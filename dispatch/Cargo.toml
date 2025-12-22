@@ -1,0 +1,20 @@
+[package]
+name = "dispatch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow-array = "57.1.0"
+arrow-schema = "57.1.0"
+arrow = "57.1.0"
+crossbeam-deque = "0.8.6"
+parquetd = { path = "../parquetd" }
+parquet = "57.1.0"
+core_affinity = "0.8.3"
+thiserror = { workspace = true }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+
+[dev-dependencies]
+rstest = "0.26.1"
