@@ -1,47 +1,61 @@
-use crate::operations::{Identifier, Operation};
-use arrow_array::RecordBatch;
+use crate::io::OperationIOSubmitter;
+use crate::operations::Operation;
+use crate::{ConsumeContext, Output, PipelineBreaker};
+use arrow_array::{RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
+/// You're average, every day `Count` (count(*)). This friendly operation (and pipeline breaker!)
+/// continuously counts incoming rows until `output` time comes, where it synchronizes with it's
+/// fellow counts and the lucky leader gets to output.
 pub struct Count {
-    id: Identifier,
     internal_count: usize,
     shared_count: Arc<AtomicUsize>,
     barrier: Arc<Barrier>,
+    output: Box<dyn Output>,
 }
 
 impl Count {
-    pub fn new(id: Identifier, shared_count: Arc<AtomicUsize>, barrier: Arc<Barrier>) -> Self {
+    pub fn new(
+        shared_count: Arc<AtomicUsize>,
+        barrier: Arc<Barrier>,
+        output: Box<dyn Output>,
+    ) -> Self {
         Self {
-            id,
             internal_count: 0,
             shared_count,
             barrier,
+            output,
         }
     }
 }
 impl Operation for Count {
-    fn id(&self) -> Identifier {
-        self.id
-    }
-
-    fn consume_output_batch(&mut self) -> Option<RecordBatch> {
+    fn consume(
+        &mut self,
+        _: &ConsumeContext,
+        _: OperationIOSubmitter,
+        batch: &RecordBatch,
+    ) -> Option<RecordBatch> {
+        self.internal_count += batch.num_rows();
         None
     }
+}
 
-    fn run(&mut self, batch: &RecordBatch) {
-        self.internal_count += batch.num_rows();
-    }
-
-    fn finish(&mut self) -> Option<RecordBatch> {
+impl PipelineBreaker for Count {
+    fn output(mut self: Box<Self>) {
         self.shared_count
             .fetch_add(self.internal_count, Ordering::Relaxed);
         if self.barrier.wait().is_leader() {
-            println!(
-                "THE RESULT IS {:?}",
-                self.shared_count.load(Ordering::Relaxed)
-            );
+            let array = UInt64Array::from(vec![self.shared_count.load(Ordering::Relaxed) as u64]);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "count",
+                DataType::UInt64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+            self.output.write(batch);
         }
-        None
+        self.output.finish();
     }
 }

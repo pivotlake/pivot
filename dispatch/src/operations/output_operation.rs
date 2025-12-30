@@ -1,0 +1,32 @@
+use crate::io::OperationIOSubmitter;
+use crate::{ConsumeContext, Operation, Output, PipelineBreaker};
+use arrow_array::RecordBatch;
+use tracing::debug;
+
+pub struct OutputOperation {
+    output: Box<dyn Output>,
+}
+
+impl OutputOperation {
+    pub fn new(output: Box<dyn Output>) -> Self {
+        Self { output }
+    }
+}
+impl Operation for OutputOperation {
+    fn consume(
+        &mut self,
+        _: &ConsumeContext,
+        _: OperationIOSubmitter,
+        batch: &RecordBatch,
+    ) -> Option<RecordBatch> {
+        self.output.write(batch.clone());
+        None
+    }
+}
+
+impl PipelineBreaker for OutputOperation {
+    fn output(mut self: Box<Self>) {
+        debug!("Finishing output op");
+        self.output.finish();
+    }
+}

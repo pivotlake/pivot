@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 arrow-array = "57.1.0"
 arrow-schema = "57.1.0"
-arrow = "57.1.0"
+arrow = {  version = "57.1.0", features = ["prettyprint"] }
 crossbeam-deque = "0.8.6"
 parquetd = { path = "../parquetd" }
 parquet = "57.1.0"
