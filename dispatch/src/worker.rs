@@ -104,6 +104,9 @@ impl Worker {
         })
     }
 
+    /// Process a raw row group received from the `ParquetReader` - this is an IO op that has
+    /// returned, and the context (`PipelineIOContext`) will tell us where it's from and where to
+    /// send the resulting `RecordBatch`s
     fn process_raw_row_group(
         &mut self,
         raw_row_group: RawRowGroup<PipelineIOContext>,
@@ -120,43 +123,35 @@ impl Worker {
 
         // We received an IO operation back-
         *io_count -= 1;
-        match pipeline_context.context {
-            PipelineIO::Operation(operation_id, r, o) => {
-                debug!("Received operation");
-                let ctx = ConsumeContext::IORequest(o);
-                let mut offset = 0;
-                for batch in reader.by_ref() {
-                    let record_batch = with_row_group_metadata(batch?, r.index(), offset);
-                    offset += record_batch.num_rows();
-                    pipeline.run_operation(
-                        &ctx,
-                        operation_id,
-                        &mut self.parquet_reader,
-                        io_count,
-                        &record_batch,
-                    )?;
-                }
-            }
-            PipelineIO::Input(i, r) => {
-                let mut offset = 0;
-                for batch in reader.by_ref() {
-                    let record_batch = with_row_group_metadata(batch?, r.index(), offset);
-                    offset += record_batch.num_rows();
-                    pipeline.run_input_operation(
-                        i,
-                        record_batch,
-                        &mut self.parquet_reader,
-                        io_count,
-                    )?;
-                }
+        let (operations, row_group_handle, ctx) = match pipeline_context.context {
+            PipelineIO::Operation(id, r, o) => (vec![id], r, ConsumeContext::IORequest(o)),
+            // TODO: can we somehow get rid of `to_vec` here?
+            PipelineIO::Input(id, r) => (pipeline.subscribers(id).to_vec(), r, ConsumeContext::Publisher)
+        };
+
+        let mut offset = 0;
+        for batch in reader.by_ref() {
+            let record_batch = with_row_group_metadata(batch?, row_group_handle.index(), offset);
+            offset += record_batch.num_rows();
+            for operation_id in &operations {
+                pipeline.run_operation(
+                    &ctx,
+                    *operation_id,
+                    &mut self.parquet_reader,
+                    io_count,
+                    &record_batch,
+                )?;
             }
         }
+
         drop(reader);
         self.parquet_reader.return_buffer(buffer_index);
         Ok(())
     }
 
-    fn process_pending_input_record_batches(&mut self) -> Result<()> {
+    /// Process any input batches that are available in memory- this will only call
+    /// `poll_record_batch` on inputs
+    fn process_pending_input_batches_from_memory(&mut self) -> Result<()> {
         for (pipeline, io_count) in self.pipelines.values_mut() {
             for input in pipeline.inputs() {
                 if let Some(r) = input.poll_record_batch() {
@@ -188,6 +183,12 @@ impl Worker {
         Ok(())
     }
 
+    /// Continuously attempt to add IO to the parquet reader until it is full (no more buffers
+    /// available).
+    ///
+    /// Strategy-wise, this will attempt to exhaust each input before moving on to the next. This
+    /// is purposefully done to allow anything hot in a particular segment of a pipeline to be run
+    /// again and again.
     fn saturate_parquet_reader(&mut self) -> Result<()> {
         let limit = self.parquet_reader.buffer_pool().available_count();
         let mut did_input = false;
@@ -234,7 +235,7 @@ impl Worker {
         loop {
             // Look for work in Inputs - we're going to attempt to find work either in pending
             // record batches or IO
-            self.process_pending_input_record_batches()?;
+            self.process_pending_input_batches_from_memory()?;
 
             if self.parquet_reader.has_pending() {
                 // We have pending data in our uring! Let's wait on it and the run on the data
