@@ -1,8 +1,7 @@
 use crate::Output;
 use arrow_array::RecordBatch;
 
-pub struct StdOutOutput {
-}
+pub struct StdOutOutput {}
 
 impl Default for StdOutOutput {
     fn default() -> Self {
@@ -12,7 +11,7 @@ impl Default for StdOutOutput {
 
 impl StdOutOutput {
     pub fn new() -> Self {
-        Self { }
+        Self {}
     }
 }
 impl Output for StdOutOutput {

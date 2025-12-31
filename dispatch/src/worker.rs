@@ -2,13 +2,12 @@ use crate::env::get_env_var_with_default;
 use crate::identified::Identifier;
 use crate::io::{PipelineIO, PipelineIOContext};
 use crate::pipeline::Pipeline;
+use crate::record_batch_metadata::with_row_group_metadata;
 use crate::{ConsumeContext, pipeline};
 use arrow_schema::ArrowError;
 use core_affinity::CoreId;
 use parquet::errors::ParquetError;
-use parquetd::{
-    BufferPool, ParquetReader, ParquetReaderBuilder, RawRowGroup,
-};
+use parquetd::{BufferPool, ParquetReader, ParquetReaderBuilder, RawRowGroup};
 use std::collections::HashMap;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier, LazyLock};
@@ -17,7 +16,6 @@ use std::time::Duration;
 use std::{result, thread};
 use thiserror::Error;
 use tracing::{debug, trace};
-use crate::record_batch_metadata::with_row_group_metadata;
 
 /// The size of the pool of buffers for pulling parquets. Only this many IO requests per worker may
 /// be active at once
@@ -46,7 +44,6 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
-
 
 /// A Worker is spun up per CPU core. The worker's main entry-point, `create`, spins up a
 /// thread with affinity to a CPU which continuously requests work from the dispatcher and does it.
@@ -126,7 +123,11 @@ impl Worker {
         let (operations, row_group_handle, ctx) = match pipeline_context.context {
             PipelineIO::Operation(id, r, o) => (vec![id], r, ConsumeContext::IORequest(o)),
             // TODO: can we somehow get rid of `to_vec` here?
-            PipelineIO::Input(id, r) => (pipeline.subscribers(id).to_vec(), r, ConsumeContext::Publisher)
+            PipelineIO::Input(id, r) => (
+                pipeline.subscribers(id).to_vec(),
+                r,
+                ConsumeContext::Publisher,
+            ),
         };
 
         let mut offset = 0;
@@ -251,7 +252,7 @@ impl Worker {
                 .extract_if(|_, (pipe, cnt)| *cnt == 0 && pipe.sources_finished())
             {
                 debug!("{:?} Finished pipeline!", self.id);
-                pipeline.output_pipeline_breakers();
+                pipeline.output_pipeline_breakers()?;
             }
 
             // Try collecting any new pipelines

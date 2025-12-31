@@ -16,9 +16,12 @@ mod record_batch_metadata;
 mod table;
 mod worker;
 
-pub use operations::*;
-pub use table::*;
-pub use memory_source::*;
+pub use memory_source::{MemoryInput, MemoryOutput};
+pub use operations::{
+    ConsumeContext, Count, Filter, Materializer, Operation, OrderBy, OrderByLimit, Output,
+    OutputOperation, PipelineBreaker, StdOutOutput,
+};
+pub use table::{RowGroupMetadataHandle, Table, TableInput, TableSource};
 
 /// The architecture is based on the paper: https://db.in.tum.de/~leis/papers/morsels.pdf
 /// Where the basic idea is to have a thread per core running a worker which continuously requests
@@ -93,9 +96,7 @@ mod tests {
     use crate::operations::{Count, Filter, Operation};
     use crate::pipeline::Pipeline;
     use crate::table::{Table, TableInput, TableSource};
-    use crate::{
-        Dispatcher, Materializer, OrderBy, OrderByLimit, Output, PipelineBreaker,
-    };
+    use crate::{Dispatcher, Materializer, OrderBy, OrderByLimit, Output, PipelineBreaker};
     use arrow::compute::{concat, like};
     use arrow_array::{Array, Int64Array, RecordBatch, Scalar, StringViewArray, UInt64Array};
     use parquetd::Projection;

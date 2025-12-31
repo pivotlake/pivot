@@ -3,7 +3,7 @@ use crate::input::Input;
 use crate::io::OperationIOSubmitter;
 use crate::io::PipelineIOContext;
 use crate::operations::Operation;
-use crate::{ConsumeContext, PipelineBreaker};
+use crate::{ConsumeContext, PipelineBreaker, operations};
 use arrow_array::RecordBatch;
 use parquetd::ParquetReader;
 use std::collections::HashMap;
@@ -15,6 +15,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("Cannot find operation {0}")]
     CannotFindOperation(Identifier),
+    #[error("{0}")]
+    Operation(#[from] operations::Error),
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
@@ -66,10 +68,11 @@ impl Pipeline {
         self.inputs.iter().all(|i| i.source_finished())
     }
 
-    pub fn output_pipeline_breakers(self) {
+    pub fn output_pipeline_breakers(self) -> Result<()> {
         for (_, pipline_breaker) in self.pipeline_breakers {
-            pipline_breaker.output();
+            pipline_breaker.output()?;
         }
+        Ok(())
     }
 
     pub fn subscribers(&mut self, identifier: Identifier) -> &[Identifier] {
@@ -105,7 +108,7 @@ impl Pipeline {
                     context,
                     OperationIOSubmitter::new(parquet_reader, counter, id, self.id),
                     &b,
-                );
+                )?;
                 if let Some(n) = next_batch {
                     let subscribers = self.publishers_to_subscribers.get(&id).cloned();
                     if let Some(subscribers) = subscribers {

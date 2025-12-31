@@ -36,14 +36,14 @@ impl Operation for Count {
         _: &ConsumeContext,
         _: OperationIOSubmitter,
         batch: &RecordBatch,
-    ) -> Option<RecordBatch> {
+    ) -> super::Result<Option<RecordBatch>> {
         self.internal_count += batch.num_rows();
-        None
+        Ok(None)
     }
 }
 
 impl PipelineBreaker for Count {
-    fn output(mut self: Box<Self>) {
+    fn output(mut self: Box<Self>) -> super::Result<()> {
         self.shared_count
             .fetch_add(self.internal_count, Ordering::Relaxed);
         if self.barrier.wait().is_leader() {
@@ -53,9 +53,10 @@ impl PipelineBreaker for Count {
                 DataType::UInt64,
                 false,
             )]));
-            let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])?;
             self.output.write(batch);
         }
         self.output.finish();
+        Ok(())
     }
 }

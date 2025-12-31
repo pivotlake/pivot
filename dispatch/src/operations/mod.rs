@@ -5,16 +5,29 @@ mod order_by_limit;
 mod output_operation;
 mod stdout;
 
-use arrow_array::RecordBatch;
-use std::any::Any;
-
 use crate::io::OperationIOSubmitter;
+use arrow_array::RecordBatch;
+use arrow_schema::ArrowError;
 pub use count::Count;
 pub use filter::Filter;
 pub use materializer::Materializer;
 pub use order_by_limit::{OrderBy, OrderByLimit};
 pub use output_operation::OutputOperation;
+use std::any::Any;
 pub use stdout::StdOutOutput;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("{0}")]
+    Materializer(#[from] materializer::Error),
+    #[error("{0}")]
+    OrderByLimit(#[from] order_by_limit::Error),
+    #[error("{0}")]
+    Arrow(#[from] ArrowError),
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub enum ConsumeContext {
     IORequest(Box<dyn Any>),
@@ -41,7 +54,7 @@ pub trait Operation: Send {
         context: &ConsumeContext,
         io_submitter: OperationIOSubmitter,
         batch: &RecordBatch,
-    ) -> Option<RecordBatch>;
+    ) -> Result<Option<RecordBatch>>;
 }
 
 /// A `PipelineBreaker` is a node in the pipeline that does not only consume, but outputs to
@@ -55,5 +68,5 @@ pub trait Operation: Send {
 /// because it only sends on rows once it has collected all input rows to it
 /// (since any intermediate result could be incorrect).
 pub trait PipelineBreaker: Operation {
-    fn output(self: Box<Self>);
+    fn output(self: Box<Self>) -> Result<()>;
 }

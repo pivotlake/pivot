@@ -18,15 +18,16 @@ impl Operation for OutputOperation {
         _: &ConsumeContext,
         _: OperationIOSubmitter,
         batch: &RecordBatch,
-    ) -> Option<RecordBatch> {
+    ) -> super::Result<Option<RecordBatch>> {
         self.output.write(batch.clone());
-        None
+        Ok(None)
     }
 }
 
 impl PipelineBreaker for OutputOperation {
-    fn output(mut self: Box<Self>) {
+    fn output(mut self: Box<Self>) -> super::Result<()> {
         debug!("Finishing output op");
         self.output.finish();
+        Ok(())
     }
 }

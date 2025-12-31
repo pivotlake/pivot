@@ -2,10 +2,19 @@ use crate::io::OperationIOSubmitter;
 use crate::{ConsumeContext, Operation, Output, PipelineBreaker};
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
 use arrow_array::RecordBatch;
-use arrow_schema::SortOptions;
+use arrow_schema::{ArrowError, SortOptions};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Instant;
+use thiserror::Error;
 use tracing::{debug, trace};
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("{0}")]
+    Arrow(#[from] ArrowError),
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct OrderBy {
     column_idx: usize,
@@ -32,7 +41,11 @@ pub struct OrderByLimit {
     receiver: Option<Receiver<RecordBatch>>,
 }
 
-fn get_top_k_from_batches(batches: Vec<RecordBatch>, order_by: &[OrderBy], k: usize) -> RecordBatch {
+fn get_top_k_from_batches(
+    batches: Vec<RecordBatch>,
+    order_by: &[OrderBy],
+    k: usize,
+) -> Result<RecordBatch> {
     if batches.is_empty() {
         panic!("get_top_k_streaming called with no batches");
     }
@@ -41,15 +54,19 @@ fn get_top_k_from_batches(batches: Vec<RecordBatch>, order_by: &[OrderBy], k: us
     let mut winners = Vec::with_capacity(batches.len());
 
     for batch in batches {
-        let local_top = get_top_k_from_single(&batch, order_by, k);
+        let local_top = get_top_k_from_single(&batch, order_by, k)?;
         winners.push(local_top);
     }
 
-    let final_pool = arrow::compute::concat_batches(&schema, &winners).unwrap();
+    let final_pool = arrow::compute::concat_batches(&schema, &winners)?;
     get_top_k_from_single(&final_pool, order_by, k)
 }
 
-fn get_top_k_from_single(batch: &RecordBatch, order_by: &[OrderBy], k: usize) -> RecordBatch {
+fn get_top_k_from_single(
+    batch: &RecordBatch,
+    order_by: &[OrderBy],
+    k: usize,
+) -> Result<RecordBatch> {
     let sort_columns: Vec<SortColumn> = order_by
         .iter()
         .map(|ob| {
@@ -64,15 +81,15 @@ fn get_top_k_from_single(batch: &RecordBatch, order_by: &[OrderBy], k: usize) ->
         })
         .collect();
 
-    let indices = lexsort_to_indices(&sort_columns, Some(k)).unwrap();
+    let indices = lexsort_to_indices(&sort_columns, Some(k))?;
 
     let columns = batch
         .columns()
         .iter()
-        .map(|c| take(c.as_ref(), &indices, None).unwrap())
-        .collect();
+        .map(|c| take(c.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    unsafe { RecordBatch::new_unchecked(batch.schema(), columns, indices.len()) }
+    Ok(unsafe { RecordBatch::new_unchecked(batch.schema(), columns, indices.len()) })
 }
 
 impl OrderByLimit {
@@ -100,17 +117,17 @@ impl Operation for OrderByLimit {
         _: &ConsumeContext,
         _: OperationIOSubmitter,
         batch: &RecordBatch,
-    ) -> Option<RecordBatch> {
+    ) -> super::Result<Option<RecordBatch>> {
         self.batches.push(batch.clone());
-        None
+        Ok(None)
     }
 }
 
 impl PipelineBreaker for OrderByLimit {
-    fn output(mut self: Box<Self>) {
+    fn output(mut self: Box<Self>) -> super::Result<()> {
         let start = Instant::now();
         if !self.batches.is_empty() {
-            let local_top_k = get_top_k_from_batches(self.batches, &self.order_by, self.limit);
+            let local_top_k = get_top_k_from_batches(self.batches, &self.order_by, self.limit)?;
             debug!("Sending on {:?}", local_top_k.num_rows());
 
             let _ = self.sender.send(local_top_k);
@@ -120,17 +137,20 @@ impl PipelineBreaker for OrderByLimit {
             drop(self.sender);
 
             trace!("Receiving...");
+            // TODO: we should somehow return here, as we're blocking the entire worker
             let global_top_k: Vec<RecordBatch> = rx.into_iter().collect();
 
-            debug!("Winners {:?}", global_top_k.len());
             if !global_top_k.is_empty() {
-                let final_batch = arrow::compute::concat_batches(&global_top_k[0].schema(), &global_top_k).unwrap();
+                let final_batch =
+                    arrow::compute::concat_batches(&global_top_k[0].schema(), &global_top_k)
+                        .map_err(Error::from)?;
                 debug!("Outputting to source {:?}", final_batch.num_rows());
-                self.output_source.write(final_batch);
+                self.output_source.write(get_top_k_from_single(&final_batch, &self.order_by, self.limit)?);
             }
 
             debug!("Sort took {:?}", start.elapsed());
         }
         self.output_source.finish();
+        Ok(())
     }
 }

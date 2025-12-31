@@ -16,9 +16,7 @@ where
     F: Fn(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
 {
     pub fn new(func: F) -> Self {
-        Self {
-            func,
-        }
+        Self { func }
     }
 }
 
@@ -31,13 +29,13 @@ where
         _: &ConsumeContext,
         _: OperationIOSubmitter,
         batch: &RecordBatch,
-    ) -> Option<RecordBatch> {
+    ) -> super::Result<Option<RecordBatch>> {
         let mask = (self.func)(batch);
         debug_assert_eq!(mask.len(), batch.num_rows());
 
         if mask.true_count() == 0 {
-            return None;
+            return Ok(None);
         }
-        Some(filter_record_batch(batch, &mask).unwrap())
+        Ok(Some(filter_record_batch(batch, &mask)?))
     }
 }
