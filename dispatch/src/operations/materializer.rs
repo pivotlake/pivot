@@ -6,8 +6,7 @@ use arrow::compute::filter_record_batch;
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::ArrowError;
 use parquetd::Projection;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
+use std::mem;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -73,17 +72,12 @@ fn filter_batch_by_global_indexes(
 /// passed the filter
 pub struct Materializer {
     projection: Option<Projection>,
-    row_groups_to_indices: HashMap<u32, Vec<u32>>,
     table: Arc<Table>,
 }
 
 impl Materializer {
     pub fn new(projection: Option<Projection>, table: Arc<Table>) -> Self {
-        Self {
-            projection,
-            table,
-            row_groups_to_indices: Default::default(),
-        }
+        Self { projection, table }
     }
 
     /// Handle an incoming `RecordBatch` from our parent publisher.
@@ -108,34 +102,35 @@ impl Materializer {
             .downcast_ref::<UInt32Array>()
             .expect("RunArray values must be UInt32Array");
 
+        let mut running_group = groups.get_physical_index(0);
+        let mut running_indexes = vec![];
+
         for i in 0..batch.num_rows() {
             let logical_index = groups.get_physical_index(i);
             let group = if groups_run_values.is_valid(logical_index) {
-                Some(groups_run_values.value(logical_index))
+                groups_run_values.value(logical_index)
             } else {
                 panic!("unsupported")
             };
 
             let row_index = row_indexes.value(i);
-            match self.row_groups_to_indices.entry(group.unwrap()) {
-                Entry::Occupied(mut e) => {
-                    e.get_mut().push(row_index);
-                }
-                Entry::Vacant(e) => {
-                    io_submitter
-                        .submit_operation_io(
-                            RowGroupMetadataHandle::new(
-                                self.table.clone(),
-                                group.unwrap() as usize,
-                            ),
-                            self.projection.as_ref(),
-                            Box::new(group.unwrap()),
-                        )
-                        .unwrap();
-                    e.insert(vec![row_index]);
-                }
+            if running_group != group as usize {
+                io_submitter.submit_operation_io(
+                    RowGroupMetadataHandle::new(self.table.clone(), running_group),
+                    self.projection.as_ref(),
+                    Box::new((running_group, mem::take(&mut running_indexes))),
+                );
             }
+
+            running_group = group as usize;
+            running_indexes.push(row_index);
         }
+
+        io_submitter.submit_operation_io(
+            RowGroupMetadataHandle::new(self.table.clone(), running_group),
+            self.projection.as_ref(),
+            Box::new((running_group, running_indexes)),
+        );
         Ok(())
     }
 }
@@ -153,11 +148,8 @@ impl Operation for Materializer {
                 Ok(None)
             }
             ConsumeContext::IORequest(value) => {
-                let row_group = value.downcast_ref::<u32>().unwrap();
-                let batch = filter_batch_by_global_indexes(
-                    batch,
-                    self.row_groups_to_indices.get(row_group).unwrap(),
-                )?;
+                let (_, indices) = value.downcast_ref::<(usize, Vec<u32>)>().unwrap();
+                let batch = filter_batch_by_global_indexes(batch, indices)?;
                 if batch.num_rows() == 0 {
                     Ok(None)
                 } else {

@@ -124,7 +124,7 @@ impl Operation for OrderByLimit {
 }
 
 impl PipelineBreaker for OrderByLimit {
-    fn output(mut self: Box<Self>) -> super::Result<()> {
+    fn finish(mut self: Box<Self>) -> super::Result<()> {
         let start = Instant::now();
         if !self.batches.is_empty() {
             let local_top_k = get_top_k_from_batches(self.batches, &self.order_by, self.limit)?;
@@ -145,7 +145,11 @@ impl PipelineBreaker for OrderByLimit {
                     arrow::compute::concat_batches(&global_top_k[0].schema(), &global_top_k)
                         .map_err(Error::from)?;
                 debug!("Outputting to source {:?}", final_batch.num_rows());
-                self.output_source.write(get_top_k_from_single(&final_batch, &self.order_by, self.limit)?);
+                self.output_source.write(get_top_k_from_single(
+                    &final_batch,
+                    &self.order_by,
+                    self.limit,
+                )?);
             }
 
             debug!("Sort took {:?}", start.elapsed());

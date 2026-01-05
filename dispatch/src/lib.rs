@@ -22,6 +22,7 @@ pub use operations::{
     OutputOperation, PipelineBreaker, StdOutOutput,
 };
 pub use table::{RowGroupMetadataHandle, Table, TableInput, TableSource};
+use worker::PipelineHandle;
 
 /// The architecture is based on the paper: https://db.in.tum.de/~leis/papers/morsels.pdf
 /// Where the basic idea is to have a thread per core running a worker which continuously requests
@@ -39,13 +40,17 @@ pub use table::{RowGroupMetadataHandle, Table, TableInput, TableSource};
 /// contain the Count operation which has a shared `Barrier` and `AtomicUsize` with the other
 /// pipelines. Each worker will run its own instance of the Pipeline, continuously updating an
 /// internal count. Once the pipeline is complete, each count operation will update the atomic and
-/// wait on their barrier, where the leader will output it
+/// wait on their barrier, where the leader will output it.
+///
+/// All pipelines and operations have identifiers. These identifiers are unique within a single worker,
+/// but *shared* across workers. Every "sibling" pipeline/operation has the same identifier; this is
+/// so to allow work stealing.
 ///
 /// The `Dispatcher` controls spinning up workers and dispatching work. The Dispatcher is the main
 /// entry-point for working with the `dispatch` library. Despite its name, the dispatcher does not
 ///  "run" actively, but is instead called by its workers to prevent unneeded context switches.
 pub struct Dispatcher {
-    pipeline_senders: Vec<Sender<Pipeline>>,
+    pipeline_senders: Vec<Sender<PipelineHandle>>,
 }
 
 impl Dispatcher {
@@ -82,8 +87,20 @@ impl Dispatcher {
 
     /// Enter a new pipeline for all the workers to execute.
     pub fn push_pipeline<F: FnMut() -> Pipeline>(&self, mut pipeline_builder: F) {
+        let mut cb_workers: Vec<_> = (0..self.pipeline_senders.len())
+            .map(|_| crossbeam_deque::Worker::new_fifo())
+            .collect();
+        let mut stealers: Vec<_> = (0..self.pipeline_senders.len())
+            .map(|_| cb_workers.iter().map(|w| w.stealer()).collect())
+            .collect();
         for sender in &self.pipeline_senders {
-            sender.send(pipeline_builder()).unwrap();
+            sender
+                .send(PipelineHandle::new(
+                    pipeline_builder(),
+                    cb_workers.pop().unwrap(),
+                    stealers.pop().unwrap(),
+                ))
+                .unwrap();
         }
     }
 }
@@ -188,6 +205,7 @@ mod tests {
     fn run_query_20(table: Arc<Table>, dispatcher: Arc<Dispatcher>, workers: usize) {
         let count_barrier = Arc::new(Barrier::new(workers));
         let shared_count = Arc::new(AtomicUsize::new(0));
+        let pipeline_count = Arc::new(AtomicUsize::new(workers));
         let table_source = Arc::new(TableSource::from(&table));
         let (output, reader) = create_test_output();
         let mut output = Box::new(output);
@@ -223,6 +241,7 @@ mod tests {
                     )) as Box<dyn PipelineBreaker>,
                 )],
                 vec![(0, vec![1]), (1, vec![2])].into_iter().collect(),
+                pipeline_count.clone(),
             )
         });
 
@@ -241,7 +260,7 @@ mod tests {
     }
 
     // SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10;
-    fn run_query_23(table: Arc<Table>, dispatcher: Arc<Dispatcher>) {
+    fn run_query_23(table: Arc<Table>, dispatcher: Arc<Dispatcher>, workers: usize) {
         let (output, waiter) = create_test_output();
         let mut output = Box::new(output);
 
@@ -250,6 +269,7 @@ mod tests {
 
         let table_source = Arc::new(TableSource::from(&table));
         let (tx, rx) = channel();
+        let pipeline_count = Arc::new(AtomicUsize::new(workers));
 
         let mut rx_opt = Some(rx);
         dispatcher.push_pipeline(|| {
@@ -285,12 +305,14 @@ mod tests {
                     )),
                 )],
                 vec![(0, vec![1]), (1, vec![2])].into_iter().collect(),
+                pipeline_count.clone(),
             )
         });
         drop(tx);
 
         let (tx, rx) = channel();
         let mut rx_opt = Some(rx);
+        let pipeline_count = Arc::new(AtomicUsize::new(workers));
         dispatcher.push_pipeline(|| {
             Pipeline::new(
                 1,
@@ -313,6 +335,7 @@ mod tests {
                     )),
                 )],
                 vec![(0, vec![1]), (1, vec![2])].into_iter().collect(),
+                pipeline_count.clone(),
             )
         });
         drop(tx);
@@ -383,7 +406,7 @@ mod tests {
             let start = Instant::now();
             match get_env_var_with_default("QUERY", 20) {
                 20 => run_query_20(table.clone(), dispatcher.clone(), handles.len()),
-                23 => run_query_23(table.clone(), dispatcher.clone()),
+                23 => run_query_23(table.clone(), dispatcher.clone(), handles.len()),
                 _ => panic!("No such query"),
             }
             println!("Elapsed {:?}", start.elapsed().as_millis())

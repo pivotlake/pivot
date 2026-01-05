@@ -30,7 +30,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub enum ConsumeContext {
-    IORequest(Box<dyn Any>),
+    IORequest(Box<dyn Any + Send>),
     Publisher,
 }
 
@@ -68,5 +68,8 @@ pub trait Operation: Send {
 /// because it only sends on rows once it has collected all input rows to it
 /// (since any intermediate result could be incorrect).
 pub trait PipelineBreaker: Operation {
-    fn output(self: Box<Self>) -> Result<()>;
+    /// "Finish" the pipeline-breaker - By consuming Self this essentially "promises" that no input
+    /// will ever be delivered again, and the pipeline-breaker can safely do anything it wants at
+    /// this point, such as outputting to another pipeline
+    fn finish(self: Box<Self>) -> Result<()>;
 }

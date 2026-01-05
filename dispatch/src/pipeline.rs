@@ -1,14 +1,15 @@
 use crate::identified::{Identified, Identifier};
 use crate::input::Input;
 use crate::io::OperationIOSubmitter;
-use crate::io::PipelineIOContext;
+use crate::io::PipelineIORequest;
 use crate::operations::Operation;
 use crate::{ConsumeContext, PipelineBreaker, operations};
 use arrow_array::RecordBatch;
-use parquetd::ParquetReader;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::result;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -31,6 +32,11 @@ pub struct Pipeline {
     pipeline_breakers: HashMap<Identifier, Box<dyn PipelineBreaker>>,
     /// A mapping of publishing identifiers to subscriber identifiers
     publishers_to_subscribers: HashMap<Identifier, Vec<Identifier>>,
+    /// Amount of workers still running on this pipeline. Once this goes down to 0, all instances
+    /// of pipelines will run their breakers
+    workers_remaining: Arc<AtomicUsize>,
+    /// Did we decrement `workers_remaining`?
+    did_decrement_workers_remaining: bool,
 }
 
 impl Debug for Pipeline {
@@ -47,6 +53,7 @@ impl Pipeline {
         operations: Vec<Identified<Box<dyn Operation>>>,
         pipeline_breakers: Vec<Identified<Box<dyn PipelineBreaker>>>,
         publishers_to_subscribers: HashMap<Identifier, Vec<Identifier>>,
+        siblings_remaining: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             id,
@@ -57,6 +64,8 @@ impl Pipeline {
                 .map(|o| (o.id(), o.take()))
                 .collect(),
             publishers_to_subscribers,
+            did_decrement_workers_remaining: false,
+            workers_remaining: siblings_remaining,
         }
     }
 
@@ -68,9 +77,30 @@ impl Pipeline {
         self.inputs.iter().all(|i| i.source_finished())
     }
 
-    pub fn output_pipeline_breakers(self) -> Result<()> {
+    pub fn maybe_decrement_pipeline_workers(&mut self) -> bool {
+        if !self.did_decrement_workers_remaining {
+            self.did_decrement_workers_remaining = true;
+            self.workers_remaining
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                == 1
+        } else {
+            self.workers_remaining
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == 0
+        }
+    }
+
+    pub fn maybe_increment_pipeline_workers(&mut self) {
+        if self.did_decrement_workers_remaining {
+            self.did_decrement_workers_remaining = false;
+            self.workers_remaining
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn finish_pipeline_breakers(self) -> Result<()> {
         for (_, pipline_breaker) in self.pipeline_breakers {
-            pipline_breaker.output()?;
+            pipline_breaker.finish()?;
         }
         Ok(())
     }
@@ -87,8 +117,7 @@ impl Pipeline {
         &mut self,
         context: &ConsumeContext,
         operation_id: Identifier,
-        parquet_reader: &mut ParquetReader<PipelineIOContext>,
-        counter: &mut usize,
+        io_request_queue: &mut crossbeam_deque::Worker<PipelineIORequest>,
         batch: &RecordBatch,
     ) -> Result<()> {
         let mut batches = vec![(vec![operation_id], batch.clone())];
@@ -106,7 +135,7 @@ impl Pipeline {
                     .ok_or(Error::CannotFindOperation(id))?;
                 let next_batch = operation.consume(
                     context,
-                    OperationIOSubmitter::new(parquet_reader, counter, id, self.id),
+                    OperationIOSubmitter::new(self.id, id, io_request_queue),
                     &b,
                 )?;
                 if let Some(n) = next_batch {
@@ -116,31 +145,6 @@ impl Pipeline {
                     }
                 }
             }
-        }
-        Ok(())
-    }
-
-    pub fn run_input_operation(
-        &mut self,
-        identifier: Identifier,
-        batch: RecordBatch,
-        reader: &mut ParquetReader<PipelineIOContext>,
-        counter: &mut usize,
-    ) -> Result<()> {
-        // TODO: remove this clone
-        let subscribers = self
-            .publishers_to_subscribers
-            .get(&identifier)
-            .unwrap()
-            .clone();
-        for subscriber in subscribers {
-            self.run_operation(
-                &ConsumeContext::Publisher,
-                subscriber,
-                reader,
-                counter,
-                &batch,
-            )?;
         }
         Ok(())
     }

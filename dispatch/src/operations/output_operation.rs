@@ -25,7 +25,7 @@ impl Operation for OutputOperation {
 }
 
 impl PipelineBreaker for OutputOperation {
-    fn output(mut self: Box<Self>) -> super::Result<()> {
+    fn finish(mut self: Box<Self>) -> super::Result<()> {
         debug!("Finishing output op");
         self.output.finish();
         Ok(())

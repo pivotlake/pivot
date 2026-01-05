@@ -1,21 +1,23 @@
 use crate::env::get_env_var_with_default;
 use crate::identified::Identifier;
-use crate::io::{PipelineIO, PipelineIOContext};
+use crate::io::{IORequest, PipelineIORequest, RowGroupFetch};
 use crate::pipeline::Pipeline;
 use crate::record_batch_metadata::with_row_group_metadata;
 use crate::{ConsumeContext, pipeline};
 use arrow_schema::ArrowError;
 use core_affinity::CoreId;
+use crossbeam_deque::{Steal, Stealer};
 use parquet::errors::ParquetError;
 use parquetd::{BufferPool, ParquetReader, ParquetReaderBuilder, RawRowGroup};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier, LazyLock};
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 use std::{result, thread};
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 /// The size of the pool of buffers for pulling parquets. Only this many IO requests per worker may
 /// be active at once
@@ -45,6 +47,43 @@ pub enum Error {
 
 pub type Result<T, E = Error> = result::Result<T, E>;
 
+pub struct PipelineHandle {
+    pipeline: Pipeline,
+    // IO pending right now within the parquet reader
+    io_pending: usize,
+    io_request_queue: crossbeam_deque::Worker<PipelineIORequest>,
+    io_stealers: Vec<Stealer<PipelineIORequest>>,
+}
+
+impl PipelineHandle {
+    pub fn new(
+        pipeline: Pipeline,
+        io_request_queue: crossbeam_deque::Worker<PipelineIORequest>,
+        io_stealers: Vec<Stealer<PipelineIORequest>>,
+    ) -> Self {
+        Self {
+            pipeline,
+            io_pending: 0,
+            io_request_queue,
+            io_stealers,
+        }
+    }
+}
+
+impl Deref for PipelineHandle {
+    type Target = Pipeline;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pipeline
+    }
+}
+
+impl DerefMut for PipelineHandle {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pipeline
+    }
+}
+
 /// A Worker is spun up per CPU core. The worker's main entry-point, `create`, spins up a
 /// thread with affinity to a CPU which continuously requests work from the dispatcher and does it.
 ///
@@ -67,11 +106,12 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 /// And forever back to 1!
 pub struct Worker {
     id: Identifier,
-    pipeline_queue: Receiver<Pipeline>,
-    parquet_reader: ParquetReader<PipelineIOContext>,
-    /// A mapping from the pipeline identifier, to the pipeline and the number of running IO
+    pipeline_queue: Receiver<PipelineHandle>,
+    parquet_reader: ParquetReader<PipelineIORequest>,
+    /// A mapping from the pipeline identifier, to the pipeline and the number of pending IO
     /// operations
-    pipelines: HashMap<Identifier, (Pipeline, usize)>,
+    pipelines: HashMap<Identifier, PipelineHandle>,
+    did_work_on_iteration: bool,
 }
 
 impl Worker {
@@ -79,7 +119,7 @@ impl Worker {
     /// The `ready_barrier` is used to synchronize the spinning up of different workers
     pub fn create(
         core: CoreId,
-        receiver: Receiver<Pipeline>,
+        receiver: Receiver<PipelineHandle>,
         ready_barrier: Arc<Barrier>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
@@ -94,6 +134,7 @@ impl Worker {
                 parquet_reader: reader,
                 pipelines: HashMap::new(),
                 pipeline_queue: receiver,
+                did_work_on_iteration: false,
             };
             core_affinity::set_for_current(core);
             ready_barrier.wait();
@@ -106,25 +147,25 @@ impl Worker {
     /// send the resulting `RecordBatch`s
     fn process_raw_row_group(
         &mut self,
-        raw_row_group: RawRowGroup<PipelineIOContext>,
+        raw_row_group: RawRowGroup<PipelineIORequest>,
     ) -> Result<()> {
         let buffer_index = raw_row_group.buffer_index();
 
         let mut reader = raw_row_group.create_reader()?;
         let pipeline_context = raw_row_group.take_user_data();
 
-        let (pipeline, io_count) = self
+        let pipeline_handle = self
             .pipelines
             .get_mut(&pipeline_context.pipeline_identifier)
             .ok_or(Error::PipelineMissing(pipeline_context.pipeline_identifier))?;
 
         // We received an IO operation back-
-        *io_count -= 1;
-        let (operations, row_group_handle, ctx) = match pipeline_context.context {
-            PipelineIO::Operation(id, r, o) => (vec![id], r, ConsumeContext::IORequest(o)),
+        pipeline_handle.io_pending -= 1;
+        let (operations, row_group_handle, ctx) = match pipeline_context.request {
+            IORequest::Operation(id, r, o) => (vec![id], r, ConsumeContext::IORequest(o)),
             // TODO: can we somehow get rid of `to_vec` here?
-            PipelineIO::Input(id, r) => (
-                pipeline.subscribers(id).to_vec(),
+            IORequest::Input(id, r) => (
+                pipeline_handle.subscribers(id).to_vec(),
                 r,
                 ConsumeContext::Publisher,
             ),
@@ -132,14 +173,18 @@ impl Worker {
 
         let mut offset = 0;
         for batch in reader.by_ref() {
-            let record_batch = with_row_group_metadata(batch?, row_group_handle.index(), offset);
+            let record_batch = with_row_group_metadata(
+                batch?,
+                row_group_handle.row_group_metadata_handle.index(),
+                offset,
+            );
             offset += record_batch.num_rows();
+            self.did_work_on_iteration = true;
             for operation_id in &operations {
-                pipeline.run_operation(
+                pipeline_handle.pipeline.run_operation(
                     &ctx,
                     *operation_id,
-                    &mut self.parquet_reader,
-                    io_count,
+                    &mut pipeline_handle.io_request_queue,
                     &record_batch,
                 )?;
             }
@@ -153,16 +198,19 @@ impl Worker {
     /// Process any input batches that are available in memory- this will only call
     /// `poll_record_batch` on inputs
     fn process_pending_input_batches_from_memory(&mut self) -> Result<()> {
-        for (pipeline, io_count) in self.pipelines.values_mut() {
-            for input in pipeline.inputs() {
+        for pipeline_handle in self.pipelines.values_mut() {
+            for input in pipeline_handle.inputs() {
                 if let Some(r) = input.poll_record_batch() {
                     let identifier = input.id();
-                    pipeline.run_input_operation(
-                        identifier,
-                        r,
-                        &mut self.parquet_reader,
-                        io_count,
-                    )?;
+                    self.did_work_on_iteration = true;
+                    for subscriber in pipeline_handle.subscribers(identifier).to_vec() {
+                        pipeline_handle.pipeline.run_operation(
+                            &ConsumeContext::Publisher,
+                            subscriber,
+                            &mut pipeline_handle.io_request_queue,
+                            &r,
+                        )?;
+                    }
                     // We return here to continue running on same input if possible
                     return Ok(());
                 }
@@ -179,9 +227,13 @@ impl Worker {
 
         for raw_row_group in completed {
             self.process_raw_row_group(raw_row_group)?;
-            self.saturate_parquet_reader()?;
+            self.saturate_io()?;
         }
         Ok(())
+    }
+
+    fn current_io_limit(&self) -> usize {
+        self.parquet_reader.buffer_pool().available_count()
     }
 
     /// Continuously attempt to add IO to the parquet reader until it is full (no more buffers
@@ -190,42 +242,130 @@ impl Worker {
     /// Strategy-wise, this will attempt to exhaust each input before moving on to the next. This
     /// is purposefully done to allow anything hot in a particular segment of a pipeline to be run
     /// again and again.
-    fn saturate_parquet_reader(&mut self) -> Result<()> {
-        let limit = self.parquet_reader.buffer_pool().available_count();
-        let mut did_input = false;
+    fn saturate_pending_io_work_from_inputs(&mut self) -> Result<()> {
+        let limit = self.current_io_limit();
+        let mut remaining = limit - self.pipelines.values().map(|p| p.io_pending).sum::<usize>();
 
-        'saturation: for (p, counter) in self.pipelines.values_mut() {
-            let p_id = p.id();
-
-            for input in p.inputs().iter().filter(|f| !f.source_finished()) {
+        for (id, pipeline_handle) in &mut self.pipelines {
+            for input in pipeline_handle
+                .pipeline
+                .inputs()
+                .iter()
+                .filter(|f| !f.source_finished())
+            {
                 // Exhaust this input until it's empty OR the global pool is full
-                while self.parquet_reader.pending_count() < limit {
+                while remaining > 0 {
                     let Some((handle, projection)) = input.poll_io() else {
                         break;
                     };
 
-                    let row_group_metadata = handle.get().clone();
-                    self.parquet_reader.submit_projected_row_group_read(
-                        PipelineIOContext {
-                            pipeline_identifier: p_id,
-                            context: PipelineIO::Input(input.id(), handle),
-                        },
-                        row_group_metadata,
-                        projection.as_ref(),
-                    )?;
-
-                    *counter += 1;
-                    did_input = true;
+                    remaining -= 1;
+                    pipeline_handle.io_request_queue.push(PipelineIORequest {
+                        pipeline_identifier: *id,
+                        request: IORequest::Input(
+                            input.id(),
+                            RowGroupFetch {
+                                row_group_metadata_handle: handle,
+                                projection,
+                            },
+                        ),
+                    });
                 }
 
-                if self.parquet_reader.pending_count() >= limit {
-                    break 'saturation;
+                if remaining == 0 {
+                    return Ok(());
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn saturate_parquet_reader_from_pending_io_work(&mut self) -> Result<()> {
+        let mut did_input = false;
+        let mut remaining = self.current_io_limit();
+
+        'outer: for pipeline_handle in self.pipelines.values_mut() {
+            while remaining > 0 {
+                match pipeline_handle.io_request_queue.pop() {
+                    Some(i) => {
+                        // TODO: can we avoid cloning here?
+                        let row_group_fetch = i.request.row_group_fetch();
+                        let row_group_metadata =
+                            row_group_fetch.row_group_metadata_handle.get().clone();
+                        let projection = row_group_fetch.projection.clone();
+
+                        self.parquet_reader.submit_projected_row_group_read(
+                            i,
+                            row_group_metadata,
+                            projection,
+                        )?;
+
+                        pipeline_handle.io_pending += 1;
+                        remaining -= 1;
+                        did_input = true;
+                    }
+                    None => break,
+                }
+            }
+
+            if remaining == 0 {
+                break 'outer;
+            }
+        }
+
         if did_input {
+            self.did_work_on_iteration = true;
             self.parquet_reader.submit()?;
+        }
+        Ok(())
+    }
+
+    fn saturate_io(&mut self) -> Result<()> {
+        self.saturate_pending_io_work_from_inputs()?;
+        self.saturate_parquet_reader_from_pending_io_work()?;
+        Ok(())
+    }
+
+    fn try_saturate_pending_work_from_sibling_workers(&mut self) -> Result<()> {
+        let mut remaining = self.current_io_limit();
+
+        for pipeline_handle in self.pipelines.values_mut() {
+            for stealer in &mut pipeline_handle.io_stealers {
+                // Exhaust this input until it's empty OR the global pool is full
+                while remaining > 0 {
+                    let res = stealer.steal();
+                    let Steal::Success(request) = res else {
+                        trace!("No pending work from sibling worker!");
+                        break;
+                    };
+
+                    // Given we're stealing from another worker, this pipeline may have notified that
+                    // it was finished - let's notify our brethren that we are now resuming
+                    pipeline_handle.pipeline.maybe_increment_pipeline_workers();
+
+                    pipeline_handle.io_pending += 1;
+                    remaining -= 1;
+                    // TODO: can we avoid cloning here?
+                    let row_group_metadata = request
+                        .request
+                        .row_group_fetch()
+                        .row_group_metadata_handle
+                        .get()
+                        .clone();
+                    let projection = request.request.row_group_fetch().projection.clone();
+                    self.did_work_on_iteration = true;
+                    self.parquet_reader.submit_projected_row_group_read(
+                        request,
+                        row_group_metadata,
+                        projection,
+                    )?;
+                }
+
+                if remaining == 0 {
+                    return Ok(());
+                }
+            }
         }
         Ok(())
     }
@@ -234,6 +374,7 @@ impl Worker {
     /// and execute them
     fn run(mut self) -> Result<()> {
         loop {
+            self.did_work_on_iteration = false;
             // Look for work in Inputs - we're going to attempt to find work either in pending
             // record batches or IO
             self.process_pending_input_batches_from_memory()?;
@@ -243,26 +384,40 @@ impl Worker {
                 self.process_pending_reads()?;
             } else {
                 // No work available within pipelines - let's try saturating our pipelines
-                self.saturate_parquet_reader()?;
+                self.saturate_io()?;
             }
 
             // Check if any pipeline is finished
-            for (_id, (pipeline, _)) in self
-                .pipelines
-                .extract_if(|_, (pipe, cnt)| *cnt == 0 && pipe.sources_finished())
+            for (_id, pipeline_handle) in self.pipelines.extract_if(|_, p| {
+                if p.io_pending == 0 && p.sources_finished() {
+                    // We notify our siblings that we're finished (if we didn't), and return whether we were the last sibling to finish (if so, run breakers)
+                    debug!("{:?} finished local!", self.id);
+                    p.maybe_decrement_pipeline_workers()
+                } else {
+                    false
+                }
+            }) {
+                info!("{:?} Finished pipeline!", self.id);
+                pipeline_handle.pipeline.finish_pipeline_breakers()?;
+            }
+
+            // Check if we want to steal IO
+            if self.pipelines.iter_mut().all(|(_, p)| p.sources_finished())
+                && !self.parquet_reader.has_pending()
+                && self.pipelines.values().all(|p| p.io_pending == 0)
             {
-                debug!("{:?} Finished pipeline!", self.id);
-                pipeline.output_pipeline_breakers()?;
+                debug!("{:?} Trying to steal IO!", self.id);
+                self.try_saturate_pending_work_from_sibling_workers()?;
             }
 
             // Try collecting any new pipelines
             if let Ok(p) = self.pipeline_queue.try_recv() {
                 debug!("{:?} Received pipeline!", self.id);
-                self.pipelines.insert(p.id(), (p, 0));
+                self.pipelines.insert(p.id(), p);
             }
 
             // If nothing to do - let's sleep :) Save the environment! One millisecond at a time.
-            if self.pipelines.is_empty() {
+            if !self.did_work_on_iteration {
                 sleep(Duration::from_millis(1));
             }
         }

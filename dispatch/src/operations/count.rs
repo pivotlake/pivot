@@ -43,7 +43,7 @@ impl Operation for Count {
 }
 
 impl PipelineBreaker for Count {
-    fn output(mut self: Box<Self>) -> super::Result<()> {
+    fn finish(mut self: Box<Self>) -> super::Result<()> {
         self.shared_count
             .fetch_add(self.internal_count, Ordering::Relaxed);
         if self.barrier.wait().is_leader() {

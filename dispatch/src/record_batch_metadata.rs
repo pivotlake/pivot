@@ -9,7 +9,7 @@ const ROW_OFFSET_FROM_END: usize = 1;
 
 static GLOBAL_ROW_GROUP_FIELD: LazyLock<Arc<Field>> = LazyLock::new(|| {
     let run_ends = Field::new("run_ends", DataType::Int32, false);
-    let values = Field::new("values", DataType::UInt32, false);
+    let values = Field::new("values", DataType::UInt32, true);
     let dt = DataType::RunEndEncoded(Arc::new(run_ends), Arc::new(values));
     Arc::new(Field::new("row_group_idx", dt, false))
 });
