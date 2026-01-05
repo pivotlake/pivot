@@ -17,7 +17,7 @@ use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 use std::{result, thread};
 use thiserror::Error;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, instrument, trace};
 
 /// The size of the pool of buffers for pulling parquets. Only this many IO requests per worker may
 /// be active at once
@@ -372,6 +372,7 @@ impl Worker {
 
     /// The inner "forever-loop" of the Worker. Continuously request pipelines from the dispatcher
     /// and execute them
+    #[instrument(skip(self), fields(worker_id = %self.id))]
     fn run(mut self) -> Result<()> {
         loop {
             self.did_work_on_iteration = false;
@@ -391,13 +392,13 @@ impl Worker {
             for (_id, pipeline_handle) in self.pipelines.extract_if(|_, p| {
                 if p.io_pending == 0 && p.sources_finished() {
                     // We notify our siblings that we're finished (if we didn't), and return whether we were the last sibling to finish (if so, run breakers)
-                    debug!("{:?} finished local!", self.id);
+                    debug!("Notifying siblings that pipeline {:?} finished...", p.id());
                     p.maybe_decrement_pipeline_workers()
                 } else {
                     false
                 }
             }) {
-                info!("{:?} Finished pipeline!", self.id);
+                info!("Finished pipeline {:?}", pipeline_handle.id());
                 pipeline_handle.pipeline.finish_pipeline_breakers()?;
             }
 
@@ -406,13 +407,13 @@ impl Worker {
                 && !self.parquet_reader.has_pending()
                 && self.pipelines.values().all(|p| p.io_pending == 0)
             {
-                debug!("{:?} Trying to steal IO!", self.id);
+                debug!("Trying to steal IO...");
                 self.try_saturate_pending_work_from_sibling_workers()?;
             }
 
             // Try collecting any new pipelines
             if let Ok(p) = self.pipeline_queue.try_recv() {
-                debug!("{:?} Received pipeline!", self.id);
+                debug!("Received pipeline!");
                 self.pipelines.insert(p.id(), p);
             }
 
