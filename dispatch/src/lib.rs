@@ -3,6 +3,7 @@ use crate::worker::Worker;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
+use tikv_jemallocator::Jemalloc;
 use tracing::info;
 
 mod env;
@@ -23,6 +24,9 @@ pub use operations::{
 };
 pub use table::{RowGroupMetadataHandle, Table, TableInput, TableSource};
 use worker::PipelineHandle;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 /// The architecture is based on the paper: https://db.in.tum.de/~leis/papers/morsels.pdf
 /// Where the basic idea is to have a thread per core running a worker which continuously requests
