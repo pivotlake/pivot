@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-arrow-array = "57.1.0"
-arrow-schema = "57.1.0"
-arrow = {  version = "57.1.0", features = ["prettyprint"] }
+
+arrow-array = { path = "../arrow/arrow-array" }
+arrow-schema = { path = "../arrow/arrow-schema" }
+arrow = { path = "../arrow/arrow", features = ["prettyprint"] }
+
 crossbeam-deque = "0.8.6"
 parquetd = { path = "../parquetd" }
 parquet = "57.1.0"
