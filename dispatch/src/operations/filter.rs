@@ -6,14 +6,14 @@ use arrow_array::{BooleanArray, RecordBatch};
 
 pub struct Filter<F>
 where
-    F: Fn(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
+    F: FnMut(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
 {
     func: F,
 }
 
 impl<F> Filter<F>
 where
-    F: Fn(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
+    F: FnMut(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
 {
     pub fn new(func: F) -> Self {
         Self { func }
@@ -22,7 +22,7 @@ where
 
 impl<F> Operation for Filter<F>
 where
-    F: Fn(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
+    F: FnMut(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
 {
     fn consume(
         &mut self,

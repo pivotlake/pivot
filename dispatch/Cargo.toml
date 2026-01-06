@@ -8,6 +8,7 @@ edition = "2024"
 arrow-array = { path = "../arrow/arrow-array" }
 arrow-schema = { path = "../arrow/arrow-schema" }
 arrow = { path = "../arrow/arrow", features = ["prettyprint"] }
+arrow-buffer = { path = "../arrow/arrow-buffer"}
 
 crossbeam-deque = "0.8.6"
 parquetd = { path = "../parquetd" }
@@ -16,6 +17,7 @@ core_affinity = "0.8.3"
 thiserror = { workspace = true }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+memchr = "2.7"
 
 tikv-jemallocator = "0.6.0"
 

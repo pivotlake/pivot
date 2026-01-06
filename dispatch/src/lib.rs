@@ -7,6 +7,7 @@ use tikv_jemallocator::Jemalloc;
 use tracing::info;
 
 mod env;
+mod functions;
 mod identified;
 mod input;
 mod io;
@@ -17,6 +18,7 @@ mod record_batch_metadata;
 mod table;
 mod worker;
 
+pub use functions::Contains;
 pub use memory_source::{MemoryInput, MemoryOutput};
 pub use operations::{
     ConsumeContext, Count, Filter, Materializer, Operation, OrderBy, OrderByLimit, Output,
@@ -117,9 +119,11 @@ mod tests {
     use crate::operations::{Count, Filter, Operation};
     use crate::pipeline::Pipeline;
     use crate::table::{Table, TableInput, TableSource};
-    use crate::{Dispatcher, Materializer, OrderBy, OrderByLimit, Output, PipelineBreaker};
-    use arrow::compute::{concat, like};
-    use arrow_array::{Array, Int64Array, RecordBatch, Scalar, StringViewArray, UInt64Array};
+    use crate::{
+        Contains, Dispatcher, Materializer, OrderBy, OrderByLimit, Output, PipelineBreaker,
+    };
+    use arrow::compute::concat;
+    use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray, UInt64Array};
     use parquetd::Projection;
     use rstest::rstest;
     use std::path::PathBuf;
@@ -215,6 +219,7 @@ mod tests {
         let mut output = Box::new(output);
 
         dispatcher.push_pipeline(|| {
+            let mut contains = Contains::new("google");
             Pipeline::new(
                 1,
                 vec![Identified::new(
@@ -232,8 +237,7 @@ mod tests {
                             .as_any()
                             .downcast_ref::<StringViewArray>()
                             .unwrap();
-                        let pat = Scalar::new(StringViewArray::from(vec![Some("%google%")]));
-                        like(&col, &pat).unwrap()
+                        contains.run(col)
                     })) as Box<dyn Operation>,
                 )],
                 vec![Identified::new(
@@ -277,6 +281,7 @@ mod tests {
 
         let mut rx_opt = Some(rx);
         dispatcher.push_pipeline(|| {
+            let mut contains = Contains::new("google");
             Pipeline::new(
                 0,
                 vec![Identified::new(
@@ -294,8 +299,7 @@ mod tests {
                             .as_any()
                             .downcast_ref::<StringViewArray>()
                             .unwrap();
-                        let pat = Scalar::new(StringViewArray::from(vec![Some("%google%")]));
-                        like(&col, &pat).unwrap()
+                        contains.run(col)
                     })) as Box<dyn Operation>,
                 )],
                 vec![Identified::new(
