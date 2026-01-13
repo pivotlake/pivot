@@ -27,6 +27,12 @@ pub use operations::{
 pub use table::{RowGroupMetadataHandle, Table, TableInput, TableSource};
 use worker::PipelineHandle;
 
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8] = b"percpu_arena:percpu,oversize_threshold:0,\
+muzzy_decay_ms:5000,dirty_decay_ms:10000,\
+lg_extent_max_active_fit:8,background_thread:true\0";
+
+
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
