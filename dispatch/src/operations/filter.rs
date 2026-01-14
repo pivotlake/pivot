@@ -1,19 +1,18 @@
-use crate::ConsumeContext;
 use crate::io::OperationIOSubmitter;
-use crate::operations::Operation;
+use crate::operations::{ConsumeContext, Operation};
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
 
 pub struct Filter<F>
 where
-    F: FnMut(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
+    F: FnMut(&RecordBatch) -> BooleanArray + Send,
 {
     func: F,
 }
 
 impl<F> Filter<F>
 where
-    F: FnMut(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
+    F: FnMut(&RecordBatch) -> BooleanArray + Send,
 {
     pub fn new(func: F) -> Self {
         Self { func }
@@ -22,7 +21,7 @@ where
 
 impl<F> Operation for Filter<F>
 where
-    F: FnMut(&RecordBatch) -> BooleanArray + Send + Sync + 'static,
+    F: FnMut(&RecordBatch) -> BooleanArray + Send,
 {
     fn consume(
         &mut self,

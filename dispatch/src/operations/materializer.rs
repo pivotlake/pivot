@@ -1,7 +1,7 @@
 use crate::io::OperationIOSubmitter;
+use crate::operations::{ConsumeContext, Operation};
 use crate::record_batch_metadata::{global_row_group, row_index};
 use crate::table::{RowGroupMetadataHandle, Table};
-use crate::{ConsumeContext, Operation};
 use arrow::compute::filter_record_batch;
 use arrow_array::{Array, RecordBatch, UInt32Array};
 use arrow_schema::ArrowError;

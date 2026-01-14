@@ -1,9 +1,10 @@
 use crate::env::get_env_var_with_default;
 use crate::identified::Identifier;
 use crate::io::{IORequest, PipelineIORequest, RowGroupFetch};
+use crate::operations::ConsumeContext;
+use crate::pipeline;
 use crate::pipeline::Pipeline;
 use crate::record_batch_metadata::with_row_group_metadata;
-use crate::{ConsumeContext, pipeline};
 use arrow_schema::ArrowError;
 use core_affinity::CoreId;
 use crossbeam_deque::{Steal, Stealer};
@@ -129,6 +130,7 @@ impl Worker {
                 .buffer_pool(pool)
                 .build()
                 .expect("Cannot create reader");
+
             let worker = Self {
                 id: core.id,
                 parquet_reader: reader,
@@ -342,7 +344,9 @@ impl Worker {
 
                     // Given we're stealing from another worker, this pipeline may have notified that
                     // it was finished - let's notify our brethren that we are now resuming
-                    pipeline_handle.pipeline.maybe_increment_pipeline_workers();
+                    pipeline_handle
+                        .pipeline
+                        .maybe_increment_shared_pipeline_workers();
 
                     pipeline_handle.io_pending += 1;
                     remaining -= 1;
@@ -393,7 +397,7 @@ impl Worker {
                 if p.io_pending == 0 && p.sources_finished() {
                     // We notify our siblings that we're finished (if we didn't), and return whether we were the last sibling to finish (if so, run breakers)
                     debug!("Notifying siblings that pipeline {:?} finished...", p.id());
-                    p.maybe_decrement_pipeline_workers()
+                    p.maybe_decrement_shared_pipeline_workers()
                 } else {
                     false
                 }

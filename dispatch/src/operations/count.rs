@@ -1,13 +1,12 @@
 use crate::io::OperationIOSubmitter;
-use crate::operations::Operation;
-use crate::{ConsumeContext, Output, PipelineBreaker};
+use crate::operations::{ConsumeContext, Operation, Output, PipelineBreaker};
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
 /// You're average, every day `Count` (count(*)). This friendly operation (and pipeline breaker!)
-/// continuously counts incoming rows until `output` time comes, where it synchronizes with it's
+/// continuously counts incoming rows until `finish` time comes, where it synchronizes with its
 /// fellow counts and the lucky leader gets to output.
 pub struct Count {
     internal_count: usize,

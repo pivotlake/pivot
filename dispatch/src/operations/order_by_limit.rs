@@ -16,6 +16,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Clone)]
 pub struct OrderBy {
     column_idx: usize,
     descending: bool,

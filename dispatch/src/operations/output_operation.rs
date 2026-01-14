@@ -1,13 +1,15 @@
 use crate::io::OperationIOSubmitter;
-use crate::{ConsumeContext, Operation, Output, PipelineBreaker};
+use crate::operations::{ConsumeContext, Operation, Output, PipelineBreaker};
 use arrow_array::RecordBatch;
 use tracing::debug;
 
+#[allow(unused)]
 pub struct OutputOperation {
     output: Box<dyn Output>,
 }
 
 impl OutputOperation {
+    #[allow(unused)]
     pub fn new(output: Box<dyn Output>) -> Self {
         Self { output }
     }

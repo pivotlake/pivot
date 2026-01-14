@@ -2,8 +2,8 @@ use crate::identified::{Identified, Identifier};
 use crate::input::Input;
 use crate::io::OperationIOSubmitter;
 use crate::io::PipelineIORequest;
-use crate::operations::Operation;
-use crate::{ConsumeContext, PipelineBreaker, operations};
+use crate::operations;
+use crate::operations::{ConsumeContext, Operation, PipelineBreaker};
 use arrow_array::RecordBatch;
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -77,7 +77,16 @@ impl Pipeline {
         self.inputs.iter().all(|i| i.source_finished())
     }
 
-    pub fn maybe_decrement_pipeline_workers(&mut self) -> bool {
+    /// Maybe decrement the shared Atomic for the number of workers remaining working the pipeline,
+    /// if the given instance of the pipeline has not already done so (i.e., if the worker has not
+    /// previously finished this pipeline). This is used to notify other workers (sibling
+    /// pipelines) that this instance of the pipeline is done. Once the counter reaches 0, nobody
+    /// is working on the pipeline anymore.
+    ///
+    /// Once decremented, `maybe_increment_shared_pipeline_workers` will increment the counter.
+    ///
+    /// # Returns whether there are no more workers left working on this pipeline
+    pub fn maybe_decrement_shared_pipeline_workers(&mut self) -> bool {
         if !self.did_decrement_workers_remaining {
             self.did_decrement_workers_remaining = true;
             self.workers_remaining
@@ -90,7 +99,15 @@ impl Pipeline {
         }
     }
 
-    pub fn maybe_increment_pipeline_workers(&mut self) {
+    /// Maybe increment the shared Atomic for the number of workers remaining working the pipeline,
+    /// if the given instance of the pipeline has previously notified that it finished (i.e., called
+    /// `maybe_decrement_shared_pipeline_workers`). This can happen if a worker steals work from
+    /// a sibling worker, at which point the pipeline would "come back to life".
+    /// Upon the beginning of work on a pipeline, this
+    /// function would do nothing.
+    ///
+    /// Once incremented, `maybe_decrement_shared_pipeline_workers` will decrement the counter.
+    pub fn maybe_increment_shared_pipeline_workers(&mut self) {
         if self.did_decrement_workers_remaining {
             self.did_decrement_workers_remaining = false;
             self.workers_remaining

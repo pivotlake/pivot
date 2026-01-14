@@ -1,6 +1,7 @@
-use crate::Output;
+use crate::operations::Output;
 use arrow_array::RecordBatch;
 
+#[allow(unused)]
 pub struct StdOutOutput {}
 
 impl Default for StdOutOutput {
@@ -10,6 +11,7 @@ impl Default for StdOutOutput {
 }
 
 impl StdOutOutput {
+    #[allow(unused)]
     pub fn new() -> Self {
         Self {}
     }

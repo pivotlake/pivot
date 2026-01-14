@@ -3,6 +3,7 @@ mod filter;
 mod materializer;
 mod order_by_limit;
 mod output_operation;
+mod project;
 mod stdout;
 
 use crate::io::OperationIOSubmitter;
@@ -12,9 +13,8 @@ pub use count::Count;
 pub use filter::Filter;
 pub use materializer::Materializer;
 pub use order_by_limit::{OrderBy, OrderByLimit};
-pub use output_operation::OutputOperation;
+pub use project::Project;
 use std::any::Any;
-pub use stdout::StdOutOutput;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 memchr = "2.7"
 
 tikv-jemallocator = "0.6.0"
+tikv-jemalloc-ctl = { version = "0.6.0", features = ["stats", "use_std"] }
+memmap2 = "0.9"
 
 [dev-dependencies]
 rstest = "0.26.1"
