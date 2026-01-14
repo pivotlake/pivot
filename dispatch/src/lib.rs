@@ -1,7 +1,7 @@
 use crate::pipeline::Pipeline;
 use crate::worker::Worker;
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, OnceLock};
 use std::thread::JoinHandle;
 use tikv_jemallocator::Jemalloc;
 use tracing::info;
@@ -36,6 +36,18 @@ lg_extent_max_active_fit:8,background_thread:true\0";
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
+pub static DISPATCHER: OnceLock<Dispatcher> = OnceLock::new();
+
+pub fn dispatcher() -> &'static Dispatcher {
+    DISPATCHER
+        .get()
+        .expect("Dispatcher has not been initialized")
+}
+
+pub fn init() {
+    DISPATCHER.get_or_init(Dispatcher::new);
+}
+
 /// The architecture is based on the paper: https://db.in.tum.de/~leis/papers/morsels.pdf
 /// Where the basic idea is to have a thread per core running a worker which continuously requests
 /// work from a global dispatcher.
@@ -63,10 +75,17 @@ static GLOBAL: Jemalloc = Jemalloc;
 ///  "run" actively, but is instead called by its workers to prevent unneeded context switches.
 pub struct Dispatcher {
     pipeline_senders: Vec<Sender<PipelineHandle>>,
+    handles: Vec<JoinHandle<()>>,
 }
 
+impl Default for Dispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+    }
+
 impl Dispatcher {
-    pub fn new() -> (Arc<Self>, Vec<JoinHandle<()>>) {
+    pub fn new() -> Self {
         let cores = core_affinity::get_core_ids().unwrap();
         let worker_count: usize = std::env::var("WORKER_COUNT")
             .unwrap_or(cores.len().to_string())
@@ -89,12 +108,14 @@ impl Dispatcher {
         barrier.wait();
         info!("All workers have begun...");
 
-        (
-            Arc::new(Dispatcher {
+        Dispatcher {
                 pipeline_senders: senders,
-            }),
-            threads,
-        )
+            handles: threads,
+        }
+    }
+
+    pub fn workers(&self) -> usize {
+        self.handles.len()
     }
 
     /// Enter a new pipeline for all the workers to execute.
