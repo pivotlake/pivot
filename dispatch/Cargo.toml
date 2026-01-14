@@ -9,10 +9,10 @@ arrow-array = { path = "../arrow/arrow-array" }
 arrow-schema = { path = "../arrow/arrow-schema" }
 arrow = { path = "../arrow/arrow", features = ["prettyprint"] }
 arrow-buffer = { path = "../arrow/arrow-buffer"}
-parquet = "57.1.0"
+parquet = { path = "../arrow/parquet" }
 
 crossbeam-deque = "0.8.6"
-parquetd = { path = "../parquetd" }
+#parquetd = { path = "../parquetd" }
 core_affinity = "0.8.3"
 thiserror = { workspace = true }
 tracing = "0.1.41"
@@ -22,6 +22,18 @@ ahash = "0.8.12"
 
 tikv-jemallocator = "0.6.0"
 tikv-jemalloc-ctl = { version = "0.6.0", features = ["stats", "use_std"] }
+
+moka = { version = "0.12.13", features = ["sync"] }
+
+bytes = "1.11.0"
+libc = "0.2.178"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+sysinfo = "0.38.0"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs", "uio"] }
 
 [dev-dependencies]
 rstest = "0.26.1"

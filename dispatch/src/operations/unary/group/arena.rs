@@ -1,4 +1,4 @@
-use crate::operations::group::arena_key::ArenaKey;
+use crate::operations::unary::group::ArenaKey;
 use std::mem::MaybeUninit;
 use std::ptr;
 

@@ -1,4 +1,4 @@
-use crate::operations::Value;
+use crate::operations::unary::group::Value;
 
 /// A simple counting aggregation, that can be inline in a `HashTable` and holds the current count
 /// for a key

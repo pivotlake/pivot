@@ -1,4 +1,4 @@
-use crate::operations::group::allocation::Allocation;
+use crate::operations::unary::group::allocation::Allocation;
 use std::alloc::{Layout, alloc_zeroed};
 use std::marker::PhantomData;
 use std::mem;

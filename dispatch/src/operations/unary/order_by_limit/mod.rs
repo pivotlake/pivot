@@ -1,12 +1,17 @@
-use crate::io::OperationIOSubmitter;
-use crate::operations::{ConsumeContext, Operation, Output, PipelineBreaker};
+use crate::operations::channels::Sender;
+use crate::operations::unary;
+use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SortOptions};
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
+use std::mem;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use thiserror::Error;
-use tracing::{debug, trace};
+use tracing::debug;
+
+mod factory;
+pub use factory::OrderByLimitFactory;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -31,15 +36,6 @@ impl OrderBy {
             nulls_first,
         }
     }
-}
-
-pub struct OrderByLimit {
-    limit: usize,
-    top_k_per_batch: Vec<RecordBatch>,
-    output_source: Box<dyn Output>,
-    order_by: Vec<OrderBy>,
-    sender: Sender<RecordBatch>,
-    receiver: Option<Receiver<RecordBatch>>,
 }
 
 fn get_top_k_from_top_ks(
@@ -86,42 +82,46 @@ fn get_top_k_from_single(
     Ok(unsafe { RecordBatch::new_unchecked(batch.schema(), columns, indices.len()) })
 }
 
+pub struct OrderByLimit {
+    limit: usize,
+    top_k_per_batch: Vec<RecordBatch>,
+    order_by: Vec<OrderBy>,
+    sender: mpsc::Sender<RecordBatch>,
+    receiver: Option<Receiver<RecordBatch>>,
+}
+
 impl OrderByLimit {
     pub fn new(
-        limit: usize,
-        output_source: Box<dyn Output>,
-        sender: Sender<RecordBatch>,
-        receiver: Option<Receiver<RecordBatch>>,
         order_by: Vec<OrderBy>,
+        limit: usize,
+        sender: mpsc::Sender<RecordBatch>,
+        receiver: Option<Receiver<RecordBatch>>,
     ) -> Self {
         Self {
             limit,
             top_k_per_batch: vec![],
-            output_source,
+            order_by,
             sender,
             receiver,
-            order_by,
         }
     }
 }
 
-impl Operation for OrderByLimit {
-    fn consume(
+impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
+    type Outputter = OrderByLimitOutputter;
+
+    fn consume<S: Sender<RecordBatch>>(
         &mut self,
-        _: &ConsumeContext,
-        _: OperationIOSubmitter,
-        batch: &RecordBatch,
-    ) -> super::Result<Option<RecordBatch>> {
+        batch: RecordBatch,
+        _sender: &mut S,
+    ) -> unary::Result<()> {
         debug!("Received batch of length {:?}", batch.num_rows());
         self.top_k_per_batch
-            .push(get_top_k_from_single(batch, &self.order_by, self.limit)?);
-        Ok(None)
+            .push(get_top_k_from_single(&batch, &self.order_by, self.limit)?);
+        Ok(())
     }
-}
 
-impl PipelineBreaker for OrderByLimit {
-    fn finish(mut self: Box<Self>) -> super::Result<()> {
-        let start = Instant::now();
+    fn into_outputter(self) -> crate::operations::unary::Result<Option<Self::Outputter>> {
         if !self.top_k_per_batch.is_empty() {
             let local_top_k =
                 get_top_k_from_top_ks(self.top_k_per_batch, &self.order_by, self.limit)?;
@@ -129,28 +129,44 @@ impl PipelineBreaker for OrderByLimit {
             let _ = self.sender.send(local_top_k);
         }
 
-        if let Some(rx) = self.receiver {
-            drop(self.sender);
+        Ok(self.receiver.map(|rx| OrderByLimitOutputter {
+            rx,
+            batches: vec![],
+            order_by: self.order_by,
+            limit: self.limit,
+        }))
+    }
+}
 
-            trace!("Receiving...");
-            // TODO: we should somehow return here, as we're blocking the entire worker
-            let global_top_k: Vec<RecordBatch> = rx.into_iter().collect();
+pub struct OrderByLimitOutputter {
+    rx: Receiver<RecordBatch>,
+    batches: Vec<RecordBatch>,
+    order_by: Vec<OrderBy>,
+    limit: usize,
+}
 
-            if !global_top_k.is_empty() {
-                let final_batch =
-                    arrow::compute::concat_batches(&global_top_k[0].schema(), &global_top_k)
-                        .map_err(Error::from)?;
-                debug!("Outputting to source {:?}", final_batch.num_rows());
-                self.output_source.write(get_top_k_from_top_ks(
-                    global_top_k,
-                    &self.order_by,
-                    self.limit,
-                )?);
+impl Outputter<RecordBatch> for OrderByLimitOutputter {
+    fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+        match self.rx.try_recv() {
+            Ok(c) => {
+                self.batches.push(c);
+                Ok(false)
             }
-
-            debug!("Sort took {:?}", start.elapsed());
+            Err(TryRecvError::Empty) => Ok(false),
+            Err(TryRecvError::Disconnected) => {
+                if !self.batches.is_empty() {
+                    let final_batch =
+                        arrow::compute::concat_batches(&self.batches[0].schema(), &self.batches)
+                            .map_err(Error::from)?;
+                    debug!("Outputting to source {:?}", final_batch.num_rows());
+                    sender.send(get_top_k_from_top_ks(
+                        mem::take(&mut self.batches),
+                        &self.order_by,
+                        self.limit,
+                    )?)?;
+                }
+                Ok(true)
+            }
         }
-        self.output_source.finish();
-        Ok(())
     }
 }

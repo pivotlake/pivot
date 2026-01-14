@@ -1,5 +1,5 @@
-use crate::operations::group::arena::ByteArena;
-use crate::operations::group::hashtable::{LiveKey, PersistedKey};
+use crate::operations::unary::group::arena::ByteArena;
+use crate::operations::unary::group::hashtable::{LiveKey, PersistedKey};
 use std::hash::{Hash, Hasher};
 use std::{ptr, slice};
 

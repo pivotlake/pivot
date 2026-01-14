@@ -4,23 +4,35 @@ mod arena;
 mod arena_key;
 mod hashtable;
 
-use crate::io::OperationIOSubmitter;
-use crate::operations::group::arena::ByteArena;
-pub use crate::operations::group::arena_key::{ArenaKey, StringKey};
-pub use crate::operations::group::hashtable::{Entry, HashTable as BaseHashTable, Value};
-use crate::operations::{ConsumeContext, Operation, Output, PipelineBreaker};
+use crate::operations::channels::Sender;
+use crate::operations::unary;
+use crate::operations::unary::factory::UnaryFactory;
+use crate::operations::unary::group::arena::ByteArena;
+pub use crate::operations::unary::group::arena_key::{ArenaKey, StringKey};
+pub use crate::operations::unary::group::hashtable::{Entry, HashTable as BaseHashTable, Value};
+use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use aggregations::Count;
 use ahash::RandomState;
 use arrow_array::builder::{StringBuilder, UInt64Builder};
 use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use crossbeam_deque::{Injector, Steal};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, mpsc};
+use thiserror::Error;
 use tracing::debug;
 
 type HashTable<K, V> = BaseHashTable<K, V, Vec<Entry<K, V>>>;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("{0}")]
+    Arrow(#[from] ArrowError),
+    #[error("{0}")]
+    Channel(#[from] crate::operations::channels::Error),
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 fn map_to_record_batch(map: &HashTable<ArenaKey, Count>) -> Result<RecordBatch, ArrowError> {
     let mut key_b = StringBuilder::with_capacity(map.len(), 4096);
@@ -47,42 +59,87 @@ const DEFAULT_CAPACITY: usize = 128;
 
 type GroupState = (ByteArena, Vec<HashTable<ArenaKey, Count>>);
 
+pub struct GroupFactory {
+    group_column: usize,
+    hash_state: RandomState,
+    injector: Arc<Injector<PartitionJob>>,
+    partition_jobs_injected: Arc<AtomicBool>,
+
+    sender: mpsc::Sender<GroupState>,
+    receiver: Option<mpsc::Receiver<GroupState>>,
+}
+
+impl GroupFactory {
+    pub fn create_for_workers(
+        group_column: usize,
+        worker_count: usize,
+    ) -> impl IntoIterator<Item = GroupFactory> {
+        let hash_state = RandomState::new();
+        let injector = Arc::new(Injector::new());
+        let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<GroupState>();
+        let mut rx_opt = Some(rx);
+
+        (0..worker_count).map(move |_| GroupFactory {
+            group_column,
+            hash_state: hash_state.clone(),
+            injector: injector.clone(),
+            partition_jobs_injected: partition_jobs_injected.clone(),
+            sender: tx.clone(),
+            receiver: rx_opt.take(),
+        })
+    }
+}
+
+impl UnaryFactory<RecordBatch, RecordBatch> for GroupFactory {
+    type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group>;
+
+    fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, Group> {
+        PipelineBreaker::Consuming(Group::new(
+            self.hash_state,
+            self.injector,
+            self.group_column,
+            self.sender,
+            self.receiver.take(),
+            self.partition_jobs_injected,
+        ))
+    }
+}
+
 pub struct Group {
     arena: ByteArena,
     group_column: usize,
-    output: Box<dyn Output>,
 
     maps: Vec<HashTable<ArenaKey, Count>>,
     hash_state: RandomState,
-    injector: Arc<Injector<PartitionJob>>,
-    sender: Sender<GroupState>,
-    receiver: Option<Receiver<GroupState>>,
-    partition_jobs_injected: Arc<AtomicBool>,
+
+    sender: mpsc::Sender<GroupState>,
+    outputter: GroupOutputter,
 }
 
 impl Group {
     pub fn new(
         state: RandomState,
         injector: Arc<Injector<PartitionJob>>,
-        output: Box<dyn Output>,
         group_column: usize,
-        sender: Sender<GroupState>,
-        receiver: Option<Receiver<GroupState>>,
+        sender: mpsc::Sender<GroupState>,
+        receiver: Option<mpsc::Receiver<GroupState>>,
         partition_jobs_injected: Arc<AtomicBool>,
     ) -> Self {
         assert_eq!(size_of::<Entry<ArenaKey, Count>>(), 32);
         Self {
             arena: ByteArena::new(),
             group_column,
-            sender,
-            receiver,
-            output,
+            outputter: GroupOutputter {
+                injector,
+                receiver,
+                partition_jobs_injected,
+            },
             hash_state: state,
             maps: (0..PARTITIONS)
                 .map(|_| HashTable::new(DEFAULT_CAPACITY))
                 .collect(),
-            injector,
-            partition_jobs_injected,
+            sender,
         }
     }
 
@@ -98,13 +155,14 @@ impl Group {
     }
 }
 
-impl Operation for Group {
-    fn consume(
+impl Consumer<RecordBatch, RecordBatch> for Group {
+    type Outputter = GroupOutputter;
+
+    fn consume<S: Sender<RecordBatch>>(
         &mut self,
-        _: &ConsumeContext,
-        _: OperationIOSubmitter,
-        batch: &RecordBatch,
-    ) -> crate::operations::Result<Option<RecordBatch>> {
+        batch: RecordBatch,
+        _sender: &mut S,
+    ) -> crate::operations::unary::Result<()> {
         let col = batch
             .column(self.group_column)
             .as_any()
@@ -120,6 +178,9 @@ impl Operation for Group {
             let hash = hashes[i];
             const USIZE_BITS: usize = 64;
 
+            // We want to take the top bits instead of the bottom bits so we don't have bit overlap
+            // within the HashTable itself (i.e., using same bits to decide the map and to place the
+            // item within the table) as we'll have many collisions
             let idx =
                 (hash as usize >> (USIZE_BITS - PARTITIONS.ilog2() as usize)) & (PARTITIONS - 1);
             let map = &mut self.maps[idx];
@@ -129,8 +190,19 @@ impl Operation for Group {
             i += 1;
         }
 
-        Ok(None)
+        Ok(())
     }
+
+    fn into_outputter(self) -> crate::operations::unary::Result<Option<Self::Outputter>> {
+        self.sender.send((self.arena, self.maps)).unwrap();
+        Ok(Some(self.outputter))
+    }
+}
+
+pub struct GroupOutputter {
+    injector: Arc<Injector<PartitionJob>>,
+    receiver: Option<mpsc::Receiver<GroupState>>,
+    partition_jobs_injected: Arc<AtomicBool>,
 }
 
 pub struct PartitionJob {
@@ -143,7 +215,7 @@ pub struct PartitionJob {
 }
 
 impl PartitionJob {
-    pub fn run(mut self, output: &mut Box<dyn Output>) -> crate::operations::Result<()> {
+    pub fn run<S: Sender<RecordBatch>>(mut self, sender: &mut S) -> Result<()> {
         let (idx, _) = self
             .maps
             .iter()
@@ -158,17 +230,17 @@ impl PartitionJob {
             }
         }
 
-        output.write(map_to_record_batch(&result_map)?);
+        sender.send(map_to_record_batch(&result_map)?)?;
         Ok(())
     }
 }
 
-impl PipelineBreaker for Group {
-    fn finish(mut self: Box<Self>) -> crate::operations::Result<()> {
-        self.sender.send((self.arena, self.maps)).unwrap();
-        drop(self.sender);
-
-        if let Some(rx) = self.receiver {
+impl Outputter<RecordBatch> for GroupOutputter {
+    fn output<S: Sender<RecordBatch>>(
+        &mut self,
+        sender: &mut S,
+    ) -> crate::operations::unary::Result<bool> {
+        if let Some(rx) = self.receiver.take() {
             // We are the leader - we must populate the injector so everyone can begin working...
             let (arenas, mut partitions): (Vec<_>, Vec<_>) = rx.into_iter().unzip();
             // It's critical we don't drop the arenas until everyone finished working (if an arena
@@ -192,23 +264,20 @@ impl PipelineBreaker for Group {
             self.partition_jobs_injected.store(true, Ordering::Relaxed);
         }
 
-        loop {
-            let steal = self.injector.steal();
-            match steal {
-                Steal::Success(job) => {
-                    job.run(&mut self.output)?;
-                }
-                Steal::Empty => {
-                    if self.partition_jobs_injected.load(Ordering::Relaxed) {
-                        // Guaranteed to be no more work to do
-                        break;
-                    }
-                }
-                Steal::Retry => continue,
+        let steal = self.injector.steal();
+        match steal {
+            Steal::Success(job) => {
+                job.run(sender).map_err(unary::Error::from)?;
             }
+            Steal::Empty => {
+                if self.partition_jobs_injected.load(Ordering::Relaxed) {
+                    // Guaranteed to be no more work to do
+                    return Ok(true);
+                }
+            }
+            Steal::Retry => {}
         }
 
-        self.output.finish();
-        Ok(())
+        Ok(false)
     }
 }
