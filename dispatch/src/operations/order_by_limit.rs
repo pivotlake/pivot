@@ -1,5 +1,5 @@
 use crate::io::OperationIOSubmitter;
-use crate::{ConsumeContext, Operation, Output, PipelineBreaker};
+use crate::operations::{ConsumeContext, Operation, Output, PipelineBreaker};
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SortOptions};
@@ -34,14 +34,14 @@ impl OrderBy {
 
 pub struct OrderByLimit {
     limit: usize,
-    batches: Vec<RecordBatch>,
+    top_k_per_batch: Vec<RecordBatch>,
     output_source: Box<dyn Output>,
     order_by: Vec<OrderBy>,
     sender: Sender<RecordBatch>,
     receiver: Option<Receiver<RecordBatch>>,
 }
 
-fn get_top_k_from_batches(
+fn get_top_k_from_top_ks(
     batches: Vec<RecordBatch>,
     order_by: &[OrderBy],
     k: usize,
@@ -51,14 +51,7 @@ fn get_top_k_from_batches(
     }
 
     let schema = batches[0].schema();
-    let mut winners = Vec::with_capacity(batches.len());
-
-    for batch in batches {
-        let local_top = get_top_k_from_single(&batch, order_by, k)?;
-        winners.push(local_top);
-    }
-
-    let final_pool = arrow::compute::concat_batches(&schema, &winners)?;
+    let final_pool = arrow::compute::concat_batches(&schema, &batches)?;
     get_top_k_from_single(&final_pool, order_by, k)
 }
 
@@ -102,7 +95,7 @@ impl OrderByLimit {
     ) -> Self {
         Self {
             limit,
-            batches: vec![],
+            top_k_per_batch: vec![],
             output_source,
             sender,
             receiver,
@@ -118,7 +111,9 @@ impl Operation for OrderByLimit {
         _: OperationIOSubmitter,
         batch: &RecordBatch,
     ) -> super::Result<Option<RecordBatch>> {
-        self.batches.push(batch.clone());
+        debug!("Received batch of length {:?}", batch.num_rows());
+        self.top_k_per_batch
+            .push(get_top_k_from_single(&batch, &self.order_by, self.limit)?);
         Ok(None)
     }
 }
@@ -126,10 +121,10 @@ impl Operation for OrderByLimit {
 impl PipelineBreaker for OrderByLimit {
     fn finish(mut self: Box<Self>) -> super::Result<()> {
         let start = Instant::now();
-        if !self.batches.is_empty() {
-            let local_top_k = get_top_k_from_batches(self.batches, &self.order_by, self.limit)?;
+        if !self.top_k_per_batch.is_empty() {
+            let local_top_k =
+                get_top_k_from_top_ks(self.top_k_per_batch, &self.order_by, self.limit)?;
             debug!("Sending on {:?}", local_top_k.num_rows());
-
             let _ = self.sender.send(local_top_k);
         }
 
@@ -145,8 +140,8 @@ impl PipelineBreaker for OrderByLimit {
                     arrow::compute::concat_batches(&global_top_k[0].schema(), &global_top_k)
                         .map_err(Error::from)?;
                 debug!("Outputting to source {:?}", final_batch.num_rows());
-                self.output_source.write(get_top_k_from_single(
-                    &final_batch,
+                self.output_source.write(get_top_k_from_top_ks(
+                    global_top_k,
                     &self.order_by,
                     self.limit,
                 )?);
