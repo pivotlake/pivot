@@ -6,8 +6,9 @@
 //!
 //! # Examples
 //!
-//! ## Count with filter (SELECT URL FROM hits WHERE URL LIKE '%google%)
+//! ## Count with filter
 //! ```ignore
+//! // SELECT URL FROM hits WHERE URL LIKE '%google%
 //! let feed = MemoryFeed::new();
 //!
 //! PipelineSpec::new()
@@ -37,7 +38,7 @@
 //!     .execute();
 //! ```
 //!
-//! ## Group by with count (Query 33)
+//! ## Group by with count
 //! ```ignore
 //! let feed = MemoryFeed::new();
 //!
