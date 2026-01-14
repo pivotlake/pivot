@@ -1,8 +1,10 @@
-use crate::operations::{Count, OrderByLimit, PipelineBreaker};
+use crate::operations::{Count, Group, OrderByLimit, PipelineBreaker};
 use crate::{OrderBy, OutputSpec, dispatcher};
+use ahash::RandomState;
+use crossbeam_deque::Injector;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Barrier};
 
@@ -59,7 +61,23 @@ impl PipelineBreakerSpec {
                 group_by_column,
                 output,
             } => {
-                todo!()
+                let partitions_injected = Arc::new(AtomicBool::new(false));
+                let hash_state = RandomState::new();
+                let partition_injector: Arc<Injector<_>> = Default::default();
+                let (tx, rx) = channel();
+                let rx_opt = Rc::new(RefCell::new(Some(rx)));
+
+                Box::new(move || {
+                    Box::new(Group::new(
+                        hash_state.clone(),
+                        partition_injector.clone(),
+                        output.build_output(),
+                        *group_by_column,
+                        tx.clone(),
+                        rx_opt.take(),
+                        partitions_injected.clone(),
+                    ))
+                })
             }
         }
     }

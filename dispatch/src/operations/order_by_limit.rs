@@ -114,7 +114,7 @@ impl Operation for OrderByLimit {
     ) -> super::Result<Option<RecordBatch>> {
         debug!("Received batch of length {:?}", batch.num_rows());
         self.top_k_per_batch
-            .push(get_top_k_from_single(&batch, &self.order_by, self.limit)?);
+            .push(get_top_k_from_single(batch, &self.order_by, self.limit)?);
         Ok(None)
     }
 }

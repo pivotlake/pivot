@@ -1,5 +1,6 @@
 mod count;
 mod filter;
+mod group;
 mod materializer;
 mod order_by_limit;
 mod output_operation;
@@ -11,6 +12,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 pub use count::Count;
 pub use filter::Filter;
+pub use group::*;
 pub use materializer::Materializer;
 pub use order_by_limit::{OrderBy, OrderByLimit};
 pub use project::Project;

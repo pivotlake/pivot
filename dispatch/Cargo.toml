@@ -9,19 +9,19 @@ arrow-array = { path = "../arrow/arrow-array" }
 arrow-schema = { path = "../arrow/arrow-schema" }
 arrow = { path = "../arrow/arrow", features = ["prettyprint"] }
 arrow-buffer = { path = "../arrow/arrow-buffer"}
+parquet = "57.1.0"
 
 crossbeam-deque = "0.8.6"
 parquetd = { path = "../parquetd" }
-parquet = "57.1.0"
 core_affinity = "0.8.3"
 thiserror = { workspace = true }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 memchr = "2.7"
+ahash = "0.8.12"
 
 tikv-jemallocator = "0.6.0"
 tikv-jemalloc-ctl = { version = "0.6.0", features = ["stats", "use_std"] }
-memmap2 = "0.9"
 
 [dev-dependencies]
 rstest = "0.26.1"
