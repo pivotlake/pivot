@@ -232,7 +232,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(false)
     }
 
-    fn try_steal_cpu_work(&mut self) -> super::Result<WorkStatus> {
+    fn try_steal_work(&mut self) -> super::Result<WorkStatus> {
         if !self.unary.ready_for_more_work() {
             return Ok(WorkStatus::Pending);
         }

@@ -39,7 +39,7 @@
 //!    and all sibling operators (across workers) have also drained. The operator does
 //!    any final work (e.g. emit aggregation results) and returns `true` when fully done.
 //!
-//! 4. [`try_steal_cpu_work`](Operator::try_steal_cpu_work) — called when the worker is
+//! 4. [`try_steal_work`](Operator::try_steal_work) — called when the worker is
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
@@ -91,12 +91,7 @@ pub trait Operator {
     fn try_finish(&mut self) -> Result<bool>;
 
     /// Try to steal work from a peer worker's channel. Default: no stealing.
-    fn try_steal_cpu_work(&mut self) -> Result<WorkStatus> {
+    fn try_steal_work(&mut self) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
-    }
-
-    /// Try to steal an IO request from a peer. Default: no stealing.
-    fn try_steal_io_request(&mut self) -> Result<Option<Vec<IORequest>>> {
-        Ok(None)
     }
 }

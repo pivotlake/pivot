@@ -8,10 +8,10 @@
 //! - [`run_ready_cpu_work`](DataFlow::run_ready_cpu_work) — traverse leaf-to-root,
 //!   running the first operator that has work ready. Leaf-to-root (downstream first)
 //!   keeps data hot in cache — we process what was just produced before moving upstream.
-//! - [`try_stealing_cpu_work`](DataFlow::try_stealing_cpu_work) — traverse root-to-leaf,
+//! - [`try_stealing_work`](DataFlow::try_stealing_work) — traverse root-to-leaf,
 //!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
-//!   means the stealing worker picks up data early in the dataflow, giving the original
-//!   worker's downstream cache lines time to cool before being touched.
+//!   means the stealing worker picks up data early in the dataflow, to not interrupt current
+//!   hot-in-cache processing
 //! - [`get_next_io_request`](DataFlow::get_next_io_request) — collect pending IO
 //!   requests from operators (e.g. parquet page reads).
 //! - [`process_io`](DataFlow::process_io) — deliver a completed IO buffer to the
@@ -147,7 +147,7 @@ impl OperatorGraph {
 ///
 /// Operators are connected by channels and arranged in an [`OperatorGraph`].
 /// The worker drives execution by repeatedly calling [`run_ready_cpu_work`](Self::run_ready_cpu_work),
-/// [`try_stealing_cpu_work`](Self::try_stealing_cpu_work), and IO methods.
+/// [`try_stealing_work`](Self::try_stealing_work), and IO methods.
 pub struct DataFlow {
     id: Identifier,
     graph: OperatorGraph,
@@ -217,9 +217,9 @@ impl DataFlow {
 
     /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
     /// so the original worker's downstream data stays hot).
-    pub fn try_stealing_cpu_work(&mut self) -> Result<WorkStatus> {
+    pub fn try_stealing_work(&mut self) -> Result<WorkStatus> {
         self.graph
-            .traverse_forwards(|_id, op| match op.try_steal_cpu_work()? {
+            .traverse_forwards(|_id, op| match op.try_steal_work()? {
                 WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                 WorkStatus::Ran => Ok(ControlFlow::Break(())),
             })

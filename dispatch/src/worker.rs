@@ -170,9 +170,9 @@ impl Worker {
     }
 
     /// Attempt to steal work from sibling workers' channels when this worker is idle.
-    fn try_steal_cpu_work(&mut self) -> Result<()> {
+    fn try_steal_work(&mut self) -> Result<()> {
         for flow in self.data_flows.values_mut() {
-            if let WorkStatus::Ran = flow.try_stealing_cpu_work()? {
+            if let WorkStatus::Ran = flow.try_stealing_work()? {
                 self.did_work_last_iteration = true;
                 return Ok(());
             }
@@ -215,7 +215,7 @@ impl Worker {
                     continue;
                 }
 
-                self.try_steal_cpu_work()?;
+                self.try_steal_work()?;
 
                 if !self.did_work_last_iteration {
                     self.clear_dirty_buffer_or_sleep();
