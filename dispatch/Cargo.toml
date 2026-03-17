@@ -33,7 +33,6 @@ io-uring = "0.7"
 nix = { version = "0.31.2", features = ["fs", "uio"] }
 
 [dev-dependencies]
-rstest = "0.26.1"
 parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
 tempfile = "3"
 
