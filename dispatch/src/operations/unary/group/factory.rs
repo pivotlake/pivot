@@ -1,0 +1,81 @@
+//! Factory for creating per-worker [`Group`] instances.
+//!
+//! [`GroupFactory::create_for_workers`] allocates the shared state once
+//! (arena, hash state, injector, channel) and produces one factory per
+//! worker. Only the first factory receives the channel receiver; the rest
+//! get `None`. Each factory is consumed by [`build_unary`](GroupFactory::build_unary)
+//! to produce the actual [`Group`] operator.
+
+use crate::operations::UnaryFactory;
+use crate::operations::unary::group::arena::SharedArena;
+use crate::operations::unary::group::hashtables::{KeyExtractor, MultiSlabTable};
+use crate::operations::unary::group::{Group, PartitionJob};
+use crate::operations::unary::pipeline_breaker::PipelineBreaker;
+use ahash::RandomState;
+use arrow_array::RecordBatch;
+use crossbeam_deque::Injector;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, mpsc};
+
+/// Creates one [`Group`] operator per worker, with shared state wired up.
+///
+/// All workers share:
+/// - A [`SharedArena`] for string key storage
+/// - A [`RandomState`] so hashes are consistent across workers
+/// - An [`Injector`] for work-stealing during the output phase
+/// - An mpsc channel for collecting per-worker tables after consumption
+///
+/// Only the first worker receives the channel receiver; it will drain
+/// the channel and inject partition jobs during the output phase.
+pub struct GroupFactory<K: KeyExtractor> {
+    shared_arena: Arc<SharedArena>,
+    group_column: usize,
+    hash_state: RandomState,
+    injector: Arc<Injector<PartitionJob<K>>>,
+    partition_jobs_injected: Arc<AtomicBool>,
+
+    sender: mpsc::Sender<Vec<MultiSlabTable<K>>>,
+    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K>>>>,
+}
+
+impl<K: KeyExtractor> GroupFactory<K> {
+    /// Create `worker_count` factories that share the same arena, hash state,
+    /// and synchronization primitives.
+    pub fn create_for_workers(
+        group_column: usize,
+        worker_count: usize,
+    ) -> impl IntoIterator<Item = GroupFactory<K>> {
+        let shared_arena = SharedArena::new();
+        let hash_state = RandomState::new();
+        let injector = Arc::new(Injector::new());
+        let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<_>();
+        let mut rx_opt = Some(rx);
+
+        (0..worker_count).map(move |_| GroupFactory {
+            shared_arena: shared_arena.clone(),
+            group_column,
+            hash_state: hash_state.clone(),
+            injector: injector.clone(),
+            partition_jobs_injected: partition_jobs_injected.clone(),
+            sender: tx.clone(),
+            receiver: rx_opt.take(),
+        })
+    }
+}
+
+impl<K: KeyExtractor> UnaryFactory<RecordBatch, RecordBatch> for GroupFactory<K> {
+    type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K>>;
+
+    fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K>> {
+        PipelineBreaker::Consuming(Group::new(
+            self.shared_arena,
+            self.hash_state,
+            self.injector,
+            self.group_column,
+            self.sender,
+            self.receiver.take(),
+            self.partition_jobs_injected,
+        ))
+    }
+}

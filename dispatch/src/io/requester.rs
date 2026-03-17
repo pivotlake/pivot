@@ -1,9 +1,7 @@
-use crate::identified::Identifier;
-use crate::io::PipelineRequest;
+use crate::Identifier;
+use crate::io::DataFlowRequest;
 use crate::io::backend::IOBackend;
-use crate::io::cache::CACHE;
-use crate::io::disk_buffer::{DIO_ALIGNMENT, DiskBuffer};
-use bytes::Bytes;
+use crate::memory::{BUFFER_SIZE, FILE_CACHE, ReadBuffer, WriteBuffer, get_write_buffer};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -17,89 +15,64 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+const RING_SIZE: u32 = 32;
+
+/// Bridges dataflow operators and the I/O backend, holding state on outstanding requests and
+/// returning responses together with the original requested context.
+///
+/// Held one per worker
 pub struct IORequester {
     backend: IOBackend,
-    pending_io_requests: HashMap<Identifier, (DiskBuffer, PipelineRequest, usize, usize)>,
-    max_io_in_parallel: usize,
+    pending_io_requests: HashMap<Identifier, (WriteBuffer, DataFlowRequest)>,
     next_id: Identifier,
 }
 
 impl IORequester {
-    pub fn new(backend: IOBackend) -> Self {
+    pub fn new() -> Self {
         Self {
-            backend,
+            backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             pending_io_requests: Default::default(),
-            max_io_in_parallel: 1,
             next_id: 0,
         }
     }
 
-    pub fn backend(&self) -> &IOBackend {
-        &self.backend
-    }
-
-    pub fn request(&mut self, request: PipelineRequest) -> Result<()> {
-        let location = &request.request.location;
-
-        // Align offset DOWN to nearest alignment boundary
-        let aligned_offset = location.offset & !(*DIO_ALIGNMENT - 1);
-        // How far into the aligned buffer your actual data starts
-        let offset_within_buffer = location.offset - aligned_offset;
-        // Size needs to cover the padding + actual data, rounded UP to alignment
-        let aligned_size =
-            (offset_within_buffer + location.size + *DIO_ALIGNMENT - 1) & !(*DIO_ALIGNMENT - 1);
-
-        let mut buffer = DiskBuffer::new(aligned_size)?;
+    /// Acquires a dirty write buffer, submits a read to the backend, and
+    /// flushes immediately.
+    pub fn request(&mut self, request: DataFlowRequest) -> Result<()> {
+        let mut buffer = get_write_buffer(false);
 
         self.backend.submit_read(
-            location.raw_fd,
-            aligned_offset as u64,
+            request.request.location.raw_fd,
+            request.request.location.offset as u64,
             &mut buffer,
-            aligned_size,
+            BUFFER_SIZE,
             self.next_id,
         )?;
-        self.pending_io_requests.insert(
-            self.next_id,
-            (buffer, request, offset_within_buffer, aligned_size),
-        );
+        self.pending_io_requests
+            .insert(self.next_id, (buffer, request));
         self.next_id += 1;
         self.backend.submit()?;
 
         Ok(())
     }
 
-    pub fn has_available(&mut self) -> bool {
-        !self.backend.is_submission_full()
-            && self.pending_io_requests.len() < self.max_io_in_parallel
-    }
-
+    /// Returns `true` if any reads have not yet completed.
     pub fn has_pending(&mut self) -> bool {
         !self.pending_io_requests.is_empty()
     }
 
-    pub fn completions(&mut self) -> Result<impl Iterator<Item = (Bytes, PipelineRequest)>> {
+    /// Drains completed reads from the backend, inserts each buffer into the
+    /// file cache, and returns them paired with the originating request.
+    pub fn completions(&mut self) -> Result<impl Iterator<Item = (ReadBuffer, DataFlowRequest)>> {
         let identifiers = self.backend.completions()?;
-        Ok(identifiers.into_iter().map(|(size, i)| {
-            let (buffer, request, offset, aligned_size) =
-                self.pending_io_requests.remove(&i).unwrap();
-
-            // It *should* supported to receive an IO response from the kernel that wasn't the size
-            // we requested, but this is not currently supported - and is a ticking time bomb :)
-            if size != aligned_size {
-                panic!(
-                    "request {:?} does not match returned {:?}",
-                    request.request.location.size + offset,
-                    size
-                );
-            }
-
-            let bytes =
-                Bytes::from_owner(buffer).slice(offset..request.request.location.size + offset);
-            CACHE.insert(request.request.location.clone(), bytes.clone());
-            (bytes, request)
+        Ok(identifiers.into_iter().map(|(_size, i)| {
+            let (buffer, request) = self.pending_io_requests.remove(&i).unwrap();
+            let read_buffer = FILE_CACHE.insert(request.request.location.clone(), buffer);
+            (read_buffer, request)
         }))
     }
 
+    /// Blocks until at least one pending read completes.
     pub fn wait(&mut self) -> Result<()> {
         self.backend.submit_and_wait(1)?;
         Ok(())

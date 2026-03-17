@@ -1,8 +1,28 @@
-use crate::identified::Identifier;
-use crate::io::{IORequest, PipelineRequest};
+//! A DataFlow is a graph of operators that a single worker executes.
+//!
+//! Built from a [`Chain`](crate::api::Chain) during [`DataFlowBuilder::build`](crate::api::DataFlowBuilder::build)
+//! on the worker thread. The operators are arranged in a directed graph (currently
+//! always a linear chain), connected by channels created during the build step.
+//!
+//! The worker drives execution by calling methods on the `DataFlow`:
+//! - [`run_ready_cpu_work`](DataFlow::run_ready_cpu_work) — traverse leaf-to-root,
+//!   running the first operator that has work ready. Leaf-to-root (downstream first)
+//!   keeps data hot in cache — we process what was just produced before moving upstream.
+//! - [`try_stealing_cpu_work`](DataFlow::try_stealing_cpu_work) — traverse root-to-leaf,
+//!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
+//!   means the stealing worker picks up data early in the dataflow, giving the original
+//!   worker's downstream cache lines time to cool before being touched.
+//! - [`get_next_io_request`](DataFlow::get_next_io_request) — collect pending IO
+//!   requests from operators (e.g. parquet page reads).
+//! - [`process_io`](DataFlow::process_io) — deliver a completed IO buffer to the
+//!   operator that requested it.
+//! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
+
+use crate::Identifier;
+use crate::io::{DataFlowRequest, IORequest};
+use crate::memory::ReadBuffer;
 use crate::operations::Operator;
 use ahash::HashMap;
-use bytes::Bytes;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
 use std::result;
@@ -21,12 +41,20 @@ pub enum Error {
 
 pub type Result<T, E = Error> = result::Result<T, E>;
 
+/// Whether an operator did useful work in this step.
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum WorkStatus {
+    /// No work was available or ready.
     Pending,
+    /// The operator consumed or produced data.
     Ran,
 }
 
+/// Directed graph of operators with precomputed roots, leaves, and edges.
+///
+/// Supports two traversal orders:
+/// - **Backwards** (leaf-to-root): for running CPU work and collecting IO requests.
+/// - **Forwards** (root-to-leaf): for stealing and finishing.
 struct OperatorGraph {
     operators: Vec<Box<dyn Operator>>,
 
@@ -68,10 +96,6 @@ impl OperatorGraph {
             edges,
             back_edges,
         }
-    }
-
-    pub fn roots(&self) -> impl Iterator<Item = &Box<dyn Operator>> {
-        self.roots.iter().map(|i| &self.operators[*i])
     }
 
     pub fn traverse_backwards<
@@ -119,9 +143,11 @@ impl OperatorGraph {
     }
 }
 
-/// A `Pipeline` is the main unit of work of a `Worker`. A Pipeline consists of multiple operations
-/// chained together (their connections are described through `publishers_to_subscribers`), and is
-/// meant to be executed by a single worker (and thus a core).
+/// A graph of operators executed by a single worker.
+///
+/// Operators are connected by channels and arranged in an [`OperatorGraph`].
+/// The worker drives execution by repeatedly calling [`run_ready_cpu_work`](Self::run_ready_cpu_work),
+/// [`try_stealing_cpu_work`](Self::try_stealing_cpu_work), and IO methods.
 pub struct DataFlow {
     id: Identifier,
     graph: OperatorGraph,
@@ -129,7 +155,7 @@ pub struct DataFlow {
 
 impl Debug for DataFlow {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut debug_struct = f.debug_struct("Pipeline");
+        let mut debug_struct = f.debug_struct("Dataflow");
         debug_struct.field("id", &self.id).finish()
     }
 }
@@ -149,10 +175,11 @@ impl DataFlow {
         self.id
     }
 
+    /// Try to finish all operators (root-to-leaf). Returns `true` if every operator
+    /// has completed, meaning this dataflow can be removed from the worker.
     pub fn maybe_finish(&mut self) -> Result<bool> {
         self.graph
             .traverse_forwards(|_s, b| {
-                // TODO: maybe we should replace with CompeletedNode so we don't call it every time?
                 Ok(if b.try_finish()? {
                     ControlFlow::Continue(())
                 } else {
@@ -162,17 +189,20 @@ impl DataFlow {
             .map(|c| matches!(c, ControlFlow::Continue(..)))
     }
 
+    /// Deliver a completed IO buffer to the operator that requested it.
     pub fn process_io(
         &mut self,
         node_id: Identifier,
         request: IORequest,
-        buffer: Bytes,
+        buffer: ReadBuffer,
     ) -> Result<()> {
         let op = self.graph.operators.get_mut(node_id).unwrap();
         op.process_disk_response(buffer, request)?;
         Ok(())
     }
 
+    /// Run one unit of CPU work, traversing leaf-to-root (downstream first for cache locality).
+    /// Returns [`WorkStatus::Ran`] if any operator did work.
     pub fn run_ready_cpu_work(&mut self) -> Result<WorkStatus> {
         self.graph
             .traverse_backwards(|_, op| match op.run_cpu_work()? {
@@ -185,6 +215,8 @@ impl DataFlow {
             })
     }
 
+    /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
+    /// so the original worker's downstream data stays hot).
     pub fn try_stealing_cpu_work(&mut self) -> Result<WorkStatus> {
         self.graph
             .traverse_forwards(|_id, op| match op.try_steal_cpu_work()? {
@@ -197,11 +229,19 @@ impl DataFlow {
             })
     }
 
-    pub fn get_next_io_request(&mut self) -> Result<Option<PipelineRequest>> {
+    /// Collect pending IO requests from operators (leaf-to-root).
+    /// Returns the first batch of requests found, or `None` if no operator needs IO.
+    pub fn get_next_io_request(&mut self) -> Result<Option<Vec<DataFlowRequest>>> {
         self.graph
             .traverse_backwards(|id, op| {
-                if let Some(r) = op.next_io_request()? {
-                    Ok(ControlFlow::Break(PipelineRequest::new(self.id, id, r)))
+                let requests = op.next_io_requests()?;
+                if !requests.is_empty() {
+                    Ok(ControlFlow::Break(
+                        requests
+                            .into_iter()
+                            .map(|r| DataFlowRequest::new(self.id, id, r))
+                            .collect(),
+                    ))
                 } else {
                     Ok(ControlFlow::Continue(()))
                 }

@@ -1,0 +1,807 @@
+//! Column decoder for fixed-width primitive types (integers, floats).
+//!
+//! Parquet stores primitives as little-endian bytes with a fixed physical
+//! width. Some Arrow types are narrower than their Parquet physical type
+//! (e.g. `Int16` is stored as 4-byte `INT32`), so [`ReadLeBytes`] abstracts
+//! over the on-disk width vs. the in-memory width.
+//!
+//! The public type alias [`PrimitiveColumnDecoder`] wires everything together
+//! into a ready-to-use [`TypedColumnDecoder`].
+
+use std::marker::PhantomData;
+use std::mem;
+use std::ptr::NonNull;
+use std::sync::Arc;
+
+use arrow_array::types::ArrowPrimitiveType;
+use arrow_array::{ArrayRef, PrimitiveArray};
+use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+
+use crate::memory::{MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator};
+use crate::operations::parquet::decoding::column_decoders::{
+    ArrayBuilder, DecodePlain, Dict, TypedColumnDecoder,
+};
+use bytes::Bytes;
+
+/// Reads a single value from a [`MultiBufferReader`] in little-endian byte
+/// order.
+///
+/// `PHYSICAL_SIZE` is the number of bytes the value occupies on disk (may
+/// differ from `size_of::<Self>()` for narrowed types like `i16`).
+pub trait ReadLeBytes: ArrowNativeType {
+    const PHYSICAL_SIZE: usize;
+    fn read_le(reader: &mut MultiBufferReader) -> Self;
+}
+
+impl ReadLeBytes for i16 {
+    const PHYSICAL_SIZE: usize = 4;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_u32_le() as i16
+    }
+}
+
+impl ReadLeBytes for u16 {
+    const PHYSICAL_SIZE: usize = 4;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_u32_le() as u16
+    }
+}
+
+impl ReadLeBytes for i32 {
+    const PHYSICAL_SIZE: usize = 4;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_i32_le()
+    }
+}
+
+impl ReadLeBytes for i64 {
+    const PHYSICAL_SIZE: usize = 8;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_i64_le()
+    }
+}
+
+impl ReadLeBytes for f32 {
+    const PHYSICAL_SIZE: usize = 4;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        let bytes = reader.read_bytes(Self::PHYSICAL_SIZE);
+        f32::from_le_bytes(bytes.try_into().unwrap())
+    }
+}
+
+impl ReadLeBytes for f64 {
+    const PHYSICAL_SIZE: usize = 8;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        let bytes = reader.read_bytes(Self::PHYSICAL_SIZE);
+        f64::from_le_bytes(bytes.try_into().unwrap())
+    }
+}
+
+/// Reads `count` fixed-width LE primitive values from scattered buffers into a MultiSlabBuffer.
+///
+/// Fast path: when many values fit within the current buffer, copies them
+/// in bulk via memcpy (no per-value overhead).
+/// Slow path: when a value straddles a buffer boundary, falls back to
+/// `MultiBufferReader` for that single value, then resumes the fast path.
+#[inline]
+fn read_primitives<N: ReadLeBytes>(
+    data: &[Bytes],
+    position: &mut ReaderPosition,
+    output: &mut MultiSlabBuffer<N>,
+    output_len: &mut usize,
+    count: usize,
+) {
+    let byte_width = N::PHYSICAL_SIZE;
+    let target = *output_len + count;
+
+    while *output_len < target {
+        let remaining = target - *output_len;
+        let buf = &data[position.buffer_index];
+        let available_bytes = buf.len() - position.offset;
+        let fit = available_bytes / byte_width;
+
+        if fit > 0 && byte_width == mem::size_of::<N>() {
+            // Fast path: bulk-copy all values that fit in the current buffer
+            let to_read = remaining.min(fit);
+            let byte_count = to_read * byte_width;
+            let src = &buf[position.offset..position.offset + byte_count];
+            unsafe {
+                let dst = output.ptr_at_index(*output_len) as *mut u8;
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, byte_count);
+            }
+            *output_len += to_read;
+            position.offset += byte_count;
+        } else if fit > 0 {
+            let to_read = remaining.min(fit);
+            let mut reader = MultiBufferReader::new(data, position);
+            for _ in 0..to_read {
+                output[*output_len] = N::read_le(&mut reader);
+                *output_len += 1;
+            }
+        } else if available_bytes > 0 {
+            // Slow path: value straddles buffer boundary
+            let mut reader = MultiBufferReader::new(data, position);
+            output[*output_len] = N::read_le(&mut reader);
+            *output_len += 1;
+        } else {
+            // Buffer fully consumed, advance to next
+            position.buffer_index += 1;
+            position.offset = 0;
+        }
+    }
+}
+
+/// [`ArrayBuilder`] for fixed-width primitive Arrow types.
+///
+/// Backed by a [`MultiSlabBuffer`] so that the final array can be produced
+/// with zero copies via [`into_array`](ArrayBuilder::into_array).
+pub struct PrimitiveBuilder<T: ArrowPrimitiveType> {
+    values: MultiSlabBuffer<T::Native>,
+    len: usize,
+}
+
+impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
+    type Element = T::Native;
+
+    fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
+        Self {
+            values: allocator.create_multi_slab_buffer(capacity, false),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    fn push(&mut self, element: &T::Native, amount: usize) {
+        let start = self.len;
+        self.len += amount;
+        let dest =
+            unsafe { std::slice::from_raw_parts_mut(self.values.ptr_at_index(start), amount) };
+        dest.fill(*element);
+    }
+
+    #[inline]
+    fn spare_mut(&mut self, count: usize) -> &mut [T::Native] {
+        let start = self.len;
+        self.len += count;
+        unsafe { std::slice::from_raw_parts_mut(self.values.ptr_at_index(start), count) }
+    }
+
+    fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef {
+        let len = self.len;
+        let byte_len = len * size_of::<T::Native>();
+        let slab = self.values.into_single_slab();
+        let ptr = NonNull::new(slab.ptr).unwrap();
+        let buffer = unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) };
+        let values = ScalarBuffer::new(buffer, 0, len);
+        let nulls = null_buffer
+            .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
+            .filter(|n| n.null_count() != 0);
+        Arc::new(PrimitiveArray::<T>::new(values, nulls))
+    }
+}
+
+/// [`DecodePlain`] implementation for fixed-width primitives.
+///
+/// Delegates to [`read_primitives`] for bulk decoding with its fast-path /
+/// slow-path strategy.
+pub struct PrimitivePlainDecoder<T: ArrowPrimitiveType>
+where
+    T::Native: ReadLeBytes,
+{
+    data: Vec<Bytes>,
+    position: ReaderPosition,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: ArrowPrimitiveType> DecodePlain for PrimitivePlainDecoder<T>
+where
+    T::Native: ReadLeBytes,
+{
+    type Builder = PrimitiveBuilder<T>;
+
+    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
+        Self {
+            data,
+            position,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn read(&mut self, builder: &mut PrimitiveBuilder<T>, size: usize) {
+        read_primitives::<T::Native>(
+            &self.data,
+            &mut self.position,
+            &mut builder.values,
+            &mut builder.len,
+            size,
+        );
+    }
+
+    fn skip(&mut self, size: usize) {
+        let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
+        reader.skip(size * T::Native::PHYSICAL_SIZE);
+    }
+}
+
+/// [`Dict`] implementation for fixed-width primitives.
+///
+/// Stores dictionary entries in a [`MultiSlabBuffer`] for O(1) index lookups.
+pub struct PrimitiveDict<T: ArrowPrimitiveType>
+where
+    T::Native: ReadLeBytes,
+{
+    entries: MultiSlabBuffer<T::Native>,
+}
+
+impl<T: ArrowPrimitiveType> Dict for PrimitiveDict<T>
+where
+    T::Native: ReadLeBytes,
+{
+    type Builder = PrimitiveBuilder<T>;
+    type Item = T::Native;
+
+    fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
+        let mut entries = allocator.create_multi_slab_buffer(size, false);
+        let mut position = ReaderPosition::default();
+        let mut len = 0;
+        read_primitives::<T::Native>(&data, &mut position, &mut entries, &mut len, size);
+        Self { entries }
+    }
+
+    #[inline(always)]
+    fn entry(&self, idx: usize) -> T::Native {
+        self.entries[idx]
+    }
+}
+
+/// Ready-to-use column decoder for any [`ArrowPrimitiveType`] whose native
+/// type implements [`ReadLeBytes`].
+pub type PrimitiveColumnDecoder<T> =
+    TypedColumnDecoder<PrimitiveDict<T>, PrimitiveBuilder<T>, PrimitivePlainDecoder<T>>;
+//
+#[cfg(test)]
+mod tests {
+    use crate::operations::parquet::types::thrift::general::Encoding;
+    use crate::operations::parquet::types::thrift::headers::PageHeader;
+    use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, UInt16Type};
+    use arrow_array::{
+        Array, ArrayRef, Float32Array, Int16Array, Int32Array, Int64Array, UInt16Array,
+    };
+    use bytes::Bytes;
+
+    use super::PrimitiveColumnDecoder;
+    use crate::memory::SlabAllocator;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::parquet::decoding::column_decoders::ColumnDecoder;
+    use crate::operations::parquet::test_utils::dummy_metadata;
+
+    fn make_data_page(
+        data: Vec<u8>,
+        num_values: usize,
+        encoding: Encoding,
+        idx: usize,
+    ) -> DecompressedPage {
+        let header = PageHeader::for_data_page(num_values as i32, encoding);
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(None),
+            column_idx: 0,
+            idx,
+            data: DecompressedPageType::Data(DataPage {
+                header: header.data_page_header.unwrap(),
+                data: vec![Bytes::from(data)],
+                filter_mask: None,
+            }),
+        }
+    }
+
+    fn make_data_page_multi_buffer(
+        buffers: Vec<Vec<u8>>,
+        num_values: usize,
+        encoding: Encoding,
+        idx: usize,
+    ) -> DecompressedPage {
+        let header = PageHeader::for_data_page(num_values as i32, encoding);
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(None),
+            column_idx: 0,
+            idx,
+            data: DecompressedPageType::Data(DataPage {
+                header: header.data_page_header.unwrap(),
+                data: buffers.into_iter().map(Bytes::from).collect(),
+                filter_mask: None,
+            }),
+        }
+    }
+
+    fn make_dict_page(data: Vec<u8>, num_values: usize) -> DecompressedPage {
+        let header = PageHeader::for_dict_page(num_values as i32);
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(None),
+            column_idx: 0,
+            idx: 0,
+            data: DecompressedPageType::Dict {
+                header: header.dictionary_page_header.unwrap(),
+                data: vec![Bytes::from(data)],
+            },
+        }
+    }
+
+    fn encode_i32s(values: &[i32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn encode_i64s(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn encode_f32s(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn extract_i32s(arr: &ArrayRef) -> Vec<i32> {
+        let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    fn extract_i64s(arr: &ArrayRef) -> Vec<i64> {
+        let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    fn extract_f32s(arr: &ArrayRef) -> Vec<f32> {
+        let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    // -- PLAIN single-page tests --
+
+    #[test]
+    fn test_i32_single_page() {
+        let values = vec![1i32, 2, 3, 100, 0];
+        let page = make_data_page(encode_i32s(&values), values.len(), Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 5);
+        let result = dec.read(&mut allocator, 5).unwrap();
+        assert_eq!(extract_i32s(&result), values);
+    }
+
+    #[test]
+    fn test_i64_single_page() {
+        let values = vec![10i64, 20, 30, i64::MAX, i64::MIN];
+        let page = make_data_page(encode_i64s(&values), values.len(), Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int64Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 5);
+        let result = dec.read(&mut allocator, 5).unwrap();
+        assert_eq!(extract_i64s(&result), values);
+    }
+
+    #[test]
+    fn test_f32_single_page() {
+        let values = vec![1.5f32, -2.25, 0.0, f32::MAX];
+        let page = make_data_page(encode_f32s(&values), values.len(), Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Float32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 4);
+        let result = dec.read(&mut allocator, 4).unwrap();
+        assert_eq!(extract_f32s(&result), values);
+    }
+
+    // -- Incremental & multi-page --
+
+    #[test]
+    fn test_i32_incremental() {
+        let values = vec![10i32, 20, 30, 40, 50];
+        let page = make_data_page(encode_i32s(&values), values.len(), Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        let r1 = dec.read(&mut allocator, 2).unwrap();
+        assert_eq!(extract_i32s(&r1), vec![10, 20]);
+
+        let r2 = dec.read(&mut allocator, 3).unwrap();
+        assert_eq!(extract_i32s(&r2), vec![30, 40, 50]);
+    }
+
+    #[test]
+    fn test_i32_multiple_pages() {
+        let page0 = make_data_page(encode_i32s(&[1, 2, 3]), 3, Encoding::PLAIN, 0);
+        let page1 = make_data_page(encode_i32s(&[4, 5]), 2, Encoding::PLAIN, 1);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page0, &mut allocator);
+        dec.insert_page(page1, &mut allocator);
+
+        assert_eq!(dec.available(), 5);
+        let result = dec.read(&mut allocator, 5).unwrap();
+        assert_eq!(extract_i32s(&result), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_i32_negative_values() {
+        let values = vec![-1i32, -100, -i32::MAX, i32::MIN, 0, 42];
+        let page = make_data_page(encode_i32s(&values), values.len(), Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        let result = dec.read(&mut allocator, 6).unwrap();
+        assert_eq!(extract_i32s(&result), values);
+    }
+
+    // -- Cross-buffer boundary (slow path) --
+
+    #[test]
+    fn test_i32_cross_buffer_boundary() {
+        // 3 i32 values = 12 bytes. Split at byte 6 (middle of 2nd value).
+        let data = encode_i32s(&[10, 20, 30]);
+        let page = make_data_page_multi_buffer(
+            vec![data[..6].to_vec(), data[6..].to_vec()],
+            3,
+            Encoding::PLAIN,
+            0,
+        );
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        let result = dec.read(&mut allocator, 3).unwrap();
+        assert_eq!(extract_i32s(&result), vec![10, 20, 30]);
+    }
+
+    // -- Dict-encoded --
+
+    #[test]
+    fn test_i32_dict_encoded() {
+        // Dictionary entries: [100, 200, 300]
+        let dict_page = make_dict_page(encode_i32s(&[100, 200, 300]), 3);
+
+        // RLE data page: bit_width=2, 1 group of 8 values
+        // Indices: [0, 1, 2, 0, 0, 1, 2, 0]
+        // 2-bit packed LSB-first:
+        //   byte0: idx[0]=0(00) | idx[1]=1(01)<<2 | idx[2]=2(10)<<4 | idx[3]=0(00)<<6 = 0x24
+        //   byte1: idx[4]=0(00) | idx[5]=1(01)<<2 | idx[6]=2(10)<<4 | idx[7]=0(00)<<6 = 0x24
+        let mut rle_data = vec![2u8]; // bit_width
+        rle_data.extend_from_slice(&[3, 0x24, 0x24]); // header=(1<<1)|1=3, packed bytes
+        let data_page = make_data_page(rle_data, 8, Encoding::RLE_DICTIONARY, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(dict_page, &mut allocator);
+        dec.insert_page(data_page, &mut allocator);
+
+        assert_eq!(dec.available(), 8);
+        let result = dec.read(&mut allocator, 8).unwrap();
+        assert_eq!(
+            extract_i32s(&result),
+            vec![100, 200, 300, 100, 100, 200, 300, 100]
+        );
+    }
+
+    // -- Filter mask integration --
+
+    use crate::operations::parquet::types::filter_mask::FilterMask;
+    use crate::operations::parquet::types::page::{
+        DataPage, DecompressedPage, DecompressedPageType,
+    };
+
+    fn make_filtered_data_page(
+        data: Vec<u8>,
+        num_values: usize,
+        encoding: Encoding,
+        idx: usize,
+        filter_mask: FilterMask,
+    ) -> DecompressedPage {
+        let header = PageHeader::for_data_page(num_values as i32, encoding);
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(None),
+            column_idx: 0,
+            idx,
+            data: DecompressedPageType::Data(DataPage {
+                header: header.data_page_header.unwrap(),
+                data: vec![Bytes::from(data)],
+                filter_mask: Some(filter_mask),
+            }),
+        }
+    }
+
+    /// Page [10, 20, 30, 40, 50], keep indices [1, 3] → [20, 40].
+    #[test]
+    fn test_i32_filter_skip_first_and_middle() {
+        let page = make_filtered_data_page(
+            encode_i32s(&[10, 20, 30, 40, 50]),
+            5,
+            Encoding::PLAIN,
+            0,
+            FilterMask::new(0, 5, &[1, 3]),
+        );
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 2);
+        let result = dec.read(&mut allocator, 2).unwrap();
+        assert_eq!(extract_i32s(&result), vec![20, 40]);
+    }
+
+    /// Page [10, 20, 30, 40, 50], keep only last [4] → [50].
+    #[test]
+    fn test_i32_filter_keep_last_only() {
+        let page = make_filtered_data_page(
+            encode_i32s(&[10, 20, 30, 40, 50]),
+            5,
+            Encoding::PLAIN,
+            0,
+            FilterMask::new(0, 5, &[4]),
+        );
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 1);
+        let result = dec.read(&mut allocator, 1).unwrap();
+        assert_eq!(extract_i32s(&result), vec![50]);
+    }
+
+    /// Page [10, 20, 30], keep all [0,1,2] → [10, 20, 30].
+    #[test]
+    fn test_i32_filter_keep_all() {
+        let page = make_filtered_data_page(
+            encode_i32s(&[10, 20, 30]),
+            3,
+            Encoding::PLAIN,
+            0,
+            FilterMask::new(0, 3, &[0, 1, 2]),
+        );
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 3);
+        let result = dec.read(&mut allocator, 3).unwrap();
+        assert_eq!(extract_i32s(&result), vec![10, 20, 30]);
+    }
+
+    /// Page [10, 20, 30, 40, 50], keep none → 0 available.
+    #[test]
+    fn test_i32_filter_keep_none() {
+        let page = make_filtered_data_page(
+            encode_i32s(&[10, 20, 30, 40, 50]),
+            5,
+            Encoding::PLAIN,
+            0,
+            FilterMask::new(0, 5, &[]),
+        );
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 0);
+    }
+
+    /// Dict-encoded page, 8 values [100,200,300,400,100,200,300,400],
+    /// keep [0, 2, 5] → [100, 300, 200].
+    #[test]
+    fn test_i32_filter_dict_encoded() {
+        let dict_page = make_dict_page(encode_i32s(&[100, 200, 300, 400]), 4);
+
+        // bit_width=2, 1 group of 8 values, indices [0,1,2,3,0,1,2,3]
+        let mut rle_data = vec![2u8];
+        rle_data.extend_from_slice(&[3, 0xE4, 0xE4]);
+
+        let data_page = make_filtered_data_page(
+            rle_data,
+            8,
+            Encoding::RLE_DICTIONARY,
+            0,
+            FilterMask::new(0, 8, &[0, 2, 5]),
+        );
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        dec.insert_page(dict_page, &mut allocator);
+        dec.insert_page(data_page, &mut allocator);
+
+        assert_eq!(dec.available(), 3);
+        let result = dec.read(&mut allocator, 3).unwrap();
+        assert_eq!(extract_i32s(&result), vec![100, 300, 200]);
+    }
+
+    // -- i16/u16 tests (Parquet stores these as 4-byte INT32) --
+
+    /// Encode i16 values as Parquet INT32 (4 bytes LE, sign-extended).
+    fn encode_i16_as_parquet(values: &[i16]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&v| (v as i32).to_le_bytes())
+            .collect()
+    }
+
+    /// Encode u16 values as Parquet INT32 (4 bytes LE, zero-extended).
+    fn encode_u16_as_parquet(values: &[u16]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&v| (v as i32).to_le_bytes())
+            .collect()
+    }
+
+    fn extract_i16s(arr: &ArrayRef) -> Vec<i16> {
+        let a = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    fn extract_u16s(arr: &ArrayRef) -> Vec<u16> {
+        let a = arr.as_any().downcast_ref::<UInt16Array>().unwrap();
+        (0..a.len()).map(|i| a.value(i)).collect()
+    }
+
+    #[test]
+    fn test_i16_single_value() {
+        let values = vec![42i16];
+        let page = make_data_page(encode_i16_as_parquet(&values), 1, Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 1);
+        let result = dec.read(&mut allocator, 1).unwrap();
+        assert_eq!(extract_i16s(&result), vec![42]);
+    }
+
+    /// Multiple i16 values - exposes fast-path byte_width mismatch.
+    #[test]
+    fn test_i16_multiple_values() {
+        let values = vec![1i16, 2, 3, 4, 5];
+        let page = make_data_page(encode_i16_as_parquet(&values), 5, Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 5);
+        let result = dec.read(&mut allocator, 5).unwrap();
+        assert_eq!(extract_i16s(&result), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_i16_negative_values() {
+        let values = vec![-1i16, -100, i16::MIN, i16::MAX, 0];
+        let page = make_data_page(encode_i16_as_parquet(&values), 5, Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 5);
+        let result = dec.read(&mut allocator, 5).unwrap();
+        assert_eq!(extract_i16s(&result), vec![-1, -100, i16::MIN, i16::MAX, 0]);
+    }
+
+    #[test]
+    fn test_u16_multiple_values() {
+        let values = vec![0u16, 1, 1000, u16::MAX, 42];
+        let page = make_data_page(encode_u16_as_parquet(&values), 5, Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<UInt16Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 5);
+        let result = dec.read(&mut allocator, 5).unwrap();
+        assert_eq!(extract_u16s(&result), vec![0, 1, 1000, u16::MAX, 42]);
+    }
+
+    /// Incremental reads for i16 - read 2, then 3.
+    #[test]
+    fn test_i16_incremental_read() {
+        let values = vec![10i16, 20, 30, 40, 50];
+        let page = make_data_page(encode_i16_as_parquet(&values), 5, Encoding::PLAIN, 0);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        let r1 = dec.read(&mut allocator, 2).unwrap();
+        assert_eq!(extract_i16s(&r1), vec![10, 20]);
+
+        let r2 = dec.read(&mut allocator, 3).unwrap();
+        assert_eq!(extract_i16s(&r2), vec![30, 40, 50]);
+    }
+
+    /// i16 with filter mask - keep indices [1, 3] from [10, 20, 30, 40, 50] → [20, 40].
+    #[test]
+    fn test_i16_filter() {
+        let page = make_filtered_data_page(
+            encode_i16_as_parquet(&[10, 20, 30, 40, 50]),
+            5,
+            Encoding::PLAIN,
+            0,
+            FilterMask::new(0, 5, &[1, 3]),
+        );
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        dec.insert_page(page, &mut allocator);
+
+        assert_eq!(dec.available(), 2);
+        let result = dec.read(&mut allocator, 2).unwrap();
+        assert_eq!(extract_i16s(&result), vec![20, 40]);
+    }
+
+    /// i16 across two pages.
+    #[test]
+    fn test_i16_two_pages() {
+        let page0 = make_data_page(encode_i16_as_parquet(&[1, 2, 3]), 3, Encoding::PLAIN, 0);
+        let page1 = make_data_page(encode_i16_as_parquet(&[4, 5]), 2, Encoding::PLAIN, 1);
+
+        init_test_free_pool(4);
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        dec.insert_page(page0, &mut allocator);
+        dec.insert_page(page1, &mut allocator);
+
+        assert_eq!(dec.available(), 5);
+        let result = dec.read(&mut allocator, 5).unwrap();
+        assert_eq!(extract_i16s(&result), vec![1, 2, 3, 4, 5]);
+    }
+}

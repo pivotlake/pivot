@@ -1,0 +1,120 @@
+//! Shared test utilities for unary operators.
+
+use crate::operations::channels::Sender;
+use crate::operations::unary::Unary;
+use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
+use arrow_array::{Int32Array, RecordBatch};
+
+/// A [`Sender`] that collects all sent items for later inspection.
+pub struct CollectSender<T = RecordBatch> {
+    pub items: Vec<T>,
+}
+
+impl<T> CollectSender<T> {
+    pub fn new() -> Self {
+        Self { items: vec![] }
+    }
+}
+
+impl CollectSender<RecordBatch> {
+    /// Total number of rows across all collected batches.
+    pub fn total_rows(&self) -> usize {
+        self.items.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// All values from column `col` as sorted i32s.
+    pub fn sorted_i32_column(&self, col: usize) -> Vec<i32> {
+        let mut values = self.i32_column(col);
+        values.sort();
+        values
+    }
+
+    /// All values from column `col` as i32s, preserving order.
+    pub fn i32_column(&self, col: usize) -> Vec<i32> {
+        self.items
+            .iter()
+            .flat_map(|b| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+}
+
+impl<T> Sender<T> for CollectSender<T> {
+    fn send(&mut self, item: T) -> std::result::Result<(), crate::operations::channels::Error> {
+        self.items.push(item);
+        Ok(())
+    }
+}
+
+/// Feed `inputs` through a [`Unary`] operator and return all output items.
+pub fn run_unary<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
+    let mut sender = CollectSender::new();
+    for item in inputs {
+        unary.consume(item, &mut sender).unwrap();
+    }
+    sender.items
+}
+
+/// Feed `inputs` through a [`Unary`] operator, then drain via `finish()`.
+///
+/// Unlike [`run_unary`], this also calls `finish()` in a loop to collect
+/// output that the operator produces lazily after consumption (e.g. the
+/// Decoder which batches across multiple pages).
+pub fn run_unary_to_completion<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
+    let mut sender = CollectSender::new();
+    for item in inputs {
+        unary.consume(item, &mut sender).unwrap();
+    }
+    loop {
+        unary.run(&mut sender).unwrap();
+        if unary.finish(&mut sender).unwrap() {
+            break;
+        }
+    }
+    sender.items
+}
+
+/// Drive a set of [`Consumer`]s through the full consume → output lifecycle.
+///
+/// 1. Feeds `worker_batches[i]` into `consumers[i]`
+/// 2. Calls `into_outputter()` on all consumers (dropping internal senders)
+/// 3. Drives all outputters until done
+///
+/// Returns a [`CollectSender`] containing all output batches.
+pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
+    consumers: Vec<C>,
+    worker_batches: Vec<Vec<RecordBatch>>,
+) -> CollectSender<RecordBatch> {
+    let mut dummy = CollectSender::new();
+
+    let mut consumers = consumers;
+    for (consumer, batches) in consumers.iter_mut().zip(&worker_batches) {
+        for batch in batches {
+            consumer.consume(batch.clone(), &mut dummy).unwrap();
+        }
+    }
+
+    let mut outputters: Vec<_> = consumers
+        .into_iter()
+        .filter_map(|c| c.into_outputter().unwrap())
+        .collect();
+
+    let mut sender = CollectSender::new();
+    let mut all_done = false;
+    while !all_done {
+        all_done = true;
+        for outputter in &mut outputters {
+            if !outputter.output(&mut sender).unwrap() {
+                all_done = false;
+            }
+        }
+    }
+    sender
+}

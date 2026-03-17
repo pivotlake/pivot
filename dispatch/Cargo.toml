@@ -9,10 +9,8 @@ arrow-array = { path = "../arrow/arrow-array" }
 arrow-schema = { path = "../arrow/arrow-schema" }
 arrow = { path = "../arrow/arrow", features = ["prettyprint"] }
 arrow-buffer = { path = "../arrow/arrow-buffer"}
-parquet = { path = "../arrow/parquet" }
 
 crossbeam-deque = "0.8.6"
-#parquetd = { path = "../parquetd" }
 core_affinity = "0.8.3"
 thiserror = { workspace = true }
 tracing = "0.1.41"
@@ -21,19 +19,24 @@ memchr = "2.7"
 ahash = "0.8.12"
 
 tikv-jemallocator = "0.6.0"
-tikv-jemalloc-ctl = { version = "0.6.0", features = ["stats", "use_std"] }
-
-moka = { version = "0.12.13", features = ["sync"] }
 
 bytes = "1.11.0"
+snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev="1e20a92f7bcad208bf6869f5394101288850ee2e" }
 libc = "0.2.178"
+
+sysinfo = "0.38.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
-sysinfo = "0.38.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["fs", "uio"] }
 
 [dev-dependencies]
 rstest = "0.26.1"
+parquet = { path = "../arrow/parquet", default-features = false, features = ["arrow", "snap"] }
+tempfile = "3"
+
+[[bench]]
+name = "clickbench"
+harness = false

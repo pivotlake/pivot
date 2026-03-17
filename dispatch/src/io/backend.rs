@@ -1,7 +1,16 @@
-//! Platform-specific I/O backends
+//! Platform-specific I/O backends.
 //!
-//! - Linux: Uses io_uring for high-performance async I/O
-//! - Other Unix: Uses pread for synchronous positioned reads
+//! Both backends expose the same API so [`super::requester::IORequester`] can
+//! treat them identically:
+//!
+//! - **Linux** — [`uring_backend::IOBackend`] wraps `io_uring` for truly
+//!   asynchronous, kernel-managed reads. Submissions are batched in the SQ and
+//!   completions are drained from the CQ.
+//! - **Other Unix** — [`pread_backend::IOBackend`] executes reads synchronously
+//!   via `pread(2)` at `submit` time, so "completions" are always immediately
+//!   available.
+
+use crate::Identifier;
 
 use std::io;
 
@@ -19,14 +28,18 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+// ============================================================================
+// Linux: io_uring backend
+// ============================================================================
+
 #[cfg(target_os = "linux")]
 mod uring_backend {
     use super::*;
-    use crate::io::disk_buffer::DiskBuffer;
+    use crate::memory::WriteBuffer;
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::RawFd;
 
-    /// io_uring based backend for Linux
+    /// io_uring based backend for Linux.
     pub struct IOBackend {
         pub ring: IoUring,
     }
@@ -34,32 +47,16 @@ mod uring_backend {
     impl IOBackend {
         pub fn new(ring_size: u32) -> io::Result<Self> {
             Ok(Self {
-                // ring: IoUring::builder().setup_coop_taskrun().build(ring_size)?,
-                ring: IoUring::builder().build(ring_size)?,
+                ring: IoUring::builder().setup_coop_taskrun().build(ring_size)?,
             })
         }
 
-        pub fn register_buffers(&self, buffers: impl Iterator<Item = (*mut libc::c_void, usize)>) {
-            unsafe {
-                self.ring
-                    .submitter()
-                    .register_buffers(
-                        &buffers
-                            .map(|(ptr, size)| libc::iovec {
-                                iov_base: ptr as *mut libc::c_void,
-                                iov_len: size,
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap();
-            }
-        }
-
+        /// Pushes a read operation onto the submission queue (does not flush).
         pub fn submit_read(
             &mut self,
             fd: RawFd,
             offset: u64,
-            buffer: &mut DiskBuffer,
+            buffer: &mut WriteBuffer,
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
@@ -78,14 +75,17 @@ mod uring_backend {
             Ok(())
         }
 
+        /// Flushes the submission queue to the kernel.
         pub fn submit(&mut self) -> io::Result<usize> {
             self.ring.submit()
         }
 
+        /// Flushes and blocks until at least `want` completions are ready.
         pub fn submit_and_wait(&mut self, want: usize) -> io::Result<usize> {
             self.ring.submit_and_wait(want)
         }
 
+        /// Drains the completion queue, returning `(bytes_read, request_id)` pairs.
         pub fn completions(&mut self) -> io::Result<Vec<(usize, Identifier)>> {
             self.ring
                 .completion()
@@ -99,34 +99,17 @@ mod uring_backend {
                 })
                 .collect::<Result<Vec<_>, _>>()
         }
-
-        pub fn has_completions(&mut self) -> bool {
-            !self.ring.completion().is_empty()
-        }
-
-        pub fn has_pending_submissions(&mut self) -> bool {
-            !self.ring.submission().is_empty()
-        }
-
-        pub fn is_submission_full(&mut self) -> bool {
-            self.ring.submission().is_full()
-        }
     }
 }
-
-// ============================================================================
-// Non-Linux Unix: pread fallback backend
-// ============================================================================
 
 #[cfg(all(unix, not(target_os = "linux")))]
 mod pread_backend {
     use super::*;
-    use crate::io::disk_buffer::DiskBuffer;
+    use crate::memory::WriteBuffer;
     use std::collections::VecDeque;
     use std::os::fd::BorrowedFd;
     use std::os::unix::io::RawFd;
 
-    /// Pending read request for pread backend
     struct PendingRead {
         fd: RawFd,
         offset: u64,
@@ -137,31 +120,33 @@ mod pread_backend {
 
     unsafe impl Send for PendingRead {}
 
-    /// pread-based fallback backend for non-Linux Unix systems
+    /// Synchronous pread-based fallback for non-Linux Unix.
+    ///
+    /// Reads are queued in [`submit_read`](Self::submit_read) and executed
+    /// synchronously when [`submit`](Self::submit) is called. Completions are
+    /// therefore always available immediately after submission.
     pub struct IOBackend {
         pending: VecDeque<PendingRead>,
         completed: VecDeque<Identifier>,
-        available: usize,
     }
 
     impl IOBackend {
-        pub fn new(ring_size: u32) -> io::Result<Self> {
+        pub fn new(_ring_size: u32) -> io::Result<Self> {
             Ok(Self {
                 pending: VecDeque::new(),
                 completed: VecDeque::new(),
-                available: ring_size as usize,
             })
         }
 
+        /// Queues a read; the actual `pread` happens at [`submit`](Self::submit) time.
         pub fn submit_read(
             &mut self,
             fd: RawFd,
             offset: u64,
-            buffer: &mut DiskBuffer,
+            buffer: &mut WriteBuffer,
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
-            self.available -= 1;
             self.pending.push_back(PendingRead {
                 fd,
                 offset,
@@ -172,9 +157,7 @@ mod pread_backend {
             Ok(())
         }
 
-        pub fn register_buffers(&self, _buffers: impl Iterator<Item = (*mut libc::c_void, usize)>) {
-        }
-
+        /// Executes all pending reads synchronously via `pread(2)`.
         pub fn submit(&mut self) -> io::Result<usize> {
             self.execute_pending()
         }
@@ -201,25 +184,7 @@ mod pread_backend {
         }
 
         pub fn completions(&mut self) -> io::Result<Vec<(usize, Identifier)>> {
-            self.available += self.completed.len();
-            Ok(self
-                .completed
-                .drain(..)
-                .into_iter()
-                .map(|i| (0, i))
-                .collect())
-        }
-
-        pub fn has_pending_submissions(&mut self) -> bool {
-            !self.pending.is_empty()
-        }
-
-        pub fn has_completions(&mut self) -> bool {
-            !self.completed.is_empty() || !self.pending.is_empty()
-        }
-
-        pub fn is_submission_full(&self) -> bool {
-            self.available == 0
+            Ok(self.completed.drain(..).map(|i| (0, i)).collect())
         }
     }
 }
@@ -227,6 +192,5 @@ mod pread_backend {
 #[cfg(target_os = "linux")]
 pub(crate) use uring_backend::IOBackend;
 
-use crate::identified::Identifier;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use pread_backend::IOBackend;

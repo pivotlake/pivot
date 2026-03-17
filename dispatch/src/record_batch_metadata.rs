@@ -28,6 +28,7 @@ pub fn global_row_group(batch: &RecordBatch) -> &RunArray<Int32Type> {
         .expect("Metadata not set correctly")
 }
 
+/// Gets the array for the index of the row within the row group
 pub fn row_index(batch: &RecordBatch) -> &UInt32Array {
     batch
         .column(batch.num_columns() - ROW_OFFSET_FROM_END)

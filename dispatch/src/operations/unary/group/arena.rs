@@ -1,115 +1,154 @@
+use crate::env::MAX_INLINE_STRING_VIEW;
+use crate::memory::{BUFFER_SIZE, RING, WriteBuffer, get_write_buffer};
 use crate::operations::unary::group::ArenaKey;
-use std::mem::MaybeUninit;
+use arrow_buffer::Buffer;
+use std::cell::UnsafeCell;
 use std::ptr;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
-const START_BUFFER_SIZE: usize = 4096;
-
-/// A byte arena for efficient bulk string allocation.
+/// Shared arena holding all string buffers across workers.
 ///
-/// # Memory Layout
-///
-/// ```text
-/// ByteArena
-/// ┌─────────────────────────────────────────────────────────────────────────┐
-/// │  cursor: usize          (write position in active buffer)               │
-/// │  active_buffer: Box<[u8]>  ──────────────────────┐                      │
-/// │  buffers: Vec<Box<[u8]>>                         │                      │
-/// └──────────────────────────────────────────────────│──────────────────────┘
-///                                                    ▼
-///     buffers (full, immutable)              active_buffer (being filled)
-///     ┌─────────────────────┐                ┌─────────────────────────────┐
-///     │ Box<[u8]> (4KB)     │──►["foo","bar",...]                          │
-///     ├─────────────────────┤                │"baz"|"qux"|     ◄── cursor  │
-///     │ Box<[u8]> (8KB)     │──►["...","...",...]                          │
-///     ├─────────────────────┤                │                (free space) │
-///     │ Box<[u8]> (16KB)    │──►["...","...",...]                          │
-///     └─────────────────────┘                └─────────────────────────────┘
-/// ```
-///
-/// # How It Works
-///
-/// 1. **Push**: Strings are copied contiguously into `active_buffer` at `cursor`.
-///    Returns an `ArenaKey` (raw pointer + length) to the copied bytes.
-///
-/// 2. **Overflow**: When a string doesn't fit, the full buffer moves to `buffers`
-///    and a new `active_buffer` is allocated at **2x the previous size**.
-///
-/// 3. **Growth**: 4KB → 8KB → 16KB → 32KB → ... (exponential, amortized O(1) push)
-///
-/// # Why Pointers Stay Valid
-///
-/// Unlike `Vec::push` which may `realloc` and invalidate pointers, this arena
-/// **never moves existing data**:
-/// - Full buffers are moved to `buffers` Vec, but the `Box<[u8]>` heap allocation
-///   doesn't move—only the Box (pointer) itself is moved into the Vec
-/// - New allocations go to a fresh buffer, leaving old pointers untouched
-///
-/// This makes `ArenaKey` (a raw pointer) safe to hold as long as the arena lives.
-///
-/// # Performance
-/// This is much more performant than simply reallocating (and having an index into arena) because
-/// reallocating can potentially cause movement of data if the vec can't grow in place. This saves
-/// the need to move data - once data is written, it will never be moved, and new buffers will
-/// be created for additional data if a buffer passes its capacity
-///
-/// # Safety
-/// It is *extremely* important to be aware that the arena demands the user be responsible for not
-/// accessing `ArenaKey`s after the ByteArena is dropped
-pub struct ByteArena {
-    cursor: usize,
-    active_buffer: Box<[MaybeUninit<u8>]>,
-    buffers: Vec<Box<[MaybeUninit<u8>]>>,
+/// Buffer pointers are stored in a plain pointer array for zero-overhead resolution.
+/// Safety: `next_idx` (atomic) guarantees each slot is written by exactly one thread.
+/// Cross-thread visibility is ensured by the mpsc channel between consume and merge phases.
+pub struct SharedArena {
+    /// We want to have all u128 views point to a centralized place shared by all workers;
+    /// this allows us in merge time to simply copy the u128s as is when creating the record batch,
+    /// instead of needing to recreate pointers (if we need to shuffle pointers around). We also want
+    /// all `resolve` calls (get a pointer from a u128) to be lock-free.
+    ///
+    /// We therefore need a ptrs array *that is initialized in advance*, i.e., that it is never moved
+    ptrs: Box<[UnsafeCell<*mut u8>]>,
+    next_idx: AtomicU32,
+    /// Owns WriteBuffers so ring memory stays alive until the arena is dropped.
+    buffers: Mutex<Vec<WriteBuffer>>,
 }
 
-fn create_buffer(size: usize) -> Box<[MaybeUninit<u8>]> {
-    let mut v: Vec<MaybeUninit<u8>> = Vec::with_capacity(size);
-    unsafe {
-        v.set_len(size);
+unsafe impl Send for SharedArena {}
+unsafe impl Sync for SharedArena {}
+impl std::panic::RefUnwindSafe for SharedArena {}
+
+impl SharedArena {
+    /// Create a new shared arena with space for up to [`MAX_BUFFERS`] write buffers.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ptrs: (0..RING.len())
+                .map(|_| UnsafeCell::new(ptr::null_mut()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            next_idx: AtomicU32::new(0),
+            buffers: Mutex::new(Vec::new()),
+        })
     }
-    v.into_boxed_slice()
+
+    /// Allocate a new write buffer, register its pointer, and return it with its index.
+    /// The caller owns the buffer for writing; call [`return_buffer`] when done.
+    pub fn take_buffer(&self) -> (WriteBuffer, u32) {
+        let wb = get_write_buffer(false);
+        let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
+        // Safety: fetch_add guarantees unique idx per caller; no two threads write the same slot.
+        unsafe { *self.ptrs[idx as usize].get() = wb.ptr };
+        (wb, idx)
+    }
+
+    /// Transfer ownership of a completed buffer back to the arena.
+    pub fn return_buffer(&self, wb: WriteBuffer) {
+        self.buffers.lock().unwrap().push(wb);
+    }
+
+    /// Resolve a non-inline key's buffer slice.
+    #[inline]
+    pub fn resolve(&self, buffer_index: u32, offset: u32, len: u32) -> &[u8] {
+        let ptr = unsafe { *self.ptrs[buffer_index as usize].get() };
+        unsafe { std::slice::from_raw_parts(ptr.add(offset as usize), len as usize) }
+    }
+
+    /// Convert all registered buffers into Arrow Buffers for zero-copy StringViewArray output.
+    /// The `Arc<SharedArena>` keeps ring memory alive as long as any Arrow Buffer exists.
+    pub fn to_arrow_buffers(self: &Arc<Self>) -> Vec<Buffer> {
+        let count = self.next_idx.load(Ordering::Acquire) as usize;
+        (0..count)
+            .map(|i| {
+                let ptr = unsafe { *self.ptrs[i].get() };
+                unsafe {
+                    Buffer::from_custom_allocation(
+                        NonNull::new_unchecked(ptr),
+                        BUFFER_SIZE,
+                        self.clone(),
+                    )
+                }
+            })
+            .collect()
+    }
 }
 
-impl ByteArena {
-    pub(crate) fn new() -> Self {
+/// Per-worker write handle into the [`SharedArena`].
+///
+/// Each worker writes to its own active buffer without locking. When the buffer
+/// fills, it is returned to the shared arena and a new one is taken.
+pub struct WorkerArena {
+    shared: Arc<SharedArena>,
+    active_buffer: WriteBuffer,
+    buffer_index: u32,
+    cursor: usize,
+}
+
+impl WorkerArena {
+    /// Create a new worker arena, taking a fresh buffer from the shared arena.
+    pub fn new(shared: Arc<SharedArena>) -> Self {
+        let (wb, idx) = shared.take_buffer();
         Self {
+            shared,
+            active_buffer: wb,
+            buffer_index: idx,
             cursor: 0,
-            active_buffer: create_buffer(START_BUFFER_SIZE),
-            buffers: vec![],
         }
     }
 
+    /// Borrow the underlying shared arena (used for key comparison).
+    pub fn shared(&self) -> &SharedArena {
+        &self.shared
+    }
+
+    /// Take a fresh buffer from the shared arena when the current one is full.
     #[cold]
     fn add_buffer(&mut self) {
-        let current_capacity = self.active_buffer.len();
-        let full_buffer =
-            std::mem::replace(&mut self.active_buffer, create_buffer(current_capacity * 2));
-        self.buffers.push(full_buffer);
+        let (new_wb, idx) = self.shared.take_buffer();
+        let old = std::mem::replace(&mut self.active_buffer, new_wb);
+        self.shared.return_buffer(old);
+        self.buffer_index = idx;
         self.cursor = 0;
     }
 
-    /// Push in a new &str, and return a pointer to it. *Note that it is the responsibility of the
-    /// user to not dereference the key if the ByteArena has been dropped*. This is obviously not
-    /// ideal and should have had a lifetime, but given issues with Rusts self-referential structs,
-    /// we're going with this for now.
+    /// Push a string into the arena and return its ArenaKey (inline or view).
     #[inline]
-    pub(crate) fn push(&mut self, s: &str) -> ArenaKey {
-        if self.cursor + s.len() > self.active_buffer.len() {
+    pub fn push(&mut self, s: &str) -> ArenaKey {
+        let data = s.as_bytes();
+        if data.len() <= MAX_INLINE_STRING_VIEW {
+            return ArenaKey::inline(data);
+        }
+
+        if self.cursor + data.len() > BUFFER_SIZE {
             self.add_buffer();
         }
 
-        let end = self.cursor + s.len();
-
+        let offset = self.cursor;
         unsafe {
             ptr::copy_nonoverlapping(
-                s.as_ptr(),
-                self.active_buffer.as_mut_ptr().add(self.cursor) as *mut u8,
-                s.len(),
+                data.as_ptr(),
+                self.active_buffer.as_mut_ptr().add(offset),
+                data.len(),
             );
         }
+        self.cursor += data.len();
 
-        let ptr = unsafe { self.active_buffer.as_ptr().add(self.cursor) as *const u8 };
+        ArenaKey::view(data, self.buffer_index, offset as u32)
+    }
 
-        self.cursor = end;
-        ArenaKey::new(ptr, s.len() as u32)
+    /// Return the active buffer to the shared arena. Must be called before dropping.
+    pub fn flush(self) {
+        self.shared.return_buffer(self.active_buffer);
     }
 }

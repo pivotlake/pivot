@@ -5,6 +5,10 @@ use arrow_array::RecordBatch;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 
+/// Creates one [`OrderByLimit`] operator per worker with shared channel wiring.
+///
+/// The first factory receives the channel receiver; the rest get `None`.
+/// All share a sender so per-worker top-k results flow to a single collector.
 pub struct OrderByLimitFactory {
     order_by: Vec<OrderBy>,
     limit: usize,
@@ -13,6 +17,7 @@ pub struct OrderByLimitFactory {
 }
 
 impl OrderByLimitFactory {
+    /// Create `worker_count` factories sharing a single mpsc channel.
     pub fn create_for_workers(
         order_by: Vec<OrderBy>,
         limit: usize,

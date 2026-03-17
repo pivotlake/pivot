@@ -1,22 +1,43 @@
-use crate::api::{DataFlowBuilder, OperatorFactory};
-use crate::dispatcher;
-use crate::operations::parquet::{
-    DecompressorFactory, IndexerFactory, PageWithInfo, RecordBatchGeneratorFactory,
-    RowGroupCompressedPage,
+use crate::operations::UnaryOperatorFactory;
+use crate::operations::channels::{
+    ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, return_to_worker_mpsc, stealable,
 };
-use crate::operations::{
-    CountFactory, FilterFactory, GroupFactory, MaterializeJobGeneratorFactory, MaterializeRequest,
-    MaterializerFactory, OrderBy, OrderByLimitFactory, ProjectFactory, ReturnToWorkerMpscFactory,
-    StealableChannelFactory, UnaryOperatorFactory, mpsc_channel, return_to_worker_mpsc, stealable,
-};
-use crate::table::input::RowGroupBuffer;
-use crate::table::{Projection, Table, TableInputFactory, TableSource};
-use arrow_array::{BooleanArray, RecordBatch};
+use crate::operations::parquet::DecoderFactory;
+use crate::operations::parquet::DecompressorFactory;
+use crate::operations::parquet::types::projection::Projection;
+use crate::operations::parquet::{CompressedPage, DecompressedPage, ParquetTable};
+use crate::operations::parquet::{IndexerFactory, RowGroupBuffer};
+use crate::{Chain, dispatcher};
+use arrow_array::RecordBatch;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// Generic, strongly-typed spec used internally to build the parquet read pipeline.
+///
+/// Holds one factory per worker, where the factory type `OF` carries the full nested
+/// generic chain (e.g. `UnaryOperatorFactory<..., UnaryOperatorFactory<..., OF>>`).
+/// This is needed because the parquet pipeline flows through non-RecordBatch types
+/// (`RowGroupBuffer → CompressedPage → DecompressedPage → RecordBatch`), and each
+/// stage uses a different channel/sender type — including `WorkerAwareSender` which
+/// requires `O: WorkerIdOutput`.
+///
+/// [`OperatorFactory::build`] must be generic over `S: Sender<O>` to support this,
+/// which makes it **not object-safe**. This is why we can't use
+/// `Box<dyn OperatorFactory<O>>` directly and need a separate object-safe
+/// [`RecordBatchOperatorFactory`](super::record_batch_operator::RecordBatchOperatorFactory)
+/// trait at the RecordBatch boundary.
+///
+/// Concretely, making `OperatorFactory<O>` object-safe would require replacing
+/// `build<S: Sender<O>>` with concrete methods like `build_stealable(Rc<Worker<O>>)`
+/// and `build_collect(MpscSender<O>)`. But there is no clean way to add a
+/// `build_worker_aware(WorkerAwareSender<O>)` method: the `Sender` impl for
+/// `WorkerAwareSender<O>` requires `O: WorkerIdOutput`, and adding that bound to the
+/// trait method either forces the bound onto all users (wrong for `RecordBatch`) or
+/// requires a `where` clause that breaks object safety.
 pub struct OperatorSpec<O, OF: OperatorFactory<O>> {
+    /// Vector of factories, one per worker. These all should build the same `Box<dyn Operator>` within
+    /// different workers.
     factories: VecDeque<OF>,
     _phantom: std::marker::PhantomData<O>,
 }
@@ -28,21 +49,25 @@ impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
             _phantom: Default::default(),
         }
     }
+
+    pub fn factories(self) -> VecDeque<OF> {
+        self.factories
+    }
 }
 
 type ReadParquet<OF> = UnaryOperatorFactory<
-    PageWithInfo,
+    DecompressedPage,
     RecordBatch,
-    RecordBatchGeneratorFactory,
-    ReturnToWorkerMpscFactory<PageWithInfo>,
+    DecoderFactory,
+    ReturnToWorkerMpscFactory<DecompressedPage>,
     UnaryOperatorFactory<
-        RowGroupCompressedPage,
-        PageWithInfo,
+        CompressedPage,
+        DecompressedPage,
         DecompressorFactory,
-        StealableChannelFactory<RowGroupCompressedPage>,
+        StealableChannelFactory<CompressedPage>,
         UnaryOperatorFactory<
             RowGroupBuffer,
-            RowGroupCompressedPage,
+            CompressedPage,
             IndexerFactory,
             StealableChannelFactory<RowGroupBuffer>,
             OF,
@@ -50,256 +75,61 @@ type ReadParquet<OF> = UnaryOperatorFactory<
     >,
 >;
 
-pub fn table_input(
-    table: Arc<Table>,
-    projection: Option<Projection>,
-) -> OperatorSpec<RecordBatch, ReadParquet<TableInputFactory>> {
-    let source = Arc::new(TableSource::from(&table));
-    let input = OperatorSpec::new(
-        (0..dispatcher().workers())
-            .map(|_| TableInputFactory::new(source.clone(), table.clone(), projection.clone())),
-    );
-    input.read_parquet(projection)
-}
-
 impl<OF: OperatorFactory<RowGroupBuffer>> OperatorSpec<RowGroupBuffer, OF> {
     pub fn read_parquet(
         mut self,
-        projection: Option<Projection>,
+        table: &Arc<ParquetTable>,
+        projection: Projection,
+        batch_size: usize,
+        add_row_group_metadata: bool,
     ) -> OperatorSpec<RecordBatch, ReadParquet<OF>> {
         let siblings_left_indexer = Arc::new(AtomicUsize::new(dispatcher().workers()));
         let siblings_left_decompressor = Arc::new(AtomicUsize::new(dispatcher().workers()));
-        let siblings_left_rbg = Arc::new(AtomicUsize::new(dispatcher().workers()));
+        let siblings_left_drain = Arc::new(AtomicUsize::new(dispatcher().workers()));
 
         OperatorSpec::new(
             stealable::<RowGroupBuffer>()
                 .into_iter()
-                .zip(stealable::<RowGroupCompressedPage>())
-                .zip(return_to_worker_mpsc::<PageWithInfo>())
-                .map(move |((ic, dc), rc)| {
+                .zip(stealable::<CompressedPage>())
+                .zip(return_to_worker_mpsc::<DecompressedPage>())
+                .map(move |((ic, dc), drc)| {
                     UnaryOperatorFactory::new(
                         UnaryOperatorFactory::new(
                             UnaryOperatorFactory::new(
                                 self.factories.pop_front().unwrap(),
-                                IndexerFactory::new(projection.clone()),
+                                IndexerFactory::new(),
                                 ic,
                                 siblings_left_indexer.clone(),
                             ),
-                            DecompressorFactory,
+                            DecompressorFactory::new(),
                             dc,
                             siblings_left_decompressor.clone(),
                         ),
-                        RecordBatchGeneratorFactory(projection.clone()),
-                        rc,
-                        siblings_left_rbg.clone(),
+                        DecoderFactory {
+                            batch_size,
+                            table: table.clone(),
+                            projection: projection.clone(),
+                            add_row_group_metadata,
+                        },
+                        drc,
+                        siblings_left_drain.clone(),
                     )
                 }),
         )
     }
 }
 
-impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
-    pub fn project<P: FnMut(&RecordBatch) -> RecordBatch + Send + 'static, PB: Fn() -> P>(
-        mut self,
-        builder: PB,
-    ) -> OperatorSpec<
-        RecordBatch,
-        UnaryOperatorFactory<
-            RecordBatch,
-            RecordBatch,
-            ProjectFactory<P>,
-            StealableChannelFactory<RecordBatch>,
-            OF,
-        >,
-    > {
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-
-        OperatorSpec::new(stealable::<RecordBatch>().into_iter().map(|c| {
-            UnaryOperatorFactory::new(
-                self.factories.pop_front().unwrap(),
-                ProjectFactory(builder()),
-                c,
-                siblings_left.clone(),
-            )
-        }))
-    }
-
-    pub fn filter<F: FnMut(&RecordBatch) -> BooleanArray + Send + 'static, FB: Fn() -> F>(
-        mut self,
-        builder: FB,
-    ) -> OperatorSpec<
-        RecordBatch,
-        UnaryOperatorFactory<
-            RecordBatch,
-            RecordBatch,
-            FilterFactory<F>,
-            StealableChannelFactory<RecordBatch>,
-            OF,
-        >,
-    > {
-        let channels = stealable::<RecordBatch>();
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-
-        OperatorSpec::new(channels.into_iter().map(|c| {
-            UnaryOperatorFactory::new(
-                self.factories.pop_front().unwrap(),
-                FilterFactory(builder()),
-                c,
-                siblings_left.clone(),
-            )
-        }))
-    }
-
-    pub fn count(
-        self,
-    ) -> OperatorSpec<
-        RecordBatch,
-        UnaryOperatorFactory<
-            RecordBatch,
-            RecordBatch,
-            CountFactory,
-            StealableChannelFactory<RecordBatch>,
-            OF,
-        >,
-    > {
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-
-        OperatorSpec::new(
-            stealable::<RecordBatch>()
-                .into_iter()
-                .zip(CountFactory::create_for_workers(dispatcher().workers()))
-                .zip(self.factories)
-                .map(|((channel_factory, count_factory), current)| {
-                    UnaryOperatorFactory::new(
-                        current,
-                        count_factory,
-                        channel_factory,
-                        siblings_left.clone(),
-                    )
-                }),
-        )
-    }
-
-    pub fn order_by_limit(
-        self,
-        order_by: Vec<OrderBy>,
-        limit: usize,
-    ) -> OperatorSpec<
-        RecordBatch,
-        UnaryOperatorFactory<
-            RecordBatch,
-            RecordBatch,
-            OrderByLimitFactory,
-            StealableChannelFactory<RecordBatch>,
-            OF,
-        >,
-    > {
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-
-        OperatorSpec::new(
-            stealable::<RecordBatch>()
-                .into_iter()
-                .zip(OrderByLimitFactory::create_for_workers(
-                    order_by,
-                    limit,
-                    dispatcher().workers(),
-                ))
-                .zip(self.factories)
-                .map(|((channel_factory, obl_factory), current)| {
-                    UnaryOperatorFactory::new(
-                        current,
-                        obl_factory,
-                        channel_factory,
-                        siblings_left.clone(),
-                    )
-                }),
-        )
-    }
-
-    pub fn group_by_count(
-        self,
-        group_column: usize,
-    ) -> OperatorSpec<
-        RecordBatch,
-        UnaryOperatorFactory<
-            RecordBatch,
-            RecordBatch,
-            GroupFactory,
-            StealableChannelFactory<RecordBatch>,
-            OF,
-        >,
-    > {
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-
-        OperatorSpec::new(
-            stealable::<RecordBatch>()
-                .into_iter()
-                .zip(GroupFactory::create_for_workers(
-                    group_column,
-                    dispatcher().workers(),
-                ))
-                .zip(self.factories)
-                .map(|((channel_factory, group_factory), current)| {
-                    UnaryOperatorFactory::new(
-                        current,
-                        group_factory,
-                        channel_factory,
-                        siblings_left.clone(),
-                    )
-                }),
-        )
-    }
-
-    pub fn materialize(
-        mut self,
-        table: Arc<Table>,
-        projection: Option<Projection>,
-    ) -> OperatorSpec<
-        RecordBatch,
-        ReadParquet<
-            MaterializerFactory<
-                UnaryOperatorFactory<
-                    RecordBatch,
-                    MaterializeRequest,
-                    MaterializeJobGeneratorFactory,
-                    StealableChannelFactory<RecordBatch>,
-                    OF,
-                >,
-                StealableChannelFactory<MaterializeRequest>,
-            >,
-        >,
-    > {
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-
-        let materializer_spec: OperatorSpec<RowGroupBuffer, _> = OperatorSpec::new(
-            stealable::<RecordBatch>()
-                .into_iter()
-                .zip(stealable::<MaterializeRequest>())
-                .map(|(rb_ch, mr_ch)| {
-                    MaterializerFactory::new(
-                        UnaryOperatorFactory::new(
-                            self.factories.pop_front().unwrap(),
-                            MaterializeJobGeneratorFactory::new(projection.clone(), table.clone()),
-                            rb_ch,
-                            siblings_left.clone(),
-                        ),
-                        mr_ch,
-                    )
-                }),
-        );
-
-        materializer_spec.read_parquet(projection)
-    }
-
-    pub fn collect(self) -> Vec<RecordBatch> {
-        let (tx, rx) = mpsc_channel();
-        dispatcher().push_data_flow(
-            self.factories
-                .into_iter()
-                .map(|f| DataFlowBuilder::new(Box::new(f), tx.clone())),
-        );
-        drop(tx);
-        let (rx, _) = rx.into_parts();
-        rx.into_iter().collect()
-    }
+/// A factory that builds one worker's operator chain, given an output sender.
+///
+/// Called on the worker thread during [`DataFlowBuilder::build`](crate::api::DataFlowBuilder::build).
+/// The `build` method consumes the factory, creates channels between stages, and returns
+/// a [`Chain`] of operators ready to execute.
+///
+/// `build` is generic over `S: Sender<O>` because different stages connect via different
+/// sender types (work-stealing, mpsc, worker-aware). This makes the trait **not object-safe**
+/// — see [`RecordBatchOperatorFactory`](super::record_batch_operator::RecordBatchOperatorFactory)
+/// for the object-safe equivalent at the `RecordBatch` boundary.
+pub trait OperatorFactory<O>: Send {
+    /// Build the operator chain, outputting to `sender`.
+    fn build<S: Sender<O> + 'static>(self: Box<Self>, sender: S) -> Chain;
 }
