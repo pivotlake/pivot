@@ -5,14 +5,14 @@ edition = "2024"
 
 [dependencies]
 
-arrow-array = { path = "../arrow/arrow-array" }
-arrow-schema = { path = "../arrow/arrow-schema" }
-arrow = { path = "../arrow/arrow", features = ["prettyprint"] }
-arrow-buffer = { path = "../arrow/arrow-buffer"}
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
+arrow-buffer = { path = "../arrow-rs/arrow-buffer"}
 
 crossbeam-deque = "0.8.6"
 core_affinity = "0.8.3"
-thiserror = { workspace = true }
+thiserror = "2.0.18"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 memchr = "2.7"
@@ -30,11 +30,11 @@ sysinfo = "0.38.0"
 io-uring = "0.7"
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs", "uio"] }
+nix = { version = "0.31.2", features = ["fs", "uio"] }
 
 [dev-dependencies]
 rstest = "0.26.1"
-parquet = { path = "../arrow/parquet", default-features = false, features = ["arrow", "snap"] }
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
 tempfile = "3"
 
 [[bench]]

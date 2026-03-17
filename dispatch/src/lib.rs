@@ -1,5 +1,5 @@
-//! Dispatch is a crate for high-throughput, low-latency, never-crashing, parallel data flow
-//! execution.
+//! Dispatch is a crate designed for high-throughput, low-latency, never-crashing (always-running),
+//! parallel data flow execution.
 //!
 //! The basic idea is to have a Worker per core (thread per core) which runs an event loop,
 //! prioritizing local work but also capable of stealing work from sibling workers.
