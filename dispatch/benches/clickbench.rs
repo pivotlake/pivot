@@ -7,14 +7,14 @@
 //!
 //! - `SOURCE_DIRECTORY` (required) — path to directory containing hits.parquet file(s)
 //! - `WORKER_COUNT` — number of worker threads (default: number of CPU cores)
-//! - `QUERY` — which query to run: 7, 20, 23, 33 (default: 20)
+//! - `QUERY` — which query/queries to run, comma-separated (default: all)
 //! - `QUERY_TEST_COUNT` — number of iterations (default: 20)
 //! - `SLEEP` — seconds to sleep between iterations (optional)
 //!
 //! # Usage
 //!
 //! ```sh
-//! SOURCE_DIRECTORY=/path/to/hits QUERY=33 QUERY_TEST_COUNT=5 cargo bench --bench clickbench
+//! SOURCE_DIRECTORY=/path/to/hits QUERY=7,20,33 QUERY_TEST_COUNT=5 cargo bench --bench clickbench
 //! ```
 
 use std::path::PathBuf;
@@ -213,6 +213,23 @@ http://tienskaia-moda	289355
     assert_result(EXPECTED, &results);
 }
 
+// ── Query registry ────────────────────────────────────────────────────────
+
+const QUERIES: &[(u32, fn(&Arc<ParquetTable>))] = &[
+    (7, run_query_7),
+    (20, run_query_20),
+    (23, run_query_23),
+    (33, run_query_33),
+];
+
+fn get_query_fn(id: u32) -> fn(&Arc<ParquetTable>) {
+    QUERIES
+        .iter()
+        .find(|(qid, _)| *qid == id)
+        .unwrap_or_else(|| panic!("Unknown query: {id}"))
+        .1
+}
+
 // ── Main ───────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -230,26 +247,33 @@ fn main() {
     let table =
         Arc::new(ParquetTable::from_directory(&SOURCE_DIRECTORY).expect("Could not create source"));
 
-    let query = get_env_var_with_default("QUERY", 20);
-    let iterations = get_env_var_with_default("QUERY_TEST_COUNT", 20);
+    let queries: Vec<(u32, fn(&Arc<ParquetTable>))> = match std::env::var("QUERY") {
+        Ok(val) => val
+            .split(',')
+            .map(|s| {
+                let id: u32 = s.trim().parse().expect("QUERY must be comma-separated numbers");
+                (id, get_query_fn(id))
+            })
+            .collect(),
+        Err(_) => QUERIES.to_vec(),
+    };
+    let iterations = get_env_var_with_default("QUERY_TEST_COUNT", 1);
 
-    for i in 0..iterations {
-        let start = Instant::now();
-        match query {
-            7 => run_query_7(&table),
-            20 => run_query_20(&table),
-            23 => run_query_23(&table),
-            33 => run_query_33(&table),
-            _ => run_query_20(&table),
-        }
-        println!(
-            "[{}/{}] Elapsed {}ms",
-            i + 1,
-            iterations,
-            start.elapsed().as_millis()
-        );
-        if let Ok(a) = std::env::var("SLEEP") {
-            sleep(Duration::from_secs(a.parse().unwrap()));
+    for (id, run) in &queries {
+        println!("=== Query {} ===", id);
+        for i in 0..iterations {
+            let start = Instant::now();
+            run(&table);
+            println!(
+                "[{}/{}] Query {} — {}ms",
+                i + 1,
+                iterations,
+                id,
+                start.elapsed().as_millis()
+            );
+            if let Ok(a) = std::env::var("SLEEP") {
+                sleep(Duration::from_secs(a.parse().unwrap()));
+            }
         }
     }
 }
