@@ -57,12 +57,10 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
 
 /// Builds a new [`Schema`] containing only the fields selected by `projection`.
 fn project_schema(schema: &Schema, projection: &Projection) -> Schema {
-    let fields: Vec<_> = schema
-        .fields()
+    let fields: Vec<_> = projection
+        .indices()
         .iter()
-        .enumerate()
-        .filter(|(i, _)| projection.includes(i))
-        .map(|(_, f)| f.clone())
+        .map(|&i| schema.field(i).clone())
         .collect();
 
     Schema::new(fields)
