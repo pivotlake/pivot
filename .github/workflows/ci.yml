@@ -13,8 +13,18 @@ env:
 
 jobs:
   test:
-    name: Test
+    name: Test (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: dispatch
+            workdir: dispatch
+          - name: planner
+            workdir: planner
+          - name: duckdb-planner
+            workdir: duckdb-planner
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,15 +34,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: dispatch
+          workspaces: ${{ matrix.crate.workdir }}
 
       - name: Run tests
-        working-directory: dispatch
+        working-directory: ${{ matrix.crate.workdir }}
         run: cargo test
 
   clippy:
-    name: Clippy
+    name: Clippy (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: dispatch
+            workdir: dispatch
+          - name: planner
+            workdir: planner
+          - name: duckdb-planner
+            workdir: duckdb-planner
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,15 +64,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: dispatch
+          workspaces: ${{ matrix.crate.workdir }}
 
       - name: Run clippy
-        working-directory: dispatch
+        working-directory: ${{ matrix.crate.workdir }}
         run: cargo clippy --all-targets
 
   fmt:
-    name: Format
+    name: Format (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: dispatch
+            workdir: dispatch
+          - name: planner
+            workdir: planner
+          - name: duckdb-planner
+            workdir: duckdb-planner
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,12 +93,22 @@ jobs:
           components: rustfmt
 
       - name: Check formatting
-        working-directory: dispatch
+        working-directory: ${{ matrix.crate.workdir }}
         run: cargo fmt --check
 
   doc:
-    name: Doc
+    name: Doc (${{ matrix.crate.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - name: dispatch
+            workdir: dispatch
+          - name: planner
+            workdir: planner
+          - name: duckdb-planner
+            workdir: duckdb-planner
     steps:
       - uses: actions/checkout@v4
         with:
@@ -78,8 +118,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: dispatch
+          workspaces: ${{ matrix.crate.workdir }}
 
       - name: Check documentation
-        working-directory: dispatch
+        working-directory: ${{ matrix.crate.workdir }}
         run: cargo doc --no-deps

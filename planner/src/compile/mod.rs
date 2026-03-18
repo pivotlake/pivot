@@ -1,0 +1,147 @@
+//! Compil a Pivot [`Plan`] into an executable
+//! [`RecordBatchOperatorSpec`].
+//!
+//! Compilation is a recursive walk: each [`PlanNode`] compiles its inputs
+//! first, then dispatches to the per-operator `compile` impl (e.g. a
+//! [`Filter`](crate::operator::Filter) compiles into
+//! [`RecordBatchOperatorSpec::filter`]). Expressions compile into **builder
+//! closures** ([`ExprFn`]) — `Fn()` returning a per-worker
+//! `FnMut(&RecordBatch) -> ExprResult` — matching dispatch's two-level
+//! closure pattern so each worker gets its own state without synchronization.
+//!
+//! # Organization
+//!
+//! - `operator` (private) — per-operator `compile` impls (one `impl` block
+//!   per [`Operator`](crate::operator::Operator) variant).
+//! - `expression` (private) — per-expression `compile` impls, producing
+//!   [`ExprFn`]s.
+//! - `create_table` (private) — the custom dispatch [`dispatch::Nullary`]
+//!   operator and factory backing
+//!   [`CreateTable::compile`](crate::operator::CreateTable).
+//!
+
+mod create_table;
+mod expression;
+mod operator;
+
+use crate::expression::Expression;
+use crate::types::Type;
+use crate::{Plan, PlanContext, PlanNode};
+use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
+use dispatch::RecordBatchOperatorSpec;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    #[error("Unexpected input Expression {0}")]
+    UnexpectedInputExpression(Expression),
+    #[error("Unexpected agg expression: {0:?}")]
+    UnexpectedAggExpression(Expression),
+    #[error("Unsupported projection expression: {0:?}")]
+    UnsupportedProjectionExpression(Expression),
+    #[error("Unsupported order by expression: {0:?}")]
+    UnsupportedOrderByExpression(Expression),
+    #[error("Unsupported top k expression: {0:?}")]
+    UnsupportedTopKExpression(Expression),
+    #[error("Unsupported aggregate functions with {0:?} params")]
+    UnsupportedAggregateGroupAmount(usize),
+    #[error("Unsupported aggregate expression: {0:?}")]
+    UnsupportedAggregateExpression(Expression),
+    #[error("Unsupported aggregate expression amount: {0}")]
+    UnsupportedAggregateExpressionAmount(usize),
+    #[error("Unsupported expression: {0:?}")]
+    UnsupportedExpression(Expression),
+    #[error("Unsupported type for group by: {0:?}")]
+    DataTypeNotSupportedForGroupBy(Type),
+    #[error("Unsupported expression for contains: {0:?}")]
+    UnsupportedExpressionForContainsNeedle(Expression),
+    #[error("Unsupported haystack expression for contains: {0:?}")]
+    UnsupportedExpressionForContainsHaystack(Expression),
+    #[error("Failed to downcast scalar into string: {0:?}")]
+    FailedToDowncastScalarIntoString(Scalar<ArrayRef>),
+    #[error("CREATE TABLE does not support OR REPLACE yet")]
+    UnsupportedCreateTableOrReplace,
+    #[error("CREATE TEMPORARY TABLE is not supported yet")]
+    UnsupportedTemporaryCreateTable,
+    #[error("CREATE TABLE AS SELECT is not supported yet")]
+    UnsupportedCreateTableAs,
+    #[error("CREATE TABLE with constraints is not supported yet ({0} constraint(s))")]
+    UnsupportedCreateTableConstraints(usize),
+    #[error("CREATE TABLE nodes should not have input operators")]
+    UnexpectedCreateTableInputs,
+}
+
+impl Plan {
+    pub fn compile(&self) -> Result<RecordBatchOperatorSpec, Error> {
+        self.root.compile(&self.plan_context)
+    }
+}
+
+impl PlanNode {
+    pub(crate) fn compile(
+        &self,
+        plan_context: &PlanContext,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        let mut inputs = self
+            .inputs
+            .iter()
+            .map(|i| i.compile(plan_context))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        match &self.operator {
+            crate::Operator::Input(o) => o.compile(plan_context),
+            crate::Operator::Projection(o) => o.compile(inputs.remove(0), plan_context),
+            crate::Operator::Filter(o) => o.compile(inputs.remove(0), plan_context),
+            crate::Operator::Aggregate(o) => o.compile(inputs.remove(0), plan_context),
+            crate::Operator::OrderBy(o) => o.compile(inputs.remove(0), plan_context),
+            crate::Operator::TopN(o) => o.compile(inputs.remove(0), plan_context),
+            crate::Operator::CreateTable(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedCreateTableInputs);
+                }
+                o.compile(plan_context)
+            }
+        }
+    }
+}
+
+/// What an evaluated expression produces for one input batch: either a
+/// per-row [`Array`](ExprResult::Array) (column refs, comparisons, scalar
+/// functions) or a single [`Scalar`](ExprResult::Scalar) (constants). Both
+/// variants implement arrow's [`Datum`] so consumers can pass them straight
+/// into kernels.
+pub enum ExprResult {
+    Array(ArrayRef),
+    Scalar(Scalar<ArrayRef>),
+}
+
+impl ExprResult {
+    pub fn as_datum(&self) -> &dyn Datum {
+        match self {
+            ExprResult::Array(a) => a,
+            ExprResult::Scalar(s) => s,
+        }
+    }
+}
+
+/// A per-batch evaluator: takes a [`RecordBatch`] and produces an
+/// [`ExprResult`]. `FnMut` so the closure can hold mutable per-worker state
+/// (e.g. a [`dispatch::Contains`] cache).
+pub type ExprEvalFn = Box<dyn FnMut(&RecordBatch) -> ExprResult + Send>;
+
+/// Builder for [`ExprEvalFn`]: called once per worker thread to produce that
+/// worker's private evaluator. Mirrors the two-level closure pattern used by
+/// dispatch's [`filter`](dispatch::RecordBatchOperatorSpec::filter) /
+/// [`project`](dispatch::RecordBatchOperatorSpec::project) APIs.
+pub type ExprFn = Box<dyn Fn() -> ExprEvalFn + Send + Sync>;
+
+/// Wraps a stateless expression closure into the builder pattern (closure returning closure).
+pub(crate) fn stateless_expr<F>(f: F) -> ExprFn
+where
+    F: Fn(&RecordBatch) -> ExprResult + Send + Sync + Clone + 'static,
+{
+    Box::new(move || {
+        let f = f.clone();
+        Box::new(move |batch: &RecordBatch| f(batch)) as ExprEvalFn
+    })
+}

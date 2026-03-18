@@ -45,7 +45,7 @@
 //! ```
 //!
 
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier, OnceLock};
 use std::thread::JoinHandle;
 use tikv_jemallocator::Jemalloc;
@@ -64,10 +64,18 @@ mod worker;
 
 use crate::worker::Worker;
 pub use api::*;
+pub use data_flow::WorkStatus;
 pub use functions::*;
+pub use io::IORequest;
+pub use memory::ReadBuffer;
+pub use operations::channels::{MpscSender, Sender};
+pub use operations::nullary::Result as NullaryResult;
 pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::ParquetTable;
-pub use operations::{IntKeyExtractor, OrderBy, StringKeyExtractor};
+pub use operations::{
+    IntKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator, OrderBy,
+    Result as OperatorResult, StringKeyExtractor,
+};
 
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"percpu_arena:percpu,oversize_threshold:0,\
@@ -120,7 +128,7 @@ pub fn init(num_workers: usize) {
 /// to send one `DataFlowBuilder` to each worker. The workers themselves drive execution
 /// in their own event loops.
 pub struct Dispatcher {
-    worker_senders: Vec<Sender<DataFlowBuilder>>,
+    worker_senders: Vec<StdSender<DataFlowBuilder>>,
     handles: Vec<JoinHandle<()>>,
 }
 
