@@ -62,8 +62,9 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    CountFactory, FilterFactory, GroupFactory, KeyExtractor, OrderBy, OrderByLimitFactory,
-    ProjectFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    CountFactory, FilterFactory, GroupFactory, KeyExtractor, NullaryFactory,
+    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, ProjectFactory, RootUnaryOperatorFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
@@ -239,6 +240,21 @@ impl RecordBatchOperatorSpec {
                 .map(|f| Box::new(f) as Box<dyn RecordBatchOperatorFactory>)
                 .collect(),
         }
+    }
+
+    /// Build a `RecordBatchOperatorSpec` from per-worker nullary factories.
+    ///
+    /// Each factory is wrapped in a [`NullaryOperatorFactory`] and the actual nullary is
+    /// built on the worker thread. This is useful for source-like or side-effect-only
+    /// operators such as DDL.
+    pub fn from_nullary<NF: NullaryFactory<RecordBatch>>(
+        nullary_factories: impl IntoIterator<Item = NF>,
+    ) -> Self {
+        Self::from_spec(OperatorSpec::new(
+            nullary_factories
+                .into_iter()
+                .map(NullaryOperatorFactory::new),
+        ))
     }
 
     /// Append a unary (one-in, one-out) stage to the dataflow.

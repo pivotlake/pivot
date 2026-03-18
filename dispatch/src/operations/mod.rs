@@ -11,6 +11,9 @@
 //!   dataflow. Three flavors: work-stealing (default), mpsc (final output), and
 //!   return-to-worker (worker-affinity routing).
 //!
+//! - **[`nullary`]** — Source-like operators with no input channel that can emit
+//!   output or perform side effects directly.
+//!
 //! - **[`unary`]** — The [`UnaryOperator`](unary::UnaryOperator), which reads from one
 //!   input channel and writes to one output channel, applying a [`Unary`](unary::Unary)
 //!   transform. Most query stages (filter, project, count, etc.) are built as unary
@@ -49,6 +52,9 @@ use thiserror::Error;
 
 pub mod channels;
 
+pub mod nullary;
+pub use nullary::*;
+
 mod unary;
 pub use unary::*;
 
@@ -56,6 +62,8 @@ pub use unary::*;
 pub enum Error {
     #[error("{0}")]
     Unary(#[from] unary::Error),
+    #[error("{0}")]
+    Nullary(#[from] nullary::Error),
     #[error("{0}")]
     Channel(#[from] channels::Error),
 }

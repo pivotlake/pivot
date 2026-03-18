@@ -39,6 +39,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// Holds a flat, globally-indexed list of `RowGroupMetadata` entries spanning
 /// every file. Cheaply shareable via `Arc` because the metadata is read-only
 /// after construction.
+#[derive(Clone)]
 pub struct ParquetTable {
     pub(crate) row_groups: Vec<Arc<RowGroupMetadata>>,
 }
