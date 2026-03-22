@@ -82,3 +82,15 @@ fn scan_multiple_parquet_files() {
 
     assert_eq!(extract_count(&results), 5);
 }
+
+#[test]
+fn scan_empty_table() {
+    init();
+    let (_dir, table) = parquet_table(&[strings_and_ints(&[], &[])]);
+
+    let results = table_input(&table, Projection::all(0), false)
+        .count()
+        .collect();
+
+    assert_eq!(extract_count(&results), 0);
+}

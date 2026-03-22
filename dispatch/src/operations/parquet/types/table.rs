@@ -18,9 +18,11 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
+
+static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -83,7 +85,11 @@ impl ParquetTable {
 
     /// Returns the Arrow schema (taken from the first row group).
     pub fn schema(&self) -> &SchemaRef {
-        &self.row_groups[0].schema
+        if self.row_groups.is_empty() {
+            &EMPTY_SCHEMA
+        } else {
+            &self.row_groups[0].schema
+        }
     }
 }
 

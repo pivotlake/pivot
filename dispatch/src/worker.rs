@@ -180,6 +180,8 @@ impl Worker {
         Ok(())
     }
 
+    /// Called when no other work is available; we either sleep or clean a dirty buffer.
+    /// We clean dirty buffers when we have nothing else to do to help future execution
     fn clear_dirty_buffer_or_sleep(&mut self) {
         if self.sleeps_between_clean >= 1
             && let Some(b) = pop_dirty_buffer()
