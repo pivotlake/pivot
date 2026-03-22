@@ -196,3 +196,74 @@ fn group_by_count_int_keys() {
 
     assert_eq!(collect_u64s(&results, 1), vec![3, 3, 2]);
 }
+
+#[test]
+fn concat_two_tables() {
+    init();
+    let (_dir1, table1) = parquet_table(&[strings_and_ints(&["a", "b", "c"], &[1, 2, 3])]);
+    let (_dir2, table2) = parquet_table(&[strings_and_ints(&["d", "e"], &[4, 5])]);
+
+    let left = table_input(&table1, Projection::all(2), false);
+    let right = table_input(&table2, Projection::all(2), false);
+
+    let results = left.concat(right).count().collect();
+
+    assert_eq!(extract_count(&results), 5);
+}
+
+#[test]
+fn concat_same_table() {
+    init();
+    let (_dir, table) = parquet_table(&[strings_and_ints(&["a", "b", "c"], &[1, 2, 3])]);
+
+    let left = table_input(&table, Projection::all(2), false);
+    let right = table_input(&table, Projection::all(2), false);
+
+    let results = left.concat(right).count().collect();
+
+    assert_eq!(extract_count(&results), 6);
+}
+
+#[test]
+fn concat_then_filter() {
+    init();
+    let (_dir1, table1) = parquet_table(&[strings_and_ints(&["alice", "bob"], &[1, 2])]);
+    let (_dir2, table2) =
+        parquet_table(&[strings_and_ints(&["alice", "carol", "alice"], &[3, 4, 5])]);
+
+    let left = table_input(&table1, Projection::columns([0]), false);
+    let right = table_input(&table2, Projection::columns([0]), false);
+
+    let results = left
+        .concat(right)
+        .filter(|| {
+            let mut c = Contains::new("alice");
+            move |batch: &RecordBatch| {
+                c.run(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .unwrap(),
+                )
+            }
+        })
+        .count()
+        .collect();
+
+    assert_eq!(extract_count(&results), 3);
+}
+
+#[test]
+fn concat_with_empty_side() {
+    init();
+    let (_dir1, table1) = parquet_table(&[strings_and_ints(&["a", "b"], &[1, 2])]);
+    let (_dir2, table2) = parquet_table(&[strings_and_ints(&[], &[])]);
+
+    let left = table_input(&table1, Projection::all(2), false);
+    let right = table_input(&table2, Projection::all(2), false);
+
+    let results = left.concat(right).count().collect();
+
+    assert_eq!(extract_count(&results), 2);
+}

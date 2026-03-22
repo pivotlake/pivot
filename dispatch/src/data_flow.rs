@@ -23,6 +23,7 @@ use crate::io::{DataFlowRequest, IORequest};
 use crate::memory::ReadBuffer;
 use crate::operations::Operator;
 use ahash::HashMap;
+use std::collections::VecDeque;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
 use std::result;
@@ -55,6 +56,9 @@ pub enum WorkStatus {
 /// Supports two traversal orders:
 /// - **Backwards** (leaf-to-root): for running CPU work and collecting IO requests.
 /// - **Forwards** (root-to-leaf): for stealing and finishing.
+///
+/// Binary operators create DAG structure (multiple parents per node). Both
+/// traversals use visited tracking to handle this correctly.
 struct OperatorGraph {
     operators: Vec<Box<dyn Operator>>,
 
@@ -62,7 +66,8 @@ struct OperatorGraph {
     roots: Vec<usize>,
 
     edges: Vec<Vec<usize>>,
-    back_edges: Vec<usize>,
+    /// Each node can have multiple parents (e.g. a binary operator has two).
+    back_edges: Vec<Vec<usize>>,
 }
 
 impl OperatorGraph {
@@ -77,16 +82,16 @@ impl OperatorGraph {
         let n = operators.len();
 
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut back_edges: Vec<usize> = vec![usize::MAX; n]; // MAX = no parent
+        let mut back_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
 
         for (&publisher, subscribers) in &publisher_to_subscribers {
             edges[publisher] = subscribers.clone();
             for &sub in subscribers {
-                back_edges[sub] = publisher;
+                back_edges[sub].push(publisher);
             }
         }
 
-        let roots = (0..n).filter(|&i| back_edges[i] == usize::MAX).collect();
+        let roots = (0..n).filter(|&i| back_edges[i].is_empty()).collect();
         let leafs = (0..n).filter(|&i| edges[i].is_empty()).collect();
 
         Self {
@@ -105,38 +110,49 @@ impl OperatorGraph {
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
-        for leaf_idx in &self.leafs {
-            let mut current_idx = Some(*leaf_idx);
+        let mut visited = vec![false; self.operators.len()];
+        let mut stack: Vec<usize> = self.leafs.clone();
+        while let Some(idx) = stack.pop() {
+            if visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
 
-            while let Some(idx) = current_idx {
-                let res = f(idx, self.operators[idx].as_mut())?;
-                if matches!(res, ControlFlow::Break(..)) {
-                    return Ok(res);
-                }
+            let res = f(idx, self.operators[idx].as_mut())?;
+            if matches!(res, ControlFlow::Break(..)) {
+                return Ok(res);
+            }
 
-                let next_idx = self.back_edges[idx];
-                if next_idx == usize::MAX {
-                    break;
-                }
-                current_idx = next_idx.into();
+            for &parent in &self.back_edges[idx] {
+                stack.push(parent);
             }
         }
         Ok(ControlFlow::Continue(()))
     }
 
+    /// Traverse root-to-leaf in topological order (Kahn's algorithm).
+    ///
+    /// A node is only visited after **all** its parents have been visited.
+    /// This guarantees that upstream operators finish before downstream ones,
+    /// which is critical for binary operators that have two parent chains.
     pub fn traverse_forwards<T, F: FnMut(usize, &mut dyn Operator) -> Result<ControlFlow<T>>>(
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
-        let mut stack = self.roots.clone();
-        while let Some(idx) = stack.pop() {
+        let mut remaining_parents: Vec<usize> = self.back_edges.iter().map(|p| p.len()).collect();
+        let mut queue: VecDeque<usize> = self.roots.iter().copied().collect();
+
+        while let Some(idx) = queue.pop_front() {
             let res = f(idx, self.operators[idx].as_mut())?;
             if matches!(res, ControlFlow::Break(..)) {
                 return Ok(res);
             }
 
             for &child_idx in &self.edges[idx] {
-                stack.push(child_idx);
+                remaining_parents[child_idx] -= 1;
+                if remaining_parents[child_idx] == 0 {
+                    queue.push_back(child_idx);
+                }
             }
         }
         Ok(ControlFlow::Continue(()))

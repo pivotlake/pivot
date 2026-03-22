@@ -52,10 +52,15 @@ pub mod channels;
 mod unary;
 pub use unary::*;
 
+mod binary;
+pub use binary::*;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
     Unary(#[from] unary::Error),
+    #[error("{0}")]
+    Binary(#[from] binary::Error),
     #[error("{0}")]
     Channel(#[from] channels::Error),
 }

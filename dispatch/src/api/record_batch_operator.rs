@@ -62,8 +62,9 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    CountFactory, FilterFactory, GroupFactory, KeyExtractor, OrderBy, OrderByLimitFactory,
-    ProjectFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    BinaryFactory, BinaryOperator, ConcatFactory, CountFactory, FilterFactory, GroupFactory,
+    KeyExtractor, OrderBy, OrderByLimitFactory, ProjectFactory, RootUnaryOperatorFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
@@ -138,6 +139,63 @@ impl<UF: UnaryFactory<RecordBatch, RecordBatch>> RecordBatchOperatorFactory
             sender,
             self.siblings_left,
         )))
+    }
+}
+
+/// Type-erased binary operator factory for `(RecordBatch, RecordBatch) -> RecordBatch` stages.
+///
+/// Wraps two type-erased heads (`Box<dyn RecordBatchOperatorFactory>`) with a concrete
+/// binary operation (e.g. concat). The `BF` type parameter is the concrete
+/// [`BinaryFactory`] — it gets erased when this struct is boxed as
+/// `Box<dyn RecordBatchOperatorFactory>`.
+pub struct RecordBatchBinaryOperatorFactory<
+    BF: BinaryFactory<RecordBatch, RecordBatch, RecordBatch>,
+> {
+    left_head: Box<dyn RecordBatchOperatorFactory>,
+    right_head: Box<dyn RecordBatchOperatorFactory>,
+    binary_factory: BF,
+    left_channel_factory: StealableChannelFactory<RecordBatch>,
+    right_channel_factory: StealableChannelFactory<RecordBatch>,
+    siblings_left: Arc<AtomicUsize>,
+}
+
+impl<BF: BinaryFactory<RecordBatch, RecordBatch, RecordBatch>> RecordBatchOperatorFactory
+    for RecordBatchBinaryOperatorFactory<BF>
+{
+    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> Chain {
+        let (left_tx, left_rx) = self.left_channel_factory.build();
+        let (right_tx, right_rx) = self.right_channel_factory.build();
+        let left_chain = self.left_head.build_stealable(left_tx);
+        let right_chain = self.right_head.build_stealable(right_tx);
+        Chain::merge(
+            left_chain,
+            right_chain,
+            Box::new(BinaryOperator::new(
+                self.binary_factory.build_binary(),
+                left_rx,
+                right_rx,
+                sender,
+                self.siblings_left,
+            )),
+        )
+    }
+
+    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> Chain {
+        let (left_tx, left_rx) = self.left_channel_factory.build();
+        let (right_tx, right_rx) = self.right_channel_factory.build();
+        let left_chain = self.left_head.build_stealable(left_tx);
+        let right_chain = self.right_head.build_stealable(right_tx);
+        Chain::merge(
+            left_chain,
+            right_chain,
+            Box::new(BinaryOperator::new(
+                self.binary_factory.build_binary(),
+                left_rx,
+                right_rx,
+                sender,
+                self.siblings_left,
+            )),
+        )
     }
 }
 
@@ -405,6 +463,57 @@ impl RecordBatchOperatorSpec {
             group_column,
             dispatcher().workers(),
         ))
+    }
+
+    /// Append a binary (two-in, one-out) stage to the dataflow.
+    ///
+    /// Combines `self` (left input) and `other` (right input) through a
+    /// [`BinaryFactory`]-produced operator.
+    fn binary<BF: BinaryFactory<RecordBatch, RecordBatch, RecordBatch>>(
+        self,
+        other: RecordBatchOperatorSpec,
+        binary_factories: impl IntoIterator<Item = BF>,
+    ) -> Self {
+        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
+        let factories = stealable::<RecordBatch>()
+            .into_iter()
+            .zip(stealable::<RecordBatch>())
+            .zip(binary_factories)
+            .zip(self.factories)
+            .zip(other.factories)
+            .map(|((((left_ch, right_ch), bf), left_head), right_head)| {
+                Box::new(RecordBatchBinaryOperatorFactory {
+                    left_head,
+                    right_head,
+                    binary_factory: bf,
+                    left_channel_factory: left_ch,
+                    right_channel_factory: right_ch,
+                    siblings_left: siblings_left.clone(),
+                }) as Box<dyn RecordBatchOperatorFactory>
+            })
+            .collect();
+        Self { factories }
+    }
+
+    /// Concatenate two dataflows into one.
+    ///
+    /// All batches from both `self` and `other` are forwarded downstream.
+    /// The output order is not guaranteed.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use dispatch::*;
+    /// # use dispatch::table_input;
+    /// # let table1 = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp/a")).unwrap());
+    /// # let table2 = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp/b")).unwrap());
+    /// let left = table_input(&table1, Projection::columns([0]), false);
+    /// let right = table_input(&table2, Projection::columns([0]), false);
+    /// let results = left.concat(right).count().collect();
+    /// ```
+    pub fn concat(self, other: RecordBatchOperatorSpec) -> Self {
+        self.binary(other, (0..dispatcher().workers()).map(|_| ConcatFactory))
     }
 
     /// Materialize additional columns from the underlying parquet table.

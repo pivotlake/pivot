@@ -83,6 +83,6 @@ pub use operator_spec::{OperatorFactory, OperatorSpec};
 
 mod record_batch_operator;
 pub use record_batch_operator::{
-    RECORD_BATCH_SIZE, RecordBatchOperatorFactory, RecordBatchOperatorSpec,
-    RecordBatchUnaryOperatorFactory, table_input,
+    RECORD_BATCH_SIZE, RecordBatchBinaryOperatorFactory, RecordBatchOperatorFactory,
+    RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory, table_input,
 };

@@ -67,7 +67,7 @@ pub use api::*;
 pub use functions::*;
 pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::ParquetTable;
-pub use operations::{IntKeyExtractor, OrderBy, StringKeyExtractor};
+pub use operations::{ConcatFactory, IntKeyExtractor, OrderBy, StringKeyExtractor};
 
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"percpu_arena:percpu,oversize_threshold:0,\
