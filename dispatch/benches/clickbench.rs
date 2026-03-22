@@ -251,7 +251,10 @@ fn main() {
         Ok(val) => val
             .split(',')
             .map(|s| {
-                let id: u32 = s.trim().parse().expect("QUERY must be comma-separated numbers");
+                let id: u32 = s
+                    .trim()
+                    .parse()
+                    .expect("QUERY must be comma-separated numbers");
                 (id, get_query_fn(id))
             })
             .collect(),
