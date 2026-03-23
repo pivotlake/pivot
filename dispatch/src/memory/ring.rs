@@ -28,8 +28,8 @@ use std::{io, ptr};
 pub const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 /// Page alignment for the mmap region.
 const BUFFER_ALIGN: usize = 4096;
-/// Total number of slots — half of physical memory divided by slot size.
-static BUFFERS: LazyLock<usize> = LazyLock::new(|| get_total_memory() / 2 / BUFFER_SIZE);
+/// Total number of slots — 75% of physical memory divided by slot size.
+static BUFFERS: LazyLock<usize> = LazyLock::new(|| get_total_memory() * 3 / 4 / BUFFER_SIZE);
 /// Bit flag set in `BufferSlot::used` when a writer holds the slot.
 const WRITING: u32 = 1 << 31;
 /// Global singleton ring, lazily initialized on first access.

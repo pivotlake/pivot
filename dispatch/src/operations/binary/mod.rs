@@ -37,6 +37,8 @@ use super::Operator;
 use super::channels::{Receiver, Sender};
 
 mod concat;
+mod join;
+
 pub use concat::ConcatFactory;
 
 #[derive(Debug, Error)]

@@ -4,6 +4,7 @@ use crate::operations::unary::parquet::types::metadata::{ColumnChunkMeta, QueryR
 use crate::operations::unary::parquet::types::projection::Projection;
 use bytes::Bytes;
 use std::os::fd::{AsRawFd, RawFd};
+use crate::worker::WORKER_IDX;
 
 /// Context attached to each `IORequest` so that when the IO completes we know which column and
 /// buffer slot the returned data belongs to.

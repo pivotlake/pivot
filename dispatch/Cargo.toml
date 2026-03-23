@@ -9,6 +9,7 @@ arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
 arrow-buffer = { path = "../arrow-rs/arrow-buffer"}
+arrow-row = { path = "../arrow-rs/arrow-row" }
 
 crossbeam-deque = "0.8.6"
 core_affinity = "0.8.3"
@@ -39,3 +40,11 @@ tempfile = "3"
 [[bench]]
 name = "clickbench"
 harness = false
+
+[[bench]]
+name = "tpch"
+harness = false
+
+[profile.profiling]
+inherits = "release"
+debug = true

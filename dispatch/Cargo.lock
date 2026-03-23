@@ -413,6 +413,7 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-buffer",
+ "arrow-row",
  "arrow-schema",
  "bytes",
  "core_affinity",
