@@ -61,7 +61,7 @@ use super::Operator;
 use super::channels::{Receiver, Sender};
 
 mod pipeline_breaker;
-pub use pipeline_breaker::Consumer;
+pub use pipeline_breaker::{Consumer, Outputter};
 
 mod count;
 pub use count::CountFactory;
