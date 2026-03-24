@@ -1,227 +1,209 @@
-mod hashtable;
+mod factory;
+mod directory;
+mod probe;
+mod build;
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
+pub use factory::{JoinBuildFactory, JoinProbeFactory, create_for_workers as create_join_factories};
+use crate::operations::unary::join::directory::Directory;
 
-use ahash::RandomState;
-use arrow_array::{Array, ArrayAccessor, Int64Array, RecordBatch};
-use crossbeam_deque::{Injector, Steal};
 
-use crate::operations::channels::Sender;
-use crate::operations::unary;
-use crate::operations::unary::join::hashtable::Directory;
-use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
+pub(crate) type Value = (u64, u64);
 
-type Value = (u64, u64);
-
-const NUM_PARTITIONS: usize = 64;
-const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
-
-struct JoinBuildConsumer {
-    key_column: usize,
-    hash_state: RandomState,
-    values: Vec<Vec<(u64, Value)>>,
-    partition_sizes: Arc<Vec<AtomicUsize>>,
-    sender: mpsc::Sender<Vec<Vec<(u64, Value)>>>,
-    outputter: JoinBuilder,
+/// Shared hash table state returned by [`JoinBuildFactory::create_for_workers`].
+/// Hand this to the probe side after the build pipeline completes.
+pub struct JoinTable {
+    pub directory: Arc<UnsafeCell<Directory>>,
+    pub arena: Arc<UnsafeCell<Vec<Value>>>,
 }
 
-unsafe impl Send for JoinBuildConsumer {}
+unsafe impl Send for JoinTable {}
 
-impl JoinBuildConsumer {
-    pub fn new(
-        key_column: usize,
-        hash_state: RandomState,
-        sender: mpsc::Sender<Vec<Vec<(u64, Value)>>>,
-        receiver: Option<mpsc::Receiver<Vec<Vec<(u64, Value)>>>>,
-        partition_sizes: Arc<Vec<AtomicUsize>>,
-        directory: Arc<UnsafeCell<Directory>>,
-        arena: Arc<UnsafeCell<Vec<Value>>>,
-        injector: Arc<Injector<JoinPartitionJob>>,
-        jobs_injected: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            key_column,
-            hash_state,
-            values: (0..NUM_PARTITIONS).map(|_| Vec::new()).collect(),
-            partition_sizes: partition_sizes.clone(),
-            sender,
-            outputter: JoinBuilder {
-                directory,
-                arena,
-                receiver,
-                partition_sizes,
-                injector,
-                jobs_injected,
-            },
-        }
-    }
-}
+unsafe impl Sync for JoinTable {}
 
-impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
-    type Outputter = JoinBuilder;
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-    fn consume<S: Sender<()>>(
-        &mut self,
-        batch: RecordBatch,
-        _sender: &mut S,
-    ) -> unary::Result<()> {
-        let col = batch
-            .column(self.key_column)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        let n = col.len();
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
 
-        for i in 0..n {
-            let key = unsafe { col.value_unchecked(i) };
-            let hash = self.hash_state.hash_one(key);
-            let partition = (hash >> PARTITION_SHIFT) as usize;
-            self.values[partition].push((hash, (key as u64, i as u64)));
-        }
+    use std::sync::atomic::Ordering;
 
-        Ok(())
+    use crate::operations::channels::VoidSender;
+    use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+    use crate::operations::unary::test_utils::CollectSender;
+    use crate::operations::{Unary, UnaryFactory};
+
+    use super::build::JoinBuildConsumer;
+    use super::factory;
+
+    fn int64_batch(keys: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(keys.to_vec()))],
+        )
+        .unwrap()
     }
 
-    fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
-        for (p, partition) in self.values.iter().enumerate() {
-            self.partition_sizes[p].fetch_add(partition.len(), Ordering::Relaxed);
+    fn extract_consumer(
+        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer>,
+    ) -> JoinBuildConsumer {
+        match breaker {
+            PipelineBreaker::Consuming(c) => c,
+            _ => unreachable!(),
         }
-        self.sender.send(self.values).unwrap();
-        Ok(Some(self.outputter))
     }
-}
 
-struct JoinBuilder {
-    directory: Arc<UnsafeCell<Directory>>,
-    arena: Arc<UnsafeCell<Vec<Value>>>,
-    receiver: Option<mpsc::Receiver<Vec<Vec<(u64, Value)>>>>,
-    partition_sizes: Arc<Vec<AtomicUsize>>,
-    injector: Arc<Injector<JoinPartitionJob>>,
-    jobs_injected: Arc<AtomicBool>,
-}
+    fn build_and_probe(
+        build_worker_batches: Vec<Vec<RecordBatch>>,
+        probe_batches: Vec<RecordBatch>,
+    ) -> Vec<RecordBatch> {
+        let workers = build_worker_batches.len();
+        let (builds, probes, _gate) = factory::create_for_workers(0, 0, workers);
 
-unsafe impl Send for JoinBuilder {}
+        let mut consumers: Vec<_> = builds
+            .into_iter()
+            .map(|f| extract_consumer(f.build_unary()))
+            .collect();
 
-struct JoinPartitionJob {
-    tuples: Vec<Vec<(u64, Value)>>,
-    directory: Arc<UnsafeCell<Directory>>,
-    arena: Arc<UnsafeCell<Vec<Value>>>,
-    arena_offset: usize,
-    slot_start: usize,
-}
+        let mut void = VoidSender;
+        for (consumer, batches) in consumers.iter_mut().zip(&build_worker_batches) {
+            for batch in batches {
+                consumer.consume(batch.clone(), &mut void).unwrap();
+            }
+        }
 
-unsafe impl Send for JoinPartitionJob {}
+        let mut outputters: Vec<_> = consumers
+            .into_iter()
+            .filter_map(|c| c.into_outputter().unwrap())
+            .collect();
 
-impl JoinPartitionJob {
-    fn run(self) {
-        let dir_ptr = self.directory.get();
-        let shift = unsafe { (*dir_ptr).shift };
-        let dir_capacity = unsafe { (*dir_ptr).entries.len() };
-        let dir_entries = unsafe { (*dir_ptr).entries.as_mut_ptr() };
-        let arena_ptr = unsafe { (*self.arena.get()).as_mut_ptr() };
-
-        // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
-        // lower 16 bits — directly in the directory, no side allocations.
-        for worker_tuples in &self.tuples {
-            for &(hash, _) in worker_tuples {
-                let slot = (hash >> shift) as usize;
-                unsafe {
-                    *dir_entries.add(slot) += 1 << 16;
-                    *dir_entries.add(slot) |= Directory::bloom(hash);
+        loop {
+            let mut all_done = true;
+            for o in &mut outputters {
+                if !o.output(&mut void).unwrap() {
+                    all_done = false;
                 }
             }
-        }
-
-        // Pass 2: convert counts → absolute write cursors. Linear sweep
-        // over this partition's directory slot range replaces each count
-        // with a running arena pointer while preserving the tag bits.
-        let slots_per_partition = dir_capacity / NUM_PARTITIONS;
-        let slot_end = self.slot_start + slots_per_partition;
-        let mut cur = self.arena_offset as u64;
-        for i in self.slot_start..slot_end {
-            unsafe {
-                let entry = *dir_entries.add(i);
-                let count = entry >> 16;
-                let tag = entry & 0xFFFF;
-                dir_entries.add(i).write((cur << 16) | tag);
-                cur += count;
+            if all_done {
+                break;
             }
         }
 
-        // Pass 3: scatter values into arena. The upper 48 bits of each
-        // directory entry serve as the write cursor; advancing by 1<<16
-        // leaves the tag bits untouched. After this pass the cursors have
-        // become end-pointers.
-        for worker_tuples in &self.tuples {
-            for &(hash, value) in worker_tuples {
-                let slot = (hash >> shift) as usize;
-                unsafe {
-                    let arena_idx = (*dir_entries.add(slot) >> 16) as usize;
-                    arena_ptr.add(arena_idx).write(value);
-                    *dir_entries.add(slot) += 1 << 16;
-                }
-            }
+        let mut probe = probes.into_iter().next().unwrap().build_unary();
+        let mut sender = CollectSender::new();
+        for batch in probe_batches {
+            probe.consume(batch, &mut sender).unwrap();
         }
+        sender.items
     }
-}
 
-impl Outputter<()> for JoinBuilder {
-    fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        if let Some(rx) = self.receiver.take() {
-            let mut all_worker_tuples: Vec<Vec<Vec<(u64, Value)>>> = rx.into_iter().collect();
+    fn collect_build_keys(results: &[RecordBatch]) -> Vec<i64> {
+        results
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
 
-            let sizes: Vec<usize> = self
-                .partition_sizes
-                .iter()
-                .map(|a| a.load(Ordering::Relaxed))
-                .collect();
-            let total: usize = sizes.iter().sum();
+    #[test]
+    fn single_key_match() {
+        let results = build_and_probe(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[20])],
+        );
 
-            // Pre-allocate directory and arena.
-            let dir_capacity = ((total as f64 * 1.125) as usize).next_power_of_two().max(64);
-            let directory = unsafe { &mut *self.directory.get() };
-            *directory = Directory::with_capacity(dir_capacity);
+        let keys = collect_build_keys(&results);
+        assert_eq!(keys, vec![20]);
+    }
 
-            let arena = unsafe { &mut *self.arena.get() };
-            arena.resize(total, (0, 0));
+    #[test]
+    fn multiple_key_matches() {
+        let results = build_and_probe(
+            vec![vec![int64_batch(&[10, 20, 30, 40, 50])]],
+            vec![int64_batch(&[20, 40])],
+        );
 
-            // Prefix sums give each partition its arena offset.
-            let mut offsets = vec![0usize; NUM_PARTITIONS];
-            for p in 1..NUM_PARTITIONS {
-                offsets[p] = offsets[p - 1] + sizes[p - 1];
-            }
+        let mut keys = collect_build_keys(&results);
+        keys.sort();
+        assert_eq!(keys, vec![20, 40]);
+    }
 
-            let slots_per_partition = dir_capacity / NUM_PARTITIONS;
-            for i in 0..NUM_PARTITIONS {
-                let tuples: Vec<Vec<(u64, Value)>> = all_worker_tuples
-                    .iter_mut()
-                    .map(|worker| std::mem::take(&mut worker[i]))
-                    .collect();
-                self.injector.push(JoinPartitionJob {
-                    tuples,
-                    directory: self.directory.clone(),
-                    arena: self.arena.clone(),
-                    arena_offset: offsets[i],
-                    slot_start: i * slots_per_partition,
-                });
-            }
-            self.jobs_injected.store(true, Ordering::Relaxed);
-        }
+    #[test]
+    fn no_matches() {
+        let results = build_and_probe(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[99, 100])],
+        );
 
-        match self.injector.steal() {
-            Steal::Success(job) => {
-                job.run();
-            }
-            Steal::Empty => {
-                if self.jobs_injected.load(Ordering::Relaxed) {
-                    return Ok(true);
-                }
-            }
-            Steal::Retry => {}
-        }
+        assert!(results.is_empty());
+    }
 
-        Ok(false)
+    #[test]
+    fn duplicate_build_keys_produce_multiple_matches() {
+        let results = build_and_probe(
+            vec![vec![int64_batch(&[10, 10, 20])]],
+            vec![int64_batch(&[10])],
+        );
+
+        let mut keys = collect_build_keys(&results);
+        keys.sort();
+        assert_eq!(keys, vec![10, 10]);
+    }
+
+    #[test]
+    fn multiple_build_batches() {
+        let results = build_and_probe(
+            vec![vec![int64_batch(&[10, 20]), int64_batch(&[30, 40])]],
+            vec![int64_batch(&[20, 30])],
+        );
+
+        let mut keys = collect_build_keys(&results);
+        keys.sort();
+        assert_eq!(keys, vec![20, 30]);
+    }
+
+    #[test]
+    fn two_build_workers() {
+        let results = build_and_probe(
+            vec![
+                vec![int64_batch(&[10, 20])],
+                vec![int64_batch(&[30, 40])],
+            ],
+            vec![int64_batch(&[10, 30])],
+        );
+
+        let mut keys = collect_build_keys(&results);
+        keys.sort();
+        assert_eq!(keys, vec![10, 30]);
+    }
+
+    #[test]
+    fn empty_build_no_matches() {
+        let results = build_and_probe(
+            vec![vec![int64_batch(&[])]],
+            vec![int64_batch(&[10])],
+        );
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn empty_probe_no_output() {
+        let results = build_and_probe(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[])],
+        );
+
+        assert!(results.is_empty());
     }
 }

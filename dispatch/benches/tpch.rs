@@ -108,6 +108,16 @@ impl TpchTables {
 //     (SELECT COUNT(*) FROM lineitem) AS lineitem_count,
 //     (SELECT COUNT(*) FROM orders) AS orders_count
 
+fn run_query_join_orders(tables: &TpchTables) {
+    let orders = table_input(&tables.orders, Projection::from_field_names(tables.orders.schema(), ["o_orderkey"]), false);
+    let joined = table_input(
+        &tables.lineitem,
+        Projection::from_field_names(tables.lineitem.schema(), ["l_orderkey"]),
+        false,
+    ).join(orders, 0, 0);
+    joined.collect();
+}
+
 fn run_query_count(tables: &TpchTables) {
     const EXPECTED: &str = "600037902\n150000000\n";
 
@@ -194,6 +204,7 @@ fn run_query_12(tables: &TpchTables) {
 
 const QUERIES: &[(u32, fn(&TpchTables))] = &[
     (0, run_query_count),
+    (1, run_query_join_orders),
     (12, run_query_12),
 ];
 

@@ -79,6 +79,8 @@ pub mod parquet;
 
 mod order_by_limit;
 pub use order_by_limit::{OrderBy, OrderByLimitFactory};
+mod join;
+pub use join::{JoinBuildFactory, JoinProbeFactory, create_join_factories};
 
 use crate::memory::ReadBuffer;
 

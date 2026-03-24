@@ -55,6 +55,9 @@ pub use unary::*;
 mod binary;
 pub use binary::*;
 
+mod gated;
+pub(crate) use gated::GatedOperator;
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]

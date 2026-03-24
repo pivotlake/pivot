@@ -80,6 +80,15 @@ pub trait Receiver<I> {
     fn steal(&self) -> Option<I>;
 }
 
+/// No-op sender for operators whose output is discarded
+pub struct VoidSender;
+
+impl Sender<()> for VoidSender {
+    fn send(&mut self, _item: ()) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl Sender<RowGroupRequest> for Injector<RowGroupRequest> {
     fn send(&mut self, item: RowGroupRequest) -> Result<()> {
         self.push(item);

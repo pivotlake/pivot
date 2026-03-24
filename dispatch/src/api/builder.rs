@@ -1,12 +1,15 @@
 use super::record_batch_operator::RecordBatchOperatorFactory;
-use crate::Identifier;
-use crate::data_flow::DataFlow;
-use crate::operations::Operator;
-use crate::operations::channels::MpscSender;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use ahash::HashMap;
 use arrow_array::RecordBatch;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::Identifier;
+use crate::data_flow::DataFlow;
+use crate::operations::{GatedOperator, Operator};
+use crate::operations::channels::MpscSender;
 
 static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
 
@@ -71,6 +74,52 @@ impl Chain {
         operators.push(binary_op);
 
         Self { operators, edges }
+    }
+
+    /// Combine two independent chains into a single operator graph.
+    ///
+    /// No edges are created between them — coordination happens through shared state
+    /// (e.g. a gate atomic). Both chains' operators run in the same `DataFlow`.
+    pub fn parallel(left: Chain, right: Chain) -> Self {
+        let left_len = left.operators.len();
+        let mut edges = left.edges;
+        for (k, v) in right.edges {
+            edges.insert(k + left_len, v.into_iter().map(|i| i + left_len).collect());
+        }
+        let mut operators = left.operators;
+        operators.extend(right.operators);
+        Self { operators, edges }
+    }
+
+    /// Wrap all root operators (those with no parents) in a [`GatedOperator`].
+    ///
+    /// While the gate is closed, the roots produce no work, no IO, and refuse to
+    /// finish — effectively freezing the entire sub-pipeline they feed.
+    pub fn gate_roots(self, gate: Arc<AtomicBool>) -> Self {
+        let mut has_parent = vec![false; self.operators.len()];
+        for children in self.edges.values() {
+            for &child in children {
+                has_parent[child] = true;
+            }
+        }
+
+        let operators = self
+            .operators
+            .into_iter()
+            .enumerate()
+            .map(|(i, op)| -> Box<dyn Operator> {
+                if has_parent[i] {
+                    op
+                } else {
+                    Box::new(GatedOperator::new(op, gate.clone()))
+                }
+            })
+            .collect();
+
+        Self {
+            operators,
+            edges: self.edges,
+        }
     }
 
     /// Convert this chain into an executable `DataFlow`.
