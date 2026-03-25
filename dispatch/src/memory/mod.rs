@@ -39,7 +39,7 @@ mod read_buffer;
 pub use read_buffer::ReadBuffer;
 
 mod slab;
-pub use slab::{MultiSlabBuffer, SlabAllocator, SlabBuffer, SlabVec, SlabVecIterator};
+pub use slab::{ContiguousMultiBuffer, MultiSlabBuffer, SlabAllocator, SlabBuffer, SlabVec, SlabVecIterator};
 
 mod reader;
 mod write_buffer_vec;

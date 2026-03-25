@@ -33,6 +33,9 @@ pub use slab_buffer::SlabBuffer;
 mod multi_slab_buffer;
 pub use multi_slab_buffer::MultiSlabBuffer;
 
+mod contiguous_multi_buffer;
+pub use contiguous_multi_buffer::ContiguousMultiBuffer;
+
 mod slab_vec;
 pub use slab_vec::{SlabVec, SlabVecIterator};
 

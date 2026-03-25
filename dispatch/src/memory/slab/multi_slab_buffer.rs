@@ -17,7 +17,12 @@ const BUFFER_MASK: usize = BUFFER_SIZE - 1;
 /// not track its logical length — callers must track how many elements have been written. This
 /// means accessing indexes that have not yet been set is UB.
 pub struct MultiSlabBuffer<T> {
+    /// Owns the slab memory (keeps `Arc<WriteBuffer>`s alive).
     slabs: Vec<Slab>,
+    /// Pre-extracted slab base pointers — 8 bytes each instead of striding through
+    /// 24-byte `Slab` structs, so the lookup array is 3× more compact and L1-resident
+    /// for typical slab counts.
+    slab_ptrs: Box<[*mut u8]>,
     _phantom: PhantomData<T>,
 }
 
@@ -25,8 +30,10 @@ impl<T> MultiSlabBuffer<T> {
     /// Wraps existing slabs into a `MultiSlabBuffer`. Each slab must start at offset 0
     /// of its `WriteBuffer` for indexing to work correctly.
     pub fn new(slabs: Vec<Slab>) -> Self {
+        let slab_ptrs = slabs.iter().map(|s| s.ptr).collect::<Vec<_>>().into_boxed_slice();
         Self {
             slabs,
+            slab_ptrs,
             _phantom: Default::default(),
         }
     }
@@ -34,12 +41,14 @@ impl<T> MultiSlabBuffer<T> {
     /// Returns a raw pointer to the element at `index`.
     ///
     /// Computes the byte offset, determines which slab it falls in via bit-shift, and
-    /// the offset within that slab via bit-mask.
+    /// the offset within that slab via bit-mask. Uses a pre-extracted pointer array
+    /// for compact, unchecked lookup.
+    #[inline(always)]
     pub(crate) fn ptr_at_index(&self, index: usize) -> *mut T {
         let byte_offset = index * size_of::<T>();
         let buffer_idx = byte_offset >> BUFFER_SHIFT;
         let offset_in_buffer = byte_offset & BUFFER_MASK;
-        unsafe { self.slabs[buffer_idx].ptr.add(offset_in_buffer) as *mut T }
+        unsafe { self.slab_ptrs.get_unchecked(buffer_idx).add(offset_in_buffer) as *mut T }
     }
 
     /// Consumes the buffer and returns the single backing `Slab`.
@@ -69,6 +78,8 @@ impl<T> Index<usize> for MultiSlabBuffer<T> {
 }
 
 impl<T> IndexMut<usize> for MultiSlabBuffer<T> {
+    
+    #[inline(always)]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         unsafe { &mut *self.ptr_at_index(index) }
     }

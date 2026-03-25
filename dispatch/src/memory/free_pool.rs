@@ -135,16 +135,14 @@ pub fn init_free_pool(worker_idx: usize) {
             },
         });
 
-        // Pre-fault buffers (strided by NUM_WORKERS) so each worker faults different pages.
-        // We forget the WriteBuffer to avoid the Drop impl pushing to the dirty pool,
-        // then manually release the slot and push to the zeroed pool.
+        // Pre-fault buffers (strided by NUM_WORKERS) so each worker faults different pages-
+        // whatever the worker faults will also be pushed into it's free pool
         for i in (worker_idx..RING.len()).step_by(num_workers()) {
             let mut write = RING.try_write(i).unwrap();
             for j in (0..BUFFER_SIZE).step_by(4096) {
                 write.as_mut()[j] = 1u8;
             }
             write.zero_out();
-            black_box(());
         }
     });
 }

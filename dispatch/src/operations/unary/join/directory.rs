@@ -1,3 +1,6 @@
+use std::cell::UnsafeCell;
+use crate::memory::{MultiSlabBuffer, SlabAllocator};
+
 const PTR_SHIFT: u32 = 16;
 
 const fn build_tag_table() -> [u16; 2048] {
@@ -18,10 +21,8 @@ static TAG_TABLE: [u16; 2048] = build_tag_table();
 
 pub struct Directory {
     /// Sentinel at index 0 (always zero), then `capacity` real slots.
-    entries: Vec<u64>,
-    /// Base pointer into `entries`, past the sentinel (i.e. &entries[1]).
-    /// All slot indexing goes through this so hash-derived indices work directly.
-    base: *mut u64,
+    entries: UnsafeCell<MultiSlabBuffer<u64>>,
+    capacity: usize,
     pub(crate) shift: u32,
 }
 
@@ -31,24 +32,32 @@ unsafe impl Sync for Directory {}
 impl Directory {
     pub fn empty() -> Self {
         Self {
-            entries: Vec::new(),
-            base: std::ptr::null_mut(),
+            entries: UnsafeCell::new(MultiSlabBuffer::new(vec![])),
+            capacity: 0,
             shift: 64,
         }
     }
 
     /// Allocate a directory with a zeroed sentinel at index 0 followed by
-    /// `capacity` zeroed real slots. `base` points past the sentinel so
-    /// `slot_for(hash)` indexes directly without any +1 adjustment.
-    pub fn with_capacity(capacity: usize) -> Self {
+    /// `capacity` zeroed real slots.
+    pub fn with_capacity(capacity: usize, allocator: &mut SlabAllocator) -> Self {
         debug_assert!(capacity.is_power_of_two());
-        let mut entries = vec![0u64; capacity + 1];
-        let base = unsafe { entries.as_mut_ptr().add(1) };
+        let entries = allocator.create_multi_slab_buffer::<u64>(capacity + 1, true);
         Self {
-            entries,
-            base,
+            entries: UnsafeCell::new(entries),
+            capacity,
             shift: 64 - capacity.trailing_zeros(),
         }
+    }
+
+    #[inline(always)]
+    fn entries(&self) -> &MultiSlabBuffer<u64> {
+        unsafe { &*self.entries.get() }
+    }
+
+    #[inline(always)]
+    fn entries_mut(&self) -> &mut MultiSlabBuffer<u64> {
+        unsafe { &mut *self.entries.get() }
     }
 
     #[inline(always)]
@@ -62,34 +71,51 @@ impl Directory {
         (hash >> self.shift) as usize
     }
 
-    /// Raw base pointer past the sentinel. Slot indices from `slot_for`
-    /// can be used directly with this pointer.
+    /// Read entry at slot (0-indexed into real slots, sentinel is slot -1).
     #[inline(always)]
-    pub fn base(&self) -> *mut u64 {
-        self.base
+    pub fn entry(&self, slot: usize) -> u64 {
+        self.entries()[slot + 1]
+    }
+
+    /// Write entry at slot.
+    ///
+    /// # Safety
+    /// Caller must ensure exclusive access to this slot.
+    #[inline(always)]
+    pub unsafe fn set_entry(&self, slot: usize, value: u64) {
+        self.entries_mut()[slot + 1] = value;
+    }
+
+    /// Add `value` to the entry at slot.
+    ///
+    /// # Safety
+    /// Caller must ensure exclusive access to this slot.
+    #[inline(always)]
+    pub unsafe fn add_to_entry(&self, slot: usize, value: u64) {
+        self.entries_mut()[slot + 1] += value;
     }
 
     #[inline(always)]
     pub fn matches_bloom(&self, hash: u64) -> bool {
         let slot = self.slot_for(hash);
-        let stored = unsafe { *self.base.add(slot) };
+        let stored = self.entries()[slot + 1];
         let probe = Self::compute_tag(hash) as u64;
         (stored & probe) == probe
     }
 
     #[inline(always)]
     pub fn bloom(&self, slot: usize) -> u16 {
-        let stored = unsafe { *self.base.add(slot) };
-        (stored & 0xFFFF) as u16
+        (self.entries()[slot + 1] & 0xFFFF) as u16
     }
 
     /// End-pointer (exclusive) stored in the upper 48 bits.
+    /// Slot -1 reads the sentinel (always 0).
     #[inline(always)]
     pub fn end_ptr(&self, slot: isize) -> usize {
-        (unsafe { *self.base.offset(slot) } >> PTR_SHIFT) as usize
+        (self.entries()[(slot + 1) as usize] >> PTR_SHIFT) as usize
     }
 
     pub fn capacity(&self) -> usize {
-        self.entries.len() - 1
+        self.capacity
     }
 }

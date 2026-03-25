@@ -125,10 +125,8 @@ unsafe impl Send for JoinPartitionJob {}
 impl JoinPartitionJob {
     fn run(self) {
         debug!("Running partition job");
-        let dir_ptr = self.directory.get();
-        let shift = unsafe { (*dir_ptr).shift };
-        let dir_capacity = unsafe { (*dir_ptr).capacity() };
-        let dir_entries = unsafe { (*dir_ptr).base() };
+        let directory = unsafe { &*self.directory.get() };
+        let shift = directory.shift;
         let arena_ptr = unsafe { (*self.arena.get()).as_mut_ptr() };
 
         // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
@@ -137,8 +135,8 @@ impl JoinPartitionJob {
             for &(hash, _) in worker_tuples {
                 let slot = (hash >> shift) as usize;
                 unsafe {
-                    *dir_entries.add(slot) += 1 << 16;
-                    // *dir_entries.add(slot) |= Directory::compute_tag(hash) as u64;
+                    directory.add_to_entry(slot, 1 << 16);
+                    // directory.add_to_entry(slot, Directory::compute_tag(hash) as u64);
                 }
             }
         }
@@ -146,17 +144,15 @@ impl JoinPartitionJob {
         // Pass 2: convert counts → absolute write cursors. Linear sweep
         // over this partition's directory slot range replaces each count
         // with a running arena pointer while preserving the tag bits.
-        let slots_per_partition = dir_capacity / NUM_PARTITIONS;
+        let slots_per_partition = directory.capacity() / NUM_PARTITIONS;
         let slot_end = self.slot_start + slots_per_partition;
         let mut cur = self.arena_offset as u64;
         for i in self.slot_start..slot_end {
-            unsafe {
-                let entry = *dir_entries.add(i);
-                let count = entry >> 16;
-                let tag = entry & 0xFFFF;
-                dir_entries.add(i).write((cur << 16) | tag);
-                cur += count;
-            }
+            let entry = directory.entry(i);
+            let count = entry >> 16;
+            let tag = entry & 0xFFFF;
+            unsafe { directory.set_entry(i, (cur << 16) | tag); }
+            cur += count;
         }
 
         // Pass 3: scatter values into arena. The upper 48 bits of each
@@ -167,9 +163,9 @@ impl JoinPartitionJob {
             for &(hash, value) in worker_tuples {
                 let slot = (hash >> shift) as usize;
                 unsafe {
-                    let arena_idx = (*dir_entries.add(slot) >> 16) as usize;
+                    let arena_idx = (directory.entry(slot) >> 16) as usize;
                     arena_ptr.add(arena_idx).write(value);
-                    *dir_entries.add(slot) += 1 << 16;
+                    directory.add_to_entry(slot, 1 << 16);
                 }
             }
         }
@@ -196,7 +192,8 @@ impl Outputter<()> for JoinBuilder {
             // Pre-allocate directory and arena.
             let dir_capacity = ((total as f64 * 1.125) as usize).next_power_of_two().max(64);
             let directory = unsafe { &mut *self.directory.get() };
-            *directory = Directory::with_capacity(dir_capacity);
+            let mut dir_allocator = SlabAllocator::new(false);
+            *directory = Directory::with_capacity(dir_capacity, &mut dir_allocator);
 
             let arena = unsafe { &mut *self.arena.get() };
             arena.reserve(total);
