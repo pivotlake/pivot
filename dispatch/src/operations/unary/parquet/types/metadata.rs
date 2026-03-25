@@ -8,7 +8,7 @@
 //! the byte-level layout of an individual column chunk needed by the
 //! decompressor to locate pages on disk.
 
-use crate::operations::parquet::types::table::ParquetTable;
+use crate::operations::unary::parquet::types::table::ParquetTable;
 use arrow_schema::SchemaRef;
 use std::fs::File;
 use std::sync::Arc;

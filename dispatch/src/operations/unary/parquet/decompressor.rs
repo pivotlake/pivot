@@ -11,11 +11,11 @@
 
 use crate::memory::{BUFFER_SIZE, get_write_buffer};
 use crate::operations::channels::Sender;
-use crate::operations::parquet::types::page::{
+use crate::operations::unary::Unary;
+use crate::operations::unary::parquet::types::page::{
     CompressedPage, DataPage, DecompressedPage, DecompressedPageType,
 };
-use crate::operations::parquet::types::thrift::general::PageType;
-use crate::operations::unary::Unary;
+use crate::operations::unary::parquet::types::thrift::general::PageType;
 use crate::operations::{DefaultUnaryFactory, unary};
 use bytes::Bytes;
 use snap::raw::Decoder;
@@ -122,10 +122,10 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::parquet::test_utils::dummy_metadata;
-    use crate::operations::parquet::types::filter_mask::FilterMask;
-    use crate::operations::parquet::types::thrift::general::Encoding;
-    use crate::operations::parquet::types::thrift::headers::{
+    use crate::operations::unary::parquet::test_utils::dummy_metadata;
+    use crate::operations::unary::parquet::types::filter_mask::FilterMask;
+    use crate::operations::unary::parquet::types::thrift::general::Encoding;
+    use crate::operations::unary::parquet::types::thrift::headers::{
         DataPageHeader, DictionaryPageHeader, PageHeader,
     };
     use crate::operations::unary::test_utils::{CollectSender, run_unary};

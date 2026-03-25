@@ -7,13 +7,13 @@
 //! [`try_read`](RowGroupDecoder::try_read) decodes the next batch.
 
 use crate::memory::SlabAllocator;
-use crate::operations::parquet::decoding::column_decoders;
-use crate::operations::parquet::decoding::column_decoders::{
+use crate::operations::unary::parquet::decoding::column_decoders;
+use crate::operations::unary::parquet::decoding::column_decoders::{
     BytesViewDecoder, ColumnDecoder, PrimitiveColumnDecoder,
 };
-use crate::operations::parquet::types::metadata::QueryRowGroupMetadata;
-use crate::operations::parquet::types::page::DecompressedPage;
-use crate::operations::parquet::types::projection::Projection;
+use crate::operations::unary::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::operations::unary::parquet::types::page::DecompressedPage;
+use crate::operations::unary::parquet::types::projection::Projection;
 use crate::record_batch_metadata::with_row_group_metadata;
 use arrow_array::RecordBatch;
 use arrow_array::types::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt16Type};

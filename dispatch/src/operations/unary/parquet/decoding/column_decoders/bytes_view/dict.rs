@@ -7,8 +7,8 @@
 //! resolved to a view in O(1).
 
 use crate::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
-use crate::operations::parquet::decoding::column_decoders::Dict;
-use crate::operations::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::operations::unary::parquet::decoding::column_decoders::Dict;
+use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
 use arrow_buffer::Buffer;
 use bytes::Bytes;

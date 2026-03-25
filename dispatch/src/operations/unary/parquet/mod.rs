@@ -21,8 +21,10 @@ pub use types::table::ParquetTable;
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::operations::parquet::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
-    use crate::operations::parquet::types::table::ParquetTable;
+    use crate::operations::unary::parquet::types::metadata::{
+        QueryRowGroupMetadata, RowGroupMetadata,
+    };
+    use crate::operations::unary::parquet::types::table::ParquetTable;
     use arrow_schema::Schema;
     use std::sync::Arc;
 

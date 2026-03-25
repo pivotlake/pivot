@@ -49,8 +49,6 @@ use thiserror::Error;
 
 pub mod channels;
 
-pub mod parquet;
-
 mod unary;
 pub use unary::*;
 

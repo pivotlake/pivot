@@ -21,16 +21,16 @@
 use crate::memory::{MultiBufferReader, ReaderPosition};
 use crate::operations::DefaultUnaryFactory;
 use crate::operations::channels::Sender;
-use crate::operations::parquet::types::filter_mask::FilterMask;
-use crate::operations::parquet::types::metadata::QueryRowGroupMetadata;
-use crate::operations::parquet::types::page::CompressedPage;
-use crate::operations::parquet::types::requests::RowGroupBuffer;
-use crate::operations::parquet::types::thrift::general::PageType;
-use crate::operations::parquet::types::thrift::headers::PageHeader;
-use crate::operations::parquet::types::thrift::parquet_thrift::{
+use crate::operations::unary::Unary;
+use crate::operations::unary::parquet::types::filter_mask::FilterMask;
+use crate::operations::unary::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::operations::unary::parquet::types::page::CompressedPage;
+use crate::operations::unary::parquet::types::requests::RowGroupBuffer;
+use crate::operations::unary::parquet::types::thrift::general::PageType;
+use crate::operations::unary::parquet::types::thrift::headers::PageHeader;
+use crate::operations::unary::parquet::types::thrift::parquet_thrift::{
     ParquetError, ThriftReadInputProtocol,
 };
-use crate::operations::unary::Unary;
 use crate::worker::WORKER_IDX;
 use bytes::Bytes;
 
@@ -154,12 +154,12 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::parquet::test_utils::dummy_metadata;
-    use crate::operations::parquet::types::thrift::general::Encoding;
-    use crate::operations::parquet::types::thrift::headers::{
+    use crate::operations::unary::parquet::test_utils::dummy_metadata;
+    use crate::operations::unary::parquet::types::thrift::general::Encoding;
+    use crate::operations::unary::parquet::types::thrift::headers::{
         DataPageHeader as ThriftDataPageHeader, DictionaryPageHeader as ThriftDictionaryPageHeader,
     };
-    use crate::operations::parquet::types::thrift::parquet_thrift::{
+    use crate::operations::unary::parquet::types::thrift::parquet_thrift::{
         ThriftCompactOutputProtocol, WriteThrift,
     };
     use crate::operations::unary::test_utils::run_unary;

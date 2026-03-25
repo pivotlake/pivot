@@ -1,7 +1,7 @@
 use crate::io::{IORequest, create_aligned_read_from_start_end};
 use crate::memory::{FILE_CACHE, ReadBuffer};
-use crate::operations::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
-use crate::operations::parquet::types::projection::Projection;
+use crate::operations::unary::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
+use crate::operations::unary::parquet::types::projection::Projection;
 use bytes::Bytes;
 use std::os::fd::{AsRawFd, RawFd};
 

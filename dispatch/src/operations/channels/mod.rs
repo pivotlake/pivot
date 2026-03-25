@@ -32,7 +32,7 @@ pub use mpsc::{MpscSender, mpsc_channel};
 mod return_to_worker;
 pub use return_to_worker::{ReturnToWorkerMpscFactory, WorkerIdOutput, return_to_worker_mpsc};
 
-use crate::operations::parquet::RowGroupRequest;
+use crate::operations::unary::parquet::RowGroupRequest;
 
 #[derive(Debug, Error)]
 pub enum Error {

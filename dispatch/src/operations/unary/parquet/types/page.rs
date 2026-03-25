@@ -16,8 +16,8 @@
 
 use super::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use crate::operations::channels::WorkerIdOutput;
-use crate::operations::parquet::types::filter_mask::FilterMask;
-use crate::operations::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::operations::unary::parquet::types::filter_mask::FilterMask;
+use crate::operations::unary::parquet::types::metadata::QueryRowGroupMetadata;
 use bytes::Bytes;
 use std::fmt::{Debug, Formatter};
 

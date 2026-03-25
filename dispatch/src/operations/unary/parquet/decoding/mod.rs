@@ -14,10 +14,10 @@
 use crate::data_flow::WorkStatus;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
-use crate::operations::parquet::DecompressedPage;
-use crate::operations::parquet::types::metadata::QueryRowGroupMetadata;
-use crate::operations::parquet::types::projection::Projection;
-use crate::operations::parquet::types::table::ParquetTable;
+use crate::operations::unary::parquet::DecompressedPage;
+use crate::operations::unary::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::operations::unary::parquet::types::projection::Projection;
+use crate::operations::unary::parquet::types::table::ParquetTable;
 use crate::operations::{Unary, UnaryFactory};
 use ahash::HashSet;
 use arrow_array::RecordBatch;
@@ -215,17 +215,17 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
 #[cfg(test)]
 mod tests {
     use crate::memory::init_test_free_pool;
-    use crate::operations::parquet::decoding::Decoder;
-    use crate::operations::parquet::types::metadata::{
+    use crate::operations::unary::parquet::decoding::Decoder;
+    use crate::operations::unary::parquet::types::metadata::{
         ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata,
     };
-    use crate::operations::parquet::types::page::{
+    use crate::operations::unary::parquet::types::page::{
         DataPage, DecompressedPage, DecompressedPageType,
     };
-    use crate::operations::parquet::types::projection::Projection;
-    use crate::operations::parquet::types::table::ParquetTable;
-    use crate::operations::parquet::types::thrift::general::Encoding;
-    use crate::operations::parquet::types::thrift::headers::PageHeader;
+    use crate::operations::unary::parquet::types::projection::Projection;
+    use crate::operations::unary::parquet::types::table::ParquetTable;
+    use crate::operations::unary::parquet::types::thrift::general::Encoding;
+    use crate::operations::unary::parquet::types::thrift::headers::PageHeader;
     use crate::operations::unary::test_utils::{run_unary, run_unary_to_completion};
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};

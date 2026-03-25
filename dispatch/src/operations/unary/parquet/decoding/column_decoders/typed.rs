@@ -13,15 +13,17 @@
 //! parameters.
 
 use crate::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
-use crate::operations::parquet::decoding::column_decoders::levels::decode_def_levels;
-use crate::operations::parquet::decoding::column_decoders::rle::RleDecoder;
-use crate::operations::parquet::decoding::column_decoders::{
+use crate::operations::unary::parquet::decoding::column_decoders::levels::decode_def_levels;
+use crate::operations::unary::parquet::decoding::column_decoders::rle::RleDecoder;
+use crate::operations::unary::parquet::decoding::column_decoders::{
     ArrayBuilder, ColumnDecoder, DecodePlain, Dict, Error, Result,
 };
-use crate::operations::parquet::types::filter_mask::RunningFilterMask;
-use crate::operations::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
-use crate::operations::parquet::types::thrift::general::Encoding;
-use crate::operations::parquet::types::thrift::headers::DataPageHeader;
+use crate::operations::unary::parquet::types::filter_mask::RunningFilterMask;
+use crate::operations::unary::parquet::types::page::{
+    DataPage, DecompressedPage, DecompressedPageType,
+};
+use crate::operations::unary::parquet::types::thrift::general::Encoding;
+use crate::operations::unary::parquet::types::thrift::headers::DataPageHeader;
 use arrow_array::ArrayRef;
 use bytes::Bytes;
 use std::marker::PhantomData;
@@ -46,7 +48,7 @@ pub struct ReadPage<
     /// Filter mask cursor; `None` when the full page is kept.
     running_filter_mask_opt: Option<RunningFilterMask>,
     /// Rows left to decode in this page.
-    pub(super) remaining: usize,
+    pub(in crate::operations) remaining: usize,
     phantom_data: PhantomData<(D, B)>,
 }
 
@@ -300,12 +302,12 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
 mod tests {
     use super::*;
     use crate::memory::{SlabAllocator, init_test_free_pool};
-    use crate::operations::parquet::decoding::column_decoders::primitive::PrimitiveColumnDecoder;
-    use crate::operations::parquet::test_utils::dummy_metadata;
-    use crate::operations::parquet::types::filter_mask::FilterMask;
-    use crate::operations::parquet::types::page::{DataPage, DecompressedPageType};
-    use crate::operations::parquet::types::thrift::general::Encoding;
-    use crate::operations::parquet::types::thrift::headers::PageHeader;
+    use crate::operations::unary::parquet::decoding::column_decoders::primitive::PrimitiveColumnDecoder;
+    use crate::operations::unary::parquet::test_utils::dummy_metadata;
+    use crate::operations::unary::parquet::types::filter_mask::FilterMask;
+    use crate::operations::unary::parquet::types::page::{DataPage, DecompressedPageType};
+    use crate::operations::unary::parquet::types::thrift::general::Encoding;
+    use crate::operations::unary::parquet::types::thrift::headers::PageHeader;
     use arrow_array::Int32Array;
     use arrow_array::types::Int32Type;
 

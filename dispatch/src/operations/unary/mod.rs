@@ -41,7 +41,7 @@
 //! - [`GroupFactory`] — Hash-based group-by with aggregation.
 
 mod group;
-pub use group::{GroupFactory, IntKeyExtractor, StringKeyExtractor};
+pub use group::{GroupFactory, IntKeyExtractor, KeyExtractor, StringKeyExtractor};
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -73,11 +73,14 @@ mod project;
 pub use project::ProjectFactory;
 
 mod default_unary_factory;
-mod order_by_limit;
-use crate::memory::ReadBuffer;
 pub use default_unary_factory::DefaultUnaryFactory;
-pub use group::KeyExtractor;
+
+pub mod parquet;
+
+mod order_by_limit;
 pub use order_by_limit::{OrderBy, OrderByLimitFactory};
+
+use crate::memory::ReadBuffer;
 
 #[derive(Debug, Error)]
 pub enum Error {

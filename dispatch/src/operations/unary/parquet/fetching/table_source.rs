@@ -6,10 +6,10 @@
 //! demand, wrapping them in a [`RowGroupRequest`] with the target projection.
 
 use crate::operations::channels::{Receiver, RootChannelFactory};
-use crate::operations::parquet::RowGroupRequest;
-use crate::operations::parquet::types::metadata::QueryRowGroupMetadata;
-use crate::operations::parquet::types::projection::Projection;
-use crate::operations::parquet::types::table::ParquetTable;
+use crate::operations::unary::parquet::RowGroupRequest;
+use crate::operations::unary::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::operations::unary::parquet::types::projection::Projection;
+use crate::operations::unary::parquet::types::table::ParquetTable;
 use crossbeam_deque::{Injector, Steal};
 use std::sync::Arc;
 
