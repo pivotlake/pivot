@@ -1,5 +1,6 @@
 mod factory;
 mod directory;
+mod primitive_builder;
 mod probe;
 mod build;
 
@@ -31,6 +32,7 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
+    use crate::memory::init_test_free_pool;
     use crate::operations::channels::VoidSender;
     use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
     use crate::operations::unary::test_utils::CollectSender;
@@ -56,12 +58,18 @@ mod tests {
         }
     }
 
+    struct JoinResult {
+        batches: Vec<RecordBatch>,
+        gate: Arc<std::sync::atomic::AtomicBool>,
+    }
+
     fn build_and_probe(
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
-    ) -> Vec<RecordBatch> {
+    ) -> JoinResult {
+        init_test_free_pool(4);
         let workers = build_worker_batches.len();
-        let (builds, probes, _gate) = factory::create_for_workers(0, 0, workers);
+        let (builds, probes, gate) = factory::create_for_workers(0, 0, workers);
 
         let mut consumers: Vec<_> = builds
             .into_iter()
@@ -97,14 +105,17 @@ mod tests {
         for batch in probe_batches {
             probe.consume(batch, &mut sender).unwrap();
         }
-        sender.items
+        JoinResult {
+            batches: sender.items,
+            gate,
+        }
     }
 
-    fn collect_build_keys(results: &[RecordBatch]) -> Vec<i64> {
+    fn collect_i64_column(results: &[RecordBatch], col: usize) -> Vec<i64> {
         results
             .iter()
             .flat_map(|b| {
-                b.column(1)
+                b.column(col)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap()
@@ -117,64 +128,64 @@ mod tests {
 
     #[test]
     fn single_key_match() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![vec![int64_batch(&[10, 20, 30])]],
             vec![int64_batch(&[20])],
         );
 
-        let keys = collect_build_keys(&results);
+        let keys = collect_i64_column(&r.batches, 1);
         assert_eq!(keys, vec![20]);
     }
 
     #[test]
     fn multiple_key_matches() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![vec![int64_batch(&[10, 20, 30, 40, 50])]],
             vec![int64_batch(&[20, 40])],
         );
 
-        let mut keys = collect_build_keys(&results);
+        let mut keys = collect_i64_column(&r.batches, 1);
         keys.sort();
         assert_eq!(keys, vec![20, 40]);
     }
 
     #[test]
     fn no_matches() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![vec![int64_batch(&[10, 20, 30])]],
             vec![int64_batch(&[99, 100])],
         );
 
-        assert!(results.is_empty());
+        assert!(r.batches.is_empty());
     }
 
     #[test]
     fn duplicate_build_keys_produce_multiple_matches() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![vec![int64_batch(&[10, 10, 20])]],
             vec![int64_batch(&[10])],
         );
 
-        let mut keys = collect_build_keys(&results);
+        let mut keys = collect_i64_column(&r.batches, 1);
         keys.sort();
         assert_eq!(keys, vec![10, 10]);
     }
 
     #[test]
     fn multiple_build_batches() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![vec![int64_batch(&[10, 20]), int64_batch(&[30, 40])]],
             vec![int64_batch(&[20, 30])],
         );
 
-        let mut keys = collect_build_keys(&results);
+        let mut keys = collect_i64_column(&r.batches, 1);
         keys.sort();
         assert_eq!(keys, vec![20, 30]);
     }
 
     #[test]
     fn two_build_workers() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![
                 vec![int64_batch(&[10, 20])],
                 vec![int64_batch(&[30, 40])],
@@ -182,28 +193,123 @@ mod tests {
             vec![int64_batch(&[10, 30])],
         );
 
-        let mut keys = collect_build_keys(&results);
+        let mut keys = collect_i64_column(&r.batches, 1);
         keys.sort();
         assert_eq!(keys, vec![10, 30]);
     }
 
     #[test]
     fn empty_build_no_matches() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![vec![int64_batch(&[])]],
             vec![int64_batch(&[10])],
         );
 
-        assert!(results.is_empty());
+        assert!(r.batches.is_empty());
     }
 
     #[test]
     fn empty_probe_no_output() {
-        let results = build_and_probe(
+        let r = build_and_probe(
             vec![vec![int64_batch(&[10, 20, 30])]],
             vec![int64_batch(&[])],
         );
 
-        assert!(results.is_empty());
+        assert!(r.batches.is_empty());
+    }
+
+    #[test]
+    fn duplicate_probe_keys() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[10, 20])]],
+            vec![int64_batch(&[10, 10, 10])],
+        );
+
+        let keys = collect_i64_column(&r.batches, 1);
+        assert_eq!(keys, vec![10, 10, 10]);
+    }
+
+    #[test]
+    fn many_to_many() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[10, 10])]],
+            vec![int64_batch(&[10, 10])],
+        );
+
+        let keys = collect_i64_column(&r.batches, 1);
+        assert_eq!(keys.len(), 4);
+        assert!(keys.iter().all(|&k| k == 10));
+    }
+
+    #[test]
+    fn multiple_probe_batches() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[10]), int64_batch(&[30])],
+        );
+
+        let mut keys = collect_i64_column(&r.batches, 1);
+        keys.sort();
+        assert_eq!(keys, vec![10, 30]);
+    }
+
+    #[test]
+    fn all_keys_match() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[1, 2, 3, 4, 5])]],
+            vec![int64_batch(&[1, 2, 3, 4, 5])],
+        );
+
+        let mut keys = collect_i64_column(&r.batches, 1);
+        keys.sort();
+        assert_eq!(keys, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn probe_idx_reflects_position_in_probe_batch() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[99, 20, 99, 30])],
+        );
+
+        // probe_idx (col 0) should be 1 and 3 — the positions of 20 and 30
+        let mut probe_idxs = collect_i64_column(&r.batches, 0);
+        probe_idxs.sort();
+        assert_eq!(probe_idxs, vec![1, 3]);
+    }
+
+    #[test]
+    fn large_build_exercises_multiple_partitions() {
+        let keys: Vec<i64> = (0..1000).collect();
+        let probe_keys: Vec<i64> = (500..600).collect();
+
+        let r = build_and_probe(
+            vec![vec![int64_batch(&keys)]],
+            vec![int64_batch(&probe_keys)],
+        );
+
+        let mut matched = collect_i64_column(&r.batches, 1);
+        matched.sort();
+        assert_eq!(matched, probe_keys);
+    }
+
+    #[test]
+    fn gate_opens_after_build_completes() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[10, 20])]],
+            vec![int64_batch(&[10])],
+        );
+
+        assert!(r.gate.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn gate_opens_even_with_empty_build() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[])]],
+            vec![int64_batch(&[10])],
+        );
+
+        assert!(r.gate.load(Ordering::Relaxed));
     }
 }

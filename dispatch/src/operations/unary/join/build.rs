@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_deque::{Injector, Steal};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use ahash::RandomState;
+use tracing::debug;
 use crate::operations::channels::Sender;
 use crate::operations::{unary, Consumer, Outputter};
 use crate::operations::unary::join::directory::Directory;
@@ -65,6 +66,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
         batch: RecordBatch,
         _sender: &mut S,
     ) -> unary::Result<()> {
+        debug!("Consuming build");
         let col = batch
             .column(self.key_column)
             .as_any()
@@ -83,6 +85,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
     }
 
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
+        debug!("Running into outputter!");
         for (p, partition) in self.values.iter().enumerate() {
             self.partition_sizes[p].fetch_add(partition.len(), Ordering::Relaxed);
         }
@@ -118,6 +121,7 @@ unsafe impl Send for JoinPartitionJob {}
 
 impl JoinPartitionJob {
     fn run(self) {
+        debug!("Running partition job");
         let dir_ptr = self.directory.get();
         let shift = unsafe { (*dir_ptr).shift };
         let dir_capacity = unsafe { (*dir_ptr).capacity() };
@@ -131,7 +135,7 @@ impl JoinPartitionJob {
                 let slot = (hash >> shift) as usize;
                 unsafe {
                     *dir_entries.add(slot) += 1 << 16;
-                    *dir_entries.add(slot) |= Directory::compute_tag(hash) as u64;
+                    // *dir_entries.add(slot) |= Directory::compute_tag(hash) as u64;
                 }
             }
         }

@@ -420,6 +420,7 @@ dependencies = [
  "crossbeam-deque",
  "io-uring",
  "libc",
+ "log",
  "memchr",
  "nix",
  "parquet",

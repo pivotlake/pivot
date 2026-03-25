@@ -115,7 +115,7 @@ fn run_query_join_orders(tables: &TpchTables) {
         Projection::from_field_names(tables.lineitem.schema(), ["l_orderkey"]),
         false,
     ).join(orders, 0, 0);
-    joined.collect();
+    joined.count().collect();
 }
 
 fn run_query_count(tables: &TpchTables) {

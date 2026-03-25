@@ -31,8 +31,11 @@ mod slab_buffer;
 pub use slab_buffer::SlabBuffer;
 
 mod multi_slab_buffer;
-
 pub use multi_slab_buffer::MultiSlabBuffer;
+
+mod slab_vec;
+pub use slab_vec::{SlabVec, SlabVecIterator};
+
 
 /// A contiguous byte region within a `WriteBuffer`.
 ///

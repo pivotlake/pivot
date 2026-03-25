@@ -130,6 +130,31 @@ impl OperatorGraph {
         Ok(ControlFlow::Continue(()))
     }
 
+    /// Try to finish all operators. Unlike [`traverse_forwards`](Self::traverse_forwards),
+    /// this does not short-circuit: an unfinished operator blocks its children but not
+    /// unrelated branches. Returns `true` only if every operator finished.
+    pub fn try_finish_all(&mut self) -> Result<bool> {
+        let mut remaining_parents: Vec<usize> = self.back_edges.iter().map(|p| p.len()).collect();
+        let mut queue: VecDeque<usize> = self.roots.iter().copied().collect();
+        let mut all_finished = true;
+
+        while let Some(idx) = queue.pop_front() {
+            let finished = self.operators[idx].try_finish()?;
+            if !finished {
+                all_finished = false;
+                continue; // don't enqueue children
+            }
+
+            for &child_idx in &self.edges[idx] {
+                remaining_parents[child_idx] -= 1;
+                if remaining_parents[child_idx] == 0 {
+                    queue.push_back(child_idx);
+                }
+            }
+        }
+        Ok(all_finished)
+    }
+
     /// Traverse root-to-leaf in topological order (Kahn's algorithm).
     ///
     /// A node is only visited after **all** its parents have been visited.
@@ -193,16 +218,14 @@ impl DataFlow {
 
     /// Try to finish all operators (root-to-leaf). Returns `true` if every operator
     /// has completed, meaning this dataflow can be removed from the worker.
+    ///
+    /// Unlike other traversals, this does **not** short-circuit on a single unfinished
+    /// operator. Independent branches (e.g. build vs probe in a join) must all make
+    /// progress even if one branch isn't done yet. An operator that returns `false`
+    /// still prevents its children from being visited (topological guarantee), but
+    /// unrelated branches continue normally.
     pub fn maybe_finish(&mut self) -> Result<bool> {
-        self.graph
-            .traverse_forwards(|_s, b| {
-                Ok(if b.try_finish()? {
-                    ControlFlow::Continue(())
-                } else {
-                    ControlFlow::Break(())
-                })
-            })
-            .map(|c| matches!(c, ControlFlow::Continue(..)))
+        self.graph.try_finish_all()
     }
 
     /// Deliver a completed IO buffer to the operator that requested it.
