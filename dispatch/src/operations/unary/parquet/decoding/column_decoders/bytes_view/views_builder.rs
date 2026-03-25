@@ -26,7 +26,7 @@
 
 use crate::memory::SlabAllocator;
 use crate::memory::SlabBuffer;
-use crate::operations::parquet::decoding::column_decoders::ArrayBuilder;
+use crate::operations::unary::parquet::decoding::column_decoders::ArrayBuilder;
 use arrow_array::{ArrayRef, StringViewArray, builder::make_view};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use std::ptr::NonNull;

@@ -29,8 +29,8 @@ mod typed;
 pub use typed::TypedColumnDecoder;
 
 use crate::memory::{ReaderPosition, SlabAllocator};
-use crate::operations::parquet::types::page::DecompressedPage;
-use crate::operations::parquet::types::thrift::general::Encoding;
+use crate::operations::unary::parquet::types::page::DecompressedPage;
+use crate::operations::unary::parquet::types::thrift::general::Encoding;
 use arrow_array::ArrayRef;
 use arrow_buffer::Buffer;
 use bytes::Bytes;

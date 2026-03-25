@@ -9,9 +9,9 @@
 //! reading them sequentially within each row group for optimal IO.
 
 use crate::operations::channels::Sender;
-use crate::operations::parquet::types::metadata::QueryRowGroupMetadata;
-use crate::operations::parquet::types::projection::Projection;
-use crate::operations::parquet::{ParquetTable, RowGroupRequest};
+use crate::operations::unary::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::operations::unary::parquet::types::projection::Projection;
+use crate::operations::unary::parquet::{ParquetTable, RowGroupRequest};
 use crate::operations::{Unary, UnaryFactory};
 use crate::record_batch_metadata::{global_row_group, row_index};
 use ahash::HashMap;

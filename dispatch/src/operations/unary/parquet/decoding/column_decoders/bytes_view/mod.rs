@@ -15,10 +15,10 @@
 //!
 //! [`BytesViewDecoder`] ties them together as a ready-to-use type alias.
 
-use crate::operations::parquet::decoding::column_decoders::TypedColumnDecoder;
-use crate::operations::parquet::decoding::column_decoders::bytes_view::dict::ViewDict;
-use crate::operations::parquet::decoding::column_decoders::bytes_view::plain_page_decoder::PlainPageDecoder;
-use crate::operations::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::operations::unary::parquet::decoding::column_decoders::TypedColumnDecoder;
+use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::dict::ViewDict;
+use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::plain_page_decoder::PlainPageDecoder;
+use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 pub(crate) mod views_builder;
 
 pub(crate) mod dict;
@@ -31,14 +31,14 @@ pub type BytesViewDecoder = TypedColumnDecoder<ViewDict, ViewsBuilder, PlainPage
 mod tests {
     use crate::memory::SlabAllocator;
     use crate::memory::init_test_free_pool;
-    use crate::operations::parquet::decoding::column_decoders::ColumnDecoder;
-    use crate::operations::parquet::decoding::column_decoders::bytes_view::BytesViewDecoder;
-    use crate::operations::parquet::test_utils::dummy_metadata;
-    use crate::operations::parquet::types::page::{
+    use crate::operations::unary::parquet::decoding::column_decoders::ColumnDecoder;
+    use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::BytesViewDecoder;
+    use crate::operations::unary::parquet::test_utils::dummy_metadata;
+    use crate::operations::unary::parquet::types::page::{
         DataPage, DecompressedPage, DecompressedPageType,
     };
-    use crate::operations::parquet::types::thrift::general::Encoding;
-    use crate::operations::parquet::types::thrift::headers::PageHeader;
+    use crate::operations::unary::parquet::types::thrift::general::Encoding;
+    use crate::operations::unary::parquet::types::thrift::headers::PageHeader;
     use arrow_array::{Array, ArrayRef, StringViewArray};
     use bytes::Bytes;
 

@@ -9,8 +9,8 @@
 use super::super::ArrayBuilder;
 use crate::env::MAX_INLINE_STRING_VIEW;
 use crate::memory::{MultiBufferReader, ReaderPosition};
-use crate::operations::parquet::decoding::column_decoders::DecodePlain;
-use crate::operations::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::operations::unary::parquet::decoding::column_decoders::DecodePlain;
+use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
 use arrow_buffer::Buffer;
 use bytes::Bytes;
@@ -208,8 +208,8 @@ mod tests {
     use super::*;
     use crate::memory::SlabAllocator;
     use crate::memory::init_test_free_pool;
-    use crate::operations::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
-    use crate::operations::parquet::decoding::column_decoders::{ArrayBuilder, DecodePlain};
+    use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+    use crate::operations::unary::parquet::decoding::column_decoders::{ArrayBuilder, DecodePlain};
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;
 

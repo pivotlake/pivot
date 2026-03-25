@@ -14,7 +14,7 @@
 //! arbitrarily sized chunks.
 
 use crate::memory::{MultiBufferReader, ReaderPosition};
-use crate::operations::parquet::decoding::column_decoders::{ArrayBuilder, Dict};
+use crate::operations::unary::parquet::decoding::column_decoders::{ArrayBuilder, Dict};
 use bytes::Bytes;
 
 mod bit_pack_decoder;
@@ -365,12 +365,12 @@ mod tests {
     use super::*;
     use crate::memory::SlabAllocator;
     use crate::memory::init_test_free_pool;
-    use crate::operations::parquet::decoding::column_decoders::ArrayBuilder;
-    use crate::operations::parquet::decoding::column_decoders::Dict;
-    use crate::operations::parquet::decoding::column_decoders::bytes_view::dict::{
+    use crate::operations::unary::parquet::decoding::column_decoders::ArrayBuilder;
+    use crate::operations::unary::parquet::decoding::column_decoders::Dict;
+    use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::dict::{
         DictFactory, ViewDict,
     };
-    use crate::operations::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+    use crate::operations::unary::parquet::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;
 

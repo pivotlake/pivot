@@ -7,9 +7,9 @@
 
 use crate::io::open_direct_read;
 use crate::memory::FILE_CACHE;
-use crate::operations::parquet::types::metadata::{ColumnChunkMeta, RowGroupMetadata};
-use crate::operations::parquet::types::thrift::footer::FileMetaData;
-use crate::operations::parquet::types::thrift::parquet_thrift::{
+use crate::operations::unary::parquet::types::metadata::{ColumnChunkMeta, RowGroupMetadata};
+use crate::operations::unary::parquet::types::thrift::footer::FileMetaData;
+use crate::operations::unary::parquet::types::thrift::parquet_thrift::{
     ReadThrift, ThriftSliceInputProtocol,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -217,7 +217,7 @@ fn convert_physical_to_arrow(
     converted_type: Option<i32>,
     logical_type: Option<&crate::operations::parquet::types::thrift::footer::LogicalType>,
 ) -> Result<DataType> {
-    use crate::operations::parquet::types::thrift::footer::LogicalType;
+    use crate::operations::unary::parquet::types::thrift::footer::LogicalType;
 
     let pt = physical_type.ok_or_else(|| {
         Error::IO(io::Error::new(

@@ -10,8 +10,8 @@ use crate::io::IORequest;
 use crate::memory::ReadBuffer;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
-use crate::operations::parquet::types::requests::RowGroupBuffer;
-use crate::operations::parquet::types::requests::{ColumnBufferContext, RowGroupRequest};
+use crate::operations::unary::parquet::types::requests::RowGroupBuffer;
+use crate::operations::unary::parquet::types::requests::{ColumnBufferContext, RowGroupRequest};
 
 /// Reads column chunks for one row group at a time via async disk IO.
 ///

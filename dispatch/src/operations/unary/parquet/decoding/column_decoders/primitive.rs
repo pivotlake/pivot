@@ -18,7 +18,7 @@ use arrow_array::{ArrayRef, PrimitiveArray};
 use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 
 use crate::memory::{MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator};
-use crate::operations::parquet::decoding::column_decoders::{
+use crate::operations::unary::parquet::decoding::column_decoders::{
     ArrayBuilder, DecodePlain, Dict, TypedColumnDecoder,
 };
 use bytes::Bytes;
@@ -278,8 +278,8 @@ pub type PrimitiveColumnDecoder<T> =
 //
 #[cfg(test)]
 mod tests {
-    use crate::operations::parquet::types::thrift::general::Encoding;
-    use crate::operations::parquet::types::thrift::headers::PageHeader;
+    use crate::operations::unary::parquet::types::thrift::general::Encoding;
+    use crate::operations::unary::parquet::types::thrift::headers::PageHeader;
     use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, UInt16Type};
     use arrow_array::{
         Array, ArrayRef, Float32Array, Int16Array, Int32Array, Int64Array, UInt16Array,
@@ -289,8 +289,8 @@ mod tests {
     use super::PrimitiveColumnDecoder;
     use crate::memory::SlabAllocator;
     use crate::memory::init_test_free_pool;
-    use crate::operations::parquet::decoding::column_decoders::ColumnDecoder;
-    use crate::operations::parquet::test_utils::dummy_metadata;
+    use crate::operations::unary::parquet::decoding::column_decoders::ColumnDecoder;
+    use crate::operations::unary::parquet::test_utils::dummy_metadata;
 
     fn make_data_page(
         data: Vec<u8>,
@@ -523,8 +523,8 @@ mod tests {
 
     // -- Filter mask integration --
 
-    use crate::operations::parquet::types::filter_mask::FilterMask;
-    use crate::operations::parquet::types::page::{
+    use crate::operations::unary::parquet::types::filter_mask::FilterMask;
+    use crate::operations::unary::parquet::types::page::{
         DataPage, DecompressedPage, DecompressedPageType,
     };
 
