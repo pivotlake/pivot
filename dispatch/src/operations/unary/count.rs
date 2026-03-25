@@ -38,17 +38,19 @@ impl UnaryFactory<RecordBatch, RecordBatch> for CountFactory {
     fn build_unary(self) -> Self::Unary {
         Count {
             internal_count: 0,
+            wrote_shared_count: false,
             siblings_left: self.siblings_left,
             shared_count: self.shared_count,
         }
     }
 }
 
-/// Your average, everyday `Count` (count(*)). This friendly operation (and pipeline breaker!)
+/// Your average, everyday `Count` (count(*)). This friendly operation
 /// continuously counts incoming rows until `finish` time comes, where it synchronizes with its
 /// fellow counts and the lucky leader gets to output.
 pub struct Count {
     internal_count: usize,
+    wrote_shared_count: bool,
     siblings_left: Arc<AtomicUsize>,
     shared_count: Arc<AtomicUsize>,
 }
@@ -64,11 +66,16 @@ impl Unary<RecordBatch, RecordBatch> for Count {
     }
 
     fn finish<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
-        self.shared_count
-            .fetch_add(self.internal_count, Ordering::Relaxed);
+        if self.wrote_shared_count {
+            return Ok(true);
+        }
 
-        if self.siblings_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let array = UInt64Array::from(vec![self.shared_count.load(Ordering::Relaxed) as u64]);
+        self.shared_count
+            .fetch_add(self.internal_count, Ordering::SeqCst);
+        self.wrote_shared_count = true;
+
+        if self.siblings_left.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let array = UInt64Array::from(vec![self.shared_count.load(Ordering::SeqCst) as u64]);
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "count",
                 DataType::UInt64,
@@ -77,6 +84,98 @@ impl Unary<RecordBatch, RecordBatch> for Count {
             let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])?;
             output.send(batch)?;
         }
+
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::unary::UnaryFactory;
+    use crate::operations::unary::test_utils::{CollectSender, run_unary_to_completion};
+    use arrow_array::UInt64Array;
+
+    fn extract_count(batch: &RecordBatch) -> u64 {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    fn make_batch(num_rows: usize) -> RecordBatch {
+        let array = arrow_array::Int32Array::from(vec![0i32; num_rows]);
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)])),
+            vec![Arc::new(array)],
+        )
+        .unwrap()
+    }
+
+    fn build_counts(n: usize) -> Vec<Count> {
+        CountFactory::create_for_workers(n)
+            .into_iter()
+            .map(|f| f.build_unary())
+            .collect()
+    }
+
+    #[test]
+    fn single_worker_counts_rows() {
+        let count = build_counts(1).pop().unwrap();
+        let results = run_unary_to_completion(count, vec![make_batch(3), make_batch(7)]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(extract_count(&results[0]), 10);
+    }
+
+    #[test]
+    fn multiple_workers_sum_counts() {
+        let mut counts = build_counts(3);
+        let mut sender = CollectSender::new();
+
+        counts[0].consume(make_batch(2), &mut sender).unwrap();
+        counts[1].consume(make_batch(5), &mut sender).unwrap();
+        counts[2].consume(make_batch(3), &mut sender).unwrap();
+
+        // First two workers finish — no output yet.
+        counts[0].finish(&mut sender).unwrap();
+        assert!(sender.items.is_empty());
+
+        counts[1].finish(&mut sender).unwrap();
+        assert!(sender.items.is_empty());
+
+        // Last worker emits the total.
+        counts[2].finish(&mut sender).unwrap();
+        assert_eq!(sender.items.len(), 1);
+        assert_eq!(extract_count(&sender.items[0]), 10);
+    }
+
+    #[test]
+    fn zero_rows_produces_zero_count() {
+        let count = build_counts(1).pop().unwrap();
+        let results = run_unary_to_completion(count, vec![]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(extract_count(&results[0]), 0);
+    }
+
+    #[test]
+    fn finish_called_twice_does_not_double_count() {
+        let mut counts = build_counts(2);
+        let mut sender = CollectSender::new();
+
+        counts[0].consume(make_batch(5), &mut sender).unwrap();
+        counts[1].consume(make_batch(3), &mut sender).unwrap();
+
+        // Worker 0 finishes twice (the bug: second call re-adds internal_count).
+        counts[0].finish(&mut sender).unwrap();
+        counts[0].finish(&mut sender).unwrap();
+
+        // Worker 1 is the last to finish and emits the total.
+        counts[1].finish(&mut sender).unwrap();
+        assert_eq!(sender.items.len(), 1);
+        assert_eq!(extract_count(&sender.items[0]), 8); // not 13
     }
 }
