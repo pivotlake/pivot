@@ -67,7 +67,7 @@ mod tests {
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
     ) -> JoinResult {
-        init_test_free_pool(4);
+        init_test_free_pool(128);
         let workers = build_worker_batches.len();
         let (builds, probes, gate) = factory::create_for_workers(0, 0, workers);
 

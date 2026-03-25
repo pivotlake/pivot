@@ -6,6 +6,7 @@ use ahash::RandomState;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Injector;
 
+use crate::memory::SlabVec;
 use crate::operations::UnaryFactory;
 use crate::operations::unary::join::directory::Directory;
 use crate::operations::unary::join::probe::Probe;
@@ -23,8 +24,8 @@ pub struct JoinBuildFactory {
     arena: Arc<UnsafeCell<Vec<Value>>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
-    sender: mpsc::Sender<Vec<Vec<(u64, Value)>>>,
-    receiver: Option<mpsc::Receiver<Vec<Vec<(u64, Value)>>>>,
+    sender: mpsc::Sender<Vec<SlabVec<(u64, Value)>>>,
+    receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
     gate: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
 }

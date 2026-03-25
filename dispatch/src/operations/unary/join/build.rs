@@ -5,6 +5,7 @@ use crossbeam_deque::{Injector, Steal};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use ahash::RandomState;
 use tracing::debug;
+use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::{unary, Consumer, Outputter};
 use crate::operations::unary::join::directory::Directory;
@@ -16,9 +17,10 @@ const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
 pub struct JoinBuildConsumer {
     key_column: usize,
     hash_state: RandomState,
-    values: Vec<Vec<(u64, Value)>>,
+    values: Vec<SlabVec<(u64, Value)>>,
+    slab_allocator: SlabAllocator,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    sender: mpsc::Sender<Vec<Vec<(u64, Value)>>>,
+    sender: mpsc::Sender<Vec<SlabVec<(u64, Value)>>>,
     outputter: JoinBuilder,
 }
 
@@ -28,8 +30,8 @@ impl JoinBuildConsumer {
     pub fn new(
         key_column: usize,
         hash_state: RandomState,
-        sender: mpsc::Sender<Vec<Vec<(u64, Value)>>>,
-        receiver: Option<mpsc::Receiver<Vec<Vec<(u64, Value)>>>>,
+        sender: mpsc::Sender<Vec<SlabVec<(u64, Value)>>>,
+        receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
         directory: Arc<UnsafeCell<Directory>>,
         arena: Arc<UnsafeCell<Vec<Value>>>,
@@ -41,7 +43,8 @@ impl JoinBuildConsumer {
         Self {
             key_column,
             hash_state,
-            values: (0..NUM_PARTITIONS).map(|_| Vec::new()).collect(),
+            values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
+            slab_allocator: SlabAllocator::new(false),
             partition_sizes: partition_sizes.clone(),
             sender,
             outputter: JoinBuilder {
@@ -78,7 +81,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
             let key = unsafe { col.value_unchecked(i) };
             let hash = self.hash_state.hash_one(key);
             let partition = (hash >> PARTITION_SHIFT) as usize;
-            self.values[partition].push((hash, (key as u64, i as u64)));
+            self.values[partition].push((hash, (key as u64, i as u64)), &mut self.slab_allocator);
         }
 
         Ok(())
@@ -97,7 +100,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 pub struct JoinBuilder {
     directory: Arc<UnsafeCell<Directory>>,
     arena: Arc<UnsafeCell<Vec<Value>>>,
-    receiver: Option<mpsc::Receiver<Vec<Vec<(u64, Value)>>>>,
+    receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
@@ -108,7 +111,7 @@ pub struct JoinBuilder {
 unsafe impl Send for JoinBuilder {}
 
 pub struct JoinPartitionJob {
-    tuples: Vec<Vec<(u64, Value)>>,
+    tuples: Vec<SlabVec<(u64, Value)>>,
     directory: Arc<UnsafeCell<Directory>>,
     arena: Arc<UnsafeCell<Vec<Value>>>,
     arena_offset: usize,
@@ -181,7 +184,7 @@ impl JoinPartitionJob {
 impl Outputter<()> for JoinBuilder {
     fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let mut all_worker_tuples: Vec<Vec<Vec<(u64, Value)>>> = rx.into_iter().collect();
+            let mut all_worker_tuples: Vec<Vec<SlabVec<(u64, Value)>>> = rx.into_iter().collect();
 
             let sizes: Vec<usize> = self
                 .partition_sizes
@@ -207,7 +210,7 @@ impl Outputter<()> for JoinBuilder {
 
             let slots_per_partition = dir_capacity / NUM_PARTITIONS;
             for i in 0..NUM_PARTITIONS {
-                let tuples: Vec<Vec<(u64, Value)>> = all_worker_tuples
+                let tuples: Vec<SlabVec<(u64, Value)>> = all_worker_tuples
                     .iter_mut()
                     .map(|worker| std::mem::take(&mut worker[i]))
                     .collect();
