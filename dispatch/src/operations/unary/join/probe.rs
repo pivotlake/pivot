@@ -26,7 +26,7 @@ pub struct Probe {
     table: JoinTable,
     hash_state: RandomState,
     key_column: usize,
-    hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    batch_ptrs: Box<[(usize, usize); RECORD_BATCH_SIZE]>,
     allocator: SlabAllocator,
 }
 
@@ -36,17 +36,22 @@ impl Probe {
             table,
             hash_state,
             key_column,
-            hashes: Box::new([0u64; RECORD_BATCH_SIZE]),
+            batch_ptrs: Box::new([(0usize, 0usize); RECORD_BATCH_SIZE]),
             allocator: SlabAllocator::new(false),
         }
     }
 
     #[inline(always)]
     fn compute_hashes(&mut self, col: &Int64Array) {
+        let directory = unsafe { &*self.table.directory.get() };
         let mut i = 0;
         let length = col.len();
         while i < length {
-            self.hashes[i] = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
+            let hash = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
+            let slot = directory.slot_for(hash);
+            let end = directory.end_ptr(slot as isize);
+            let start = directory.end_ptr(slot as isize - 1);
+            self.batch_ptrs[i] = (start, end);
             i += 1;
         }
     }
@@ -65,7 +70,6 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             .unwrap();
         self.compute_hashes(col);
 
-        let directory = unsafe { &*self.table.directory.get() };
         let arena = unsafe { &*self.table.arena.get() };
         let len = col.len();
 
@@ -76,10 +80,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
 
         let mut i = 0;
         while i < len {
-            let hash = unsafe { *self.hashes.get_unchecked(i) };
-            let slot = directory.slot_for(hash);
-            let end = directory.end_ptr(slot as isize);
-            let start = directory.end_ptr(slot as isize - 1);
+            let (start, end) = unsafe { *self.batch_ptrs.get_unchecked(i) };
             let probe_key = unsafe { col.value_unchecked(i) } as u64;
 
             for j in start..end {
