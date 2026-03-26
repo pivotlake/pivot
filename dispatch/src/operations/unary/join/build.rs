@@ -81,7 +81,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
             let key = unsafe { col.value_unchecked(i) };
             let hash = self.hash_state.hash_one(key);
             let partition = (hash >> PARTITION_SHIFT) as usize;
-            self.values[partition].push((hash, (key as u64, i as u64)), &mut self.slab_allocator);
+            self.values[partition].push((hash, key as u32), &mut self.slab_allocator);
         }
 
         Ok(())

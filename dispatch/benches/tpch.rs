@@ -115,8 +115,12 @@ fn run_query_join_orders(tables: &TpchTables) {
         Projection::from_field_names(tables.lineitem.schema(), ["l_orderkey"]),
         false,
     ).join(orders, 0, 0);
-    joined.count().collect();
+    let batches = joined.count().collect();
+    let batch = concat_batches(batches.as_slice());
+    let actual = batch_to_tsv(&batch);
+    println!("Actual {:?}", actual);
 }
+
 
 fn run_query_count(tables: &TpchTables) {
     const EXPECTED: &str = "600037902\n150000000\n";

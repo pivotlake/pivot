@@ -17,8 +17,8 @@ use crate::RECORD_BATCH_SIZE;
 static PROBE_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("probe_idx", DataType::Int64, false),
-        Field::new("build_key", DataType::Int64, false),
-        Field::new("build_payload", DataType::Int64, false),
+        // Field::new("build_key", DataType::Int64, false),
+        // Field::new("build_payload", DataType::Int64, false),
     ]))
 });
 
@@ -74,21 +74,21 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         let len = col.len();
 
         let mut probe_indices = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-        let mut build_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-        let mut build_payloads = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        // let mut build_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        // let mut build_payloads = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
         let mut out = 0;
 
         let mut i = 0;
         while i < len {
             let (start, end) = unsafe { *self.batch_ptrs.get_unchecked(i) };
-            let probe_key = unsafe { col.value_unchecked(i) } as u64;
+            let probe_key = unsafe { col.value_unchecked(i) } as u32;
 
             for j in start..end {
-                let entry: &Value = unsafe { arena.get_unchecked(j) };
-                if entry.0 == probe_key {
+                let entry: Value = unsafe { *arena.get_unchecked(j) };
+                if entry == probe_key {
                     probe_indices.write(out, i as i64);
-                    build_keys.write(out, entry.0 as i64);
-                    build_payloads.write(out, entry.1 as i64);
+                    // build_keys.write(out, entry.0 as i64);
+                    // build_payloads.write(out, entry.1 as i64);
                     out += 1;
                 }
             }
@@ -104,8 +104,8 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             PROBE_SCHEMA.clone(),
             vec![
                 probe_indices.into_array(out),
-                build_keys.into_array(out),
-                build_payloads.into_array(out),
+                // build_keys.into_array(out),
+                // build_payloads.into_array(out),
             ],
         )?;
         sender.send(result)?;

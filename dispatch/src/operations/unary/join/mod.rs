@@ -10,7 +10,8 @@ pub use factory::{JoinBuildFactory, JoinProbeFactory, create_for_workers as crea
 use crate::operations::unary::join::directory::Directory;
 
 
-pub(crate) type Value = (u64, u64);
+// pub(crate) type Value = (u64, u64);
+pub(crate) type Value = u32;
 
 /// Shared hash table state returned by [`JoinBuildFactory::create_for_workers`].
 /// Hand this to the probe side after the build pipeline completes.
