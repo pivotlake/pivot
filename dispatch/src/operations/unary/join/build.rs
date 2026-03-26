@@ -1,14 +1,15 @@
 use std::cell::UnsafeCell;
+use std::ops::{Index, IndexMut};
 use std::sync::{mpsc, Arc};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_deque::{Injector, Steal};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use ahash::RandomState;
 use tracing::debug;
-use crate::memory::{SlabAllocator, SlabVec};
+use crate::memory::{ContiguousMultiBuffer, SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::{unary, Consumer, Outputter};
-use crate::operations::unary::join::directory::Directory;
+use crate::operations::unary::join::directory::{Directory, JoinDirectory};
 use crate::operations::unary::join::Value;
 
 pub(crate) const NUM_PARTITIONS: usize = 64;
@@ -33,7 +34,7 @@ impl JoinBuildConsumer {
         sender: mpsc::Sender<Vec<SlabVec<(u64, Value)>>>,
         receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
-        directory: Arc<UnsafeCell<Directory>>,
+        directory: Arc<UnsafeCell<JoinDirectory>>,
         arena: Arc<UnsafeCell<Vec<Value>>>,
         injector: Arc<Injector<JoinPartitionJob>>,
         jobs_injected: Arc<AtomicBool>,
@@ -98,7 +99,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 }
 
 pub struct JoinBuilder {
-    directory: Arc<UnsafeCell<Directory>>,
+    directory: Arc<UnsafeCell<JoinDirectory>>,
     arena: Arc<UnsafeCell<Vec<Value>>>,
     receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
@@ -112,7 +113,7 @@ unsafe impl Send for JoinBuilder {}
 
 pub struct JoinPartitionJob {
     tuples: Vec<SlabVec<(u64, Value)>>,
-    directory: Arc<UnsafeCell<Directory>>,
+    directory: Arc<UnsafeCell<JoinDirectory>>,
     arena: Arc<UnsafeCell<Vec<Value>>>,
     arena_offset: usize,
     slot_start: usize,
@@ -125,7 +126,18 @@ unsafe impl Send for JoinPartitionJob {}
 impl JoinPartitionJob {
     fn run(self) {
         debug!("Running partition job");
-        let directory = unsafe { &*self.directory.get() };
+        let join_dir = unsafe { &*self.directory.get() };
+        match join_dir {
+            JoinDirectory::Contiguous(dir) => self.run_with_dir(dir),
+            JoinDirectory::NonContiguous(dir) => self.run_with_dir(dir),
+        }
+    }
+
+    #[inline(always)]
+    fn run_with_dir<B: Index<usize, Output = u64> + IndexMut<usize>>(
+        &self,
+        directory: &Directory<B>,
+    ) {
         let shift = directory.shift;
         let arena_ptr = unsafe { (*self.arena.get()).as_mut_ptr() };
 
@@ -192,8 +204,16 @@ impl Outputter<()> for JoinBuilder {
             // Pre-allocate directory and arena.
             let dir_capacity = ((total as f64 * 1.125) as usize).next_power_of_two().max(64);
             let directory = unsafe { &mut *self.directory.get() };
-            let mut dir_allocator = SlabAllocator::new(false);
-            *directory = Directory::with_capacity(dir_capacity, &mut dir_allocator);
+            *directory = match ContiguousMultiBuffer::<u64>::new(dir_capacity + 1) {
+                Ok(buf) => JoinDirectory::Contiguous(Directory::new(buf, dir_capacity)),
+                Err(()) => {
+                    let mut alloc = SlabAllocator::new(false);
+                    JoinDirectory::NonContiguous(Directory::new(
+                        alloc.create_multi_slab_buffer(dir_capacity + 1, true),
+                        dir_capacity,
+                    ))
+                }
+            };
 
             let arena = unsafe { &mut *self.arena.get() };
             arena.reserve(total);

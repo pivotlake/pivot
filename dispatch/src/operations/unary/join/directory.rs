@@ -1,5 +1,6 @@
 use std::cell::UnsafeCell;
-use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use std::ops::{Index, IndexMut};
+use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer};
 
 const PTR_SHIFT: u32 = 16;
 
@@ -19,45 +20,27 @@ const fn build_tag_table() -> [u16; 2048] {
 }
 static TAG_TABLE: [u16; 2048] = build_tag_table();
 
-pub struct Directory {
-    /// Sentinel at index 0 (always zero), then `capacity` real slots.
-    entries: UnsafeCell<MultiSlabBuffer<u64>>,
+pub struct Directory<B> {
+    entries: UnsafeCell<B>,
     capacity: usize,
     pub(crate) shift: u32,
 }
 
-unsafe impl Send for Directory {}
-unsafe impl Sync for Directory {}
+unsafe impl<B> Send for Directory<B> {}
+unsafe impl<B> Sync for Directory<B> {}
 
-impl Directory {
-    pub fn empty() -> Self {
-        Self {
-            entries: UnsafeCell::new(MultiSlabBuffer::new(vec![])),
-            capacity: 0,
-            shift: 64,
-        }
-    }
-
-    /// Allocate a directory with a zeroed sentinel at index 0 followed by
-    /// `capacity` zeroed real slots.
-    pub fn with_capacity(capacity: usize, allocator: &mut SlabAllocator) -> Self {
-        debug_assert!(capacity.is_power_of_two());
-        let entries = allocator.create_multi_slab_buffer::<u64>(capacity + 1, true);
+impl<B> Directory<B> {
+    pub fn new(entries: B, capacity: usize) -> Self {
         Self {
             entries: UnsafeCell::new(entries),
             capacity,
-            shift: 64 - capacity.trailing_zeros(),
+            shift: if capacity > 0 {
+                debug_assert!(capacity.is_power_of_two());
+                64 - capacity.trailing_zeros()
+            } else {
+                64
+            },
         }
-    }
-
-    #[inline(always)]
-    fn entries(&self) -> &MultiSlabBuffer<u64> {
-        unsafe { &*self.entries.get() }
-    }
-
-    #[inline(always)]
-    fn entries_mut(&self) -> &mut MultiSlabBuffer<u64> {
-        unsafe { &mut *self.entries.get() }
     }
 
     #[inline(always)]
@@ -69,6 +52,22 @@ impl Directory {
     #[inline(always)]
     pub fn slot_for(&self, hash: u64) -> usize {
         (hash >> self.shift) as usize
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
+    #[inline(always)]
+    fn entries(&self) -> &B {
+        unsafe { &*self.entries.get() }
+    }
+
+    #[inline(always)]
+    fn entries_mut(&self) -> &mut B {
+        unsafe { &mut *self.entries.get() }
     }
 
     /// Read entry at slot (0-indexed into real slots, sentinel is slot -1).
@@ -114,8 +113,18 @@ impl Directory {
     pub fn end_ptr(&self, slot: isize) -> usize {
         (self.entries()[(slot + 1) as usize] >> PTR_SHIFT) as usize
     }
+}
 
-    pub fn capacity(&self) -> usize {
-        self.capacity
+/// Wraps two monomorphized `Directory` variants. The match happens once per
+/// partition job / probe batch, then the inner loop runs on the concrete
+/// `Directory<B>` — no branch per element.
+pub enum JoinDirectory {
+    Contiguous(Directory<ContiguousMultiBuffer<u64>>),
+    NonContiguous(Directory<MultiSlabBuffer<u64>>),
+}
+
+impl JoinDirectory {
+    pub fn initial() -> Self {
+        JoinDirectory::NonContiguous(Directory::new(MultiSlabBuffer::new(vec![]), 0))
     }
 }

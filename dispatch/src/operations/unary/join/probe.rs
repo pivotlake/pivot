@@ -1,3 +1,4 @@
+use std::ops::{Index, IndexMut};
 use std::sync::{Arc, LazyLock};
 
 use ahash::RandomState;
@@ -9,6 +10,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::Unary;
+use crate::operations::unary::join::directory::{Directory, JoinDirectory};
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::Value;
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
@@ -42,8 +44,7 @@ impl Probe {
     }
 
     #[inline(always)]
-    fn compute_hashes(&mut self, col: &Int64Array) {
-        let directory = unsafe { &*self.table.directory.get() };
+    fn compute_hashes<B: Index<usize, Output = u64> + IndexMut<usize>>(&mut self, col: &Int64Array, directory: &Directory<B>) {
         let mut i = 0;
         let length = col.len();
         while i < length {
@@ -55,20 +56,16 @@ impl Probe {
             i += 1;
         }
     }
-}
 
-impl Unary<RecordBatch, RecordBatch> for Probe {
-    fn consume<S: Sender<RecordBatch>>(
+    #[inline(always)]
+    fn probe_with_dir<B: Index<usize, Output = u64> + IndexMut<usize>, S: Sender<RecordBatch>>(
         &mut self,
-        batch: RecordBatch,
+        directory: &Directory<B>,
+        col: &Int64Array,
         sender: &mut S,
     ) -> unary::Result<()> {
-        let col = batch
-            .column(self.key_column)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        self.compute_hashes(col);
+
+        self.compute_hashes(col, directory);
 
         let arena = unsafe { &*self.table.arena.get() };
         let len = col.len();
@@ -110,5 +107,25 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         )?;
         sender.send(result)?;
         Ok(())
+    }
+}
+
+impl Unary<RecordBatch, RecordBatch> for Probe {
+    fn consume<S: Sender<RecordBatch>>(
+        &mut self,
+        batch: RecordBatch,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        let col = batch
+            .column(self.key_column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let join_dir = unsafe { &*self.table.directory.get() };
+        match join_dir {
+            JoinDirectory::Contiguous(dir) => self.probe_with_dir(dir, col, sender),
+            JoinDirectory::NonContiguous(dir) => self.probe_with_dir(dir, col, sender),
+        }
     }
 }

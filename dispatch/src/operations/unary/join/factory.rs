@@ -8,7 +8,7 @@ use crossbeam_deque::Injector;
 
 use crate::memory::SlabVec;
 use crate::operations::UnaryFactory;
-use crate::operations::unary::join::directory::Directory;
+use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::probe::Probe;
 use crate::operations::unary::join::{JoinTable, Value};
 use crate::operations::unary::join::build::{JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS};
@@ -20,7 +20,7 @@ pub struct JoinBuildFactory {
     key_column: usize,
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    directory: Arc<UnsafeCell<Directory>>,
+    directory: Arc<UnsafeCell<JoinDirectory>>,
     arena: Arc<UnsafeCell<Vec<Value>>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
@@ -60,7 +60,7 @@ pub fn create_for_workers(
     let hash_state = RandomState::new();
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
-    let directory = Arc::new(UnsafeCell::new(Directory::empty()));
+    let directory = Arc::new(UnsafeCell::new(JoinDirectory::initial()));
     let arena: Arc<UnsafeCell<Vec<Value>>> = Arc::new(UnsafeCell::new(Vec::new()));
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));

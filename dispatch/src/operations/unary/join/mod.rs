@@ -7,7 +7,7 @@ mod build;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 pub use factory::{JoinBuildFactory, JoinProbeFactory, create_for_workers as create_join_factories};
-use crate::operations::unary::join::directory::Directory;
+use crate::operations::unary::join::directory::JoinDirectory;
 
 
 // pub(crate) type Value = (u64, u64);
@@ -16,7 +16,7 @@ pub(crate) type Value = u32;
 /// Shared hash table state returned by [`JoinBuildFactory::create_for_workers`].
 /// Hand this to the probe side after the build pipeline completes.
 pub struct JoinTable {
-    pub directory: Arc<UnsafeCell<Directory>>,
+    pub directory: Arc<UnsafeCell<JoinDirectory>>,
     pub arena: Arc<UnsafeCell<Vec<Value>>>,
 }
 
