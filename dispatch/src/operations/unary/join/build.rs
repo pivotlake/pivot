@@ -9,7 +9,7 @@ use tracing::debug;
 use crate::memory::{ContiguousMultiBuffer, SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::{unary, Consumer, Outputter};
-use crate::operations::unary::join::directory::{Directory, JoinDirectory};
+use crate::operations::unary::join::directory::{prefetch_ptr, Directory, JoinDirectory};
 use crate::operations::unary::join::Value;
 
 pub(crate) const NUM_PARTITIONS: usize = 128;
@@ -172,12 +172,46 @@ impl JoinPartitionJob {
         // leaves the tag bits untouched. After this pass the cursors have
         // become end-pointers.
         for worker_tuples in &self.tuples {
-            for &(hash, value) in worker_tuples {
-                let slot = (hash >> shift) as usize;
-                unsafe {
-                    let arena_idx = (directory.entry(slot) >> 16) as usize;
-                    arena_ptr.add(arena_idx).write(value);
-                    directory.add_to_entry(slot, 1 << 16);
+
+            let mut iterator = worker_tuples.into_iter();
+            let mut arena_iterator = worker_tuples.into_iter();
+
+            let mut work_iterator = worker_tuples.into_iter();
+
+            const COUNT: usize = 128;
+
+            loop {
+                for _ in 0..COUNT {
+                    if let Some((hash, _)) =iterator.next() {
+                        directory.prefetch(*hash);
+                    }
+                }
+
+                for _ in 0..COUNT {
+                    if let Some((hash, _)) =arena_iterator.next() {
+                        let slot = (hash >> shift) as usize;
+                        let arena_idx = (directory.entry(slot) >> 16) as usize;
+                        prefetch_ptr(unsafe { arena_ptr.add(arena_idx) } as *const u8);
+                    }
+                }
+
+                let mut is_done = false;
+                for _ in 0..COUNT {
+                    if let Some((hash, value)) =work_iterator.next() {
+                        let slot = (hash >> shift) as usize;
+                        unsafe {
+                            let arena_idx = (directory.entry(slot) >> 16) as usize;
+                            arena_ptr.add(arena_idx).write(*value);
+                            directory.add_to_entry(slot, 1 << 16);
+                        }
+                    } else {
+                        is_done = true;
+                        break;
+                    }
+                }
+
+                if is_done {
+                    break;
                 }
             }
         }
