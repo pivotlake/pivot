@@ -55,7 +55,7 @@ pub use factory::{RecordBatchBinaryOperatorFactory, RecordBatchUnaryOperatorFact
 mod spec;
 pub use spec::{RecordBatchOperatorSpec, table_input};
 
-pub const RECORD_BATCH_SIZE: usize = 8192;
+pub const RECORD_BATCH_SIZE: usize = 2048;
 
 /// Object-safe version of [`OperatorFactory<RecordBatch>`].
 ///

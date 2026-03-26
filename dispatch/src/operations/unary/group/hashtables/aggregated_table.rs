@@ -85,7 +85,7 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             }
 
             let key = K::live_key(&array, i, &mut self.worker_arena);
-            table.merge::<false, _>(hash, key, K::Value::single());
+            table.merge::<false, _>(hash, key, Value::single());
 
             if table.undersized() {
                 self.create_new_table();
@@ -94,6 +94,7 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             i += 1;
         }
     }
+
     /// Finalize this worker's aggregation: flush the arena and return all tables.
     pub fn flush(self) -> Vec<MultiSlabTable<K>> {
         self.worker_arena.flush();

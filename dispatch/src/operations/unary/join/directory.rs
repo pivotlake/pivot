@@ -59,6 +59,16 @@ impl<B> Directory<B> {
     }
 }
 
+#[inline(always)]
+pub fn prefetch_ptr(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ptr;
+}
+
 impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     #[inline(always)]
     fn entries(&self) -> &B {
@@ -92,6 +102,14 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     #[inline(always)]
     pub unsafe fn add_to_entry(&self, slot: usize, value: u64) {
         self.entries_mut()[slot + 1] += value;
+    }
+
+    /// Prefetch the directory entry for the slot where `hash` would land.
+    #[inline(always)]
+    pub fn prefetch(&self, hash: u64) {
+        let slot = self.slot_for(hash);
+        let ptr = &self.entries()[slot + 1] as *const u64 as *const u8;
+        prefetch_ptr(ptr);
     }
 
     #[inline(always)]

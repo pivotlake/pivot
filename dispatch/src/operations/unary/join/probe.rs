@@ -19,7 +19,7 @@ use crate::RECORD_BATCH_SIZE;
 static PROBE_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("probe_idx", DataType::Int64, false),
-        // Field::new("build_key", DataType::Int64, false),
+        Field::new("build_key", DataType::Int64, false),
         // Field::new("build_payload", DataType::Int64, false),
     ]))
 });
@@ -28,7 +28,7 @@ pub struct Probe {
     table: JoinTable,
     hash_state: RandomState,
     key_column: usize,
-    batch_ptrs: Box<[(usize, usize); RECORD_BATCH_SIZE]>,
+    hashes: Box<[u64; RECORD_BATCH_SIZE]>,
     allocator: SlabAllocator,
 }
 
@@ -38,7 +38,7 @@ impl Probe {
             table,
             hash_state,
             key_column,
-            batch_ptrs: Box::new([(0usize, 0usize); RECORD_BATCH_SIZE]),
+            hashes: Box::new([0; RECORD_BATCH_SIZE]),
             allocator: SlabAllocator::new(false),
         }
     }
@@ -49,10 +49,7 @@ impl Probe {
         let length = col.len();
         while i < length {
             let hash = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
-            let slot = directory.slot_for(hash);
-            let end = directory.end_ptr(slot as isize);
-            let start = directory.end_ptr(slot as isize - 1);
-            self.batch_ptrs[i] = (start, end);
+            self.hashes[i] = hash;
             i += 1;
         }
     }
@@ -64,28 +61,48 @@ impl Probe {
         col: &Int64Array,
         sender: &mut S,
     ) -> unary::Result<()> {
-
         self.compute_hashes(col, directory);
 
         let arena = unsafe { &*self.table.arena.get() };
         let len = col.len();
 
-        let mut probe_indices = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-        // let mut build_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-        // let mut build_payloads = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+
         let mut out = 0;
 
         let mut i = 0;
         while i < len {
-            let (start, end) = unsafe { *self.batch_ptrs.get_unchecked(i) };
+            const PREFETCH_DISTANCE: usize = 16;
+            if i + PREFETCH_DISTANCE < len {
+                let ph = self.hashes[i + PREFETCH_DISTANCE];
+                directory.prefetch(ph);
+            }
+
+            if i + 8 < len {
+                let h = unsafe { *self.hashes.get_unchecked(i + 8) };
+                let slot = directory.slot_for(h) as isize;
+                let start = directory.end_ptr(slot - 1);
+                let ptr = unsafe {arena.as_ptr().add(start) } as *const i8;
+
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+                }
+            }
+
+            let hash = unsafe { *self.hashes.get_unchecked(i) };
+            let slot = directory.slot_for(hash) as isize;
+            let start = directory.end_ptr(slot - 1);
+            let end = directory.end_ptr(slot);
+
             let probe_key = unsafe { col.value_unchecked(i) } as u32;
 
             for j in start..end {
                 let entry: Value = unsafe { *arena.get_unchecked(j) };
                 if entry == probe_key {
-                    probe_indices.write(out, i as i64);
-                    // build_keys.write(out, entry.0 as i64);
-                    // build_payloads.write(out, entry.1 as i64);
+                    lineitem_keys.write(out, entry as i64);
+                    order_keys.write(out, entry as i64);
                     out += 1;
                 }
             }
@@ -100,9 +117,8 @@ impl Probe {
         let result = RecordBatch::try_new(
             PROBE_SCHEMA.clone(),
             vec![
-                probe_indices.into_array(out),
-                // build_keys.into_array(out),
-                // build_payloads.into_array(out),
+                lineitem_keys.into_array(out),
+                order_keys.into_array(out),
             ],
         )?;
         sender.send(result)?;

@@ -12,7 +12,7 @@ use crate::operations::{unary, Consumer, Outputter};
 use crate::operations::unary::join::directory::{Directory, JoinDirectory};
 use crate::operations::unary::join::Value;
 
-pub(crate) const NUM_PARTITIONS: usize = 64;
+pub(crate) const NUM_PARTITIONS: usize = 128;
 const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
 
 pub struct JoinBuildConsumer {
