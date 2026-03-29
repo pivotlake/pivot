@@ -263,9 +263,10 @@ fn main() {
                 id,
                 start.elapsed().as_millis()
             );
-            if let Ok(a) = std::env::var("SLEEP") {
+            if let Ok(a) = std::env::var("SLEEP") && i != iterations - 1 {
                 sleep(Duration::from_secs(a.parse().unwrap()));
             }
         }
     }
+    println!("Finished!");
 }

@@ -134,7 +134,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         batch: RecordBatch,
         sender: &mut S,
     ) -> unary::Result<()> {
-        // perf_enable();
+        perf_enable();
         let col = batch
             .column(self.key_column)
             .as_any()
@@ -149,7 +149,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        // perf_disable();
+        perf_disable();
         Ok(true)
     }
 }

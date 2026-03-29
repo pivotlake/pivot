@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::mem;
 use crate::memory::slab::Slab;
 use crate::memory::{SlabAllocator, BUFFER_SIZE};
 
@@ -13,6 +14,7 @@ pub struct SlabVec<T> {
     ptr: *mut T,
     last_ptr: *mut T,
     len: usize,
+    next_size: usize,
     _phantom: PhantomData<T>,
 }
 
@@ -31,6 +33,7 @@ impl<T> SlabVec<T> {
             last_ptr: std::ptr::null_mut(),
             slabs: Vec::new(),
             len: 0,
+            next_size: elements_per_slab::<T>(),
             _phantom: PhantomData,
         }
     }
@@ -43,10 +46,13 @@ impl<T> SlabVec<T> {
     #[inline(always)]
     pub fn push(&mut self, value: T, allocator: &mut SlabAllocator) {
         if self.ptr >= self.last_ptr {
-            let slab = allocator.get_slab_of_size(BUFFER_SIZE, false);
+            let slab = allocator.get_slab_of_size(self.next_size * size_of::<T>(), false);
             self.ptr = slab.ptr as *mut T;
-            self.last_ptr = unsafe { (slab.ptr as *mut T).add(elements_per_slab::<T>()) };
+            self.last_ptr = unsafe { (slab.ptr as *mut T).add(self.next_size) };
             self.slabs.push(slab);
+            if self.next_size * 2 * size_of::<T>()  <= BUFFER_SIZE {
+                self.next_size *= 2;
+            }
         }
         unsafe {
             self.ptr.write(value);

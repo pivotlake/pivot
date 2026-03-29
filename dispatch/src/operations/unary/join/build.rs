@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::hint::black_box;
 use std::mem;
 use std::ops::{Index, IndexMut};
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
@@ -14,7 +15,7 @@ use crate::operations::unary::join::directory::{prefetch_ptr, Directory, JoinDir
 use crate::operations::unary::join::Value;
 use crate::perf_stat::{perf_disable, perf_enable};
 
-pub(crate) const NUM_PARTITIONS: usize = 2048;
+pub(crate) const NUM_PARTITIONS: usize = 64;
 const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
 
 pub struct JoinBuildConsumer {
@@ -193,14 +194,13 @@ impl JoinPartitionJob {
 
                 let count = std::cmp::min(slab_size, total_left);
 
-
                 for i in 0..count {
                     let (hash, value) = unsafe { *(ptr.add(i) ) };
                     let slot = (hash >> shift) as usize;
                     let entry = directory.entry(slot);
                     unsafe { directory.add_to_entry(slot, 1 << 16); }
-                    // let arena_idx = (entry >> 16) as usize;
-                    // unsafe { arena.ptr_at_index(arena_idx).write(value) };
+                    let arena_idx = (entry >> 16) as usize;
+                    unsafe { arena.ptr_at_index(arena_idx).write(value) };
                 }
 
                 total_left -= count;
@@ -216,7 +216,7 @@ impl JoinPartitionJob {
 
 impl Outputter<()> for JoinBuilder {
     fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        perf_enable();
+        // perf_enable();
         if let Some(rx) = self.receiver.take() {
             let mut all_worker_tuples: Vec<Vec<SlabVec<(u64, Value)>>> = rx.into_iter().collect();
 
@@ -276,7 +276,7 @@ impl Outputter<()> for JoinBuilder {
             }
             Steal::Empty => {
                 if self.jobs_injected.load(Ordering::Relaxed) {
-                    perf_disable();
+                    // perf_disable();
                     return Ok(true);
                 }
             }
