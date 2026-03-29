@@ -273,10 +273,10 @@ mod tests {
             vec![int64_batch(&[99, 20, 99, 30])],
         );
 
-        // probe_idx (col 0) should be 1 and 3 — the positions of 20 and 30
-        let mut probe_idxs = collect_i64_column(&r.batches, 0);
-        probe_idxs.sort();
-        assert_eq!(probe_idxs, vec![1, 3]);
+        // col 0 is now lineitem_keys (matched build keys), not probe_idx
+        let mut keys = collect_i64_column(&r.batches, 0);
+        keys.sort();
+        assert_eq!(keys, vec![20, 30]);
     }
 
     #[test]

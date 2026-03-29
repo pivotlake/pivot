@@ -1,12 +1,13 @@
 use std::cell::UnsafeCell;
+use std::mem;
 use std::ops::{Index, IndexMut};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_deque::{Injector, Steal};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use ahash::RandomState;
 use tracing::debug;
-use crate::memory::{ContiguousMultiBuffer, SlabAllocator, SlabVec};
+use crate::memory::{ContiguousMultiBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec, BUFFER_SIZE};
 use crate::operations::channels::Sender;
 use crate::operations::{unary, Consumer, Outputter};
 use crate::operations::unary::join::directory::{prefetch_ptr, Directory, JoinDirectory};
@@ -116,6 +117,9 @@ pub struct JoinPartitionJob {
     directory: Arc<UnsafeCell<JoinDirectory>>,
     arena: Arc<UnsafeCell<Vec<Value>>>,
     arena_offset: usize,
+
+    // arena_slabs: Arc<Mutex<Vec<SlabBuffer<Value>>>>,
+
     slot_start: usize,
     gate: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
@@ -153,12 +157,16 @@ impl JoinPartitionJob {
             }
         }
 
-        // Pass 2: convert counts → absolute write cursors. Linear sweep
+        // Pass 2: convert counts to absolute write cursors. Linear sweep
         // over this partition's directory slot range replaces each count
         // with a running arena pointer while preserving the tag bits.
         let slots_per_partition = directory.capacity() / NUM_PARTITIONS;
         let slot_end = self.slot_start + slots_per_partition;
         let mut cur = self.arena_offset as u64;
+
+        // let mut slabs = vec![];
+        // let current_slab = Slab::
+
         for i in self.slot_start..slot_end {
             let entry = directory.entry(i);
             let count = entry >> 16;
@@ -167,52 +175,34 @@ impl JoinPartitionJob {
             cur += count;
         }
 
-        // Pass 3: scatter values into arena. The upper 48 bits of each
-        // directory entry serve as the write cursor; advancing by 1<<16
-        // leaves the tag bits untouched. After this pass the cursors have
-        // become end-pointers.
+        const COUNT: usize = 32;
+        // Pass 3: scatter values into arena in batches of COUNT:
+        //   1. Consume tuples, compute slots
+        //   2. Read directory to get arena write pointers, advance cursors
+        //   3. Write values to the collected arena pointers
         for worker_tuples in &self.tuples {
 
-            let mut iterator = worker_tuples.into_iter();
-            let mut arena_iterator = worker_tuples.into_iter();
+            let mut total_left = worker_tuples.len();
 
-            let mut work_iterator = worker_tuples.into_iter();
+            // let mut entries = [0u64; COUNT];
+            // let mut values = [0 as Value; COUNT];
+            // let mut dest = [std::ptr::null_mut::<Value>(); COUNT];
 
-            const COUNT: usize = 128;
+            for slab in worker_tuples.slabs() {
+                let ptr = slab.ptr as *mut (u64, Value);
+                let slab_size = BUFFER_SIZE / size_of::<(u64, Value)>();
 
-            loop {
-                for _ in 0..COUNT {
-                    if let Some((hash, _)) =iterator.next() {
-                        directory.prefetch(*hash);
-                    }
+                let count = std::cmp::min(slab_size, total_left);
+                for i in 0..count {
+                    let (hash, value) = unsafe { *(ptr.add(i) ) };
+                    let slot = (hash >> shift) as usize;
+                    let entry = directory.entry(slot);
+                    unsafe { directory.add_to_entry(slot, 1 << 16); }
+                    let arena_idx = (entry >> 16) as usize;
+                    unsafe { (arena_ptr.add(arena_idx) as *mut Value).write(value) };
                 }
 
-                for _ in 0..COUNT {
-                    if let Some((hash, _)) =arena_iterator.next() {
-                        let slot = (hash >> shift) as usize;
-                        let arena_idx = (directory.entry(slot) >> 16) as usize;
-                        prefetch_ptr(unsafe { arena_ptr.add(arena_idx) } as *const u8);
-                    }
-                }
-
-                let mut is_done = false;
-                for _ in 0..COUNT {
-                    if let Some((hash, value)) =work_iterator.next() {
-                        let slot = (hash >> shift) as usize;
-                        unsafe {
-                            let arena_idx = (directory.entry(slot) >> 16) as usize;
-                            arena_ptr.add(arena_idx).write(*value);
-                            directory.add_to_entry(slot, 1 << 16);
-                        }
-                    } else {
-                        is_done = true;
-                        break;
-                    }
-                }
-
-                if is_done {
-                    break;
-                }
+                total_left -= count;
             }
         }
 
@@ -236,7 +226,7 @@ impl Outputter<()> for JoinBuilder {
             let total: usize = sizes.iter().sum();
 
             // Pre-allocate directory and arena.
-            let dir_capacity = ((total as f64 * 1.125) as usize).next_power_of_two().max(64);
+            let dir_capacity = ((total as f64 * 1.125) as usize).next_power_of_two().max(NUM_PARTITIONS);
             let directory = unsafe { &mut *self.directory.get() };
             *directory = match ContiguousMultiBuffer::<u64>::new(dir_capacity + 1) {
                 Ok(buf) => JoinDirectory::Contiguous(Directory::new(buf, dir_capacity)),
