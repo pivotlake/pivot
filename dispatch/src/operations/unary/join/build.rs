@@ -7,7 +7,7 @@ use crossbeam_deque::{Injector, Steal};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use ahash::RandomState;
 use tracing::debug;
-use crate::memory::{ContiguousMultiBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec, BUFFER_SIZE};
+use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec, BUFFER_SIZE};
 use crate::operations::channels::Sender;
 use crate::operations::{unary, Consumer, Outputter};
 use crate::operations::unary::join::directory::{prefetch_ptr, Directory, JoinDirectory};
@@ -36,7 +36,7 @@ impl JoinBuildConsumer {
         receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
         directory: Arc<UnsafeCell<JoinDirectory>>,
-        arena: Arc<UnsafeCell<Vec<Value>>>,
+        arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
         injector: Arc<Injector<JoinPartitionJob>>,
         jobs_injected: Arc<AtomicBool>,
         gate: Arc<AtomicBool>,
@@ -101,7 +101,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 
 pub struct JoinBuilder {
     directory: Arc<UnsafeCell<JoinDirectory>>,
-    arena: Arc<UnsafeCell<Vec<Value>>>,
+    arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
     receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     injector: Arc<Injector<JoinPartitionJob>>,
@@ -115,10 +115,8 @@ unsafe impl Send for JoinBuilder {}
 pub struct JoinPartitionJob {
     tuples: Vec<SlabVec<(u64, Value)>>,
     directory: Arc<UnsafeCell<JoinDirectory>>,
-    arena: Arc<UnsafeCell<Vec<Value>>>,
+    arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
     arena_offset: usize,
-
-    // arena_slabs: Arc<Mutex<Vec<SlabBuffer<Value>>>>,
 
     slot_start: usize,
     gate: Arc<AtomicBool>,
@@ -143,7 +141,7 @@ impl JoinPartitionJob {
         directory: &Directory<B>,
     ) {
         let shift = directory.shift;
-        let arena_ptr = unsafe { (*self.arena.get()).as_mut_ptr() };
+        let arena = unsafe { &*self.arena.get() };
 
         // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
         // lower 16 bits — directly in the directory, no side allocations.
@@ -199,7 +197,7 @@ impl JoinPartitionJob {
                     let entry = directory.entry(slot);
                     unsafe { directory.add_to_entry(slot, 1 << 16); }
                     let arena_idx = (entry >> 16) as usize;
-                    unsafe { (arena_ptr.add(arena_idx) as *mut Value).write(value) };
+                    unsafe { arena.ptr_at_index(arena_idx).write(value) };
                 }
 
                 total_left -= count;
@@ -240,8 +238,8 @@ impl Outputter<()> for JoinBuilder {
             };
 
             let arena = unsafe { &mut *self.arena.get() };
-            arena.reserve(total);
-            unsafe { arena.set_len(total) };
+            let mut arena_alloc = SlabAllocator::new(false);
+            *arena = arena_alloc.create_multi_slab_buffer::<Value>(total.max(1), false);
 
             // Prefix sums give each partition its arena offset.
             let mut offsets = vec![0usize; NUM_PARTITIONS];

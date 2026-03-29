@@ -6,7 +6,7 @@ use ahash::RandomState;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Injector;
 
-use crate::memory::SlabVec;
+use crate::memory::{MultiSlabBuffer, SlabVec};
 use crate::operations::UnaryFactory;
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::probe::Probe;
@@ -21,7 +21,7 @@ pub struct JoinBuildFactory {
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     directory: Arc<UnsafeCell<JoinDirectory>>,
-    arena: Arc<UnsafeCell<Vec<Value>>>,
+    arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
     sender: mpsc::Sender<Vec<SlabVec<(u64, Value)>>>,
@@ -61,7 +61,7 @@ pub fn create_for_workers(
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
     let directory = Arc::new(UnsafeCell::new(JoinDirectory::initial()));
-    let arena: Arc<UnsafeCell<Vec<Value>>> = Arc::new(UnsafeCell::new(Vec::new()));
+    let arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>> = Arc::new(UnsafeCell::new(MultiSlabBuffer::new(vec![])));
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(AtomicBool::new(false));

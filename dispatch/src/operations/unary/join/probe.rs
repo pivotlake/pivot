@@ -83,7 +83,7 @@ impl Probe {
                 let h = unsafe { *self.hashes.get_unchecked(i + 8) };
                 let slot = directory.slot_for(h) as isize;
                 let start = directory.end_ptr(slot - 1);
-                let ptr = unsafe {arena.as_ptr().add(start) } as *const i8;
+                let ptr = arena.ptr_at_index(start) as *const i8;
 
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
@@ -99,7 +99,7 @@ impl Probe {
             let probe_key = unsafe { col.value_unchecked(i) } as u32;
 
             for j in start..end {
-                let entry: Value = unsafe { *arena.get_unchecked(j) };
+                let entry: Value = arena[j];
                 if entry == probe_key {
                     lineitem_keys.write(out, entry as i64);
                     order_keys.write(out, entry as i64);

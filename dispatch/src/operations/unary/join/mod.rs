@@ -7,6 +7,7 @@ mod build;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 pub use factory::{JoinBuildFactory, JoinProbeFactory, create_for_workers as create_join_factories};
+use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::directory::JoinDirectory;
 
 
@@ -17,7 +18,7 @@ pub(crate) type Value = u32;
 /// Hand this to the probe side after the build pipeline completes.
 pub struct JoinTable {
     pub directory: Arc<UnsafeCell<JoinDirectory>>,
-    pub arena: Arc<UnsafeCell<Vec<Value>>>,
+    pub arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
 }
 
 unsafe impl Send for JoinTable {}
@@ -68,7 +69,7 @@ mod tests {
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
     ) -> JoinResult {
-        init_test_free_pool(128);
+        init_test_free_pool(256);
         let workers = build_worker_batches.len();
         let (builds, probes, gate) = factory::create_for_workers(0, 0, workers);
 
