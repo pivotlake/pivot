@@ -61,6 +61,7 @@ mod memory;
 mod operations;
 mod record_batch_metadata;
 mod worker;
+mod perf_stat;
 
 use crate::worker::Worker;
 pub use api::*;

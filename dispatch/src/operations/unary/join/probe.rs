@@ -14,7 +14,9 @@ use crate::operations::unary::join::directory::{Directory, JoinDirectory};
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::Value;
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
+use crate::perf_stat::{perf_disable, perf_enable};
 use crate::RECORD_BATCH_SIZE;
+
 
 static PROBE_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
@@ -132,6 +134,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         batch: RecordBatch,
         sender: &mut S,
     ) -> unary::Result<()> {
+        // perf_enable();
         let col = batch
             .column(self.key_column)
             .as_any()
@@ -143,5 +146,10 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             JoinDirectory::Contiguous(dir) => self.probe_with_dir(dir, col, sender),
             JoinDirectory::NonContiguous(dir) => self.probe_with_dir(dir, col, sender),
         }
+    }
+
+    fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
+        // perf_disable();
+        Ok(true)
     }
 }
