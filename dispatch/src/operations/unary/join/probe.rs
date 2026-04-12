@@ -19,7 +19,7 @@ use crate::operations::unary::join::Value;
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
 use crate::perf_stat::{perf_disable, perf_enable};
 use crate::RECORD_BATCH_SIZE;
-
+use crate::worker::WORKER_IDX;
 
 static PROBE_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
@@ -34,7 +34,6 @@ pub struct Probe {
     hash_state: RandomState,
     key_column: usize,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
-    rng: SmallRng,
     allocator: SlabAllocator,
     total: usize,
 }
@@ -46,7 +45,6 @@ impl Probe {
             hash_state,
             key_column,
             hashes: Box::new([0; RECORD_BATCH_SIZE]),
-            rng: SmallRng::seed_from_u64(0xBADC0FFEE),
             allocator: SlabAllocator::new(false),
             total: 0,
         }
@@ -73,40 +71,42 @@ impl Probe {
         col: &Int64Array,
         sender: &mut S,
     ) -> unary::Result<()> {
-        println!("Directory shift {:?}", directory.shift);
-        // self.compute_hashes(col, directory);
+        let mut ptrs: [*const u64; RECORD_BATCH_SIZE] = [std::ptr::null(); RECORD_BATCH_SIZE];
+        self.compute_hashes(col, directory);
 
-        // Pre-compute the EXACT address each random slot lands on. We do the
-        // address arithmetic up front so the touch loop below is just a stream
-        // of independent loads with no shifting/masking dependency between
-        // iterations — that gives the reorder buffer the maximum number of
-        // in-flight memory ops and saturates memory bandwidth.
-        let mut ptrs: [*const u64; 2048] = [std::ptr::null(); 2048];
 
-        for i in 0..64 {
-            let slot = (self.rng.next_u64() >> directory.shift) as usize;
-            ptrs[i] = directory.ptr_for_slot(slot);
-            prefetch_ptr_l2(ptrs[i] as *const u8);
-        }
 
-        for i in 64..2048 {
-            let slot = (self.rng.next_u64() >> directory.shift) as usize;
-            ptrs[i] = directory.ptr_for_slot(slot);
-        }
-
-        for i in 0..2048-64 {
-            prefetch_ptr_l2(ptrs[i + PREFETCH_DISTANCE] as *const u8);
-            let a = unsafe { *ptrs[i] };
-            black_box(a);
-        }
-
-        const PREFETCH_DISTANCE: usize = 64;
-        for i in 2048-64..2048 {
-            let a = unsafe { *ptrs[i] };
-            black_box(a);
-        }
-
-        self.total += 2048;
+        // // Pre-compute the EXACT address each random slot lands on. We do the
+        // // address arithmetic up front so the touch loop below is just a stream
+        // // of independent loads with no shifting/masking dependency between
+        // // iterations — that gives the reorder buffer the maximum number of
+        // // in-flight memory ops and saturates memory bandwidth.
+        //
+        //
+        // for i in 0..PREFETCH_DISTANCE {
+        //     let slot = (self.rng.next_u64() >> directory.shift) as usize;
+        //     ptrs[i] = directory.ptr_for_slot(slot);
+        //     prefetch_ptr_l2(ptrs[i] as *const u8);
+        // }
+        //
+        // for i in PREFETCH_DISTANCE..SIZE {
+        //     let slot = (self.rng.next_u64() >> directory.shift) as usize;
+        //     ptrs[i] = directory.ptr_for_slot(slot);
+        // }
+        //
+        // for i in 0..SIZE-PREFETCH_DISTANCE {
+        //     prefetch_ptr_l2(ptrs[i + PREFETCH_DISTANCE] as *const u8);
+        //     // unsafe { std::ptr::read_volatile(ptrs[i] as *const u8); }
+        //     let a = unsafe { *ptrs[i] };
+        //     black_box(a);
+        // }
+        //
+        // // for i in SIZE-PREFETCH_DISTANCE..SIZE {
+        // //     let a = unsafe { *ptrs[i] };
+        // //     black_box(a);
+        // // }
+        //
+        // self.total += SIZE;
         // let arena = unsafe { &*self.table.arena.get() };
         // let len = col.len();
 
@@ -200,7 +200,6 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
         perf_disable();
-        println!("Total {}", mem::take(&mut self.total));
         Ok(true)
     }
 }

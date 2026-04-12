@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import click
 
@@ -15,12 +17,16 @@ from .model import (
 )
 from .parse import (
     build_annotated_lines,
+    compute_function_summaries,
+    compute_load_base,
     compute_totals,
     find_binary,
+    get_function_bounds,
     parse_ibs_raw,
     parse_prefetch_pmc,
     parse_samples,
     run_objdump,
+    run_objdump_function,
     run_perf,
 )
 
@@ -99,28 +105,58 @@ def main(
         mode = DisplayMode.WEIGHTED
 
     click.echo("Parsing perf data...", err=True)
-    script_output = run_perf(
-        ["script", "-F", "ip,sym,symoff,data_src", "-G"], perf_data
+
+    # Launch all three perf processes in parallel so their I/O overlaps.
+    proc_samples = subprocess.Popen(
+        ["perf", "script", "-F", "ip,sym,symoff,data_src", "-G", "-i", perf_data],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    proc_ibs = subprocess.Popen(
+        ["perf", "script", "-D", "-i", perf_data],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    proc_pmc = subprocess.Popen(
+        ["perf", "script", "-F", "event,period,ip,sym,symoff", "-G", "-i", perf_data],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
 
+    # Drain PMC output in background (small, prevents pipe buffer stall)
+    pmc_drain = ThreadPoolExecutor(max_workers=1).submit(proc_pmc.communicate)
+
+    # Stage 1: parse samples (while IBS + PMC processes run in background)
+    script_output, script_err = proc_samples.communicate()
+    if proc_samples.returncode != 0:
+        raise RuntimeError(f"perf script failed: {script_err.strip()}")
     stats, skipped, ip_to_key = parse_samples(script_output)
     total_uw, total_w = compute_totals(stats)
 
-    click.echo("Parsing raw IBS registers...", err=True)
-    parse_ibs_raw(perf_data, stats, ip_to_key)
-
-    click.echo("Parsing prefetch PMC samples...", err=True)
-    pf_disp, pf_dc, pf_mab, pf_fills = parse_prefetch_pmc(perf_data, stats, ip_to_key)
-
     if total_uw == 0:
+        proc_ibs.kill()
+        proc_pmc.kill()
         click.echo("No resolved samples found.", err=True)
         sys.exit(1)
 
-    binary_path = binary or find_binary(perf_data)
-    click.echo(f"Disassembling {binary_path}...", err=True)
-    annotate_output = run_objdump(binary_path)
+    # Stages 2+3: parse IBS (streaming) and PMC (buffered) in parallel
+    pmc_output, _ = pmc_drain.result()
 
-    lines = build_annotated_lines(annotate_output, stats, ip_to_key)
+    def _do_ibs():
+        parse_ibs_raw(proc_ibs.stdout, stats, ip_to_key)
+        proc_ibs.wait()
+
+    def _do_pmc():
+        return parse_prefetch_pmc(pmc_output, stats, ip_to_key)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ibs_f = pool.submit(_do_ibs)
+        pmc_f = pool.submit(_do_pmc)
+        ibs_f.result()
+        pf_disp, pf_dc, pf_mab, pf_fills = pmc_f.result()
+
+    binary_path = binary or find_binary(perf_data)
+    func_summaries = compute_function_summaries(stats)
+    load_base = compute_load_base(ip_to_key, binary_path)
+    func_bounds = get_function_bounds(binary_path)
+
     skipped_lines = skipped.summary_lines()
 
     # Cache hierarchy breakdown from data_src
@@ -169,7 +205,23 @@ def main(
         if pf_dropped > 0:
             pf_lines.append(f"  Dropped/other: {pf_dropped:>10}  ({100.0 * pf_dropped / pf_disp:5.1f}%)")
 
+    def load_function(func_name: str) -> list:
+        """Load annotated lines for a single function via objdump."""
+        # Find runtime base from perf data, convert to file address
+        for ip, key in ip_to_key.items():
+            sym, offset_s = key.split("\0", 1)
+            if sym == func_name:
+                runtime_base = ip - int(offset_s)
+                file_addr = runtime_base - load_base
+                size = func_bounds.get(file_addr, 0x10000)
+                out = run_objdump_function(binary_path, file_addr, file_addr + size)
+                return build_annotated_lines(out, stats, ip_to_key, load_base)
+        return []
+
     if stdout or not sys.stdout.isatty():
+        click.echo(f"Disassembling {binary_path}...", err=True)
+        annotate_output = run_objdump(binary_path)
+        lines = build_annotated_lines(annotate_output, stats, ip_to_key, load_base)
         for s in cache_lines + pf_lines:
             print(f"# {s}")
         if cache_lines or pf_lines:
@@ -178,5 +230,8 @@ def main(
     else:
         from .tui import CursesTUI
 
-        tui = CursesTUI(lines, mode, total_uw, total_w, cache_lines + pf_lines + skipped_lines)
+        tui = CursesTUI(
+            func_summaries, load_function, mode, total_uw, total_w,
+            cache_lines + pf_lines + skipped_lines,
+        )
         tui.run()

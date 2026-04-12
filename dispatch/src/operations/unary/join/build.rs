@@ -152,7 +152,7 @@ impl JoinPartitionJob {
                 let slot = (hash >> shift) as usize;
                 unsafe {
                     directory.add_to_entry(slot, 1 << 16);
-                    // directory.add_to_entry(slot, Directory::compute_tag(hash) as u64);
+                    directory.add_to_entry(slot, Directory::<B>::compute_tag(hash) as u64);
                 }
             }
         }
@@ -163,9 +163,6 @@ impl JoinPartitionJob {
         let slots_per_partition = directory.capacity() / NUM_PARTITIONS;
         let slot_end = self.slot_start + slots_per_partition;
         let mut cur = self.arena_offset as u64;
-
-        // let mut slabs = vec![];
-        // let current_slab = Slab::
 
         for i in self.slot_start..slot_end {
             let entry = directory.entry(i);

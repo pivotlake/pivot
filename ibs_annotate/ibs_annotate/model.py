@@ -228,6 +228,18 @@ class InsnStats:
         return self.total_weight / self.weight_count if self.weight_count else 0.0
 
 
+@dataclass
+class FunctionSummary:
+    """Per-function aggregate for the function picker."""
+
+    name: str
+    total_samples: int
+    weighted_cost: int
+    cache_counts: dict[CacheLevel, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
+
+
 # -- Annotated line types ------------------------------------------------------
 
 

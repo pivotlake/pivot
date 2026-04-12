@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import curses
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from .model import (
@@ -10,6 +11,7 @@ from .model import (
     CacheLevel,
     DisplayMode,
     FunctionHeader,
+    FunctionSummary,
     InsnStats,
     InstructionLine,
     OpType,
@@ -74,35 +76,38 @@ _PADDING = " " * _COL_TOTAL_W
 class CursesTUI:
     def __init__(
         self,
-        lines: list[AnnotatedLine],
+        func_summaries: list[FunctionSummary],
+        load_function: Callable[[str], list[AnnotatedLine]],
         mode: DisplayMode,
         total_unweighted: int,
         total_weighted: int,
         skipped_lines: list[str],
     ) -> None:
-        self.lines = lines
+        self.func_summaries = func_summaries
+        self.load_function = load_function
         self.mode = mode
         self.total_uw = total_unweighted
         self.total_w = total_weighted
         self.skipped = skipped_lines
+        self.total_weighted_cost = sum(f.weighted_cost for f in func_summaries)
+
+        # Function picker state
+        self.func_cursor = 0
+        self.func_scroll = 0
+
+        # Annotated view state (populated on function selection)
+        self.lines: list[AnnotatedLine] = []
         self.cursor = 0
         self.scroll = 0
-        self.page: str = "main"  # "main", "detail", "summary"
+        self._hottest_idx = 0
+
+        self.page: str = "functions"
+        self.prev_page: str = "functions"
         self.detail_line: InstructionLine | None = None
         self.detail_scroll = 0
         self.summary_scroll = 0
         self.search_query: str = ""
         self.search_active: bool = False
-
-        # Precompute hottest instruction index
-        self._hottest_idx = 0
-        best = 0
-        for i, line in enumerate(self.lines):
-            if isinstance(line, InstructionLine):
-                w = sum(c * lvl.weight for lvl, c in line.stats.cache_counts.items())
-                if w > best:
-                    best = w
-                    self._hottest_idx = i
 
     def run(self) -> None:
         curses.wrapper(self._loop)
@@ -115,7 +120,9 @@ class CursesTUI:
 
         while True:
             stdscr.erase()
-            if self.page == "main":
+            if self.page == "functions":
+                self._draw_functions(stdscr)
+            elif self.page == "main":
                 self._draw_main(stdscr)
             elif self.page == "detail":
                 self._draw_detail(stdscr)
@@ -158,7 +165,9 @@ class CursesTUI:
             self.mode = DisplayMode.ABSOLUTE
             return True
 
-        if self.page == "main":
+        if self.page == "functions":
+            return self._handle_functions_key(key)
+        elif self.page == "main":
             return self._handle_main_key(key)
         elif self.page == "detail":
             return self._handle_detail_key(key)
@@ -166,7 +175,49 @@ class CursesTUI:
             return self._handle_summary_key(key)
         return True
 
+    def _handle_functions_key(self, key: int) -> bool:
+        if key == curses.KEY_UP and self.func_cursor > 0:
+            self.func_cursor -= 1
+        elif key == curses.KEY_DOWN and self.func_cursor < len(self.func_summaries) - 1:
+            self.func_cursor += 1
+        elif key == curses.KEY_PPAGE:
+            self.func_cursor = max(0, self.func_cursor - 30)
+        elif key == curses.KEY_NPAGE:
+            self.func_cursor = min(len(self.func_summaries) - 1, self.func_cursor + 30)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            self._load_selected_function()
+        elif key == ord("s") and self.skipped:
+            self.summary_scroll = 0
+            self.prev_page = "functions"
+            self.page = "summary"
+        return True
+
+    def _load_selected_function(self) -> None:
+        if not self.func_summaries:
+            return
+        func = self.func_summaries[self.func_cursor]
+        self.lines = self.load_function(func.name)
+        self.cursor = 0
+        self.scroll = 0
+
+        # Find hottest instruction
+        self._hottest_idx = 0
+        best = 0
+        for i, line in enumerate(self.lines):
+            if isinstance(line, InstructionLine):
+                w = sum(c * lvl.weight for lvl, c in line.stats.cache_counts.items())
+                if w > best:
+                    best = w
+                    self._hottest_idx = i
+
+        self.page = "main"
+
     def _handle_main_key(self, key: int) -> bool:
+        if key in (27,):  # Escape → back to function picker
+            self.page = "functions"
+            return True
+        if not self.lines:
+            return True
         if key == curses.KEY_UP and self.cursor > 0:
             self.cursor -= 1
         elif key == curses.KEY_DOWN and self.cursor < len(self.lines) - 1:
@@ -187,6 +238,7 @@ class CursesTUI:
                 self.page = "detail"
         elif key == ord("s") and self.skipped:
             self.summary_scroll = 0
+            self.prev_page = "main"
             self.page = "summary"
         elif key == ord("H"):
             self.cursor = self._hottest_idx
@@ -214,7 +266,7 @@ class CursesTUI:
 
     def _handle_summary_key(self, key: int) -> bool:
         if key in (27, curses.KEY_BACKSPACE, 127, curses.KEY_LEFT, ord("s")):
-            self.page = "main"
+            self.page = self.prev_page
         elif key == curses.KEY_UP:
             self.summary_scroll = max(0, self.summary_scroll - 1)
         elif key == curses.KEY_DOWN:
@@ -243,6 +295,36 @@ class CursesTUI:
             if q in self._line_text(self.lines[idx]).lower():
                 self.cursor = idx
                 return
+
+    # -- function picker drawing -------------------------------------------------
+
+    def _draw_functions(self, stdscr) -> None:
+        h, w = stdscr.getmaxyx()
+
+        header = f"  {'Overhead':>8}  {'Samples':>8}  Function"
+        _safe_addstr(stdscr, 0, 0, header, curses.A_BOLD)
+        _safe_addstr(stdscr, 1, 0, "\u2500" * min(w - 1, 80))
+
+        visible = h - 3
+
+        if self.func_cursor < self.func_scroll:
+            self.func_scroll = self.func_cursor
+        if self.func_cursor >= self.func_scroll + visible:
+            self.func_scroll = self.func_cursor - visible + 1
+
+        for i in range(visible):
+            idx = self.func_scroll + i
+            if idx >= len(self.func_summaries):
+                break
+            f = self.func_summaries[idx]
+            is_cursor = idx == self.func_cursor
+            pct = 100.0 * f.weighted_cost / self.total_weighted_cost if self.total_weighted_cost else 0
+            text = f"  {pct:>7.2f}%  {f.total_samples:>8}  {f.name}"
+            attr = curses.color_pair(_PAIR_CURSOR) if is_cursor else 0
+            _safe_addstr(stdscr, i + 2, 0, text.ljust(w - 1), attr)
+
+        footer = " [Enter] annotate  [q]uit  [s]ummary"
+        _safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1), curses.A_REVERSE)
 
     # -- main page drawing -----------------------------------------------------
 
@@ -278,7 +360,7 @@ class CursesTUI:
         else:
             footer = (
                 f" [{self.mode.label}]"
-                "  [q]uit  [/]search  [H]ottest  [w]eighted  [p]ercent  [n]umber  [Enter] detail  [s]ummary"
+                "  [Esc] back  [q]uit  [/]search  [H]ottest  [w]eighted  [p]ercent  [n]umber  [Enter] detail  [s]ummary"
             )
         _safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1), curses.A_REVERSE)
 

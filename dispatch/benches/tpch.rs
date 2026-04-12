@@ -28,7 +28,7 @@ use arrow::util::display::ArrayFormatter;
 use arrow_array::RecordBatch;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use dispatch::{ParquetTable, Projection, table_input};
+use dispatch::{ParquetTable, Projection, table_input, IntKeyExtractor};
 
 static SOURCE_DIRECTORY: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(std::env::var("SOURCE_DIRECTORY").unwrap()));
@@ -84,6 +84,7 @@ fn assert_result(expected: &str, batches: &[RecordBatch]) {
 
 struct TpchTables {
     lineitem: Arc<ParquetTable>,
+    lineitem_filtered: Arc<ParquetTable>,
     orders: Arc<ParquetTable>,
 }
 
@@ -92,6 +93,10 @@ impl TpchTables {
         Self {
             lineitem: Arc::new(
                 ParquetTable::from_directory(&base_dir.join("lineitem"))
+                    .expect("Could not load lineitem table"),
+            ),
+            lineitem_filtered: Arc::new(
+                ParquetTable::from_directory(&base_dir.join("lineitem_filtered"))
                     .expect("Could not load lineitem table"),
             ),
             orders: Arc::new(
@@ -195,20 +200,23 @@ fn run_query_12(tables: &TpchTables) {
 //     const EXPECTED: &str = r#"MAIL	623115	934713
 // SHIP	622979	934534"#;
 //
-//     let _lineitem = table_input(
-//         &tables.lineitem,
-//         Projection::from_field_names(
-//             tables.lineitem.schema(),
-//             ["l_orderkey", "l_shipdate", "l_commitdate", "l_receiptdate", "l_shipmode"],
-//         ),
-//         false,
-//     );
-//
-//     let _orders = table_input(
-//         &tables.orders,
-//         Projection::from_field_names(tables.orders.schema(), ["o_orderkey", "o_orderpriority"]),
-//         false,
-//     );
+    let lineitem = table_input(
+        &tables.lineitem_filtered,
+        Projection::from_field_names(
+            tables.lineitem_filtered.schema(),
+            ["l_orderkey", "l_shipmode"],
+        ),
+        false,
+    );
+
+    let orders = table_input(
+        &tables.orders,
+        Projection::from_field_names(tables.orders.schema(), ["o_orderkey"]),
+        false,
+    );
+
+    let res = orders.join(lineitem, 0, 0)
+        .count().collect();
 //
 //     // TODO: join lineitem and orders on l_orderkey = o_orderkey,
 //     // filter on l_shipmode, date predicates,

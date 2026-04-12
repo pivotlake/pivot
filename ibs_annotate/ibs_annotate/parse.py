@@ -9,6 +9,7 @@ from .model import (
     AnnotatedLine,
     CacheLevel,
     FunctionHeader,
+    FunctionSummary,
     IBSRaw,
     InsnStats,
     InstructionLine,
@@ -24,7 +25,7 @@ from .model import (
 _SYM_OFFSET_RE = re.compile(r"(\S+)\+0x([0-9a-fA-F]+)")
 _IP_SYM_RE = re.compile(r"([0-9a-fA-F]{8,})\s+(.+)\+0x([0-9a-fA-F]+)\s*$")
 _FUNC_HEADER_RE = re.compile(r"([0-9a-fA-F]+)\s+<(.+)>:\s*$")
-_INSN_LINE_RE = re.compile(r"^[ \t]+([0-9a-fA-F]+):\s*(.*)")
+_INSN_LINE_RE = re.compile(r"^\s*(?:[\d.]*\s*:\s+)?([0-9a-fA-F]+):\s*(.*)")
 _SOURCE_LINE_RE = re.compile(r"\s*:\s*(.*)")
 _SAMPLE_IP_RE = re.compile(r"PERF_RECORD_SAMPLE.*:\s+0x([0-9a-fA-F]+)\s+period:")
 
@@ -81,6 +82,18 @@ def run_objdump(binary: str) -> str:
     )
     if result.returncode != 0:
         raise RuntimeError(f"objdump failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def run_perf_annotate_sym(sym: str, perf_data: str) -> str:
+    """Run perf annotate for a single symbol — fast, handles PIE correctly."""
+    result = subprocess.run(
+        ["perf", "annotate", "--symbol", sym, "--stdio", "-i", perf_data],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"perf annotate failed: {result.stderr.strip()}")
     return result.stdout
 
 
@@ -210,18 +223,31 @@ def parse_samples(
 
 
 def build_annotated_lines(
-    objdump_output: str,
+    disasm_output: str,
     stats: dict[str, InsnStats],
     ip_to_key: dict[int, str],
+    load_base: int = 0,
 ) -> list[AnnotatedLine]:
+    """Parse disassembly from either objdump or perf annotate --stdio.
+
+    load_base is added to file addresses from objdump to convert them to
+    the runtime IPs used as keys in ip_to_key (needed for PIE binaries).
+    """
     lines: list[AnnotatedLine] = []
     current_sym: str | None = None
     current_base = 0
 
-    for raw in objdump_output.splitlines():
+    for raw in disasm_output.splitlines():
         if not raw.strip():
             continue
+        # Skip noise from objdump and perf annotate headers
         if "file format" in raw or raw.startswith("Disassembly of section"):
+            continue
+        if "Percent" in raw and "|" in raw:
+            continue
+
+        if re.match(r"^-+\s*$", raw):
+            lines.append(SeparatorLine())
             continue
 
         func_m = _FUNC_HEADER_RE.search(raw)
@@ -235,12 +261,11 @@ def build_annotated_lines(
         insn_m = _INSN_LINE_RE.match(raw)
         if insn_m:
             addr_s = insn_m.group(1)
-            ip = int(addr_s, 16)
-            offset = ip - current_base
-            # IP-based lookup is most reliable: handles cases where objdump's
-            # demangler produces a different symbol name than perf's (e.g. Rust
-            # hash suffixes), and avoids needing exact name matching.
-            key = ip_to_key.get(ip)
+            file_addr = int(addr_s, 16)
+            offset = file_addr - current_base
+            # Convert file address to runtime IP for lookup in ip_to_key
+            runtime_ip = file_addr + load_base
+            key = ip_to_key.get(runtime_ip)
             if key is None:
                 key = f"{current_sym}\0{offset}" if current_sym else ""
             lines.append(
@@ -254,9 +279,12 @@ def build_annotated_lines(
             )
             continue
 
-        # Anything else is interleaved source (file:line markers or actual
-        # source code) emitted by `objdump -S`.
-        lines.append(SourceLine(text=raw.rstrip()))
+        # Source lines from objdump -S or perf annotate (": <source>")
+        src_m = _SOURCE_LINE_RE.match(raw)
+        if src_m:
+            lines.append(SourceLine(text=src_m.group(1)))
+        elif current_sym is not None:
+            lines.append(SourceLine(text=raw.rstrip()))
 
     return lines
 
@@ -270,19 +298,11 @@ def _ibs_int(line: str, field: str) -> int:
 
 
 def parse_ibs_raw(
-    perf_data: str,
+    stream,
     stats: dict[str, InsnStats],
     ip_to_key: dict[int, str],
 ) -> None:
-    """Stream perf script -D, extract raw IBS fields, merge into stats."""
-    proc = subprocess.Popen(
-        ["perf", "script", "-D", "-i", perf_data],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    assert proc.stdout is not None
-
+    """Parse raw IBS fields from a perf script -D output stream."""
     # Accumulate IBS fields per sample
     comp_to_ret = 0
     tag_to_ret = 0
@@ -300,7 +320,7 @@ def parse_ibs_raw(
     is_mem_op = False
     have_ibs = False
 
-    for line in proc.stdout:
+    for line in stream:
         if line.startswith("ibs_op_data:"):
             comp_to_ret = _ibs_int(line, "CompToRetCtr")
             tag_to_ret = _ibs_int(line, "TagToRetCtr")
@@ -373,8 +393,6 @@ def parse_ibs_raw(
             is_mem_op = False
             have_ibs = False
 
-    proc.wait()
-
 
 # -- Totals --------------------------------------------------------------------
 
@@ -406,11 +424,11 @@ _PERIOD_RE = re.compile(r"^\s*(\d+)\s+cpu/")
 
 
 def parse_prefetch_pmc(
-    perf_data: str,
+    script_output: str,
     stats: dict[str, InsnStats],
     ip_to_key: dict[int, str],
 ) -> tuple[int, int, int, int]:
-    """Parse PMC prefetch counter samples from perf script, attribute per-instruction.
+    """Parse PMC prefetch counter samples, attribute per-instruction.
 
     Each sample is weighted by its period (one sample = period events).
     Returns (total_dispatched, total_ineffective_dc, total_ineffective_mab, total_fills).
@@ -420,13 +438,7 @@ def parse_prefetch_pmc(
     total_ineff_mab = 0
     total_fills = 0
 
-    result = subprocess.run(
-        ["perf", "script", "-F", "event,period,ip,sym,symoff", "-G", "-i", perf_data],
-        capture_output=True,
-        text=True,
-    )
-
-    for line in result.stdout.splitlines():
+    for line in script_output.splitlines():
         pmc_m = _PMC_LINE_RE.search(line)
         if not pmc_m:
             continue
@@ -465,3 +477,113 @@ def parse_prefetch_pmc(
             total_fills += period
 
     return total_dispatched, total_ineff_dc, total_ineff_mab, total_fills
+
+
+# -- Function-level aggregation ------------------------------------------------
+
+
+def compute_function_summaries(stats: dict[str, InsnStats]) -> list[FunctionSummary]:
+    """Aggregate per-instruction stats into per-function summaries, sorted by weighted cost."""
+    by_func: dict[str, FunctionSummary] = {}
+    for key, s in stats.items():
+        func_name = key.split("\0", 1)[0]
+        if func_name not in by_func:
+            by_func[func_name] = FunctionSummary(
+                name=func_name, total_samples=0, weighted_cost=0,
+            )
+        f = by_func[func_name]
+        f.total_samples += s.total_samples
+        for lvl, c in s.cache_counts.items():
+            f.weighted_cost += c * lvl.weight
+            f.cache_counts[lvl] += c
+    return sorted(by_func.values(), key=lambda f: f.weighted_cost, reverse=True)
+
+
+# -- Per-function objdump via address range ------------------------------------
+
+_RUST_HASH_RE = re.compile(r"::h[0-9a-f]+$")
+
+
+def get_function_bounds(binary: str) -> dict[int, int]:
+    """Return {file_addr: size} for text symbols via nm -S."""
+    result = subprocess.run(
+        ["nm", "-S", binary],
+        capture_output=True,
+        text=True,
+    )
+    bounds: dict[int, int] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] in ("t", "T"):
+            try:
+                addr = int(parts[0], 16)
+                size = int(parts[1], 16)
+                bounds[addr] = size
+            except ValueError:
+                continue
+    return bounds
+
+
+def compute_load_base(
+    ip_to_key: dict[int, str],
+    binary: str,
+) -> int:
+    """Compute ASLR load base for PIE binaries. Returns 0 for non-PIE.
+
+    Matches one symbol name between perf's ip_to_key and nm --demangle
+    to find the constant offset between runtime and file addresses.
+    """
+    if not ip_to_key:
+        return 0
+
+    # {func_name: runtime_base_addr} from perf data
+    perf_bases: dict[str, int] = {}
+    for ip, key in ip_to_key.items():
+        sym, offset_s = key.split("\0", 1)
+        if sym not in perf_bases:
+            perf_bases[sym] = ip - int(offset_s)
+
+    # {func_name: file_addr} from nm --demangle
+    result = subprocess.run(
+        ["nm", "--demangle", binary],
+        capture_output=True,
+        text=True,
+    )
+    nm_funcs: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) >= 3 and parts[1] in ("t", "T"):
+            try:
+                nm_funcs[parts[2]] = int(parts[0], 16)
+            except ValueError:
+                continue
+
+    # Exact name match
+    for name, runtime_base in perf_bases.items():
+        if name in nm_funcs:
+            return runtime_base - nm_funcs[name]
+
+    # Fuzzy: strip Rust hash suffix (::h<hex>) from nm names
+    for nm_name, file_addr in nm_funcs.items():
+        stripped = _RUST_HASH_RE.sub("", nm_name)
+        if stripped in perf_bases:
+            return perf_bases[stripped] - file_addr
+
+    return 0
+
+
+def run_objdump_function(binary: str, start_addr: int, end_addr: int) -> str:
+    """Disassemble a specific address range with source interleaving."""
+    result = subprocess.run(
+        [
+            "objdump", "-d", "-S", "--no-show-raw-insn", "--demangle",
+            f"--start-address=0x{start_addr:x}",
+            f"--stop-address=0x{end_addr:x}",
+            binary,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"objdump failed: {result.stderr.strip()}")
+    return result.stdout
