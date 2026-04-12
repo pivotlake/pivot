@@ -1,3 +1,5 @@
+use std::hint::black_box;
+use std::mem;
 use std::ops::{Index, IndexMut};
 use std::sync::{Arc, LazyLock};
 
@@ -5,12 +7,13 @@ use ahash::RandomState;
 use arrow_array::types::Int64Type;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-
+use rand::{Rng, SeedableRng};
+use rand::rngs::SmallRng;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::Unary;
-use crate::operations::unary::join::directory::{Directory, JoinDirectory};
+use crate::operations::unary::join::directory::{prefetch_ptr_l2, Directory, JoinDirectory, PtrBuffer};
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::Value;
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
@@ -31,7 +34,9 @@ pub struct Probe {
     hash_state: RandomState,
     key_column: usize,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    rng: SmallRng,
     allocator: SlabAllocator,
+    total: usize,
 }
 
 impl Probe {
@@ -41,7 +46,9 @@ impl Probe {
             hash_state,
             key_column,
             hashes: Box::new([0; RECORD_BATCH_SIZE]),
+            rng: SmallRng::seed_from_u64(0xBADC0FFEE),
             allocator: SlabAllocator::new(false),
+            total: 0,
         }
     }
 
@@ -57,73 +64,116 @@ impl Probe {
     }
 
     #[inline(always)]
-    fn probe_with_dir<B: Index<usize, Output = u64> + IndexMut<usize>, S: Sender<RecordBatch>>(
+    fn probe_with_dir<
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+        S: Sender<RecordBatch>,
+    >(
         &mut self,
         directory: &Directory<B>,
         col: &Int64Array,
         sender: &mut S,
     ) -> unary::Result<()> {
-        self.compute_hashes(col, directory);
+        println!("Directory shift {:?}", directory.shift);
+        // self.compute_hashes(col, directory);
 
-        let arena = unsafe { &*self.table.arena.get() };
-        let len = col.len();
+        // Pre-compute the EXACT address each random slot lands on. We do the
+        // address arithmetic up front so the touch loop below is just a stream
+        // of independent loads with no shifting/masking dependency between
+        // iterations — that gives the reorder buffer the maximum number of
+        // in-flight memory ops and saturates memory bandwidth.
+        let mut ptrs: [*const u64; 2048] = [std::ptr::null(); 2048];
 
-        let mut lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-        let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-
-        let mut out = 0;
-
-        let mut i = 0;
-        while i < len {
-            const PREFETCH_DISTANCE: usize = 16;
-            if i + PREFETCH_DISTANCE < len {
-                let ph = self.hashes[i + PREFETCH_DISTANCE];
-                directory.prefetch(ph);
-            }
-
-            if i + 8 < len {
-                let h = unsafe { *self.hashes.get_unchecked(i + 8) };
-                let slot = directory.slot_for(h) as isize;
-                let start = directory.end_ptr(slot - 1);
-                let ptr = arena.ptr_at_index(start) as *const i8;
-
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
-                }
-            }
-
-            let hash = unsafe { *self.hashes.get_unchecked(i) };
-            let slot = directory.slot_for(hash) as isize;
-            let start = directory.end_ptr(slot - 1);
-            let end = directory.end_ptr(slot);
-
-            let probe_key = unsafe { col.value_unchecked(i) } as u32;
-
-            for j in start..end {
-                let entry: Value = arena[j];
-                if entry == probe_key {
-                    lineitem_keys.write(out, entry as i64);
-                    order_keys.write(out, entry as i64);
-                    out += 1;
-                }
-            }
-
-            i += 1;
+        for i in 0..64 {
+            let slot = (self.rng.next_u64() >> directory.shift) as usize;
+            ptrs[i] = directory.ptr_for_slot(slot);
+            prefetch_ptr_l2(ptrs[i] as *const u8);
         }
 
-        if out == 0 {
-            return Ok(());
+        for i in 64..2048 {
+            let slot = (self.rng.next_u64() >> directory.shift) as usize;
+            ptrs[i] = directory.ptr_for_slot(slot);
         }
 
-        let result = RecordBatch::try_new(
-            PROBE_SCHEMA.clone(),
-            vec![
-                lineitem_keys.into_array(out),
-                order_keys.into_array(out),
-            ],
-        )?;
-        sender.send(result)?;
+        for i in 0..2048-64 {
+            prefetch_ptr_l2(ptrs[i + PREFETCH_DISTANCE] as *const u8);
+            let a = unsafe { *ptrs[i] };
+            black_box(a);
+        }
+
+        const PREFETCH_DISTANCE: usize = 64;
+        for i in 2048-64..2048 {
+            let a = unsafe { *ptrs[i] };
+            black_box(a);
+        }
+
+        self.total += 2048;
+        // let arena = unsafe { &*self.table.arena.get() };
+        // let len = col.len();
+
+        // let mut lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        // let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        //
+        // let mut i = 0;
+        // while i < len {
+        //     // let h = unsafe { *self.hashes.get_unchecked(i + 8) };
+        //     // let slot = directory.slot_for(h) as isize;
+        //     // let start = directory.end_ptr(slot - 1);
+        //     i += 1;
+        // }
+        //
+        // let mut out = 0;
+        //
+        // let mut i = 0;
+        // while i < len {
+        //     const PREFETCH_DISTANCE: usize = 16;
+        //     if i + PREFETCH_DISTANCE < len {
+        //         let ph = self.hashes[i + PREFETCH_DISTANCE];
+        //         directory.prefetch_l1(ph);
+        //     }
+        //
+        //     if i + 8 < len {
+        //         let h = unsafe { *self.hashes.get_unchecked(i + 8) };
+        //         let slot = directory.slot_for(h) as isize;
+        //         let start = directory.end_ptr(slot - 1);
+        //         let ptr = arena.ptr_at_index(start) as *const i8;
+        //
+        //         #[cfg(target_arch = "x86_64")]
+        //         unsafe {
+        //             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+        //         }
+        //     }
+        //
+        //     let hash = unsafe { *self.hashes.get_unchecked(i) };
+        //     let slot = directory.slot_for(hash) as isize;
+        //     let start = directory.end_ptr(slot - 1);
+        //     let end = directory.end_ptr(slot);
+        //
+        //     let probe_key = unsafe { col.value_unchecked(i) } as u32;
+        //
+        //     for j in start..end {
+        //         let entry: Value = arena[j];
+        //         if entry == probe_key {
+        //             lineitem_keys.write(out, entry as i64);
+        //             order_keys.write(out, entry as i64);
+        //             out += 1;
+        //         }
+        //     }
+        //
+        //     i += 1;
+        // }
+        //
+        // if out == 0 {
+        //     return Ok(());
+        // }
+        //
+        // let result = RecordBatch::try_new(
+        //     PROBE_SCHEMA.clone(),
+        //     vec![
+        //         lineitem_keys.into_array(out),
+        //         order_keys.into_array(out),
+        //     ],
+        // )?;
+        // sender.send(result)?;
         Ok(())
     }
 }
@@ -150,6 +200,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
         perf_disable();
+        println!("Total {}", mem::take(&mut self.total));
         Ok(true)
     }
 }

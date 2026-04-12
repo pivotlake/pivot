@@ -77,12 +77,20 @@ impl Ring {
         const_assert_aligned();
 
         let total_size = *BUFFERS * BUFFER_SIZE;
+        #[cfg(target_os = "linux")]
+        let flags = libc::MAP_PRIVATE
+            | libc::MAP_ANONYMOUS
+            | libc::MAP_HUGETLB
+            | (30 << libc::MAP_HUGE_SHIFT);
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+
         let ptr = unsafe {
             libc::mmap(
                 ptr::null_mut(),
                 total_size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                flags,
                 -1,
                 0,
             )

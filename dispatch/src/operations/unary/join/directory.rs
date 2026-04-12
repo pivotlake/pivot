@@ -20,6 +20,14 @@ const fn build_tag_table() -> [u16; 2048] {
 }
 static TAG_TABLE: [u16; 2048] = build_tag_table();
 
+/// Returns a raw pointer to the element at the given slot index. Implemented by
+/// the buffer types that back a [`Directory`] so probe code can compute the exact
+/// address for a hash slot ahead of time and feed many independent loads to the
+/// CPU's reorder buffer.
+pub trait PtrBuffer {
+    fn get_ptr(&self, slot: usize) -> *const u64;
+}
+
 pub struct Directory<B> {
     entries: UnsafeCell<B>,
     capacity: usize,
@@ -59,6 +67,14 @@ impl<B> Directory<B> {
     }
 }
 
+impl<B: PtrBuffer> Directory<B> {
+    /// Raw pointer to the entry at `slot` (accounts for the sentinel at index 0).
+    #[inline(always)]
+    pub fn ptr_for_slot(&self, slot: usize) -> *const u64 {
+        unsafe { (*self.entries.get()).get_ptr(slot + 1) }
+    }
+}
+
 #[inline(always)]
 pub fn prefetch_ptr(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
@@ -69,9 +85,19 @@ pub fn prefetch_ptr(ptr: *const u8) {
     let _ = ptr;
 }
 
+#[inline(always)]
+pub fn prefetch_ptr_l2(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = ptr;
+}
+
 impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     #[inline(always)]
-    fn entries(&self) -> &B {
+    pub(crate) fn entries(&self) -> &B {
         unsafe { &*self.entries.get() }
     }
 
@@ -106,10 +132,19 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
 
     /// Prefetch the directory entry for the slot where `hash` would land.
     #[inline(always)]
-    pub fn prefetch(&self, hash: u64) {
+    pub fn prefetch_l1(&self, hash: u64) {
         let slot = self.slot_for(hash);
         let ptr = &self.entries()[slot + 1] as *const u64 as *const u8;
         prefetch_ptr(ptr);
+        // let ptr = &self.entries()[slot + 2] as *const u64 as *const u8;
+        // prefetch_ptr(ptr);
+    }
+
+    #[inline(always)]
+    pub fn prefetch_l2(&self, hash: u64) {
+        let slot = self.slot_for(hash);
+        let ptr = &self.entries()[slot + 1] as *const u64 as *const u8;
+        prefetch_ptr_l2(ptr);
     }
 
     #[inline(always)]
@@ -130,6 +165,25 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     #[inline(always)]
     pub fn end_ptr(&self, slot: isize) -> usize {
         (self.entries()[(slot + 1) as usize] >> PTR_SHIFT) as usize
+    }
+
+    #[inline(always)]
+    pub fn entry_at_raw_slot(&self, slot: usize) -> usize {
+        self.entries()[slot] as usize
+    }
+}
+
+impl PtrBuffer for ContiguousMultiBuffer<u64> {
+    #[inline(always)]
+    fn get_ptr(&self, slot: usize) -> *const u64 {
+        self.ptr_at_index(slot) as *const u64
+    }
+}
+
+impl PtrBuffer for MultiSlabBuffer<u64> {
+    #[inline(always)]
+    fn get_ptr(&self, slot: usize) -> *const u64 {
+        self.ptr_at_index(slot) as *const u64
     }
 }
 

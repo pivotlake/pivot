@@ -2,9 +2,9 @@ use std::cell::Cell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
 static START: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -31,7 +31,7 @@ pub fn perf_enable() {
     ENABLED.with(|e| {
         if !e.get() {
             e.set(true);
-            if ACTIVE.fetch_add(1, Ordering::Relaxed) == 0 {
+            if ACTIVE.swap(true, Ordering::Relaxed) == false {
                 if perf_write("enable") {
                     START.store(now_ns(), Ordering::Relaxed);
                 }
@@ -44,7 +44,7 @@ pub fn perf_disable() {
     ENABLED.with(|e| {
         if e.get() {
             e.set(false);
-            if ACTIVE.fetch_sub(1, Ordering::Relaxed) == 1 {
+            if ACTIVE.swap(false, Ordering::Relaxed) == true {
                 if perf_write("disable") {
                     let elapsed_ms = (now_ns() - START.load(Ordering::Relaxed)) as f64 / 1_000_000.0;
                     eprintln!("perf window: {elapsed_ms:.1}ms");

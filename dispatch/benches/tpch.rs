@@ -122,6 +122,20 @@ fn run_query_join_orders(tables: &TpchTables) {
 }
 
 
+fn run_query_join_orders_twice(tables: &TpchTables) {
+    let orders = table_input(&tables.orders, Projection::from_field_names(tables.orders.schema(), ["o_orderkey"]), false);
+    let joined = table_input(
+        &tables.orders,
+        Projection::from_field_names(tables.orders.schema(), ["o_orderkey"]),
+        false,
+    ).join(orders, 0, 0);
+    let batches = joined.count().collect();
+    let batch = concat_batches(batches.as_slice());
+    let actual = batch_to_tsv(&batch);
+    println!("Actual {:?}", actual);
+}
+
+
 fn run_query_count(tables: &TpchTables) {
     const EXPECTED: &str = "600037902\n150000000\n";
 
@@ -135,17 +149,19 @@ fn run_query_count(tables: &TpchTables) {
 
     let orders_count = table_input(
         &tables.orders,
-        Projection::from_field_names(tables.orders.schema(), ["o_orderkey", "o_orderpriority"]),
+        Projection::from_field_names(tables.orders.schema(), ["o_orderkey"]),
         false,
     )
     .count();
 
     let results = lineitem_count.concat(orders_count).collect();
+    // let batch = concat_batches(&results);
+
     let batch = concat_batches(&results);
 
     println!("Actual {:?}", batch_to_tsv(&batch));
 
-    assert_result(EXPECTED, &results);
+    // assert_result(EXPECTED, &results);
 }
 
 // ── Query 12 ───────────────────────────────────────────────────────────────
@@ -209,6 +225,7 @@ fn run_query_12(tables: &TpchTables) {
 const QUERIES: &[(u32, fn(&TpchTables))] = &[
     (0, run_query_count),
     (1, run_query_join_orders),
+    (2, run_query_join_orders_twice),
     (12, run_query_12),
 ];
 

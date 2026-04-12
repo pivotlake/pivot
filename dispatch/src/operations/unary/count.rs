@@ -11,6 +11,7 @@ use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::perf_stat::{perf_disable, perf_enable};
 
 /// Factory for the count operator. All workers share the same `shared_count` and
 /// `siblings_left` atomics, created by [`create_for_workers`](CountFactory::create_for_workers).
@@ -61,6 +62,7 @@ impl Unary<RecordBatch, RecordBatch> for Count {
         batch: RecordBatch,
         _output: &mut OP,
     ) -> unary::Result<()> {
+        // perf_enable();
         self.internal_count += batch.num_rows();
         Ok(())
     }
@@ -70,6 +72,7 @@ impl Unary<RecordBatch, RecordBatch> for Count {
             return Ok(true);
         }
 
+        // perf_disable();
         self.shared_count
             .fetch_add(self.internal_count, Ordering::SeqCst);
         self.wrote_shared_count = true;
