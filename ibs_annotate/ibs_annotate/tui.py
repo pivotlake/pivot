@@ -67,8 +67,12 @@ def _level_attr(lvl: CacheLevel) -> int:
 
 # -- Header text ---------------------------------------------------------------
 
-_HEADER = " ".join(f"{lvl.label:>{COL_WIDTH}}" for lvl in CACHE_LEVELS) + " \u2502 Disassembly"
-_COL_TOTAL_W = (COL_WIDTH + 1) * len(CACHE_LEVELS)
+_HEADER = (
+    " ".join(f"{lvl.label:>{COL_WIDTH}}" for lvl in CACHE_LEVELS)
+    + f" {'CYC':>{COL_WIDTH}}"
+    + " \u2502 Disassembly"
+)
+_COL_TOTAL_W = (COL_WIDTH + 1) * (len(CACHE_LEVELS) + 1)  # +1 for TTR
 _SEP_LINE = "\u2500" * _COL_TOTAL_W + "\u253c" + "\u2500" * 60
 _PADDING = " " * _COL_TOTAL_W
 
@@ -81,6 +85,7 @@ class CursesTUI:
         mode: DisplayMode,
         total_unweighted: int,
         total_weighted: int,
+        total_cycles: int,
         skipped_lines: list[str],
     ) -> None:
         self.func_summaries = func_summaries
@@ -88,6 +93,7 @@ class CursesTUI:
         self.mode = mode
         self.total_uw = total_unweighted
         self.total_w = total_weighted
+        self.total_cycles = total_cycles
         self.skipped = skipped_lines
         self.total_weighted_cost = sum(f.weighted_cost for f in func_summaries)
 
@@ -381,6 +387,17 @@ class CursesTUI:
                 x += COL_WIDTH
                 _safe_addstr(stdscr, row, x, " ", cursor_attr)
                 x += 1
+            # Cycles column
+            cyc = line.stats.cycles
+            if not cyc:
+                _safe_addstr(stdscr, row, x, " " * COL_WIDTH, cursor_attr)
+            elif self.mode == DisplayMode.ABSOLUTE:
+                _safe_addstr(stdscr, row, x, f"{cyc:>{COL_WIDTH}}", cursor_attr)
+            elif self.total_cycles:
+                _safe_addstr(stdscr, row, x, f"{100.0 * cyc / self.total_cycles:>{COL_WIDTH}.1f}", cursor_attr)
+            x += COL_WIDTH
+            _safe_addstr(stdscr, row, x, " ", cursor_attr)
+            x += 1
             rest = f": {line.addr}:  {line.disasm}"
             _safe_addstr(stdscr, row, x, rest, cursor_attr)
 

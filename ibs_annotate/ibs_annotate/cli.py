@@ -22,6 +22,7 @@ from .parse import (
     compute_totals,
     find_binary,
     get_function_bounds,
+    parse_cycles,
     parse_ibs_raw,
     parse_prefetch_pmc,
     parse_samples,
@@ -31,8 +32,9 @@ from .parse import (
 )
 
 
-def _print_stdout(lines, mode, total_uw, total_w, skipped_lines) -> None:
-    padding = " ".join(" " * COL_WIDTH for _ in CACHE_LEVELS)
+def _print_stdout(lines, mode, total_uw, total_w, total_cycles, skipped_lines) -> None:
+    ncols = len(CACHE_LEVELS) + 1  # +1 for CYC
+    padding = " ".join(" " * COL_WIDTH for _ in range(ncols))
 
     for s in skipped_lines:
         print(f"# {s}")
@@ -41,13 +43,11 @@ def _print_stdout(lines, mode, total_uw, total_w, skipped_lines) -> None:
 
     print(
         " ".join(f"{lvl.label:>{COL_WIDTH}}" for lvl in CACHE_LEVELS)
+        + f" {'CYC':>{COL_WIDTH}}"
         + " \u2502 Disassembly"
     )
-    print(
-        "\u2500" * ((COL_WIDTH + 1) * len(CACHE_LEVELS))
-        + "\u253c"
-        + "\u2500" * 60
-    )
+    sep = "\u2500" * ((COL_WIDTH + 1) * ncols) + "\u253c" + "\u2500" * 60
+    print(sep)
 
     for line in lines:
         match line:
@@ -63,15 +63,21 @@ def _print_stdout(lines, mode, total_uw, total_w, skipped_lines) -> None:
                         cols.append(f"{100.0 * c / total_uw:>{COL_WIDTH}.1f}")
                     else:
                         cols.append(f"{100.0 * c * lvl.weight / total_w:>{COL_WIDTH}.1f}")
+                # Cycles column
+                cyc = line.stats.cycles
+                if not cyc:
+                    cols.append(" " * COL_WIDTH)
+                elif mode == DisplayMode.ABSOLUTE:
+                    cols.append(f"{cyc:>{COL_WIDTH}}")
+                elif total_cycles:
+                    cols.append(f"{100.0 * cyc / total_cycles:>{COL_WIDTH}.1f}")
+                else:
+                    cols.append(" " * COL_WIDTH)
                 print(" ".join(cols) + f" : {line.addr}:  {line.disasm}")
             case FunctionHeader():
                 print(f"\n{padding}   {line.name}:")
             case SeparatorLine():
-                print(
-                    "\u2500" * ((COL_WIDTH + 1) * len(CACHE_LEVELS))
-                    + "\u253c"
-                    + "\u2500" * 60
-                )
+                print(sep)
             case SourceLine():
                 print(f"{padding}   {line.text}")
 
@@ -106,7 +112,7 @@ def main(
 
     click.echo("Parsing perf data...", err=True)
 
-    # Launch all three perf processes in parallel so their I/O overlaps.
+    # Launch all perf processes in parallel so their I/O overlaps.
     proc_samples = subprocess.Popen(
         ["perf", "script", "-F", "ip,sym,symoff,data_src", "-G", "-i", perf_data],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -119,11 +125,18 @@ def main(
         ["perf", "script", "-F", "event,period,ip,sym,symoff", "-G", "-i", perf_data],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
+    proc_cycles = subprocess.Popen(
+        ["perf", "script", "-F", "comm,event,ip,sym,symoff",
+         "-i", perf_data],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
 
-    # Drain PMC output in background (small, prevents pipe buffer stall)
-    pmc_drain = ThreadPoolExecutor(max_workers=1).submit(proc_pmc.communicate)
+    # Drain small outputs in background (prevents pipe buffer stall)
+    drain_pool = ThreadPoolExecutor(max_workers=2)
+    pmc_drain = drain_pool.submit(proc_pmc.communicate)
+    cycles_drain = drain_pool.submit(proc_cycles.communicate)
 
-    # Stage 1: parse samples (while IBS + PMC processes run in background)
+    # Stage 1: parse IBS samples (while other processes run in background)
     script_output, script_err = proc_samples.communicate()
     if proc_samples.returncode != 0:
         raise RuntimeError(f"perf script failed: {script_err.strip()}")
@@ -133,11 +146,13 @@ def main(
     if total_uw == 0:
         proc_ibs.kill()
         proc_pmc.kill()
+        proc_cycles.kill()
         click.echo("No resolved samples found.", err=True)
         sys.exit(1)
 
-    # Stages 2+3: parse IBS (streaming) and PMC (buffered) in parallel
+    # Stages 2-4: parse IBS raw, PMC, and cycles in parallel
     pmc_output, _ = pmc_drain.result()
+    cycles_output, _ = cycles_drain.result()
 
     def _do_ibs():
         parse_ibs_raw(proc_ibs.stdout, stats, ip_to_key)
@@ -146,15 +161,20 @@ def main(
     def _do_pmc():
         return parse_prefetch_pmc(pmc_output, stats, ip_to_key)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    def _do_cycles():
+        return parse_cycles(cycles_output, stats, ip_to_key)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
         ibs_f = pool.submit(_do_ibs)
         pmc_f = pool.submit(_do_pmc)
+        cyc_f = pool.submit(_do_cycles)
         ibs_f.result()
         pf_disp, pf_dc, pf_mab, pf_fills = pmc_f.result()
+        total_cycles = cyc_f.result()
 
     binary_path = binary or find_binary(perf_data)
     func_summaries = compute_function_summaries(stats)
-    load_base = compute_load_base(ip_to_key, binary_path)
+    load_base = compute_load_base(perf_data, binary_path)
     func_bounds = get_function_bounds(binary_path)
 
     skipped_lines = skipped.summary_lines()
@@ -226,12 +246,12 @@ def main(
             print(f"# {s}")
         if cache_lines or pf_lines:
             print()
-        _print_stdout(lines, mode, total_uw, total_w, skipped_lines)
+        _print_stdout(lines, mode, total_uw, total_w, total_cycles, skipped_lines)
     else:
         from .tui import CursesTUI
 
         tui = CursesTUI(
             func_summaries, load_function, mode, total_uw, total_w,
-            cache_lines + pf_lines + skipped_lines,
+            total_cycles, cache_lines + pf_lines + skipped_lines,
         )
         tui.run()

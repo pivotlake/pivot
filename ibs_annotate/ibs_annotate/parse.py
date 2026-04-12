@@ -219,6 +219,46 @@ def parse_samples(
     return stats, skipped, ip_to_key
 
 
+# -- Cycles PMC samples -------------------------------------------------------
+
+
+def parse_cycles(
+    script_output: str,
+    stats: dict[str, InsnStats],
+    ip_to_key: dict[int, str],
+) -> int:
+    """Parse cycles PMC samples, attribute per-instruction. Returns total.
+
+    Format: each cycles sample is a "cycles:" line followed by the IP on
+    the next line (first call-graph entry).  We grab the first sym+offset
+    line after each "cycles:" marker.
+    """
+    total = 0
+    want_ip = False
+    for line in script_output.splitlines():
+        if "cycles:" in line:
+            want_ip = True
+            continue
+        if not want_ip:
+            continue
+        want_ip = False
+        if "[unknown]" in line:
+            continue
+        m = _IP_SYM_RE.search(line)
+        if not m:
+            continue
+        ip_val = int(m.group(1), 16)
+        key = ip_to_key.get(ip_val)
+        if key is None:
+            key = f"{m.group(2)}\0{int(m.group(3), 16)}"
+            ip_to_key[ip_val] = key
+        if key not in stats:
+            stats[key] = InsnStats()
+        stats[key].cycles += 1
+        total += 1
+    return total
+
+
 # -- Phase 2: merge with perf annotate disassembly -----------------------------
 
 
@@ -236,6 +276,9 @@ def build_annotated_lines(
     lines: list[AnnotatedLine] = []
     current_sym: str | None = None
     current_base = 0
+    _matched_ip = 0
+    _matched_sym = 0
+    _unmatched = 0
 
     for raw in disasm_output.splitlines():
         if not raw.strip():
@@ -254,6 +297,8 @@ def build_annotated_lines(
         if func_m:
             current_base = int(func_m.group(1), 16)
             current_sym = func_m.group(2)
+            # Strip Rust hash suffix so sym matches perf's names
+            current_sym = _RUST_HASH_RE.sub("", current_sym)
             lines.append(SeparatorLine())
             lines.append(FunctionHeader(name=current_sym, base_addr=current_base))
             continue
@@ -266,8 +311,14 @@ def build_annotated_lines(
             # Convert file address to runtime IP for lookup in ip_to_key
             runtime_ip = file_addr + load_base
             key = ip_to_key.get(runtime_ip)
-            if key is None:
+            if key is not None:
+                _matched_ip += 1
+            else:
                 key = f"{current_sym}\0{offset}" if current_sym else ""
+                if key in stats:
+                    _matched_sym += 1
+                else:
+                    _unmatched += 1
             lines.append(
                 InstructionLine(
                     addr=addr_s,
@@ -286,6 +337,17 @@ def build_annotated_lines(
         elif current_sym is not None:
             lines.append(SourceLine(text=raw.rstrip()))
 
+    import sys
+    total = _matched_ip + _matched_sym + _unmatched
+    if total:
+        print(
+            f"  Instruction matching: {_matched_ip} by IP, "
+            f"{_matched_sym} by sym+offset, "
+            f"{_unmatched} unmatched "
+            f"(load_base=0x{load_base:x})",
+            file=sys.stderr,
+        )
+
     return lines
 
 
@@ -303,6 +365,11 @@ def parse_ibs_raw(
     ip_to_key: dict[int, str],
 ) -> None:
     """Parse raw IBS fields from a perf script -D output stream."""
+    _matched = 0
+    _no_ip = 0
+    _no_key = 0
+    _no_stats = 0
+
     # Accumulate IBS fields per sample
     comp_to_ret = 0
     tag_to_ret = 0
@@ -343,10 +410,17 @@ def parse_ibs_raw(
 
         elif "PERF_RECORD_SAMPLE" in line and have_ibs:
             ip_m = _SAMPLE_IP_RE.search(line)
-            if ip_m:
+            if not ip_m:
+                _no_ip += 1
+            elif ip_m:
                 ip = int(ip_m.group(1), 16)
                 key = ip_to_key.get(ip)
-                if key and key in stats:
+                if not key:
+                    _no_key += 1
+                elif key not in stats:
+                    _no_stats += 1
+                else:
+                    _matched += 1
                     ibs = stats[key].ibs
                     ibs.sample_count += 1
                     if dc_miss_lat > 0:
@@ -392,6 +466,16 @@ def parse_ibs_raw(
             dc_l1_tlb_miss = dc_l2_tlb_miss = dc_miss = l2_miss = False
             is_mem_op = False
             have_ibs = False
+
+    import sys
+    total = _matched + _no_ip + _no_key + _no_stats
+    if total:
+        dropped = _no_ip + _no_key + _no_stats
+        print(
+            f"  IBS raw: {_matched} matched, {dropped} dropped "
+            f"(no_ip={_no_ip}, no_key={_no_key}, no_stats={_no_stats})",
+            file=sys.stderr,
+        )
 
 
 # -- Totals --------------------------------------------------------------------
@@ -524,52 +608,61 @@ def get_function_bounds(binary: str) -> dict[int, int]:
     return bounds
 
 
-def compute_load_base(
-    ip_to_key: dict[int, str],
-    binary: str,
-) -> int:
-    """Compute ASLR load base for PIE binaries. Returns 0 for non-PIE.
+_MMAP_RE = re.compile(
+    r"\[0x([0-9a-fA-F]+)\(0x[0-9a-fA-F]+\)\s+@\s+0x([0-9a-fA-F]+)\s+[^\]]*\]:\s+r-xp\s+(\S+)"
+)
 
-    Matches one symbol name between perf's ip_to_key and nm --demangle
-    to find the constant offset between runtime and file addresses.
+
+def compute_load_base(perf_data: str, binary: str) -> int:
+    """Compute ASLR load base from perf MMAP records + ELF headers.
+
+    Bulletproof: no symbol name matching, handles Rust monomorphizations.
+    load_base = mmap_addr + p_offset - mmap_file_offset - p_vaddr
     """
-    if not ip_to_key:
-        return 0
+    import os
 
-    # {func_name: runtime_base_addr} from perf data
-    perf_bases: dict[str, int] = {}
-    for ip, key in ip_to_key.items():
-        sym, offset_s = key.split("\0", 1)
-        if sym not in perf_bases:
-            perf_bases[sym] = ip - int(offset_s)
+    binary_name = os.path.basename(binary)
 
-    # {func_name: file_addr} from nm --demangle
+    # 1. Find the r-xp MMAP record for the binary in perf data
     result = subprocess.run(
-        ["nm", "--demangle", binary],
+        ["perf", "script", "--show-mmap-events", "-i", perf_data],
         capture_output=True,
         text=True,
     )
-    nm_funcs: dict[str, int] = {}
+    mmap_addr = mmap_foff = None
     for line in result.stdout.splitlines():
-        parts = line.split(maxsplit=2)
-        if len(parts) >= 3 and parts[1] in ("t", "T"):
-            try:
-                nm_funcs[parts[2]] = int(parts[0], 16)
-            except ValueError:
-                continue
+        m = _MMAP_RE.search(line)
+        if m and m.group(3).endswith(binary_name):
+            mmap_addr = int(m.group(1), 16)
+            mmap_foff = int(m.group(2), 16)
+            break
 
-    # Exact name match
-    for name, runtime_base in perf_bases.items():
-        if name in nm_funcs:
-            return runtime_base - nm_funcs[name]
+    if mmap_addr is None:
+        return 0
 
-    # Fuzzy: strip Rust hash suffix (::h<hex>) from nm names
-    for nm_name, file_addr in nm_funcs.items():
-        stripped = _RUST_HASH_RE.sub("", nm_name)
-        if stripped in perf_bases:
-            return perf_bases[stripped] - file_addr
+    # 2. Find the executable LOAD segment's p_offset and p_vaddr
+    result = subprocess.run(
+        ["readelf", "-lW", binary],
+        capture_output=True,
+        text=True,
+    )
+    p_offset = p_vaddr = None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if "LOAD" in parts and "E" in parts:
+            idx = parts.index("LOAD")
+            p_offset = int(parts[idx + 1], 16)
+            p_vaddr = int(parts[idx + 2], 16)
+            break
 
-    return 0
+    if p_offset is None:
+        return 0
+
+    load_base = mmap_addr + p_offset - mmap_foff - p_vaddr
+
+    import sys
+    print(f"  load_base=0x{load_base:x}", file=sys.stderr)
+    return load_base
 
 
 def run_objdump_function(binary: str, start_addr: int, end_addr: int) -> str:

@@ -200,6 +200,7 @@ class InsnStats:
     total_weight: int = 0
     weight_count: int = 0
     total_samples: int = 0
+    cycles: int = 0
     ibs: IBSRaw = field(default_factory=IBSRaw)
     prefetch: PrefetchCounts = field(default_factory=PrefetchCounts)
 
