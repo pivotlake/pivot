@@ -232,54 +232,97 @@ impl Probe {
         sender: &mut S,
     ) -> unary::Result<()> {
         const GROUP_SIZE: usize = 10;
-        let mut hashes: [u64; GROUP_SIZE * 10] = [0; GROUP_SIZE * 10];
-
-        let mut end_ptrs: [*const u64; GROUP_SIZE] = [null(); GROUP_SIZE];
-        let mut end_entries = [0u64; GROUP_SIZE];
-
-        let mut next_end_ptrs: [*const u64; GROUP_SIZE] = [null(); GROUP_SIZE];
-        let mut next_end_entries: [u64; GROUP_SIZE] = [0; GROUP_SIZE];
-
-        let mut start_ptrs: [(*const u64, usize); RECORD_BATCH_SIZE] = [(null(), 0); RECORD_BATCH_SIZE];
-
-        let mut matched_index_count = 0;
-
-        let mut i = 0;
-
-        while i < col.len() {
-            let group_size = std::cmp::min(GROUP_SIZE, col.len() - i);
-
-            let hash_counter = i % 128;
-
-            for j in 0..group_size {
-                hashes[hash_counter + j] = self.hash_state.hash_one(unsafe { col.value_unchecked(i + j) });
-                prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_counter + j] >> directory.shift) as usize) as *const u8);
-
-                next_end_ptrs[j] = directory.ptr_for_slot((hashes[hash_counter + j + GROUP_SIZE] >> directory.shift) as usize);
-            }
-
-            for j in 0..group_size {
-                next_end_entries[j] =  unsafe { *next_end_ptrs[j] };
-            }
-
-            for j in 0..group_size {
-                let entry = end_entries[j];
-                let probe = Directory::<B>::compute_tag(entry) as u64;
-                if entry & probe != probe {
-                    continue;
-                }
-
-                start_ptrs[matched_index_count] = (unsafe { end_ptrs[j].sub(1) }, i + j);
-                matched_index_count += 1;
-            }
-
-            i += group_size;
-            mem::swap(&mut end_entries, &mut next_end_entries);
-            mem::swap(&mut end_ptrs, &mut next_end_ptrs);
+        const BUF_SIZE: usize = GROUP_SIZE * 10;
+        let len = col.len();
+        if len == 0 {
+            return Ok(());
         }
 
-        let mut arenas_ptrs: [(usize, usize, usize); GROUP_SIZE] = [(0, 0, 0); GROUP_SIZE];
-        let mut load_arenas_ptrs: [(usize, usize, usize); GROUP_SIZE] = [(0, 0, 0); GROUP_SIZE];
+        // Circular buffer for hashes and directory ptrs
+        let mut hashes: [u64; BUF_SIZE] = [0; BUF_SIZE];
+        let mut dir_ptrs: [*const u64; BUF_SIZE] = [null(); BUF_SIZE];
+        // Entries loaded by tight deref loop, indexed same as circular buffer
+        let mut entries: [u64; BUF_SIZE] = [0; BUF_SIZE];
+
+        // Bloom-matched: (ptr to slot entry, col index)
+        let mut start_ptrs: [(*const u64, usize); RECORD_BATCH_SIZE] = [(null(), 0); RECORD_BATCH_SIZE];
+        let mut matched_count = 0;
+
+        // --- Bootstrap ---
+        // Fill circular buffer: hash up to BUF_SIZE elements, prefetch all
+        let bootstrap_size = std::cmp::min(BUF_SIZE, len);
+        for k in 0..bootstrap_size {
+            hashes[k] = self.hash_state.hash_one(unsafe { col.value_unchecked(k) });
+            dir_ptrs[k] = directory.ptr_for_slot((hashes[k] >> directory.shift) as usize);
+            prefetch_ptr_l2(dir_ptrs[k] as *const u8);
+        }
+
+        // Deref group 0 (tight loop) so bloom can start on first main iteration
+        let g0_size = std::cmp::min(GROUP_SIZE, len);
+        for j in 0..g0_size {
+            entries[j] = unsafe { *dir_ptrs[j] };
+        }
+
+        // Previous group position in circular buffer for bloom check
+        let mut bloom_off: usize = 0;
+        let mut bloom_col: usize = 0;
+        let mut bloom_size: usize = g0_size;
+
+        let mut write_pos = bootstrap_size;
+
+        // --- Main loop ---
+        // deref_col tracks the col index of the group we're deref-ing
+        let mut deref_col = GROUP_SIZE;
+        while deref_col < len {
+            let deref_size = std::cmp::min(GROUP_SIZE, len - deref_col);
+            let deref_off = deref_col % BUF_SIZE;
+
+            // Stage 1: Bloom check previous group (pure ALU, no loads)
+            for j in 0..bloom_size {
+                let tag = Directory::<B>::compute_tag(hashes[bloom_off + j]) as u64;
+                if entries[bloom_off + j] & tag != tag {
+                    continue;
+                }
+                start_ptrs[matched_count] = (dir_ptrs[bloom_off + j], bloom_col + j);
+                matched_count += 1;
+            }
+
+            // Stage 2: Deref directory ptrs for current group (tight loop)
+            for j in 0..deref_size {
+                entries[deref_off + j] = unsafe { *dir_ptrs[deref_off + j] };
+            }
+
+            // Stage 3: Hash + prefetch next GROUP_SIZE into circular buffer
+            let hash_size = std::cmp::min(GROUP_SIZE, len.saturating_sub(write_pos));
+            for j in 0..hash_size {
+                let slot = write_pos % BUF_SIZE;
+                hashes[slot] = self.hash_state.hash_one(unsafe { col.value_unchecked(write_pos) });
+                dir_ptrs[slot] = directory.ptr_for_slot((hashes[slot] >> directory.shift) as usize);
+                prefetch_ptr_l2(dir_ptrs[slot] as *const u8);
+                write_pos += 1;
+            }
+
+            bloom_off = deref_off;
+            bloom_col = deref_col;
+            bloom_size = deref_size;
+            deref_col += deref_size;
+        }
+
+        // Drain: bloom check the last deref'd group
+        for j in 0..bloom_size {
+            let tag = Directory::<B>::compute_tag(hashes[bloom_off + j]) as u64;
+            if entries[bloom_off + j] & tag != tag {
+                continue;
+            }
+            start_ptrs[matched_count] = (dir_ptrs[bloom_off + j], bloom_col + j);
+            matched_count += 1;
+        }
+
+        // --- Phase 2: arena pipeline ---
+        // 3 stages, all reading directly from start_ptrs:
+        //   L2 prefetch: 64 matched entries ahead
+        //   L1 load (black_box): current group (1 group ahead of probe)
+        //   Probe: previous group
 
         let arena = unsafe { &*self.table.arena.get() };
 
@@ -287,31 +330,52 @@ impl Probe {
         let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
         let mut out = 0;
 
-        const PREFETCH_DISTANCE: usize = 64;
-        for i in 0..matched_index_count {
-            let group_size = std::cmp::min(GROUP_SIZE, col.len() - i);
+        const L2_DISTANCE: usize = 64;
 
-            if i + PREFETCH_DISTANCE * 2 < matched_index_count {
-                let (ptr, _) = start_ptrs[i + PREFETCH_DISTANCE];
-                prefetch_ptr_l2(ptr as *const u8);
+        // L2 prefetch bootstrap: prefetch first 64 entries
+        let l2_bootstrap = std::cmp::min(L2_DISTANCE, matched_count);
+        for k in 0..l2_bootstrap {
+            let (ptr, _) = start_ptrs[k];
+            let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
+            prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
+        }
+
+        // L1 load bootstrap: black_box load first group
+        let g0 = std::cmp::min(GROUP_SIZE, matched_count);
+        for j in 0..g0 {
+            let (ptr, _) = start_ptrs[j];
+            let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
+            black_box(unsafe { *(arena.ptr_at_index(start) as *const u32) });
+        }
+
+        let mut prev_start = 0usize;
+        let mut prev_size = g0;
+        let mut load_col = GROUP_SIZE;
+
+        while load_col < matched_count {
+            let load_size = std::cmp::min(GROUP_SIZE, matched_count - load_col);
+
+            // Stage 1: L2 prefetch 64 ahead (tight loop)
+            let l2_start = load_col + L2_DISTANCE;
+            let l2_end = std::cmp::min(l2_start + load_size, matched_count);
+            for k in l2_start..l2_end {
+                let (ptr, _) = start_ptrs[k];
+                let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
+                prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
             }
 
-            for j in 0..group_size {
-                let (ptr, idx) = start_ptrs[i + j];
-                let value = unsafe { *ptr };
-                let entry = unsafe { *ptr.add(1) };
-                let start = (value >> PTR_SHIFT) as usize;
-                let end = (entry >> PTR_SHIFT) as usize;
-                arenas_ptrs[j] = (start, end, idx);
+            // Stage 2: L1 load current group via black_box (tight loop, warm in L2)
+            for j in 0..load_size {
+                let (ptr, _) = start_ptrs[load_col + j];
+                let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
+                black_box(unsafe { *(arena.ptr_at_index(start) as *const u32) });
             }
 
-            for j in 0..group_size {
-                let (start, _, _) = arenas_ptrs[j];
-                black_box(arena[start]);
-            }
-
-            for j in 0..group_size {
-                let (start, end, idx) = load_arenas_ptrs[j];
+            // Stage 3: Probe previous group (in L1)
+            for j in 0..prev_size {
+                let (ptr, idx) = start_ptrs[prev_start + j];
+                let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
+                let end = (unsafe { *ptr } >> PTR_SHIFT) as usize;
                 let probe_key = unsafe { col.value_unchecked(idx) } as u32;
                 for k in start..end {
                     let entry: Value = arena[k];
@@ -322,8 +386,40 @@ impl Probe {
                     }
                 }
             }
+
+            prev_start = load_col;
+            prev_size = load_size;
+            load_col += load_size;
         }
 
+        // Drain: probe the last group (already in L1)
+        for j in 0..prev_size {
+            let (ptr, idx) = start_ptrs[prev_start + j];
+            let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
+            let end = (unsafe { *ptr } >> PTR_SHIFT) as usize;
+            let probe_key = unsafe { col.value_unchecked(idx) } as u32;
+            for k in start..end {
+                let entry: Value = arena[k];
+                if entry == probe_key {
+                    lineitem_keys.write(out, entry as i64);
+                    order_keys.write(out, entry as i64);
+                    out += 1;
+                }
+            }
+        }
+
+        if out == 0 {
+            return Ok(());
+        }
+
+        let result = RecordBatch::try_new(
+            PROBE_SCHEMA.clone(),
+            vec![
+                lineitem_keys.into_array(out),
+                order_keys.into_array(out),
+            ],
+        )?;
+        sender.send(result)?;
         Ok(())
     }
 }

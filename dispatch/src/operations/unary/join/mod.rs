@@ -3,6 +3,7 @@ mod directory;
 mod primitive_builder;
 mod probe;
 mod build;
+mod pipeline;
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
