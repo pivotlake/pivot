@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::ops::{Index, IndexMut};
 use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer};
 
-const PTR_SHIFT: u32 = 16;
+pub const PTR_SHIFT: u32 = 16;
 
 const fn build_tag_table() -> [u16; 2048] {
     let mut table = [0u16; 2048];
@@ -128,6 +128,15 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     #[inline(always)]
     pub unsafe fn add_to_entry(&self, slot: usize, value: u64) {
         self.entries_mut()[slot + 1] += value;
+    }
+
+    /// OR `value` into the entry at slot.
+    ///
+    /// # Safety
+    /// Caller must ensure exclusive access to this slot.
+    #[inline(always)]
+    pub unsafe fn or_to_entry(&self, slot: usize, value: u64) {
+        self.entries_mut()[slot + 1] |= value;
     }
 
     /// Prefetch the directory entry for the slot where `hash` would land.

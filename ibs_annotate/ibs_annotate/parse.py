@@ -577,10 +577,11 @@ def compute_function_summaries(stats: dict[str, InsnStats]) -> list[FunctionSumm
             )
         f = by_func[func_name]
         f.total_samples += s.total_samples
+        f.cycles += s.cycles
         for lvl, c in s.cache_counts.items():
             f.weighted_cost += c * lvl.weight
             f.cache_counts[lvl] += c
-    return sorted(by_func.values(), key=lambda f: f.weighted_cost, reverse=True)
+    return sorted(by_func.values(), key=lambda f: f.cycles, reverse=True)
 
 
 # -- Per-function objdump via address range ------------------------------------

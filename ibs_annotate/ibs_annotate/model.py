@@ -236,6 +236,7 @@ class FunctionSummary:
     name: str
     total_samples: int
     weighted_cost: int
+    cycles: int = 0
     cache_counts: dict[CacheLevel, int] = field(
         default_factory=lambda: defaultdict(int)
     )

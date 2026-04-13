@@ -307,7 +307,7 @@ class CursesTUI:
     def _draw_functions(self, stdscr) -> None:
         h, w = stdscr.getmaxyx()
 
-        header = f"  {'Overhead':>8}  {'Samples':>8}  Function"
+        header = f"  {'Cycles%':>8}  {'Cycles':>8}  {'Samples':>8}  Function"
         _safe_addstr(stdscr, 0, 0, header, curses.A_BOLD)
         _safe_addstr(stdscr, 1, 0, "\u2500" * min(w - 1, 80))
 
@@ -324,8 +324,8 @@ class CursesTUI:
                 break
             f = self.func_summaries[idx]
             is_cursor = idx == self.func_cursor
-            pct = 100.0 * f.weighted_cost / self.total_weighted_cost if self.total_weighted_cost else 0
-            text = f"  {pct:>7.2f}%  {f.total_samples:>8}  {f.name}"
+            cyc_pct = 100.0 * f.cycles / self.total_cycles if self.total_cycles else 0
+            text = f"  {cyc_pct:>7.2f}%  {f.cycles:>8}  {f.total_samples:>8}  {f.name}"
             attr = curses.color_pair(_PAIR_CURSOR) if is_cursor else 0
             _safe_addstr(stdscr, i + 2, 0, text.ljust(w - 1), attr)
 

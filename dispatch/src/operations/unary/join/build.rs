@@ -152,7 +152,7 @@ impl JoinPartitionJob {
                 let slot = (hash >> shift) as usize;
                 unsafe {
                     directory.add_to_entry(slot, 1 << 16);
-                    directory.add_to_entry(slot, Directory::<B>::compute_tag(hash) as u64);
+                    directory.or_to_entry(slot, Directory::<B>::compute_tag(hash) as u64);
                 }
             }
         }

@@ -216,7 +216,9 @@ fn run_query_12(tables: &TpchTables) {
     );
 
     let res = orders.join(lineitem, 0, 0)
-        .count().collect();
+        .count().collect().get(0).unwrap().clone();
+    println!("Actual {:?}", batch_to_tsv(&res));
+
 //
 //     // TODO: join lineitem and orders on l_orderkey = o_orderkey,
 //     // filter on l_shipmode, date predicates,
