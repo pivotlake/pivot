@@ -9,7 +9,7 @@ use crossbeam_deque::Injector;
 use crate::memory::{MultiSlabBuffer, SlabVec};
 use crate::operations::UnaryFactory;
 use crate::operations::unary::join::directory::JoinDirectory;
-use crate::operations::unary::join::probe::Probe;
+use crate::operations::unary::join::probe_new::Probe;
 use crate::operations::unary::join::{JoinTable, Value};
 use crate::operations::unary::join::build::{JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
@@ -37,6 +37,7 @@ pub struct JoinProbeFactory {
     pub(crate) table: JoinTable,
     hash_state: RandomState,
     key_column: usize,
+    shared_total: Arc<AtomicUsize>
 }
 
 unsafe impl Send for JoinProbeFactory {}
@@ -57,7 +58,8 @@ pub fn create_for_workers(
     impl IntoIterator<Item = JoinProbeFactory>,
     Arc<AtomicBool>,
 ) {
-    let hash_state = RandomState::new();
+    let hash_state = RandomState::with_seeds(0, 0, 0, 0);
+    let shared_total = Arc::new(AtomicUsize::new(0));
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
     let directory = Arc::new(UnsafeCell::new(JoinDirectory::initial()));
@@ -89,6 +91,7 @@ pub fn create_for_workers(
     });
 
     let probe_factories = (0..worker_count).map(move |_| JoinProbeFactory {
+        shared_total: shared_total.clone(),
         table: JoinTable {
             directory: dir_clone.clone(),
             arena: arena_clone.clone(),
@@ -124,6 +127,6 @@ impl UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory {
     type Unary = Probe;
 
     fn build_unary(self) -> Probe {
-        Probe::new(self.table, self.hash_state, self.key_column)
+        Probe::new(self.table, self.hash_state, self.key_column, self.shared_total.clone())
     }
 }

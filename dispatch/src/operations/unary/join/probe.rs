@@ -1,32 +1,39 @@
+use std::cmp::min;
 use std::hint::black_box;
 use std::mem;
 use std::ops::{Index, IndexMut, Sub};
 use std::ptr::null;
 use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use ahash::RandomState;
 use arrow_array::types::Int64Type;
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayAccessor, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use libc::send;
 use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
-use crate::memory::SlabAllocator;
+use crate::memory::{SlabAllocator, BUFFER_SIZE, RING};
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::Unary;
-use crate::operations::unary::join::directory::{prefetch_ptr_l2, Directory, JoinDirectory, PtrBuffer, PTR_SHIFT};
+use crate::operations::unary::join::directory::{prefetch_ptr, prefetch_ptr_l2, Directory, JoinDirectory, PtrBuffer, PTR_SHIFT};
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::Value;
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
 use crate::perf_stat::{perf_disable, perf_enable};
 use crate::RECORD_BATCH_SIZE;
 use crate::worker::WORKER_IDX;
+const BATCH: usize = 1;
+const RING_SIZE: usize = 128;
 
 // struct SearchEntry {
 //     start: u64,
 //     end: u64,
 //     arena:
 // }
+const GROUP_SIZE: usize = 40;
+const HASH_RING_SIZE: usize = 120;
 
 
 static PROBE_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
@@ -48,10 +55,11 @@ pub struct Probe {
     matched_indexes: Box<[usize; RECORD_BATCH_SIZE]>,
     allocator: SlabAllocator,
     total: usize,
+    shared_total: Arc<AtomicUsize>
 }
 
 impl Probe {
-    pub fn new(table: JoinTable, hash_state: RandomState, key_column: usize) -> Self {
+    pub fn new(table: JoinTable, hash_state: RandomState, key_column: usize, shared_total: Arc<AtomicUsize>) -> Self {
         Self {
             table,
             hash_state,
@@ -63,16 +71,43 @@ impl Probe {
             matched_indexes: Box::new([0; RECORD_BATCH_SIZE]),
             allocator: SlabAllocator::new(false),
             total: 0,
+            shared_total,
         }
     }
 
     #[inline(never)]
-    fn compute_hashes<B: Index<usize, Output = u64> + IndexMut<usize>>(&mut self, col: &Int64Array, directory: &Directory<B>) {
+    fn compute_hashes(&mut self, col: &Int64Array) {
         let mut i = 0;
         let length = col.len();
         while i < length {
             let hash = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
             self.hashes[i] = hash;
+            i += 1;
+        }
+    }
+
+
+    #[inline(never)]
+    fn compute_hashes_len(&mut self, col: &Int64Array, len: usize) {
+        let mut i = 0;
+        let length = min(col.len(), len);
+        while i < length {
+            let hash = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
+            self.hashes[i] = hash;
+            black_box(self.hashes[i]);
+            i += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn compute_hashes_len2<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(&mut self, directory: &Directory<B>, col: &Int64Array, mut idx: usize, offset: usize, len: usize) {
+        let mut i = offset;
+        let total = len + i;
+        while i < total {
+            let hash = self.hash_state.hash_one(unsafe { col.value_unchecked(idx) });
+            self.hashes[i] = hash;
+            prefetch_ptr_l2(directory.ptr_for_slot((hash >> directory.shift) as usize) as *const u8);
+            idx += 1;
             i += 1;
         }
     }
@@ -115,14 +150,46 @@ impl Probe {
 
         for i in 0..size-prefetch_size {
             prefetch_ptr_l2(self.ptrs[i + PREFETCH_DISTANCE] as *const u8);
-            self.entries[i] = unsafe { *self.ptrs[i] };
+            black_box(unsafe { *self.ptrs[i] });
         }
 
         for i in size-prefetch_size..size {
-            self.entries[i] = unsafe { *self.ptrs[i] };
+            // self.entries[i] = unsafe { *self.ptrs[i] };
+            black_box(unsafe { *self.ptrs[i] });
         }
     }
 
+    #[inline(never)]
+    fn touch_size_simple<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(&mut self, size: usize, directory: &Directory<B>) {
+        // for i in 0..size {
+        //     self.ptrs[i] = directory.ptr_for_slot((self.hashes[i] >> directory.shift) as usize);
+        // }
+
+        for i in 0..size {
+            if directory.matches_bloom(self.hashes[i]) {
+                self.total += 1;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn touch_size2<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(&mut self, hash_idx: usize, directory: &Directory<B>) {
+        // for i in 0..BATCH {
+        //     self.ptrs[i] = directory.ptr_for_slot((self.hashes[hash_idx + i] >> directory.shift) as usize);
+        // }
+
+        for i in 0..BATCH {
+            // black_box(unsafe { *self.ptrs[i] });
+            // let res = unsafe { *self.ptrs[i] };
+            // black_box(self.hashes[hash_idx + i]);
+            if directory.matches_bloom(self.hashes[hash_idx + i]) {
+                self.total += 1;
+            }
+        }
+    }
+
+    // fn bloom_filters
+    //
 
     // /// The only reason this would be good is - if the CPU has several pipelines before it, and it
     // /// cannot dispatch the next pipeline, it look for another pipelin
@@ -221,8 +288,8 @@ impl Probe {
         Ok(())
     }
 
-    #[inline(always)]
-    fn probe_with_dir<
+    #[inline(never)]
+    fn probe_old_with_hashing<
         B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
         S: Sender<RecordBatch>,
     >(
@@ -231,173 +298,271 @@ impl Probe {
         col: &Int64Array,
         sender: &mut S,
     ) -> unary::Result<()> {
-        const GROUP_SIZE: usize = 10;
-        const BUF_SIZE: usize = GROUP_SIZE * 10;
+        self.compute_hashes(col);
+        let arena = unsafe { &*self.table.arena.get() };
         let len = col.len();
-        if len == 0 {
+
+        let mut lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+
+        let mut out = 0;
+
+        let mut i = 0;
+        while i < len {
+            const PREFETCH_DISTANCE: usize = 16;
+            if i + PREFETCH_DISTANCE < len {
+                let ph = self.hashes[i + PREFETCH_DISTANCE];
+                directory.prefetch_l1(ph);
+            }
+
+            // if i + 8 < len {
+            //     let h = unsafe { *self.hashes.get_unchecked(i + 8) };
+            //     let slot = directory.slot_for(h) as isize;
+            //     let start = directory.end_ptr(slot - 1);
+            //     let ptr = arena.ptr_at_index(start) as *const i8;
+            //
+            //     #[cfg(target_arch = "x86_64")]
+            //     unsafe {
+            //         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+            //     }
+            // }
+
+            let hash = unsafe { *self.hashes.get_unchecked(i) };
+
+            if !directory.matches_bloom(hash) {
+                i += 1;
+                continue;
+            }
+            self.total += 1;
+            black_box(hash);
+            // //
+            // let slot = directory.slot_for(hash) as isize;
+            // let start = directory.end_ptr(slot - 1);
+            // let end = directory.end_ptr(slot);
+            //
+            // let probe_key = unsafe { col.value_unchecked(i) } as u32;
+            //
+            // for j in start..end {
+            //     let entry: Value = arena[j];
+            //     // if entry == probe_key {
+            //         lineitem_keys.write(out, entry as i64);
+            //         order_keys.write(out, entry as i64);
+            //         out += 1;
+            //     // }
+            // }
+
+            i += 1;
+        }
+
+        if out == 0 {
             return Ok(());
         }
 
-        // Circular buffer for hashes and directory ptrs
-        let mut hashes: [u64; BUF_SIZE] = [0; BUF_SIZE];
-        let mut dir_ptrs: [*const u64; BUF_SIZE] = [null(); BUF_SIZE];
-        // Entries loaded by tight deref loop, indexed same as circular buffer
-        let mut entries: [u64; BUF_SIZE] = [0; BUF_SIZE];
-
-        // Bloom-matched: (ptr to slot entry, col index)
-        let mut start_ptrs: [(*const u64, usize); RECORD_BATCH_SIZE] = [(null(), 0); RECORD_BATCH_SIZE];
-        let mut matched_count = 0;
-
-        // --- Bootstrap ---
-        // Fill circular buffer: hash up to BUF_SIZE elements, prefetch all
-        let bootstrap_size = std::cmp::min(BUF_SIZE, len);
-        for k in 0..bootstrap_size {
-            hashes[k] = self.hash_state.hash_one(unsafe { col.value_unchecked(k) });
-            dir_ptrs[k] = directory.ptr_for_slot((hashes[k] >> directory.shift) as usize);
-            prefetch_ptr_l2(dir_ptrs[k] as *const u8);
+        if out > RECORD_BATCH_SIZE {
+            panic!("OH no!");
         }
+        let result = RecordBatch::try_new(
+            PROBE_SCHEMA.clone(),
+            vec![
+                lineitem_keys.into_array(out),
+                order_keys.into_array(out),
+            ],
+        )?;
+        sender.send(result)?;
+        Ok(())
+    }
 
-        // Deref group 0 (tight loop) so bloom can start on first main iteration
-        let g0_size = std::cmp::min(GROUP_SIZE, len);
-        for j in 0..g0_size {
-            entries[j] = unsafe { *dir_ptrs[j] };
-        }
+    #[inline(never)]
+    fn probe_old<
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+        S: Sender<RecordBatch>,
+    >(
+        &mut self,
+        directory: &Directory<B>,
+        col: &Int64Array,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        self.compute_hashes(col);
+        let arena = unsafe { &*self.table.arena.get() };
+        let len = col.len();
 
-        // Previous group position in circular buffer for bloom check
-        let mut bloom_off: usize = 0;
-        let mut bloom_col: usize = 0;
-        let mut bloom_size: usize = g0_size;
+        let mut lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
 
-        let mut write_pos = bootstrap_size;
+        let mut out = 0;
 
-        // --- Main loop ---
-        // deref_col tracks the col index of the group we're deref-ing
-        let mut deref_col = GROUP_SIZE;
-        while deref_col < len {
-            let deref_size = std::cmp::min(GROUP_SIZE, len - deref_col);
-            let deref_off = deref_col % BUF_SIZE;
-
-            // Stage 1: Bloom check previous group (pure ALU, no loads)
-            for j in 0..bloom_size {
-                let tag = Directory::<B>::compute_tag(hashes[bloom_off + j]) as u64;
-                if entries[bloom_off + j] & tag != tag {
-                    continue;
-                }
-                start_ptrs[matched_count] = (dir_ptrs[bloom_off + j], bloom_col + j);
-                matched_count += 1;
+        let mut i = 0;
+        while i < len {
+            const PREFETCH_DISTANCE: usize = 16;
+            if i + PREFETCH_DISTANCE < len {
+                let ph = self.hashes[i + PREFETCH_DISTANCE];
+                directory.prefetch_l1(ph);
             }
 
-            // Stage 2: Deref directory ptrs for current group (tight loop)
-            for j in 0..deref_size {
-                entries[deref_off + j] = unsafe { *dir_ptrs[deref_off + j] };
-            }
+            // if i + 8 < len {
+            //     let h = unsafe { *self.hashes.get_unchecked(i + 8) };
+            //     let slot = directory.slot_for(h) as isize;
+            //     let start = directory.end_ptr(slot - 1);
+            //     let ptr = arena.ptr_at_index(start) as *const i8;
+            //
+            //     #[cfg(target_arch = "x86_64")]
+            //     unsafe {
+            //         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+            //     }
+            // }
 
-            // Stage 3: Hash + prefetch next GROUP_SIZE into circular buffer
-            let hash_size = std::cmp::min(GROUP_SIZE, len.saturating_sub(write_pos));
-            for j in 0..hash_size {
-                let slot = write_pos % BUF_SIZE;
-                hashes[slot] = self.hash_state.hash_one(unsafe { col.value_unchecked(write_pos) });
-                dir_ptrs[slot] = directory.ptr_for_slot((hashes[slot] >> directory.shift) as usize);
-                prefetch_ptr_l2(dir_ptrs[slot] as *const u8);
-                write_pos += 1;
-            }
+            let hash = unsafe { *self.hashes.get_unchecked(i) };
 
-            bloom_off = deref_off;
-            bloom_col = deref_col;
-            bloom_size = deref_size;
-            deref_col += deref_size;
-        }
-
-        // Drain: bloom check the last deref'd group
-        for j in 0..bloom_size {
-            let tag = Directory::<B>::compute_tag(hashes[bloom_off + j]) as u64;
-            if entries[bloom_off + j] & tag != tag {
+            if !directory.matches_bloom(hash) {
+                i += 1;
                 continue;
             }
-            start_ptrs[matched_count] = (dir_ptrs[bloom_off + j], bloom_col + j);
-            matched_count += 1;
+            self.total += 1;
+            black_box(hash);
+            // //
+            // let slot = directory.slot_for(hash) as isize;
+            // let start = directory.end_ptr(slot - 1);
+            // let end = directory.end_ptr(slot);
+            //
+            // let probe_key = unsafe { col.value_unchecked(i) } as u32;
+            //
+            // for j in start..end {
+            //     let entry: Value = arena[j];
+            //     // if entry == probe_key {
+            //         lineitem_keys.write(out, entry as i64);
+            //         order_keys.write(out, entry as i64);
+            //         out += 1;
+            //     // }
+            // }
+
+            i += 1;
         }
 
-        // --- Phase 2: arena pipeline ---
-        // 3 stages, all reading directly from start_ptrs:
-        //   L2 prefetch: 64 matched entries ahead
-        //   L1 load (black_box): current group (1 group ahead of probe)
-        //   Probe: previous group
+        if out == 0 {
+            return Ok(());
+        }
 
+        if out > RECORD_BATCH_SIZE {
+            panic!("OH no!");
+        }
+        let result = RecordBatch::try_new(
+            PROBE_SCHEMA.clone(),
+            vec![
+                lineitem_keys.into_array(out),
+                order_keys.into_array(out),
+            ],
+        )?;
+        sender.send(result)?;
+        Ok(())
+    }
+
+    // fn probe_old<
+    //     B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+    //     S: Sender<RecordBatch>,
+    // >(
+    //     &mut self,
+    //     directory: &Directory<B>,
+    //     col: &Int64Array,
+    //     sender: &mut S,
+    // ) -> unary::Result<()> {
+    //     self.compute_hashes(col);
+    //     let arena = unsafe { &*self.table.arena.get() };
+    //     let len = col.len();
+    //
+    //     let mut lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+    //     let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+    //
+    //     let mut out = 0;
+    //
+    //     let mut i = 0;
+    //     while i < len {
+    //         const PREFETCH_DISTANCE: usize = 16;
+    //         if i + PREFETCH_DISTANCE < len {
+    //             let ph = self.hashes[i + PREFETCH_DISTANCE];
+    //             directory.prefetch_l1(ph);
+    //         }
+    //         //
+    //         // if i + 8 < len {
+    //         //     let h = unsafe { *self.hashes.get_unchecked(i + 8) };
+    //         //     let slot = directory.slot_for(h) as isize;
+    //         //     let start = directory.end_ptr(slot - 1);
+    //         //     let ptr = arena.ptr_at_index(start) as *const i8;
+    //         //
+    //         //     #[cfg(target_arch = "x86_64")]
+    //         //     unsafe {
+    //         //         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+    //         //     }
+    //         // }
+    //
+    //         let hash = unsafe { *self.hashes.get_unchecked(i) };
+    //
+    //         if !directory.matches_bloom(hash) {
+    //             i += 1;
+    //             continue;
+    //         }
+    //         black_box(hash);
+    //
+    //         // let slot = directory.slot_for(hash) as isize;
+    //         // let start = directory.end_ptr(slot - 1);
+    //         // let end = directory.end_ptr(slot);
+    //         //
+    //         // let probe_key = unsafe { col.value_unchecked(i) } as u32;
+    //         //
+    //         // for j in start..end {
+    //         //     let entry: Value = arena[j];
+    //         //     if entry == probe_key {
+    //         //         lineitem_keys.write(out, entry as i64);
+    //         //         order_keys.write(out, entry as i64);
+    //         //         out += 1;
+    //         //     }
+    //         // }
+    //
+    //         i += 1;
+    //     }
+    //
+    //     if out == 0 {
+    //         return Ok(());
+    //     }
+    //
+    //     let result = RecordBatch::try_new(
+    //         PROBE_SCHEMA.clone(),
+    //         vec![
+    //             lineitem_keys.into_array(out),
+    //             order_keys.into_array(out),
+    //         ],
+    //     )?;
+    //     sender.send(result)?;
+    //     Ok(())
+    // }
+
+    #[inline(never)]
+    fn simple_load< S: Sender<RecordBatch>>(&mut self,  sender: &mut S, matched_count: usize, start_ptrs: &[(*const u64, usize); RECORD_BATCH_SIZE], col: &Int64Array) -> unary::Result<()> {
         let arena = unsafe { &*self.table.arena.get() };
 
         let mut lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
         let mut order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
         let mut out = 0;
 
-        const L2_DISTANCE: usize = 64;
+        const PREFETCH_DISTANCE: usize = 8;
 
-        // L2 prefetch bootstrap: prefetch first 64 entries
-        let l2_bootstrap = std::cmp::min(L2_DISTANCE, matched_count);
-        for k in 0..l2_bootstrap {
-            let (ptr, _) = start_ptrs[k];
-            let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
-            prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
-        }
+        for i in 0..matched_count {
+            // if i + PREFETCH_DISTANCE < matched_count {
+            //     let ph = start_ptrs[i + PREFETCH_DISTANCE];
+            //     directory.prefetch_l1(ph);
+            // }
+            //
+            // if i + PREFETCH_DISTANCE < matched_count {
+            //     let (ptr, _) = start_ptrs[i + PREFETCH_DISTANCE];
+            //     let start = (unsafe { *ptr } >> PTR_SHIFT) as usize;
+            //     let val =  arena.ptr_at_index(start);
+            //     prefetch_ptr(val as *const u8);
+            // }
 
-        // L1 load bootstrap: black_box load first group
-        let g0 = std::cmp::min(GROUP_SIZE, matched_count);
-        for j in 0..g0 {
-            let (ptr, _) = start_ptrs[j];
-            let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
-            black_box(unsafe { *(arena.ptr_at_index(start) as *const u32) });
-        }
-
-        let mut prev_start = 0usize;
-        let mut prev_size = g0;
-        let mut load_col = GROUP_SIZE;
-
-        while load_col < matched_count {
-            let load_size = std::cmp::min(GROUP_SIZE, matched_count - load_col);
-
-            // Stage 1: L2 prefetch 64 ahead (tight loop)
-            let l2_start = load_col + L2_DISTANCE;
-            let l2_end = std::cmp::min(l2_start + load_size, matched_count);
-            for k in l2_start..l2_end {
-                let (ptr, _) = start_ptrs[k];
-                let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
-                prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
-            }
-
-            // Stage 2: L1 load current group via black_box (tight loop, warm in L2)
-            for j in 0..load_size {
-                let (ptr, _) = start_ptrs[load_col + j];
-                let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
-                black_box(unsafe { *(arena.ptr_at_index(start) as *const u32) });
-            }
-
-            // Stage 3: Probe previous group (in L1)
-            for j in 0..prev_size {
-                let (ptr, idx) = start_ptrs[prev_start + j];
-                let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
-                let end = (unsafe { *ptr } >> PTR_SHIFT) as usize;
-                let probe_key = unsafe { col.value_unchecked(idx) } as u32;
-                for k in start..end {
-                    let entry: Value = arena[k];
-                    if entry == probe_key {
-                        lineitem_keys.write(out, entry as i64);
-                        order_keys.write(out, entry as i64);
-                        out += 1;
-                    }
-                }
-            }
-
-            prev_start = load_col;
-            prev_size = load_size;
-            load_col += load_size;
-        }
-
-        // Drain: probe the last group (already in L1)
-        for j in 0..prev_size {
-            let (ptr, idx) = start_ptrs[prev_start + j];
+            let (ptr, idx) = start_ptrs[i];
             let start = (unsafe { *ptr.sub(1) } >> PTR_SHIFT) as usize;
             let end = (unsafe { *ptr } >> PTR_SHIFT) as usize;
             let probe_key = unsafe { col.value_unchecked(idx) } as u32;
+
             for k in start..end {
                 let entry: Value = arena[k];
                 if entry == probe_key {
@@ -422,6 +587,271 @@ impl Probe {
         sender.send(result)?;
         Ok(())
     }
+
+    // fn run_probe_once<
+    //     const RUN_HASHES: bool,
+    //
+    //     B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+    //     S: Sender<RecordBatch>,
+    // >(
+    //     &mut self,
+    //     col_index: &mut usize,
+    //     directory: &Directory<B>,
+    //     col: &Int64Array,
+    //
+    //     hashes: &mut [u64; HASH_RING_SIZE],
+    //     end_ptrs: &mut [*const u64; GROUP_SIZE],
+    //     next_end_ptrs: &mut [*const u64; GROUP_SIZE],
+    //     end_entries: &mut [u64; GROUP_SIZE],
+    //     next_end_entries: &mut [u64; GROUP_SIZE],
+    //     start_ptrs: &mut [(*const u64, usize); RECORD_BATCH_SIZE],
+    //     matched_index_count: &mut usize
+    // ) {
+    //     let group_size = std::cmp::min(GROUP_SIZE, col.len() - *col_index);
+    //
+    //     let hash_counter = (*col_index + GROUP_SIZE) % HASH_RING_SIZE;
+    //     let matching_group_counter = (*col_index - GROUP_SIZE) % HASH_RING_SIZE;
+    //     let next_group_counter = *col_index % HASH_RING_SIZE;
+    //
+    //     if RUN_HASHES {
+    //         for j in 0..group_size {
+    //             hashes[hash_counter + j] = self.hash_state.hash_one(unsafe { col.value_unchecked(*col_index + j) });
+    //             prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_counter + j] >> directory.shift) as usize) as *const u8);
+    //         }
+    //     }
+    //
+    //     for j in 0..GROUP_SIZE {
+    //         next_end_ptrs[j] = directory.ptr_for_slot((hashes[next_group_counter + j] >> directory.shift) as usize);
+    //     }
+    //
+    //     // Interesting if we'll see lots of cycles at end of previous loop? Maybe we could
+    //     // overlap with next section if we have another layer of depth in pipeline with
+    //     // something like "next_next_end_ptrs"
+    //     for j in 0..GROUP_SIZE {
+    //         next_end_entries[j] =  unsafe { *next_end_ptrs[j] };
+    //     }
+    //
+    //     for j in 0..GROUP_SIZE {
+    //         let entry = end_entries[j];
+    //         let probe = Directory::<B>::compute_tag(hashes[matching_group_counter + j]) as u64;
+    //         if entry & probe != probe {
+    //             continue;
+    //         }
+    //
+    //         start_ptrs[*matched_index_count] = (unsafe { end_ptrs[j].sub(1) }, *col_index + j - 2 * GROUP_SIZE);
+    //         *matched_index_count += 1;
+    //     }
+    //
+    //     *col_index += group_size;
+    //     mem::swap(end_entries, next_end_entries);
+    //     mem::swap(end_ptrs, next_end_ptrs);
+    // }
+
+    #[inline(never)]
+    fn probe_with_dir<
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+        S: Sender<RecordBatch>,
+    >(
+        &mut self,
+        directory: &Directory<B>,
+        col: &Int64Array,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        /// [ GROUP-HASHING (+ Prefetch l2) ] [ GROUP-MATCHING ] [GROUP-LOADING]
+        let mut hashes: [u64; HASH_RING_SIZE] = [0; HASH_RING_SIZE];
+
+        let mut end_ptrs: [*const u64; GROUP_SIZE] = [null(); GROUP_SIZE];
+        let mut end_entries = [0u64; GROUP_SIZE];
+
+        let mut next_end_ptrs: [*const u64; GROUP_SIZE] = [null(); GROUP_SIZE];
+        let mut next_end_entries: [u64; GROUP_SIZE] = [0; GROUP_SIZE];
+
+        let mut start_ptrs: [(*const u64, usize); RECORD_BATCH_SIZE] = [(null(), 0); RECORD_BATCH_SIZE];
+
+        let mut matched_index_count = 0;
+
+        for i in GROUP_SIZE..HASH_RING_SIZE {
+            hashes[i] = self.hash_state.hash_one(unsafe { col.value_unchecked(i - GROUP_SIZE) });
+            prefetch_ptr_l2(directory.ptr_for_slot((hashes[i] >> directory.shift) as usize) as *const u8);
+        }
+        for j in 0..GROUP_SIZE {
+            let pos = GROUP_SIZE + j;
+            end_ptrs[j] = directory.ptr_for_slot((hashes[pos] >> directory.shift) as usize);
+        }
+        for j in 0..GROUP_SIZE {
+            end_entries[j] = unsafe { *end_ptrs[j] };
+        }
+
+        let mut i = HASH_RING_SIZE - GROUP_SIZE;
+
+        while i < col.len() {
+            let group_size = std::cmp::min(GROUP_SIZE, col.len() - i);
+
+            let hash_counter = (i + GROUP_SIZE) % HASH_RING_SIZE;
+            let matching_group_counter = (i - GROUP_SIZE) % HASH_RING_SIZE;
+            let next_group_counter = i % HASH_RING_SIZE;
+
+            for j in 0..group_size {
+                hashes[hash_counter + j] = self.hash_state.hash_one(unsafe { col.value_unchecked(i + j) });
+                // prefetch_ptr(directory.ptr_for_slot((hashes[hash_counter + j] >> directory.shift) as usize) as *const u8);
+            }
+
+            for j in 0..GROUP_SIZE {
+                next_end_ptrs[j] = directory.ptr_for_slot((hashes[next_group_counter + j] >> directory.shift) as usize);
+            }
+
+            // Interesting if we'll see lots of cycles at end of previous loop? Maybe we could
+            // overlap with next section if we have another layer of depth in pipeline with
+            // something like "next_next_end_ptrs"
+            for j in 0..GROUP_SIZE {
+                next_end_entries[j] =  unsafe { *next_end_ptrs[j] };
+                black_box(next_end_entries[j]);
+            }
+            //
+            // for j in 0..GROUP_SIZE {
+            //     let entry = end_entries[j];
+            //     let probe = Directory::<B>::compute_tag(hashes[matching_group_counter + j]) as u64;
+            //     if entry & probe != probe {
+            //         continue;
+            //     }
+            //
+            //     start_ptrs[matched_index_count] = (unsafe { end_ptrs[j].sub(1) }, i + j - 2 * GROUP_SIZE);
+            //     matched_index_count += 1;
+            // }
+
+            i += group_size;
+            mem::swap(&mut end_entries, &mut next_end_entries);
+            mem::swap(&mut end_ptrs, &mut next_end_ptrs);
+        }
+
+        for ptr in start_ptrs {
+            black_box(ptr);
+        }
+
+        // /// We will finish at a state something like this:
+        // /// [ HASHES ] [ HASHES ]
+        // /// [ end_ptrs]
+        // ///
+        // /// We need to do one loop to create entries for last hashes, and two loops to generate start_ptrs
+        // let last_group_size = match col.len() % GROUP_SIZE {
+        //     0 => GROUP_SIZE,
+        //     r => r,
+        // };
+        // let last_i = i - last_group_size;
+        //
+        // let next_group_counter = (last_i + GROUP_SIZE) % HASH_RING_SIZE;
+        // let mut matching_group_counter = last_i % HASH_RING_SIZE;
+        // for j in 0..last_group_size {
+        //     next_end_ptrs[j] = directory.ptr_for_slot((hashes[next_group_counter + j] >> directory.shift) as usize);
+        // }
+        // for j in 0..last_group_size {
+        //     next_end_entries[j] =  unsafe { *next_end_ptrs[j] };
+        // }
+        //
+        // for j in 0..GROUP_SIZE {
+        //     let entry = end_entries[j];
+        //     let probe = Directory::<B>::compute_tag(hashes[matching_group_counter + j]) as u64;
+        //     if entry & probe != probe {
+        //         continue;
+        //     }
+        //
+        //     start_ptrs[matched_index_count] = (unsafe { end_ptrs[j].sub(1) }, last_i - GROUP_SIZE + j);
+        //     matched_index_count += 1;
+        // }
+        //
+        // mem::swap(&mut end_entries, &mut next_end_entries);
+        // mem::swap(&mut end_ptrs, &mut next_end_ptrs);
+        //
+        // matching_group_counter =  (matching_group_counter + GROUP_SIZE) % HASH_RING_SIZE;
+        //
+        // for j in 0..last_group_size {
+        //     let entry = end_entries[j];
+        //     let probe = Directory::<B>::compute_tag(hashes[matching_group_counter + j]) as u64;
+        //     if entry & probe != probe {
+        //         continue;
+        //     }
+        //
+        //     start_ptrs[matched_index_count] = (unsafe { end_ptrs[j].sub(1) }, i + j - last_group_size);
+        //     matched_index_count += 1;
+        // }
+        //
+        // self.total += matched_index_count;
+        // for p in start_ptrs {
+        //     black_box(p);
+        // }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn probe_with_dir2<
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+        S: Sender<RecordBatch>,
+    >(
+        &mut self,
+        directory: &Directory<B>,
+        col: &Int64Array,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        const BATCH: usize = 256;
+
+
+        let len = col.len();
+        let mut i = 0;
+        while i + BATCH <= len {
+            let chunk = col.slice(i, BATCH);
+            self.compute_hashes_len(&chunk, BATCH);
+            self.touch_size(BATCH, directory);
+            i += BATCH;
+        }
+        if i < len {
+            let rem = len - i;
+            let chunk = col.slice(i, rem);
+            self.compute_hashes_len(&chunk, rem);
+            self.touch_size(rem, directory);
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn probe_with_dir3<
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+        S: Sender<RecordBatch>,
+    >(
+        &mut self,
+        directory: &Directory<B>,
+        col: &Int64Array,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+
+        self.compute_hashes_len2(directory, &col, 0, 0, RING_SIZE - BATCH);
+
+        let len = col.len();
+        let mut i = 0;
+
+        while i + BATCH <= (len - (RING_SIZE - BATCH))  {
+            let hash_offset = (i + (RING_SIZE - BATCH)) % RING_SIZE;
+            self.compute_hashes_len2(directory, &col, i + (RING_SIZE - BATCH), hash_offset, BATCH);
+
+            let touch_offset = i % RING_SIZE;
+            self.touch_size2(touch_offset, directory);
+            i += BATCH;
+        }
+
+        while i + BATCH <= len {
+            let touch_offset = i % RING_SIZE;
+            self.touch_size2(touch_offset, directory);
+            i += BATCH;
+        }
+
+        if i < len {
+            let rem = len - i;
+            let chunk = col.slice(i, rem);
+            self.compute_hashes_len(&chunk, rem);
+            self.touch_size_simple(rem, directory);
+            // self.touch_size(rem, directory);
+        }
+        Ok(())
+    }
 }
 
 impl Unary<RecordBatch, RecordBatch> for Probe {
@@ -439,14 +869,31 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
 
         let join_dir = unsafe { &*self.table.directory.get() };
         match join_dir {
-            JoinDirectory::Contiguous(dir) => self.probe_with_dir(dir, col, sender),
-            JoinDirectory::NonContiguous(dir) => panic!("Oh on"),
+            JoinDirectory::Contiguous(dir) => {
+                if col.len() <= RING_SIZE {
+                    self.compute_hashes_len2(dir, col, 0, 0, col.len());
+                    self.touch_size_simple(col.len(), dir);
+                } else {
+                    self.probe_with_dir3(dir, col, sender);
+                }
+                Ok(())
+            },
+            JoinDirectory::NonContiguous(dir) => {
+                if col.len() <= RING_SIZE {
+                    self.compute_hashes_len2(dir, col, 0, 0, col.len());
+                    self.touch_size_simple(col.len(), dir);
+                } else {
+                    self.probe_with_dir3(dir, col, sender);
+                }
+                Ok(())
+            },
         }
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
         perf_disable();
-        println!("total {:?}", mem::take(&mut self.total));
+        self.shared_total.fetch_add(mem::take(&mut self.total), Ordering::Relaxed);
+        println!("Shared total: {:?}", self.shared_total.load(Ordering::Relaxed));
         Ok(true)
     }
 }

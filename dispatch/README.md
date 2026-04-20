@@ -18,10 +18,8 @@ cargo test --test integration
 
 The benchmarks use the partitioned ClickBench hits dataset (100 parquet files, ~14 GB total):
 ```sh
-mkdir -p /path/to/hits && cd /path/to/hits
-for i in $(seq 0 99); do
-  wget "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_${i}.parquet"
-done
+mkdir -p hits && cd hits
+seq 28 99 | xargs -n1 -P8 -I{} wget -q "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_{}.parquet"
 ```
 
 Then set `SOURCE_DIRECTORY=/path/to/hits` when running benchmarks.

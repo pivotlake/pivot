@@ -440,6 +440,9 @@ def parse_ibs_raw(
                         ibs.mabs_count += 1
                         if mabs > ibs.mabs_max:
                             ibs.mabs_max = mabs
+                            ibs.mabs_max_count = 1
+                        elif mabs == ibs.mabs_max:
+                            ibs.mabs_max_count += 1
                     if sw_pf:
                         ibs.sw_pf_count += 1
                     if misaligned:

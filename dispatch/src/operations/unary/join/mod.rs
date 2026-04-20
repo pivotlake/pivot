@@ -4,6 +4,7 @@ mod primitive_builder;
 mod probe;
 mod build;
 mod pipeline;
+mod probe_new;
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;

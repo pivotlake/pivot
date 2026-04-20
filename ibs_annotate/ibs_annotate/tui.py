@@ -572,7 +572,7 @@ class CursesTUI:
             if ibs.mabs_count:
                 rows.append(("  Memory-Level Parallelism", B))
                 rows.append(("  " + "\u2500" * 52, D))
-                rows.append((f"    Avg MABs in flight:  {ibs.avg_mabs:.1f}  (max {ibs.mabs_max}, {ibs.mabs_count} samples)", N))
+                rows.append((f"    Avg MABs in flight:  {ibs.avg_mabs:.1f}  (max {ibs.mabs_max} \u00d7{ibs.mabs_max_count}, {ibs.mabs_count} samples)", N))
                 if ibs.dc_miss_no_mab_count:
                     rows.append((f"    MAB coalesced (hit existing): {ibs.dc_miss_no_mab_count}", N))
                 rows.append(("", N))

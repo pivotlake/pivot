@@ -95,12 +95,18 @@ def _print_stdout(lines, mode, total_uw, total_w, total_cycles, skipped_lines) -
     default=None,
     help="Path to binary to disassemble (auto-detected from perf.data if omitted).",
 )
+@click.option(
+    "--sym",
+    default=None,
+    help="Function name to annotate (substring match). Implies --stdout.",
+)
 def main(
     perf_data: str,
     absolute: bool,
     percent: bool,
     stdout: bool,
     binary: str | None,
+    sym: str | None,
 ) -> None:
     """AMD IBS cache-level annotator with interactive TUI."""
     if absolute:
@@ -238,7 +244,25 @@ def main(
                 return build_annotated_lines(out, stats, ip_to_key, load_base)
         return []
 
-    if stdout or not sys.stdout.isatty():
+    if sym:
+        # Find matching function name (substring match)
+        matches = [f for f in func_summaries if sym in f.name]
+        if not matches:
+            click.echo(f"No function matching '{sym}'", err=True)
+            sys.exit(1)
+        if len(matches) > 1:
+            click.echo(f"Multiple matches for '{sym}':", err=True)
+            for f in matches[:10]:
+                cyc_pct = 100.0 * f.cycles / total_cycles if total_cycles else 0
+                click.echo(f"  {cyc_pct:>6.2f}%  {f.name}", err=True)
+            sys.exit(1)
+        lines = load_function(matches[0].name)
+        for s in cache_lines + pf_lines:
+            print(f"# {s}")
+        if cache_lines or pf_lines:
+            print()
+        _print_stdout(lines, mode, total_uw, total_w, total_cycles, skipped_lines)
+    elif stdout or not sys.stdout.isatty():
         click.echo(f"Disassembling {binary_path}...", err=True)
         annotate_output = run_objdump(binary_path)
         lines = build_annotated_lines(annotate_output, stats, ip_to_key, load_base)

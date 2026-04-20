@@ -226,7 +226,6 @@ impl Outputter<()> for JoinBuilder {
 
             // Pre-allocate directory and arena.
             let dir_capacity = ((total as f64 * 1.125) as usize).next_power_of_two().max(NUM_PARTITIONS);
-            println!("Size total is {:?}", dir_capacity);
             let directory = unsafe { &mut *self.directory.get() };
             *directory = match ContiguousMultiBuffer::<u64>::new(dir_capacity + 1) {
                 Ok(buf) => JoinDirectory::Contiguous(Directory::new(buf, dir_capacity)),
@@ -238,6 +237,13 @@ impl Outputter<()> for JoinBuilder {
                     ))
                 }
             };
+
+            // let mut alloc = SlabAllocator::new(false);
+            // *directory =  JoinDirectory::NonContiguous(Directory::new(
+            //     alloc.create_multi_slab_buffer(dir_capacity + 1, true),
+            //     dir_capacity,
+            // ));
+
 
             let arena = unsafe { &mut *self.arena.get() };
             let mut arena_alloc = SlabAllocator::new(false);

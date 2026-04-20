@@ -125,6 +125,7 @@ class IBSRaw:
     mabs_sum: int = 0
     mabs_count: int = 0
     mabs_max: int = 0
+    mabs_max_count: int = 0
     sw_pf_count: int = 0
     misaligned_count: int = 0
     dc_miss_no_mab_count: int = 0
