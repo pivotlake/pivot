@@ -1,7 +1,7 @@
 //! Per-expression compile impls.
 //!
 //! Each variant of [`Expression`] compiles into an
-//! [`ExprFn`](super::ExprFn) — a builder closure the filter/project operators
+//! [`ExprFn`] — a builder closure the filter/project operators
 //! in `dispatch` can call.
 use crate::PlanContext;
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};

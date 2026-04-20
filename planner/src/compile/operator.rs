@@ -38,7 +38,6 @@ impl Projection {
 
         Ok(input.project(|| {
             let idxs = idxs.clone();
-
             move |batch: &RecordBatch| batch.project(&idxs).unwrap()
         }))
     }

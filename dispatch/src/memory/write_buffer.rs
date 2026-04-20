@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 ///
 /// When done writing, the buffer can either be:
 /// - Dropped — returns the slot to the free pool as dirty (not zeroed).
-/// - Converted into a [`ReadBuffer`] via `From` — transitions the slot from exclusive
+/// - Converted into a [`super::ReadBuffer`] via `From` — transitions the slot from exclusive
 ///   write mode to shared read mode without releasing it.
 /// - Consumed via [`zero_out`](Self::zero_out) — zeroes the memory and returns the slot
 ///   to the free pool as zeroed.

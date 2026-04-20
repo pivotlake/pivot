@@ -1,5 +1,5 @@
 //! [`TypedColumnDecoder`] — the generic, type-parameterised implementation of
-//! [`ColumnDecoder`](super::ColumnDecoder).
+//! [`ColumnDecoder`].
 //!
 //! This struct is parameterised over three traits that together describe how to
 //! decode a particular Parquet column type:

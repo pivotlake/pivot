@@ -56,7 +56,7 @@ mod env;
 mod api;
 mod data_flow;
 mod functions;
-pub(crate) mod io;
+mod io;
 mod memory;
 mod operations;
 mod record_batch_metadata;

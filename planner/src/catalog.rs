@@ -101,7 +101,7 @@ pub trait Catalog: Debug + Send + Sync {
     /// Create a new table from a [`CreateTableRequest`]. Invoked at execution
     /// time by the nullary operator compiled from a `CREATE TABLE` statement,
     /// not during planning. Errors are surfaced to the caller as
-    /// [`catalog::Error`](Error).
+    /// [`catalog::Error`](enum@Error).
     fn create_table(&self, request: CreateTableRequest) -> Result<()>;
 }
 

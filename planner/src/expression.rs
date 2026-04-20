@@ -202,7 +202,6 @@ impl TryFrom<Box<duckdb_planner::expression::Expression>> for Box<Expression> {
 
 /// A filter that was pushed down into a table scan.
 #[derive(Debug)]
-
 pub enum TableFilter {
     Expression(Box<Expression>),
 }

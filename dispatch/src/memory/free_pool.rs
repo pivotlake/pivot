@@ -181,7 +181,7 @@ pub fn push_free_idx(idx: usize, zeroed: bool) {
 /// When false, tries dirty first then zeroed.
 ///
 /// Panics if called from a thread that has not been initialized via [`init_free_pool`]
-/// or [`init_test_free_pool`].
+/// or `init_test_free_pool` (test-only).
 pub fn pop_free_idx(prefer_zeroed: bool) -> Option<usize> {
     LOCAL_POOLS.with(|l| {
         let pools = l.borrow();

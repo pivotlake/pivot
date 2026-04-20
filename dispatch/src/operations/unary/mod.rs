@@ -18,7 +18,7 @@
 //! - [`UnaryFactory<I, O>`] — Trait for creating a [`Unary`] instance. Each factory is
 //!   consumed once per worker to produce the unary transform for that worker.
 //!
-//! - [`UnaryOperatorFactory<I, O, UF, C, OP>`] — An [`OperatorFactory`](crate::api::operator_spec::OperatorFactory)
+//! - [`UnaryOperatorFactory<I, O, UF, C, OP>`] — An [`OperatorFactory`](crate::api::OperatorFactory)
 //!   that chains a head factory (`OP`) with a [`UnaryFactory`] (`UF`) and a
 //!   [`ChannelFactory`](super::channels::ChannelFactory) (`C`). When built, it creates the
 //!   channel, builds the head (passing it the channel's sender), and creates a

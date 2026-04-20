@@ -6,10 +6,8 @@
 //!
 //! - [`Table<K, S>`] — a `BaseHashTable` whose key/value types are derived
 //!   from `K: KeyExtractor`, generic over the storage backend `S`.
-//! - [`SingleSlabTable<K>`] / [`MultiSlabTable<K>`] — concrete storage
-//!   backends backed by one or many slab buffers.
-//! - [`SlabTable<K>`] — an enum over both variants so callers don't need
-//!   to be generic over the storage backend.
+//! - [`MultiSlabTable<K>`] — a concrete [`Table`] backed by a
+//!   [`MultiSlabBuffer`] (supports tables larger than one slab).
 //! - [`AggregatedTable<K>`] — the per-worker accumulator used during the
 //!   consume phase.
 

@@ -1,7 +1,7 @@
 //! Operators, channels, and the parquet read pipeline.
 //!
 //! This module contains everything that executes within a worker's
-//! [`DataFlow`](crate::data_flow::DataFlow):
+//! `DataFlow`:
 //!
 //! - **[`Operator`]** — The trait every node in a dataflow implements. An operator
 //!   is a stateful object that can do CPU work, request disk IO, process IO completions,
@@ -14,8 +14,8 @@
 //! - **[`nullary`]** — Source-like operators with no input channel that can emit
 //!   output or perform side effects directly.
 //!
-//! - **[`unary`]** — The [`UnaryOperator`](unary::UnaryOperator), which reads from one
-//!   input channel and writes to one output channel, applying a [`Unary`](unary::Unary)
+//! - **[`unary`]** — The [`UnaryOperator`], which reads from one
+//!   input channel and writes to one output channel, applying a [`Unary`]
 //!   transform. Most query stages (filter, project, count, etc.) are built as unary
 //!   operators. The [`UnaryOperatorFactory`] creates them during the factory build step.
 //!
@@ -70,7 +70,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A single node in a [`DataFlow`](crate::data_flow::DataFlow).
+/// A single node in a `DataFlow`.
 ///
 /// Each operator lives for the full lifetime of the dataflow on one worker thread.
 /// Sibling operators (the same stage on different workers) share the same identifier,
@@ -91,9 +91,8 @@ pub trait Operator {
     /// Handle a completed disk read. Called by the worker when IO finishes.
     fn process_disk_response(&mut self, buffer: ReadBuffer, request: IORequest) -> Result<()>;
 
-    /// Attempt to finish. Called once the input is drained and all siblings have also
-    /// drained (tracked via a shared `siblings_left` atomic). Returns `true` when this
-    /// operator is fully complete.
+    /// Attempt to finish, return whether the operator is ready to finish. Regardless of whether it
+    /// is, this function may be called many times.
     fn try_finish(&mut self) -> Result<bool>;
 
     /// Try to steal work from a peer worker's channel. Default: no stealing.

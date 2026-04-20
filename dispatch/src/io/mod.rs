@@ -45,7 +45,7 @@ pub struct IOLocation {
     pub offset: usize,
 }
 
-/// A read request targeting an [`IOLocation`], carrying an opaque context that is
+/// A read request targeting an `IOLocation`, carrying an opaque context that is
 /// returned alongside the completed read buffer.
 pub struct IORequest {
     pub location: IOLocation,

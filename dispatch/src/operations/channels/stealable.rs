@@ -56,7 +56,7 @@ impl<O> Sender<O> for Rc<Worker<O>> {
 /// Receiving end of a stealable channel.
 ///
 /// Shares an `Rc<Worker<I>>` with the sender (both live on the same worker thread).
-/// [`try_recv`] pops from the local deque; [`steal`] tries each peer's deque in order
+/// [`Receiver::try_recv`] pops from the local deque; [`Receiver::steal`] tries each peer's deque in order
 /// when the local one is empty, enabling cross-worker load balancing.
 pub struct StealableReceiver<I> {
     worker: Rc<Worker<I>>,

@@ -7,7 +7,7 @@
 //!
 //! Three channel types are provided, each with different trade-offs:
 //!
-//! - **[`stealable`]** — Work-stealing deque. The local worker pushes/pops from its own
+//! - **[`mod@stealable`]** — Work-stealing deque. The local worker pushes/pops from its own
 //!   deque (LIFO for cache locality), while idle workers can steal from peers. Used for
 //!   most intermediate stages.
 //!

@@ -4,7 +4,7 @@ use std::ops::{Index, IndexMut};
 
 /// Typed buffer backed by a single [`Slab`] (must fit within one 2MB `WriteBuffer`).
 ///
-/// Created via [`SlabAllocator::create_slab_buffer`]. Cheaper to index than [`MultiSlabBuffer`]
+/// Created via [`super::SlabAllocator::create_slab_buffer`]. Cheaper to index than [`super::MultiSlabBuffer`]
 /// since there's no slab lookup — just a single pointer offset.
 ///
 /// Supports `Index<usize>` and `IndexMut<usize>` for typed element access. Like `MultiSlabBuffer`,

@@ -43,7 +43,7 @@ pub struct Indexer {}
 /// Walk a single column's byte stream and parse it into compressed pages.
 ///
 /// Each iteration reads a Thrift page header, then slices out the compressed payload via
-/// [`MultiBytesReader::copy_out_buffers`] (zero-copy).
+/// [`MultiBufferReader::copy_out_buffers`] (zero-copy).
 /// For data pages with filtered indices, a [`FilterMask`] scoped to the page's
 /// row range is attached.
 fn create_compressed_pages(

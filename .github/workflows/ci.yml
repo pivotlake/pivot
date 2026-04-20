@@ -120,6 +120,10 @@ jobs:
         with:
           workspaces: ${{ matrix.crate.workdir }}
 
-      - name: Check documentation
+      - name: Check public documentation
         working-directory: ${{ matrix.crate.workdir }}
         run: cargo doc --no-deps
+
+      - name: Check internal documentation
+        working-directory: ${{ matrix.crate.workdir }}
+        run: cargo doc --document-private-items --no-deps

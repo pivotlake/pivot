@@ -1,7 +1,7 @@
 //! Partition-parallel merge of per-worker hash tables.
 //!
 //! During the GROUP BY consume phase each worker builds its own set of
-//! [`SlabTable`]s. Once all workers finish, we merge those tables into a
+//! hash tables. Once all workers finish, we merge those tables into a
 //! single result per partition.
 //!
 //! ## Partitioning scheme

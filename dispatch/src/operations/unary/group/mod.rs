@@ -63,8 +63,8 @@
 //!
 //! - [`key_extractions`] — the [`KeyExtractor`] trait and implementations
 //!   ([`IntKeyExtractor`], [`StringKeyExtractor`])
-//! - [`hashtables`] — [`BaseHashTable`](hashtables::hash_table::BaseHashTable),
-//!   [`AggregatedTable`], [`SlabTable`], and associated type machinery
+//! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
+//!   and associated type machinery
 //! - [`merge`] — partition-parallel merge of per-worker tables
 //! - [`arena`] / [`arena_key`] — shared string storage and the [`ArenaKey`] type
 //! - [`factory`] — [`GroupFactory`] for creating per-worker [`Group`] instances

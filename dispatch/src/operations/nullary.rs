@@ -2,7 +2,7 @@
 //!
 //! A nullary operator is a source-like stage that can generate output or perform
 //! side effects without receiving upstream input. It is driven directly by the
-//! worker event loop through [`Operator`](Operator).
+//! worker event loop through [`Operator`].
 
 use super::Operator;
 use crate::api::{Chain, OperatorFactory};
@@ -55,7 +55,7 @@ pub trait Nullary<O> {
     }
 }
 
-/// Wraps a [`Nullary`] and its output sender as a concrete [`Operator`](Operator).
+/// Wraps a [`Nullary`] and its output sender as a concrete [`Operator`].
 pub struct NullaryOperator<O, N: Nullary<O>, S: Sender<O>> {
     nullary: N,
     sender: S,

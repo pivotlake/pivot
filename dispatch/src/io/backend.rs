@@ -3,10 +3,10 @@
 //! Both backends expose the same API so [`super::requester::IORequester`] can
 //! treat them identically:
 //!
-//! - **Linux** — [`uring_backend::IOBackend`] wraps `io_uring` for truly
+//! - **Linux** — `uring_backend::IOBackend` wraps `io_uring` for truly
 //!   asynchronous, kernel-managed reads. Submissions are batched in the SQ and
 //!   completions are drained from the CQ.
-//! - **Other Unix** — [`pread_backend::IOBackend`] executes reads synchronously
+//! - **Other Unix** — `pread_backend::IOBackend` executes reads synchronously
 //!   via `pread(2)` at `submit` time, so "completions" are always immediately
 //!   available.
 

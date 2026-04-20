@@ -31,7 +31,7 @@ unsafe impl Sync for SharedArena {}
 impl std::panic::RefUnwindSafe for SharedArena {}
 
 impl SharedArena {
-    /// Create a new shared arena with space for up to [`MAX_BUFFERS`] write buffers.
+    /// Create a new shared arena with space for up to [`RING`] amount of write buffers.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             ptrs: (0..RING.len())
@@ -44,7 +44,7 @@ impl SharedArena {
     }
 
     /// Allocate a new write buffer, register its pointer, and return it with its index.
-    /// The caller owns the buffer for writing; call [`return_buffer`] when done.
+    /// The caller owns the buffer for writing; call [`Self::return_buffer`] when done.
     pub fn take_buffer(&self) -> (WriteBuffer, u32) {
         let wb = get_write_buffer(false);
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);

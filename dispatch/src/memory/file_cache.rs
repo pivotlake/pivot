@@ -7,9 +7,9 @@
 //! clearing reference bits until it finds an unreferenced slot it can acquire for writing.
 //!
 //! The cache is keyed two levels deep: `RawFd → offset → ring slot index`.  A file must be
-//! registered with [`open_file_entry`] before its pages can be cached.
+//! registered with [`FileCache::open_file_entry`] before its pages can be cached.
 //!
-//! Concurrency: lookups in [`get`] use the ring's reader-count protocol to pin a slot before
+//! Concurrency: lookups in [`FileCache::get`] use the ring's reader-count protocol to pin a slot before
 //! verifying the location still matches, preventing TOCTOU races with concurrent evictions.
 
 use crate::io::IOLocation;
@@ -107,7 +107,7 @@ impl FileCache {
     }
 
     /// Register a file descriptor so its pages can be cached.
-    /// Must be called before any [`insert`] or [`get`] for this fd.
+    /// Must be called before any [`Self::insert`] or [`Self::get`] for this fd.
     ///
     /// If the fd was previously registered, all its cached entries are cleared.
     /// This handles fd reuse: after a file is closed the OS may assign the same

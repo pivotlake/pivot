@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 /// Per-worker aggregation state for the consume phase.
 ///
-/// Holds a stack of [`SlabTable`]s. Incoming arrays are merged into the
+/// Holds a stack of [`MultiSlabTable`]s. Incoming arrays are merged into the
 /// top table. When that table exceeds its load threshold, it is frozen
 /// (pushed onto the stack) and a new, 2x-larger table is created for
 /// subsequent rows. This avoids expensive in-place resizing while keeping

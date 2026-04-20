@@ -46,7 +46,7 @@ pub struct RowGroupMetadata {
     pub num_rows: i64,
     /// Index of this row group within its Parquet file.
     pub file_row_group_idx: usize,
-    /// The global index of the row group within the table's Vec<RowGroupMetadata>. Note that this
+    /// The global index of the row group within the table's `Vec<RowGroupMetadata>`. Note that this
     /// should not be conflated with the row group number within a particular parquet file.
     pub global_row_group_idx: usize,
 }

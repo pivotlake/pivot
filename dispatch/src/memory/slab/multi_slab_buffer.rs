@@ -9,7 +9,7 @@ const BUFFER_MASK: usize = BUFFER_SIZE - 1;
 /// Typed buffer backed by one or more [`Slab`]s, supporting allocations that span
 /// multiple 2MB `WriteBuffer`s.
 ///
-/// Created via [`SlabAllocator::create_multi_slab_buffer`]. Each slab is aligned to the
+/// Created via [`super::SlabAllocator::create_multi_slab_buffer`]. Each slab is aligned to the
 /// start of a 2MB buffer, so element indexing works by computing a byte offset, then using
 /// bit-shift (`>> 21`) to find the slab and bit-mask (`& 0x1FFFFF`) for the offset within it.
 ///
