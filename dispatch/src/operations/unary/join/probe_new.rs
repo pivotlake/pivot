@@ -81,24 +81,49 @@ impl Probe {
             prefetch_ptr_l2(directory.ptr_for_slot((hashes[i] >> directory.shift) as usize) as *const u8);
         }
 
-        for i in 0..(col.len().saturating_sub(PREFETCH_LENGTH)) {
-            // hash and prefetch
-            let value = unsafe { col.value_unchecked(i + PREFETCH_LENGTH) };
-            let hash_offset = (i + PREFETCH_LENGTH) & MASK;
-            hashes[hash_offset] = self.hash_state.hash_one(value);
-            prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_offset] >> directory.shift) as usize) as *const u8);
+        let mut idx = 0;
+        while idx + PREFETCH_LENGTH < col.len().saturating_sub(PREFETCH_LENGTH) {
+            for _ in 0..PREFETCH_LENGTH {
+                // hash
+                let value = unsafe { col.value_unchecked(idx + PREFETCH_LENGTH) };
+                let hash_offset = (idx + PREFETCH_LENGTH) & MASK;
+                hashes[hash_offset] = self.hash_state.hash_one(value);
+                prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_offset] >> directory.shift) as usize) as *const u8);
 
-            // hashes
-            let touch_offset = i & MASK;
-            let hash = hashes[touch_offset];
-            if directory.matches_bloom(hash) {
-                let slot = directory.slot_for(hash) as isize;
-                arena_ptrs[arena_size & MASK] = directory.end_ptr(slot);
-                arena_size += 1;
+                // bloom check, arena
+                let touch_offset = idx & MASK;
+                let hash = hashes[touch_offset];
+                if directory.matches_bloom(hash) {
+                    // let slot = directory.slot_for(hash) as isize;
+                    // arena_ptrs[arena_size & MASK] = directory.end_ptr(slot);
+                    // arena_size += 1;
+                    self.total += 1;
+                }
+                idx += 1;
             }
         }
 
         let end_offset = col.len().saturating_sub(PREFETCH_LENGTH);
+
+        while idx < end_offset {
+            // hash
+            let value = unsafe { col.value_unchecked(idx + PREFETCH_LENGTH) };
+            let hash_offset = (idx + PREFETCH_LENGTH) & MASK;
+            hashes[hash_offset] = self.hash_state.hash_one(value);
+            prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_offset] >> directory.shift) as usize) as *const u8);
+
+            // bloom check, arena
+            let touch_offset = idx & MASK;
+            let hash = hashes[touch_offset];
+            if directory.matches_bloom(hash) {
+                // let slot = directory.slot_for(hash) as isize;
+                // arena_ptrs[arena_size & MASK] = directory.end_ptr(slot);
+                // arena_size += 1;
+                self.total += 1;
+            }
+            idx += 1;
+        }
+
         for j in 0..min(PREFETCH_LENGTH, col.len()) {
             let hash_offset = (end_offset + j) & MASK;
             let hash = hashes[hash_offset];
