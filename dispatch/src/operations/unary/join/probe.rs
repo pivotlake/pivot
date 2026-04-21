@@ -417,27 +417,25 @@ impl Probe {
                 i += 1;
                 continue;
             }
+
+            let slot = directory.slot_for(hash) as isize;
+            let start = directory.end_ptr(slot - 1);
+            let end = directory.end_ptr(slot);
+
+            let probe_key = unsafe { col.value_unchecked(i) } as u32;
+
+            let ptr = arena.ptr_at_index(start);
+            black_box((start, end, unsafe{*ptr}));
             self.total += 1;
 
-            // let slot = directory.slot_for(hash) as isize;
-            // let start = directory.end_ptr(slot - 1);
-            // let end = directory.end_ptr(slot);
-            //
-            // let probe_key = unsafe { col.value_unchecked(i) } as u32;
-            //
-            // let ptr = arena.ptr_at_index(start);
-            // black_box((start, end, unsafe{*ptr}));
-            // self.total += 1;
-            //
-            // for j in start..end {
-            //     let entry: Value = arena[j];
-            //     if entry == probe_key {
-            //         self.total += 1;
-            //         // lineitem_keys.write(out, entry as i64);
-            //         // order_keys.write(out, entry as i64);
-            //         // out += 1;
-            //     }
-            // }
+            for j in start..end {
+                let entry: Value = arena[j];
+                if entry == probe_key {
+                    lineitem_keys.write(out, entry as i64);
+                    order_keys.write(out, entry as i64);
+                    out += 1;
+                }
+            }
 
             i += 1;
         }

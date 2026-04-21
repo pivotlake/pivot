@@ -13,6 +13,8 @@ from .model import (
     IBSRaw,
     InsnStats,
     InstructionLine,
+    JumpArrow,
+    JumpGraph,
     OpType,
     PrefetchCounts,
     SeparatorLine,
@@ -330,12 +332,15 @@ def build_annotated_lines(
             )
             continue
 
-        # Source lines from objdump -S or perf annotate (": <source>")
+        # Source lines from objdump -S or perf annotate (": <source>").
+        # Strip leading whitespace so nesting depth in the source file doesn't
+        # push source text rightward past the instruction column (perf does the
+        # same — source is treated as a label, not structured code).
         src_m = _SOURCE_LINE_RE.match(raw)
         if src_m:
-            lines.append(SourceLine(text=src_m.group(1)))
+            lines.append(SourceLine(text=src_m.group(1).lstrip()))
         elif current_sym is not None:
-            lines.append(SourceLine(text=raw.rstrip()))
+            lines.append(SourceLine(text=raw.strip()))
 
     import sys
     total = _matched_ip + _matched_sym + _unmatched
@@ -385,12 +390,23 @@ def parse_ibs_raw(
     dc_miss = False
     l2_miss = False
     is_mem_op = False
+    brn_ret = False
+    brn_misp = False
+    brn_taken = False
+    brn_return = False
+    brn_fuse = False
     have_ibs = False
 
     for line in stream:
         if line.startswith("ibs_op_data:"):
             comp_to_ret = _ibs_int(line, "CompToRetCtr")
             tag_to_ret = _ibs_int(line, "TagToRetCtr")
+            brn_ret = _ibs_int(line, "BrnRet") != 0
+            # Op{BrnMisp,BrnTaken,Return} are only emitted by perf when BrnRet=1.
+            brn_misp = _ibs_int(line, "OpBrnMisp") != 0
+            brn_taken = _ibs_int(line, "OpBrnTaken") != 0
+            brn_return = _ibs_int(line, "OpReturn") != 0
+            brn_fuse = _ibs_int(line, "BrnFuse") != 0
             have_ibs = True
 
         elif line.startswith("ibs_op_data3:"):
@@ -461,6 +477,16 @@ def parse_ibs_raw(
                         ibs.dc_miss_count += 1
                     if l2_miss:
                         ibs.l2_miss_count += 1
+                    if brn_ret:
+                        ibs.brn_ret_count += 1
+                        if brn_misp:
+                            ibs.brn_misp_count += 1
+                        if brn_taken:
+                            ibs.brn_taken_count += 1
+                        if brn_return:
+                            ibs.brn_return_count += 1
+                    if brn_fuse:
+                        ibs.brn_fuse_count += 1
 
             # Reset for next sample
             comp_to_ret = tag_to_ret = dc_miss_lat = tlb_refill_lat = 0
@@ -468,6 +494,7 @@ def parse_ibs_raw(
             sw_pf = misaligned = dc_miss_no_mab = False
             dc_l1_tlb_miss = dc_l2_tlb_miss = dc_miss = l2_miss = False
             is_mem_op = False
+            brn_ret = brn_misp = brn_taken = brn_return = brn_fuse = False
             have_ibs = False
 
     import sys
@@ -667,6 +694,90 @@ def compute_load_base(perf_data: str, binary: str) -> int:
     import sys
     print(f"  load_base=0x{load_base:x}", file=sys.stderr)
     return load_base
+
+
+# -- Jump graph (for the annotated view gutter) -------------------------------
+
+# Match conditional and unconditional direct jumps. Skips `call` (usually
+# cross-function) and indirect forms like `jmp *%rax` (no static target).
+_JUMP_TARGET_RE = re.compile(r"^(j[a-z]+)\s+(?:0x)?([0-9a-f]+)\b")
+
+# If a jump spans more than this many display rows, draw ↑/↓ at the source
+# instead of a bracket — otherwise the gutter becomes noise.
+_BRACKET_MAX_SPAN = 30
+
+
+def compute_jump_graph(lines: list[AnnotatedLine]) -> JumpGraph:
+    """Scan an annotated function for intra-function direct jumps."""
+    addr_to_idx: dict[int, int] = {}
+    max_offset = 0
+    for i, ln in enumerate(lines):
+        if isinstance(ln, InstructionLine):
+            try:
+                addr_to_idx[int(ln.addr, 16)] = i
+            except ValueError:
+                continue
+            if ln.offset > max_offset:
+                max_offset = ln.offset
+
+    arrows: list[JumpArrow] = []
+    for i, ln in enumerate(lines):
+        if not isinstance(ln, InstructionLine):
+            continue
+        m = _JUMP_TARGET_RE.match(ln.disasm.lstrip())
+        if not m:
+            continue
+        try:
+            target_addr = int(m.group(2), 16)
+            src_addr = int(ln.addr, 16)
+        except ValueError:
+            continue
+        tgt_idx = addr_to_idx.get(target_addr)
+        if tgt_idx is None:
+            arrows.append(JumpArrow(
+                src_idx=i,
+                tgt_idx=-1,
+                forward=target_addr > src_addr,
+                is_short=False,
+            ))
+            continue
+        span = abs(i - tgt_idx)
+        arrows.append(JumpArrow(
+            src_idx=i,
+            tgt_idx=tgt_idx,
+            forward=tgt_idx > i,
+            is_short=span <= _BRACKET_MAX_SPAN,
+        ))
+
+    # Assign lanes to short arrows. Greedy: pack by min(src,tgt) then widen.
+    short = [a for a in arrows if a.is_short]
+    short.sort(key=lambda a: (min(a.src_idx, a.tgt_idx), -abs(a.src_idx - a.tgt_idx)))
+    placed: list[JumpArrow] = []
+    for a in short:
+        lo, hi = sorted((a.src_idx, a.tgt_idx))
+        for lane in range(16):
+            conflict = False
+            for b in placed:
+                if b.lane != lane:
+                    continue
+                blo, bhi = sorted((b.src_idx, b.tgt_idx))
+                if not (hi < blo or lo > bhi):
+                    conflict = True
+                    break
+            if not conflict:
+                a.lane = lane
+                break
+        placed.append(a)
+
+    targets = {a.tgt_idx for a in short}
+    max_lanes = max((a.lane for a in short), default=-1) + 1
+    addr_width = max(4, len(f"{max_offset:x}"))
+    return JumpGraph(
+        arrows=arrows,
+        targets=targets,
+        max_lanes=max_lanes,
+        addr_width=addr_width,
+    )
 
 
 def run_objdump_function(binary: str, start_addr: int, end_addr: int) -> str:

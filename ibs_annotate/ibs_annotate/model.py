@@ -137,6 +137,13 @@ class IBSRaw:
     mem_width_counts: dict[int, int] = field(
         default_factory=lambda: defaultdict(int)
     )
+    # Branch bits (IBS_OP_DATA: BrnRet/OpBrnMisp/OpBrnTaken/OpReturn/BrnFuse).
+    # Op{BrnMisp,BrnTaken,Return} are qualified by BrnRet == 1.
+    brn_ret_count: int = 0
+    brn_misp_count: int = 0
+    brn_taken_count: int = 0
+    brn_return_count: int = 0
+    brn_fuse_count: int = 0
     sample_count: int = 0
 
     def avg(self, total: int, count: int) -> float:
@@ -272,6 +279,27 @@ class SeparatorLine:
 
 
 AnnotatedLine = SourceLine | FunctionHeader | InstructionLine | SeparatorLine
+
+
+@dataclass
+class JumpArrow:
+    """An intra-function branch relation between two line indices."""
+
+    src_idx: int          # line index of the jump instruction
+    tgt_idx: int          # line index of the target instruction, or -1 if outside function
+    forward: bool         # target is below source (src_idx < tgt_idx), or (tgt_idx == -1 and target_addr > src_addr)
+    lane: int = 0         # assigned gutter lane (only meaningful when is_short)
+    is_short: bool = True  # draw a bracket in the gutter; otherwise draw ↑/↓ at source
+
+
+@dataclass
+class JumpGraph:
+    """Precomputed jump relations for a single function."""
+
+    arrows: list[JumpArrow] = field(default_factory=list)
+    targets: set[int] = field(default_factory=set)  # line indices that are jump targets (short arrows only)
+    max_lanes: int = 0
+    addr_width: int = 0  # hex chars needed for the widest offset label
 
 
 # -- Skipped samples bookkeeping ----------------------------------------------

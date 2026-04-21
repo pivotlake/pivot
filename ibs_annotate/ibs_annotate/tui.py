@@ -14,6 +14,7 @@ from .model import (
     FunctionSummary,
     InsnStats,
     InstructionLine,
+    JumpGraph,
     OpType,
     SeparatorLine,
     SnoopStatus,
@@ -75,6 +76,9 @@ _HEADER = (
 _COL_TOTAL_W = (COL_WIDTH + 1) * (len(CACHE_LEVELS) + 1)  # +1 for TTR
 _SEP_LINE = "\u2500" * _COL_TOTAL_W + "\u253c" + "\u2500" * 60
 _PADDING = " " * _COL_TOTAL_W
+# Extra indentation of instruction mnemonics relative to source-line text,
+# so source reads "outside" the asm it lowers to.
+_INSTR_INDENT = 4
 
 
 class CursesTUI:
@@ -106,6 +110,7 @@ class CursesTUI:
         self.cursor = 0
         self.scroll = 0
         self._hottest_idx = 0
+        self._jumps: JumpGraph = JumpGraph()
 
         self.page: str = "functions"
         self.prev_page: str = "functions"
@@ -124,8 +129,16 @@ class CursesTUI:
         curses.curs_set(0)
         _init_colors()
 
+        prev_page: str | None = None
         while True:
-            stdscr.erase()
+            # Full clear on page transitions — erase() doesn't always drop
+            # background-color cells (e.g. the function-picker cursor highlight)
+            # when the next page writes shorter content in the same rows.
+            if self.page != prev_page:
+                stdscr.clear()
+                prev_page = self.page
+            else:
+                stdscr.erase()
             if self.page == "functions":
                 self._draw_functions(stdscr)
             elif self.page == "main":
@@ -215,6 +228,9 @@ class CursesTUI:
                 if w > best:
                     best = w
                     self._hottest_idx = i
+
+        from .parse import compute_jump_graph
+        self._jumps = compute_jump_graph(self.lines)
 
         self.page = "main"
 
@@ -353,7 +369,12 @@ class CursesTUI:
             idx = self.scroll + i
             if idx >= len(self.lines):
                 break
-            self._draw_main_line(stdscr, i + 2, self.lines[idx], idx == self.cursor, w)
+            self._draw_main_line(stdscr, i + 2, idx, idx == self.cursor, w)
+            try:
+                stdscr.move(i + 2, min(w - 1, stdscr.getyx()[1]))
+                stdscr.clrtoeol()
+            except curses.error:
+                pass
 
         # Footer
         if self.search_active:
@@ -370,11 +391,81 @@ class CursesTUI:
             )
         _safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1), curses.A_REVERSE)
 
-    def _draw_main_line(self, stdscr, row: int, line: AnnotatedLine, is_cursor: bool, w: int) -> None:
+    # -- helpers for perf-style gutter + mnemonic coloring ---------------------
+
+    def _cycles_attr(self, cycles: int) -> int:
+        """Color mnemonic/cycles cell by cycles share of the run."""
+        if not self.total_cycles or cycles <= 0:
+            return curses.A_DIM
+        pct = 100.0 * cycles / self.total_cycles
+        if pct >= 5.0:
+            return curses.color_pair(_PAIR_RED) | curses.A_BOLD
+        if pct >= 1.0:
+            return curses.color_pair(_PAIR_RED)
+        if pct >= 0.3:
+            return curses.color_pair(_PAIR_YELLOW)
+        return 0
+
+    def _gutter_cells(self, idx: int) -> list[tuple[str, int]]:
+        """Return (glyph, attr) per gutter cell: lanes + arm. Fixed width."""
+        jg = self._jumps
+        width = jg.max_lanes + 1  # lanes + arm column
+        cells: list[tuple[str, int]] = [(" ", 0)] * width
+        jump_attr = curses.color_pair(_PAIR_MAGENTA)
+
+        # Lane glyphs for short-range brackets.
+        for a in jg.arrows:
+            if not a.is_short:
+                continue
+            lo, hi = sorted((a.src_idx, a.tgt_idx))
+            if not (lo <= idx <= hi):
+                continue
+            if idx == lo:
+                glyph = "┌"  # ┌
+            elif idx == hi:
+                glyph = "└"  # └
+            else:
+                glyph = "│"  # │
+            if cells[a.lane] == (" ", 0):
+                cells[a.lane] = (glyph, jump_attr)
+
+        # Arm: `─` from the innermost endpoint lane to the arm column when this
+        # line is a src/tgt of a short arrow.
+        ending = [a for a in jg.arrows if a.is_short and idx in (a.src_idx, a.tgt_idx)]
+        if ending:
+            leftmost = min(a.lane for a in ending)
+            for j in range(leftmost + 1, width):
+                cells[j] = ("─", jump_attr)  # ─
+
+        # Long-range jump source: show ↑/↓ in the arm column.
+        for a in jg.arrows:
+            if a.is_short or a.src_idx != idx:
+                continue
+            cells[-1] = ("↓" if a.forward else "↑", jump_attr)
+            break
+
+        return cells
+
+    # -- main page drawing (line-by-line) --------------------------------------
+
+    def _draw_main_line(self, stdscr, row: int, idx: int, is_cursor: bool, w: int) -> None:
+        line = self.lines[idx]
         cursor_attr = curses.color_pair(_PAIR_CURSOR) if is_cursor else 0
+        jg = self._jumps
+
+        # Column layout for this function — collapse any section that's unused.
+        # The cost-column loop already ends with a trailing space at the last
+        # character of _COL_TOTAL_W, so no extra +1 is needed before the label.
+        addr_label_w = (jg.addr_width + 1) if jg.targets else 0  # hex digits + ':'
+        gutter_w = (jg.max_lanes + 1) if jg.arrows else 0        # lane columns + arm
+        post_label_sp = 1 if addr_label_w else 0
+        post_gutter_sp = 1 if gutter_w else 0
+        source_x = _COL_TOTAL_W + addr_label_w + post_label_sp + gutter_w + post_gutter_sp
+        code_x = source_x + _INSTR_INDENT
 
         if isinstance(line, InstructionLine):
             x = 0
+            # Cache-level columns — ends with x == _COL_TOTAL_W (incl. trailing space).
             for lvl in CACHE_LEVELS:
                 c = line.stats.cache_counts.get(lvl, 0)
                 if not c:
@@ -387,22 +478,67 @@ class CursesTUI:
                 x += COL_WIDTH
                 _safe_addstr(stdscr, row, x, " ", cursor_attr)
                 x += 1
-            # Cycles column
+
+            # Cycles column (colored by cycles share)
             cyc = line.stats.cycles
+            cyc_attr = cursor_attr if is_cursor else self._cycles_attr(cyc)
             if not cyc:
                 _safe_addstr(stdscr, row, x, " " * COL_WIDTH, cursor_attr)
             elif self.mode == DisplayMode.ABSOLUTE:
-                _safe_addstr(stdscr, row, x, f"{cyc:>{COL_WIDTH}}", cursor_attr)
+                _safe_addstr(stdscr, row, x, f"{cyc:>{COL_WIDTH}}", cyc_attr)
             elif self.total_cycles:
-                _safe_addstr(stdscr, row, x, f"{100.0 * cyc / self.total_cycles:>{COL_WIDTH}.1f}", cursor_attr)
+                _safe_addstr(stdscr, row, x, f"{100.0 * cyc / self.total_cycles:>{COL_WIDTH}.1f}", cyc_attr)
             x += COL_WIDTH
             _safe_addstr(stdscr, row, x, " ", cursor_attr)
             x += 1
-            rest = f": {line.addr}:  {line.disasm}"
-            _safe_addstr(stdscr, row, x, rest, cursor_attr)
+            # At this point x == _COL_TOTAL_W, matching `source_x`'s base.
+
+            # Address label — only at jump targets
+            if addr_label_w:
+                if idx in jg.targets:
+                    label = f"{line.offset:x}:"
+                    label_attr = cursor_attr if is_cursor else curses.color_pair(_PAIR_MAGENTA)
+                else:
+                    label = ""
+                    label_attr = cursor_attr
+                _safe_addstr(stdscr, row, x, label.rjust(addr_label_w), label_attr)
+                x += addr_label_w
+                _safe_addstr(stdscr, row, x, " ", cursor_attr)
+                x += 1
+
+            # Arrow gutter (lanes + arm)
+            if gutter_w:
+                for glyph, attr in self._gutter_cells(idx):
+                    _safe_addstr(stdscr, row, x, glyph, cursor_attr if is_cursor else attr)
+                    x += 1
+                _safe_addstr(stdscr, row, x, " ", cursor_attr)
+                x += 1
+
+            # Instructions are indented relative to source text (perf-style:
+            # source sits outer, asm sits "under" the source it implements).
+            _safe_addstr(stdscr, row, x, " " * _INSTR_INDENT, cursor_attr)
+            x += _INSTR_INDENT
+
+            # Mnemonic (colored by cycles; direct branches always magenta+bold)
+            parts = line.disasm.split(None, 1)
+            mnem = parts[0] if parts else ""
+            operands = parts[1] if len(parts) > 1 else ""
+            if is_cursor:
+                mnem_attr = cursor_attr
+            elif mnem.startswith("j") and mnem not in ("ja", "jb"):
+                mnem_attr = curses.color_pair(_PAIR_MAGENTA) | curses.A_BOLD
+            else:
+                mnem_attr = self._cycles_attr(cyc)
+            MNEM_W = 8
+            _safe_addstr(stdscr, row, x, mnem[:MNEM_W], mnem_attr)
+            mnem_pad = max(1, MNEM_W - len(mnem) + 2)
+            x += len(mnem[:MNEM_W])
+            _safe_addstr(stdscr, row, x, " " * mnem_pad, cursor_attr)
+            x += mnem_pad
+            _safe_addstr(stdscr, row, x, operands, cursor_attr)
 
         elif isinstance(line, FunctionHeader):
-            text = f"{_PADDING} {line.name}:"
+            text = f"{' ' * code_x}{line.name}:"
             attr = (curses.color_pair(_PAIR_CYAN) | curses.A_BOLD) if not is_cursor else cursor_attr
             _safe_addstr(stdscr, row, 0, text, attr)
 
@@ -410,8 +546,18 @@ class CursesTUI:
             _safe_addstr(stdscr, row, 0, _SEP_LINE, curses.A_DIM | cursor_attr)
 
         elif isinstance(line, SourceLine):
-            text = f"{_PADDING}   {line.text}"
-            _safe_addstr(stdscr, row, 0, text, curses.A_DIM | cursor_attr)
+            # Source code sits OUTER — one gutter-width to the left of the
+            # instruction mnemonic column. Gutter `│` still passes through so
+            # any enclosing jump bracket stays visually continuous.
+            x = _COL_TOTAL_W + addr_label_w + post_label_sp
+            if gutter_w:
+                for glyph, attr in self._gutter_cells(idx):
+                    draw_glyph = glyph if glyph == "│" else " "
+                    _safe_addstr(stdscr, row, x, draw_glyph, cursor_attr if is_cursor else attr)
+                    x += 1
+                _safe_addstr(stdscr, row, x, " ", cursor_attr)
+                x += 1
+            _safe_addstr(stdscr, row, x, line.text, cursor_attr)
 
     def _fmt_val(self, count: int, lvl: CacheLevel) -> str:
         if self.mode == DisplayMode.ABSOLUTE:
@@ -599,6 +745,34 @@ class CursesTUI:
                 rows.append(("  " + "\u2500" * 52, D))
                 rows.append((f"    DcMiss (L1):  {ibs.dc_miss_count:>6}  / {ibs.sample_count}", N))
                 rows.append((f"    L2Miss:       {ibs.l2_miss_count:>6}  / {ibs.sample_count}", N))
+                rows.append(("", N))
+
+            # Branches (raw IBS bits). OpBrnMisp/Taken/Return are qualified by BrnRet=1.
+            if ibs.brn_ret_count or ibs.brn_fuse_count:
+                rows.append(("  Branches (raw IBS bits)", B))
+                rows.append(("  " + "\u2500" * 52, D))
+                br = ibs.brn_ret_count
+                rows.append((f"    BrnRet:       {br:>6}  / {ibs.sample_count}", N))
+                if br:
+                    misp = ibs.brn_misp_count
+                    taken = ibs.brn_taken_count
+                    ret = ibs.brn_return_count
+                    misp_attr = curses.color_pair(_PAIR_RED) if misp else N
+                    rows.append((
+                        f"    OpBrnMisp:    {misp:>6}  / {br:>6}  ({100.0 * misp / br:5.1f}% mispredict)",
+                        misp_attr,
+                    ))
+                    rows.append((
+                        f"    OpBrnTaken:   {taken:>6}  / {br:>6}  ({100.0 * taken / br:5.1f}% taken)",
+                        N,
+                    ))
+                    if ret:
+                        rows.append((
+                            f"    OpReturn:     {ret:>6}  / {br:>6}  ({100.0 * ret / br:5.1f}% returns)",
+                            N,
+                        ))
+                if ibs.brn_fuse_count:
+                    rows.append((f"    BrnFuse:      {ibs.brn_fuse_count:>6}  / {ibs.sample_count}", D))
                 rows.append(("", N))
 
             misc_lines = []
