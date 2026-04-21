@@ -146,7 +146,7 @@ impl JoinPartitionJob {
         let arena = unsafe { &*self.arena.get() };
 
         // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
-        // lower 16 bits — directly in the directory, no side allocations.
+        // lower 16 bits
         for worker_tuples in &self.tuples {
             for &(hash, _) in worker_tuples {
                 let slot = (hash >> shift) as usize;
@@ -168,11 +168,10 @@ impl JoinPartitionJob {
             let entry = directory.entry(i);
             let count = entry >> 16;
             let tag = entry & 0xFFFF;
-            unsafe { directory.set_entry(i, (cur << 16) | tag); }
             cur += count;
+            directory.set_entry(i, (cur << 16) | tag);
         }
 
-        const COUNT: usize = 32;
         // Pass 3: scatter values into arena in batches of COUNT:
         //   1. Consume tuples, compute slots
         //   2. Read directory to get arena write pointers, advance cursors
@@ -180,10 +179,6 @@ impl JoinPartitionJob {
         for worker_tuples in &self.tuples {
 
             let mut total_left = worker_tuples.len();
-
-            // let mut entries = [0u64; COUNT];
-            // let mut values = [0 as Value; COUNT];
-            // let mut dest = [std::ptr::null_mut::<Value>(); COUNT];
 
             for slab in worker_tuples.slabs() {
                 let ptr = slab.ptr as *mut (u64, Value);
@@ -194,8 +189,8 @@ impl JoinPartitionJob {
                 for i in 0..count {
                     let (hash, value) = unsafe { *(ptr.add(i) ) };
                     let slot = (hash >> shift) as usize;
-                    let entry = directory.entry(slot);
-                    unsafe { directory.add_to_entry(slot, 1 << 16); }
+                    let entry = directory.entry(slot).wrapping_sub(1 << 16);
+                    directory.set_entry(slot, entry);
                     let arena_idx = (entry >> 16) as usize;
                     unsafe { arena.ptr_at_index(arena_idx).write(value) };
                 }
@@ -213,7 +208,7 @@ impl JoinPartitionJob {
 
 impl Outputter<()> for JoinBuilder {
     fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        // perf_enable();
+        perf_enable();
         if let Some(rx) = self.receiver.take() {
             let mut all_worker_tuples: Vec<Vec<SlabVec<(u64, Value)>>> = rx.into_iter().collect();
 
@@ -280,7 +275,7 @@ impl Outputter<()> for JoinBuilder {
             }
             Steal::Empty => {
                 if self.jobs_injected.load(Ordering::Relaxed) {
-                    // perf_disable();
+                    perf_disable();
                     return Ok(true);
                 }
             }

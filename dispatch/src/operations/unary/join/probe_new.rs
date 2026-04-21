@@ -72,7 +72,7 @@ impl Probe {
         let arena = unsafe { &*self.table.arena.get() };
 
         let mut hashes: [u64; RING_SIZE] = [0; RING_SIZE];
-        let mut arena_ptrs: [isize; RING_SIZE] = [0; RING_SIZE];
+        let mut arena_ptrs: [usize; RING_SIZE] = [0; RING_SIZE];
 
         // Prepopulate hashes for first RING_SIZE elements
         for i in 0..min(PREFETCH_LENGTH, col.len()) {
@@ -93,14 +93,16 @@ impl Probe {
                 // bloom check, arena
                 let touch_offset = idx & MASK;
                 let hash = hashes[touch_offset];
-                if directory.matches_bloom(hash) {
-                    let slot = directory.slot_for(hash) as isize;
+
+                let slot = directory.slot_for(hash);
+                let stored = directory.entries()[slot];
+                let probe = Directory::<B>::compute_tag(hash) as u64;
+                if (stored & probe) == probe {
+                    prefetch_ptr_l2(directory.ptr_for_slot(slot + 1) as *const u8);
                     arena_ptrs[arena_size & MASK] = slot;
-                    let start_ptr =  arena.ptr_at_index(directory.end_ptr(slot)) as *const u8;
-                    let end_ptr =  arena.ptr_at_index(directory.end_ptr(slot)) as *const u8;
+                    let start_ptr =  arena.ptr_at_index(directory.end_ptr(slot as isize)) as *const u8;
                     prefetch_ptr_l2(start_ptr);
-                    prefetch_ptr_l2(end_ptr);
-                    arena_size += 1;
+                    self.total += 1;
                 }
                 idx += 1;
             }
@@ -125,9 +127,10 @@ impl Probe {
             let touch_offset = idx & MASK;
             let hash = hashes[touch_offset];
             if directory.matches_bloom(hash) {
-                let slot = directory.slot_for(hash) as isize;
-                arena_ptrs[arena_size & MASK] = slot;
-                arena_size += 1;
+                // let slot = directory.slot_for(hash) as isize;
+                // arena_ptrs[arena_size & MASK] = slot;
+                // arena_size += 1;
+                self.total += 1;
             }
             idx += 1;
         }
@@ -149,7 +152,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         batch: RecordBatch,
         sender: &mut S,
     ) -> unary::Result<()> {
-        perf_enable();
+        // perf_enable();
         let col = batch
             .column(self.key_column)
             .as_any()
@@ -167,7 +170,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        perf_disable();
+        // perf_disable();
         self.shared_total.fetch_add(mem::take(&mut self.total), Ordering::Relaxed);
         // println!("Shared total: {:?}", self.shared_total.load(Ordering::Relaxed));
         Ok(true)

@@ -71,7 +71,7 @@ impl<B: PtrBuffer> Directory<B> {
     /// Raw pointer to the entry at `slot` (accounts for the sentinel at index 0).
     #[inline(always)]
     pub fn ptr_for_slot(&self, slot: usize) -> *const u64 {
-        unsafe { (*self.entries.get()).get_ptr(slot + 1) }
+        unsafe { (*self.entries.get()).get_ptr(slot) }
     }
 }
 
@@ -109,7 +109,7 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     /// Read entry at slot (0-indexed into real slots, sentinel is slot -1).
     #[inline(always)]
     pub fn entry(&self, slot: usize) -> u64 {
-        self.entries()[slot + 1]
+        self.entries()[slot]
     }
 
     /// Write entry at slot.
@@ -117,8 +117,8 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     /// # Safety
     /// Caller must ensure exclusive access to this slot.
     #[inline(always)]
-    pub unsafe fn set_entry(&self, slot: usize, value: u64) {
-        self.entries_mut()[slot + 1] = value;
+    pub fn set_entry(&self, slot: usize, value: u64) {
+        self.entries_mut()[slot] = value;
     }
 
     /// Add `value` to the entry at slot.
@@ -127,7 +127,12 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     /// Caller must ensure exclusive access to this slot.
     #[inline(always)]
     pub unsafe fn add_to_entry(&self, slot: usize, value: u64) {
-        self.entries_mut()[slot + 1] += value;
+        self.entries_mut()[slot] += value;
+    }
+
+    #[inline(always)]
+    pub unsafe fn sub_to_entry(&self, slot: usize, value: u64) {
+        self.entries_mut()[slot] -= value;
     }
 
     /// OR `value` into the entry at slot.
@@ -136,14 +141,14 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     /// Caller must ensure exclusive access to this slot.
     #[inline(always)]
     pub unsafe fn or_to_entry(&self, slot: usize, value: u64) {
-        self.entries_mut()[slot + 1] |= value;
+        self.entries_mut()[slot] |= value;
     }
 
     /// Prefetch the directory entry for the slot where `hash` would land.
     #[inline(always)]
     pub fn prefetch_l1(&self, hash: u64) {
         let slot = self.slot_for(hash);
-        let ptr = &self.entries()[slot + 1] as *const u64 as *const u8;
+        let ptr = &self.entries()[slot] as *const u64 as *const u8;
         prefetch_ptr(ptr);
         // let ptr = &self.entries()[slot + 2] as *const u64 as *const u8;
         // prefetch_ptr(ptr);
@@ -152,28 +157,28 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     #[inline(always)]
     pub fn prefetch_l2(&self, hash: u64) {
         let slot = self.slot_for(hash);
-        let ptr = &self.entries()[slot + 1] as *const u64 as *const u8;
+        let ptr = &self.entries()[slot] as *const u64 as *const u8;
         prefetch_ptr_l2(ptr);
     }
 
     #[inline(always)]
     pub fn matches_bloom(&self, hash: u64) -> bool {
         let slot = self.slot_for(hash);
-        let stored = self.entries()[slot + 1];
+        let stored = self.entries()[slot];
         let probe = Self::compute_tag(hash) as u64;
         (stored & probe) == probe
     }
 
     #[inline(always)]
     pub fn bloom(&self, slot: usize) -> u16 {
-        (self.entries()[slot + 1] & 0xFFFF) as u16
+        (self.entries()[slot] & 0xFFFF) as u16
     }
 
     /// End-pointer (exclusive) stored in the upper 48 bits.
     /// Slot -1 reads the sentinel (always 0).
     #[inline(always)]
     pub fn end_ptr(&self, slot: isize) -> usize {
-        (self.entries()[(slot + 1) as usize] >> PTR_SHIFT) as usize
+        (self.entries()[(slot) as usize] >> PTR_SHIFT) as usize
     }
 
     #[inline(always)]
