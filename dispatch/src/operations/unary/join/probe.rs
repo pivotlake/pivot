@@ -399,17 +399,17 @@ impl Probe {
                 directory.prefetch_l1(ph);
             }
 
-            // if i + 8 < len {
-            //     let h = unsafe { *self.hashes.get_unchecked(i + 8) };
-            //     let slot = directory.slot_for(h) as isize;
-            //     let start = directory.end_ptr(slot - 1);
-            //     let ptr = arena.ptr_at_index(start) as *const i8;
-            //
-            //     #[cfg(target_arch = "x86_64")]
-            //     unsafe {
-            //         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
-            //     }
-            // }
+            if i + 8 < len {
+                let h = unsafe { *self.hashes.get_unchecked(i + 8) };
+                let slot = directory.slot_for(h) as isize;
+                let start = directory.end_ptr(slot - 1);
+                let ptr = arena.ptr_at_index(start) as *const i8;
+
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+                }
+            }
 
             let hash = unsafe { *self.hashes.get_unchecked(i) };
 
@@ -418,21 +418,25 @@ impl Probe {
                 continue;
             }
             self.total += 1;
-            black_box(hash);
-            // //
+
             // let slot = directory.slot_for(hash) as isize;
             // let start = directory.end_ptr(slot - 1);
             // let end = directory.end_ptr(slot);
             //
             // let probe_key = unsafe { col.value_unchecked(i) } as u32;
             //
+            // let ptr = arena.ptr_at_index(start);
+            // black_box((start, end, unsafe{*ptr}));
+            // self.total += 1;
+            //
             // for j in start..end {
             //     let entry: Value = arena[j];
-            //     // if entry == probe_key {
-            //         lineitem_keys.write(out, entry as i64);
-            //         order_keys.write(out, entry as i64);
-            //         out += 1;
-            //     // }
+            //     if entry == probe_key {
+            //         self.total += 1;
+            //         // lineitem_keys.write(out, entry as i64);
+            //         // order_keys.write(out, entry as i64);
+            //         // out += 1;
+            //     }
             // }
 
             i += 1;
@@ -870,21 +874,11 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         let join_dir = unsafe { &*self.table.directory.get() };
         match join_dir {
             JoinDirectory::Contiguous(dir) => {
-                if col.len() <= RING_SIZE {
-                    self.compute_hashes_len2(dir, col, 0, 0, col.len());
-                    self.touch_size_simple(col.len(), dir);
-                } else {
-                    self.probe_with_dir3(dir, col, sender);
-                }
+                self.probe_old(dir, col, sender);
                 Ok(())
             },
             JoinDirectory::NonContiguous(dir) => {
-                if col.len() <= RING_SIZE {
-                    self.compute_hashes_len2(dir, col, 0, 0, col.len());
-                    self.touch_size_simple(col.len(), dir);
-                } else {
-                    self.probe_with_dir3(dir, col, sender);
-                }
+                self.probe_old(dir, col, sender);
                 Ok(())
             },
         }

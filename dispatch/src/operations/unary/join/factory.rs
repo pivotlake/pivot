@@ -9,9 +9,9 @@ use crossbeam_deque::Injector;
 use crate::memory::{MultiSlabBuffer, SlabVec};
 use crate::operations::UnaryFactory;
 use crate::operations::unary::join::directory::JoinDirectory;
-use crate::operations::unary::join::probe_new::Probe;
+use crate::operations::unary::join::probe::Probe;
 use crate::operations::unary::join::{JoinTable, Value};
-use crate::operations::unary::join::build::{JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS};
+use crate::operations::unary::join::build_old::{JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 

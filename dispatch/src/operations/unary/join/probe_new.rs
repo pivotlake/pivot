@@ -72,7 +72,7 @@ impl Probe {
         let arena = unsafe { &*self.table.arena.get() };
 
         let mut hashes: [u64; RING_SIZE] = [0; RING_SIZE];
-        let mut arena_ptrs: [usize; RING_SIZE] = [0; RING_SIZE];
+        let mut arena_ptrs: [(usize, usize); RING_SIZE] = [(0, 0); RING_SIZE];
 
         // Prepopulate hashes for first RING_SIZE elements
         for i in 0..min(PREFETCH_LENGTH, col.len()) {
@@ -99,18 +99,29 @@ impl Probe {
                 let probe = Directory::<B>::compute_tag(hash) as u64;
                 if (stored & probe) == probe {
                     prefetch_ptr_l2(directory.ptr_for_slot(slot + 1) as *const u8);
-                    arena_ptrs[arena_size & MASK] = slot;
+                    arena_ptrs[arena_size & MASK] = (slot, idx);
+                    arena_size += 1;
                     let start_ptr =  arena.ptr_at_index(directory.end_ptr(slot as isize)) as *const u8;
                     prefetch_ptr_l2(start_ptr);
                     self.total += 1;
                 }
                 idx += 1;
             }
-            //
-            // for i in 0..arena_size {
-            //     let idx = arena_ptrs[i];
-            //     let ptr = arena.ptr_at_index(arena_ptrs[idx]);
-            // }
+
+            for i in 0..arena_size {
+                let (slot, idx) = arena_ptrs[i];
+                let start = directory.end_ptr(slot as isize);
+                let end = directory.end_ptr((slot + 1) as isize);
+                // let ptr = arena.ptr_at_index(start);
+                // black_box(((start, end, unsafe {*ptr})));
+                for j in start..end {
+                    let entry: Value = arena[j];
+                    let probe_key = unsafe { col.value_unchecked(idx) } as u32;
+                    if entry == probe_key {
+                        self.total += 1;
+                    }
+                }
+            }
         }
 
         let end_offset = col.len().saturating_sub(PREFETCH_LENGTH);
@@ -152,7 +163,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         batch: RecordBatch,
         sender: &mut S,
     ) -> unary::Result<()> {
-        // perf_enable();
+        perf_enable();
         let col = batch
             .column(self.key_column)
             .as_any()
@@ -165,12 +176,15 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
                 self.run(dir, col);
                 Ok(())
             },
-            JoinDirectory::NonContiguous(dir) => panic!("Oh on"),
+            JoinDirectory::NonContiguous(dir) => {
+                self.run(dir, col);
+                Ok(())
+            },
         }
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        // perf_disable();
+        perf_disable();
         self.shared_total.fetch_add(mem::take(&mut self.total), Ordering::Relaxed);
         // println!("Shared total: {:?}", self.shared_total.load(Ordering::Relaxed));
         Ok(true)

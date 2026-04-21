@@ -5,6 +5,7 @@ mod probe;
 mod build;
 mod pipeline;
 mod probe_new;
+mod build_old;
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
