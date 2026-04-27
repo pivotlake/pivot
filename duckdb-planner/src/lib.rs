@@ -10,12 +10,12 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use duckdb_planner::{
-//!     DuckDBBind, DuckDBColumn, GetDuckDBTypedColumns, LogicalTypeId, Operator, PlannerContext,
+//!     DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId, Operator, PlannerContext,
 //! };
 //!
 //! struct UsersTable;
 //!
-//! impl GetDuckDBTypedColumns for UsersTable {
+//! impl DuckDBTable for UsersTable {
 //!     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
 //!         vec![DuckDBColumn {
 //!             name: "name".to_string(),
@@ -27,7 +27,7 @@
 //! struct MyCatalog;
 //!
 //! impl DuckDBBind for MyCatalog {
-//!     fn try_bind(&self, name: &str) -> Option<Arc<dyn GetDuckDBTypedColumns>> {
+//!     fn try_bind(&self, name: &str) -> Option<Arc<dyn DuckDBTable>> {
 //!         match name {
 //!             "users" => Some(Arc::new(UsersTable)),
 //!             _ => None,
@@ -62,7 +62,7 @@ use custom_deserializer::CustomDeserializer;
 use duckdb_bridge::ffi;
 use thiserror::Error;
 
-pub use catalog_provider::{DuckDBBind, GetDuckDBTypedColumns};
+pub use catalog_provider::{DuckDBBind, DuckDBTable};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use operator::Operator;
@@ -142,19 +142,19 @@ impl PlannerContext {
     }
 
     /// Plan a SQL query: sends the query to DuckDB, deserializes the JSON
-    /// logical plan into a [`PlanNode`] tree, and attaches the `GetDuckDBTypedColumns`
+    /// logical plan into a [`PlanNode`] tree, and attaches the `DuckDBTable`
     /// trait objects to each `Input` node.
     pub fn plan(&mut self, query: &str) -> Result<PlanNode, Error> {
         let result = ffi::extract_plan(self.cxx_context.pin_mut(), query);
         let plan: PlanResult = serde_json::from_str(&result.json)?;
         match plan {
             PlanResult::Success(plan) => {
-                let tables: Vec<Arc<dyn catalog_provider::GetDuckDBTypedColumns>> = result
+                let tables: Vec<Arc<dyn catalog_provider::DuckDBTable>> = result
                     .tables
                     .into_iter()
                     .filter_map(|ot| ot.table)
                     .collect();
-                Ok(plan.resolve_tables(&tables))
+                Ok(plan.resolve_inputs(&tables))
             }
             PlanResult::Error(err) => Err(err.into_error()),
         }

@@ -1,8 +1,16 @@
 #pragma once
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "rust/cxx.h"
 #include "duckdb-planner/src/duckdb_bridge/mod.rs.h"
+
+struct PivotScanBindData : public duckdb::TableFunctionData {
+	explicit PivotScanBindData(duckdb::TableCatalogEntry &catalog_entry, OptionalTableWrapper &table)
+	    : catalog_entry(catalog_entry), table(table) {}
+	duckdb::TableCatalogEntry &catalog_entry;
+	OptionalTableWrapper &table;
+};
 
 class PivotTableCatalogEntry : public duckdb::TableCatalogEntry {
 public:
