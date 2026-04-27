@@ -19,3 +19,5 @@ arrow-json = { path = "../arrow-rs/arrow-json" }
 serde_json = "1.0"
 tempfile = "3"
 core_affinity = "0.8.3"
+insta = "1"
+rstest = "0.23"

@@ -18,6 +18,7 @@ use arrow_array::{
 };
 use duckdb_planner::ScalarValue;
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -34,6 +35,20 @@ pub enum Type {
     Int32,
     Int64,
     Utf8,
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Type::Boolean => "Boolean",
+            Type::Int8 => "Int8",
+            Type::Int16 => "Int16",
+            Type::Int32 => "Int32",
+            Type::Int64 => "Int64",
+            Type::Utf8 => "Utf8",
+        };
+        f.write_str(name)
+    }
 }
 
 #[derive(Error, Debug)]

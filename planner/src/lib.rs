@@ -107,7 +107,7 @@ pub use plan::{Plan, PlanContext, PlanNode};
 use thiserror::Error;
 
 use crate::catalog::DuckDBCatalogAdapter;
-pub use duckdb_planner::{DuckDBBind, DuckDBColumn, GetDuckDBTypedColumns, LogicalTypeId};
+pub use duckdb_planner::{DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId};
 
 /// Errors surfaced by [`Planner::plan`].
 #[derive(Debug, Error)]

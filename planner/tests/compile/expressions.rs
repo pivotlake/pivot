@@ -5,35 +5,32 @@ use arrow_array::{ArrayRef, StringViewArray};
 use crate::common::*;
 use planner::Error as PlannerError;
 use planner::types::Type;
+use rstest::rstest;
 
-#[test]
-fn filter_contains_substring() {
-    init();
-    let mut planner = string_table();
-
-    let results = planner
-        .plan("SELECT name, value FROM test WHERE contains(name, 'ali')")
+#[rstest]
+fn filter_contains_substring(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, b FROM example_table WHERE contains(name, 'ali')")
         .unwrap()
         .compile()
         .unwrap()
         .collect();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["value"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["b"].as_i64().unwrap());
 
-    // "alice" contains "ali" — appears at rows with value 10 and 50
+    // "alice" appears at rows with b=10 and b=50.
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["name"], "alice");
     assert_eq!(rows[1]["name"], "alice");
 }
 
-#[test]
-fn filter_contains_no_match() {
-    init();
-    let mut planner = string_table();
-
-    let results = planner
-        .plan("SELECT name FROM test WHERE contains(name, 'zzz')")
+#[rstest]
+fn filter_contains_no_match(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT name FROM example_table WHERE contains(name, 'zzz')")
         .unwrap()
         .compile()
         .unwrap()
@@ -43,11 +40,10 @@ fn filter_contains_no_match() {
     assert!(rows.is_empty());
 }
 
-#[test]
-fn filter_contains_matches_all() {
-    init();
-    let mut planner = make_planner_with_table(
-        "test",
+#[rstest]
+fn filter_contains_matches_all(mut testing_planner: TestingPlanner) {
+    testing_planner.catalog.add_table(
+        "substrings",
         &[(
             "s",
             Type::Utf8,
@@ -55,8 +51,9 @@ fn filter_contains_matches_all() {
         )],
     );
 
-    let results = planner
-        .plan("SELECT s FROM test WHERE contains(s, 'aa')")
+    let results = testing_planner
+        .planner
+        .plan("SELECT s FROM substrings WHERE contains(s, 'aa')")
         .unwrap()
         .compile()
         .unwrap()
@@ -66,14 +63,12 @@ fn filter_contains_matches_all() {
     assert_eq!(rows.len(), 3);
 }
 
-#[test]
-fn contains_then_group_by() {
-    init();
-    let mut planner = string_table();
-
-    // Filter to names containing "a" (alice, charlie, dave), then group by name
-    let results = planner
-        .plan("SELECT name, COUNT(*) FROM test WHERE contains(name, 'a') GROUP BY name")
+#[rstest]
+fn contains_then_group_by(mut testing_planner: TestingPlanner) {
+    // Filter to names containing "a" (alice, charlie, dave), then group by name.
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, COUNT(*) FROM example_table WHERE contains(name, 'a') GROUP BY name")
         .unwrap()
         .compile()
         .unwrap()
@@ -82,18 +77,17 @@ fn contains_then_group_by() {
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
 
-    // alice (2 rows), charlie (1), dave (1) all contain "a"; bob does not
+    // alice (2 rows), charlie (1), dave (1) all contain "a"; bob does not.
     assert_eq!(rows.len(), 3);
     let alice = rows.iter().find(|r| r["key"] == "alice").unwrap();
     assert_eq!(alice["value"], 2);
     assert!(rows.iter().all(|r| r["key"] != "bob"));
 }
 
-#[test]
-fn unsupported_scalar_function_returns_error() {
-    init();
-    let mut planner = string_table();
-
-    let result = planner.plan("SELECT lower(name) FROM test");
+#[rstest]
+fn unsupported_scalar_function_returns_error(mut testing_planner: TestingPlanner) {
+    let result = testing_planner
+        .planner
+        .plan("SELECT lower(name) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }

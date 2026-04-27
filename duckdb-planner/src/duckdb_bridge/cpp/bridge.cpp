@@ -11,12 +11,14 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -75,7 +77,7 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
     : catalog(std::move(catalog)),
       db(nullptr, &this->config),
       con(db) {
-	con.Query("SET disabled_optimizers='compressed_materialization,late_materialization,empty_result_pullup,filter_pushdown'");
+        con.Query("SET disabled_optimizers='compressed_materialization,late_materialization,empty_result_pullup'");
 
 	// Set catalog context on the storage extension and attach the pivot catalog as default
 	auto ext = duckdb::StorageExtension::Find(
@@ -100,6 +102,13 @@ json build_ref_expression(duckdb::BoundReferenceExpression *ref) {
 	return {
 	    {"column_idx", ref->index},
 	    {"return_type", ref->return_type.id()},
+	};
+}
+
+json build_column_ref_expression(duckdb::BoundColumnRefExpression *col_ref) {
+	return {
+	    {"column_idx", col_ref->binding.column_index.GetIndex()},
+	    {"return_type", col_ref->return_type.id()},
 	};
 }
 
@@ -155,6 +164,11 @@ json build_expression(duckdb::Expression *expr) {
 		new_expression["data"] = build_ref_expression(&expr->Cast<duckdb::BoundReferenceExpression>());
 		break;
 	}
+	case duckdb::ExpressionType::BOUND_COLUMN_REF: {
+		new_expression["type"] = duckdb::ExpressionType::BOUND_REF;
+		new_expression["data"] = build_column_ref_expression(&expr->Cast<duckdb::BoundColumnRefExpression>());
+		break;
+	}
 	case duckdb::ExpressionType::COMPARE_EQUAL:
 	case duckdb::ExpressionType::COMPARE_NOTEQUAL:
 	case duckdb::ExpressionType::COMPARE_LESSTHAN:
@@ -195,6 +209,17 @@ json build_projection(duckdb::LogicalProjection *projection) {
 	};
 }
 
+json build_constant_comparison_filter(duckdb::ConstantFilter &filter, json column_ref) {
+    return {
+        {"column_ref", std::move(column_ref)},
+        {"compare_type", static_cast<uint8_t>(filter.comparison_type)},
+        {"constant", {
+            {"logical_type", filter.constant.type().id()},
+            {"raw_value", filter.constant.ToString()},
+        }},
+    };
+}
+
 json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables) {
 	json columns = json::array();
 	auto &column_ids = get->GetColumnIds();
@@ -209,19 +234,6 @@ json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper
 		columns.push_back(column);
 	}
 
-	json filters = json::array();
-	for (auto &entry : get->table_filters) {
-		auto &filter = entry.Filter();
-		// Currently only support expression filters
-		if (filter.filter_type == duckdb::TableFilterType::EXPRESSION_FILTER) {
-			json filter_json = json::object();
-
-			filter_json["type"] = static_cast<uint8_t>(filter.filter_type);
-			filter_json["data"] = build_expression(filter.Cast<duckdb::ExpressionFilter>().expr.get());
-			filters.push_back(filter_json);
-		}
-	}
-
 	if (!get->GetTable()) {
 		throw UnsupportedPlanError("LogicalGet without a pivot table entry is not supported");
 	}
@@ -232,8 +244,7 @@ json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper
 
 	json result = {
 		{"table_id", table_id},
-		{"columns", columns},
-		{"filters", filters}
+		{"columns", columns}
 	};
 	return result;
 }
