@@ -7,14 +7,17 @@ use planner::Error as PlannerError;
 use planner::Planner;
 use planner::catalog::{Catalog, CreateTableRequest, Table};
 use planner::types::Type;
+use rstest::rstest;
 
-#[test]
-fn select_column_subset() {
-    init();
-    let mut planner = int_table();
+fn int_col(values: Vec<i32>) -> ArrayRef {
+    Arc::new(Int32Array::from(values))
+}
 
-    let results = planner
-        .plan("SELECT a, b FROM test")
+#[rstest]
+fn select_column_subset(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b FROM example_table")
         .unwrap()
         .compile()
         .unwrap()
@@ -29,6 +32,8 @@ fn select_column_subset() {
             {"a": 1, "b": 10},
             {"a": 2, "b": 20},
             {"a": 3, "b": 30},
+            {"a": 4, "b": 40},
+            {"a": 5, "b": 50},
         ])
         .as_array()
         .unwrap()
@@ -36,13 +41,11 @@ fn select_column_subset() {
     );
 }
 
-#[test]
-fn select_all_columns() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a, b, c FROM test")
+#[rstest]
+fn select_all_columns(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b, c FROM example_table")
         .unwrap()
         .compile()
         .unwrap()
@@ -57,6 +60,8 @@ fn select_all_columns() {
             {"a": 1, "b": 10, "c": 100},
             {"a": 2, "b": 20, "c": 200},
             {"a": 3, "b": 30, "c": 300},
+            {"a": 4, "b": 40, "c": 400},
+            {"a": 5, "b": 50, "c": 500},
         ])
         .as_array()
         .unwrap()
@@ -64,13 +69,11 @@ fn select_all_columns() {
     );
 }
 
-#[test]
-fn select_single_column() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT c FROM test")
+#[rstest]
+fn select_single_column(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT c FROM example_table")
         .unwrap()
         .compile()
         .unwrap()
@@ -85,6 +88,8 @@ fn select_single_column() {
             {"c": 100},
             {"c": 200},
             {"c": 300},
+            {"c": 400},
+            {"c": 500},
         ])
         .as_array()
         .unwrap()
@@ -92,27 +97,19 @@ fn select_single_column() {
     );
 }
 
-#[test]
-fn filter_not_equal_columns() {
-    init();
-    let mut planner = make_planner_with_table(
-        "test",
+#[rstest]
+fn filter_not_equal_columns(mut testing_planner: TestingPlanner) {
+    testing_planner.catalog.add_table(
+        "pairs_with_dup",
         &[
-            (
-                "a",
-                Type::Int32,
-                Arc::new(Int32Array::from(vec![1, 2, 3, 10])) as ArrayRef,
-            ),
-            (
-                "b",
-                Type::Int32,
-                Arc::new(Int32Array::from(vec![10, 20, 30, 10])),
-            ),
+            ("a", Type::Int32, int_col(vec![1, 2, 3, 10])),
+            ("b", Type::Int32, int_col(vec![10, 20, 30, 10])),
         ],
     );
 
-    let results = planner
-        .plan("SELECT a, b FROM test WHERE a <> b")
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b FROM pairs_with_dup WHERE a <> b")
         .unwrap()
         .compile()
         .unwrap()
@@ -121,7 +118,7 @@ fn filter_not_equal_columns() {
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["a"].as_i64().unwrap());
 
-    // (10, 10) should be excluded
+    // (10, 10) is excluded.
     assert_eq!(
         rows,
         serde_json::json!([
@@ -135,23 +132,19 @@ fn filter_not_equal_columns() {
     );
 }
 
-#[test]
-fn filter_not_equal_no_matches() {
-    init();
-    let mut planner = make_planner_with_table(
-        "test",
+#[rstest]
+fn filter_not_equal_no_matches(mut testing_planner: TestingPlanner) {
+    testing_planner.catalog.add_table(
+        "pairs_all_equal",
         &[
-            (
-                "a",
-                Type::Int32,
-                Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-            ),
-            ("b", Type::Int32, Arc::new(Int32Array::from(vec![1, 2, 3]))),
+            ("a", Type::Int32, int_col(vec![1, 2, 3])),
+            ("b", Type::Int32, int_col(vec![1, 2, 3])),
         ],
     );
 
-    let results = planner
-        .plan("SELECT a FROM test WHERE a <> b")
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM pairs_all_equal WHERE a <> b")
         .unwrap()
         .compile()
         .unwrap()
@@ -161,13 +154,11 @@ fn filter_not_equal_no_matches() {
     assert!(rows.is_empty());
 }
 
-#[test]
-fn filter_not_equal_all_pass() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a, b FROM test WHERE a <> b")
+#[rstest]
+fn filter_not_equal_all_pass(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b FROM example_table WHERE a <> b")
         .unwrap()
         .compile()
         .unwrap()
@@ -182,6 +173,8 @@ fn filter_not_equal_all_pass() {
             {"a": 1, "b": 10},
             {"a": 2, "b": 20},
             {"a": 3, "b": 30},
+            {"a": 4, "b": 40},
+            {"a": 5, "b": 50},
         ])
         .as_array()
         .unwrap()
@@ -189,13 +182,11 @@ fn filter_not_equal_all_pass() {
     );
 }
 
-#[test]
-fn filter_not_equal_constant() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a FROM test WHERE a <> 2")
+#[rstest]
+fn filter_not_equal_constant(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a <> 2")
         .unwrap()
         .compile()
         .unwrap()
@@ -209,6 +200,8 @@ fn filter_not_equal_constant() {
         serde_json::json!([
             {"a": 1},
             {"a": 3},
+            {"a": 4},
+            {"a": 5},
         ])
         .as_array()
         .unwrap()
@@ -220,13 +213,11 @@ fn filter_not_equal_constant() {
 // OrderBy tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn order_by_ascending() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a, b FROM test ORDER BY a ASC")
+#[rstest]
+fn order_by_ascending(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b FROM example_table ORDER BY a ASC")
         .unwrap()
         .compile()
         .unwrap()
@@ -239,6 +230,8 @@ fn order_by_ascending() {
             {"a": 1, "b": 10},
             {"a": 2, "b": 20},
             {"a": 3, "b": 30},
+            {"a": 4, "b": 40},
+            {"a": 5, "b": 50},
         ])
         .as_array()
         .unwrap()
@@ -246,13 +239,11 @@ fn order_by_ascending() {
     );
 }
 
-#[test]
-fn order_by_descending() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a, b FROM test ORDER BY a DESC")
+#[rstest]
+fn order_by_descending(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b FROM example_table ORDER BY a DESC")
         .unwrap()
         .compile()
         .unwrap()
@@ -262,6 +253,8 @@ fn order_by_descending() {
     assert_eq!(
         rows,
         serde_json::json!([
+            {"a": 5, "b": 50},
+            {"a": 4, "b": 40},
             {"a": 3, "b": 30},
             {"a": 2, "b": 20},
             {"a": 1, "b": 10},
@@ -272,13 +265,11 @@ fn order_by_descending() {
     );
 }
 
-#[test]
-fn top_n_limit_1() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a FROM test ORDER BY a DESC LIMIT 1")
+#[rstest]
+fn top_n_limit_1(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 1")
         .unwrap()
         .compile()
         .unwrap()
@@ -286,32 +277,28 @@ fn top_n_limit_1() {
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["a"], 3);
+    assert_eq!(rows[0]["a"], 5);
 }
 
-#[test]
-fn top_n_limit_exceeds_row_count() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a FROM test ORDER BY a LIMIT 100")
+#[rstest]
+fn top_n_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table ORDER BY a LIMIT 100")
         .unwrap()
         .compile()
         .unwrap()
         .collect();
 
     let rows = batches_to_json(&results);
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 5);
 }
 
-#[test]
-fn top_n_limit_2_ascending() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT b FROM test ORDER BY a ASC LIMIT 2")
+#[rstest]
+fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT b FROM example_table ORDER BY a ASC LIMIT 2")
         .unwrap()
         .compile()
         .unwrap()
@@ -330,13 +317,11 @@ fn top_n_limit_2_ascending() {
     );
 }
 
-#[test]
-fn group_by_int_column() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a, COUNT(*) FROM test GROUP BY a")
+#[rstest]
+fn group_by_int_column(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a")
         .unwrap()
         .compile()
         .unwrap()
@@ -345,20 +330,18 @@ fn group_by_int_column() {
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["key"].as_i64().unwrap());
 
-    // Each value of a (1, 2, 3) appears once
-    assert_eq!(rows.len(), 3);
+    // Each value of a (1..=5) appears exactly once.
+    assert_eq!(rows.len(), 5);
     for row in &rows {
         assert_eq!(row["value"], 1);
     }
 }
 
-#[test]
-fn group_by_string_column_with_duplicates() {
-    init();
-    let mut planner = string_table();
-
-    let results = planner
-        .plan("SELECT name, COUNT(*) FROM test GROUP BY name")
+#[rstest]
+fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, COUNT(*) FROM example_table GROUP BY name")
         .unwrap()
         .compile()
         .unwrap()
@@ -367,7 +350,7 @@ fn group_by_string_column_with_duplicates() {
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
 
-    // alice appears twice, bob/charlie/dave each once
+    // alice appears twice, bob/charlie/dave each once.
     assert_eq!(rows.len(), 4);
     let alice = rows.iter().find(|r| r["key"] == "alice").unwrap();
     assert_eq!(alice["value"], 2);
@@ -379,13 +362,11 @@ fn group_by_string_column_with_duplicates() {
 // Combined operator tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn filter_then_order_by() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a, b FROM test WHERE a <> b ORDER BY a DESC")
+#[rstest]
+fn filter_then_order_by(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b FROM example_table WHERE a <> b ORDER BY a DESC")
         .unwrap()
         .compile()
         .unwrap()
@@ -395,6 +376,8 @@ fn filter_then_order_by() {
     assert_eq!(
         rows,
         serde_json::json!([
+            {"a": 5, "b": 50},
+            {"a": 4, "b": 40},
             {"a": 3, "b": 30},
             {"a": 2, "b": 20},
             {"a": 1, "b": 10},
@@ -405,28 +388,20 @@ fn filter_then_order_by() {
     );
 }
 
-#[test]
-fn filter_then_count() {
-    init();
-    let mut planner = make_planner_with_table(
-        "test",
+#[rstest]
+fn filter_then_count(mut testing_planner: TestingPlanner) {
+    // Every row has a == b, so WHERE a <> b yields 0 rows.
+    testing_planner.catalog.add_table(
+        "pairs_all_equal",
         &[
-            (
-                "a",
-                Type::Int32,
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])) as ArrayRef,
-            ),
-            (
-                "b",
-                Type::Int32,
-                Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
-            ),
+            ("a", Type::Int32, int_col(vec![1, 2, 3, 4, 5])),
+            ("b", Type::Int32, int_col(vec![1, 2, 3, 4, 5])),
         ],
     );
 
-    // All rows have a == b, so WHERE a <> b yields 0 rows
-    let results = planner
-        .plan("SELECT COUNT(*) FROM test WHERE a <> b")
+    let results = testing_planner
+        .planner
+        .plan("SELECT COUNT(*) FROM pairs_all_equal WHERE a <> b")
         .unwrap()
         .compile()
         .unwrap()
@@ -437,13 +412,11 @@ fn filter_then_count() {
     assert_eq!(rows[0]["count"], 0);
 }
 
-#[test]
-fn filter_then_top_n() {
-    init();
-    let mut planner = int_table();
-
-    let results = planner
-        .plan("SELECT a FROM test WHERE a <> b ORDER BY a DESC LIMIT 2")
+#[rstest]
+fn filter_then_top_n(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap()
         .compile()
         .unwrap()
@@ -451,8 +424,8 @@ fn filter_then_top_n() {
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["a"], 3);
-    assert_eq!(rows[1]["a"], 2);
+    assert_eq!(rows[0]["a"], 5);
+    assert_eq!(rows[1]["a"], 4);
 }
 
 #[derive(Debug, Default)]
@@ -471,6 +444,10 @@ impl Catalog for RecordingCatalog {
     }
 }
 
+// CREATE TABLE tests use a custom recording catalog (which the shared
+// `TestCatalog` can't impersonate without adding state we don't otherwise
+// need), so they construct their own `Planner` rather than going through the
+// `testing_planner` fixture.
 #[test]
 fn create_table_calls_catalog_once() {
     init();
@@ -525,11 +502,10 @@ fn create_table_passes_with_options_to_catalog() {
     );
 }
 
-#[test]
-fn unsupported_aggregate_returns_error() {
-    init();
-    let mut planner = string_table();
-
-    let result = planner.plan("SELECT SUM(value) FROM test");
+#[rstest]
+fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
+    let result = testing_planner
+        .planner
+        .plan("SELECT SUM(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }

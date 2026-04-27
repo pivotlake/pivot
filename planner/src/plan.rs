@@ -10,6 +10,7 @@
 
 use crate::catalog::Catalog;
 use crate::operator::{self, Operator};
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -26,6 +27,39 @@ pub struct PlanNode {
     pub name: String,
     pub inputs: Vec<PlanNode>,
     pub operator: Operator,
+}
+
+impl TryFrom<duckdb_planner::PlanNode> for PlanNode {
+    type Error = Error;
+
+    fn try_from(p: duckdb_planner::PlanNode) -> Result<Self, Self::Error> {
+        Ok(PlanNode {
+            name: p.name,
+            inputs: p
+                .inputs
+                .into_iter()
+                .map(PlanNode::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            operator: p.operator.try_into()?,
+        })
+    }
+}
+
+impl PlanNode {
+    fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
+        let prefix = "  ".repeat(indent);
+        writeln!(f, "{prefix}{}", self.operator)?;
+        for child in &self.inputs {
+            child.fmt_indented(f, indent + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for PlanNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_indented(f, 0)
+    }
 }
 
 /// State shared across the whole compile pass for one [`Plan`].
@@ -48,18 +82,8 @@ pub struct Plan {
     pub root: PlanNode,
 }
 
-impl TryFrom<duckdb_planner::PlanNode> for PlanNode {
-    type Error = Error;
-
-    fn try_from(p: duckdb_planner::PlanNode) -> Result<Self, Self::Error> {
-        Ok(PlanNode {
-            name: p.name,
-            inputs: p
-                .inputs
-                .into_iter()
-                .map(PlanNode::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-            operator: p.operator.try_into()?,
-        })
+impl fmt::Display for Plan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.root)
     }
 }

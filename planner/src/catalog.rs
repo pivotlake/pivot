@@ -8,16 +8,18 @@
 //! Because DuckDB owns SQL binding, the catalog and tables also need to be
 //! visible to it: the adapters [`DuckDBCatalogAdapter`] and
 //! [`DuckDBTableAdapter`] implement DuckDB's [`DuckDBBind`] /
-//! [`GetDuckDBTypedColumns`] traits over our Pivot types. They exist as
+//! [`DuckDBTable`] traits over our Pivot types. They exist as
 //! standalone wrapper structs (rather than blanket impls) because the orphan
 //! rule prevents implementing a foreign trait for `Arc<dyn Table>` directly.
 
 use std::collections::HashMap;
 
+use crate::expression::TableFilter;
 use crate::types::{Type, logical_from_type};
 use dispatch::{Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
-use duckdb_planner::catalog_provider::{DuckDBBind, GetDuckDBTypedColumns};
+use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
+use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
@@ -62,9 +64,15 @@ pub trait Table: Debug + Send + Sync {
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
+
+    // Try to pushdown a filter to table. Returns true if the filter was *FULLY* pushed down.
+    // (IE if another filter operator after table input is not required later).
+    fn pushdown_filter(&self, _filter: TableFilter) -> bool {
+        false
+    }
 }
 
-/// Adapts a Pivot [`Table`] to DuckDB's [`GetDuckDBTypedColumns`] trait,
+/// Adapts a Pivot [`Table`] to DuckDB's [`DuckDBTable`] trait,
 /// converting our column types into DuckDB logical types. Required because
 /// Rust's orphan rule prevents implementing a foreign trait for a foreign type.
 #[derive(Debug)]
@@ -72,7 +80,7 @@ pub struct DuckDBTableAdapter {
     pub table: Arc<dyn Table>,
 }
 
-impl GetDuckDBTypedColumns for DuckDBTableAdapter {
+impl DuckDBTable for DuckDBTableAdapter {
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         self.table
             .columns()
@@ -82,6 +90,13 @@ impl GetDuckDBTypedColumns for DuckDBTableAdapter {
                 duckdb_logical_type_id: logical_from_type(&col.col_type) as u8,
             })
             .collect()
+    }
+
+    fn pushdown_filter(&self, filter: DuckDBTableFilter) -> bool {
+        match filter.try_into() {
+            Ok(filter) => self.table.pushdown_filter(filter),
+            Err(_) => false,
+        }
     }
 }
 
@@ -113,7 +128,7 @@ pub struct DuckDBCatalogAdapter {
 }
 
 impl DuckDBBind for DuckDBCatalogAdapter {
-    fn try_bind(&self, name: &str) -> Option<Arc<dyn GetDuckDBTypedColumns>> {
+    fn try_bind(&self, name: &str) -> Option<Arc<dyn DuckDBTable>> {
         let table = self.catalog.table(name)?;
         Some(Arc::new(DuckDBTableAdapter { table }))
     }

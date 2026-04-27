@@ -3,10 +3,11 @@
 
 use crate::types;
 use crate::types::{Type, build_scalar_value, type_from_logical};
-use arrow_array::{ArrayRef, Scalar};
+use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow_array::{ArrayRef, Datum, Scalar};
 use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
 use duckdb_planner::expression as duckdb_expression;
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -170,9 +171,41 @@ pub enum Expression {
     Function(Function),
 }
 
+impl Display for CompareType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompareType::NotEqual => f.write_str("<>"),
+        }
+    }
+}
+
+/// Format an arrow `Scalar<ArrayRef>` constant as `value:Type` for plan
+/// display. Falls back to `?:DataType` for unsupported arrow types.
+fn format_constant(s: &Scalar<ArrayRef>) -> String {
+    let (arr, _is_scalar) = s.get();
+    let formatter = ArrayFormatter::try_new(arr, &FormatOptions::default());
+    let value = match formatter {
+        Ok(f) => f.value(0).to_string(),
+        Err(_) => "?".to_string(),
+    };
+    format!("{value}:{}", arr.data_type())
+}
+
 impl Display for Expression {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expression::Ref(r) => write!(f, "#{}:{}", r.column_idx, r.return_type),
+            Expression::Compare(c) => write!(
+                f,
+                "{} {} {} -> {}",
+                c.left, c.compare_type, c.right, c.return_type
+            ),
+            Expression::Constant(c) => f.write_str(&format_constant(c)),
+            Expression::AggregateFunc(AggregateFunc::CountStar(_)) => f.write_str("count_star()"),
+            Expression::Function(Function::Contains(c)) => {
+                write!(f, "contains({}, {})", c.haystack, c.needle)
+            }
+        }
     }
 }
 
@@ -200,10 +233,30 @@ impl TryFrom<Box<duckdb_planner::expression::Expression>> for Box<Expression> {
     }
 }
 
+/// A constant comparison against a single column pushed into a table scan.
+#[derive(Debug)]
+pub struct ConstantComparison {
+    pub column_ref: Box<Expression>,
+    pub compare_type: CompareType,
+    pub constant: Scalar<ArrayRef>,
+}
+
+impl TryFrom<duckdb_expression::ConstantComparison> for ConstantComparison {
+    type Error = Error;
+    fn try_from(c: duckdb_expression::ConstantComparison) -> Result<Self, Self::Error> {
+        Ok(ConstantComparison {
+            column_ref: Box::<Expression>::try_from(c.column_ref)?,
+            compare_type: c.compare_type.try_into()?,
+            constant: build_scalar_value(c.constant)?,
+        })
+    }
+}
+
 /// A filter that was pushed down into a table scan.
 #[derive(Debug)]
 pub enum TableFilter {
     Expression(Box<Expression>),
+    ConstantComparison(ConstantComparison),
 }
 
 impl TryFrom<duckdb_expression::TableFilter> for TableFilter {
@@ -211,6 +264,24 @@ impl TryFrom<duckdb_expression::TableFilter> for TableFilter {
     fn try_from(f: duckdb_expression::TableFilter) -> Result<Self, Self::Error> {
         Ok(match f {
             duckdb_expression::TableFilter::Expression(e) => TableFilter::Expression(e.try_into()?),
+            duckdb_expression::TableFilter::ConstantComparison(c) => {
+                TableFilter::ConstantComparison(c.try_into()?)
+            }
         })
+    }
+}
+
+impl Display for TableFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TableFilter::Expression(e) => write!(f, "{e}"),
+            TableFilter::ConstantComparison(c) => write!(
+                f,
+                "{} {} {}",
+                c.column_ref,
+                c.compare_type,
+                format_constant(&c.constant),
+            ),
+        }
     }
 }
