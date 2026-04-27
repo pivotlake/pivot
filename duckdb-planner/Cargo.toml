@@ -21,6 +21,8 @@ dispatch = { path = "../dispatch" }
 libc = "0.2.184"
 parquet = { version = "58.0.0", features = ["arrow"] }
 tempfile = "3"
+rstest = "0.23"
+insta = "1"
 
 [build-dependencies]
 cxx-build = { version = "1.0", features = ["parallel"] }

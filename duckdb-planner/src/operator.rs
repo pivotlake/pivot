@@ -8,33 +8,40 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::duckdb_bridge::duckdb_types::{LogicalOperatorType, OrderType};
-use crate::expression::{Expression, TableFilter};
+use crate::expression::{Expression, type_name};
 use custom_deserializer::CustomDeserializer;
 use serde_repr::Deserialize_repr;
 
-/// Deserialized form of a table scan — carries a `table_id` index into the
-/// tables vector returned alongside the JSON plan from the C++ bridge.
-/// Converted into [`Input`] (which holds the resolved
-/// `Arc<dyn GetDuckDBTypedColumns>`) by `PlanNode::resolve_tables` during the
-/// post-processing pass.
-#[derive(CustomDeserializer)]
+/// Raw, pre-resolution form of a table scan as it comes off the JSON plan.
+///
+/// `PlanNode::resolve_inputs` turns each `RawInput` into an [`Input`] by looking
+/// up the table by `table_id`.
+#[derive(CustomDeserializer, Debug)]
 pub struct RawInput {
     pub table_id: usize,
     pub columns: Vec<Expression>,
-    pub filters: Vec<TableFilter>,
 }
 
-/// Resolved table scan with the `GetDuckDBTypedColumns` trait object attached.
+/// Resolved table scan with the `DuckDBTable` trait object attached.
 /// Produced from [`RawInput`] after the planning phase resolves `table_id`
-/// to an `Arc<dyn GetDuckDBTypedColumns>` provided by the [`DuckDBBind`](crate::DuckDBBind).
+/// to an `Arc<dyn DuckDBTable>` provided by the [`DuckDBBind`](crate::DuckDBBind).
 pub struct Input {
-    pub table: Arc<dyn crate::catalog_provider::GetDuckDBTypedColumns>,
+    pub table: Arc<dyn crate::catalog_provider::DuckDBTable>,
     pub columns: Vec<Expression>,
     pub filters: Vec<TableFilter>,
 }
 
+impl fmt::Debug for Input {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Input")
+            .field("columns", &self.columns)
+            .field("filters", &self.filters)
+            .finish()
+    }
+}
+
 /// Computes a list of output expressions from its child's columns.
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct Projection {
     pub projections: Vec<Expression>,
 }
@@ -43,7 +50,7 @@ pub struct Projection {
 ///
 /// `Default` is what DuckDB emits when no explicit `ASC`/`DESC` is given
 /// (equivalent to `Asc` in practice).
-#[derive(Deserialize_repr)]
+#[derive(Deserialize_repr, Debug)]
 #[repr(u8)]
 pub enum OrderByDirection {
     Default = OrderType::ORDER_DEFAULT as u8,
@@ -52,47 +59,47 @@ pub enum OrderByDirection {
 }
 
 /// A single sort key within an ORDER BY or TopN operator.
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct OrderByNode {
     pub direction: OrderByDirection,
     pub expression: Expression,
 }
 
 /// Sorts its input by one or more keys.
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct OrderBy {
     pub order_bys: Vec<OrderByNode>,
 }
 
 /// GROUP BY + aggregate functions.
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct Aggregate {
     pub groups: Vec<Expression>,
     pub expressions: Vec<Expression>,
 }
 
 /// Filters rows by one or more boolean conditions (implicitly ANDed).
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct Filter {
     pub conditions: Vec<Expression>,
 }
 
 /// Combined ORDER BY + LIMIT (returns the top N rows).
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,
 }
 
 /// A single column definition inside a CREATE TABLE statement.
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct CreateTableColumn {
     pub name: String,
     pub col_type: crate::duckdb_bridge::duckdb_types::LogicalTypeId,
 }
 
 /// CREATE TABLE with an explicit column list.
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct CreateTable {
     pub name: String,
     pub columns: Vec<CreateTableColumn>,
@@ -106,14 +113,14 @@ pub struct CreateTable {
 
 /// A logical operator in the query plan. Discriminated by DuckDB's
 /// [`LogicalOperatorType`].
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub enum Operator {
     #[type_tag(LogicalOperatorType::LOGICAL_GET)]
     #[doc(hidden)]
     RawInput(RawInput),
     #[skip_deserialize]
     // LogicalGet is deserialized as RawInput, then converted to Input in a
-    // post-processing step to attach the GetDuckDBTypedColumns trait object.
+    // post-processing step to attach the DuckDBTable trait object.
     Input(Input),
     #[type_tag(LogicalOperatorType::LOGICAL_PROJECTION)]
     Projection(Projection),
@@ -173,15 +180,23 @@ impl fmt::Display for Operator {
                 )
             }
             Operator::Input(i) => {
-                write!(
-                    f,
-                    "Input([{}])",
-                    i.columns
+                let cols = i
+                    .columns
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<String>>()
+                    .join(", ");
+                if i.filters.is_empty() {
+                    write!(f, "Input([{cols}])")
+                } else {
+                    let filters = i
+                        .filters
                         .iter()
-                        .map(|c| c.to_string())
+                        .map(|tf| tf.to_string())
                         .collect::<Vec<String>>()
-                        .join(", ")
-                )
+                        .join(", ");
+                    write!(f, "Input([{cols}], filters: [{filters}])")
+                }
             }
             Operator::Projection(p) => {
                 let exprs: Vec<String> = p.projections.iter().map(|e| e.to_string()).collect();
@@ -213,14 +228,20 @@ impl fmt::Display for Operator {
                 let columns: Vec<String> = c
                     .columns
                     .iter()
-                    .map(|col| format!("{}:{:?}", col.name, col.col_type))
+                    .map(|col| format!("{}:{}", col.name, type_name(&col.col_type)))
+                    .collect();
+                let mut options: Vec<(&String, &String)> = c.options.iter().collect();
+                options.sort_by(|a, b| a.0.cmp(b.0));
+                let options_str: Vec<String> = options
+                    .iter()
+                    .map(|(k, v)| format!("{k:?}: {v:?}"))
                     .collect();
                 write!(
                     f,
-                    "CreateTable({}, [{}], options: {:?})",
+                    "CreateTable({}, [{}], options: {{{}}})",
                     c.name,
                     columns.join(", "),
-                    c.options
+                    options_str.join(", "),
                 )
             }
         }

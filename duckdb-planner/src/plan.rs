@@ -3,7 +3,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::catalog_provider::GetDuckDBTypedColumns;
+use crate::catalog_provider::DuckDBTable;
 use crate::operator::Operator;
 use custom_deserializer::CustomDeserializer;
 
@@ -26,7 +26,7 @@ use custom_deserializer::CustomDeserializer;
 ///
 /// Each node above feeds its rows to exactly one parent — `Input` cannot
 /// simultaneously feed both `Filter` and some other operator.
-#[derive(CustomDeserializer)]
+#[derive(CustomDeserializer, Debug)]
 pub struct PlanNode {
     pub name: String,
     pub inputs: Vec<PlanNode>,
@@ -49,23 +49,28 @@ impl PlanNode {
         Ok(())
     }
 
-    /// Walk the plan tree and convert each `RawInput` into a resolved `Input`
-    /// by looking up the `Table` trait object from `tables` (keyed by `table_id`).
-    /// TODO: Explain why we need this.
-    pub(crate) fn resolve_tables(mut self, tables: &[Arc<dyn GetDuckDBTypedColumns>]) -> Self {
-        self.operator = match self.operator {
-            Operator::RawInput(raw) => Operator::Input(crate::operator::Input {
+    /// Walk the plan tree and turn each `RawInput` into a resolved
+    /// [`Input`](crate::operator::Input) by looking up the `table_id` in the
+    /// `tables` vector.
+    pub(crate) fn resolve_inputs(mut self, tables: &[Arc<dyn DuckDBTable>]) -> Self {
+        self.inputs = self
+            .inputs
+            .into_iter()
+            .map(|n| n.resolve_inputs(tables))
+            .collect();
+
+        let Operator::RawInput(raw) = self.operator else {
+            return self;
+        };
+
+        PlanNode {
+            name: self.name,
+            inputs: self.inputs,
+            operator: Operator::Input(crate::operator::Input {
                 table: tables[raw.table_id].clone(),
                 columns: raw.columns,
                 filters: raw.filters,
             }),
-            other => other,
-        };
-        self.inputs = self
-            .inputs
-            .into_iter()
-            .map(|n| n.resolve_tables(tables))
-            .collect();
-        self
+        }
     }
 }

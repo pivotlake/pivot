@@ -1,18 +1,90 @@
 use crate::common::*;
-use planner::Operator;
+use insta::assert_snapshot;
+use rstest::rstest;
 
-#[test]
-fn filter_with_contains_has_filter_node() {
-    init();
-    let mut planner = string_table();
+/// `Ref` — a bound column reference, displayed as `#idx:Type`.
+#[rstest]
+fn ref_column(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int32)
+      Input([#0:Int32])
+    ");
+}
 
-    let plan = planner
-        .plan("SELECT name FROM test WHERE contains(name, 'ali')")
-        .unwrap()
-        .root;
+/// `Compare(NotEqual)` between two column references.
+#[rstest]
+fn compare_notequal_columns(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a <> b")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int32)
+      Filter(#0:Int32 <> #1:Int32 -> Boolean)
+        Input([#0:Int32, #1:Int32])
+    ");
+}
 
-    fn has_filter(plan: &planner::PlanNode) -> bool {
-        matches!(plan.operator, Operator::Filter(_)) || plan.inputs.iter().any(has_filter)
-    }
-    assert!(has_filter(&plan), "Expected a Filter operator in the plan");
+/// `Constant` (integer) on the RHS of a comparison.
+#[rstest]
+fn constant_integer(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a <> 5")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int32)
+      Filter(#0:Int32 <> 5:Int32 -> Boolean)
+        Input([#0:Int32])
+    ");
+}
+
+/// `Constant` (string) on the RHS of a comparison — DuckDB widens string
+/// literals to `Utf8View`.
+#[rstest]
+fn constant_string(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT name FROM example_table WHERE name <> 'alice'")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Utf8)
+      Filter(#0:Utf8 <> alice:Utf8View -> Boolean)
+        Input([#3:Utf8])
+    ");
+}
+
+/// `AggregateFunc::CountStar` — the only aggregate the planner currently
+/// supports.
+#[rstest]
+fn aggregate_count_star(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT COUNT(*) FROM example_table WHERE a <> 0")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int64)
+      Aggregate(groups: [], exprs: [count_star()])
+        Filter(#0:Int32 <> 0:Int32 -> Boolean)
+          Input([#0:Int32])
+    ");
+}
+
+/// `Function::Contains` — the only scalar function the planner currently
+/// supports.
+#[rstest]
+fn function_contains(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT name FROM example_table WHERE contains(name, 'ali')")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Utf8)
+      Filter(contains(#0:Utf8, ali:Utf8View))
+        Input([#3:Utf8])
+    ");
 }

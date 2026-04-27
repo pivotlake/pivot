@@ -7,7 +7,9 @@
 
 pub mod duckdb_types;
 
-use crate::catalog_provider::{CatalogContext, OptionalTableWrapper, catalog_get_table};
+use crate::catalog_provider::{
+    CatalogContext, OptionalTableWrapper, catalog_get_table, pushdown_filter,
+};
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
 #[cxx::bridge]
@@ -23,7 +25,7 @@ pub mod ffi {
     struct CatalogGetTableResult {
         pub found: bool,
         pub columns: Vec<DuckDBColumn>,
-        /// Opaque handle to the Rust `GetDuckDBTypedColumns` object that was looked up.
+        /// Opaque handle to the Rust `DuckDBTable` object that was looked up.
         pub table: Box<OptionalTableWrapper>,
     }
 
@@ -38,6 +40,7 @@ pub mod ffi {
         type CatalogContext;
         type OptionalTableWrapper;
         fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetTableResult;
+        fn pushdown_filter(table: &OptionalTableWrapper, filters_json: &str) -> bool;
     }
 
     unsafe extern "C++" {

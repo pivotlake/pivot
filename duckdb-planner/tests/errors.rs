@@ -1,11 +1,11 @@
 use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, Error, GetDuckDBTypedColumns, LogicalTypeId, PlannerContext,
+    DuckDBBind, DuckDBColumn, Error, DuckDBTable, LogicalTypeId, PlannerContext,
 };
 use std::sync::Arc;
 
 struct TTable;
 
-impl GetDuckDBTypedColumns for TTable {
+impl DuckDBTable for TTable {
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         vec![
             DuckDBColumn {
@@ -23,7 +23,7 @@ impl GetDuckDBTypedColumns for TTable {
 struct TestCatalog;
 
 impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, table_name: &str) -> Option<Arc<dyn GetDuckDBTypedColumns>> {
+    fn try_bind(&self, table_name: &str) -> Option<Arc<dyn DuckDBTable>> {
         match table_name {
             "t" => Some(Arc::new(TTable)),
             _ => None,

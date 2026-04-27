@@ -14,6 +14,7 @@ use crate::expression::{self, Expression, TableFilter};
 use crate::types::{self, type_from_logical};
 use duckdb_planner::operator as duckdb_operator;
 use std::any::Any;
+use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -57,6 +58,28 @@ impl TryFrom<duckdb_operator::Input> for Input {
     }
 }
 
+impl fmt::Display for Input {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cols = self
+            .columns
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.filters.is_empty() {
+            write!(f, "Input([{cols}])")
+        } else {
+            let filters = self
+                .filters
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, "Input([{cols}], filters: [{filters}])")
+        }
+    }
+}
+
 /// Computes a list of output expressions from its child's columns.
 #[derive(Debug)]
 pub struct Projection {
@@ -73,6 +96,18 @@ impl TryFrom<duckdb_operator::Projection> for Projection {
                 .map(Expression::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+}
+
+impl fmt::Display for Projection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let exprs = self
+            .projections
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "Projection({exprs})")
     }
 }
 
@@ -94,6 +129,16 @@ impl From<duckdb_operator::OrderByDirection> for OrderByDirection {
     }
 }
 
+impl fmt::Display for OrderByDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            OrderByDirection::Asc | OrderByDirection::Default => "ASC",
+            OrderByDirection::Desc => "DESC",
+        };
+        f.write_str(s)
+    }
+}
+
 /// A single sort key within an ORDER BY or TopN operator.
 #[derive(Debug)]
 pub struct OrderByNode {
@@ -108,6 +153,12 @@ impl TryFrom<duckdb_operator::OrderByNode> for OrderByNode {
             direction: n.direction.into(),
             expression: n.expression.try_into()?,
         })
+    }
+}
+
+impl fmt::Display for OrderByNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.expression, self.direction)
     }
 }
 
@@ -127,6 +178,18 @@ impl TryFrom<duckdb_operator::OrderBy> for OrderBy {
                 .map(OrderByNode::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+}
+
+impl fmt::Display for OrderBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let orders = self
+            .order_bys
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "OrderBy({orders})")
     }
 }
 
@@ -155,6 +218,24 @@ impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
     }
 }
 
+impl fmt::Display for Aggregate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let groups = self
+            .groups
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let exprs = self
+            .expressions
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "Aggregate(groups: [{groups}], exprs: [{exprs}])")
+    }
+}
+
 /// Filters rows by one or more boolean conditions (implicitly ANDed).
 #[derive(Debug)]
 pub struct Filter {
@@ -171,6 +252,18 @@ impl TryFrom<duckdb_operator::Filter> for Filter {
                 .map(Expression::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+}
+
+impl fmt::Display for Filter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let conds = self
+            .conditions
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        write!(f, "Filter({conds})")
     }
 }
 
@@ -192,6 +285,18 @@ impl TryFrom<duckdb_operator::TopN> for TopN {
                 .collect::<Result<Vec<_>, _>>()?,
             limit: t.limit,
         })
+    }
+}
+
+impl fmt::Display for TopN {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let orders = self
+            .order_bys
+            .iter()
+            .map(|o| o.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "TopN(limit: {}, order: {orders})", self.limit)
     }
 }
 
@@ -233,6 +338,33 @@ impl TryFrom<duckdb_operator::CreateTable> for CreateTable {
     }
 }
 
+impl fmt::Display for CreateTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let columns = self
+            .request
+            .columns
+            .iter()
+            .map(|c| format!("{}:{}", c.name, c.col_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Sort by key so the rendered output is deterministic — `HashMap`
+        // iteration order is randomized per process and would otherwise flake
+        // any snapshot/equality test that includes options.
+        let mut options: Vec<(&String, &String)> = self.request.options.iter().collect();
+        options.sort_by(|a, b| a.0.cmp(b.0));
+        let options_str = options
+            .iter()
+            .map(|(k, v)| format!("{k:?}: {v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "CreateTable({}, [{columns}], options: {{{options_str}}})",
+            self.request.name
+        )
+    }
+}
+
 /// An operator in the query plan.
 #[derive(Debug)]
 pub enum Operator {
@@ -261,5 +393,19 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
                 unreachable!("RawInput should be resolved to Input before reaching the planner")
             }
         })
+    }
+}
+
+impl fmt::Display for Operator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Operator::Input(i) => write!(f, "{i}"),
+            Operator::Projection(p) => write!(f, "{p}"),
+            Operator::OrderBy(o) => write!(f, "{o}"),
+            Operator::Aggregate(a) => write!(f, "{a}"),
+            Operator::Filter(fl) => write!(f, "{fl}"),
+            Operator::TopN(t) => write!(f, "{t}"),
+            Operator::CreateTable(c) => write!(f, "{c}"),
+        }
     }
 }
