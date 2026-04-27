@@ -79,19 +79,29 @@ impl Probe {
 
         let mut hashes: [u64; RING_SIZE] = [0; RING_SIZE];
 
-        let mut arena_ptrs: [(usize, usize); RING_SIZE] = [(0, 0); RING_SIZE];
-        let mut next_arena_ptrs: [(usize, usize); RING_SIZE] = [(0, 0); RING_SIZE];
+        // let mut arena_ptrs: [(usize, usize); RING_SIZE] = [(0, 0); RING_SIZE];
+
+        let mut arena_ptrs: [[(usize, usize); RING_SIZE]; 2] = [[(0, 0); RING_SIZE]; 2];
+        let [buf0, buf1] = &mut arena_ptrs;
 
         // Prepopulate hashes for first RING_SIZE elements
         for i in 0..min(PREFETCH_LENGTH, col.len()) {
             hashes[i] = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
             prefetch_ptr_l2(directory.ptr_for_slot((hashes[i] >> directory.shift) as usize) as *const u8);
         }
+        let mut arena_outer_idx = 0usize;
 
         let mut idx = 0;
         while idx + PREFETCH_LENGTH < col.len().saturating_sub(PREFETCH_LENGTH) {
+            let (next_arena_ptrs, current_arena_ptrs) = if arena_outer_idx == 0 {
+                (&mut *buf1, &*buf0)
+            } else {
+                (&mut *buf0, &*buf1)
+            };
+
+            arena_outer_idx ^= 1;
             let mut arena_size = 0;
-            for n in 0..PREFETCH_LENGTH {
+            for _ in 0..PREFETCH_LENGTH {
                 // hash
                 let value = unsafe { col.value_unchecked(idx + PREFETCH_LENGTH) };
                 let hash_offset = (idx + PREFETCH_LENGTH) & MASK;
@@ -107,23 +117,16 @@ impl Probe {
                 let stored = directory.entries()[slot];
                 let probe = Directory::<B>::compute_tag(hash) as u64;
 
-                // if (stored & probe) == probe {
-                //     prefetch_ptr_l2(directory.ptr_for_slot(slot + 1) as *const u8);
-                //     next_arena_ptrs[arena_size & MASK] = (slot, idx);
-                //     arena_size += 1;
-                //     //
-                //     // let start_arena_idx = directory.end_ptr(slot as isize);
-                //     // let ptr = arena.ptr_at_index(start_arena_idx) as *const u8;
-                //     // prefetch_ptr_l2(ptr);
-                // }
-
-                let hit = ((stored & probe) == probe) as usize;
-                next_arena_ptrs[arena_size] = (slot, idx);
-                arena_size += hit;
-                prefetch_ptr_l2(directory.ptr_for_slot(slot + 1) as *const u8);
+                if (stored & probe) == probe {
+                    prefetch_ptr_l2(directory.ptr_for_slot(slot + 1) as *const u8);
+                    next_arena_ptrs[arena_size & MASK] = (slot, idx);
+                    arena_size += 1;
+                }
 
                 idx += 1;
             }
+
+            // TODO: there's an unneessary iteration at first run
 
             for i in 0..arena_size {
                 let (slot, _) = next_arena_ptrs[i];
@@ -132,7 +135,7 @@ impl Probe {
                 prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
                 prefetch_ptr_l2(arena.ptr_at_index(end) as *const u8);
 
-                let (slot, idx) = arena_ptrs[i];
+                let (slot, idx) = current_arena_ptrs[i];
                 let start = directory.end_ptr(slot as isize);
                 let end = directory.end_ptr((slot + 1) as isize);
                 let probe_key = unsafe { col.value_unchecked(idx) } as u32;
@@ -143,31 +146,13 @@ impl Probe {
                     order_keys.write(output, entry as i64);
                     output += (entry == probe_key) as usize;
                 }
-                // let mut j = start;
-                // while j + 2 <= end {
-                //     let e0 = arena[j];
-                //     let e1 = arena[j + 1];
-                //     lineitem_keys.write(output, e0 as i64);
-                //     order_keys.write(output, e0 as i64);
-                //     output += (e0 == probe_key) as usize;
-                //     lineitem_keys.write(output, e1 as i64);
-                //     order_keys.write(output, e1 as i64);
-                //     output += (e1 == probe_key) as usize;
-                //     j += 2;
-                // }
-                // if j < end {
-                //     let e = arena[j];
-                //     lineitem_keys.write(output, e as i64);
-                //     order_keys.write(output, e as i64);
-                //     output += (e == probe_key) as usize;
-                // }
             }
-
-            mem::swap(&mut arena_ptrs, &mut next_arena_ptrs)
         }
 
+        let current = &mut arena_ptrs[arena_outer_idx];
+
         for i in 0..PREFETCH_LENGTH {
-            let (slot, idx) = arena_ptrs[i];
+            let (slot, idx) = current[i];
             let start = directory.end_ptr(slot as isize);
             let end = directory.end_ptr((slot + 1) as isize);
 
@@ -180,11 +165,8 @@ impl Probe {
             }
         }
 
-
-
         let end_offset = col.len().saturating_sub(PREFETCH_LENGTH);
 
-        let mut arena_size = 0;
         while idx < end_offset {
             // hash
             let value = unsafe { col.value_unchecked(idx + PREFETCH_LENGTH) };
@@ -222,7 +204,6 @@ impl Probe {
             );
 
         }
-
     }
 }
 
