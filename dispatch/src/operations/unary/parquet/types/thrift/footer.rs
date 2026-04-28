@@ -102,10 +102,22 @@ thrift_struct!(
 );
 
 thrift_struct!(
+    pub(crate) struct Statistics {
+        1: optional binary max;
+        2: optional binary min;
+        3: optional i64 null_count;
+        4: optional i64 distinct_count;
+        5: optional binary max_value;
+        6: optional binary min_value;
+    }
+);
+
+thrift_struct!(
     pub(crate) struct ColumnMetaData {
         7: required i64 total_compressed_size;
         9: required i64 data_page_offset;
         11: optional i64 dictionary_page_offset;
+        12: optional Statistics statistics;
     }
 );
 

@@ -69,7 +69,6 @@ impl PlanNode {
             operator: Operator::Input(crate::operator::Input {
                 table: tables[raw.table_id].clone(),
                 columns: raw.columns,
-                filters: raw.filters,
             }),
         }
     }
