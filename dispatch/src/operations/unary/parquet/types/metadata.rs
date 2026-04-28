@@ -9,9 +9,26 @@
 //! decompressor to locate pages on disk.
 
 use crate::operations::unary::parquet::types::table::ParquetTable;
+use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use std::fs::File;
 use std::sync::Arc;
+
+/// Decoded min/max from a column chunk's footer statistics. Each side is
+/// stored as an arrow [`Scalar<ArrayRef>`] — the same shape the planner uses
+/// for SQL constants — so a pushdown predicate can compare a query constant
+/// directly against `min` / `max` without further conversion.
+///
+/// `None` for either side means the writer didn't record that bound (e.g.
+/// all-null column, or stats omitted entirely); a present `min`/`max` is a
+/// valid bound but may be conservative rather than the true extremum.
+#[derive(Clone, Debug)]
+pub struct ColumnStatistics {
+    pub min: Option<Scalar<ArrayRef>>,
+    pub max: Option<Scalar<ArrayRef>>,
+    pub null_count: Option<i64>,
+    pub distinct_count: Option<i64>,
+}
 
 /// Byte-level layout of a single column chunk within a row group.
 ///
@@ -27,6 +44,9 @@ pub struct ColumnChunkMeta {
     pub total_compressed_size: i64,
     /// Maximum definition level for this column (indicates nesting / nullability depth).
     pub max_def_level: i16,
+    /// Decoded min/max for this chunk, when the writer recorded statistics
+    /// and the column's Arrow type is one we know how to decode.
+    pub statistics: Option<ColumnStatistics>,
 }
 
 /// Static, file-level metadata for a single Parquet row group.
