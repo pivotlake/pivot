@@ -139,6 +139,10 @@ fn str_col(values: Vec<&'static str>) -> ArrayRef {
 /// `catalog` would never reach the planner.
 pub struct TestingPlanner {
     pub planner: Planner,
+    // Read by the `compile` and `types` test binaries to register extra
+    // tables; the `plan` binary only uses `.planner`, which would otherwise
+    // trip dead-code there since each binary lints this module independently.
+    #[allow(dead_code)]
     pub catalog: Arc<TestCatalog>,
 }
 

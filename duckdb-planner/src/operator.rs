@@ -28,14 +28,12 @@ pub struct RawInput {
 pub struct Input {
     pub table: Arc<dyn crate::catalog_provider::DuckDBTable>,
     pub columns: Vec<Expression>,
-    pub filters: Vec<TableFilter>,
 }
 
 impl fmt::Debug for Input {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Input")
             .field("columns", &self.columns)
-            .field("filters", &self.filters)
             .finish()
     }
 }
@@ -186,17 +184,8 @@ impl fmt::Display for Operator {
                     .map(|c| c.to_string())
                     .collect::<Vec<String>>()
                     .join(", ");
-                if i.filters.is_empty() {
-                    write!(f, "Input([{cols}])")
-                } else {
-                    let filters = i
-                        .filters
-                        .iter()
-                        .map(|tf| tf.to_string())
-                        .collect::<Vec<String>>()
-                        .join(", ");
-                    write!(f, "Input([{cols}], filters: [{filters}])")
-                }
+                write!(f, "Input([{cols}])")
+
             }
             Operator::Projection(p) => {
                 let exprs: Vec<String> = p.projections.iter().map(|e| e.to_string()).collect();

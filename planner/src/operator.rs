@@ -10,7 +10,7 @@
 //! [`crate::compile`].
 
 use crate::catalog::{CreateTableRequest, DuckDBTableAdapter, Table};
-use crate::expression::{self, Expression, TableFilter};
+use crate::expression::{self, Expression};
 use crate::types::{self, type_from_logical};
 use duckdb_planner::operator as duckdb_operator;
 use std::any::Any;
@@ -33,7 +33,6 @@ pub enum Error {
 pub struct Input {
     pub table: Arc<dyn Table>,
     pub columns: Vec<Expression>,
-    pub filters: Vec<TableFilter>,
 }
 
 impl TryFrom<duckdb_operator::Input> for Input {
@@ -49,11 +48,6 @@ impl TryFrom<duckdb_operator::Input> for Input {
                 .into_iter()
                 .map(Expression::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
-            filters: s
-                .filters
-                .into_iter()
-                .map(TableFilter::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
@@ -66,17 +60,7 @@ impl fmt::Display for Input {
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        if self.filters.is_empty() {
-            write!(f, "Input([{cols}])")
-        } else {
-            let filters = self
-                .filters
-                .iter()
-                .map(|t| t.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            write!(f, "Input([{cols}], filters: [{filters}])")
-        }
+        write!(f, "Input([{cols}])")
     }
 }
 
