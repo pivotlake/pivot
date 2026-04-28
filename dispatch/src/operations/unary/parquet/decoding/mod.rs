@@ -242,6 +242,7 @@ mod tests {
                     data_page_offset: 0,
                     total_compressed_size: 0,
                     max_def_level: 0,
+                    statistics: None,
                 })
                 .collect(),
             num_rows,
