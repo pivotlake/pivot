@@ -1,0 +1,17 @@
+[package]
+name = "catalog"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+planner = { path = "../planner" }
+dispatch = { path = "../dispatch" }
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-ord = { path = "../arrow-rs/arrow-ord" }
+thiserror = "2.0.18"
+
+[dev-dependencies]
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+tempfile = "3"
+core_affinity = "0.8.3"

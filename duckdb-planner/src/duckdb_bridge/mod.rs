@@ -40,7 +40,7 @@ pub mod ffi {
         type CatalogContext;
         type OptionalTableWrapper;
         fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetTableResult;
-        fn pushdown_filter(table: &OptionalTableWrapper, filters_json: &str) -> bool;
+        fn pushdown_filter(table: &mut OptionalTableWrapper, filters_json: &str) -> bool;
     }
 
     unsafe extern "C++" {

@@ -10,7 +10,7 @@
 //! [`DuckDBTableAdapter`] implement DuckDB's [`DuckDBBind`] /
 //! [`DuckDBTable`] traits over our Pivot types. They exist as
 //! standalone wrapper structs (rather than blanket impls) because the orphan
-//! rule prevents implementing a foreign trait for `Arc<dyn Table>` directly.
+//! rule prevents implementing a foreign trait for `Box<dyn Table>` directly.
 
 use std::collections::HashMap;
 
@@ -67,7 +67,7 @@ pub trait Table: Debug + Send + Sync {
 
     // Try to pushdown a filter to table. Returns true if the filter was *FULLY* pushed down.
     // (IE if another filter operator after table input is not required later).
-    fn pushdown_filter(&self, _filter: TableFilter) -> bool {
+    fn pushdown_filter(&mut self, _filter: TableFilter) -> bool {
         false
     }
 }
@@ -77,7 +77,7 @@ pub trait Table: Debug + Send + Sync {
 /// Rust's orphan rule prevents implementing a foreign trait for a foreign type.
 #[derive(Debug)]
 pub struct DuckDBTableAdapter {
-    pub table: Arc<dyn Table>,
+    pub table: Box<dyn Table>,
 }
 
 impl DuckDBTable for DuckDBTableAdapter {
@@ -92,7 +92,7 @@ impl DuckDBTable for DuckDBTableAdapter {
             .collect()
     }
 
-    fn pushdown_filter(&self, filter: DuckDBTableFilter) -> bool {
+    fn pushdown_filter(&mut self, filter: DuckDBTableFilter) -> bool {
         match filter.try_into() {
             Ok(filter) => self.table.pushdown_filter(filter),
             Err(_) => false,
@@ -110,8 +110,11 @@ impl DuckDBTable for DuckDBTableAdapter {
 /// `create_table` is invoked at execution time (not at plan time) by the
 /// nullary operator that compiles a `CREATE TABLE` statement.
 pub trait Catalog: Debug + Send + Sync {
-    /// Resolve a table name to a [`Table`], or `None` if no such table exists.
-    fn table(&self, name: &str) -> Option<Arc<dyn Table>>;
+    /// Resolve a table name to a fresh, independently-mutable [`Table`], or
+    /// `None` if no such table exists. Each call returns a unique `Box`, so
+    /// per-query filter pushdown can mutate the table without affecting
+    /// concurrent queries.
+    fn table(&self, name: &str) -> Option<Box<dyn Table>>;
 
     /// Create a new table from a [`CreateTableRequest`]. Invoked at execution
     /// time by the nullary operator compiled from a `CREATE TABLE` statement,
@@ -128,8 +131,8 @@ pub struct DuckDBCatalogAdapter {
 }
 
 impl DuckDBBind for DuckDBCatalogAdapter {
-    fn try_bind(&self, name: &str) -> Option<Arc<dyn DuckDBTable>> {
+    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
         let table = self.catalog.table(name)?;
-        Some(Arc::new(DuckDBTableAdapter { table }))
+        Some(Box::new(DuckDBTableAdapter { table }))
     }
 }

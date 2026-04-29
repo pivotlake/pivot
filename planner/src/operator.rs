@@ -15,7 +15,6 @@ use crate::types::{self, type_from_logical};
 use duckdb_planner::operator as duckdb_operator;
 use std::any::Any;
 use std::fmt;
-use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -31,18 +30,19 @@ pub enum Error {
 /// and `filters` are predicates pushed down into the scan.
 #[derive(Debug)]
 pub struct Input {
-    pub table: Arc<dyn Table>,
+    pub table: Box<dyn Table>,
     pub columns: Vec<Expression>,
 }
 
 impl TryFrom<duckdb_operator::Input> for Input {
     type Error = Error;
     fn try_from(s: duckdb_operator::Input) -> Result<Self, Self::Error> {
-        let wrapper = (&*s.table as &dyn Any)
-            .downcast_ref::<DuckDBTableAdapter>()
+        let any: Box<dyn Any> = s.table;
+        let wrapper: Box<DuckDBTableAdapter> = any
+            .downcast::<DuckDBTableAdapter>()
             .expect("Input.table should be a DuckDBTableAdapter");
         Ok(Input {
-            table: wrapper.table.clone(),
+            table: wrapper.table,
             columns: s
                 .columns
                 .into_iter()

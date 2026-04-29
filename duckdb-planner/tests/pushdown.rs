@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A `users` table whose `pushdown_filter` answer is configurable per-test.
+#[derive(Clone)]
 struct UsersTable {
     accept_pushdown: bool,
 }
@@ -36,26 +37,26 @@ impl DuckDBTable for UsersTable {
         ]
     }
 
-    fn pushdown_filter(&self, _filter: TableFilter) -> bool {
+    fn pushdown_filter(&mut self, _filter: TableFilter) -> bool {
         self.accept_pushdown
     }
 }
 
 struct TestCatalog {
-    tables: HashMap<String, Arc<dyn DuckDBTable>>,
+    tables: HashMap<String, Box<UsersTable>>,
 }
 
 impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, name: &str) -> Option<Arc<dyn DuckDBTable>> {
-        self.tables.get(name).cloned()
+    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
+        self.tables.get(name).cloned().map(|t| t as _)
     }
 }
 
 fn planner_with(accept_pushdown: bool) -> PlannerContext {
-    let mut tables: HashMap<String, Arc<dyn DuckDBTable>> = HashMap::new();
+    let mut tables: HashMap<String, Box<UsersTable>> = HashMap::new();
     tables.insert(
         "users".to_string(),
-        Arc::new(UsersTable { accept_pushdown }),
+        Box::new(UsersTable { accept_pushdown }),
     );
     PlannerContext::new(Arc::new(TestCatalog { tables }))
 }
