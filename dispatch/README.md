@@ -48,7 +48,7 @@ even if you make code changes- there will just be more misses and it will fallba
 # This would run once for all queries- this can take a few minutes
 just pgo-gen bench --bench clickbench
 # You can choose certain queries to optimize on so gen takes less time
-QUERY=33,23 just pgo-gen --bench clickbench
+QUERY=33,23 just pgo-gen bench --bench clickbench
 
 # 2. Run with optimized build- this should hopefully NOT take a few minutes :)
 QUERY=33,23 QUERY_TEST_COUNT=3 just pgo-use bench --bench clickbench

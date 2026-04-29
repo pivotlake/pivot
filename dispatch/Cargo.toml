@@ -35,6 +35,10 @@ nix = { version = "0.31.2", features = ["fs", "uio"] }
 parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
 tempfile = "3"
 
+[profile.profiling]
+inherits = "release"
+debug = true
+
 [[bench]]
 name = "clickbench"
 harness = false
