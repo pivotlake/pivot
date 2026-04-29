@@ -12,11 +12,14 @@ use crate::common::*;
 /// Stand-in for a real table that records every `pushdown_filter` call so the
 /// test can assert what DuckDB tried to push, and answers `accept_pushdown`
 /// to drive the "rejected" vs "accepted" plan shapes.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RecordingTable {
     columns: Vec<Column>,
     accept_pushdown: bool,
-    received: Mutex<Vec<TableFilter>>,
+    /// Shared between the original (held by the test) and the per-binding
+    /// clone (held by the catalog), so a test can inspect filters that were
+    /// pushed into the clone.
+    received: Arc<Mutex<Vec<TableFilter>>>,
 }
 
 impl RecordingTable {
@@ -24,7 +27,7 @@ impl RecordingTable {
         Self {
             columns,
             accept_pushdown,
-            received: Mutex::new(Vec::new()),
+            received: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -38,7 +41,7 @@ impl Table for RecordingTable {
         self.columns.clone()
     }
 
-    fn pushdown_filter(&self, filter: TableFilter) -> bool {
+    fn pushdown_filter(&mut self, filter: TableFilter) -> bool {
         self.received.lock().unwrap().push(filter);
         self.accept_pushdown
     }
@@ -49,12 +52,12 @@ impl Table for RecordingTable {
 #[derive(Debug)]
 struct SingleTableCatalog {
     name: String,
-    table: Arc<dyn Table>,
+    table: RecordingTable,
 }
 
 impl Catalog for SingleTableCatalog {
-    fn table(&self, name: &str) -> Option<Arc<dyn Table>> {
-        (name == self.name).then(|| self.table.clone())
+    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+        (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn Table>)
     }
 
     fn create_table(&self, _request: CreateTableRequest) -> planner::catalog::Result<()> {
@@ -75,11 +78,11 @@ fn two_int_cols() -> Vec<Column> {
     ]
 }
 
-fn build_planner(table: Arc<RecordingTable>) -> Planner {
+fn build_planner(table: RecordingTable) -> Planner {
     init();
     let catalog = Arc::new(SingleTableCatalog {
         name: "t".to_string(),
-        table: table as Arc<dyn Table>,
+        table,
     });
     Planner::new(catalog)
 }
@@ -88,8 +91,8 @@ fn build_planner(table: Arc<RecordingTable>) -> Planner {
 /// what the planner shows in `Input([...])`.
 #[test]
 fn catalog_resolves_named_table() {
-    let table = Arc::new(RecordingTable::new(two_int_cols(), false));
-    let mut planner = build_planner(table);
+    let table = RecordingTable::new(two_int_cols(), false);
+    let mut planner = build_planner(table.clone());
 
     let plan = planner.plan("SELECT a, b FROM t").unwrap();
 
@@ -102,8 +105,8 @@ fn catalog_resolves_named_table() {
 /// Unknown table names surface as a planning error rather than panicking.
 #[test]
 fn catalog_returns_error_for_unknown_table() {
-    let table = Arc::new(RecordingTable::new(two_int_cols(), false));
-    let mut planner = build_planner(table);
+    let table = RecordingTable::new(two_int_cols(), false);
+    let mut planner = build_planner(table.clone());
 
     let err = planner.plan("SELECT a FROM nonexistent").unwrap_err();
     let msg = err.to_string();
@@ -126,7 +129,7 @@ fn pushdown_snapshot(received: &[TableFilter]) -> String {
 /// the predicate DuckDB tried to push.
 #[test]
 fn pushdown_rejected_keeps_filter_operator() {
-    let table = Arc::new(RecordingTable::new(two_int_cols(), false));
+    let table = RecordingTable::new(two_int_cols(), false);
     let mut planner = build_planner(table.clone());
 
     let plan = planner.plan("SELECT a FROM t WHERE a <> 0").unwrap();
@@ -147,7 +150,7 @@ fn pushdown_rejected_keeps_filter_operator() {
 /// table's responsibility.
 #[test]
 fn pushdown_accepted_drops_filter_operator() {
-    let table = Arc::new(RecordingTable::new(two_int_cols(), true));
+    let table = RecordingTable::new(two_int_cols(), true);
     let mut planner = build_planner(table.clone());
 
     let plan = planner.plan("SELECT a FROM t WHERE a <> 0").unwrap();
@@ -165,7 +168,7 @@ fn pushdown_accepted_drops_filter_operator() {
 /// Queries without a `WHERE` clause never invoke `pushdown_filter`.
 #[test]
 fn no_where_clause_skips_pushdown() {
-    let table = Arc::new(RecordingTable::new(two_int_cols(), true));
+    let table = RecordingTable::new(two_int_cols(), true);
     let mut planner = build_planner(table.clone());
 
     let _plan = planner.plan("SELECT a FROM t").unwrap();

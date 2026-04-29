@@ -434,7 +434,7 @@ struct RecordingCatalog {
 }
 
 impl Catalog for RecordingCatalog {
-    fn table(&self, _name: &str) -> Option<Arc<dyn Table>> {
+    fn table(&self, _name: &str) -> Option<Box<dyn Table>> {
         None
     }
 

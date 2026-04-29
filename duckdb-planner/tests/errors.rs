@@ -21,9 +21,9 @@ impl DuckDBTable for TTable {
 struct TestCatalog;
 
 impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, table_name: &str) -> Option<Arc<dyn DuckDBTable>> {
+    fn try_bind(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
-            "t" => Some(Arc::new(TTable)),
+            "t" => Some(Box::new(TTable)),
             _ => None,
         }
     }

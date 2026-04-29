@@ -5,6 +5,7 @@ use rstest::fixture;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Clone)]
 struct ColTable {
     columns: Vec<(String, u8)>,
 }
@@ -22,12 +23,12 @@ impl DuckDBTable for ColTable {
 }
 
 struct TestCatalog {
-    tables: HashMap<String, Arc<dyn DuckDBTable>>,
+    tables: HashMap<String, Box<ColTable>>,
 }
 
 impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, name: &str) -> Option<Arc<dyn DuckDBTable>> {
-        self.tables.get(name).cloned()
+    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
+        self.tables.get(name).cloned().map(|t| t as _)
     }
 }
 
@@ -50,7 +51,7 @@ pub fn planner() -> PlannerContext {
         .iter()
         .map(|(n, t)| (n.to_string(), t.clone() as u8))
         .collect();
-    let mut tables: HashMap<String, Arc<dyn DuckDBTable>> = HashMap::new();
-    tables.insert("users".to_string(), Arc::new(ColTable { columns }));
+    let mut tables: HashMap<String, Box<ColTable>> = HashMap::new();
+    tables.insert("users".to_string(), Box::new(ColTable { columns }));
     PlannerContext::new(Arc::new(TestCatalog { tables }))
 }

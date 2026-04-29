@@ -27,9 +27,9 @@
 //! struct MyCatalog;
 //!
 //! impl DuckDBBind for MyCatalog {
-//!     fn try_bind(&self, name: &str) -> Option<Arc<dyn DuckDBTable>> {
+//!     fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
 //!         match name {
-//!             "users" => Some(Arc::new(UsersTable)),
+//!             "users" => Some(Box::new(UsersTable)),
 //!             _ => None,
 //!         }
 //!     }
@@ -149,12 +149,12 @@ impl PlannerContext {
         let plan: PlanResult = serde_json::from_str(&result.json)?;
         match plan {
             PlanResult::Success(plan) => {
-                let tables: Vec<Arc<dyn catalog_provider::DuckDBTable>> = result
+                let tables: Vec<Box<dyn catalog_provider::DuckDBTable>> = result
                     .tables
                     .into_iter()
-                    .filter_map(|ot| ot.table)
+                    .map(|ot| ot.table.expect("planner returned an unbound table"))
                     .collect();
-                Ok(plan.resolve_inputs(&tables))
+                Ok(plan.resolve_inputs(tables))
             }
             PlanResult::Error(err) => Err(err.into_error()),
         }

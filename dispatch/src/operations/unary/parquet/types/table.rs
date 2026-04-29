@@ -62,6 +62,17 @@ impl ParquetTable {
         Self { row_groups }
     }
 
+    /// Read-only view of this table's row groups.
+    pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
+        &self.row_groups
+    }
+
+    /// Mutable access to this table's row groups. Used by callers that need
+    /// to prune the row-group set in place (e.g. catalog-side filter pushdown).
+    pub fn row_groups_mut(&mut self) -> &mut Vec<Arc<RowGroupMetadata>> {
+        &mut self.row_groups
+    }
+
     /// Creates a table from every Parquet file in `path`.
     ///
     /// Reads and parses the Thrift footer of each file, opens the file with

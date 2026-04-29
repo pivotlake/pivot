@@ -1,7 +1,6 @@
 //! The [`PlanNode`] tree that represents a deserialized DuckDB logical plan.
 
 use std::fmt;
-use std::sync::Arc;
 
 use crate::catalog_provider::DuckDBTable;
 use crate::operator::Operator;
@@ -50,13 +49,22 @@ impl PlanNode {
     }
 
     /// Walk the plan tree and turn each `RawInput` into a resolved
-    /// [`Input`](crate::operator::Input) by looking up the `table_id` in the
-    /// `tables` vector.
-    pub(crate) fn resolve_inputs(mut self, tables: &[Arc<dyn DuckDBTable>]) -> Self {
+    /// [`Input`](crate::operator::Input), moving the `Box<dyn DuckDBTable>`
+    /// at index `table_id` out of `tables`.
+    ///
+    /// `Box<dyn DuckDBTable>` is not `Clone`, so each `table_id` must be
+    /// referenced by at most one `RawInput`. The walker enforces this by
+    /// wrapping each table with Option, and swapping out the table when accessed.
+    pub(crate) fn resolve_inputs(self, tables: Vec<Box<dyn DuckDBTable>>) -> Self {
+        let mut slots: Vec<Option<Box<dyn DuckDBTable>>> = tables.into_iter().map(Some).collect();
+        self.resolve_inputs_walker(&mut slots)
+    }
+
+    fn resolve_inputs_walker(mut self, tables: &mut [Option<Box<dyn DuckDBTable>>]) -> Self {
         self.inputs = self
             .inputs
             .into_iter()
-            .map(|n| n.resolve_inputs(tables))
+            .map(|n| n.resolve_inputs_walker(tables))
             .collect();
 
         let Operator::RawInput(raw) = self.operator else {
@@ -67,7 +75,9 @@ impl PlanNode {
             name: self.name,
             inputs: self.inputs,
             operator: Operator::Input(crate::operator::Input {
-                table: tables[raw.table_id].clone(),
+                table: tables[raw.table_id]
+                    .take()
+                    .expect("table id already consumed by another Input"),
                 columns: raw.columns,
             }),
         }
