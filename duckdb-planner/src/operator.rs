@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 
 use crate::duckdb_bridge::duckdb_types::{LogicalOperatorType, OrderType};
 use crate::expression::{Expression, type_name};
@@ -24,9 +23,9 @@ pub struct RawInput {
 
 /// Resolved table scan with the `DuckDBTable` trait object attached.
 /// Produced from [`RawInput`] after the planning phase resolves `table_id`
-/// to an `Arc<dyn DuckDBTable>` provided by the [`DuckDBBind`](crate::DuckDBBind).
+/// to a `Box<dyn DuckDBTable>` provided by the [`DuckDBBind`](crate::DuckDBBind).
 pub struct Input {
-    pub table: Arc<dyn crate::catalog_provider::DuckDBTable>,
+    pub table: Box<dyn crate::catalog_provider::DuckDBTable>,
     pub columns: Vec<Expression>,
 }
 

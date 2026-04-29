@@ -9,7 +9,7 @@ use crate::expression::TableFilter;
 ///
 /// Implement this trait for tables in your schema and return instances
 /// from [`DuckDBBind::try_bind`]. The planner uses [`duckdb_typed_columns`](DuckDBTable::duckdb_typed_columns)
-/// to resolve column names and types, and attaches the `Arc<dyn DuckDBTable>` to the
+/// to resolve column names and types, and attaches the `Box<dyn DuckDBTable>` to the
 /// resulting [`Input`](crate::operator::Input) operator so downstream consumers
 /// can identify which table is being scanned.
 pub trait DuckDBTable: Any {
@@ -18,30 +18,28 @@ pub trait DuckDBTable: Any {
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn>;
 
     /// Called from DuckDB's `pushdown_complex_filter` hook with the current
-    /// scan-local filter expressions serialized as JSON.
+    /// scan-local filter expressions deserialized into a [`TableFilter`].
     ///
-    /// The JSON payload is a list of DuckDB expression objects in the same
-    /// shape used by the planner bridge internally. Implementors that care
-    /// about pre-statistics filter state can deserialize or stash the values
-    /// here. The default implementation ignores the callback.
-    fn pushdown_filter(&self, _filter: TableFilter) -> bool {
+    /// Implementors that care about pre-statistics filter state can stash the
+    /// values here. The default implementation ignores the callback.
+    fn pushdown_filter(&mut self, _filter: TableFilter) -> bool {
         false
     }
 }
 
-/// Newtype around `Option<Arc<dyn DuckDBTable>>` needed because CXX cannot declare
+/// Newtype around `Option<Box<dyn DuckDBTable>>` needed because CXX cannot declare
 /// generic opaque types in `extern "Rust"` blocks. This gives us a concrete
 /// name that CXX can reference while still carrying an optional
 /// `DuckDBTable` trait object across the FFI boundary.
 #[derive(Default)]
 pub struct OptionalTableWrapper {
-    pub table: Option<Arc<dyn DuckDBTable>>,
+    pub table: Option<Box<dyn DuckDBTable>>,
 }
 
 pub trait DuckDBBind {
     /// Given a table name, return a table/object that implements [`DuckDBTable`] with column definitions.
     /// Returns `None` if the table doesn't exist.
-    fn try_bind(&self, name: &str) -> Option<Arc<dyn DuckDBTable>>;
+    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>>;
 }
 
 /// Wraps an `Arc<dyn DuckDBBind>` for the C++ bridge.
@@ -80,8 +78,8 @@ pub(crate) fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetT
     }
 }
 
-pub(crate) fn pushdown_filter(table: &OptionalTableWrapper, filter_json: &str) -> bool {
-    let Some(table) = &table.table else {
+pub(crate) fn pushdown_filter(table: &mut OptionalTableWrapper, filter_json: &str) -> bool {
+    let Some(table) = table.table.as_mut() else {
         return false;
     };
 

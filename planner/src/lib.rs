@@ -46,14 +46,23 @@
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
 //! }
 //!
+//! #[derive(Clone, Debug)]
+//! struct MyTableTemplate {
+//!     parquet: Arc<ParquetTable>,
+//!     columns: Vec<Column>,
+//! }
+//!
 //! #[derive(Debug)]
 //! struct MyCatalog {
-//!     tables: HashMap<String, Arc<dyn Table>>,
+//!     tables: HashMap<String, MyTableTemplate>,
 //! }
 //!
 //! impl Catalog for MyCatalog {
-//!     fn table(&self, name: &str) -> Option<Arc<dyn Table>> {
-//!         self.tables.get(name).cloned()
+//!     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+//!         self.tables
+//!             .get(name)
+//!             .cloned()
+//!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn Table>)
 //!     }
 //!     fn create_table(&self, _req: CreateTableRequest) -> planner::catalog::Result<()> {
 //!         unimplemented!("this catalog is read-only")
@@ -62,13 +71,13 @@
 //!
 //! // Wire one parquet directory into the catalog under the name "hits".
 //! let parquet = Arc::new(ParquetTable::from_directory(Path::new("/tmp/hits")).unwrap());
-//! let hits = Arc::new(MyTable {
+//! let template = MyTableTemplate {
 //!     parquet,
 //!     columns: vec![Column { name: "URL".into(), col_type: Type::Utf8 }],
-//! }) as Arc<dyn Table>;
+//! };
 //!
 //! let mut tables = HashMap::new();
-//! tables.insert("hits".to_string(), hits);
+//! tables.insert("hits".to_string(), template);
 //! let catalog = Arc::new(MyCatalog { tables });
 //!
 //! let mut planner = Planner::new(catalog);

@@ -26,9 +26,9 @@ pub fn init() {
     INIT.call_once(|| dispatch::init(core_affinity::get_core_ids().unwrap().len()));
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TestTable {
-    _dir: TempDir,
+    _dir: Arc<TempDir>,
     parquet_table: Arc<ParquetTable>,
     columns: Vec<Column>,
 }
@@ -64,7 +64,7 @@ impl TestTable {
             .collect();
 
         TestTable {
-            _dir: dir,
+            _dir: Arc::new(dir),
             parquet_table,
             columns: cols,
         }
@@ -86,7 +86,7 @@ impl Table for TestTable {
 /// that need extra schemas can register them at the start of the test.
 #[derive(Debug)]
 pub struct TestCatalog {
-    tables: Mutex<HashMap<String, Arc<dyn Table>>>,
+    tables: Mutex<HashMap<String, TestTable>>,
 }
 
 impl TestCatalog {
@@ -101,14 +101,21 @@ impl TestCatalog {
     /// to the shared catalog so the existing `testing_planner` can plan
     /// queries against it.
     pub fn add_table(&self, name: &str, columns: &[(&str, Type, ArrayRef)]) {
-        let table: Arc<dyn Table> = Arc::new(TestTable::new(columns));
-        self.tables.lock().unwrap().insert(name.to_string(), table);
+        self.tables
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), TestTable::new(columns));
     }
 }
 
 impl Catalog for TestCatalog {
-    fn table(&self, name: &str) -> Option<Arc<dyn Table>> {
-        self.tables.lock().unwrap().get(name).cloned()
+    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+        self.tables
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .map(|t| Box::new(t) as _)
     }
 
     fn create_table(
