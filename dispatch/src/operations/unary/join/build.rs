@@ -187,6 +187,8 @@ impl JoinPartitionJob {
                 let count = std::cmp::min(slab_size, total_left);
 
                 for i in 0..count {
+
+
                     let (hash, value) = unsafe { *(ptr.add(i) ) };
                     let slot = (hash >> shift) as usize;
                     let entry = directory.entry(slot).wrapping_sub(1 << 16);
@@ -232,6 +234,13 @@ impl Outputter<()> for JoinBuilder {
                     ))
                 }
             };
+
+            // Sentinel at entry[capacity] holds the end pointer of the last slot.
+            // Probe reads end_ptr(slot+1) for slot = capacity-1, which lands here.
+            match directory {
+                JoinDirectory::Contiguous(d) => d.set_entry(dir_capacity, (total as u64) << 16),
+                JoinDirectory::NonContiguous(d) => d.set_entry(dir_capacity, (total as u64) << 16),
+            }
 
             // let mut alloc = SlabAllocator::new(false);
             // *directory =  JoinDirectory::NonContiguous(Directory::new(

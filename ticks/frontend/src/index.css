@@ -1,0 +1,25 @@
+:root {
+  --bg: #0d0f12;
+  --bg-2: #14171c;
+  --bg-3: #1c2026;
+  --fg: #c4c8cc;
+  --fg-dim: #6a7079;
+  --fg-mute: #3a3f46;
+  --green: #4ec97a;
+  --yellow: #d6a73d;
+  --red: #ec5f7a;
+  --magenta: #c170d3;
+  --cyan: #57c7e3;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.45;
+}
