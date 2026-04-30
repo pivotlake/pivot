@@ -209,6 +209,37 @@ fn filter_not_equal_constant(mut testing_planner: TestingPlanner) {
     );
 }
 
+#[rstest]
+fn filter_equal_constant(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a = 3")
+        .unwrap()
+        .compile()
+        .unwrap()
+        .collect();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(
+        rows,
+        serde_json::json!([{"a": 3}]).as_array().unwrap().clone()
+    );
+}
+
+#[rstest]
+fn filter_equal_no_match(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a = 999")
+        .unwrap()
+        .compile()
+        .unwrap()
+        .collect();
+
+    let rows = batches_to_json(&results);
+    assert!(rows.is_empty(), "expected no rows, got: {rows:?}");
+}
+
 // ---------------------------------------------------------------------------
 // OrderBy tests
 // ---------------------------------------------------------------------------

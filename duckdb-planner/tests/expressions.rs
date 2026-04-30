@@ -62,6 +62,35 @@ fn compare_notequal_structure(mut planner: PlannerContext) {
     ");
 }
 
+/// Equality compares deserialize as `Compare` (same variant as `<>`) thanks
+/// to the multi-tag `#[type_tag]` on `Expression::Compare`.
+#[rstest]
+fn compare_equal_structure(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT * FROM users WHERE score = 0")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(#1:INTEGER, #2:VARCHAR, #0:INTEGER, #3:INTEGER, #4:BOOLEAN)
+      Filter(#0:INTEGER = 0:INTEGER -> BOOLEAN)
+        Input([#2:INTEGER, #0:INTEGER, #1:VARCHAR, #3:INTEGER, #4:BOOLEAN])
+    ");
+}
+
+/// `=` between two columns also lands on `Expression::Compare`.
+#[rstest]
+fn compare_equal_two_columns(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT id FROM users WHERE id = score")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(#0:INTEGER)
+      Filter(#0:INTEGER = #1:INTEGER -> BOOLEAN)
+        Input([#0:INTEGER, #2:INTEGER])
+    ");
+}
+
 // ---- Function expressions ----
 
 #[rstest]

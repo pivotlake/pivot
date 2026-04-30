@@ -12,6 +12,13 @@ use crate::expression::TableFilter;
 /// to resolve column names and types, and attaches the `Box<dyn DuckDBTable>` to the
 /// resulting [`Input`](crate::operator::Input) operator so downstream consumers
 /// can identify which table is being scanned.
+/// Type-erased error that crosses the FFI boundary as a C++ exception (CXX
+/// converts via `Display`).
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Result alias for fallible [`DuckDBTable`] / bridge operations.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 pub trait DuckDBTable: Any {
     /// The ordered list of columns in this table, used by the planner to
     /// resolve column references and determine output types.
@@ -20,10 +27,11 @@ pub trait DuckDBTable: Any {
     /// Called from DuckDB's `pushdown_complex_filter` hook with the current
     /// scan-local filter expressions deserialized into a [`TableFilter`].
     ///
-    /// Implementors that care about pre-statistics filter state can stash the
-    /// values here. The default implementation ignores the callback.
-    fn pushdown_filter(&mut self, _filter: TableFilter) -> bool {
-        false
+    /// Returns `Ok(true)` when the filter was fully consumed by the table
+    /// (DuckDB drops it from the scan), `Ok(false)` to keep it. Errors are
+    /// surfaced to C++ as exceptions.
+    fn pushdown_filter(&mut self, _filter: TableFilter) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -78,14 +86,11 @@ pub(crate) fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetT
     }
 }
 
-pub(crate) fn pushdown_filter(table: &mut OptionalTableWrapper, filter_json: &str) -> bool {
-    let Some(table) = table.table.as_mut() else {
-        return false;
-    };
-
-    let filter = match serde_json::from_str::<TableFilter>(filter_json) {
-        Ok(filter) => filter,
-        Err(err) => panic!("invalid pushdown filter payload from C++ bridge: {err}"),
-    };
+pub(crate) fn pushdown_filter(table: &mut OptionalTableWrapper, filter_json: &str) -> Result<bool> {
+    let table = table
+        .table
+        .as_mut()
+        .ok_or_else(|| -> Error { "pushdown_filter called on unbound table".into() })?;
+    let filter = serde_json::from_str::<TableFilter>(filter_json)?;
     table.pushdown_filter(filter)
 }

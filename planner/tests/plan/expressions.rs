@@ -29,6 +29,34 @@ fn compare_notequal_columns(mut testing_planner: TestingPlanner) {
     ");
 }
 
+/// `Compare(Equal)` between two column references.
+#[rstest]
+fn compare_equal_columns(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a = b")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int32)
+      Filter(#0:Int32 = #1:Int32 -> Boolean)
+        Input([#0:Int32, #1:Int32])
+    ");
+}
+
+/// `Compare(Equal)` against a constant — same shape as `<>`, displayed as `=`.
+#[rstest]
+fn compare_equal_constant(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a = 5")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int32)
+      Filter(#0:Int32 = 5:Int32 -> Boolean)
+        Input([#0:Int32])
+    ");
+}
+
 /// `Constant` (integer) on the RHS of a comparison.
 #[rstest]
 fn constant_integer(mut testing_planner: TestingPlanner) {

@@ -41,9 +41,9 @@ impl Table for RecordingTable {
         self.columns.clone()
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> bool {
+    fn pushdown_filter(&mut self, filter: TableFilter) -> planner::catalog::Result<bool> {
         self.received.lock().unwrap().push(filter);
-        self.accept_pushdown
+        Ok(self.accept_pushdown)
     }
 }
 
