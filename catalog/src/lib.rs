@@ -28,7 +28,7 @@ use dispatch::{
 use planner::catalog::{
     Catalog, Column, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
 };
-use planner::expression::{CompareType, ConstantComparison, Expression, Ref, TableFilter};
+use planner::expression::{Compare, CompareType, Expression, Ref, TableFilter};
 use thiserror::Error;
 
 const PATH_OPTION: &str = "path";
@@ -47,6 +47,8 @@ pub enum Error {
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
     TableExists(String),
+    #[error(transparent)]
+    Arrow(#[from] arrow_schema::ArrowError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -142,55 +144,76 @@ impl Table for ParquetCatalogTable {
         self.columns.clone()
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> bool {
-        let TableFilter::ConstantComparison(cmp) = filter else {
-            return false;
+    fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
+        let TableFilter::Expression(expr) = filter else {
+            return Ok(false);
+        };
+        let Expression::Compare(compare) = expr.as_ref() else {
+            return Ok(false);
+        };
+        let (reference, constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
+            (Expression::Ref(r), Expression::Constant(k))
+            | (Expression::Constant(k), Expression::Ref(r)) => (r, k),
+            _ => return Ok(false),
         };
 
-        let Expression::Ref(reference) = cmp.column_ref.as_ref() else {
-            return false;
-        };
+        let mut retain_err = Ok(());
+        self.parquet.row_groups_mut().retain(|rg| {
+            match should_filter_row_group(rg, compare, reference, constant) {
+                Ok(b) => !b,
+                Err(e) => {
+                    retain_err = Err(e);
+                    true
+                }
+            }
+        });
+        retain_err?;
 
-        self.parquet
-            .row_groups_mut()
-            .retain(|rg| should_retain_row_group(rg, reference, &cmp));
-
-        false
+        Ok(false)
     }
 }
 
-/// Decide whether a row group could contain rows satisfying the predicate,
-/// based on the column's min/max statistics. Returns `true` to keep the row
-/// group (it might match and must be scanned) and `false` to prune it.
-fn should_retain_row_group(
+/// Decide whether a row group can be skipped (filtered out) for the given
+/// predicate, based on the column's min/max statistics. Returns `Ok(true)`
+/// to drop the row group, `Ok(false)` to keep it.
+///
+/// When stats are missing we return `Ok(false)` — a missing bound is not
+/// proof of absence, so the row group must still be scanned.
+fn should_filter_row_group(
     row_group: &RowGroupMetadata,
+    compare: &Compare,
     column: &Ref,
-    compare: &ConstantComparison,
-) -> bool {
+    constant: &Scalar<ArrayRef>,
+) -> Result<bool> {
     let Some(stats) = row_group
         .columns
         .get(column.column_idx)
         .and_then(|c| c.statistics.as_ref())
     else {
-        return true;
+        return Ok(false);
     };
     let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
-        return true;
+        return Ok(false);
     };
 
-    match compare.compare_type {
+    Ok(match compare.compare_type {
         // `col <> k` is true on every row unless every row in this group
-        // equals `k`
+        // equals `k` — provable only when min == max == k.
         CompareType::NotEqual => {
-            !(scalars_equal(min, &compare.constant) && scalars_equal(max, &compare.constant))
+            bool_kernel(min, constant, arrow_ord::cmp::eq)? && bool_kernel(max, constant, arrow_ord::cmp::eq)?
         }
-    }
+        // `col = k` can never match when k is strictly outside [min, max].
+        CompareType::Equal => {
+            bool_kernel(constant, min, arrow_ord::cmp::lt)? || bool_kernel(constant, max, arrow_ord::cmp::gt)?
+        }
+    })
 }
 
-fn scalars_equal(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
-    let result: BooleanArray = match arrow_ord::cmp::eq(a as &dyn Datum, b as &dyn Datum) {
-        Ok(arr) => arr,
-        Err(_) => return false,
-    };
-    result.len() == 1 && result.value(0)
+fn bool_kernel(
+    a: &Scalar<ArrayRef>,
+    b: &Scalar<ArrayRef>,
+    kernel: fn(&dyn Datum, &dyn Datum) -> Result<BooleanArray, arrow_schema::ArrowError>,
+) -> Result<bool> {
+    let result = kernel(a as &dyn Datum, b as &dyn Datum)?;
+    Ok(result.len() == 1 && result.value(0))
 }

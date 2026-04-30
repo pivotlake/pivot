@@ -14,8 +14,6 @@ use thiserror::Error;
 pub enum Error {
     #[error("{0}")]
     TypeError(#[from] types::Error),
-    #[error("Equality comparisons are not supported yet")]
-    UnsupportedEqualityComparison,
     #[error("Unsupported comparison type: {0:?}")]
     UnsupportedComparisonType(ExpressionType),
     #[error("Unsupported aggregate function: {0}")]
@@ -49,6 +47,7 @@ impl TryFrom<duckdb_expression::Ref> for Ref {
 
 #[derive(Debug, Clone)]
 pub enum CompareType {
+    Equal,
     NotEqual,
 }
 
@@ -56,8 +55,8 @@ impl TryFrom<ExpressionType> for CompareType {
     type Error = Error;
     fn try_from(c: ExpressionType) -> Result<Self, Self::Error> {
         match c {
+            ExpressionType::COMPARE_EQUAL => Ok(CompareType::Equal),
             ExpressionType::COMPARE_NOTEQUAL => Ok(CompareType::NotEqual),
-            ExpressionType::COMPARE_EQUAL => Err(Error::UnsupportedEqualityComparison),
             _ => Err(Error::UnsupportedComparisonType(c)),
         }
     }
@@ -174,6 +173,7 @@ pub enum Expression {
 impl Display for CompareType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CompareType::Equal => f.write_str("="),
             CompareType::NotEqual => f.write_str("<>"),
         }
     }

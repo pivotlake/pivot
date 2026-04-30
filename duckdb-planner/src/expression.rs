@@ -71,6 +71,7 @@ pub struct Function {
 pub enum Expression {
     #[type_tag(ExpressionType::BOUND_REF)]
     Ref(Ref),
+    #[type_tag(ExpressionType::COMPARE_EQUAL)]
     #[type_tag(ExpressionType::COMPARE_NOTEQUAL)]
     Compare(Compare),
     #[type_tag(ExpressionType::VALUE_CONSTANT)]

@@ -79,12 +79,20 @@ fn derive_enum(input: &DeriveInput) -> TokenStream {
             _ => panic!("each variant must be a single-element tuple variant, e.g. Foo(Bar)"),
         };
 
-        let disc: Option<Expr> = variant.attrs.iter().find_map(|attr| {
-            if !attr.path().is_ident("type_tag") {
-                return None;
-            }
-            attr.parse_args::<Expr>().ok()
-        });
+        // A variant can carry multiple `#[type_tag(...)]` attrs — useful when
+        // several DuckDB constants should map to the same Rust variant
+        // (e.g. both `COMPARE_EQUAL` and `COMPARE_NOTEQUAL` deserialize as
+        // `Compare`).
+        let discs: Vec<Expr> = variant
+            .attrs
+            .iter()
+            .filter_map(|attr| {
+                if !attr.path().is_ident("type_tag") {
+                    return None;
+                }
+                attr.parse_args::<Expr>().ok()
+            })
+            .collect();
 
         let custom_deser: Option<Expr> = variant.attrs.iter().find_map(|attr| {
             if !attr.path().is_ident("custom_deserialize") {
@@ -102,15 +110,16 @@ fn derive_enum(input: &DeriveInput) -> TokenStream {
             },
         };
 
-        let condition = match disc {
-            Some(d) => quote! {
-                serde_json::Value::Number(ref n) if n.as_u64() == Some(#d as u64)
-            },
-            None => {
-                let name_lower = variant_name.to_string().to_lowercase();
-                quote! {
-                    serde_json::Value::String(ref s) if s == #name_lower
-                }
+        let condition = if discs.is_empty() {
+            let name_lower = variant_name.to_string().to_lowercase();
+            quote! {
+                serde_json::Value::String(ref s) if s == #name_lower
+            }
+        } else {
+            // Generate `n.as_u64() == Some(D1 as u64) || n.as_u64() == Some(D2 as u64) || ...`.
+            let checks = discs.iter().map(|d| quote! { n.as_u64() == Some(#d as u64) });
+            quote! {
+                serde_json::Value::Number(ref n) if #(#checks)||*
             }
         };
 

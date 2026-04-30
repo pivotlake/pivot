@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use catalog::{ParquetCatalog, ParquetCatalogTable};
 use planner::catalog::{Catalog as PlannerCatalog, Column, CreateTableRequest, Table};
-use planner::expression::{CompareType, ConstantComparison, Expression, Ref, TableFilter};
+use planner::expression::{Compare, CompareType, Expression, Ref, TableFilter};
 use planner::types::Type;
 
 /// Write a parquet file containing each batch as its own row group, so a
@@ -76,14 +76,29 @@ fn int_constant(v: i32) -> Scalar<ArrayRef> {
 }
 
 fn col_neq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> TableFilter {
-    TableFilter::ConstantComparison(ConstantComparison {
-        column_ref: Box::new(Expression::Ref(Ref {
+    constant_comparison(column_idx, CompareType::NotEqual, constant)
+}
+
+fn col_eq_filter(column_idx: usize, constant: Scalar<ArrayRef>) -> TableFilter {
+    constant_comparison(column_idx, CompareType::Equal, constant)
+}
+
+fn constant_comparison(
+    column_idx: usize,
+    compare_type: CompareType,
+    constant: Scalar<ArrayRef>,
+) -> TableFilter {
+    // Build the same shape DuckDB pushes through the C++ bridge:
+    // `TableFilter::Expression(Compare { Ref, Constant })`.
+    TableFilter::Expression(Box::new(Expression::Compare(Compare {
+        left: Box::new(Expression::Ref(Ref {
             column_idx,
             return_type: Type::Int32,
         })),
-        compare_type: CompareType::NotEqual,
-        constant,
-    })
+        right: Box::new(Expression::Constant(constant)),
+        compare_type,
+        return_type: Type::Boolean,
+    })))
 }
 
 fn row_group_count(table: &ParquetCatalogTable) -> usize {
@@ -155,7 +170,9 @@ fn pushdown_filter_always_returns_false() {
         .create_table(create_request("t", dir.path(), columns))
         .unwrap();
     let mut table = catalog.parquet_table("t").unwrap();
-    let pushed = table.pushdown_filter(col_neq_filter(0, int_constant(20)));
+    let pushed = table
+        .pushdown_filter(col_neq_filter(0, int_constant(20)))
+        .unwrap();
     assert!(!pushed);
 }
 
@@ -170,7 +187,9 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     let mut table = catalog.parquet_table("t").unwrap();
     assert_eq!(row_group_count(&table), 3);
 
-    table.pushdown_filter(col_neq_filter(0, int_constant(20)));
+    table
+        .pushdown_filter(col_neq_filter(0, int_constant(20)))
+        .unwrap();
 
     // Row group whose single value is 20 has min == max == 20 and is pruned.
     assert_eq!(row_group_count(&table), 2);
@@ -187,12 +206,60 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
         .unwrap();
 
     let mut first = catalog.parquet_table("t").unwrap();
-    first.pushdown_filter(col_neq_filter(0, int_constant(20)));
+    first
+        .pushdown_filter(col_neq_filter(0, int_constant(20)))
+        .unwrap();
     assert_eq!(row_group_count(&first), 2);
 
     // A fresh bind starts from the master entry's full row group set.
     let second = catalog.parquet_table("t").unwrap();
     assert_eq!(row_group_count(&second), 3);
+}
+
+#[test]
+fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
+    let (dir, columns) = three_row_table();
+    let catalog = ParquetCatalog::new();
+    catalog
+        .create_table(create_request("t", dir.path(), columns))
+        .unwrap();
+
+    // `id = 999` lies outside every (min,max) → all three row groups drop.
+    let mut table = catalog.parquet_table("t").unwrap();
+    table
+        .pushdown_filter(col_eq_filter(0, int_constant(999)))
+        .unwrap();
+    assert_eq!(row_group_count(&table), 0);
+}
+
+#[test]
+fn pushdown_filter_eq_keeps_only_matching_row_group() {
+    let (dir, columns) = three_row_table();
+    let catalog = ParquetCatalog::new();
+    catalog
+        .create_table(create_request("t", dir.path(), columns))
+        .unwrap();
+
+    // `id = 20` matches only the row group whose single value is 20.
+    let mut table = catalog.parquet_table("t").unwrap();
+    table
+        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .unwrap();
+    assert_eq!(row_group_count(&table), 1);
+}
+
+#[test]
+fn pushdown_filter_eq_returns_false() {
+    let (dir, columns) = three_row_table();
+    let catalog = ParquetCatalog::new();
+    catalog
+        .create_table(create_request("t", dir.path(), columns))
+        .unwrap();
+    let mut table = catalog.parquet_table("t").unwrap();
+    let pushed = table
+        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .unwrap();
+    assert!(!pushed);
 }
 
 #[test]
@@ -204,7 +271,9 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
         .unwrap();
 
     let mut table = catalog.parquet_table("t").unwrap();
-    table.pushdown_filter(col_neq_filter(0, int_constant(999)));
+    table
+        .pushdown_filter(col_neq_filter(0, int_constant(999)))
+        .unwrap();
 
     assert_eq!(row_group_count(&table), 3);
 }

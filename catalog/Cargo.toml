@@ -8,6 +8,7 @@ planner = { path = "../planner" }
 dispatch = { path = "../dispatch" }
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-ord = { path = "../arrow-rs/arrow-ord" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
 thiserror = "2.0.18"
 
 [dev-dependencies]
