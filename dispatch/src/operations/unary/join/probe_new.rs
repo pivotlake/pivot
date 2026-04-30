@@ -27,9 +27,9 @@ use crate::perf_stat::{perf_disable, perf_enable};
 use crate::RECORD_BATCH_SIZE;
 use crate::worker::WORKER_IDX;
 
-const RING_SIZE: usize = 64;
+const RING_SIZE: usize = 256;
 const MASK: usize = RING_SIZE - 1;
-const PREFETCH_LENGTH: usize = 32;
+const PREFETCH_LENGTH: usize = 255;
 
 static PROBE_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
@@ -95,7 +95,7 @@ impl Probe {
 
         // let mut arena_ptrs: [(usize, usize); RING_SIZE] = [(0, 0); RING_SIZE];
 
-        let mut arena_ptrs: [[(usize, usize); RING_SIZE]; 2] = [[(0, 0); RING_SIZE]; 2];
+        let mut arena_ptrs: [[(usize, usize); PREFETCH_LENGTH]; 2] = [[(0, 0); PREFETCH_LENGTH]; 2];
         let [buf0, buf1] = &mut arena_ptrs;
 
         // Prepopulate hashes for first RING_SIZE elements
@@ -144,93 +144,96 @@ impl Probe {
 
             for i in 0..arena_size {
                 let (slot, _) = next_arena_ptrs[i];
+                black_box(slot);
+
                 let start = directory.end_ptr(slot as isize);
                 let end = directory.end_ptr((slot + 1) as isize);
                 prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
                 prefetch_ptr_l2(arena.ptr_at_index(end) as *const u8);
 
-                let (slot, idx) = current_arena_ptrs[i];
+                let (slot, _) = current_arena_ptrs[i];
                 let start = directory.end_ptr(slot as isize);
-                let end = directory.end_ptr((slot + 1) as isize);
-                let probe_key = unsafe { col.value_unchecked(idx) } as u32;
+                black_box(arena[start]);
 
-                for j in start..end {
-                    let entry: Value = arena[j];
-                    self.lineitem_keys.write(output, entry as i64);
-                    self.order_keys.write(output, entry as i64);
-                    output += (entry == probe_key) as usize;
-                }
-            }
-        }
-
-        let current = &mut arena_ptrs[arena_outer_idx];
-
-        for i in 0..PREFETCH_LENGTH {
-            let (slot, idx) = current[i];
-            let start = directory.end_ptr(slot as isize);
-            let end = directory.end_ptr((slot + 1) as isize);
-
-            for j in start..end {
-                // let entry: Value = arena[j];
-                let probe_key = unsafe { col.value_unchecked(idx) } as u32;
-                // if entry == probe_key {
-                //     self.total += 1;
+                // let start = directory.end_ptr(slot as isize);
+                // let end = directory.end_ptr((slot + 1) as isize);
+                // let probe_key = unsafe { col.value_unchecked(idx) } as u32;
+                //
+                // for j in start..end {
+                //     let entry: Value = arena[j];
+                //     self.lineitem_keys.write(output, entry as i64);
+                //     self.order_keys.write(output, entry as i64);
+                    // output += (entry == probe_key) as usize;
                 // }
-
-                let entry: Value = arena[j];
-                self.lineitem_keys.write(output, entry as i64);
-                self.order_keys.write(output, entry as i64);
-                output += (entry == probe_key) as usize;
             }
         }
 
-        let end_offset = col.len().saturating_sub(PREFETCH_LENGTH);
+        // let current = &mut arena_ptrs[arena_outer_idx];
+        //
+        // for i in 0..PREFETCH_LENGTH {
+        //     let (slot, idx) = current[i];
+        //     let start = directory.end_ptr(slot as isize);
+        //     let end = directory.end_ptr((slot + 1) as isize);
+        //
+        //     for j in start..end {
+        //         // let entry: Value = arena[j];
+        //         let probe_key = unsafe { col.value_unchecked(idx) } as u32;
+        //         // if entry == probe_key {
+        //         //     self.total += 1;
+        //         // }
+        //
+        //         let entry: Value = arena[j];
+        //         self.lineitem_keys.write(output, entry as i64);
+        //         self.order_keys.write(output, entry as i64);
+        //         output += (entry == probe_key) as usize;
+        //     }
+        // }
 
-        while idx < end_offset {
-            // hash
-            let value = unsafe { col.value_unchecked(idx + PREFETCH_LENGTH) };
-            let hash_offset = (idx + PREFETCH_LENGTH) & MASK;
-            hashes[hash_offset] = self.hash_state.hash_one(value);
-            prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_offset] >> directory.shift) as usize) as *const u8);
+        // let end_offset = col.len().saturating_sub(PREFETCH_LENGTH);
+        //
+        // while idx < end_offset {
+        //     // hash
+        //     let value = unsafe { col.value_unchecked(idx + PREFETCH_LENGTH) };
+        //     let hash_offset = (idx + PREFETCH_LENGTH) & MASK;
+        //     hashes[hash_offset] = self.hash_state.hash_one(value);
+        //     prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_offset] >> directory.shift) as usize) as *const u8);
+        //
+        //     // bloom check, arena
+        //     let touch_offset = idx & MASK;
+        //     let hash = hashes[touch_offset];
+        //
+        //     if directory.matches_bloom(hash) {
+        //         // let slot = directory.slot_for(hash) as isize;
+        //         // arena_ptrs[arena_size & MASK] = slot;
+        //         // arena_size += 1;
+        //         self.total += 1;
+        //     }
+        //     idx += 1;
+        // }
+        //
+        // for j in 0..min(PREFETCH_LENGTH, col.len()) {
+        //     let hash_offset = (end_offset + j) & MASK;
+        //     let hash = hashes[hash_offset];
+        //     if directory.matches_bloom(hash) {
+        //         self.total += 1;
+        //     }
+        // }
 
-            // bloom check, arena
-            let touch_offset = idx & MASK;
-            let hash = hashes[touch_offset];
-
-            if directory.matches_bloom(hash) {
-                // let slot = directory.slot_for(hash) as isize;
-                // arena_ptrs[arena_size & MASK] = slot;
-                // arena_size += 1;
-                // self.total += 1;
-            }
-            idx += 1;
-        }
-
-        for j in 0..min(PREFETCH_LENGTH, col.len()) {
-            let hash_offset = (end_offset + j) & MASK;
-            let hash = hashes[hash_offset];
-            if directory.matches_bloom(hash) {
-                self.total += 1;
-            }
-        }
-
-        if output > 28383828 {
-            let lineitem = mem::replace(
-                &mut self.order_keys,
-                JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE),
-            );
-            let order = mem::replace(
-                &mut self.lineitem_keys,
-                JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE),
-            );
-            RecordBatch::try_new(
-                PROBE_SCHEMA.clone(),
-                vec![
-                    lineitem.into_array(output),
-                    order.into_array(output),
-                ],
-            );
-        }
+        let lineitem = mem::replace(
+            &mut self.order_keys,
+            JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE),
+        );
+        let order = mem::replace(
+            &mut self.lineitem_keys,
+            JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE),
+        );
+        RecordBatch::try_new(
+            PROBE_SCHEMA.clone(),
+            vec![
+                lineitem.into_array(output),
+                order.into_array(output),
+            ],
+        );
     }
 }
 
@@ -252,8 +255,8 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         let join_dir = unsafe { &*self.table.directory.get() };
         match join_dir {
             JoinDirectory::Contiguous(dir) => {
-                let lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-                let order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+                // let lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+                // let order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
                 ProbeArray {
                     row_idx: 0,
                     hash_state: self.hash_state.clone(),
@@ -264,8 +267,9 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
                     matched_slots: [[(0, 0); PREFETCH_LENGTH]; 2],
                     matched_size: [0; 2],
                     matched_idx: 0,
-                    lineitem_builder: lineitem_keys,
-                    order_builder: order_keys,
+                    builders: vec![JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE), JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE)],
+                    // lineitem_builder: lineitem_keys,
+                    // order_builder: order_keys,
                     output_idx: 0,
                     shared_total: self.shared_total.clone(),
                     total: 0,
@@ -309,8 +313,9 @@ struct ProbeArray<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrB
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    lineitem_builder: JoinPrimitiveBuilder::<Int64Type>,
-    order_builder: JoinPrimitiveBuilder::<Int64Type>,
+    builders: Vec<JoinPrimitiveBuilder::<Int64Type>>,
+    // lineitem_builder: JoinPrimitiveBuilder::<Int64Type>,
+    // order_builder: JoinPrimitiveBuilder::<Int64Type>,
     output_idx: usize,
 
     shared_total: Arc<AtomicUsize>,
@@ -326,17 +331,18 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
         if self.output_idx == 0 {
             return;
         }
-        let lineitem = mem::replace(
-            &mut self.lineitem_builder,
-            JoinPrimitiveBuilder::<Int64Type>::new(self.allocator, RECORD_BATCH_SIZE),
-        );
-        let order = mem::replace(
-            &mut self.order_builder,
-            JoinPrimitiveBuilder::<Int64Type>::new(self.allocator, RECORD_BATCH_SIZE),
-        );
+        // let lineitem = mem::replace(
+        //     &mut self.lineitem_builder,
+        //     JoinPrimitiveBuilder::<Int64Type>::new(self.allocator, RECORD_BATCH_SIZE),
+        // );
+        // let order = mem::replace(
+        //     &mut self.order_builder,
+        //     JoinPrimitiveBuilder::<Int64Type>::new(self.allocator, RECORD_BATCH_SIZE),
+        // );
+        let builders = mem::replace(&mut self.builders, vec![]);
         let batch = RecordBatch::try_new(
             PROBE_SCHEMA.clone(),
-            vec![lineitem.into_array(self.output_idx), order.into_array(self.output_idx)],
+            builders.into_iter().map(|b| b.into_array(self.output_idx)).collect()
         )
         .unwrap();
         self.sender.send(batch).unwrap();
@@ -345,9 +351,8 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
 
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
-        let next = self.matched_idx;
-        let next_matched_slots: &mut [(usize, usize); PREFETCH_LENGTH] = &mut self.matched_slots[next];
-        let mut size = self.matched_size[next];
+        let next_matched_slots: &mut [(usize, usize); PREFETCH_LENGTH] = &mut self.matched_slots[self.matched_idx];
+        let mut size = self.matched_size[self.matched_idx];
         let mut row_idx = self.row_idx;
         let shift = self.directory.shift;
         for _ in 0..length {
@@ -380,7 +385,7 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
 
             row_idx += 1;
         }
-        self.matched_size[next] = size;
+        self.matched_size[self.matched_idx] = size;
         self.row_idx = row_idx;
     }
 
@@ -392,31 +397,51 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
 
         let arena = self.arena;
         let mut output_idx = self.output_idx;
-        let current_matched_slots: &[(usize, usize); PREFETCH_LENGTH] = &self.matched_slots[cur];
-        let next_matched_slots: &[(usize, usize); PREFETCH_LENGTH] = &self.matched_slots[nxt];
+        // let current_matched_slots: &[(usize, usize); PREFETCH_LENGTH] = &self.matched_slots[cur];
+        // let next_matched_slots: &[(usize, usize); PREFETCH_LENGTH] = &self.matched_slots[nxt];
         for i in 0..self.matched_size[cur] {
             // Since all our memory should be in l2 (or on it's way) for the current slots being
             // built, we want to overlap future memory access. We therefore begin pulling the ptrs
             // from the next iterations matched slots
             if PREFETCH_NEXT {
-                let (slot, _) = next_matched_slots[i];
+                let (slot, _) = self.matched_slots[nxt][i];
                 let start = self.directory.end_ptr(slot as isize);
                 let end = self.directory.end_ptr((slot + 1) as isize);
                 prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
-                prefetch_ptr_l2(arena.ptr_at_index(end) as *const u8);
+                // prefetch_ptr_l2(arena.ptr_at_index(end) as *const u8);
             }
 
-            let (slot, idx) = current_matched_slots[i];
+
+            let (slot, idx) = self.matched_slots[cur][i];
+            // black_box((slot, idx));
+            // black_box((slot + 1, idx));
+            // black_box((slot + 2, idx));
+            // black_box((slot + 3, idx));
+            // black_box((slot, idx));
+            // black_box((slot + 1, idx));
+            // black_box((slot + 2, idx));
+            // black_box((slot + 3, idx));
             let start = self.directory.end_ptr(slot as isize);
-            let end = self.directory.end_ptr((slot + 1) as isize);
-            let probe_key = unsafe { self.col.value_unchecked(idx) } as u32;
-
-            for j in start..end {
-                let entry: Value = arena[j];
-                self.lineitem_builder.write(output_idx, entry as i64);
-                self.order_builder.write(output_idx, entry as i64);
-                output_idx += (entry == probe_key) as usize;
-            }
+            black_box(arena[start]);
+            //
+            // if PREFETCH_NEXT {
+            //     let (slot, _) = next_matched_slots[i];
+            //     let start = self.directory.end_ptr(slot as isize);
+            //     let end = self.directory.end_ptr((slot + 1) as isize);
+            //     prefetch_ptr_l2(arena.ptr_at_index(start) as *const u8);
+            //     prefetch_ptr_l2(arena.ptr_at_index(end) as *const u8);
+            //     // black_box(slot);
+            // }
+            // let end = self.directory.end_ptr((slot + 1) as isize);
+            // let probe_key = unsafe { self.col.value_unchecked(idx) } as u32;
+            //
+            // for j in start..end {
+            //     let entry: Value = arena[j];
+            //     for builder in &mut self.builders {
+            //         builder.write(output_idx, entry as i64);
+            //     }
+                // output_idx += (entry == probe_key) as usize;
+            // }
         }
         self.output_idx = output_idx;
     }
@@ -439,25 +464,22 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
     #[inline(always)]
     pub fn run(mut self) {
         self.bootstrap_initial_hashes();
-        self.generate_matched_slots::<true>(min(PREFETCH_LENGTH, self.col.len()));
-        self.swap_matched_slots();
+        // self.generate_matched_slots::<true>(min(PREFETCH_LENGTH, self.col.len()));
+        // self.swap_matched_slots();
 
         while self.row_idx + PREFETCH_LENGTH < self.col.len().saturating_sub(PREFETCH_LENGTH) {
+            // let slots_to_generate = min(PREFETCH_LENGTH, (self.col.len() - self.row_idx).saturating_sub(PREFETCH_LENGTH));
             self.generate_matched_slots::<true>(PREFETCH_LENGTH);
-            // TODO: there's an unneessary iteration at first run
             self.build_output::<true>();
             self.swap_matched_slots();
 
         }
-        self.build_output::<true>();
 
-        self.generate_matched_slots::<true>((self.col.len() - self.row_idx).saturating_sub(PREFETCH_LENGTH));
-        self.swap_matched_slots();
-        self.build_output::<true>();
-
-        self.generate_matched_slots::<false>(self.col.len() - self.row_idx);
-        self.swap_matched_slots();
-        self.build_output::<false>();
+        // self.build_output::<true>();
+        //
+        // self.generate_matched_slots::<false>(self.col.len() - self.row_idx);
+        // self.swap_matched_slots();
+        // self.build_output::<false>();
         self.flush();
     }
 }
