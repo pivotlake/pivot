@@ -1,12 +1,15 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/bridge.h"
 
-#include "duckdb/storage/table_storage_info.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/common/column_index.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
 
 #include <nlohmann/json.hpp>
 #include <cstdio>
@@ -19,18 +22,65 @@ static BindInfo PivotScanGetBindInfo(const optional_ptr<FunctionData> bind_data)
 	return BindInfo(data.catalog_entry);
 }
 
-// This function is used to "hook" the filters a logicalget has before stats / anything else runs.
-// We use it to try and pushdown filters into the table function so stats will be accurate to the filters.
+// Walk an expression tree and rewrite every BoundReferenceExpression's index
+// from "projected output" space (i.e. an index into LogicalGet's bound output)
+// into "storage" space (an index into the table's full column list), using
+// the get's `column_ids` mapping (`projected_index → storage_index`).
+//
+// Why this is necessary:
+//
+// By the time `pushdown_complex_filter` runs, DuckDB's binder has already
+// pruned `LogicalGet` to only the columns the query references. The filter
+// expressions handed to us reference columns by their position in *that
+// pruned output*, not by their position in the underlying table. The Rust
+// catalog, on the other hand, indexes parquet row-group statistics by
+// storage position — so without this remap a filter on `UserID` (storage
+// index 9, projected index 0) would look up stats for whatever storage
+// column happens to live at parquet index 0 (e.g. `WatchID`), which is
+// nonsense and over-prunes (or under-prunes) row groups.
+//
+// We mutate a *clone* of the expression rather than the filter in-place: if
+// the table refuses pushdown, DuckDB keeps the original filter and reapplies
+// it as a `LogicalFilter` above the scan, where projected-space indices are
+// the right ones again.
+static void RewriteRefsToStorage(Expression &expr, const vector<ColumnIndex> &column_ids) {
+	// Filters arriving in `pushdown_complex_filter` reference columns via
+	// `BoundColumnRefExpression`, whose `binding.column_index` is a
+	// `ProjectionIndex` into the LogicalGet's projected output. Remap to
+	// storage with `column_ids`.
+	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
+		auto projected = col_ref.binding.column_index.GetIndex();
+		D_ASSERT(projected < column_ids.size());
+		col_ref.binding.column_index =
+		    ProjectionIndex(column_ids[projected].GetPrimaryIndex());
+		return;
+	}
+	ExpressionIterator::EnumerateChildren(
+	    expr, [&](Expression &child) { RewriteRefsToStorage(child, column_ids); });
+}
+
+// This function is used to "hook" the filters a LogicalGet has before stats /
+// anything else runs. We use it to try and push filters into the table function
+// so stats will be accurate to the filters.
+//
+// References inside `filters` are in projected space (see RewriteRefsToStorage
+// above for the gory details); we clone + remap each filter before handing it
+// to Rust so the catalog sees storage-space column indices and can index into
+// parquet row-group stats correctly.
 static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data,
                                            vector<unique_ptr<Expression>> &filters) {
 	auto &data = bind_data->Cast<PivotScanBindData>();
+	const auto &column_ids = get.GetColumnIds();
 
 	// Complex filters: offer each one to Rust. If the table pushes it down,
 	// drop it from the vector so DuckDB doesn't re-apply it on top.
 	for (auto it = filters.begin(); it != filters.end();) {
+		auto remapped = (*it)->Copy();
+		RewriteRefsToStorage(*remapped, column_ids);
 		json serialized_filter = {
 		    {"type", static_cast<uint8_t>(duckdb::TableFilterType::EXPRESSION_FILTER)},
-		    {"data", build_expression(it->get())},
+		    {"data", build_expression(remapped.get())},
 		};
 		if (pushdown_filter(data.table, serialized_filter.dump())) {
 			it = filters.erase(it);

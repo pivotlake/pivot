@@ -9,7 +9,7 @@ use crate::expression::{Compare, CompareType, Contains, Expression, Function, Re
 use crate::types::Type;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Datum, RecordBatch};
-use arrow_ord::cmp::neq;
+use arrow_ord::cmp::{eq, neq};
 use dispatch::Contains as DispatchContains;
 use std::sync::Arc;
 
@@ -24,23 +24,23 @@ impl Ref {
 
 impl Compare {
     pub fn compile(&self, plan_context: &PlanContext) -> Result<ExprFn, Error> {
-        match self.compare_type {
-            CompareType::NotEqual => {
-                let left_builder = self.left.compile(plan_context)?;
-                let right_builder = self.right.compile(plan_context)?;
-                Ok(Box::new(move || {
-                    let mut left_expr = left_builder();
-                    let mut right_expr = right_builder();
-                    Box::new(move |batch: &RecordBatch| {
-                        let left = left_expr(batch);
-                        let right = right_expr(batch);
-                        ExprResult::Array(
-                            Arc::new(neq(left.as_datum(), right.as_datum()).unwrap()) as ArrayRef
-                        )
-                    }) as ExprEvalFn
-                }))
-            }
-        }
+        let kernel: fn(&dyn Datum, &dyn Datum) -> _ = match self.compare_type {
+            CompareType::Equal => eq,
+            CompareType::NotEqual => neq,
+        };
+        let left_builder = self.left.compile(plan_context)?;
+        let right_builder = self.right.compile(plan_context)?;
+        Ok(Box::new(move || {
+            let mut left_expr = left_builder();
+            let mut right_expr = right_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let left = left_expr(batch);
+                let right = right_expr(batch);
+                ExprResult::Array(
+                    Arc::new(kernel(left.as_datum(), right.as_datum()).unwrap()) as ArrayRef
+                )
+            }) as ExprEvalFn
+        }))
     }
 }
 

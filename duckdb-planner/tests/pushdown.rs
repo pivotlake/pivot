@@ -37,8 +37,11 @@ impl DuckDBTable for UsersTable {
         ]
     }
 
-    fn pushdown_filter(&mut self, _filter: TableFilter) -> bool {
-        self.accept_pushdown
+    fn pushdown_filter(
+        &mut self,
+        _filter: TableFilter,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        Ok(self.accept_pushdown)
     }
 }
 

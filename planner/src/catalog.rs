@@ -65,10 +65,12 @@ pub trait Table: Debug + Send + Sync {
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
 
-    // Try to pushdown a filter to table. Returns true if the filter was *FULLY* pushed down.
-    // (IE if another filter operator after table input is not required later).
-    fn pushdown_filter(&mut self, _filter: TableFilter) -> bool {
-        false
+    /// Try to push a filter into the table. Returns `Ok(true)` if it was
+    /// *FULLY* consumed (no upstream `Filter` operator required), `Ok(false)`
+    /// if it was kept above. Errors propagate to the FFI boundary as C++
+    /// exceptions.
+    fn pushdown_filter(&mut self, _filter: TableFilter) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -92,11 +94,12 @@ impl DuckDBTable for DuckDBTableAdapter {
             .collect()
     }
 
-    fn pushdown_filter(&mut self, filter: DuckDBTableFilter) -> bool {
-        match filter.try_into() {
-            Ok(filter) => self.table.pushdown_filter(filter),
-            Err(_) => false,
-        }
+    fn pushdown_filter(
+        &mut self,
+        filter: DuckDBTableFilter,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        let filter: TableFilter = filter.try_into()?;
+        Ok(self.table.pushdown_filter(filter)?)
     }
 }
 
