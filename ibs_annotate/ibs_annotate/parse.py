@@ -25,11 +25,33 @@ from .model import (
 )
 
 _SYM_OFFSET_RE = re.compile(r"(\S+)\+0x([0-9a-fA-F]+)")
-_IP_SYM_RE = re.compile(r"([0-9a-fA-F]{8,})\s+(.+)\+0x([0-9a-fA-F]+)\s*$")
+_IP_SYM_RE = re.compile(r"([0-9a-fA-F]{4,})\s+(.+)\+0x([0-9a-fA-F]+)\s*$")
 _FUNC_HEADER_RE = re.compile(r"([0-9a-fA-F]+)\s+<(.+)>:\s*$")
 _INSN_LINE_RE = re.compile(r"^\s*(?:[\d.]*\s*:\s+)?([0-9a-fA-F]+):\s*(.*)")
 _SOURCE_LINE_RE = re.compile(r"\s*:\s*(.*)")
 _SAMPLE_IP_RE = re.compile(r"PERF_RECORD_SAMPLE.*:\s+0x([0-9a-fA-F]+)\s+period:")
+
+# Jump-operand simplifier: rewrite `jne 2306f0 <funcname+0x480>` (or the
+# bare `jne 2306f0`) to `jne 480` so the operand matches the offset label
+# rendered next to the target.
+_JUMP_OPERAND_RE = re.compile(
+    r"^(j[a-z]+\s+)(?:0x)?([0-9a-fA-F]+)(\s+<[^>]*\+0x([0-9a-fA-F]+)>)?(.*)$"
+)
+
+
+def _simplify_jump(disasm: str, current_base: int) -> str:
+    m = _JUMP_OPERAND_RE.match(disasm.lstrip())
+    if not m:
+        return disasm
+    annot_off = m.group(4)
+    if annot_off is not None:
+        off = annot_off
+    else:
+        try:
+            off = f"{int(m.group(2), 16) - current_base:x}"
+        except ValueError:
+            return disasm
+    return f"{m.group(1)}{off}{m.group(5)}"
 
 
 # -- perf subprocess ----------------------------------------------------------
@@ -325,7 +347,7 @@ def build_annotated_lines(
                 InstructionLine(
                     addr=addr_s,
                     offset=offset,
-                    disasm=insn_m.group(2),
+                    disasm=_simplify_jump(insn_m.group(2), current_base),
                     sym=current_sym,
                     stats=stats.get(key, InsnStats()),
                 )
@@ -566,7 +588,7 @@ def parse_prefetch_pmc(
 
         # Extract sym+offset (after event spec)
         after_event = line[pmc_m.end():]
-        sym_m = re.search(r"([0-9a-fA-F]{8,})\s+(.+)\+0x([0-9a-fA-F]+)\s*$", after_event)
+        sym_m = re.search(r"([0-9a-fA-F]{4,})\s+(.+)\+0x([0-9a-fA-F]+)\s*$", after_event)
         if not sym_m:
             continue
 
@@ -708,15 +730,17 @@ _BRACKET_MAX_SPAN = 30
 
 
 def compute_jump_graph(lines: list[AnnotatedLine]) -> JumpGraph:
-    """Scan an annotated function for intra-function direct jumps."""
-    addr_to_idx: dict[int, int] = {}
+    """Scan an annotated function for intra-function direct jumps.
+
+    `_simplify_jump` has already rewritten jump operands to function-relative
+    offsets, so we index `addr_to_idx` by `ln.offset` and parse the operand
+    as an offset too.
+    """
+    offset_to_idx: dict[int, int] = {}
     max_offset = 0
     for i, ln in enumerate(lines):
         if isinstance(ln, InstructionLine):
-            try:
-                addr_to_idx[int(ln.addr, 16)] = i
-            except ValueError:
-                continue
+            offset_to_idx[ln.offset] = i
             if ln.offset > max_offset:
                 max_offset = ln.offset
 
@@ -728,16 +752,16 @@ def compute_jump_graph(lines: list[AnnotatedLine]) -> JumpGraph:
         if not m:
             continue
         try:
-            target_addr = int(m.group(2), 16)
-            src_addr = int(ln.addr, 16)
+            target_off = int(m.group(2), 16)
         except ValueError:
             continue
-        tgt_idx = addr_to_idx.get(target_addr)
+        src_off = ln.offset
+        tgt_idx = offset_to_idx.get(target_off)
         if tgt_idx is None:
             arrows.append(JumpArrow(
                 src_idx=i,
                 tgt_idx=-1,
-                forward=target_addr > src_addr,
+                forward=target_off > src_off,
                 is_short=False,
             ))
             continue
@@ -769,7 +793,7 @@ def compute_jump_graph(lines: list[AnnotatedLine]) -> JumpGraph:
                 break
         placed.append(a)
 
-    targets = {a.tgt_idx for a in short}
+    targets = {a.tgt_idx for a in arrows if a.tgt_idx >= 0}
     max_lanes = max((a.lane for a in short), default=-1) + 1
     addr_width = max(4, len(f"{max_offset:x}"))
     return JumpGraph(

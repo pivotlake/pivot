@@ -66,16 +66,23 @@ def _level_attr(lvl: CacheLevel) -> int:
     return attr
 
 
-# -- Header text ---------------------------------------------------------------
+# Short header labels (\u2264 COL_WIDTH chars) for stall columns.
+_STALL_SHORT = {
+    "Int reg file":   "IReg",
+    "Load queue":     "LdQ",
+    "Store queue":    "StQ",
+    "FP reg file":    "FReg",
+    "FP scheduler":   "FSch",
+    "FP flush":       "FFls",
+    "Branch buffer":  "BBuf",
+    "Retire queue":   "Rtir",
+    "Int sched 0":    "ISc0",
+    "Int sched 1":    "ISc1",
+    "Int sched 2":    "ISc2",
+    "Int sched 3":    "ISc3",
+}
 
-_HEADER = (
-    " ".join(f"{lvl.label:>{COL_WIDTH}}" for lvl in CACHE_LEVELS)
-    + f" {'CYC':>{COL_WIDTH}}"
-    + " \u2502 Disassembly"
-)
-_COL_TOTAL_W = (COL_WIDTH + 1) * (len(CACHE_LEVELS) + 1)  # +1 for TTR
-_SEP_LINE = "\u2500" * _COL_TOTAL_W + "\u253c" + "\u2500" * 60
-_PADDING = " " * _COL_TOTAL_W
+
 # Extra indentation of instruction mnemonics relative to source-line text,
 # so source reads "outside" the asm it lowers to.
 _INSTR_INDENT = 4
@@ -91,6 +98,7 @@ class CursesTUI:
         total_weighted: int,
         total_cycles: int,
         skipped_lines: list[str],
+        stall_totals: dict[str, int] | None = None,
     ) -> None:
         self.func_summaries = func_summaries
         self.load_function = load_function
@@ -120,6 +128,35 @@ class CursesTUI:
         self.search_query: str = ""
         self.search_active: bool = False
 
+        # Column picker state. `extra_columns` is a list of stall labels
+        # rendered as columns (prepended before the cache columns).
+        # `stall_totals` is global (across all functions), used as the
+        # denominator for percentage modes — same convention as `total_uw`.
+        self.stall_totals: dict[str, int] = stall_totals or {}
+        self.extra_columns: list[str] = []
+        self.col_cursor = 0
+
+    # -- dynamic layout (depends on extra_columns) ----------------------------
+
+    def _ncols(self) -> int:
+        # extras + cache levels + cycles
+        return len(self.extra_columns) + len(CACHE_LEVELS) + 1
+
+    def _col_total_w(self) -> int:
+        return (COL_WIDTH + 1) * self._ncols()
+
+    def _header_text(self) -> str:
+        parts = [f"{_STALL_SHORT.get(c, c[:COL_WIDTH]):>{COL_WIDTH}}" for c in self.extra_columns]
+        parts += [f"{lvl.label:>{COL_WIDTH}}" for lvl in CACHE_LEVELS]
+        parts.append(f"{'CYC':>{COL_WIDTH}}")
+        return " ".join(parts) + " │ Disassembly"
+
+    def _sep_line(self) -> str:
+        return "─" * self._col_total_w() + "┼" + "─" * 60
+
+    def _padding(self) -> str:
+        return " " * self._col_total_w()
+
     def run(self) -> None:
         curses.wrapper(self._loop)
 
@@ -147,6 +184,8 @@ class CursesTUI:
                 self._draw_detail(stdscr)
             elif self.page == "summary":
                 self._draw_summary(stdscr)
+            elif self.page == "columns":
+                self._draw_columns(stdscr)
             stdscr.refresh()
 
             key = stdscr.getch()
@@ -192,6 +231,8 @@ class CursesTUI:
             return self._handle_detail_key(key)
         elif self.page == "summary":
             return self._handle_summary_key(key)
+        elif self.page == "columns":
+            return self._handle_columns_key(key)
         return True
 
     def _handle_functions_key(self, key: int) -> bool:
@@ -254,7 +295,11 @@ class CursesTUI:
             self.cursor = len(self.lines) - 1
         elif key in (curses.KEY_ENTER, 10, 13):
             line = self.lines[self.cursor]
-            if isinstance(line, InstructionLine) and line.stats.total_samples > 0:
+            if isinstance(line, InstructionLine) and (
+                line.stats.total_samples > 0
+                or line.stats.cycles > 0
+                or line.stats.token_stalls
+            ):
                 self.detail_line = line
                 self.detail_scroll = 0
                 self.page = "detail"
@@ -264,6 +309,10 @@ class CursesTUI:
             self.page = "summary"
         elif key == ord("H"):
             self.cursor = self._hottest_idx
+        elif key == ord("c"):
+            self.col_cursor = 0
+            self.prev_page = "main"
+            self.page = "columns"
         elif key == ord("/"):
             self.search_active = True
             self.search_query = ""
@@ -285,6 +334,63 @@ class CursesTUI:
         elif key == curses.KEY_NPAGE:
             self.detail_scroll += 30
         return True
+
+    # -- column picker ---------------------------------------------------------
+
+    def _available_columns(self) -> list[tuple[str, int]]:
+        """Available extra columns: (label, global_count), sorted by count desc."""
+        return sorted(
+            ((label, c) for label, c in self.stall_totals.items() if c > 0),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+
+    def _handle_columns_key(self, key: int) -> bool:
+        cols = self._available_columns()
+        if key in (27, curses.KEY_BACKSPACE, 127, curses.KEY_LEFT, ord("c")):
+            self.page = self.prev_page
+        elif key == curses.KEY_UP and self.col_cursor > 0:
+            self.col_cursor -= 1
+        elif key == curses.KEY_DOWN and self.col_cursor < len(cols) - 1:
+            self.col_cursor += 1
+        elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+            if cols:
+                label = cols[self.col_cursor][0]
+                if label in self.extra_columns:
+                    self.extra_columns.remove(label)
+                else:
+                    self.extra_columns.append(label)
+        elif key == ord("x"):
+            self.extra_columns.clear()
+        return True
+
+    def _draw_columns(self, stdscr) -> None:
+        h, w = stdscr.getmaxyx()
+        cols = self._available_columns()
+        total = sum(c for _, c in cols) or 1
+
+        _safe_addstr(stdscr, 0, 0, "Available columns (Space/Enter toggle, x clear, Esc back)", curses.A_BOLD)
+        _safe_addstr(stdscr, 1, 0, "─" * min(w - 1, 60))
+
+        header = f"  {'Sel':>3}  {'Column':<18s}  {'Samples':>10s}  {'%':>6s}"
+        _safe_addstr(stdscr, 2, 0, header, curses.A_DIM)
+
+        for i, (label, c) in enumerate(cols):
+            if i + 4 >= h - 1:
+                break
+            sel = "[x]" if label in self.extra_columns else "[ ]"
+            pct = 100.0 * c / total
+            bar_w = int(20 * c / cols[0][1]) if cols else 0
+            bar = "█" * bar_w
+            text = f"  {sel:>3}  {label:<18s}  {c:>10}  {pct:>5.1f}%  {bar}"
+            attr = curses.color_pair(_PAIR_CURSOR) if i == self.col_cursor else 0
+            _safe_addstr(stdscr, i + 4, 0, text.ljust(w - 1), attr)
+
+        if not cols:
+            _safe_addstr(stdscr, 4, 2, "(no token-stall data found in perf.data)", curses.A_DIM)
+
+        footer = " [Space/Enter] toggle  [x] clear all  [Esc/c] back  [q]uit"
+        _safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1), curses.A_REVERSE)
 
     def _handle_summary_key(self, key: int) -> bool:
         if key in (27, curses.KEY_BACKSPACE, 127, curses.KEY_LEFT, ord("s")):
@@ -354,8 +460,8 @@ class CursesTUI:
         h, w = stdscr.getmaxyx()
 
         # Header
-        _safe_addstr(stdscr, 0, 0, _HEADER, curses.A_BOLD)
-        _safe_addstr(stdscr, 1, 0, _SEP_LINE)
+        _safe_addstr(stdscr, 0, 0, self._header_text(), curses.A_BOLD)
+        _safe_addstr(stdscr, 1, 0, self._sep_line())
 
         visible = h - 3  # header + sep + footer
 
@@ -387,7 +493,7 @@ class CursesTUI:
         else:
             footer = (
                 f" [{self.mode.label}]"
-                "  [Esc] back  [q]uit  [/]search  [H]ottest  [w]eighted  [p]ercent  [n]umber  [Enter] detail  [s]ummary"
+                "  [Esc] back  [q]uit  [/]search  [H]ottest  [w/p/n] mode  [c]olumns  [Enter] detail  [s]ummary"
             )
         _safe_addstr(stdscr, h - 1, 0, footer.ljust(w - 1), curses.A_REVERSE)
 
@@ -460,12 +566,27 @@ class CursesTUI:
         gutter_w = (jg.max_lanes + 1) if jg.arrows else 0        # lane columns + arm
         post_label_sp = 1 if addr_label_w else 0
         post_gutter_sp = 1 if gutter_w else 0
-        source_x = _COL_TOTAL_W + addr_label_w + post_label_sp + gutter_w + post_gutter_sp
+        col_total_w = self._col_total_w()
+        source_x = col_total_w + addr_label_w + post_label_sp + gutter_w + post_gutter_sp
         code_x = source_x + _INSTR_INDENT
 
         if isinstance(line, InstructionLine):
             x = 0
-            # Cache-level columns — ends with x == _COL_TOTAL_W (incl. trailing space).
+            # Extra (token-stall) columns, prepended.
+            for label in self.extra_columns:
+                c = line.stats.token_stalls.get(label, 0)
+                if not c:
+                    val = " " * COL_WIDTH
+                    attr = cursor_attr
+                else:
+                    val = self._fmt_stall_val(c, label)
+                    attr = cursor_attr if is_cursor else curses.color_pair(_PAIR_YELLOW)
+                _safe_addstr(stdscr, row, x, val, attr)
+                x += COL_WIDTH
+                _safe_addstr(stdscr, row, x, " ", cursor_attr)
+                x += 1
+
+            # Cache-level columns — ends with x == col_total_w (incl. trailing space).
             for lvl in CACHE_LEVELS:
                 c = line.stats.cache_counts.get(lvl, 0)
                 if not c:
@@ -491,7 +612,7 @@ class CursesTUI:
             x += COL_WIDTH
             _safe_addstr(stdscr, row, x, " ", cursor_attr)
             x += 1
-            # At this point x == _COL_TOTAL_W, matching `source_x`'s base.
+            # At this point x == col_total_w, matching `source_x`'s base.
 
             # Address label — only at jump targets
             if addr_label_w:
@@ -543,13 +664,13 @@ class CursesTUI:
             _safe_addstr(stdscr, row, 0, text, attr)
 
         elif isinstance(line, SeparatorLine):
-            _safe_addstr(stdscr, row, 0, _SEP_LINE, curses.A_DIM | cursor_attr)
+            _safe_addstr(stdscr, row, 0, self._sep_line(), curses.A_DIM | cursor_attr)
 
         elif isinstance(line, SourceLine):
             # Source code sits OUTER — one gutter-width to the left of the
             # instruction mnemonic column. Gutter `│` still passes through so
             # any enclosing jump bracket stays visually continuous.
-            x = _COL_TOTAL_W + addr_label_w + post_label_sp
+            x = col_total_w + addr_label_w + post_label_sp
             if gutter_w:
                 for glyph, attr in self._gutter_cells(idx):
                     draw_glyph = glyph if glyph == "│" else " "
@@ -558,6 +679,14 @@ class CursesTUI:
                 _safe_addstr(stdscr, row, x, " ", cursor_attr)
                 x += 1
             _safe_addstr(stdscr, row, x, line.text, cursor_attr)
+
+    def _fmt_stall_val(self, count: int, label: str) -> str:
+        if self.mode == DisplayMode.ABSOLUTE:
+            return f"{count:>{COL_WIDTH}}"
+        denom = self.stall_totals.get(label, 0)
+        if not denom:
+            return f"{count:>{COL_WIDTH}}"
+        return f"{100.0 * count / denom:>{COL_WIDTH}.1f}"
 
     def _fmt_val(self, count: int, lvl: CacheLevel) -> str:
         if self.mode == DisplayMode.ABSOLUTE:
@@ -773,6 +902,25 @@ class CursesTUI:
                         ))
                 if ibs.brn_fuse_count:
                     rows.append((f"    BrnFuse:      {ibs.brn_fuse_count:>6}  / {ibs.sample_count}", D))
+                rows.append(("", N))
+
+            # -- Dispatch token stalls (per-instruction PMC) ----------------
+            if s.token_stalls:
+                total_stalls = sum(s.token_stalls.values())
+                rows.append(("  Dispatch Token Stalls   Samples       %", B))
+                rows.append(("  " + "─" * 52, D))
+                for name, c in sorted(
+                    s.token_stalls.items(), key=lambda kv: kv[1], reverse=True,
+                ):
+                    if not c:
+                        continue
+                    pct = 100.0 * c / total_stalls if total_stalls else 0
+                    bar = "█" * int(25 * c / total_stalls) if total_stalls else ""
+                    rows.append((
+                        f"    {name:<18s}  {c:>8}  {pct:6.1f}%  {bar}",
+                        N,
+                    ))
+                rows.append((f"    {'Total':<18s}  {total_stalls:>8}", D))
                 rows.append(("", N))
 
             misc_lines = []

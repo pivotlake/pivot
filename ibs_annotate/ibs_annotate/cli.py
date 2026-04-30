@@ -30,6 +30,7 @@ from .parse import (
     run_objdump_function,
     run_perf,
 )
+from .pmc_summary import parse_pmc_summary, render_pmc_summary
 
 
 def _print_stdout(lines, mode, total_uw, total_w, total_cycles, skipped_lines) -> None:
@@ -178,6 +179,16 @@ def main(
         pf_disp, pf_dc, pf_mab, pf_fills = pmc_f.result()
         total_cycles = cyc_f.result()
 
+    # cf.sh-style cache funnel + dispatch stalls (any subset of the events
+    # listed in cf.sh; absent events just leave their fields zero).
+    pmc_sum = parse_pmc_summary(pmc_output, stats)
+
+    # Global per-label token-stall totals (denominator for percent modes)
+    stall_totals: dict[str, int] = {}
+    for s in stats.values():
+        for label, c in s.token_stalls.items():
+            stall_totals[label] = stall_totals.get(label, 0) + c
+
     binary_path = binary or find_binary(perf_data)
     func_summaries = compute_function_summaries(stats)
     load_base = compute_load_base(perf_data, binary_path)
@@ -215,6 +226,10 @@ def main(
             if total_remote:
                 cache_lines.append(f"      Remote:   {total_remote:>8}  ({100.0 * total_remote / l1_misses:5.1f}%)")
         cache_lines.append("")
+
+    funnel_lines = render_pmc_summary(pmc_sum)
+    if funnel_lines:
+        funnel_lines.append("")
 
     pf_lines: list[str] = []
     if pf_disp:
@@ -257,18 +272,18 @@ def main(
                 click.echo(f"  {cyc_pct:>6.2f}%  {f.name}", err=True)
             sys.exit(1)
         lines = load_function(matches[0].name)
-        for s in cache_lines + pf_lines:
+        for s in funnel_lines + cache_lines + pf_lines:
             print(f"# {s}")
-        if cache_lines or pf_lines:
+        if funnel_lines or cache_lines or pf_lines:
             print()
         _print_stdout(lines, mode, total_uw, total_w, total_cycles, skipped_lines)
     elif stdout or not sys.stdout.isatty():
         click.echo(f"Disassembling {binary_path}...", err=True)
         annotate_output = run_objdump(binary_path)
         lines = build_annotated_lines(annotate_output, stats, ip_to_key, load_base)
-        for s in cache_lines + pf_lines:
+        for s in funnel_lines + cache_lines + pf_lines:
             print(f"# {s}")
-        if cache_lines or pf_lines:
+        if funnel_lines or cache_lines or pf_lines:
             print()
         _print_stdout(lines, mode, total_uw, total_w, total_cycles, skipped_lines)
     else:
@@ -276,6 +291,7 @@ def main(
 
         tui = CursesTUI(
             func_summaries, load_function, mode, total_uw, total_w,
-            total_cycles, cache_lines + pf_lines + skipped_lines,
+            total_cycles, funnel_lines + cache_lines + pf_lines + skipped_lines,
+            stall_totals=stall_totals,
         )
         tui.run()

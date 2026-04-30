@@ -211,6 +211,11 @@ class InsnStats:
     cycles: int = 0
     ibs: IBSRaw = field(default_factory=IBSRaw)
     prefetch: PrefetchCounts = field(default_factory=PrefetchCounts)
+    # Per-instruction PMC totals for dispatch token-stall events
+    # (de_dis_dispatch_token_stalls1.* and de_dis_dispatch_token_stalls2.*).
+    token_stalls: dict[str, int] = field(
+        default_factory=lambda: defaultdict(int)
+    )
 
     def add(
         self,
