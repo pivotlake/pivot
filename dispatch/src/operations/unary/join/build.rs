@@ -186,8 +186,24 @@ impl JoinPartitionJob {
 
                 let count = std::cmp::min(slab_size, total_left);
 
-                for i in 0..count {
+                for i in 0..64 {
+                    let (hash, _) = unsafe { *(ptr.add(i) ) };
+                    directory.prefetch_l2(hash);
+                }
 
+                for i in 0..count.saturating_sub(64) {
+                    let (hash, _) = unsafe { *(ptr.add(i + 64) ) };
+                    directory.prefetch_l2(hash);
+
+                    let (hash, value) = unsafe { *(ptr.add(i) ) };
+                    let slot = (hash >> shift) as usize;
+                    let entry = directory.entry(slot).wrapping_sub(1 << 16);
+                    directory.set_entry(slot, entry);
+                    let arena_idx = (entry >> 16) as usize;
+                    unsafe { arena.ptr_at_index(arena_idx).write(value) };
+                }
+
+                for i in count.saturating_sub(64)..count {
 
                     let (hash, value) = unsafe { *(ptr.add(i) ) };
                     let slot = (hash >> shift) as usize;
@@ -210,7 +226,7 @@ impl JoinPartitionJob {
 
 impl Outputter<()> for JoinBuilder {
     fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        // perf_enable();
+        perf_enable();
         if let Some(rx) = self.receiver.take() {
             let mut all_worker_tuples: Vec<Vec<SlabVec<(u64, Value)>>> = rx.into_iter().collect();
 
@@ -284,7 +300,7 @@ impl Outputter<()> for JoinBuilder {
             }
             Steal::Empty => {
                 if self.jobs_injected.load(Ordering::Relaxed) {
-                    // perf_disable();
+                    perf_disable();
                     return Ok(true);
                 }
             }
