@@ -121,7 +121,7 @@ pub use duckdb_planner::{DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId};
 /// Errors surfaced by [`Planner::plan`].
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("Planning error: {0}")]
+    #[error(transparent)]
     Planning(#[from] duckdb_planner::Error),
     #[error("Error converting plan: {0}")]
     PlanConversion(#[from] plan::Error),
