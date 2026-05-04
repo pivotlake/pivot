@@ -216,7 +216,14 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
             self.siblings_left.load(Ordering::Relaxed) == 0
         } else {
             self.notified_finished = true;
-            self.siblings_left.fetch_sub(1, Ordering::Relaxed) == 1
+            let last = self.siblings_left.fetch_sub(1, Ordering::Relaxed) == 1;
+            if last {
+                // Peers waiting on this counter (their early try_finish set
+                // notified_finished=true and they're now parked) can now run
+                // unary.finish — wake them up instead of stalling 1ms.
+                crate::wake_workers();
+            }
+            last
         };
 
         if ready {
@@ -230,7 +237,12 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
                 return Ok(false);
             }
 
-            return Ok(self.unary.finish(&mut self.sender)?);
+            let finished = self.unary.finish(&mut self.sender)?;
+            // finish() may have emitted a final batch downstream (Count,
+            // aggregations, etc.). Peers that re-parked since the earlier
+            // siblings-hit-zero wake need a fresh nudge to consume it.
+            crate::wake_workers();
+            return Ok(finished);
         }
         Ok(false)
     }
