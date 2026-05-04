@@ -20,7 +20,9 @@ fn scan_all_columns() {
         &[1, 2, 3, 4, 5],
     )]);
 
-    let results = table_input(&table, Projection::all(2), false).collect();
+    let results = table_input(&table, Projection::all(2), false)
+        .collect()
+        .unwrap();
 
     assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
     assert_eq!(results[0].num_columns(), 2);
@@ -44,7 +46,9 @@ fn scan_column_subset() {
     .unwrap();
     let (_dir, table) = parquet_table(&[batch]);
 
-    let results = table_input(&table, Projection::columns([1]), false).collect();
+    let results = table_input(&table, Projection::columns([1]), false)
+        .collect()
+        .unwrap();
 
     let mut vals = collect_i64s(&results, 0);
     vals.sort();
@@ -78,7 +82,8 @@ fn scan_multiple_parquet_files() {
 
     let results = table_input(&table, Projection::all(2), false)
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&results), 5);
 }
@@ -90,7 +95,8 @@ fn scan_empty_table() {
 
     let results = table_input(&table, Projection::all(0), false)
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&results), 0);
 }

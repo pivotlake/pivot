@@ -117,7 +117,7 @@ impl Worker {
                 break;
             }
 
-            while let Some(requests) = flow.get_next_io_request()? {
+            while let Some(requests) = flow.get_next_io_request() {
                 for r in requests {
                     self.io.request(r)?;
                 }
@@ -131,15 +131,12 @@ impl Worker {
     }
 
     /// Run one unit of CPU work from the first dataflow that has work ready.
-    fn step_run_ready_cpu_work(&mut self) -> Result<()> {
+    fn step_run_ready_cpu_work(&mut self) {
         for flow in self.data_flows.values_mut() {
-            if let WorkStatus::Ran = flow.run_ready_cpu_work()? {
+            if let WorkStatus::Ran = flow.run_ready_cpu_work() {
                 self.did_work_last_iteration = true;
-                return Ok(());
             }
         }
-
-        Ok(())
     }
 
     /// Deliver completed IO buffers back to the operators that requested them.
@@ -147,16 +144,16 @@ impl Worker {
         for (buffer, request) in self.io.completions()? {
             let data_flow = self.data_flows.get_mut(&request.data_flow_id).unwrap();
             debug!("Received IO for request {:?}", request.request.location);
-            data_flow.process_io(request.operator_idx, request.request, buffer)?;
+            data_flow.process_io(request.operator_idx, request.request, buffer);
         }
         Ok(())
     }
 
     /// Check each dataflow for completion and remove finished ones.
-    fn try_finishing_dataflows(&mut self) -> Result<()> {
+    fn try_finishing_dataflows(&mut self) {
         let mut to_remove = Vec::new();
         for (id, flow) in &mut self.data_flows {
-            if flow.maybe_finish()? {
+            if flow.maybe_finish() {
                 // If nobody broke out- everybody is finished!
                 to_remove.push(*id);
             }
@@ -166,18 +163,15 @@ impl Worker {
             info!("Finished data flow {:?}", id);
             self.data_flows.remove(&id);
         }
-        Ok(())
     }
 
     /// Attempt to steal work from sibling workers' channels when this worker is idle.
-    fn try_steal_work(&mut self) -> Result<()> {
+    fn try_steal_work(&mut self) {
         for flow in self.data_flows.values_mut() {
-            if let WorkStatus::Ran = flow.try_stealing_work()? {
+            if let WorkStatus::Ran = flow.try_stealing_work() {
                 self.did_work_last_iteration = true;
-                return Ok(());
             }
         }
-        Ok(())
     }
 
     /// Called when no other work is available; we either sleep or clean a dirty buffer.
@@ -195,6 +189,10 @@ impl Worker {
         sleep(Duration::from_millis(1));
     }
 
+    fn clear_cancelled_dataflows(&mut self) {
+        self.data_flows.retain(|_, d| !d.cancelled())
+    }
+
     #[instrument(skip(self), fields(worker_id = %self.id))]
     pub fn run(&mut self) -> Result<()> {
         loop {
@@ -205,10 +203,11 @@ impl Worker {
                 self.data_flows.insert(data_flow.id(), data_flow);
             }
 
+            self.clear_cancelled_dataflows();
             self.process_io_completions()?;
             self.saturate_io()?;
-            self.step_run_ready_cpu_work()?;
-            self.try_finishing_dataflows()?;
+            self.step_run_ready_cpu_work();
+            self.try_finishing_dataflows();
 
             if !self.did_work_last_iteration {
                 if self.io.has_pending() {
@@ -217,7 +216,7 @@ impl Worker {
                     continue;
                 }
 
-                self.try_steal_work()?;
+                self.try_steal_work();
 
                 if !self.did_work_last_iteration {
                     self.clear_dirty_buffer_or_sleep();

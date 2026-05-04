@@ -25,18 +25,23 @@ use crate::operations::Operator;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
-use std::result;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::{panic, result};
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Cannot find operation {0}")]
     CannotFindOperation(Identifier),
-    #[error("{0}")]
+    #[error(transparent)]
     Operation(#[from] crate::operations::Error),
-    #[error("{0}")]
+    #[error(transparent)]
     IORequester(#[from] crate::io::IORequesterError),
+    #[error("{0}")]
+    Panic(String),
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
@@ -150,6 +155,8 @@ impl OperatorGraph {
 /// [`try_stealing_work`](Self::try_stealing_work), and IO methods.
 pub struct DataFlow {
     id: Identifier,
+    cancelled: Arc<AtomicBool>,
+    err_tx: mpsc::Sender<Error>,
     graph: OperatorGraph,
 }
 
@@ -163,11 +170,15 @@ impl Debug for DataFlow {
 impl DataFlow {
     pub fn new(
         id: Identifier,
+        canceled: Arc<AtomicBool>,
+        err_tx: mpsc::Sender<Error>,
         operators: Vec<Box<dyn Operator>>,
         publisher_to_subscribers: HashMap<Identifier, Vec<Identifier>>,
     ) -> Self {
         Self {
             id,
+            cancelled: canceled,
+            err_tx,
             graph: OperatorGraph::from_edges(operators, publisher_to_subscribers),
         }
     }
@@ -175,77 +186,126 @@ impl DataFlow {
         self.id
     }
 
+    /// Is this dataflow cancelled? This is an AtomicBool that can be set from other workers or from
+    /// outside dispatch
+    pub fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Bail on running the current dataflow because of an error. This will set `canceled` to true
+    /// (cancelling it for all workers) and send the error out
+    fn bail_and_cancel(&self, err: Error) {
+        error!("DataFlow {:?} failed: {err}", self.id());
+        if self.err_tx.send(err).is_err() {
+            warn!("Unable to send error...");
+        }
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// Try running a function within the dataflow- this will gracefully catch any errors/panics and
+    /// send them via `err_tx`, along with setting `cancelled` to true across all workers (thus
+    /// causing the dataflow to stop processing).
+    fn try_run(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) {
+        self.try_run_or((), f);
+    }
+
+    /// Similar to the above function, `try_run_or` will run catch any errors and handle them
+    /// appropriately, while also returning a default value if there is indeed an error
+    fn try_run_or<R>(&mut self, default: R, f: impl FnOnce(&mut Self) -> Result<R>) -> R {
+        match panic::catch_unwind(AssertUnwindSafe(|| f(self))) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                self.bail_and_cancel(e);
+                default
+            }
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                self.bail_and_cancel(Error::Panic(msg.to_string()));
+                default
+            }
+        }
+    }
+
     /// Try to finish all operators (root-to-leaf). Returns `true` if every operator
     /// has completed, meaning this dataflow can be removed from the worker.
-    pub fn maybe_finish(&mut self) -> Result<bool> {
-        self.graph
-            .traverse_forwards(|_s, b| {
-                Ok(if b.try_finish()? {
-                    ControlFlow::Continue(())
-                } else {
-                    ControlFlow::Break(())
+    pub fn maybe_finish(&mut self) -> bool {
+        self.try_run_or(false, |d| {
+            d.graph
+                .traverse_forwards(|_s, b| {
+                    Ok(if b.try_finish()? {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    })
                 })
-            })
-            .map(|c| matches!(c, ControlFlow::Continue(..)))
+                .map(|c| matches!(c, ControlFlow::Continue(..)))
+        })
     }
 
     /// Deliver a completed IO buffer to the operator that requested it.
-    pub fn process_io(
-        &mut self,
-        node_id: Identifier,
-        request: IORequest,
-        buffer: ReadBuffer,
-    ) -> Result<()> {
-        let op = self.graph.operators.get_mut(node_id).unwrap();
-        op.process_disk_response(buffer, request)?;
-        Ok(())
+    pub fn process_io(&mut self, node_id: Identifier, request: IORequest, buffer: ReadBuffer) {
+        self.try_run(|d| {
+            let op = d.graph.operators.get_mut(node_id).unwrap();
+            op.process_disk_response(buffer, request)?;
+            Ok(())
+        });
     }
 
     /// Run one unit of CPU work, traversing leaf-to-root (downstream first for cache locality).
     /// Returns [`WorkStatus::Ran`] if any operator did work.
-    pub fn run_ready_cpu_work(&mut self) -> Result<WorkStatus> {
-        self.graph
-            .traverse_backwards(|_, op| match op.run_cpu_work()? {
-                WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                WorkStatus::Ran => Ok(ControlFlow::Break(())),
-            })
-            .map(|c| match c {
-                ControlFlow::Continue(_) => WorkStatus::Pending,
-                ControlFlow::Break(_) => WorkStatus::Ran,
-            })
+    pub fn run_ready_cpu_work(&mut self) -> WorkStatus {
+        self.try_run_or(WorkStatus::Ran, |d| {
+            d.graph
+                .traverse_backwards(|_, op| match op.run_cpu_work()? {
+                    WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                    WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                })
+                .map(|c| match c {
+                    ControlFlow::Continue(_) => WorkStatus::Pending,
+                    ControlFlow::Break(_) => WorkStatus::Ran,
+                })
+        })
     }
 
     /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
     /// so the original worker's downstream data stays hot).
-    pub fn try_stealing_work(&mut self) -> Result<WorkStatus> {
-        self.graph
-            .traverse_forwards(|_id, op| match op.try_steal_work()? {
-                WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                WorkStatus::Ran => Ok(ControlFlow::Break(())),
-            })
-            .map(|c| match c {
-                ControlFlow::Continue(_) => WorkStatus::Pending,
-                ControlFlow::Break(_) => WorkStatus::Ran,
-            })
+    pub fn try_stealing_work(&mut self) -> WorkStatus {
+        self.try_run_or(WorkStatus::Ran, |d| {
+            d.graph
+                .traverse_forwards(|_id, op| match op.try_steal_work()? {
+                    WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                    WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                })
+                .map(|c| match c {
+                    ControlFlow::Continue(_) => WorkStatus::Pending,
+                    ControlFlow::Break(_) => WorkStatus::Ran,
+                })
+        })
     }
 
     /// Collect pending IO requests from operators (leaf-to-root).
     /// Returns the first batch of requests found, or `None` if no operator needs IO.
-    pub fn get_next_io_request(&mut self) -> Result<Option<Vec<DataFlowRequest>>> {
-        self.graph
-            .traverse_backwards(|id, op| {
-                let requests = op.next_io_requests()?;
-                if !requests.is_empty() {
-                    Ok(ControlFlow::Break(
-                        requests
-                            .into_iter()
-                            .map(|r| DataFlowRequest::new(self.id, id, r))
-                            .collect(),
-                    ))
-                } else {
-                    Ok(ControlFlow::Continue(()))
-                }
-            })
-            .map(|c| c.break_value())
+    pub fn get_next_io_request(&mut self) -> Option<Vec<DataFlowRequest>> {
+        self.try_run_or(None, |d| {
+            d.graph
+                .traverse_backwards(|id, op| {
+                    let requests = op.next_io_requests()?;
+                    if !requests.is_empty() {
+                        Ok(ControlFlow::Break(
+                            requests
+                                .into_iter()
+                                .map(|r| DataFlowRequest::new(d.id, id, r))
+                                .collect(),
+                        ))
+                    } else {
+                        Ok(ControlFlow::Continue(()))
+                    }
+                })
+                .map(|c| c.break_value())
+        })
     }
 }
