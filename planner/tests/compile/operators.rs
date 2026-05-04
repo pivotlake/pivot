@@ -21,7 +21,8 @@ fn select_column_subset(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["a"].as_i64().unwrap());
@@ -49,7 +50,8 @@ fn select_all_columns(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["a"].as_i64().unwrap());
@@ -77,7 +79,8 @@ fn select_single_column(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["c"].as_i64().unwrap());
@@ -113,7 +116,8 @@ fn filter_not_equal_columns(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["a"].as_i64().unwrap());
@@ -148,7 +152,8 @@ fn filter_not_equal_no_matches(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert!(rows.is_empty());
@@ -162,7 +167,8 @@ fn filter_not_equal_all_pass(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["a"].as_i64().unwrap());
@@ -190,7 +196,8 @@ fn filter_not_equal_constant(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["a"].as_i64().unwrap());
@@ -217,7 +224,8 @@ fn filter_equal_constant(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(
@@ -234,7 +242,8 @@ fn filter_equal_no_match(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert!(rows.is_empty(), "expected no rows, got: {rows:?}");
@@ -252,7 +261,8 @@ fn order_by_ascending(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(
@@ -278,7 +288,8 @@ fn order_by_descending(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(
@@ -304,7 +315,8 @@ fn top_n_limit_1(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 1);
@@ -319,7 +331,8 @@ fn top_n_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 5);
@@ -333,7 +346,8 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(
@@ -356,7 +370,8 @@ fn group_by_int_column(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["key"].as_i64().unwrap());
@@ -376,7 +391,8 @@ fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
@@ -401,7 +417,8 @@ fn filter_then_order_by(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(
@@ -436,7 +453,8 @@ fn filter_then_count(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 1);
@@ -451,7 +469,8 @@ fn filter_then_top_n(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 2);
@@ -490,7 +509,8 @@ fn create_table_calls_catalog_once() {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert!(results.is_empty());
 
@@ -517,7 +537,8 @@ fn create_table_passes_with_options_to_catalog() {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert!(results.is_empty());
 

@@ -20,7 +20,8 @@ fn count() {
 
     let results = table_input(&table, Projection::all(2), false)
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&results), 5);
 }
@@ -47,7 +48,8 @@ fn filter_string_contains() {
             }
         })
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&results), 3);
 }
@@ -71,7 +73,8 @@ fn filter_no_matches_returns_zero() {
             }
         })
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&results), 0);
 }
@@ -98,7 +101,8 @@ fn filter_integer_column() {
             }
         })
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&results), 3);
 }
@@ -113,7 +117,8 @@ fn project_selects_single_column() {
             let idx = vec![1];
             move |batch: &RecordBatch| batch.project(&idx).unwrap()
         })
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(results[0].num_columns(), 1);
     let mut vals = collect_i64s(&results, 0);
@@ -131,7 +136,8 @@ fn order_by_ascending_with_limit() {
 
     let results = table_input(&table, Projection::all(2), false)
         .order_by_limit(vec![OrderBy::new(1, false, false)], 3)
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(collect_i64s(&results, 1), vec![10, 20, 30]);
     assert_eq!(collect_strings(&results, 0), vec!["a", "b", "c"]);
@@ -145,7 +151,8 @@ fn order_by_descending_with_limit() {
 
     let results = table_input(&table, Projection::all(2), false)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 2)
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(collect_i64s(&results, 1), vec![40, 30]);
 }
@@ -157,7 +164,8 @@ fn order_by_limit_exceeds_row_count() {
 
     let results = table_input(&table, Projection::all(2), false)
         .order_by_limit(vec![OrderBy::new(1, false, false)], 100)
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(collect_i64s(&results, 1), vec![10, 20, 30]);
 }
@@ -173,7 +181,8 @@ fn group_by_count_string_keys() {
     let results = table_input(&table, Projection::columns([0]), false)
         .group_by_count::<StringKeyExtractor>(0)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(collect_strings(&results, 0), vec!["alice", "bob", "carol"]);
     assert_eq!(collect_u64s(&results, 1), vec![3, 2, 1]);
@@ -192,7 +201,8 @@ fn group_by_count_int_keys() {
     let results = table_input(&table, Projection::columns([0]), false)
         .group_by_count::<IntKeyExtractor<Int64Type>>(0)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(collect_u64s(&results, 1), vec![3, 3, 2]);
 }

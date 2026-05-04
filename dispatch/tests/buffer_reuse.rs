@@ -16,7 +16,9 @@ fn subsequent_batches_reuse_write_buffer() {
     let values: Vec<i64> = (0..n as i64).collect();
     let (_dir, table) = parquet_table(&[strings_and_ints(&names, &values)]);
 
-    let results = table_input(&table, Projection::columns([1]), false).collect();
+    let results = table_input(&table, Projection::columns([1]), false)
+        .collect()
+        .unwrap();
 
     assert!(
         results.len() >= 2,
@@ -63,7 +65,8 @@ fn dropped_batch_memory_is_reused() {
             }
         })
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     let ptrs = ptrs.lock().unwrap();
     assert!(
@@ -124,7 +127,8 @@ fn decompressed_string_buffer_is_reused() {
             }
         })
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&res), n as u64);
 

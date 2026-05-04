@@ -128,7 +128,8 @@ fn run_query_7(table: &Arc<ParquetTable>) {
     })
     .group_by_count::<IntKeyExtractor<Int16Type>>(0)
     .order_by_limit(vec![OrderBy::new(1, true, false)], 10000000)
-    .collect();
+    .collect()
+    .unwrap();
 
     assert_result(EXPECTED, &results);
 }
@@ -154,7 +155,8 @@ fn run_query_20(table: &Arc<ParquetTable>) {
         }
     })
     .count()
-    .collect();
+    .collect()
+    .unwrap();
 
     assert_result(EXPECTED, &results);
 }
@@ -186,7 +188,8 @@ fn run_query_23(table: &Arc<ParquetTable>) {
         let indices = (0..105).collect::<Vec<_>>();
         move |batch: &RecordBatch| batch.project(&indices).unwrap()
     })
-    .collect();
+    .collect()
+    .unwrap();
 
     assert_result(EXPECTED, &results);
 }
@@ -208,7 +211,8 @@ http://tienskaia-moda	289355
     let results = table_input(table, Projection::columns([13]), false)
         .group_by_count::<StringKeyExtractor>(0)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_result(EXPECTED, &results);
 }

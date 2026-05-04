@@ -27,7 +27,8 @@ fn boolean_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 2);
@@ -53,7 +54,8 @@ fn int8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|row| row["value"].as_i64().unwrap());
@@ -79,7 +81,8 @@ fn int16_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|row| row["value"].as_i64().unwrap());
@@ -97,7 +100,8 @@ fn int32_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|row| row["c"].as_i64().unwrap());
@@ -125,7 +129,8 @@ fn int64_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|row| row["value"].as_i64().unwrap());
@@ -143,7 +148,8 @@ fn utf8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|row| row["name"].as_str().unwrap().to_string());

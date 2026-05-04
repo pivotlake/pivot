@@ -15,7 +15,8 @@ fn filter_contains_substring(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["b"].as_i64().unwrap());
@@ -34,7 +35,8 @@ fn filter_contains_no_match(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert!(rows.is_empty());
@@ -57,7 +59,8 @@ fn filter_contains_matches_all(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 3);
@@ -72,7 +75,8 @@ fn contains_then_group_by(mut testing_planner: TestingPlanner) {
         .unwrap()
         .compile()
         .unwrap()
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
