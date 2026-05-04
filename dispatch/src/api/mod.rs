@@ -81,7 +81,10 @@ pub use builder::{Chain, DataFlowBuilder};
 mod operator_spec;
 pub use operator_spec::{OperatorFactory, OperatorSpec};
 
+mod data_flow_handle;
 mod record_batch_operator;
+pub use data_flow_handle::DataFlowHandle;
+
 pub use record_batch_operator::{
     RECORD_BATCH_SIZE, RecordBatchOperatorFactory, RecordBatchOperatorSpec,
     RecordBatchUnaryOperatorFactory, table_input,

@@ -93,6 +93,10 @@ pub static DISPATCHER: OnceLock<Dispatcher> = OnceLock::new();
 
 static NUM_WORKERS: OnceLock<usize> = OnceLock::new();
 
+/// Our default identifier across the system is a usize. To denote this (instead of simply having a
+/// usize which could also be a counter etc) we have an system-wide alias
+pub type Identifier = usize;
+
 /// Returns the number of worker threads. Panics if [`init`] has not been called.
 #[inline(always)]
 pub fn num_workers() -> usize {
@@ -178,5 +182,3 @@ impl Dispatcher {
         }
     }
 }
-
-pub type Identifier = usize;

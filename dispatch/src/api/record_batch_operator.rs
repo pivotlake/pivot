@@ -44,7 +44,7 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use arrow_array::{BooleanArray, RecordBatch};
 use crossbeam_deque::Worker;
@@ -52,7 +52,6 @@ use crossbeam_deque::Worker;
 use crate::api::Chain;
 use crate::api::builder::DataFlowBuilder;
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
-use crate::dispatcher;
 use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, mpsc_channel, stealable,
 };
@@ -66,6 +65,7 @@ use crate::operations::{
     NullaryOperatorFactory, OrderBy, OrderByLimitFactory, ProjectFactory, RootUnaryOperatorFactory,
     UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
+use crate::{DataFlowHandle, dispatcher};
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
 /// Object-safe version of [`OperatorFactory<RecordBatch>`].
@@ -504,18 +504,26 @@ impl RecordBatchOperatorSpec {
     ///             contains.run(col)
     ///         }
     ///     })
-    ///     .collect();
+    ///     .collect()
+    ///     .unwrap();
     /// ```
-    pub fn collect(self) -> Vec<RecordBatch> {
+    pub fn execute(self) -> DataFlowHandle {
         let (tx, rx) = mpsc_channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
         dispatcher().push_data_flow(
             self.factories
                 .into_iter()
-                .map(|f| DataFlowBuilder::new(f, tx.clone())),
+                .map(|f| DataFlowBuilder::new(cancelled.clone(), err_tx.clone(), f, tx.clone())),
         );
         drop(tx);
+
         let (rx, _) = rx.into_parts();
-        rx.into_iter().collect::<Vec<RecordBatch>>()
+        DataFlowHandle::new(rx, err_rx, cancelled)
+    }
+
+    pub fn collect(self) -> crate::data_flow::Result<Vec<RecordBatch>> {
+        self.execute().collect()
     }
 }
 

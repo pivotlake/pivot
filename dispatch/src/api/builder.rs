@@ -5,8 +5,8 @@ use crate::operations::Operator;
 use crate::operations::channels::MpscSender;
 use ahash::HashMap;
 use arrow_array::RecordBatch;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, mpsc};
 
 static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
 
@@ -38,11 +38,15 @@ impl Chain {
     }
 
     /// Convert this chain into an executable `DataFlow`.
-    pub fn into_data_flow(self) -> DataFlow {
+    pub fn into_data_flow(
+        self,
+        cancelled: Arc<AtomicBool>,
+        err_tx: mpsc::Sender<crate::data_flow::Error>,
+    ) -> DataFlow {
         let map: HashMap<Identifier, Vec<Identifier>> = (0..self.operators.len() - 1)
             .map(|i| (i, vec![i + 1]))
             .collect();
-        DataFlow::new(next_dataflow_id(), self.operators, map)
+        DataFlow::new(next_dataflow_id(), cancelled, err_tx, self.operators, map)
     }
 }
 
@@ -52,21 +56,36 @@ impl Chain {
 /// one per worker. The worker calls [`build`](DataFlowBuilder::build) to produce a `DataFlow`,
 /// which triggers the recursive factory build chain on the worker thread.
 pub struct DataFlowBuilder {
+    /// A flag shared across all workers (and the DataFlowHandle) on whether to cancel this query
+    cancelled: Arc<AtomicBool>,
+    /// A sender for errors that may occur during running
+    err_tx: mpsc::Sender<crate::data_flow::Error>,
+    /// The last operator in the dataflow
     tail: Box<dyn RecordBatchOperatorFactory>,
+    /// A sender for record batches that result from this dataflow (say a queries response)
     output_tx: MpscSender<RecordBatch>,
 }
 
 impl DataFlowBuilder {
     pub fn new(
+        cancelled: Arc<AtomicBool>,
+        err_tx: mpsc::Sender<crate::data_flow::Error>,
         tail: Box<dyn RecordBatchOperatorFactory>,
         output_tx: MpscSender<RecordBatch>,
     ) -> Self {
-        Self { tail, output_tx }
+        Self {
+            cancelled,
+            err_tx,
+            tail,
+            output_tx,
+        }
     }
 
     /// Build the full operator chain and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
     pub fn build(self) -> DataFlow {
-        self.tail.build_collect(self.output_tx).into_data_flow()
+        self.tail
+            .build_collect(self.output_tx)
+            .into_data_flow(self.cancelled, self.err_tx)
     }
 }

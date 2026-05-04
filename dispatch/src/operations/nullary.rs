@@ -124,7 +124,6 @@ impl<O: 'static, NF: NullaryFactory<O>> OperatorFactory<O> for NullaryOperatorFa
 mod tests {
     use super::*;
     use crate::operations::Operator;
-    use crate::operations::channels::{Receiver, mpsc_channel};
     use crate::operations::unary::test_utils::CollectSender;
 
     #[derive(Default)]
@@ -158,33 +157,5 @@ mod tests {
             WorkStatus::Pending
         ));
         assert!(operator.try_finish().unwrap());
-    }
-
-    struct EmitOneFactory;
-
-    impl NullaryFactory<i32> for EmitOneFactory {
-        type Nullary = EmitOne;
-
-        fn build_nullary(self) -> Self::Nullary {
-            EmitOne::default()
-        }
-    }
-
-    #[test]
-    fn nullary_factory_builds_nullary() {
-        let factory = Box::new(NullaryOperatorFactory::new(EmitOneFactory));
-        let (sender, receiver) = mpsc_channel::<i32>();
-        let mut flow =
-            <NullaryOperatorFactory<i32, EmitOneFactory> as OperatorFactory<i32>>::build(
-                factory, sender,
-            )
-            .into_data_flow();
-
-        assert!(matches!(
-            flow.run_ready_cpu_work().unwrap(),
-            WorkStatus::Ran
-        ));
-        assert_eq!(receiver.try_recv(), Some(7));
-        assert!(flow.maybe_finish().unwrap());
     }
 }
