@@ -72,9 +72,9 @@ pub use types::ScalarValue;
 /// Top-level error type for the planner.
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("{0}")]
+    #[error(transparent)]
     DuckDBPlanning(#[from] PlanningError),
-    #[error("Unsupported plan: {0}")]
+    #[error("{0}")]
     UnsupportedPlan(String),
     #[error("Bridge error: {0}")]
     Bridge(String),
@@ -91,7 +91,7 @@ pub struct PlanningError {
 
 impl std::fmt::Display for PlanningError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Planning error: {}", self.exception_message)
+        write!(f, "{}", self.exception_message)
     }
 }
 
