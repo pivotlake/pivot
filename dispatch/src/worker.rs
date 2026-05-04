@@ -30,11 +30,11 @@ use crate::memory::{init_free_pool, pop_dirty_buffer};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::result;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
-use std::thread::{JoinHandle, sleep};
+use std::thread::{self, JoinHandle, park_timeout};
 use std::time::Duration;
-use std::{result, thread};
 use thiserror::Error;
 use tracing::{debug, info, instrument};
 
@@ -180,8 +180,13 @@ impl Worker {
         Ok(())
     }
 
-    /// Called when no other work is available; we either sleep or clean a dirty buffer.
-    /// We clean dirty buffers when we have nothing else to do to help future execution
+    /// Called when no other work is available; we either park or clean a dirty buffer.
+    /// We clean dirty buffers when we have nothing else to do to help future execution.
+    ///
+    /// `park_timeout` (rather than a plain sleep) lets a peer worker wake us up early
+    /// via [`Dispatcher::wake_workers`](crate::Dispatcher::wake_workers) when an
+    /// operator's `siblings_left` counter hits zero — turning what would be a 1ms
+    /// idle stall into an immediate hand-off to the finish step.
     fn clear_dirty_buffer_or_sleep(&mut self) {
         if self.sleeps_between_clean >= 1
             && let Some(b) = pop_dirty_buffer()
@@ -192,7 +197,7 @@ impl Worker {
         }
 
         self.sleeps_between_clean += 1;
-        sleep(Duration::from_millis(1));
+        park_timeout(Duration::from_millis(1));
     }
 
     #[instrument(skip(self), fields(worker_id = %self.id))]

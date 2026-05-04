@@ -106,6 +106,15 @@ pub fn dispatcher() -> &'static Dispatcher {
         .expect("Dispatcher has not been initialized")
 }
 
+/// Unpark every worker thread, or no-op if the dispatcher isn't initialized
+/// (e.g. unit tests that exercise an operator in isolation). See
+/// [`Dispatcher::wake_workers`] for why operators call this.
+pub(crate) fn wake_workers() {
+    if let Some(d) = DISPATCHER.get() {
+        d.wake_workers();
+    }
+}
+
 /// Initialize the global [`Dispatcher`] with `num_workers` worker threads.
 ///
 /// Panics if `num_workers` exceeds the number of CPU cores.
@@ -175,6 +184,24 @@ impl Dispatcher {
     pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) {
         for (sender, builder) in self.worker_senders.iter().zip(builders) {
             sender.send(builder).unwrap();
+        }
+        // Idle workers are parked on park_timeout; nudge them so they pick up
+        // the new dataflow on this iteration instead of after the 1ms timeout.
+        self.wake_workers();
+    }
+
+    /// Unpark every worker thread.
+    ///
+    /// Workers idle via [`thread::park_timeout`](std::thread::park_timeout) for up
+    /// to 1ms. Operators call this when they observe a state transition that may
+    /// unblock peers (today: a `siblings_left` counter hitting zero, after which a
+    /// downstream finish step becomes runnable) so idle workers can pick up the
+    /// new work immediately instead of waiting out the timeout.
+    ///
+    /// `unpark` is a cheap per-thread permit set; redundant calls collapse to one.
+    pub fn wake_workers(&self) {
+        for h in &self.handles {
+            h.thread().unpark();
         }
     }
 }
