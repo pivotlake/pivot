@@ -31,7 +31,8 @@ fn filter_then_project() {
             let idx = vec![1];
             move |batch: &RecordBatch| batch.project(&idx).unwrap()
         })
-        .collect();
+        .collect()
+        .unwrap();
 
     let mut vals = collect_i64s(&results, 0);
     vals.sort();
@@ -60,7 +61,8 @@ fn filter_then_count() {
             }
         })
         .count()
-        .collect();
+        .collect()
+        .unwrap();
 
     assert_eq!(extract_count(&results), 3);
 }
@@ -98,7 +100,8 @@ fn filter_then_group_by_then_order_by() {
         })
         .group_by_count::<StringKeyExtractor>(0)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
-        .collect();
+        .collect()
+        .unwrap();
 
     let keys = collect_strings(&results, 0);
     let counts = collect_u64s(&results, 1);
