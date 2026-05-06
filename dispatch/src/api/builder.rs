@@ -5,14 +5,24 @@ use crate::operations::Operator;
 use crate::operations::channels::MpscSender;
 use ahash::HashMap;
 use arrow_array::RecordBatch;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
+use thiserror::Error;
 
 static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(0));
 
 fn next_dataflow_id() -> usize {
     ID.fetch_add(1, Ordering::Relaxed)
 }
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("{0}")]
+    PanicOnBuild(String),
+}
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A linear sequence of operators built during the factory `build` step on a worker thread.
 ///
@@ -83,9 +93,17 @@ impl DataFlowBuilder {
 
     /// Build the full operator chain and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
-    pub fn build(self) -> DataFlow {
-        self.tail
-            .build_collect(self.output_tx)
-            .into_data_flow(self.cancelled, self.err_tx)
+    pub fn build(self) -> Result<DataFlow> {
+        let chain = catch_unwind(AssertUnwindSafe(|| self.tail.build_collect(self.output_tx)))
+            .map_err(|e| {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                Error::PanicOnBuild(msg.to_string())
+            })?;
+
+        Ok(chain.into_data_flow(self.cancelled, self.err_tx))
     }
 }
