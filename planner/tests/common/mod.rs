@@ -23,7 +23,9 @@ static INIT: Once = Once::new();
 /// need to invoke it directly — only tests that build their own `Planner`
 /// (e.g. with a custom `Catalog`) need to.
 pub fn init() {
-    INIT.call_once(|| dispatch::init(core_affinity::get_core_ids().unwrap().len()));
+    INIT.call_once(|| {
+        dispatch::init(core_affinity::get_core_ids().unwrap().len());
+    });
 }
 
 #[derive(Clone, Debug)]

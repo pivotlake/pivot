@@ -19,7 +19,9 @@ pub fn init() {
 }
 
 pub fn init_with_workers(num_workers: usize) {
-    INIT.call_once(|| dispatch::init(num_workers));
+    INIT.call_once(|| {
+        dispatch::init(num_workers);
+    });
 }
 
 pub fn parquet_table(batches: &[RecordBatch]) -> (TempDir, Arc<ParquetTable>) {
