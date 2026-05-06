@@ -25,6 +25,8 @@ jobs:
             workdir: planner
           - name: duckdb-planner
             workdir: duckdb-planner
+          - name: server
+            workdir: server
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,6 +55,8 @@ jobs:
             workdir: planner
           - name: duckdb-planner
             workdir: duckdb-planner
+          - name: server
+            workdir: server
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,6 +87,8 @@ jobs:
             workdir: planner
           - name: duckdb-planner
             workdir: duckdb-planner
+          - name: server
+            workdir: server
     steps:
       - uses: actions/checkout@v4
         with:
@@ -109,6 +115,8 @@ jobs:
             workdir: planner
           - name: duckdb-planner
             workdir: duckdb-planner
+          - name: server
+            workdir: server
     steps:
       - uses: actions/checkout@v4
         with:

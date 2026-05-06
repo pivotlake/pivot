@@ -83,7 +83,7 @@ pub use operator_spec::{OperatorFactory, OperatorSpec};
 
 mod data_flow_handle;
 mod record_batch_operator;
-pub use data_flow_handle::DataFlowHandle;
+pub use data_flow_handle::{CancelToken, DataFlowHandle};
 
 pub use record_batch_operator::{
     RECORD_BATCH_SIZE, RecordBatchOperatorFactory, RecordBatchOperatorSpec,

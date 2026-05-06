@@ -30,13 +30,14 @@ use crate::memory::{init_free_pool, pop_dirty_buffer};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::{JoinHandle, sleep};
 use std::time::Duration;
 use std::{result, thread};
 use thiserror::Error;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 thread_local! {
     pub static WORKER_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -75,17 +76,32 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 ///
 /// And forever back to 1!
 pub struct Worker {
+    /// A requester (through uring) for any IO necessary
     io: IORequester,
+    /// The identifier of the worker (every worker has a unique ID)
     id: Identifier,
+    /// A queue of dataflows for the worker to work on. The worker can work on many dataflows
+    /// simultaneously
     data_flow_queue: Receiver<DataFlowBuilder>,
+    /// A mapping of dataflows currently running
     data_flows: HashMap<Identifier, DataFlow>,
+    /// Did the worker do work on last iteration? This is used to decide whether the worker should
+    /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
+    /// How many times did the worker sleep between cleans of buffers. We want to ensure we're not
+    /// cleaning too much and over-using l2/l3 caches that are in use by other workers for live
+    /// queries
     sleeps_between_clean: usize,
 }
 
 impl Worker {
     /// Spawn a worker thread pinned to `core`. Blocks on `ready_barrier` before
     /// entering the event loop, so all workers start roughly together.
+    ///
+    /// The worker checks the process-wide [`crate::EXIT`] flag on every
+    /// iteration and returns from `run` once it flips to `true`; panics
+    /// inside the event loop propagate normally and surface through the
+    /// returned [`JoinHandle`].
     pub fn create(
         idx: usize,
         core: CoreId,
@@ -193,20 +209,40 @@ impl Worker {
         self.data_flows.retain(|_, d| !d.cancelled())
     }
 
+    fn try_receiving_new_dataflow(&mut self) {
+        if let Ok(builder) = self.data_flow_queue.try_recv() {
+            info!("Received data flow...");
+            match builder.build() {
+                Ok(data_flow) => {
+                    self.data_flows.insert(data_flow.id(), data_flow);
+                }
+                Err(e) => {
+                    warn!("Failed to build dataflow {:?}", e)
+                }
+            }
+        }
+    }
+
     #[instrument(skip(self), fields(worker_id = %self.id))]
     pub fn run(&mut self) -> Result<()> {
         loop {
-            self.did_work_last_iteration = false;
-            if let Ok(builder) = self.data_flow_queue.try_recv() {
-                info!("Received data flow...");
-                let data_flow = builder.build();
-                self.data_flows.insert(data_flow.id(), data_flow);
+            // Cooperative shutdown: [`crate::shutdown`] flips this flag and
+            // we exit cleanly so the thread can be reaped.
+            if crate::EXIT.load(Ordering::Relaxed) {
+                debug!("Worker {} exiting via shutdown flag", self.id);
+                return Ok(());
             }
+            self.did_work_last_iteration = false;
+
+            self.try_receiving_new_dataflow();
 
             self.clear_cancelled_dataflows();
+
             self.process_io_completions()?;
             self.saturate_io()?;
+
             self.step_run_ready_cpu_work();
+
             self.try_finishing_dataflows();
 
             if !self.did_work_last_iteration {

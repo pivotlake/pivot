@@ -29,6 +29,7 @@
 //! # use arrow_array::StringViewArray;
 //! # use dispatch::*;
 //! # use dispatch::table_input;
+//! # let _ = init(1);
 //! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
 //! // SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
 //! let results = table_input(&table, Projection::columns([13]), false)
@@ -45,6 +46,7 @@
 //! ```
 //!
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier, OnceLock};
 use std::thread::JoinHandle;
@@ -64,7 +66,7 @@ mod worker;
 
 use crate::worker::Worker;
 pub use api::*;
-pub use data_flow::WorkStatus;
+pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
 pub use io::IORequest;
 pub use memory::ReadBuffer;
@@ -93,6 +95,11 @@ pub static DISPATCHER: OnceLock<Dispatcher> = OnceLock::new();
 
 static NUM_WORKERS: OnceLock<usize> = OnceLock::new();
 
+/// Process-wide shutdown flag. Set by [`shutdown`]; checked by every worker
+/// at the top of its event loop, so a worker exits cleanly on the next
+/// iteration instead of running forever.
+pub(crate) static EXIT: AtomicBool = AtomicBool::new(false);
+
 /// Our default identifier across the system is a usize. To denote this (instead of simply having a
 /// usize which could also be a counter etc) we have an system-wide alias
 pub type Identifier = usize;
@@ -110,19 +117,35 @@ pub fn dispatcher() -> &'static Dispatcher {
         .expect("Dispatcher has not been initialized")
 }
 
+/// Signal every worker thread to exit on its next event-loop iteration.
+///
+/// Called from the embedding application (e.g. the server) on shutdown so
+/// that a `JoinHandle::join()` over the worker handles eventually returns.
+/// Once flipped, the flag stays set for the rest of the process — there is
+/// no `start()` counterpart.
+pub fn shutdown() {
+    EXIT.store(true, Ordering::Relaxed);
+}
+
 /// Initialize the global [`Dispatcher`] with `num_workers` worker threads.
 ///
-/// Panics if `num_workers` exceeds the number of CPU cores.
-/// Must be called before any queries. Safe to call multiple times (only the first
-/// call has effect).
-pub fn init(num_workers: usize) {
+/// Returns one [`JoinHandle`] per worker; the caller is expected to keep
+/// these around for monitoring (any worker exiting is a fatal error: workers
+/// are supposed to run forever) and to `join()` them once [`shutdown`] has
+/// been called for orderly process teardown.
+///
+/// Panics if `num_workers` exceeds the number of CPU cores. Safe to call
+/// multiple times — only the first call has effect.
+pub fn init(num_workers: usize) -> Vec<JoinHandle<()>> {
     let core_count = core_affinity::get_core_ids().unwrap().len();
     assert!(
         num_workers <= core_count,
         "num_workers ({num_workers}) exceeds core count ({core_count})"
     );
     NUM_WORKERS.get_or_init(|| num_workers);
-    DISPATCHER.get_or_init(Dispatcher::new);
+    let (handles, dispatcher) = Dispatcher::new();
+    DISPATCHER.get_or_init(|| dispatcher);
+    handles
 }
 
 /// Global coordinator that owns the worker threads and distributes work to them.
@@ -136,17 +159,12 @@ pub fn init(num_workers: usize) {
 /// in their own event loops.
 pub struct Dispatcher {
     worker_senders: Vec<StdSender<DataFlowBuilder>>,
-    handles: Vec<JoinHandle<()>>,
-}
-
-impl Default for Dispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Dispatcher {
-    pub fn new() -> Self {
+    /// Initialize the workers together with the dispatcher. Returns a `JoinHandle` per
+    /// worker as well as the Dispatcher object itself
+    fn new() -> (Vec<JoinHandle<()>>, Self) {
         let cores = core_affinity::get_core_ids().unwrap();
         info!("Setting up io...");
 
@@ -163,19 +181,21 @@ impl Dispatcher {
         barrier.wait();
         info!("All workers have begun...");
 
-        Dispatcher {
-            worker_senders: senders,
-            handles: threads,
-        }
+        (
+            threads,
+            Dispatcher {
+                worker_senders: senders,
+            },
+        )
     }
 
     /// Number of active worker threads (one per core).
     pub fn workers(&self) -> usize {
-        self.handles.len()
+        self.worker_senders.len()
     }
 
-    /// Send each worker their pre-built DataFlow bundle.
-    /// Each worker receives exactly one builder with their specific resources.
+    /// Send each worker their pre-built `DataFlow` bundle. Each worker
+    /// receives exactly one builder with their specific resources.
     pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) {
         for (sender, builder) in self.worker_senders.iter().zip(builders) {
             sender.send(builder).unwrap();

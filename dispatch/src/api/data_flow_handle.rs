@@ -11,7 +11,7 @@ pub struct DataFlowHandle {
     record_batch_rx: mpsc::Receiver<RecordBatch>,
     /// A receiver for errors that occurred during running.
     err_rx: mpsc::Receiver<crate::data_flow::Error>,
-    /// A flag that is by default off - it can be turned on to cause all workers to cancel the 
+    /// A flag that is by default off - it can be turned on to cause all workers to cancel the
     /// running query
     cancelled: Arc<AtomicBool>,
 }
@@ -28,7 +28,7 @@ impl DataFlowHandle {
             cancelled,
         }
     }
-    
+
     /// Collect all record batches from the running dataflow across all workers
     pub fn collect(mut self) -> crate::data_flow::Result<Vec<RecordBatch>> {
         let mut batches = Vec::new();
@@ -43,9 +43,35 @@ impl DataFlowHandle {
         }
         Ok(batches)
     }
-    
-    /// Cancel the current running dataflow. This does NOT wait for all workers to finish running 
+
+    /// Cancel the current running dataflow. This does NOT wait for all workers to finish running
     /// it; for that collect must be called.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// A cheap, `Clone + Send + Sync` handle that can fire cancellation from a
+    /// thread that doesn't own the [`DataFlowHandle`] — e.g. from an async
+    /// task driving `next()` on a separate blocking thread.
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken {
+            cancelled: self.cancelled.clone(),
+        }
+    }
+}
+
+/// A detached cancellation handle for a running dataflow.
+///
+/// Obtain one with [`DataFlowHandle::cancel_token`]. Cloning is cheap (it's an
+/// `Arc<AtomicBool>` under the hood), so it can be moved into a Drop guard,
+/// stored in a registry keyed by connection id, etc.
+#[derive(Clone)]
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// Signal cancellation. Idempotent.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }
