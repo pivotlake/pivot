@@ -18,7 +18,19 @@ pgo-use *args:
     RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
         cargo {{args}}
 
-
 # Remove all PGO profiles and merged data.
 pgo-clean:
     rm -rf {{pgo_dir}}
+
+# Run a cargo command under perf for perfy
+# Writes perf.data and perf.stat.data into {{perf_dir}}.
+#
+#   just perf bench --profile profiling --bench clickbench -- --nocapture
+perf *args:
+    mkdir -p {{perf_dir}}
+    RUSTFLAGS="-Cforce-frame-pointers=yes" \
+        perf stat record --quiet -o {{perf_dir}}/perf.stat.data -a -M l3_read_miss_latency \
+        -e amd_umc/umc_cas_cmd.rd/,amd_umc/umc_cas_cmd.wr/ -I 10 -- \
+        perf record --clockid mono -o {{perf_dir}}/perf.data -g -a -d -R \
+        -e cycles:D -e 'ibs_op//' \
+        cargo {{args}}
