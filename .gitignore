@@ -3,3 +3,7 @@ target/
 .tmp/
 .DS_Store
 .claude/worktrees/
+
+# Python
+__pycache__/
+*.pyc

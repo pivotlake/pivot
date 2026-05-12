@@ -1,0 +1,25 @@
+[package]
+name = "ibs-annotate"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Rust port of ibs_annotate: AMD IBS perf.data parsing and annotation"
+
+[dependencies]
+regex = { workspace = true }
+once_cell = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ahash = { workspace = true }
+memchr = { workspace = true }
+linux-perf-data = { workspace = true }
+linux-perf-event-reader = { workspace = true }
+object = { workspace = true }
+rustc-demangle = { workspace = true }
+cpp_demangle = { workspace = true }
+byteorder = { workspace = true }
+memmap2 = { workspace = true }
+anyhow = { workspace = true }
+wholesym = { workspace = true }
+tokio = { workspace = true }

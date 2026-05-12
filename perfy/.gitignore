@@ -1,0 +1,5 @@
+target/
+**/*.rs.bk
+
+frontend/node_modules/
+frontend/dist/
