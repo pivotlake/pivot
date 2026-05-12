@@ -24,14 +24,20 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
 use arrow_schema::{ArrowError, SortOptions};
 use std::mem;
+use std::sync::{Arc, RwLock};
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Instant;
 use thiserror::Error;
 use tracing::debug;
+
+/// Shared cell between one producer and N consumers. Holds the current
+/// dynamic-filter boundary as an arrow scalar so consumers can compare it
+/// against row-group statistics without any per-row-group reparsing.
+pub type DynamicFilterSlot = RwLock<Option<Scalar<ArrayRef>>>;
 
 mod factory;
 pub use factory::OrderByLimitFactory;
@@ -121,6 +127,12 @@ pub struct OrderByLimit {
     order_by: Vec<OrderBy>,
     sender: mpsc::Sender<RecordBatch>,
     receiver: Option<Receiver<RecordBatch>>,
+    /// When set, after each consume the operator extracts the kth-worst
+    /// value of the leading sort key from the just-computed per-batch
+    /// top-k and tightens this shared dynamic-filter slot. Sibling scans
+    /// reading the slot use it to prune row groups that can't make it
+    /// into the global top-k.
+    dynamic_filter: Option<Arc<DynamicFilterSlot>>,
 }
 
 impl OrderByLimit {
@@ -129,6 +141,7 @@ impl OrderByLimit {
         limit: usize,
         sender: mpsc::Sender<RecordBatch>,
         receiver: Option<Receiver<RecordBatch>>,
+        dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> Self {
         Self {
             limit,
@@ -136,7 +149,57 @@ impl OrderByLimit {
             order_by,
             sender,
             receiver,
+            dynamic_filter,
         }
+    }
+
+    /// If we're producing into a dynamic-filter slot and the per-batch
+    /// top-k is full (`limit` rows), extract `order_by[0]`'s kth-worst
+    /// and store it — but only if it's strictly tighter than what's
+    /// already there.
+    ///
+    /// Tightness is read off the sort direction: for ascending order
+    /// (we want the smallest k), a smaller boundary is tighter; for
+    /// descending order, a larger boundary is tighter. A single-batch
+    /// kth-worst is a valid upper bound on the global kth-worst because
+    /// the batch alone witnesses `limit` rows on the in-window side of
+    /// that value.
+    fn publish_boundary(&self, batch_top_k: &RecordBatch) {
+        let Some(slot) = &self.dynamic_filter else {
+            return;
+        };
+        if batch_top_k.num_rows() < self.limit || self.order_by.is_empty() {
+            return;
+        }
+        let leading = &self.order_by[0];
+        let column = batch_top_k.column(leading.column_idx);
+        let last_row: ArrayRef = column.slice(batch_top_k.num_rows() - 1, 1);
+        let new_boundary = Scalar::new(last_row);
+
+        let mut guard = slot.write().expect("dynamic filter slot poisoned");
+        let should_overwrite = match guard.as_ref() {
+            None => true,
+            Some(current) => is_tighter(&new_boundary, current, leading.descending),
+        };
+        if should_overwrite {
+            *guard = Some(new_boundary);
+        }
+    }
+}
+
+/// `new` tightens `current` for a TopN on this sort direction:
+/// * ascending — filter is `col < boundary`; smaller boundary is tighter.
+/// * descending — filter is `col > boundary`; larger boundary is tighter.
+///
+/// Returns `false` (don't overwrite) when the arrow comparison kernel
+/// errors, so a mismatched-type slot can't get stuck on a stale value
+/// it can never improve from.
+fn is_tighter(new: &Scalar<ArrayRef>, current: &Scalar<ArrayRef>, descending: bool) -> bool {
+    use arrow::compute::kernels::cmp;
+    let kernel = if descending { cmp::gt } else { cmp::lt };
+    match kernel(new as &dyn Datum, current as &dyn Datum) {
+        Ok(arr) => arr.len() == 1 && arr.value(0),
+        Err(_) => false,
     }
 }
 
@@ -149,8 +212,9 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
         _sender: &mut S,
     ) -> unary::Result<()> {
         debug!("Received batch of length {:?}", batch.num_rows());
-        self.top_k_per_batch
-            .push(get_top_k_from_single(&batch, &self.order_by, self.limit)?);
+        let batch_top_k = get_top_k_from_single(&batch, &self.order_by, self.limit)?;
+        self.publish_boundary(&batch_top_k);
+        self.top_k_per_batch.push(batch_top_k);
         Ok(())
     }
 
@@ -235,6 +299,7 @@ mod tests {
                     limit,
                     tx.clone(),
                     rx_opt.take(),
+                    None,
                 )
             })
             .collect();

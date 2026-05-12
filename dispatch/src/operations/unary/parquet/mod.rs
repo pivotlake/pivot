@@ -8,7 +8,7 @@ mod decoding;
 pub use decoding::{DecoderFactory, RowGroupDecoderError};
 
 mod fetching;
-pub use fetching::{RowGroupFetcherFactory, RowGroupInjectorFactory};
+pub use fetching::{RowGroupFetcherFactory, RowGroupFilter, RowGroupInjectorFactory};
 
 pub(crate) mod types;
 

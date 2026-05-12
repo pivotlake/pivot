@@ -57,11 +57,11 @@ use crate::operations::channels::{
 };
 use crate::operations::parquet::types::projection::Projection;
 use crate::operations::parquet::{
-    MaterializerFactory, ParquetTable, RowGroupFetcherFactory, RowGroupInjectorFactory,
-    RowGroupRequest,
+    MaterializerFactory, ParquetTable, RowGroupFetcherFactory, RowGroupFilter,
+    RowGroupInjectorFactory, RowGroupRequest,
 };
 use crate::operations::{
-    CountFactory, FilterFactory, GroupFactory, KeyExtractor, NullaryFactory,
+    CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, NullaryFactory,
     NullaryOperatorFactory, OrderBy, OrderByLimitFactory, ProjectFactory, RootUnaryOperatorFactory,
     UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
@@ -390,11 +390,17 @@ impl RecordBatchOperatorSpec {
     /// spec.order_by_limit(vec![OrderBy::new(0, true, false)], 10)
     /// # ;
     /// ```
-    pub fn order_by_limit(self, order_by: Vec<OrderBy>, limit: usize) -> Self {
+    pub fn order_by_limit(
+        self,
+        order_by: Vec<OrderBy>,
+        limit: usize,
+        dynamic_filter: Option<Arc<DynamicFilterSlot>>,
+    ) -> Self {
         self.unary(OrderByLimitFactory::create_for_workers(
             order_by,
             limit,
             dispatcher().workers(),
+            dynamic_filter,
         ))
     }
 
@@ -568,8 +574,9 @@ pub fn table_input(
     table: &Arc<ParquetTable>,
     projection: Projection,
     add_row_group_metadata: bool,
+    row_group_filter: Option<RowGroupFilter>,
 ) -> RecordBatchOperatorSpec {
-    let injector = RowGroupInjectorFactory::new(table, projection.clone());
+    let injector = RowGroupInjectorFactory::new(table, projection.clone(), row_group_filter);
     let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
     let input = OperatorSpec::new((0..dispatcher().workers()).map(|_| {
         RootUnaryOperatorFactory::new(

@@ -108,6 +108,7 @@ fn run_query_7(table: &Arc<ParquetTable>) {
         table,
         Projection::from_field_names(table.schema(), ["AdvEngineID"]),
         false,
+        None,
     )
     .project(|| {
         let indices = vec![0];
@@ -127,7 +128,7 @@ fn run_query_7(table: &Arc<ParquetTable>) {
         }
     })
     .group_by_count::<IntKeyExtractor<Int16Type>>(0)
-    .order_by_limit(vec![OrderBy::new(1, true, false)], 10000000)
+    .order_by_limit(vec![OrderBy::new(1, true, false)], 10000000, None)
     .collect()
     .unwrap();
 
@@ -142,6 +143,7 @@ fn run_query_20(table: &Arc<ParquetTable>) {
         table,
         Projection::from_field_names(table.schema(), ["URL"]),
         false,
+        None,
     )
     .filter(|| {
         let mut contains = Contains::new("google");
@@ -169,6 +171,7 @@ fn run_query_23(table: &Arc<ParquetTable>) {
         table,
         Projection::from_field_names(table.schema(), ["EventTime", "URL"]),
         true,
+        None,
     )
     .filter(|| {
         let mut contains = Contains::new("google");
@@ -181,9 +184,9 @@ fn run_query_23(table: &Arc<ParquetTable>) {
             contains.run(col)
         }
     })
-    .order_by_limit(vec![OrderBy::new(0, false, false)], 10)
+    .order_by_limit(vec![OrderBy::new(0, false, false)], 10, None)
     .materialize(table.clone(), Projection::all(105))
-    .order_by_limit(vec![OrderBy::new(4, false, false)], 10)
+    .order_by_limit(vec![OrderBy::new(4, false, false)], 10, None)
     .project(|| {
         let indices = (0..105).collect::<Vec<_>>();
         move |batch: &RecordBatch| batch.project(&indices).unwrap()
@@ -208,9 +211,9 @@ http://video.yandex.ru/search/?jenre=50&s_yers	318979
 http://tienskaia-moda	289355
 "#;
 
-    let results = table_input(table, Projection::columns([13]), false)
+    let results = table_input(table, Projection::columns([13]), false, None)
         .group_by_count::<StringKeyExtractor>(0)
-        .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
+        .order_by_limit(vec![OrderBy::new(1, true, false)], 10, None)
         .collect()
         .unwrap();
 

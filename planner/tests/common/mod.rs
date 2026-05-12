@@ -74,8 +74,12 @@ impl TestTable {
 }
 
 impl Table for TestTable {
-    fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec {
-        table_input(&self.parquet_table, projection, false)
+    fn compile(
+        &self,
+        projection: Projection,
+        row_group_filter: Option<dispatch::RowGroupFilter>,
+    ) -> RecordBatchOperatorSpec {
+        table_input(&self.parquet_table, projection, false, row_group_filter)
     }
 
     fn columns(&self) -> Vec<Column> {

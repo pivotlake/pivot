@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::expression::TableFilter;
 use crate::types::{Type, logical_from_type};
-use dispatch::{Projection, RecordBatchOperatorSpec};
+use dispatch::{Projection, RecordBatchOperatorSpec, RowGroupFilter};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
 use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
@@ -59,8 +59,15 @@ pub struct CreateTableRequest {
 /// [`DuckDBTableAdapter`]) and a way to compile a scan into a dispatch
 /// [`RecordBatchOperatorSpec`].
 pub trait Table: Debug + Send + Sync {
-    /// Build a dispatch scan spec that reads this table.
-    fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec;
+    /// Build a dispatch scan spec that reads this table. `row_group_filter`,
+    /// when `Some`, is evaluated per row group at scan time and may skip
+    /// row groups whose stats don't satisfy a runtime predicate (typically
+    /// from a dynamic filter installed elsewhere in the plan).
+    fn compile(
+        &self,
+        projection: Projection,
+        row_group_filter: Option<RowGroupFilter>,
+    ) -> RecordBatchOperatorSpec;
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;

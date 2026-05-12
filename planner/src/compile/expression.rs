@@ -27,6 +27,12 @@ impl Compare {
         let kernel: fn(&dyn Datum, &dyn Datum) -> _ = match self.compare_type {
             CompareType::Equal => eq,
             CompareType::NotEqual => neq,
+            CompareType::LessThan
+            | CompareType::LessThanOrEqual
+            | CompareType::GreaterThan
+            | CompareType::GreaterThanOrEqual => {
+                return Err(Error::UnsupportedExpression(Expression::Compare(self.clone())));
+            }
         };
         let left_builder = self.left.compile(plan_context)?;
         let right_builder = self.right.compile(plan_context)?;

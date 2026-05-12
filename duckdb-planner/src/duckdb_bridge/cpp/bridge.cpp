@@ -19,10 +19,14 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 using json = nlohmann::json;
 using std::string;
@@ -31,7 +35,14 @@ struct UnsupportedPlanError : public std::runtime_error {
 	using std::runtime_error::runtime_error;
 };
 
-json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables);
+// Stable id assignment for shared `DynamicFilterData` cells. A single cell may
+// be referenced by both the producer (TopN, hash-join build side) and one or
+// more consumers (LogicalGet table_filters); deduping by raw pointer identity
+// lets the Rust side rebuild the shared-slot graph by index lookup.
+using DynamicFilterDedup = std::unordered_map<duckdb::DynamicFilterData *, size_t>;
+
+json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                          DynamicFilterDedup &df_dedup);
 json build_expression(duckdb::Expression *expr);
 
 json build_bridge_error(const string &kind, const string &message, std::optional<string> position = std::nullopt) {
@@ -220,7 +231,96 @@ json build_constant_comparison_filter(duckdb::ConstantFilter &filter, json colum
     };
 }
 
-json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables) {
+// Find a DynamicFilter inside a TableFilter, peeling off OPTIONAL_FILTER if
+// present. Returns nullptr if there's no DynamicFilter at the top (or one
+// level deep inside an OptionalFilter). More exotic shapes — e.g. the
+// `OptionalFilter(ConjunctionOr(IsNull, DynamicFilter))` produced by TopN
+// pushdown when nulls land first — are intentionally left unrecognised here;
+// they'll fall through to the skip-on-OPTIONAL/DYNAMIC path in the
+// per-column walker below.
+static duckdb::DynamicFilter *extract_dynamic_filter(duckdb::TableFilter &filter) {
+	if (filter.filter_type == duckdb::TableFilterType::DYNAMIC_FILTER) {
+		return &filter.Cast<duckdb::DynamicFilter>();
+	}
+	if (filter.filter_type == duckdb::TableFilterType::OPTIONAL_FILTER) {
+		auto &opt = filter.Cast<duckdb::OptionalFilter>();
+		if (opt.child_filter && opt.child_filter->filter_type == duckdb::TableFilterType::DYNAMIC_FILTER) {
+			return &opt.child_filter->Cast<duckdb::DynamicFilter>();
+		}
+	}
+	return nullptr;
+}
+
+// Recursive walker over the TableFilter tree for a single column. Splits
+// `filter` into:
+//   * dynamic-filter consumer entries appended to `dynamic_filters` (for
+//     `OPTIONAL(DYNAMIC)` / bare `DYNAMIC` children), and
+//   * synthetic `LogicalFilter` conditions appended to `conditions` (for
+//     static children like `ConstantFilter`).
+//
+// `CONJUNCTION_AND` is unwrapped — its children are processed independently
+// at the same column position. That's exactly the case that triggers when a
+// column has BOTH a static predicate (`col <> ''`) and a TopN-installed
+// dynamic filter merged into the same `table_filters` entry. Anything else
+// (CONJUNCTION_OR, NULL/IS_NOT_NULL, IN, …) flows through `ToExpression`
+// and may then fail in `build_expression` if Rust doesn't yet support that
+// expression shape — same conservative behaviour as before.
+static void emit_table_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_idx,
+                              const duckdb::LogicalGet &get, DynamicFilterDedup &df_dedup,
+                              json &dynamic_filters, json &conditions) {
+	if (filter.filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
+		auto &conj = filter.Cast<duckdb::ConjunctionAndFilter>();
+		for (auto &child : conj.child_filters) {
+			emit_table_filter(*child, proj_idx, get, df_dedup, dynamic_filters, conditions);
+		}
+		return;
+	}
+
+	if (auto *df = extract_dynamic_filter(filter)) {
+		auto *filter_data = df->filter_data.get();
+		auto [it, _] = df_dedup.try_emplace(filter_data, df_dedup.size());
+		auto storage_idx = get.GetColumnIds()[proj_idx].GetPrimaryIndex();
+		dynamic_filters.push_back({
+		    {"slot_id", it->second},
+		    {"column_idx", storage_idx},
+		    {"compare_type", static_cast<uint8_t>(filter_data->filter->comparison_type)},
+		});
+		return;
+	}
+
+	// Standalone OPTIONAL/DYNAMIC we didn't peel above (e.g.
+	// `OptionalFilter(ConjunctionOr(IsNull, DynamicFilter))`): drop it
+	// rather than ship a `BoundConstant(true)` placeholder to Rust.
+	if (filter.filter_type == duckdb::TableFilterType::OPTIONAL_FILTER ||
+	    filter.filter_type == duckdb::TableFilterType::DYNAMIC_FILTER) {
+		return;
+	}
+
+	duckdb::ColumnBinding binding(get.table_index, duckdb::ProjectionIndex(proj_idx));
+	auto col_ref = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(get.types[proj_idx], binding);
+	auto expr = filter.ToExpression(*col_ref);
+	conditions.push_back(build_expression(expr.get()));
+}
+
+// Result of walking a Get's table_filters: the consumer-side dynamic-filter
+// entries to attach to the Input, plus any synthetic LogicalFilter conditions
+// that should sit above the Input.
+struct GetTableFilters {
+	json dynamic_filters;
+	json conditions;
+};
+
+static GetTableFilters split_table_filters(duckdb::LogicalGet &get, DynamicFilterDedup &df_dedup) {
+	GetTableFilters out{json::array(), json::array()};
+	for (auto &entry : get.table_filters) {
+		emit_table_filter(entry.Filter(), entry.GetIndex().GetIndex(), get, df_dedup,
+		                  out.dynamic_filters, out.conditions);
+	}
+	return out;
+}
+
+json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+               json dynamic_filters) {
 	json columns = json::array();
 	auto &column_ids = get->GetColumnIds();
 	for (size_t i = 0; i < column_ids.size(); i++) {
@@ -242,11 +342,11 @@ json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper
 	tables.push_back(std::move(pivot_entry.table));
 	size_t table_id = tables.size() - 1;
 
-	json result = {
-		{"table_id", table_id},
-		{"columns", columns}
+	return {
+	    {"table_id", table_id},
+	    {"columns", columns},
+	    {"dynamic_filters", std::move(dynamic_filters)},
 	};
-	return result;
 }
 
 json build_order_by(duckdb::LogicalOrder *order_by) {
@@ -291,7 +391,7 @@ json build_filter(duckdb::LogicalFilter *filter) {
 	};
 }
 
-json build_top_n(duckdb::LogicalTopN *top_n) {
+json build_top_n(duckdb::LogicalTopN *top_n, DynamicFilterDedup &df_dedup) {
 	json orders = json::array();
     for (auto &order : top_n->orders) {
         orders.push_back({
@@ -300,9 +400,29 @@ json build_top_n(duckdb::LogicalTopN *top_n) {
         });
     }
 
+    // The TopN optimizer only installs a dynamic filter when `orders[0]` is a
+    // BoundColumnRefExpression (see topn_optimizer.cpp:75-83), but by the time
+    // extract_plan runs, ColumnBindingResolver has already rewritten that into
+    // a BoundReferenceExpression. The `index` on that ref is the position in
+    // TopN's child output — i.e. the column we're tracking.
+    // `comparison_type` lives on the pre-allocated placeholder ConstantFilter
+    // and is stable across runs.
+    json produces_dynamic_filter = nullptr;
+    if (top_n->dynamic_filter) {
+        auto *filter_data = top_n->dynamic_filter.get();
+        auto &ref = top_n->orders[0].expression->Cast<duckdb::BoundReferenceExpression>();
+        auto [it, _] = df_dedup.try_emplace(filter_data, df_dedup.size());
+        produces_dynamic_filter = {
+            {"slot_id", it->second},
+            {"column_idx", ref.index},
+            {"compare_type", static_cast<uint8_t>(filter_data->filter->comparison_type)},
+        };
+    }
+
     return {
         {"limit", top_n->limit},
-        {"order_bys", orders}
+        {"order_bys", orders},
+        {"produces_dynamic_filter", produces_dynamic_filter},
 	    };
 }
 
@@ -344,7 +464,8 @@ json build_create_table(duckdb::LogicalCreateTable *create_table) {
     };
 }
 
-json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables) {
+json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                          DynamicFilterDedup &df_dedup) {
 	json new_node = json::object();
 	json new_operator = json::object();
 
@@ -352,7 +473,7 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 
 	json inputs = json::array();
 	for (auto &child : op->children) {
-		inputs.push_back(build_plan_node_json(child.get(), tables));
+		inputs.push_back(build_plan_node_json(child.get(), tables, df_dedup));
 	}
 	new_node["inputs"] = inputs;
 
@@ -365,7 +486,24 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_GET: {
-		new_operator["data"] = build_get(&op->Cast<duckdb::LogicalGet>(), tables);
+		auto &get = op->Cast<duckdb::LogicalGet>();
+		auto split = split_table_filters(get, df_dedup);
+		new_operator["data"] = build_get(&get, tables, std::move(split.dynamic_filters));
+		if (!split.conditions.empty()) {
+			// Wrap the get node in a synthetic LogicalFilter carrying the
+			// static pushed-down table filters. This mirrors what DuckDB
+			// would emit itself if filter_pushdown were false, so the Rust
+			// side keeps seeing `Filter(...) -> Input(...)`.
+			json get_node = {
+			    {"name", op->GetName()},
+			    {"inputs", new_node["inputs"]},
+			    {"operator", new_operator},
+			};
+			new_operator = json::object();
+			new_operator["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_FILTER);
+			new_operator["data"] = {{"conditions", std::move(split.conditions)}};
+			new_node["inputs"] = json::array({std::move(get_node)});
+		}
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: {
@@ -381,7 +519,7 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
-		new_operator["data"] = build_top_n(&op->Cast<duckdb::LogicalTopN>());
+		new_operator["data"] = build_top_n(&op->Cast<duckdb::LogicalTopN>(), df_dedup);
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE: {
@@ -403,7 +541,8 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
 
 	try {
 		auto plan = ctx.con.ExtractPlan(std::string(query.data(), query.size()));
-		auto root = build_plan_node_json(plan.get(), tables);
+		DynamicFilterDedup df_dedup;
+		auto root = build_plan_node_json(plan.get(), tables, df_dedup);
 		result = {{"type", "success"}, {"data", root}};
 	} catch (duckdb::Exception &e) {
 		result = build_duckdb_error(e);

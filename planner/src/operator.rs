@@ -10,6 +10,7 @@
 //! [`crate::compile`].
 
 use crate::catalog::{CreateTableRequest, DuckDBTableAdapter, Table};
+use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{self, Expression};
 use crate::types::{self, type_from_logical};
 use duckdb_planner::operator as duckdb_operator;
@@ -26,12 +27,15 @@ pub enum Error {
 }
 
 /// Scans a [`Table`] from the catalog. `columns` lists the requested output
-/// columns (each as a [`Ref`](crate::expression::Ref) into the table schema)
-/// and `filters` are predicates pushed down into the scan.
+/// columns (each as a [`Ref`](crate::expression::Ref) into the table schema).
+/// `dynamic_filters` are runtime-populated predicates the scan should read
+/// from its shared slots — typically installed by a TopN or hash-join
+/// elsewhere in the plan.
 #[derive(Debug)]
 pub struct Input {
     pub table: Box<dyn Table>,
     pub columns: Vec<Expression>,
+    pub dynamic_filters: Vec<DynamicFilter>,
 }
 
 impl TryFrom<duckdb_operator::Input> for Input {
@@ -47,6 +51,11 @@ impl TryFrom<duckdb_operator::Input> for Input {
                 .columns
                 .into_iter()
                 .map(Expression::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            dynamic_filters: s
+                .dynamic_filters
+                .into_iter()
+                .map(DynamicFilter::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
@@ -256,6 +265,10 @@ impl fmt::Display for Filter {
 pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,
+    /// When set, the TopN is the producer for a dynamic filter: at runtime
+    /// it publishes the current boundary value to the shared slot so any
+    /// consumer scans elsewhere in the plan can prune against it.
+    pub produces_dynamic_filter: Option<DynamicFilter>,
 }
 
 impl TryFrom<duckdb_operator::TopN> for TopN {
@@ -268,6 +281,10 @@ impl TryFrom<duckdb_operator::TopN> for TopN {
                 .map(OrderByNode::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
             limit: t.limit,
+            produces_dynamic_filter: t
+                .produces_dynamic_filter
+                .map(DynamicFilter::try_from)
+                .transpose()?,
         })
     }
 }

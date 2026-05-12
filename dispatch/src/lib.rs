@@ -72,14 +72,15 @@ pub use io::IORequest;
 pub use memory::ReadBuffer;
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
+pub use operations::parquet::RowGroupFilter;
 pub use operations::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
 pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::{Error as ParquetTableError, ParquetTable};
 pub use operations::{
-    IntKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator, OrderBy,
-    Result as OperatorResult, StringKeyExtractor,
+    DynamicFilterSlot, IntKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator,
+    OrderBy, Result as OperatorResult, StringKeyExtractor,
 };
 
 #[unsafe(export_name = "_rjem_malloc_conf")]

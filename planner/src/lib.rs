@@ -40,8 +40,12 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec {
-//!         table_input(&self.parquet, projection, false)
+//!     fn compile(
+//!         &self,
+//!         projection: Projection,
+//!         row_group_filter: Option<dispatch::RowGroupFilter>,
+//!     ) -> RecordBatchOperatorSpec {
+//!         table_input(&self.parquet, projection, false, row_group_filter)
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
 //! }
@@ -104,9 +108,11 @@
 
 pub mod catalog;
 pub mod compile;
+pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;
 pub mod plan;
+pub mod row_group_stats;
 pub mod types;
 use std::sync::Arc;
 

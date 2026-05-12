@@ -78,7 +78,7 @@ pub use default_unary_factory::DefaultUnaryFactory;
 pub mod parquet;
 
 mod order_by_limit;
-pub use order_by_limit::{OrderBy, OrderByLimitFactory};
+pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
 use crate::memory::ReadBuffer;
 

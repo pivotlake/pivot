@@ -20,15 +20,15 @@ use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar};
+use arrow_array::{Array, ArrayRef, Datum, Int64Array, Scalar};
 use dispatch::{
-    ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec, RowGroupMetadata,
-    table_input,
+    ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec, RowGroupFilter,
+    RowGroupMetadata, table_input,
 };
 use planner::catalog::{
     Catalog, Column, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
 };
-use planner::expression::{Compare, CompareType, Expression, Ref, TableFilter};
+use planner::expression::{Compare, Expression, Ref, TableFilter};
 use thiserror::Error;
 
 const PATH_OPTION: &str = "path";
@@ -95,7 +95,8 @@ impl ParquetCatalog {
         if !path_buf.is_dir() {
             return Err(Error::PathNotDirectory(path.clone()));
         }
-        let parquet = ParquetTable::from_directory(path_buf)?;
+        let mut parquet = ParquetTable::from_directory(path_buf)?;
+        sort_row_groups_by_event_time_desc(&mut parquet, &request.columns);
 
         let table = ParquetCatalogTable {
             columns: request.columns,
@@ -135,9 +136,13 @@ pub struct ParquetCatalogTable {
 }
 
 impl Table for ParquetCatalogTable {
-    fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec {
+    fn compile(
+        &self,
+        projection: Projection,
+        row_group_filter: Option<RowGroupFilter>,
+    ) -> RecordBatchOperatorSpec {
         let parquet = Arc::new(self.parquet.clone());
-        table_input(&parquet, projection, false)
+        table_input(&parquet, projection, false, row_group_filter)
     }
 
     fn columns(&self) -> Vec<Column> {
@@ -173,47 +178,58 @@ impl Table for ParquetCatalogTable {
     }
 }
 
+/// Reorder a table's row groups by their `EventTime` column's min statistic,
+/// highest first. If there is no `EventTime` column, or its stats aren't a
+/// BIGINT min that we can read, the table is left untouched.
+///
+/// This is a deliberate ClickBench-specific knob: with `ORDER BY EventTime`
+/// queries we want to control the work-stealing order to study how the
+/// dynamic-filter pruning interacts with it. Once we want this for other
+/// columns / other tables we'll lift the column name out into a catalog
+/// option.
+fn sort_row_groups_by_event_time_desc(parquet: &mut ParquetTable, columns: &[Column]) {
+    let Some(event_time_idx) = columns.iter().position(|c| c.name == "EventTime") else {
+        return;
+    };
+    parquet.row_groups_mut().sort_by(|a, b| {
+        let a_min = min_event_time(a, event_time_idx);
+        let b_min = min_event_time(b, event_time_idx);
+        // `None` (missing stats) sorts to the end of the queue — we
+        // can't position it intelligently, so don't let it crowd out
+        // groups with usable stats.
+        match (b_min, a_min) {
+            (Some(a), Some(b)) => b.cmp(&a),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+}
+
+fn min_event_time(rg: &RowGroupMetadata, col_idx: usize) -> Option<i64> {
+    let stats = rg.columns.get(col_idx)?.statistics.as_ref()?;
+    let min = stats.min.as_ref()?;
+    let (arr, _) = min.get();
+    let arr = arr.as_any().downcast_ref::<Int64Array>()?;
+    if arr.is_empty() || arr.is_null(0) {
+        return None;
+    }
+    Some(arr.value(0))
+}
+
 /// Decide whether a row group can be skipped (filtered out) for the given
 /// predicate, based on the column's min/max statistics. Returns `Ok(true)`
 /// to drop the row group, `Ok(false)` to keep it.
-///
-/// When stats are missing we return `Ok(false)` — a missing bound is not
-/// proof of absence, so the row group must still be scanned.
 fn should_filter_row_group(
     row_group: &RowGroupMetadata,
     compare: &Compare,
     column: &Ref,
     constant: &Scalar<ArrayRef>,
 ) -> Result<bool> {
-    let Some(stats) = row_group
-        .columns
-        .get(column.column_idx)
-        .and_then(|c| c.statistics.as_ref())
-    else {
-        return Ok(false);
-    };
-    let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
-        return Ok(false);
-    };
-
-    Ok(match compare.compare_type {
-        // `col <> k` is true on every row unless every row in this group
-        // equals `k` — provable only when min == max == k.
-        CompareType::NotEqual => {
-            bool_kernel(min, constant, arrow_ord::cmp::eq)? && bool_kernel(max, constant, arrow_ord::cmp::eq)?
-        }
-        // `col = k` can never match when k is strictly outside [min, max].
-        CompareType::Equal => {
-            bool_kernel(constant, min, arrow_ord::cmp::lt)? || bool_kernel(constant, max, arrow_ord::cmp::gt)?
-        }
-    })
-}
-
-fn bool_kernel(
-    a: &Scalar<ArrayRef>,
-    b: &Scalar<ArrayRef>,
-    kernel: fn(&dyn Datum, &dyn Datum) -> Result<BooleanArray, arrow_schema::ArrowError>,
-) -> Result<bool> {
-    let result = kernel(a as &dyn Datum, b as &dyn Datum)?;
-    Ok(result.len() == 1 && result.value(0))
+    Ok(planner::row_group_stats::row_group_eliminated(
+        row_group,
+        column.column_idx,
+        compare.compare_type,
+        constant,
+    )?)
 }

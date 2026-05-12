@@ -33,7 +33,11 @@ impl RecordingTable {
 }
 
 impl Table for RecordingTable {
-    fn compile(&self, _projection: Projection) -> RecordBatchOperatorSpec {
+    fn compile(
+        &self,
+        _projection: Projection,
+        _row_group_filter: Option<dispatch::RowGroupFilter>,
+    ) -> RecordBatchOperatorSpec {
         unreachable!("plan-only test should not reach compile")
     }
 

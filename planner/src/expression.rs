@@ -45,10 +45,14 @@ impl TryFrom<duckdb_expression::Ref> for Ref {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum CompareType {
     Equal,
     NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
 }
 
 impl TryFrom<ExpressionType> for CompareType {
@@ -57,6 +61,10 @@ impl TryFrom<ExpressionType> for CompareType {
         match c {
             ExpressionType::COMPARE_EQUAL => Ok(CompareType::Equal),
             ExpressionType::COMPARE_NOTEQUAL => Ok(CompareType::NotEqual),
+            ExpressionType::COMPARE_LESSTHAN => Ok(CompareType::LessThan),
+            ExpressionType::COMPARE_LESSTHANOREQUALTO => Ok(CompareType::LessThanOrEqual),
+            ExpressionType::COMPARE_GREATERTHAN => Ok(CompareType::GreaterThan),
+            ExpressionType::COMPARE_GREATERTHANOREQUALTO => Ok(CompareType::GreaterThanOrEqual),
             _ => Err(Error::UnsupportedComparisonType(c)),
         }
     }
@@ -172,10 +180,15 @@ pub enum Expression {
 
 impl Display for CompareType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CompareType::Equal => f.write_str("="),
-            CompareType::NotEqual => f.write_str("<>"),
-        }
+        let s = match self {
+            CompareType::Equal => "=",
+            CompareType::NotEqual => "<>",
+            CompareType::LessThan => "<",
+            CompareType::LessThanOrEqual => "<=",
+            CompareType::GreaterThan => ">",
+            CompareType::GreaterThanOrEqual => ">=",
+        };
+        f.write_str(s)
     }
 }
 

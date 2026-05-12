@@ -1,7 +1,8 @@
 use crate::operations::unary::factory::UnaryFactory;
-use crate::operations::unary::order_by_limit::{OrderBy, OrderByLimit};
+use crate::operations::unary::order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimit};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use arrow_array::RecordBatch;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 
@@ -9,11 +10,17 @@ use std::sync::mpsc::Receiver;
 ///
 /// The first factory receives the channel receiver; the rest get `None`.
 /// All share a sender so per-worker top-k results flow to a single collector.
+///
+/// `dynamic_filter`, when set, is cloned into every per-worker operator —
+/// each one writes its current local kth-worst boundary into the same
+/// slot, tightening as new better values are found. Sibling scans
+/// elsewhere in the plan read the slot for row-group pruning.
 pub struct OrderByLimitFactory {
     order_by: Vec<OrderBy>,
     limit: usize,
     sender: mpsc::Sender<RecordBatch>,
     receiver: Option<Receiver<RecordBatch>>,
+    dynamic_filter: Option<Arc<DynamicFilterSlot>>,
 }
 
 impl OrderByLimitFactory {
@@ -22,6 +29,7 @@ impl OrderByLimitFactory {
         order_by: Vec<OrderBy>,
         limit: usize,
         worker_count: usize,
+        dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> impl IntoIterator<Item = OrderByLimitFactory> {
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
@@ -31,6 +39,7 @@ impl OrderByLimitFactory {
             limit,
             sender: tx.clone(),
             receiver: rx_opt.take(),
+            dynamic_filter: dynamic_filter.clone(),
         })
     }
 }
@@ -44,6 +53,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for OrderByLimitFactory {
             self.limit,
             self.sender,
             self.receiver.take(),
+            self.dynamic_filter.take(),
         ))
     }
 }

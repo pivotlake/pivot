@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::duckdb_bridge::duckdb_types::{LogicalOperatorType, OrderType};
+use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Expression, type_name};
 use custom_deserializer::CustomDeserializer;
 use serde_repr::Deserialize_repr;
@@ -14,11 +15,12 @@ use serde_repr::Deserialize_repr;
 /// Raw, pre-resolution form of a table scan as it comes off the JSON plan.
 ///
 /// `PlanNode::resolve_inputs` turns each `RawInput` into an [`Input`] by looking
-/// up the table by `table_id`.
+/// up the table by `table_id` and binding each [`DynamicFilter`] to its slot.
 #[derive(CustomDeserializer, Debug)]
 pub struct RawInput {
     pub table_id: usize,
     pub columns: Vec<Expression>,
+    pub dynamic_filters: Vec<DynamicFilter>,
 }
 
 /// Resolved table scan with the `DuckDBTable` trait object attached.
@@ -27,6 +29,7 @@ pub struct RawInput {
 pub struct Input {
     pub table: Box<dyn crate::catalog_provider::DuckDBTable>,
     pub columns: Vec<Expression>,
+    pub dynamic_filters: Vec<DynamicFilter>,
 }
 
 impl fmt::Debug for Input {
@@ -86,6 +89,10 @@ pub struct Filter {
 pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,
+    /// If DuckDB's TopN optimizer installed a dynamic-filter producer on
+    /// this node, the [`DynamicFilter`] declares the shared slot to write
+    /// the current boundary into at runtime.
+    pub produces_dynamic_filter: Option<DynamicFilter>,
 }
 
 /// A single column definition inside a CREATE TABLE statement.
