@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "ibs-annotate"
+version = "0.1.0"
+description = "AMD IBS cache-level annotator with interactive TUI"
+authors = ["Maor Kern"]
+packages = [{include = "ibs_annotate"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+click = "^8.0"
+
+[tool.poetry.scripts]
+ibs-annotate = "ibs_annotate.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
