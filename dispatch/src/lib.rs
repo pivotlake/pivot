@@ -64,7 +64,7 @@ mod operations;
 mod record_batch_metadata;
 mod worker;
 
-use crate::worker::Worker;
+use crate::worker::{Worker, worker_waker};
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
@@ -125,6 +125,10 @@ pub fn dispatcher() -> &'static Dispatcher {
 /// no `start()` counterpart.
 pub fn shutdown() {
     EXIT.store(true, Ordering::Relaxed);
+    // Workers parked on the waker won't observe `EXIT` until someone wakes
+    // them. Notify so every parked worker returns from `wait_if_unchanged`
+    // and sees the flag on its next loop iteration.
+    worker_waker().notify();
 }
 
 /// Initialize the global [`Dispatcher`] with `num_workers` worker threads.
@@ -200,5 +204,8 @@ impl Dispatcher {
         for (sender, builder) in self.worker_senders.iter().zip(builders) {
             sender.send(builder).unwrap();
         }
+        // Wake idle workers so they pick up the new dataflow without waiting
+        // out their park timeout.
+        worker_waker().notify();
     }
 }

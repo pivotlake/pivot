@@ -1,3 +1,4 @@
+use crate::worker::worker_waker;
 use arrow_array::RecordBatch;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -48,6 +49,7 @@ impl DataFlowHandle {
     /// it; for that collect must be called.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        worker_waker().notify();
     }
 
     /// A cheap, `Clone + Send + Sync` handle that can fire cancellation from a
@@ -74,6 +76,7 @@ impl CancelToken {
     /// Signal cancellation. Idempotent.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        worker_waker().notify();
     }
 }
 

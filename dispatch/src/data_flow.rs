@@ -22,6 +22,7 @@ use crate::Identifier;
 use crate::io::{DataFlowRequest, IORequest};
 use crate::memory::ReadBuffer;
 use crate::operations::Operator;
+use crate::worker::worker_waker;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
@@ -31,6 +32,17 @@ use std::sync::{Arc, mpsc};
 use std::{panic, result};
 use thiserror::Error;
 use tracing::{debug, error, warn};
+
+/// One node of the operator graph. Owns its operator; edges are tracked
+/// in the parent `DataFlow` as index lists.
+struct OperatorNode {
+    id: Identifier,
+    operator: Box<dyn Operator>,
+    /// turns true once `try_finish` returns `true`. Future traversals skip
+    /// this node so each operator's try_finish isn't called after it reports
+    /// done.
+    finished: bool,
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -55,93 +67,92 @@ pub enum WorkStatus {
     Ran,
 }
 
-/// Directed graph of operators with precomputed roots, leaves, and edges.
+/// Directed graph of operators with precomputed roots and leaves.
 ///
-/// Supports two traversal orders:
+/// Each node has at most one downstream subscriber (`edges`) and zero or more
+/// upstream publishers (`back_edges`). Supports two traversal orders:
 /// - **Backwards** (leaf-to-root): for running CPU work and collecting IO requests.
 /// - **Forwards** (root-to-leaf): for stealing and finishing.
 struct OperatorGraph {
-    operators: Vec<Box<dyn Operator>>,
-
+    operators: Vec<OperatorNode>,
     leafs: Vec<usize>,
     roots: Vec<usize>,
-
-    edges: Vec<Vec<usize>>,
-    back_edges: Vec<usize>,
+    /// Subscriber index for each node, or `None` if the node is a leaf.
+    edges: Vec<Option<usize>>,
+    /// Publisher indices for each node.
+    back_edges: Vec<Vec<usize>>,
 }
 
 impl OperatorGraph {
     fn from_edges(
         operators: Vec<Box<dyn Operator>>,
-        publisher_to_subscribers: HashMap<Identifier, Vec<Identifier>>,
+        publisher_to_subscriber: HashMap<Identifier, Identifier>,
     ) -> Self {
         debug!(
-            "Building from publishers to subscribers {:?}",
-            publisher_to_subscribers
+            "Building from publisher to subscriber {:?}",
+            publisher_to_subscriber
         );
+
         let n = operators.len();
+        let mut edges: Vec<Option<usize>> = vec![None; n];
+        let mut back_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
 
-        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut back_edges: Vec<usize> = vec![usize::MAX; n]; // MAX = no parent
-
-        for (&publisher, subscribers) in &publisher_to_subscribers {
-            edges[publisher] = subscribers.clone();
-            for &sub in subscribers {
-                back_edges[sub] = publisher;
-            }
+        for (&publisher, &sub) in &publisher_to_subscriber {
+            edges[publisher] = Some(sub);
+            back_edges[sub].push(publisher);
         }
 
-        let roots = (0..n).filter(|&i| back_edges[i] == usize::MAX).collect();
-        let leafs = (0..n).filter(|&i| edges[i].is_empty()).collect();
+        let operators: Vec<OperatorNode> = operators
+            .into_iter()
+            .enumerate()
+            .map(|(id, operator)| OperatorNode {
+                id,
+                operator,
+                finished: false,
+            })
+            .collect();
+
+        let roots = (0..n).filter(|&i| back_edges[i].is_empty()).collect();
+        let leafs = (0..n).filter(|&i| edges[i].is_none()).collect();
 
         Self {
             operators,
-            leafs,
             roots,
+            leafs,
             edges,
             back_edges,
         }
     }
 
-    pub fn traverse_backwards<
-        T,
-        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
-    >(
+    /// Walk leaf-to-root via back-edges. The closure receives `&mut OperatorNode`
+    /// so it can drive the operator and read/update `finished` or other properties.
+    pub fn traverse_backwards<T, F: FnMut(&mut OperatorNode) -> Result<ControlFlow<T>>>(
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
-        for leaf_idx in &self.leafs {
-            let mut current_idx = Some(*leaf_idx);
-
-            while let Some(idx) = current_idx {
-                let res = f(idx, self.operators[idx].as_mut())?;
-                if matches!(res, ControlFlow::Break(..)) {
-                    return Ok(res);
-                }
-
-                let next_idx = self.back_edges[idx];
-                if next_idx == usize::MAX {
-                    break;
-                }
-                current_idx = next_idx.into();
+        let mut stack: Vec<usize> = self.leafs.clone();
+        while let Some(idx) = stack.pop() {
+            let res = f(&mut self.operators[idx])?;
+            if matches!(res, ControlFlow::Break(..)) {
+                return Ok(res);
             }
+            stack.extend(self.back_edges[idx].iter().copied());
         }
         Ok(ControlFlow::Continue(()))
     }
 
-    pub fn traverse_forwards<T, F: FnMut(usize, &mut dyn Operator) -> Result<ControlFlow<T>>>(
+    pub fn traverse_forwards<T, F: FnMut(&mut OperatorNode) -> Result<ControlFlow<T>>>(
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
-        let mut stack = self.roots.clone();
+        let mut stack: Vec<usize> = self.roots.clone();
         while let Some(idx) = stack.pop() {
-            let res = f(idx, self.operators[idx].as_mut())?;
+            let res = f(&mut self.operators[idx])?;
             if matches!(res, ControlFlow::Break(..)) {
                 return Ok(res);
             }
-
-            for &child_idx in &self.edges[idx] {
-                stack.push(child_idx);
+            if let Some(child) = self.edges[idx] {
+                stack.push(child);
             }
         }
         Ok(ControlFlow::Continue(()))
@@ -173,13 +184,13 @@ impl DataFlow {
         canceled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<Error>,
         operators: Vec<Box<dyn Operator>>,
-        publisher_to_subscribers: HashMap<Identifier, Vec<Identifier>>,
+        publisher_to_subscriber: HashMap<Identifier, Identifier>,
     ) -> Self {
         Self {
             id,
+            graph: OperatorGraph::from_edges(operators, publisher_to_subscriber),
             cancelled: canceled,
             err_tx,
-            graph: OperatorGraph::from_edges(operators, publisher_to_subscribers),
         }
     }
     pub fn id(&self) -> Identifier {
@@ -200,6 +211,7 @@ impl DataFlow {
             warn!("Unable to send error...");
         }
         self.cancelled.store(true, Ordering::Relaxed);
+        worker_waker().notify();
     }
 
     /// Try running a function within the dataflow- this will gracefully catch any errors/panics and
@@ -232,11 +244,18 @@ impl DataFlow {
 
     /// Try to finish all operators (root-to-leaf). Returns `true` if every operator
     /// has completed, meaning this dataflow can be removed from the worker.
+    ///
+    /// Operators that have already reported `try_finish == true` are latched
+    /// via `OperatorNode::finished` and skipped on subsequent passes, so each
+    /// operator's `try_finish` is invoked at most once after it reports done.
     pub fn maybe_finish(&mut self) -> bool {
         self.try_run_or(false, |d| {
             d.graph
-                .traverse_forwards(|_s, b| {
-                    Ok(if b.try_finish()? {
+                .traverse_forwards(|node| {
+                    if !node.finished {
+                        node.finished = node.operator.try_finish()?;
+                    }
+                    Ok(if node.finished {
                         ControlFlow::Continue(())
                     } else {
                         ControlFlow::Break(())
@@ -249,8 +268,9 @@ impl DataFlow {
     /// Deliver a completed IO buffer to the operator that requested it.
     pub fn process_io(&mut self, node_id: Identifier, request: IORequest, buffer: ReadBuffer) {
         self.try_run(|d| {
-            let op = d.graph.operators.get_mut(node_id).unwrap();
-            op.process_disk_response(buffer, request)?;
+            d.graph.operators[node_id]
+                .operator
+                .process_disk_response(buffer, request)?;
             Ok(())
         });
     }
@@ -260,7 +280,7 @@ impl DataFlow {
     pub fn run_ready_cpu_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_backwards(|_, op| match op.run_cpu_work()? {
+                .traverse_backwards(|op| match op.operator.run_cpu_work()? {
                     WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                     WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
@@ -276,7 +296,7 @@ impl DataFlow {
     pub fn try_stealing_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_forwards(|_id, op| match op.try_steal_work()? {
+                .traverse_forwards(|op| match op.operator.try_steal_work()? {
                     WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                     WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
@@ -292,13 +312,13 @@ impl DataFlow {
     pub fn get_next_io_request(&mut self) -> Option<Vec<DataFlowRequest>> {
         self.try_run_or(None, |d| {
             d.graph
-                .traverse_backwards(|id, op| {
-                    let requests = op.next_io_requests()?;
+                .traverse_backwards(|op| {
+                    let requests = op.operator.next_io_requests()?;
                     if !requests.is_empty() {
                         Ok(ControlFlow::Break(
                             requests
                                 .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, id, r))
+                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
                                 .collect(),
                         ))
                     } else {
