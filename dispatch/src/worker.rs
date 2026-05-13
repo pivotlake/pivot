@@ -26,21 +26,98 @@ use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::IORequester;
-use crate::memory::{init_free_pool, pop_dirty_buffer};
+use crate::memory::{init_free_pool, pop_local_dirty_buffer};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Barrier};
-use std::thread::{JoinHandle, sleep};
-use std::time::Duration;
+use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::{result, thread};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
 
 thread_local! {
     pub static WORKER_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Wake mechanism shared by all workers. Holds a monotonic `wake_count` and a
+/// `Condvar`. Anyone who generates work that idle workers should pick up
+/// (a new dataflow, a sibling-counter transitioning to 0) calls [`notify`](WorkerWaker::notify),
+/// which bumps the count and wakes every waiting worker.
+///
+/// Each worker remembers the count it observed at the end of its previous
+/// park. When it next finds no work and tries to sleep, [`wait_if_unchanged`](WorkerWaker::wait_if_unchanged)
+/// parks on the condvar only if the count still matches — if it has advanced,
+/// a `notify` arrived during the work pass and the worker returns immediately
+/// to retry.
+/// State protected by the waker's mutex: the wake counter and the number of
+/// currently parked workers.
+struct WakerState {
+    /// Monotonic counter (wrapping) bumped on every [`WorkerWaker::notify`].
+    wake_count: u64,
+    /// How many workers are currently parked on the condvar. Used by
+    /// `notify` to skip the `notify_all` syscall when nobody is waiting.
+    sleepers: usize,
+}
+
+pub struct WorkerWaker {
+    state: Mutex<WakerState>,
+    /// Workers wait here when idle; `notify` wakes all of them.
+    cond: Condvar,
+}
+
+impl WorkerWaker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(WakerState {
+                wake_count: 0,
+                sleepers: 0,
+            }),
+            cond: Condvar::new(),
+        }
+    }
+
+    /// Bump the wake count and wake all waiting workers. Skips the `notify_all`
+    /// call when no workers are currently parked, avoiding the syscall on
+    /// hot send paths that nobody is waiting on.
+    pub fn notify(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.wake_count = state.wake_count.wrapping_add(1);
+        if state.sleepers > 0 {
+            self.cond.notify_all();
+        }
+    }
+
+    /// Current wake count. Workers snapshot this before doing a pass of work.
+    pub fn wake_count(&self) -> u64 {
+        self.state.lock().unwrap().wake_count
+    }
+
+    /// If the wake count still matches `last_seen`, block on the condvar until
+    /// a `notify` advances it. If it has already advanced, return immediately
+    /// so the worker re-runs its loop. Returns the wake count observed under
+    /// the lock after the wait, suitable for use as the next iteration's
+    /// `last_seen` — captured atomically with the wait so a concurrent notify
+    /// cannot be lost between sleep cycles.
+    pub fn wait_if_unchanged(&self, last_seen: u64) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        if state.wake_count == last_seen {
+            state.sleepers += 1;
+            state = self.cond.wait(state).unwrap();
+            state.sleepers -= 1;
+        }
+        state.wake_count
+    }
+}
+
+static WORKER_WAKER: OnceLock<WorkerWaker> = OnceLock::new();
+
+/// Global [`WorkerWaker`] shared by all workers and any code that may produce
+/// work for them.
+pub fn worker_waker() -> &'static WorkerWaker {
+    WORKER_WAKER.get_or_init(WorkerWaker::new)
 }
 
 #[derive(Debug, Error)]
@@ -88,10 +165,14 @@ pub struct Worker {
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
     /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
-    /// How many times did the worker sleep between cleans of buffers. We want to ensure we're not
-    /// cleaning too much and over-using l2/l3 caches that are in use by other workers for live
-    /// queries
-    sleeps_between_clean: usize,
+    /// Wake-count snapshot used to decide whether the next park can sleep.
+    /// Captured under the waker's mutex at the moment of the previous park
+    /// (initialised once at worker startup). Iterations that do work do not
+    /// refresh it — any `notify` they missed will simply make the next park
+    /// observe a mismatch and return immediately, so no wake is lost. The
+    /// shared park/notify object itself is the process-wide
+    /// [`worker_waker()`] singleton; we just hold the counter locally.
+    last_seen_wake_count: u64,
 }
 
 impl Worker {
@@ -110,13 +191,14 @@ impl Worker {
     ) -> JoinHandle<()> {
         thread::spawn(move || {
             WORKER_IDX.set(idx);
+            let last_seen_wake_count = worker_waker().wake_count();
             let mut worker = Self {
                 io: IORequester::new(),
                 id: core.id,
                 data_flows: HashMap::new(),
                 data_flow_queue: receiver,
                 did_work_last_iteration: false,
-                sleeps_between_clean: 0,
+                last_seen_wake_count,
             };
             init_free_pool(idx);
             core_affinity::set_for_current(core);
@@ -190,19 +272,34 @@ impl Worker {
         }
     }
 
-    /// Called when no other work is available; we either sleep or clean a dirty buffer.
-    /// We clean dirty buffers when we have nothing else to do to help future execution
-    fn clear_dirty_buffer_or_sleep(&mut self) {
-        if self.sleeps_between_clean >= 1
-            && let Some(b) = pop_dirty_buffer()
+    /// Called when no other work is available; we either park or clean a dirty buffer.
+    /// We clean dirty buffers when we have nothing else to do to help future execution.
+    ///
+    /// Parking compares against `last_seen_wake_count` (captured under the waker's
+    /// mutex at the previous park): if it has not advanced, we wait on the condvar
+    /// (with a 1s safety timeout); if it has, we return immediately to retry. The
+    /// new count is captured atomically with the wait and stored back into
+    /// `last_seen_wake_count` for the next park.
+    fn clear_dirty_buffer_or_park(&mut self) {
+        // Only clean dirty buffers between queries — while a dataflow is
+        // running we don't want to spend filler-time on buffer cleanup that
+        // could otherwise be CPU available for stealing work from sibling workers.
+        //
+        // Ideally, we would do cleanup also when you have dataflows above a certain
+        // threshold of dirty buffers - but we don't have that implemented yet.
+        if self.data_flows.is_empty()
+            && let Some(b) = pop_local_dirty_buffer()
         {
-            self.sleeps_between_clean = 0;
             b.zero_out();
+
+            // Bound work per pass: zero one buffer, then hand
+            // control back to the main loop so a newly-arrived
+            // dataflow / new stealable work isn't starved behind
+            // a long cleanup run.
             return;
         }
 
-        self.sleeps_between_clean += 1;
-        sleep(Duration::from_millis(1));
+        self.last_seen_wake_count = worker_waker().wait_if_unchanged(self.last_seen_wake_count);
     }
 
     fn clear_cancelled_dataflows(&mut self) {
@@ -255,7 +352,7 @@ impl Worker {
                 self.try_steal_work();
 
                 if !self.did_work_last_iteration {
-                    self.clear_dirty_buffer_or_sleep();
+                    self.clear_dirty_buffer_or_park();
                 }
             }
         }

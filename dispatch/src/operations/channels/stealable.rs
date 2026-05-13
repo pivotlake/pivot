@@ -14,6 +14,7 @@
 use crate::dispatcher;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, Sender};
+use crate::worker::worker_waker;
 use crossbeam_deque::{Stealer, Worker};
 use std::rc::Rc;
 
@@ -49,6 +50,8 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
 impl<O> Sender<O> for Rc<Worker<O>> {
     fn send(&mut self, item: O) -> channels::Result<()> {
         self.push(item);
+        // Wake any parked peer so they can steal the freshly-pushed work.
+        worker_waker().notify();
         Ok(())
     }
 }

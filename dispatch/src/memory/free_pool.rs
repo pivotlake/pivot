@@ -64,11 +64,15 @@ impl FreePool {
     /// Try to obtain a free buffer index.
     ///
     /// 1. Pop from the local LIFO deque (cheapest – no contention).
-    /// 2. Drain the per-worker injector (picks up buffers returned by other threads).
-    /// 3. Steal from another worker's deque (round-robin starting from `last_stealer_idx`).
+    /// 2. Drain the per-worker injector (buffers returned by other threads).
+    /// 3. If `steal`, steal from another worker's deque (round-robin from `last_stealer_idx`).
     ///
-    /// Returns `None` only when every source is empty.
-    fn pop(&self) -> Option<usize> {
+    /// Callers pass `steal=false` for opportunistic background work (e.g. idle-time
+    /// dirty-buffer cleanup) so they don't pull buffers off peer workers that may
+    /// want them. Real allocation paths pass `steal=true`.
+    ///
+    /// Returns `None` only when every consulted source is empty.
+    fn pop(&self, steal: bool) -> Option<usize> {
         if let Some(idx) = self.worker.pop() {
             return Some(idx);
         }
@@ -79,6 +83,10 @@ impl FreePool {
                 Steal::Retry => continue,
                 Steal::Empty => break,
             }
+        }
+
+        if !steal {
+            return None;
         }
 
         let start = self.last_stealer_idx.fetch_add(1, Ordering::Relaxed);
@@ -193,17 +201,20 @@ pub fn pop_free_idx(prefer_zeroed: bool) -> Option<usize> {
         } else {
             (&pools.dirty, &pools.zeroed)
         };
-        first.pop().or_else(|| second.pop())
+        first.pop(true).or_else(|| second.pop(true))
     })
 }
 
-pub fn pop_dirty_idx() -> Option<usize> {
+/// Pop a dirty buffer index from this worker's local deque only.
+///
+/// Does **not** steal from peers
+pub fn pop_local_dirty_idx() -> Option<usize> {
     LOCAL_POOLS.with(|l| {
         let pools = l.borrow();
         let pools = pools
             .as_ref()
             .expect("Cannot allocate free index from nonworker thread");
-        pools.dirty.pop()
+        pools.dirty.pop(false)
     })
 }
 

@@ -7,6 +7,7 @@
 
 use crate::operations::channels;
 use crate::operations::channels::{Receiver, Sender};
+use crate::worker::worker_waker;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -38,6 +39,11 @@ impl<T> Sender<T> for MpscSender<T> {
         // corresponding inner.send is guaranteed to have completed, so
         // `try_recv` will find the item.
         self.count.fetch_add(1, Ordering::Release);
+        // Wake the receiving worker (which may be parked) so it picks up the
+        // freshly-sent item. `return_to_worker` routes cross-worker messages
+        // through this channel, so without a notify the target worker can sit
+        // parked while its mpsc has work waiting.
+        worker_waker().notify();
         Ok(())
     }
 }
