@@ -53,9 +53,8 @@ impl Chain {
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
     ) -> DataFlow {
-        let map: HashMap<Identifier, Vec<Identifier>> = (0..self.operators.len() - 1)
-            .map(|i| (i, vec![i + 1]))
-            .collect();
+        let map: HashMap<Identifier, Identifier> =
+            (0..self.operators.len() - 1).map(|i| (i, i + 1)).collect();
         DataFlow::new(next_dataflow_id(), cancelled, err_tx, self.operators, map)
     }
 }
