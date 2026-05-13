@@ -23,6 +23,7 @@
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
+use crate::worker::worker_waker;
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, SortOptions};
@@ -160,6 +161,7 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
                 get_top_k_from_top_ks(self.top_k_per_batch, &self.order_by, self.limit)?;
             debug!("Sending on {:?}", local_top_k.num_rows());
             self.sender.send(local_top_k).expect("Receiver dropped!");
+            worker_waker().notify();
         }
 
         Ok(self.receiver.map(|rx| OrderByLimitOutputter {

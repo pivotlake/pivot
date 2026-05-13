@@ -59,6 +59,7 @@ use thiserror::Error;
 
 use super::Operator;
 use super::channels::{Receiver, Sender};
+use crate::worker::worker_waker;
 
 mod pipeline_breaker;
 pub use pipeline_breaker::Consumer;
@@ -216,7 +217,14 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
             self.siblings_left.load(Ordering::Relaxed) == 0
         } else {
             self.notified_finished = true;
-            self.siblings_left.fetch_sub(1, Ordering::Relaxed) == 1
+            let was_last = self.siblings_left.fetch_sub(1, Ordering::Relaxed) == 1;
+            if was_last {
+                // Sibling counter just hit 0: every worker's `try_finish` for this
+                // operator can now run. Wake any peers parked on the waker so they
+                // advance to their `finish` instead of sleeping out the timeout.
+                worker_waker().notify();
+            }
+            was_last
         };
 
         if ready {
@@ -230,7 +238,15 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
                 return Ok(false);
             }
 
-            return Ok(self.unary.finish(&mut self.sender)?);
+            let done = self.unary.finish(&mut self.sender)?;
+            if done {
+                // `finish` may have created new batches downstream (e.g.
+                // OrderByLimit flushing), so wake any parked peers
+                // to pick that work up rather than waiting out their park
+                // timeout.
+                worker_waker().notify();
+            }
+            return Ok(done);
         }
         Ok(false)
     }

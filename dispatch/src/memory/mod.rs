@@ -17,7 +17,7 @@
 //! [`WriteBuffer`]s can also be used for many miscellaneous things, such as Vectors and HashTables. It
 //! is generally preferred to use [`WriteBuffer`]s as the memory is easily accounted for. See [`SlabAllocator`].
 
-use crate::memory::free_pool::{pop_dirty_idx, pop_free_idx};
+use crate::memory::free_pool::{pop_free_idx, pop_local_dirty_idx};
 use std::sync::LazyLock;
 
 mod ring;
@@ -77,6 +77,7 @@ pub fn get_write_buffer(prefer_zeroed: bool) -> WriteBuffer {
     }
 }
 
-pub fn pop_dirty_buffer() -> Option<WriteBuffer> {
-    pop_dirty_idx().and_then(|i| RING.try_write(i))
+/// Pop a dirty buffer from this worker's local deque only (no stealing).
+pub fn pop_local_dirty_buffer() -> Option<WriteBuffer> {
+    pop_local_dirty_idx().and_then(|i| RING.try_write(i))
 }

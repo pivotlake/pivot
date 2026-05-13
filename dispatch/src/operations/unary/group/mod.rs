@@ -85,6 +85,7 @@ pub use key_extractions::{IntKeyExtractor, KeyExtractor, StringKeyExtractor};
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{AggregatedTable, MultiSlabTable};
+use crate::worker::worker_waker;
 use ahash::RandomState;
 use arena::SharedArena;
 use arrow_array::RecordBatch;
@@ -237,6 +238,9 @@ impl<K: KeyExtractor> Outputter<RecordBatch> for GroupOutputter<K> {
                 })
             }
             self.partition_jobs_injected.store(true, Ordering::Relaxed);
+
+            // Wake up all workers so that they can start working on partitions
+            worker_waker().notify();
         }
 
         let steal = self.injector.steal();
