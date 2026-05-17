@@ -22,8 +22,8 @@ use std::sync::{Arc, RwLock};
 
 use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar};
 use dispatch::{
-    ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec, RowGroupMetadata,
-    table_input,
+    DataFlowDispatcher, ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec,
+    RowGroupMetadata, table_input,
 };
 use planner::catalog::{
     Catalog, Column, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
@@ -135,9 +135,13 @@ pub struct ParquetCatalogTable {
 }
 
 impl Table for ParquetCatalogTable {
-    fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec {
+    fn compile(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        projection: Projection,
+    ) -> RecordBatchOperatorSpec {
         let parquet = Arc::new(self.parquet.clone());
-        table_input(&parquet, projection, false)
+        table_input(dispatcher, &parquet, projection, false)
     }
 
     fn columns(&self) -> Vec<Column> {

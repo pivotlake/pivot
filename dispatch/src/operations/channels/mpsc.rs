@@ -6,12 +6,14 @@
 //! and internally by the [`return_to_worker`](super::return_to_worker) channel.
 
 use crate::operations::channels;
-use crate::operations::channels::{Receiver, Sender};
+use crate::operations::channels::{ChannelFactory, Receiver, Sender};
 use crate::worker::worker_waker;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::mpsc::channel;
+use crossbeam_deque::{Stealer, Worker};
+
 
 /// Sending end of an mpsc channel. Cloneable — each clone shares the same atomic count.
 pub struct MpscSender<T> {

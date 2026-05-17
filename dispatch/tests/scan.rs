@@ -10,17 +10,17 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use common::*;
-use dispatch::{ParquetTable, Projection, table_input};
+use dispatch::{Projection, table_input};
 
 #[test]
 fn scan_all_columns() {
-    init();
-    let (_dir, table) = parquet_table(&[strings_and_ints(
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(&dispatch, &[strings_and_ints(
         &["a", "b", "c", "d", "e"],
         &[1, 2, 3, 4, 5],
-    )]);
+    )], true);
 
-    let results = table_input(&table, Projection::all(2), false)
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
         .collect()
         .unwrap();
 
@@ -30,7 +30,7 @@ fn scan_all_columns() {
 
 #[test]
 fn scan_column_subset() {
-    init();
+    let dispatch = dispatch(1);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
@@ -44,9 +44,9 @@ fn scan_column_subset() {
         ],
     )
     .unwrap();
-    let (_dir, table) = parquet_table(&[batch]);
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
 
-    let results = table_input(&table, Projection::columns([1]), false)
+    let results = table_input(&dispatch, &table, Projection::columns([1]), false)
         .collect()
         .unwrap();
 
@@ -57,7 +57,7 @@ fn scan_column_subset() {
 
 #[test]
 fn scan_multiple_parquet_files() {
-    init();
+    let dispatch = dispatch(1);
     let dir = TempDir::new().unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8View, false),
@@ -78,9 +78,9 @@ fn scan_multiple_parquet_files() {
         w.write(batch).unwrap();
         w.close().unwrap();
     }
-    let table = Arc::new(ParquetTable::from_directory(dir.path()).unwrap());
+    let table = parquet_table_from_dir(&dispatch, dir.path());
 
-    let results = table_input(&table, Projection::all(2), false)
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
         .count()
         .collect()
         .unwrap();
@@ -90,10 +90,10 @@ fn scan_multiple_parquet_files() {
 
 #[test]
 fn scan_empty_table() {
-    init();
-    let (_dir, table) = parquet_table(&[strings_and_ints(&[], &[])]);
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(&dispatch, &[strings_and_ints(&[], &[])], true);
 
-    let results = table_input(&table, Projection::all(0), false)
+    let results = table_input(&dispatch, &table, Projection::all(0), false)
         .count()
         .collect()
         .unwrap();

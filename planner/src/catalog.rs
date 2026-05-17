@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::expression::TableFilter;
 use crate::types::{Type, logical_from_type};
-use dispatch::{Projection, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
 use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
@@ -60,7 +60,11 @@ pub struct CreateTableRequest {
 /// [`RecordBatchOperatorSpec`].
 pub trait Table: Debug + Send + Sync {
     /// Build a dispatch scan spec that reads this table.
-    fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec;
+    fn compile(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        projection: Projection,
+    ) -> RecordBatchOperatorSpec;
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;

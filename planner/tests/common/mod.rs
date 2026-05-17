@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
 use arrow_json::ArrayWriter;
@@ -11,22 +11,12 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use dispatch::{ParquetTable, Projection, RecordBatchOperatorSpec, table_input};
+use dispatch::{
+    DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec, table_input,
+};
 use planner::Planner;
 use planner::catalog::{Catalog, Column, Table};
 use planner::types::Type;
-
-static INIT: Once = Once::new();
-
-/// Initialize the `dispatch` worker pool. Idempotent; safe to call from every
-/// test. The `testing_planner` fixture calls this for you, so most tests don't
-/// need to invoke it directly — only tests that build their own `Planner`
-/// (e.g. with a custom `Catalog`) need to.
-pub fn init() {
-    INIT.call_once(|| {
-        dispatch::init(core_affinity::get_core_ids().unwrap().len());
-    });
-}
 
 #[derive(Clone, Debug)]
 struct TestTable {
@@ -36,7 +26,7 @@ struct TestTable {
 }
 
 impl TestTable {
-    fn new(columns: &[(&str, Type, ArrayRef)]) -> Self {
+    fn new(dispatch: &Dispatch, columns: &[(&str, Type, ArrayRef)]) -> Self {
         let dir = TempDir::new().unwrap();
 
         let fields: Vec<Field> = columns
@@ -56,7 +46,13 @@ impl TestTable {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        let parquet_table = Arc::new(ParquetTable::from_directory(dir.path()).unwrap());
+        // `ParquetTable::from_directory` touches `memory_ctx()` (file cache),
+        // so it has to run on a worker.
+        let dir_path = dir.path().to_owned();
+        let parquet_table = dispatch
+            .dispatcher()
+            .run_on_worker(move || Arc::new(ParquetTable::from_directory(&dir_path).unwrap()))
+            .expect("ParquetTable::from_directory failed");
         let cols = columns
             .iter()
             .map(|(name, col_type, _)| Column {
@@ -74,8 +70,12 @@ impl TestTable {
 }
 
 impl Table for TestTable {
-    fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec {
-        table_input(&self.parquet_table, projection, false)
+    fn compile(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        projection: Projection,
+    ) -> RecordBatchOperatorSpec {
+        table_input(dispatcher, &self.parquet_table, projection, false)
     }
 
     fn columns(&self) -> Vec<Column> {
@@ -102,11 +102,11 @@ impl TestCatalog {
     /// shape of the old `make_planner_with_table` helper, but adds the table
     /// to the shared catalog so the existing `testing_planner` can plan
     /// queries against it.
-    pub fn add_table(&self, name: &str, columns: &[(&str, Type, ArrayRef)]) {
+    pub fn add_table(&self, dispatch: &Dispatch, name: &str, columns: &[(&str, Type, ArrayRef)]) {
         self.tables
             .lock()
             .unwrap()
-            .insert(name.to_string(), TestTable::new(columns));
+            .insert(name.to_string(), TestTable::new(dispatch, columns));
     }
 }
 
@@ -136,20 +136,39 @@ fn str_col(values: Vec<&'static str>) -> ArrayRef {
     Arc::new(StringViewArray::from(values))
 }
 
-/// A `Planner` paired with a handle to its backing catalog.
+/// A `Planner` paired with a handle to its backing catalog and a private
+/// `Dispatch` for the workers running compiled plans.
 ///
-/// The two are bundled in one fixture (rather than two separate fixtures)
-/// because rstest does not share fixture instances between a sub-fixture
-/// dependency and a direct test parameter — they would resolve to different
-/// `TestCatalog` instances and any tables registered through the test's
-/// `catalog` would never reach the planner.
+/// The first two are bundled in one fixture (rather than two separate
+/// fixtures) because rstest does not share fixture instances between a
+/// sub-fixture dependency and a direct test parameter — they would resolve
+/// to different `TestCatalog` instances and any tables registered through
+/// the test's `catalog` would never reach the planner.
+///
+/// `dispatch` is owned by the fixture so each test gets its own worker pool
+/// and matching `MemoryContext`, and tear-down is automatic when the fixture
+/// drops at end of test.
 pub struct TestingPlanner {
     pub planner: Planner,
-    // Read by the `compile` and `types` test binaries to register extra
-    // tables; the `plan` binary only uses `.planner`, which would otherwise
-    // trip dead-code there since each binary lints this module independently.
     #[allow(dead_code)]
     pub catalog: Arc<TestCatalog>,
+    // Held only for its `Drop` side-effect; access the dispatcher via
+    // [`TestingPlanner::dispatcher`].
+    #[allow(dead_code)]
+    dispatch: Dispatch,
+}
+
+impl TestingPlanner {
+    /// Borrow the dispatcher to hand to `Plan::compile`.
+    pub fn dispatcher(&self) -> &DataFlowDispatcher {
+        self.dispatch.dispatcher()
+    }
+
+    /// Register an ad-hoc table in the catalog. Uses this fixture's own
+    /// `Dispatch` so the parquet write/open happens on a worker.
+    pub fn add_table(&self, name: &str, columns: &[(&str, Type, ArrayRef)]) {
+        self.catalog.add_table(&self.dispatch, name, columns);
+    }
 }
 
 /// Shared planner backed by a catalog seeded with `example_table`:
@@ -169,9 +188,13 @@ pub struct TestingPlanner {
 /// call [`TestCatalog::add_table`] before planning.
 #[fixture]
 pub fn testing_planner() -> TestingPlanner {
-    init();
+    // `TestTable::new` calls `ParquetTable::from_directory`, which touches
+    // `memory_ctx()` (file cache) and so must run on a worker — see
+    // `TestTable::new` for the `run_on_worker` hop.
+    let dispatch = Dispatch::spin_up(1, 32);
     let catalog = Arc::new(TestCatalog::new());
     catalog.add_table(
+        &dispatch,
         "example_table",
         &[
             ("a", Type::Int32, int_col(vec![1, 2, 3, 4, 5])),
@@ -185,7 +208,11 @@ pub fn testing_planner() -> TestingPlanner {
         ],
     );
     let planner = Planner::new(catalog.clone() as Arc<dyn Catalog>);
-    TestingPlanner { planner, catalog }
+    TestingPlanner {
+        planner,
+        catalog,
+        dispatch,
+    }
 }
 
 // Used only by compile tests, but this module is shared across test binaries.

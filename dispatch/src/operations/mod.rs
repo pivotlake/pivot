@@ -17,22 +17,17 @@
 //! - **[`unary`]** — The [`UnaryOperator`], which reads from one
 //!   input channel and writes to one output channel, applying a [`Unary`]
 //!   transform. Most query stages (filter, project, count, etc.) are built as unary
-//!   operators. The [`UnaryOperatorFactory`] creates them during the factory build step.
-//!
-//! - **[`parquet`]** — The parquet read pipeline: fetching row groups from disk,
-//!   decompressing pages, and decoding them into Arrow `RecordBatch`es. This is a chain
-//!   of unary operators with types flowing through
-//!   `RowGroupRequest → RowGroupBuffer → CompressedPage → DecompressedPage → RecordBatch`.
-//!
+//!   operators. The [`UnaryOperatorFactory`] creates them during the factory build step
+//! 
 //! # Operator lifecycle
 //!
 //! Operators are created during the factory build step on the worker thread (not before —
 //! some hold `Rc` or other non-`Send` state). Once created, the worker's event loop
 //! repeatedly calls:
 //!
-//! 1. [`run_cpu_work`](Operator::run_cpu_work) — consume one item from the input channel,
-//!    process it, and send the result downstream. Returns [`WorkStatus::Ran`] if it did
-//!    anything, [`WorkStatus::Pending`] if no input was available.
+//! 1. [`run_cpu_work`](Operator::run_cpu_work) — does one 'unit' of CPU work, optionally. 
+//!    Returns [`WorkStatus::Ran`] if it did anything, [`WorkStatus::Pending`] if no work was available
+//!    to do.
 //!
 //! 2. [`next_io_requests`](Operator::next_io_requests) — return any pending IO requests
 //!    (e.g. read a parquet page from disk). The worker submits these asynchronously and
@@ -55,7 +50,7 @@ pub mod channels;
 pub mod nullary;
 pub use nullary::*;
 
-mod unary;
+pub mod unary;
 pub use unary::*;
 
 #[derive(Debug, Error)]

@@ -4,9 +4,10 @@
 //! Pivot's own structs (the `TryFrom` impl below recurses through the
 //! tree). Each [`PlanNode`] holds an [`Operator`] and its child plan nodes.
 //!
-//! [`PlanContext`] is threaded through the lowering step in
-//! [`compile`](crate::compile) so operators that need to act on the
-//! catalog / read settings at execution time can use it.
+//! The [`Plan`] carries the [`Catalog`] it was bound against (operators like
+//! `CREATE TABLE` need it at execution time). The dispatcher, on the other
+//! hand, is passed in at [`compile`](crate::compile) time — it represents
+//! "what worker pool runs this plan" and isn't a property of the plan itself.
 
 use crate::catalog::Catalog;
 use crate::operator::{self, Operator};
@@ -62,23 +63,14 @@ impl fmt::Display for PlanNode {
     }
 }
 
-/// State shared across the whole compile pass for one [`Plan`].
-///
-/// Currently just the [`Catalog`], handed to operators that need it
-/// (e.g. for `CREATE TABLE` to mutate the catalog at execution time).
-#[derive(Debug, Clone)]
-pub struct PlanContext {
-    pub catalog: Arc<dyn Catalog>,
-}
-
 /// A fully-translated plan ready for compilation.
 ///
 /// Produced by [`Planner::plan`](crate::Planner::plan); converted into an
 /// executable [`RecordBatchOperatorSpec`](dispatch::RecordBatchOperatorSpec)
-/// via [`Plan::compile`](crate::compile).
+/// via [`Plan::compile`](crate::compile), which takes the dispatcher.
 #[derive(Debug)]
 pub struct Plan {
-    pub plan_context: PlanContext,
+    pub catalog: Arc<dyn Catalog>,
     pub root: PlanNode,
 }
 

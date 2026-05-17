@@ -1,37 +1,86 @@
 #![allow(dead_code)]
 
-use std::sync::Once;
-
+use std::ops::Deref;
 use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use tempfile::TempDir;
 
-use dispatch::ParquetTable;
+use dispatch::{
+    DataFlowDispatcher, Dispatch, MemoryContextFactory, ParquetTable, init_memory_context,
+};
+
+/// The process-wide dispatcher, created on the first `init*` call.
+// static DISPATCHER: OnceLock<Mutex<DataFlowDispatcher>> = OnceLock::new();
+
+// pub fn init() {
+//     init_with_workers(core_affinity::get_core_ids().unwrap().len());
+// }
+
+// pub fn init_with_workers(num_workers: usize) {
+//     // Each test thread also drops result `RecordBatch`es here, so it needs its
+//     // own `MemoryContext`. Create a 1-worker context and install it.
+//     let factory = MemoryContextFactory::create_many(1)
+//         .into_iter()
+//         .next()
+//         .unwrap();
+//     init_memory_context(factory.create_memory_ctx());
+//
+//     DISPATCHER.get_or_init(|| {
+//         let (exit, handles, dispatcher) = Dispatch::new(num_workers).into_parts();
+//         Mutex::new(dispatcher)
+//     });
+// }
+
 
 static INIT: Once = Once::new();
 
-pub fn init() {
-    init_with_workers(core_affinity::get_core_ids().unwrap().len());
-}
-
-pub fn init_with_workers(num_workers: usize) {
+fn init_tracing() {
     INIT.call_once(|| {
-        dispatch::init(num_workers);
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .init()
     });
 }
 
-pub fn parquet_table(batches: &[RecordBatch]) -> (TempDir, Arc<ParquetTable>) {
-    parquet_table_with_opts(batches, true)
+/// RAII wrapper around the owned `Dispatch`: derefs to its
+/// `DataFlowDispatcher` for `table_input(&dispatch, …)` usage and calls
+/// [`Dispatch::exit`] on drop to clean up worker threads.
+pub struct DispatchGuard(Option<Dispatch>);
+
+impl Deref for DispatchGuard {
+    type Target = DataFlowDispatcher;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap().dispatcher()
+    }
 }
 
-pub fn parquet_table_with_opts(
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        self.0.take().unwrap().exit();
+    }
+}
+
+/// Spin a `Dispatch` up on the calling thread and return a guard for it.
+pub fn dispatch(workers: usize) -> DispatchGuard {
+    init_tracing();
+    DispatchGuard(Some(Dispatch::spin_up(workers, 10)))
+}
+
+pub fn parquet_table(
+    dispatch: &DispatchGuard,
     batches: &[RecordBatch],
     dictionary: bool,
 ) -> (TempDir, Arc<ParquetTable>) {
+    // Write the parquet file on the test thread (`ArrowWriter` is plain
+    // `std::fs` IO — no `MemoryContext` needed).
     let dir = TempDir::new().unwrap();
     let schema = batches[0].schema();
     let path = dir.path().join("data.parquet");
@@ -45,8 +94,22 @@ pub fn parquet_table_with_opts(
         writer.write(batch).unwrap();
     }
     writer.close().unwrap();
-    let table = Arc::new(ParquetTable::from_directory(dir.path()).unwrap());
+
+    let table = parquet_table_from_dir(dispatch, dir.path());
     (dir, table)
+}
+
+/// Load a `ParquetTable` from an already-populated directory. Runs
+/// `ParquetTable::from_directory` on a worker because it touches
+/// `memory_ctx()` via the file cache.
+pub fn parquet_table_from_dir(
+    dispatch: &DispatchGuard,
+    dir: &std::path::Path,
+) -> Arc<ParquetTable> {
+    let dir_path = dir.to_owned();
+    dispatch
+        .run_on_worker(move || Arc::new(ParquetTable::from_directory(&dir_path).unwrap()))
+        .expect("ParquetTable::from_directory failed")
 }
 
 pub fn strings_and_ints(names: &[&str], values: &[i64]) -> RecordBatch {

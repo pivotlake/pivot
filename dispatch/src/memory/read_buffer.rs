@@ -1,6 +1,9 @@
-use crate::memory::{BUFFER_SIZE, RING, WriteBuffer};
+use crate::memory::ring::Ring;
+use crate::memory::{BUFFER_SIZE, WriteBuffer};
 use std::ops::Deref;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use crate::memory_ctx;
 
 /// Shared, immutable handle to a 2MB slot in the ring buffer. While held, the slot cannot be used
 /// for writing (similar to a Read lock in a Rwlock)
@@ -49,7 +52,7 @@ impl Deref for ReadBuffer {
 /// the count reaches 0 and the slot becomes reclaimable.
 impl Drop for ReadBuffer {
     fn drop(&mut self) {
-        RING.slots[self.slot_idx]
+        memory_ctx().ring().slots[self.slot_idx]
             .used
             .fetch_sub(1, Ordering::Relaxed);
     }
@@ -65,7 +68,10 @@ impl From<WriteBuffer> for ReadBuffer {
         let ptr = value.ptr;
         let slot_idx = value.slot_idx;
         std::mem::forget(value);
-        RING.set_slot_used(slot_idx, 1, Ordering::Release);
-        Self { ptr, slot_idx }
+        memory_ctx().ring().set_slot_used(slot_idx, 1, Ordering::Release);
+        Self {
+            ptr,
+            slot_idx,
+        }
     }
 }

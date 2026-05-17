@@ -1,5 +1,5 @@
 use crate::io::{IORequest, create_aligned_read_from_start_end};
-use crate::memory::{FILE_CACHE, ReadBuffer};
+use crate::memory::{memory_ctx, ReadBuffer};
 use crate::operations::unary::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::operations::unary::parquet::types::projection::Projection;
 use bytes::Bytes;
@@ -48,7 +48,7 @@ impl ColumnRequest {
         let mut buffers = Vec::with_capacity(read.locations.len());
 
         for (j, location) in read.locations.into_iter().enumerate() {
-            match FILE_CACHE.get(&location) {
+            match memory_ctx().file_cache().get(&location) {
                 None => {
                     io_requests.push(IORequest {
                         location,

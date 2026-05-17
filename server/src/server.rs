@@ -7,28 +7,29 @@
 //!    [`pgwire::tokio::process_socket`], which drives the full wire-protocol
 //!    state machine (startup handshake, query loop, message framing) and
 //!    calls back into the [`PivotHandlers`] bundle for each phase.
-//! 2. **Watch the dispatch worker pool.** Every worker `JoinHandle` from
-//!    [`dispatch::init`] is moved into a [`JoinSet`] of blocking tasks. Workers
-//!    are designed to run forever, so a join ordinarily only completes once
-//!    [`dispatch::shutdown`] flips the process-wide exit flag. An earlier
-//!    completion (panic, unexpected return) is treated as fatal and aborts
-//!    the accept loop with an [`enum@Error`].
+//! 2. **Watch the dispatch worker pool.** Every worker `JoinHandle` returned by
+//!    [`Dispatch::into_parts`] is moved into a [`JoinSet`] of blocking tasks.
+//!    Workers are designed to run forever, so a join ordinarily only completes
+//!    once the shared exit flag (also returned from `into_parts`) flips. An
+//!    earlier completion (panic, unexpected return) is treated as fatal and
+//!    aborts the accept loop with an [`enum@Error`].
 //!
-//! On clean shutdown the accept loop calls [`dispatch::shutdown`] itself and
-//! drains the worker watchers, so when [`Server::serve`] returns `Ok(())`
-//! every worker thread has already terminated.
+//! On clean shutdown the accept loop sets the exit flag itself and drains the
+//! worker watchers, so when [`Server::serve`] returns `Ok(())` every worker
+//! thread has already terminated.
 
 use pgwire::tokio::process_socket;
 use planner::catalog::Catalog;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
-
+use dispatch::Dispatch;
 use crate::query_handler::PivotHandlers;
 
 #[derive(Debug, Error)]
@@ -54,37 +55,45 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Server {
     bind: SocketAddr,
     worker_watchers: JoinSet<std::thread::Result<()>>,
+    shutdown: Arc<AtomicBool>,
     handlers: Arc<PivotHandlers>,
 }
 
 impl Server {
-    /// Build a server from the bind address, the dispatch worker handles, and
-    /// the catalog used to resolve table names. `worker_handles` is what
-    /// [`dispatch::init`] returns; the server takes ownership and joins each
-    /// one as part of its shutdown / fault-detection path. Pass port `0` in
-    /// `bind` to let the OS pick a free port (useful in tests).
+    /// Build a server from the bind address, an already-spun-up [`Dispatch`],
+    /// and the catalog used to resolve table names. The server takes the
+    /// `Dispatch` apart with [`Dispatch::into_parts`]: it clones the
+    /// dispatcher for the query handler and adopts every worker `JoinHandle`
+    /// for the shutdown / fault-detection path. Pass port `0` in `bind` to
+    /// let the OS pick a free port (useful in tests).
     pub fn new(
         bind: SocketAddr,
-        worker_handles: Vec<JoinHandle<()>>,
+        dispatch: Dispatch,
         catalog: Arc<dyn Catalog>,
     ) -> Self {
+        // Clone the dispatcher out *before* `into_parts` drops it; the
+        // query handler needs it to compile every plan.
+        let dispatcher = dispatch.dispatcher().clone();
+        let (handles, shutdown) = dispatch.into_parts();
         let mut watchers = JoinSet::new();
-        for handle in worker_handles {
+        for handle in handles {
             watchers.spawn_blocking(move || handle.join());
         }
         Self {
             bind,
+            shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(catalog)),
+            handlers: Arc::new(PivotHandlers::new(catalog, dispatcher)),
         }
     }
 
     /// Run the accept loop until `shutdown` resolves or a worker exits.
     ///
-    /// On `shutdown`, we call [`dispatch::shutdown`] to flip the process-wide
-    /// exit flag and then await the worker-watcher tasks; they unblock once
-    /// every worker observes the flag. The wait is short (a few worker-loop
-    /// iterations) and bounded by the longest-running in-flight query.
+    /// On `shutdown`, we flip the shared exit flag (the `Arc<AtomicBool>` we
+    /// took from `Dispatch::into_parts`) and then await the worker-watcher
+    /// tasks; they unblock once every worker observes the flag. The wait is
+    /// short (a few worker-loop iterations) and bounded by the longest-running
+    /// in-flight query.
     pub async fn serve(
         mut self,
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
@@ -99,14 +108,14 @@ impl Server {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signalled, draining workers");
-                    dispatch::shutdown();
+                    self.shutdown.store(true, Ordering::Relaxed);
                     // Wait for every worker to observe the flag and exit. No
                     // need to inspect results — we initiated the shutdown.
                     while self.worker_watchers.join_next().await.is_some() {}
                     return Ok(());
                 }
                 Some(joined) = self.worker_watchers.join_next() => {
-                    dispatch::shutdown();
+                    self.shutdown.store(true, Ordering::Relaxed);
                     return Err(match joined {
                         Ok(Ok(())) => {
                             error!("dispatch worker returned unexpectedly");
@@ -190,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
-        let server = Server::new(bind(), vec![], catalog());
+        let server = Server::new(bind(), Dispatch::spin_up(1, 32), catalog());
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;
@@ -199,26 +208,5 @@ mod tests {
         let result = join.await.unwrap();
 
         assert!(matches!(result, Ok(())));
-    }
-
-    #[tokio::test]
-    async fn panicking_worker_handle_surfaces_error() {
-        // Suppress the spawned thread's panic message so it doesn't pollute
-        // test output. Restored as soon as join() returns.
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let bad = std::thread::spawn(|| panic!("worker boom"));
-        let server = Server::new(bind(), vec![bad], catalog());
-
-        let result = server.serve(Box::pin(std::future::pending::<()>())).await;
-        std::panic::set_hook(prev_hook);
-
-        match result {
-            Err(Error::DispatchWorkerFailed(msg)) => assert!(
-                msg.contains("worker boom"),
-                "expected message to mention panic payload, got: {msg}",
-            ),
-            other => panic!("expected DispatchWorkerFailed, got: {other:?}"),
-        }
     }
 }

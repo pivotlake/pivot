@@ -1,5 +1,6 @@
+use std::marker::PhantomData;
 use super::record_batch_operator::RecordBatchOperatorFactory;
-use crate::Identifier;
+use crate::{Identifier, OperatorFactory};
 use crate::data_flow::DataFlow;
 use crate::operations::Operator;
 use crate::operations::channels::MpscSender;
@@ -70,30 +71,26 @@ pub struct DataFlowBuilder {
     /// A sender for errors that may occur during running
     err_tx: mpsc::Sender<crate::data_flow::Error>,
     /// The last operator in the dataflow
-    tail: Box<dyn RecordBatchOperatorFactory>,
-    /// A sender for record batches that result from this dataflow (say a queries response)
-    output_tx: MpscSender<RecordBatch>,
+    build: Box<dyn FnOnce() -> Chain + Send>
 }
 
 impl DataFlowBuilder {
     pub fn new(
+        build: Box<dyn FnOnce() -> Chain + Send>,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
-        tail: Box<dyn RecordBatchOperatorFactory>,
-        output_tx: MpscSender<RecordBatch>,
     ) -> Self {
         Self {
             cancelled,
             err_tx,
-            tail,
-            output_tx,
+            build,
         }
     }
 
     /// Build the full operator chain and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
     pub fn build(self) -> Result<DataFlow> {
-        let chain = catch_unwind(AssertUnwindSafe(|| self.tail.build_collect(self.output_tx)))
+        let chain = catch_unwind(AssertUnwindSafe(|| (self.build)()))
             .map_err(|e| {
                 let msg = e
                     .downcast_ref::<String>()

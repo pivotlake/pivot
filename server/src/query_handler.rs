@@ -24,9 +24,7 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use crate::arrow_to_pgwire::{build_field_info, encode_batch};
-use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use crate::arrow_to_pgwire::PGRowBatch;
 use async_trait::async_trait;
 use dispatch::{CancelToken, DataFlowHandle};
 use futures::{Sink, stream};
@@ -34,7 +32,7 @@ use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{FieldInfo, QueryResponse, Response};
+use pgwire::api::results::{QueryResponse, Response};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers,
@@ -124,21 +122,29 @@ impl Drop for CancelOnDrop {
 /// blocking pool, surfacing errors and supporting cancellation.
 pub struct PivotQueryHandler {
     catalog: Arc<dyn planner::catalog::Catalog>,
+    dispatcher: dispatch::DataFlowDispatcher,
 }
 
 impl PivotQueryHandler {
-    pub fn new(catalog: Arc<dyn planner::catalog::Catalog>) -> Self {
-        Self { catalog }
+    pub fn new(
+        catalog: Arc<dyn planner::catalog::Catalog>,
+        dispatcher: dispatch::DataFlowDispatcher,
+    ) -> Self {
+        Self {
+            catalog,
+            dispatcher,
+        }
     }
 
     async fn run_query(&self, query: &str) -> Result<Response> {
         let catalog = self.catalog.clone();
+        let dispatcher = self.dispatcher.clone();
         let query = query.to_string();
-        let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle> {
+        let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
             with_planner(&catalog, |planner| {
                 let plan = planner.plan(&query)?;
-                let spec = plan.compile()?;
-                Ok(spec.execute())
+                let spec = plan.compile(&dispatcher)?;
+                Ok(spec.map(|| |b| PGRowBatch::from(b)).execute())
             })
         })
         .await
@@ -148,18 +154,19 @@ impl PivotQueryHandler {
         // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
         // raw disconnects (whole connection task dropped).
         let guard = CancelOnDrop::new(handle.cancel_token());
-        let batches = tokio::task::spawn_blocking(move || handle.collect())
+        let batches: Vec<_> = tokio::task::spawn_blocking(move || handle.collect())
             .await
             .map_err(Error::WorkerPanic)??;
         guard.defuse();
 
-        Ok(response_for(batches))
+        let fields = batches.first().map_or(Arc::new(vec![]), |b| b.fields.clone());
+        Ok(Response::Query(QueryResponse::new(fields, stream::iter(batches.into_iter().map(|b| b.rows).flatten().map(Ok)))))
     }
 }
 
 #[async_trait]
 impl SimpleQueryHandler for PivotQueryHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -169,20 +176,6 @@ impl SimpleQueryHandler for PivotQueryHandler {
         let res = self.run_query(query).await.map_err(|e| e.into_pgwire())?;
         Ok(vec![res])
     }
-}
-
-/// Build the [`Response`] for one statement.
-fn response_for(batches: Vec<RecordBatch>) -> Response {
-    // TODO: In the future this shouldn't always return a QueryResponse
-    let schema = batches
-        .first()
-        .map_or_else(|| Arc::new(Schema::empty()), |b| b.schema());
-    let fields: Arc<Vec<FieldInfo>> = build_field_info(&schema);
-    let rows: Vec<_> = batches
-        .iter()
-        .flat_map(|b| encode_batch(b, fields.clone()))
-        .collect();
-    Response::Query(QueryResponse::new(fields, stream::iter(rows)))
 }
 
 /// Startup handler that registers each new connection with the shared
@@ -215,10 +208,13 @@ pub struct PivotHandlers {
 }
 
 impl PivotHandlers {
-    pub fn new(catalog: Arc<dyn planner::catalog::Catalog>) -> Self {
+    pub fn new(
+        catalog: Arc<dyn planner::catalog::Catalog>,
+        dispatcher: dispatch::DataFlowDispatcher,
+    ) -> Self {
         let manager = Arc::new(ConnectionManager::new());
         Self {
-            query_handler: Arc::new(PivotQueryHandler::new(catalog)),
+            query_handler: Arc::new(PivotQueryHandler::new(catalog, dispatcher)),
             startup_handler: Arc::new(PivotStartupHandler::new(manager.clone())),
             cancel_handler: Arc::new(DefaultCancelHandler::new(manager)),
         }

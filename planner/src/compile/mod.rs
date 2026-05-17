@@ -24,12 +24,14 @@ mod create_table;
 mod expression;
 mod operator;
 
+use std::sync::Arc;
 use crate::expression::Expression;
 use crate::types::Type;
-use crate::{Plan, PlanContext, PlanNode};
+use crate::{Plan, PlanNode};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
-use dispatch::RecordBatchOperatorSpec;
+use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use thiserror::Error;
+use crate::catalog::Catalog;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -72,34 +74,43 @@ pub enum Error {
 }
 
 impl Plan {
-    pub fn compile(&self) -> Result<RecordBatchOperatorSpec, Error> {
-        self.root.compile(&self.plan_context)
+    /// Lower this plan into an executable
+    /// [`RecordBatchOperatorSpec`](dispatch::RecordBatchOperatorSpec) on the
+    /// given dispatcher. The catalog the plan was bound against is read from
+    /// [`Plan::catalog`] for operators that need it at runtime
+    /// (e.g. `CREATE TABLE`).
+    pub fn compile(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        self.root.compile(dispatcher, &self.catalog)
     }
 }
 
 impl PlanNode {
     pub(crate) fn compile(
         &self,
-        plan_context: &PlanContext,
+        dispatcher: &DataFlowDispatcher,
+        catalog: &Arc<dyn Catalog>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let mut inputs = self
             .inputs
             .iter()
-            .map(|i| i.compile(plan_context))
+            .map(|i| i.compile(dispatcher, catalog))
             .collect::<Result<Vec<_>, _>>()?;
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(plan_context),
-            crate::Operator::Projection(o) => o.compile(inputs.remove(0), plan_context),
-            crate::Operator::Filter(o) => o.compile(inputs.remove(0), plan_context),
-            crate::Operator::Aggregate(o) => o.compile(inputs.remove(0), plan_context),
-            crate::Operator::OrderBy(o) => o.compile(inputs.remove(0), plan_context),
-            crate::Operator::TopN(o) => o.compile(inputs.remove(0), plan_context),
+            crate::Operator::Input(o) => o.compile(dispatcher),
+            crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
+            crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
+            crate::Operator::TopN(o) => o.compile(inputs.remove(0)),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);
                 }
-                o.compile(plan_context)
+                o.compile(dispatcher, catalog)
             }
         }
     }

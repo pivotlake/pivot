@@ -1,7 +1,7 @@
 //! Per-core worker threads that execute dataflows.
 //!
 //! Each worker is pinned to a CPU core and runs an event loop that:
-//! - Receives [`DataFlowBuilder`]s from the [`Dispatcher`](crate::Dispatcher) via a channel
+//! - Receives [`DataFlowBuilder`]s from the [`Dispatch`](crate::Dispatch) via a channel
 //! - Builds them into [`DataFlow`]s (creating operators, channels, etc. on the worker thread)
 //! - Drives execution by interleaving CPU work, IO, and work stealing
 //!
@@ -26,20 +26,31 @@ use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::IORequester;
-use crate::memory::{init_free_pool, pop_local_dirty_buffer};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::{result, thread};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
+use crate::memory::{init_memory_context, memory_ctx, MemoryContextFactory};
 
 thread_local! {
     pub static WORKER_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+    pub static NUM_WORKERS: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// Worker-thread-only handle to the shared [`WorkerWaker`].
+    ///
+    /// Set once by [`Worker::create`] before the event loop starts, so that
+    /// worker-side code (channel sends, the worker's own park path) can call
+    /// [`worker_waker`] without threading an extra parameter through every
+    /// call site. Non-worker threads — the embedding server, cancellation
+    /// handles created off-worker — must instead reach the same instance
+    /// through their owned `Arc<WorkerWaker>` (e.g.
+    /// [`crate::DataFlowDispatcher::waker`]).
+    static WORKER_WAKER: Cell<*const WorkerWaker> = const { Cell::new(std::ptr::null()) };
 }
 
 /// Wake mechanism shared by all workers. Holds a monotonic `wake_count` and a
@@ -69,7 +80,7 @@ pub struct WorkerWaker {
 }
 
 impl WorkerWaker {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: Mutex::new(WakerState {
                 wake_count: 0,
@@ -112,12 +123,30 @@ impl WorkerWaker {
     }
 }
 
-static WORKER_WAKER: OnceLock<WorkerWaker> = OnceLock::new();
+/// Install this thread's view of the shared [`WorkerWaker`].
+///
+/// Called by [`Worker::create`] before the event loop starts. The `Arc` is
+/// kept alive by the [`Worker`] itself (and by [`crate::DataFlowDispatcher`]),
+/// so the raw pointer cached here is valid for the lifetime of the worker
+/// thread.
+fn set_worker_waker(waker: &Arc<WorkerWaker>) {
+    WORKER_WAKER.set(Arc::as_ptr(waker));
+}
 
-/// Global [`WorkerWaker`] shared by all workers and any code that may produce
-/// work for them.
+/// Return the shared [`WorkerWaker`] for code running on a worker thread.
+///
+/// Panics if called from a thread that has not had a waker installed via
+/// [`set_worker_waker`] — non-worker callers should reach the same waker
+/// through their owned `Arc`, e.g. [`crate::DataFlowDispatcher::waker`],
+/// rather than going through this function.
 pub fn worker_waker() -> &'static WorkerWaker {
-    WORKER_WAKER.get_or_init(WorkerWaker::new)
+    let ptr = WORKER_WAKER.get();
+    assert!(
+        !ptr.is_null(),
+        "worker_waker() called from a non-worker thread; use \
+         DataFlowDispatcher::waker() instead"
+    );
+    unsafe { &*ptr }
 }
 
 #[derive(Debug, Error)]
@@ -153,10 +182,11 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 ///
 /// And forever back to 1!
 pub struct Worker {
-    /// A requester (through uring) for any IO necessary
-    io: IORequester,
     /// The identifier of the worker (every worker has a unique ID)
     id: Identifier,
+    should_exit: Arc<AtomicBool>,
+    /// A requester (through uring) for any IO necessary
+    io: IORequester,
     /// A queue of dataflows for the worker to work on. The worker can work on many dataflows
     /// simultaneously
     data_flow_queue: Receiver<DataFlowBuilder>,
@@ -165,13 +195,15 @@ pub struct Worker {
     /// Did the worker do work on last iteration? This is used to decide whether the worker should
     /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
+    /// Shared park/notify object. Keeping an owned `Arc` here means the
+    /// [`set_worker_waker`] raw pointer stays valid for the lifetime of the
+    /// worker thread.
+    waker: Arc<WorkerWaker>,
     /// Wake-count snapshot used to decide whether the next park can sleep.
     /// Captured under the waker's mutex at the moment of the previous park
     /// (initialised once at worker startup). Iterations that do work do not
     /// refresh it — any `notify` they missed will simply make the next park
-    /// observe a mismatch and return immediately, so no wake is lost. The
-    /// shared park/notify object itself is the process-wide
-    /// [`worker_waker()`] singleton; we just hold the counter locally.
+    /// observe a mismatch and return immediately, so no wake is lost.
     last_seen_wake_count: u64,
 }
 
@@ -185,23 +217,35 @@ impl Worker {
     /// returned [`JoinHandle`].
     pub fn create(
         idx: usize,
+        num_workers: usize,
         core: CoreId,
+        should_exit: Arc<AtomicBool>,
+        memory_context_factory: MemoryContextFactory,
         receiver: Receiver<DataFlowBuilder>,
         ready_barrier: Arc<Barrier>,
+        waker: Arc<WorkerWaker>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
             WORKER_IDX.set(idx);
-            let last_seen_wake_count = worker_waker().wake_count();
+            NUM_WORKERS.set(num_workers);
+            set_worker_waker(&waker);
+            let last_seen_wake_count = waker.wake_count();
             let mut worker = Self {
                 io: IORequester::new(),
                 id: core.id,
                 data_flows: HashMap::new(),
                 data_flow_queue: receiver,
                 did_work_last_iteration: false,
+                should_exit,
+                waker,
                 last_seen_wake_count,
             };
-            init_free_pool(idx);
+            debug!("Initializing memory context for worker {:?}", idx);
+            init_memory_context(memory_context_factory.create_memory_ctx());
+            debug!("Pre-faulting for worker {:?}", idx);
+            memory_ctx().prefault_buffers();
             core_affinity::set_for_current(core);
+            debug!("Waiting for barrier for worker {:?}", idx);
             ready_barrier.wait();
             debug!("Starting worker {:?}", idx);
             worker.run().expect("Worker failed!");
@@ -276,10 +320,10 @@ impl Worker {
     /// We clean dirty buffers when we have nothing else to do to help future execution.
     ///
     /// Parking compares against `last_seen_wake_count` (captured under the waker's
-    /// mutex at the previous park): if it has not advanced, we wait on the condvar
-    /// (with a 1s safety timeout); if it has, we return immediately to retry. The
-    /// new count is captured atomically with the wait and stored back into
-    /// `last_seen_wake_count` for the next park.
+    /// mutex at the previous park): if it has not advanced, we wait on the condvar;
+    /// if it has, we return immediately to retry. The new count is captured
+    /// atomically with the wait and stored back into `last_seen_wake_count` for the
+    /// next park.
     fn clear_dirty_buffer_or_park(&mut self) {
         // Only clean dirty buffers between queries — while a dataflow is
         // running we don't want to spend filler-time on buffer cleanup that
@@ -288,7 +332,7 @@ impl Worker {
         // Ideally, we would do cleanup also when you have dataflows above a certain
         // threshold of dirty buffers - but we don't have that implemented yet.
         if self.data_flows.is_empty()
-            && let Some(b) = pop_local_dirty_buffer()
+            && let Some(b) = memory_ctx().pop_dirty_buffer()
         {
             b.zero_out();
 
@@ -299,7 +343,7 @@ impl Worker {
             return;
         }
 
-        self.last_seen_wake_count = worker_waker().wait_if_unchanged(self.last_seen_wake_count);
+        self.last_seen_wake_count = self.waker.wait_if_unchanged(self.last_seen_wake_count);
     }
 
     fn clear_cancelled_dataflows(&mut self) {
@@ -323,9 +367,9 @@ impl Worker {
     #[instrument(skip(self), fields(worker_id = %self.id))]
     pub fn run(&mut self) -> Result<()> {
         loop {
-            // Cooperative shutdown: [`crate::shutdown`] flips this flag and
-            // we exit cleanly so the thread can be reaped.
-            if crate::EXIT.load(Ordering::Relaxed) {
+            // Cooperative shutdown: [`crate::Dispatch::exit`] flips this flag
+            // and we exit cleanly so the thread can be reaped.
+            if self.should_exit.load(Ordering::Relaxed) {
                 debug!("Worker {} exiting via shutdown flag", self.id);
                 return Ok(());
             }

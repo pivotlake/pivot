@@ -11,7 +11,6 @@
 //! return it to the worker that sent out, since it needs to be sent to the Decoder of that row group.
 //! Therefore it should *not* be in a stealable channel (but in `return_to_worker`)
 
-use crate::dispatcher;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, Sender};
 use crate::worker::worker_waker;
@@ -103,8 +102,8 @@ impl<I> Receiver<I> for StealableReceiver<I> {
 ///
 /// Returns an iterator of factories — one per worker. Each factory's stealer list
 /// contains every other worker's deque, so any worker can steal from any other.
-pub fn stealable<T: Send>() -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    let workers: Vec<_> = (0..dispatcher().workers())
+pub fn stealable<T: Send>(count: usize) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
+    let workers: Vec<_> = (0..count)
         .map(|_| Worker::new_lifo())
         .collect();
 

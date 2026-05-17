@@ -3,7 +3,6 @@
 //! Each [`Operator`](crate::operator::Operator) variant has a `compile`
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
-use crate::PlanContext;
 use crate::compile::create_table::CreateTableNullaryFactory;
 use crate::compile::{Error, ExprEvalFn};
 use crate::expression::Expression;
@@ -13,18 +12,15 @@ use crate::operator::{
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
 use arrow_array::{BooleanArray, RecordBatch};
-use dispatch::{
-    IntKeyExtractor, OrderBy as DispatchOrderBy, Projection as DispatchProjection,
-    RecordBatchOperatorSpec, StringKeyExtractor,
-};
+use dispatch::{DataFlowDispatcher, IntKeyExtractor, OrderBy as DispatchOrderBy, Projection as DispatchProjection, RecordBatchOperatorSpec, StringKeyExtractor};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use crate::catalog::Catalog;
 
 impl Projection {
     pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,
-        _plan_context: &PlanContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let idxs = Arc::new(
             self.projections
@@ -38,7 +34,7 @@ impl Projection {
 
         Ok(input.project(|| {
             let idxs = idxs.clone();
-            move |batch: &RecordBatch| batch.project(&idxs).unwrap()
+            move |batch: RecordBatch| batch.project(&idxs).unwrap()
         }))
     }
 }
@@ -47,7 +43,6 @@ impl Aggregate {
     pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,
-        _plan_context: &PlanContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         if self.expressions.len() != 1 {
             return Err(Error::UnsupportedAggregateExpressionAmount(
@@ -96,7 +91,7 @@ impl Aggregate {
 impl Input {
     pub(crate) fn compile(
         &self,
-        _plan_context: &PlanContext,
+        dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let column_indices: Vec<usize> = self
             .columns
@@ -110,7 +105,7 @@ impl Input {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
-        Ok(self.table.compile(projection))
+        Ok(self.table.compile(dispatcher, projection))
     }
 }
 
@@ -118,12 +113,11 @@ impl Filter {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
-        plan_context: &PlanContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let filters = Arc::new(
             self.conditions
                 .iter()
-                .map(|e| e.compile(plan_context))
+                .map(|e| e.compile())
                 .collect::<Result<Vec<_>, _>>()?,
         );
         assert!(!filters.is_empty());
@@ -149,7 +143,6 @@ impl OrderBy {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
-        _plan_context: &PlanContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let orders = self
             .order_bys
@@ -172,7 +165,6 @@ impl TopN {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
-        _plan_context: &PlanContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let orders = self
             .order_bys
@@ -193,7 +185,8 @@ impl TopN {
 impl CreateTable {
     pub(crate) fn compile(
         &self,
-        plan_context: &PlanContext,
+        dispatcher: &DataFlowDispatcher,
+        catalog: &Arc<dyn Catalog>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         if self.or_replace {
             return Err(Error::UnsupportedCreateTableOrReplace);
@@ -213,9 +206,10 @@ impl CreateTable {
         let already_created = Arc::new(AtomicBool::new(false));
 
         Ok(RecordBatchOperatorSpec::from_nullary(
-            (0..dispatch::dispatcher().workers()).map(|_| {
+            dispatcher,
+            (0..dispatcher.worker_count()).map(|_| {
                 CreateTableNullaryFactory::new(
-                    plan_context.catalog.clone(),
+                    catalog.clone(),
                     self.request.clone(),
                     already_created.clone(),
                 )

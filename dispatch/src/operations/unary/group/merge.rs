@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn single_worker_all_entries_preserved() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let tables = make_worker_tables(&state, &arena, &[1, 2, 3, 4, 5]);
 
@@ -263,7 +263,7 @@ mod tests {
     #[test]
     fn two_workers_disjoint_keys() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let mut tables = make_worker_tables(&state, &arena, &[1, 2, 3]);
         tables.extend(make_worker_tables(&state, &arena, &[4, 5, 6]));
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn two_workers_overlapping_keys_merged() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let mut tables = make_worker_tables(&state, &arena, &[1, 2, 3]);
         tables.extend(make_worker_tables(&state, &arena, &[2, 3, 4]));
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn empty_tables_produce_no_entries() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let tables = make_worker_tables(&state, &arena, &[]);
 
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn many_workers_large_overlap() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let mut tables = vec![];
         for _ in 0..8 {
@@ -324,7 +324,7 @@ mod tests {
     #[test]
     fn partitions_are_disjoint() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let values: Vec<i32> = (0..200).collect();
         let tables = make_worker_tables(&state, &arena, &values);
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn mixed_size_tables_merge_correctly() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let small = make_worker_tables(&state, &arena, &[1, 2]);
         let big_values: Vec<i32> = (0..500).collect();
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn duplicates_within_single_worker_carry_through_merge() {
         init_test_free_pool(64);
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let tables = make_worker_tables(&state, &arena, &[5, 5, 5, 5, 5]);
 

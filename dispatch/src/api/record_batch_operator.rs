@@ -9,8 +9,10 @@
 //! # use dispatch::*;
 //! # use dispatch::table_input;
 //! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+//! # let dispatch = Dispatch::spin_up(1, 32);
+//! # let dispatcher = dispatch.dispatcher();
 //! // SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
-//! let results = table_input(&table, Projection::columns([0]), false)
+//! let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");
 //!         move |batch: &RecordBatch| {
@@ -61,11 +63,12 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    CountFactory, FilterFactory, GroupFactory, KeyExtractor, NullaryFactory,
-    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, ProjectFactory, RootUnaryOperatorFactory,
-    UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    CountFactory, FilterFactory, GroupFactory, KeyExtractor, LocalCollectFactory, MapFactory,
+    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
+    RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
-use crate::{DataFlowHandle, dispatcher};
+use crate::operations::unary;
+use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
 /// Object-safe version of [`OperatorFactory<RecordBatch>`].
@@ -142,12 +145,14 @@ impl<UF: UnaryFactory<RecordBatch, RecordBatch>> RecordBatchOperatorFactory
     }
 }
 
-/// Bridges a `Box<dyn RecordBatchOperatorFactory>` back into `OperatorFactory<RecordBatch>`.
+/// Bridges a `Box<dyn RecordBatchOperatorFactory>` into `OperatorFactory<RecordBatch>`,
+/// so the type-erased `RecordBatch` head can be slotted into any generic
+/// `UnaryOperatorFactory<RecordBatch, ..., RecordBatchFactoryBridge>`.
 ///
-/// Used by [`RecordBatchOperatorSpec::materialize`] to feed type-erased factories back
-/// into the generic [`UnaryOperatorFactory`] / [`OperatorSpec::read_parquet`] pipeline.
-/// Uses [`Any`] downcasting to dispatch the sender to the correct build method at runtime.
-struct RecordBatchFactoryBridge(Box<dyn RecordBatchOperatorFactory>);
+/// Uses [`Any`] downcasting at build time (once per worker, not per batch) to
+/// dispatch the now-erased sender to the correct concrete build method on
+/// the underlying [`RecordBatchOperatorFactory`].
+pub struct RecordBatchFactoryBridge(Box<dyn RecordBatchOperatorFactory>);
 
 impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
     fn build<S: Sender<RecordBatch> + 'static>(self: Box<Self>, sender: S) -> Chain {
@@ -180,7 +185,9 @@ impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
 /// # use dispatch::*;
 /// # use dispatch::table_input;
 /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-/// let results = table_input(&table, Projection::columns([0]), false)
+/// # let dispatch = Dispatch::spin_up(1, 32);
+/// # let dispatcher = dispatch.dispatcher();
+/// let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
 ///     .filter(|| {
 ///         let mut contains = Contains::new("google");
 ///         move |batch: &RecordBatch| {
@@ -206,7 +213,9 @@ impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
 /// # use dispatch::*;
 /// # use dispatch::table_input;
 /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-/// # let spec = table_input(&table, Projection::columns([0]), false);
+/// # let dispatch = Dispatch::spin_up(1, 32);
+/// # let dispatcher = dispatch.dispatcher();
+/// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
 /// spec.filter(|| {
 ///     // This closure is called N times (once per worker).
 ///     // Each worker gets its own `Contains` instance.
@@ -222,6 +231,7 @@ impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
 /// # ;
 /// ```
 pub struct RecordBatchOperatorSpec {
+    dispatcher: DataFlowDispatcher,
     factories: VecDeque<Box<dyn RecordBatchOperatorFactory>>,
 }
 
@@ -233,9 +243,10 @@ impl RecordBatchOperatorSpec {
     pub fn from_spec<OF: OperatorFactory<RecordBatch> + 'static>(
         spec: OperatorSpec<RecordBatch, OF>,
     ) -> Self {
+        let (dispatcher, factories) = spec.into_parts();
         Self {
-            factories: spec
-                .factories()
+            dispatcher,
+            factories: factories
                 .into_iter()
                 .map(|f| Box::new(f) as Box<dyn RecordBatchOperatorFactory>)
                 .collect(),
@@ -248,13 +259,20 @@ impl RecordBatchOperatorSpec {
     /// built on the worker thread. This is useful for source-like or side-effect-only
     /// operators such as DDL.
     pub fn from_nullary<NF: NullaryFactory<RecordBatch>>(
+        dispatcher: &DataFlowDispatcher,
         nullary_factories: impl IntoIterator<Item = NF>,
     ) -> Self {
         Self::from_spec(OperatorSpec::new(
+            dispatcher.clone(),
             nullary_factories
                 .into_iter()
                 .map(NullaryOperatorFactory::new),
         ))
+    }
+
+    /// Borrow the dispatcher this spec was built against.
+    pub fn dispatcher(&self) -> &DataFlowDispatcher {
+        &self.dispatcher
     }
 
     /// Append a unary (one-in, one-out) stage to the dataflow.
@@ -265,8 +283,8 @@ impl RecordBatchOperatorSpec {
         self,
         unary_factories: impl IntoIterator<Item = UF>,
     ) -> Self {
-        let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-        let factories = stealable::<RecordBatch>()
+        let siblings_left = Arc::new(AtomicUsize::new(self.worker_count()));
+        let factories = stealable::<RecordBatch>(self.worker_count())
             .into_iter()
             .zip(unary_factories)
             .zip(self.factories)
@@ -279,9 +297,16 @@ impl RecordBatchOperatorSpec {
                 }) as Box<dyn RecordBatchOperatorFactory>
             })
             .collect();
-        Self { factories }
+        Self {
+            dispatcher: self.dispatcher,
+            factories,
+        }
     }
-
+    
+    fn worker_count(&self) -> usize {
+        self.factories.len()
+    }
+    
     /// Filter rows from each batch using a boolean mask.
     ///
     /// Takes an **outer builder closure** (`FB`) that is called once per worker thread
@@ -298,7 +323,9 @@ impl RecordBatchOperatorSpec {
     /// # use dispatch::*;
     /// # use dispatch::table_input;
     /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// # let spec = table_input(&table, Projection::columns([0]), false);
+    /// # let dispatch = Dispatch::spin_up(1, 32);
+    /// # let dispatcher = dispatch.dispatcher();
+    /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
     /// spec.filter(|| {
     ///     // Called once per worker — allocate per-worker state here.
     ///     let mut contains = Contains::new("google");
@@ -317,39 +344,90 @@ impl RecordBatchOperatorSpec {
         F: FnMut(&RecordBatch) -> BooleanArray + Send + 'static,
         FB: Fn() -> F,
     {
-        self.unary((0..dispatcher().workers()).map(|_| FilterFactory(builder())))
+        let worker_count = self.worker_count();
+        self.unary((0..worker_count).map(|_| FilterFactory(builder())))
     }
 
-    /// Transform each batch by projecting or computing new columns.
+    /// Apply a per-batch 1→1 transform that can change the output type.
     ///
-    /// Same two-level closure pattern as [`filter`](Self::filter): the outer closure
-    /// is called once per worker to set up state, and the inner closure is called
-    /// once per `RecordBatch`, returning a new `RecordBatch`.
+    /// Replaces both the old `project` (RB → RB) and the old `for_each`
+    /// (RB → T) — one method, generic over the output type. The closure
+    /// takes an owned `RecordBatch` and returns a single `T`; every `send`
+    /// downstream is monomorphized over the resulting `OperatorSpec<T, _>`.
+    ///
+    /// Lifts out of `RecordBatchOperatorSpec` into the generic
+    /// [`OperatorSpec<T, _>`]. To chain back into RB-only methods like
+    /// `.count()` / `.order_by_limit()`, call
+    /// [`record_batches`](OperatorSpec::record_batches) on the result when
+    /// `T = RecordBatch`.
+    ///
+    /// Same two-level closure pattern as [`filter`](Self::filter): the outer
+    /// builder closure is called once per worker.
     ///
     /// # Example
     ///
     /// ```no_run
     /// # use std::sync::Arc;
-    /// # use arrow_array::RecordBatch;
+    /// # use arrow_array::{Int64Array, RecordBatch};
     /// # use dispatch::*;
-    /// # use dispatch::table_input;
     /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// # let spec = table_input(&table, Projection::all(3), false);
-    /// spec.project(|| {
-    ///     // Called once per worker.
-    ///     let indices = vec![0, 2];
-    ///
-    ///     // Called once per RecordBatch — keep only columns 0 and 2.
-    ///     move |batch: &RecordBatch| batch.project(&indices).unwrap()
+    /// # let dispatch = Dispatch::spin_up(1, 32);
+    /// # let dispatcher = dispatch.dispatcher();
+    /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
+    /// // RB → RB (the old `project`)
+    /// spec.map(|| {
+    ///     let indices = vec![0];
+    ///     move |batch: RecordBatch| batch.project(&indices).unwrap()
     /// })
     /// # ;
     /// ```
-    pub fn project<P, PB>(self, builder: PB) -> Self
+    pub fn map<T, F, FB>(
+        self,
+        builder: FB,
+    ) -> OperatorSpec<
+        T,
+        UnaryOperatorFactory<
+            RecordBatch,
+            T,
+            MapFactory<F>,
+            StealableChannelFactory<RecordBatch>,
+            RecordBatchFactoryBridge,
+        >,
+    >
     where
-        P: FnMut(&RecordBatch) -> RecordBatch + Send + 'static,
-        PB: Fn() -> P,
+        T: Send + 'static,
+        F: FnMut(RecordBatch) -> T + Send + 'static,
+        FB: Fn() -> F,
     {
-        self.unary((0..dispatcher().workers()).map(|_| ProjectFactory(builder())))
+        let worker_count = self.worker_count();
+        let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let factories: Vec<_> = stealable::<RecordBatch>(worker_count)
+            .into_iter()
+            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip(self.factories)
+            .map(|((channel_factory, unary_factory), head)| {
+                UnaryOperatorFactory::new(
+                    RecordBatchFactoryBridge(head),
+                    unary_factory,
+                    channel_factory,
+                    siblings_left.clone(),
+                )
+            })
+            .collect();
+        OperatorSpec::new(self.dispatcher, factories)
+    }
+
+    /// Sugar for [`map`](Self::map) when the output is `RecordBatch`: applies
+    /// the transform and stays in `RecordBatchOperatorSpec` so you can keep
+    /// chaining RB-only methods like `.count()` / `.order_by_limit()`.
+    ///
+    /// Equivalent to `self.map(builder).record_batches()`.
+    pub fn project<F, FB>(self, builder: FB) -> Self
+    where
+        F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
+        FB: Fn() -> F,
+    {
+        self.map(builder).record_batches()
     }
 
     /// Count the total number of rows across all batches.
@@ -364,13 +442,16 @@ impl RecordBatchOperatorSpec {
     /// # use dispatch::*;
     /// # use dispatch::table_input;
     /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// let results = table_input(&table, Projection::columns([0]), false)
+    /// # let dispatch = Dispatch::spin_up(1, 32);
+    /// # let dispatcher = dispatch.dispatcher();
+    /// let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
     ///     .count()
     ///     .collect();
     /// // results contains a single RecordBatch with one row: the count
     /// ```
     pub fn count(self) -> Self {
-        self.unary(CountFactory::create_for_workers(dispatcher().workers()))
+        let worker_count = self.worker_count();
+        self.unary(CountFactory::create_for_workers(worker_count))
     }
 
     /// Sort by the given columns and keep only the first `limit` rows.
@@ -385,16 +466,19 @@ impl RecordBatchOperatorSpec {
     /// # use dispatch::*;
     /// # use dispatch::table_input;
     /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// # let spec = table_input(&table, Projection::columns([0]), false);
+    /// # let dispatch = Dispatch::spin_up(1, 32);
+    /// # let dispatcher = dispatch.dispatcher();
+    /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
     /// // Top 10 rows ordered by column 0 descending
     /// spec.order_by_limit(vec![OrderBy::new(0, true, false)], 10)
     /// # ;
     /// ```
     pub fn order_by_limit(self, order_by: Vec<OrderBy>, limit: usize) -> Self {
+        let worker_count = self.worker_count();
         self.unary(OrderByLimitFactory::create_for_workers(
             order_by,
             limit,
-            dispatcher().workers(),
+            worker_count,
         ))
     }
 
@@ -411,17 +495,23 @@ impl RecordBatchOperatorSpec {
     /// # use dispatch::*;
     /// # use dispatch::table_input;
     /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// # let spec = table_input(&table, Projection::columns([0]), false);
+    /// # let dispatch = Dispatch::spin_up(1, 32);
+    /// # let dispatcher = dispatch.dispatcher();
+    /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
     /// // GROUP BY column 0 (string), COUNT(*)
     /// spec.group_by_count::<StringKeyExtractor>(0)
     /// # ;
     /// ```
     pub fn group_by_count<K: KeyExtractor>(self, group_column: usize) -> Self {
+        let worker_count = self.worker_count();
+        let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K>::create_for_workers(
             group_column,
-            dispatcher().workers(),
+            worker_count,
+            buffers
         ))
     }
+
 
     /// Materialize additional columns from the underlying parquet table.
     ///
@@ -437,7 +527,9 @@ impl RecordBatchOperatorSpec {
     /// # use arrow_array::{RecordBatch, StringViewArray};
     /// # use dispatch::*;
     /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// table_input(&table, Projection::columns([0, 13]), true)  // read EventTime + URL
+    /// # let dispatch = Dispatch::spin_up(1, 32);
+    /// # let dispatcher = dispatch.dispatcher();
+    /// table_input(&dispatcher, &table, Projection::columns([0, 13]), true)  // read EventTime + URL
     ///     .filter(|| {
     ///         let mut contains = Contains::new("google");
     ///         move |batch: &RecordBatch| {
@@ -451,27 +543,28 @@ impl RecordBatchOperatorSpec {
     ///     .collect();
     /// ```
     pub fn materialize(mut self, table: Arc<ParquetTable>, projection: Projection) -> Self {
-        let siblings_left_materializer = Arc::new(AtomicUsize::new(dispatcher().workers()));
-        let siblings_left_fetcher = Arc::new(AtomicUsize::new(dispatcher().workers()));
+        let siblings_left_materializer = Arc::new(AtomicUsize::new(self.worker_count()));
+        let siblings_left_fetcher = Arc::new(AtomicUsize::new(self.worker_count()));
 
-        let materializer_spec = OperatorSpec::new(
-            stealable::<RecordBatch>()
-                .into_iter()
-                .zip(stealable::<RowGroupRequest>())
-                .map(|(rb_ch, rq_ch)| {
+        let dispatcher = self.dispatcher.clone();
+        let materializer_factories: Vec<_> = stealable::<RecordBatch>(self.worker_count())
+            .into_iter()
+            .zip(stealable::<RowGroupRequest>(self.worker_count()))
+            .map(|(rb_ch, rq_ch)| {
+                UnaryOperatorFactory::new(
                     UnaryOperatorFactory::new(
-                        UnaryOperatorFactory::new(
-                            RecordBatchFactoryBridge(self.factories.pop_front().unwrap()),
-                            MaterializerFactory::new(projection.clone(), table.clone()),
-                            rb_ch,
-                            siblings_left_materializer.clone(),
-                        ),
-                        RowGroupFetcherFactory::new(),
-                        rq_ch,
-                        siblings_left_fetcher.clone(),
-                    )
-                }),
-        );
+                        RecordBatchFactoryBridge(self.factories.pop_front().unwrap()),
+                        MaterializerFactory::new(projection.clone(), table.clone()),
+                        rb_ch,
+                        siblings_left_materializer.clone(),
+                    ),
+                    RowGroupFetcherFactory::new(),
+                    rq_ch,
+                    siblings_left_fetcher.clone(),
+                )
+            })
+            .collect();
+        let materializer_spec = OperatorSpec::new(dispatcher, materializer_factories);
 
         Self::from_spec(materializer_spec.read_parquet(
             &table,
@@ -495,7 +588,9 @@ impl RecordBatchOperatorSpec {
     /// # use arrow_array::{RecordBatch, StringViewArray};
     /// # use dispatch::*;
     /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// let batches: Vec<RecordBatch> = table_input(&table, Projection::columns([0]), false)
+    /// # let dispatch = Dispatch::spin_up(1, 32);
+    /// # let dispatcher = dispatch.dispatcher();
+    /// let batches: Vec<RecordBatch> = table_input(&dispatcher, &table, Projection::columns([0]), false)
     ///     .filter(|| {
     ///         let mut contains = Contains::new("google");
     ///         move |batch: &RecordBatch| {
@@ -507,23 +602,34 @@ impl RecordBatchOperatorSpec {
     ///     .collect()
     ///     .unwrap();
     /// ```
-    pub fn execute(self) -> DataFlowHandle {
-        let (tx, rx) = mpsc_channel();
-        let (err_tx, err_rx) = std::sync::mpsc::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        dispatcher().push_data_flow(
-            self.factories
-                .into_iter()
-                .map(|f| DataFlowBuilder::new(cancelled.clone(), err_tx.clone(), f, tx.clone())),
-        );
-        drop(tx);
-
-        let (rx, _) = rx.into_parts();
-        DataFlowHandle::new(rx, err_rx, cancelled)
+    /// Dispatch the pipeline to the workers and return a control handle plus
+    /// a stream of the produced batches.
+    ///
+    /// Batches arrive **ring-backed**: their `Buffer`s point into worker
+    /// `WriteBuffer`s and are only safe to handle on a thread with a matching
+    /// `MemoryContext`. For the usual case prefer
+    /// [`collect`](Self::collect), which inserts a
+    /// [`LocalCollect`](crate::operations::LocalCollectFactory) cap so every
+    /// batch leaves the worker as plain heap-backed buffers.
+    pub fn execute(self) -> DataFlowHandle<RecordBatch> {
+        let factories: Vec<_> = self
+            .factories
+            .into_iter()
+            .map(RecordBatchFactoryBridge)
+            .collect();
+        OperatorSpec::new(self.dispatcher, factories).execute()
     }
 
+    /// Run the dataflow and collect every batch into a `Vec`.
+    ///
+    /// Appends a [`LocalCollect`](crate::operations::LocalCollectFactory)
+    /// stage before executing, so the batches you receive are plain
+    /// heap-backed (safe to hold on any thread, regardless of
+    /// `MemoryContext`). Ring slots return to the worker's pool the moment
+    /// `LocalCollect`'s on-worker copy drops.
     pub fn collect(self) -> crate::data_flow::Result<Vec<RecordBatch>> {
-        self.execute().collect()
+        let count = self.worker_count();
+        self.unary((0..count).into_iter().map(|_| LocalCollectFactory)).execute().collect()
     }
 }
 
@@ -549,8 +655,11 @@ impl RecordBatchOperatorSpec {
 /// # use arrow_array::{RecordBatch, StringViewArray};
 /// # use dispatch::*;
 /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+/// # let dispatch = Dispatch::spin_up(1, 32);
+/// # let dispatcher = dispatch.dispatcher();
 /// // Read columns "URL" and "EventTime" from a parquet table
 /// let spec = table_input(
+///     &dispatcher,
 ///     &table,
 ///     Projection::from_field_names(table.schema(), ["URL", "EventTime"]),
 ///     false,
@@ -565,19 +674,24 @@ impl RecordBatchOperatorSpec {
 /// }).collect();
 /// ```
 pub fn table_input(
+    dispatcher: &DataFlowDispatcher,
     table: &Arc<ParquetTable>,
     projection: Projection,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
+    let worker_count = dispatcher.worker_count();
     let injector = RowGroupInjectorFactory::new(table, projection.clone());
-    let siblings_left = Arc::new(AtomicUsize::new(dispatcher().workers()));
-    let input = OperatorSpec::new((0..dispatcher().workers()).map(|_| {
-        RootUnaryOperatorFactory::new(
-            RowGroupFetcherFactory::new(),
-            injector.clone(),
-            siblings_left.clone(),
-        )
-    }));
+    let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+    let factories: Vec<_> = (0..worker_count)
+        .map(|_| {
+            RootUnaryOperatorFactory::new(
+                RowGroupFetcherFactory::new(),
+                injector.clone(),
+                siblings_left.clone(),
+            )
+        })
+        .collect();
+    let input = OperatorSpec::new(dispatcher.clone(), factories);
     RecordBatchOperatorSpec::from_spec(input.read_parquet(
         table,
         projection,

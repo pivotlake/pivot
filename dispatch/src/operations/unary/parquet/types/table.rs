@@ -6,7 +6,6 @@
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
 use crate::io::open_direct_read;
-use crate::memory::FILE_CACHE;
 use crate::operations::unary::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
@@ -27,6 +26,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
+use crate::memory::memory_ctx;
 
 static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
 
@@ -147,7 +147,7 @@ fn parse_row_group_metadatas(
     let buf = read_parquet_footer(&mut file)?;
     let file_meta = parse_footer_thrift(&buf)?;
     let file = open_direct_read(path)?;
-    FILE_CACHE.open_file_entry(file.as_raw_fd());
+    memory_ctx().file_cache().open_file_entry(file.as_raw_fd());
 
     let file = Arc::new(file);
 
@@ -394,6 +394,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn write_parquet(batch: &RecordBatch, stats: EnabledStatistics) -> (TempDir, ParquetTable) {
+        // `ParquetTable::from_directory` touches `memory_ctx()` (via the file
+        // cache), so every test in this module needs a context on its thread.
+        crate::memory::init_test_free_pool(0);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("data.parquet");
         let props = WriterProperties::builder()

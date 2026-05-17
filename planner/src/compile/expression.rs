@@ -3,7 +3,6 @@
 //! Each variant of [`Expression`] compiles into an
 //! [`ExprFn`] — a builder closure the filter/project operators
 //! in `dispatch` can call.
-use crate::PlanContext;
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::expression::{Compare, CompareType, Contains, Expression, Function, Ref};
 use crate::types::Type;
@@ -14,7 +13,7 @@ use dispatch::Contains as DispatchContains;
 use std::sync::Arc;
 
 impl Ref {
-    pub fn compile(&self, _plan_context: &PlanContext) -> Result<ExprFn, Error> {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
         let column_idx = self.column_idx;
         Ok(stateless_expr(move |batch: &RecordBatch| {
             ExprResult::Array(batch.column(column_idx).clone())
@@ -23,13 +22,13 @@ impl Ref {
 }
 
 impl Compare {
-    pub fn compile(&self, plan_context: &PlanContext) -> Result<ExprFn, Error> {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
         let kernel: fn(&dyn Datum, &dyn Datum) -> _ = match self.compare_type {
             CompareType::Equal => eq,
             CompareType::NotEqual => neq,
         };
-        let left_builder = self.left.compile(plan_context)?;
-        let right_builder = self.right.compile(plan_context)?;
+        let left_builder = self.left.compile()?;
+        let right_builder = self.right.compile()?;
         Ok(Box::new(move || {
             let mut left_expr = left_builder();
             let mut right_expr = right_builder();
@@ -45,7 +44,7 @@ impl Compare {
 }
 
 impl Contains {
-    pub fn compile(&self, plan_context: &PlanContext) -> Result<ExprFn, Error> {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
         match self.haystack.as_ref() {
             Expression::Ref(r) if r.return_type == Type::Utf8 => {}
             expr => {
@@ -55,7 +54,7 @@ impl Contains {
             }
         }
 
-        let haystack_builder = self.haystack.compile(plan_context)?;
+        let haystack_builder = self.haystack.compile()?;
 
         // Extract the needle string from the constant expression
         let needle_str: String = match self.needle.as_ref() {
@@ -85,25 +84,25 @@ impl Contains {
 }
 
 impl Function {
-    pub fn compile(&self, plan_context: &PlanContext) -> Result<ExprFn, Error> {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
-            Function::Contains(c) => c.compile(plan_context),
+            Function::Contains(c) => c.compile(),
         }
     }
 }
 
 impl Expression {
-    pub fn compile(&self, plan_context: &PlanContext) -> Result<ExprFn, Error> {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
-            Expression::Ref(r) => r.compile(plan_context),
-            Expression::Compare(c) => c.compile(plan_context),
+            Expression::Ref(r) => r.compile(),
+            Expression::Compare(c) => c.compile(),
             Expression::Constant(c) => {
                 let scalar = c.clone();
                 Ok(stateless_expr(move |_batch: &RecordBatch| {
                     ExprResult::Scalar(scalar.clone())
                 }))
             }
-            Expression::Function(f) => f.compile(plan_context),
+            Expression::Function(f) => f.compile(),
             _ => Err(Error::UnsupportedExpression(self.clone())),
         }
     }
