@@ -1,0 +1,26 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+server = { path = "../server" }
+catalog = { path = "../catalog" }
+planner = { path = "../planner" }
+dispatch = { path = "../dispatch" }
+
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "macros", "sync"] }
+tokio-postgres = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+core_affinity = "0.8.3"
+
+[[bin]]
+name = "pivot-bench"
+path = "src/main.rs"
