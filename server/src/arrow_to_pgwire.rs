@@ -18,7 +18,6 @@ use arrow_schema::{DataType, SchemaRef};
 
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
-use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
 /// Build a pgwire row schema from an Arrow [`SchemaRef`]. Each Arrow column
@@ -40,20 +39,24 @@ pub fn build_field_info(schema: &SchemaRef) -> Arc<Vec<FieldInfo>> {
     Arc::new(fields)
 }
 
-/// Encode every row in `batch` as a [`DataRow`] using `fields` as the schema.
-pub fn encode_batch(
-    batch: &RecordBatch,
-    fields: Arc<Vec<FieldInfo>>,
-) -> Vec<PgWireResult<DataRow>> {
-    let mut encoder = DataRowEncoder::new(fields);
-    let mut out = Vec::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        for col in 0..batch.num_columns() {
-            encode_cell(&mut encoder, batch.column(col).as_ref(), row);
+pub struct PGRowBatch {
+    pub rows: Vec<DataRow>,
+    pub fields: Arc<Vec<FieldInfo>>,
+}
+
+impl From<RecordBatch> for PGRowBatch {
+    fn from(batch: RecordBatch) -> Self {
+        let fields = build_field_info(&batch.schema());
+        let mut encoder = DataRowEncoder::new(fields.clone());
+        let mut rows = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            for col in 0..batch.num_columns() {
+                encode_cell(&mut encoder, batch.column(col).as_ref(), row);
+            }
+            rows.push(encoder.take_row());
         }
-        out.push(Ok(encoder.take_row()));
+        Self { rows, fields }
     }
-    out
 }
 
 /// Encode a single cell. We always feed the encoder a typed Rust value (or
@@ -214,11 +217,8 @@ mod tests {
     }
 
     fn rows(batch: &RecordBatch) -> Vec<Vec<Option<String>>> {
-        let fields = build_field_info(&batch.schema());
-        encode_batch(batch, fields)
-            .into_iter()
-            .map(|r| decode_text_row(&r.unwrap()))
-            .collect()
+        let pg: PGRowBatch = batch.clone().into();
+        pg.rows.iter().map(decode_text_row).collect()
     }
 
     #[test]

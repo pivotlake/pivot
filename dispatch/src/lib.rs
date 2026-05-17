@@ -29,10 +29,11 @@
 //! # use arrow_array::StringViewArray;
 //! # use dispatch::*;
 //! # use dispatch::table_input;
-//! # let _ = init(1);
+//! # let dispatch = Dispatch::spin_up(1, 32);
+//! # let dispatcher = dispatch.dispatcher();
 //! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
 //! // SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
-//! let results = table_input(&table, Projection::columns([13]), false)
+//! let results = table_input(&dispatcher, &table, Projection::columns([13]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");
 //!         move |batch: &arrow_array::RecordBatch| {
@@ -48,7 +49,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use tikv_jemallocator::Jemalloc;
 use tracing::info;
@@ -64,12 +65,15 @@ mod operations;
 mod record_batch_metadata;
 mod worker;
 
-use crate::worker::{Worker, worker_waker};
+use crate::operations::nullary::OneShotNullaryFactory;
+use crate::worker::{Worker, WorkerWaker};
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
 pub use io::IORequest;
+pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
+pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use operations::parquet::types::metadata::{
@@ -90,122 +94,172 @@ lg_extent_max_active_fit:8,background_thread:true\0";
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-/// Global singleton dispatcher. Initialized once via [`init`].
-pub static DISPATCHER: OnceLock<Dispatcher> = OnceLock::new();
-
-static NUM_WORKERS: OnceLock<usize> = OnceLock::new();
-
-/// Process-wide shutdown flag. Set by [`shutdown`]; checked by every worker
-/// at the top of its event loop, so a worker exits cleanly on the next
-/// iteration instead of running forever.
-pub(crate) static EXIT: AtomicBool = AtomicBool::new(false);
-
 /// Our default identifier across the system is a usize. To denote this (instead of simply having a
 /// usize which could also be a counter etc) we have an system-wide alias
 pub type Identifier = usize;
 
-/// Returns the number of worker threads. Panics if [`init`] has not been called.
-#[inline(always)]
-pub fn num_workers() -> usize {
-    *NUM_WORKERS.get().expect("num_workers called before init()")
+/// A helper object to shut-down a running dispatch. This does NOT collect the worker threads, but
+/// wakes all workers up and turns on the flag to notify them to shut down. They will exit on
+/// their next iteration.
+pub struct Shutdown {
+    flag: Arc<AtomicBool>,
+    waker: Arc<WorkerWaker>,
 }
 
-/// Returns the global [`Dispatcher`]. Panics if [`init`] has not been called.
-pub fn dispatcher() -> &'static Dispatcher {
-    DISPATCHER
-        .get()
-        .expect("Dispatcher has not been initialized")
+impl Shutdown {
+    pub fn shutdown(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        // Workers parked on the waker won't observe `exit_flag` until someone
+        // wakes them. Notify so every parked worker returns from
+        // `wait_if_unchanged` and sees the flag on its next loop iteration.
+        self.waker.notify();
+    }
 }
 
-/// Signal every worker thread to exit on its next event-loop iteration.
-///
-/// Called from the embedding application (e.g. the server) on shutdown so
-/// that a `JoinHandle::join()` over the worker handles eventually returns.
-/// Once flipped, the flag stays set for the rest of the process — there is
-/// no `start()` counterpart.
-pub fn shutdown() {
-    EXIT.store(true, Ordering::Relaxed);
-    // Workers parked on the waker won't observe `EXIT` until someone wakes
-    // them. Notify so every parked worker returns from `wait_if_unchanged`
-    // and sees the flag on its next loop iteration.
-    worker_waker().notify();
+#[derive(Clone)]
+pub struct DataFlowDispatcher {
+    senders: Vec<StdSender<DataFlowBuilder>>,
+    buffers: usize,
+    /// Shared [`WorkerWaker`] handed to every worker on startup. Non-worker
+    /// threads (e.g. the embedding server) can call `waker().notify()` to
+    /// kick idle workers out of their park; worker threads access the same
+    /// instance through their thread-local [`crate::worker::worker_waker`].
+    waker: Arc<WorkerWaker>,
 }
 
-/// Initialize the global [`Dispatcher`] with `num_workers` worker threads.
-///
-/// Returns one [`JoinHandle`] per worker; the caller is expected to keep
-/// these around for monitoring (any worker exiting is a fatal error: workers
-/// are supposed to run forever) and to `join()` them once [`shutdown`] has
-/// been called for orderly process teardown.
-///
-/// Panics if `num_workers` exceeds the number of CPU cores. Safe to call
-/// multiple times — only the first call has effect.
-pub fn init(num_workers: usize) -> Vec<JoinHandle<()>> {
-    let core_count = core_affinity::get_core_ids().unwrap().len();
-    assert!(
-        num_workers <= core_count,
-        "num_workers ({num_workers}) exceeds core count ({core_count})"
-    );
-    NUM_WORKERS.get_or_init(|| num_workers);
-    let (handles, dispatcher) = Dispatcher::new();
-    DISPATCHER.get_or_init(|| dispatcher);
-    handles
+impl DataFlowDispatcher {
+    /// Send each worker their pre-built `DataFlow` bundle. Each worker
+    /// receives exactly one builder with their specific resources.
+    pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) {
+        for (sender, builder) in self.senders.iter().zip(builders) {
+            sender.send(builder).unwrap();
+        }
+        // Wake idle workers so they pick up the new dataflow without
+        // waiting out their park.
+        self.waker.notify();
+    }
+
+    /// Borrow the shared waker so callers outside a worker thread (e.g.
+    /// cancellation handles, the embedding server's shutdown path) can wake
+    /// parked workers without going through the worker-thread TLS.
+    pub fn waker(&self) -> &Arc<WorkerWaker> {
+        &self.waker
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Ship a `FnOnce() -> T` to worker 0 and return its result.
+    ///
+    /// Useful for one-shot setup work that needs a `MemoryContext` to run
+    /// (e.g. `ParquetTable::from_directory`, which touches the file cache)
+    /// from a thread that doesn't have one. Builds a single-element
+    /// `OperatorSpec` whose nullary fires once, sends one item, and finishes.
+    pub fn run_on_worker<T, F>(&self, f: F) -> crate::data_flow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let spec = OperatorSpec::new(
+            self.clone(),
+            std::iter::once(NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))),
+        );
+        let mut results = spec.collect()?;
+        Ok(results
+            .pop()
+            .expect("OneShotNullary should have produced exactly one result"))
+    }
 }
 
-/// Global coordinator that owns the worker threads and distributes work to them.
+/// Owns the worker threads and exposes a [`DataFlowDispatcher`] for sending work to them.
 ///
-/// Created once via [`init`] and accessed through [`dispatcher()`]. The `Dispatcher`
-/// spawns one `Worker` per CPU core, each pinned to its core and connected via a
-/// channel for receiving [`DataFlowBuilder`]s.
+/// Created via [`Dispatch::spin_up`], which spawns one [`Worker`] per CPU core (pinned
+/// to its core, connected via an mpsc channel for receiving [`DataFlowBuilder`]s) and
+/// then blocks until all workers have completed their startup. Borrow the inner
+/// dispatcher with [`dispatcher`](Self::dispatcher) and shut everything down with
+/// [`exit`](Self::exit).
 ///
-/// The dispatcher does not actively schedule — it simply provides [`push_data_flow`](Self::push_data_flow)
-/// to send one `DataFlowBuilder` to each worker. The workers themselves drive execution
-/// in their own event loops.
-pub struct Dispatcher {
-    worker_senders: Vec<StdSender<DataFlowBuilder>>,
+/// `Dispatch` does not actively schedule — [`push_data_flow`](DataFlowDispatcher::push_data_flow)
+/// just sends one `DataFlowBuilder` to each worker. The workers themselves drive
+/// execution in their own event loops.
+pub struct Dispatch {
+    dataflow_dispatcher: DataFlowDispatcher,
+    handles: Vec<JoinHandle<()>>,
+    shutdown: Shutdown,
 }
 
-impl Dispatcher {
-    /// Initialize the workers together with the dispatcher. Returns a `JoinHandle` per
-    /// worker as well as the Dispatcher object itself
-    fn new() -> (Vec<JoinHandle<()>>, Self) {
+impl Dispatch {
+    /// Spawn `worker_count` worker threads (capped by available cores) and return a
+    /// `Dispatch` that owns them. `buffers` sets the size of the shared ring (in 2MB
+    /// slots) used for all worker memory contexts. Blocks until every worker has
+    /// finished pre-faulting and is ready for work.
+    pub fn spin_up(worker_count: usize, buffers: usize) -> Self {
         let cores = core_affinity::get_core_ids().unwrap();
         info!("Setting up io...");
 
-        let cores: Vec<_> = cores.into_iter().take(num_workers()).collect();
+        let cores: Vec<_> = cores.into_iter().take(worker_count).collect();
         let mut threads = vec![];
-        info!("Starting workers...");
+        info!("Creating memory context ({})...", cores.len());
         let barrier = Arc::new(Barrier::new(cores.len() + 1));
         let mut senders = vec![];
+        let mut memory_context_factories = MemoryContextFactory::create_many(cores.len(), buffers);
+        let should_exit = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(WorkerWaker::new());
+        info!("Starting workers...");
         for (i, core) in cores.into_iter().enumerate() {
             let (tx, rx) = channel();
             senders.push(tx);
-            threads.push(Worker::create(i, core, rx, barrier.clone()));
+            threads.push(Worker::create(
+                i,
+                worker_count,
+                core,
+                should_exit.clone(),
+                memory_context_factories.pop().unwrap(),
+                rx,
+                barrier.clone(),
+                waker.clone(),
+            ));
         }
         barrier.wait();
         info!("All workers have begun...");
 
-        (
-            threads,
-            Dispatcher {
-                worker_senders: senders,
+        Dispatch {
+            dataflow_dispatcher: DataFlowDispatcher {
+                senders,
+                buffers,
+                waker: waker.clone(),
             },
-        )
+            handles: threads,
+            shutdown: Shutdown {
+                flag: should_exit,
+                waker,
+            },
+        }
     }
 
     /// Number of active worker threads (one per core).
     pub fn workers(&self) -> usize {
-        self.worker_senders.len()
+        self.handles.len()
     }
 
-    /// Send each worker their pre-built `DataFlow` bundle. Each worker
-    /// receives exactly one builder with their specific resources.
-    pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) {
-        for (sender, builder) in self.worker_senders.iter().zip(builders) {
-            sender.send(builder).unwrap();
+    /// Signal every worker to stop and join their threads.
+    pub fn exit(self) {
+        info!("Shutting down!");
+        self.shutdown.shutdown();
+        // Drop our copies of the senders so the worker channels close.
+        drop(self.dataflow_dispatcher);
+        for handle in self.handles {
+            handle.join().unwrap();
         }
-        // Wake idle workers so they pick up the new dataflow without waiting
-        // out their park timeout.
-        worker_waker().notify();
+        info!("Shut down...");
+    }
+
+    pub fn dispatcher(&self) -> &DataFlowDispatcher {
+        &self.dataflow_dispatcher
+    }
+
+    pub fn into_parts(self) -> (Vec<JoinHandle<()>>, Shutdown) {
+        (self.handles, self.shutdown)
     }
 }

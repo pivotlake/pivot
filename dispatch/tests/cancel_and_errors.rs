@@ -10,14 +10,11 @@ use dispatch::{Projection, table_input};
 /// `.collect()`, not a silent empty result.
 #[test]
 fn panic_in_filter_returns_error() {
-    // Setup: a parquet table with several rows so the filter is exercised.
-    init();
+    let dispatcher = dispatch(1);
     let names: Vec<&str> = (0..1000).map(|_| "x").collect();
     let values: Vec<i64> = (0..1000).collect();
-    let (_dir, table) = parquet_table(&[strings_and_ints(&names, &values)]);
-
-    // Execute: filter that panics on every batch.
-    let result = table_input(&table, Projection::columns([1]), false)
+    let (_dir, table) = parquet_table(&dispatcher, &[strings_and_ints(&names, &values)], true);
+    let result = table_input(&dispatcher, &table, Projection::columns([1]), false)
         .filter(|| move |_batch: &RecordBatch| panic!("intentional panic in filter"))
         .count()
         .collect();
@@ -38,14 +35,14 @@ fn panic_in_filter_returns_error() {
 #[test]
 fn cancelled_query_returns_without_hanging() {
     // Setup: a table large enough that finishing in one tick is unlikely.
-    init();
+    let dispatcher = dispatch(1);
     let n = 200_000;
     let names: Vec<&str> = (0..n).map(|_| "x").collect();
     let values: Vec<i64> = (0..n as i64).collect();
-    let (_dir, table) = parquet_table(&[strings_and_ints(&names, &values)]);
+    let (_dir, table) = parquet_table(&dispatcher, &[strings_and_ints(&names, &values)], true);
 
-    // Execute: kick off the query, immediately cancel, then collect.
-    let handle = table_input(&table, Projection::columns([1]), false)
+    // Execute: kick off the query, immediately cancel, then drain the handle.
+    let handle = table_input(&dispatcher, &table, Projection::columns([1]), false)
         .filter(|| {
             move |batch: &RecordBatch| {
                 let col = batch

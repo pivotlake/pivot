@@ -10,7 +10,8 @@
 //! # use dispatch::*;
 //! # use dispatch::table_input;
 //! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-//! let results = table_input(&table, Projection::columns([0]), false)
+//! # let dispatch = Dispatch::spin_up(1, 32);
+//! let results = table_input(dispatch.dispatcher(), &table, Projection::columns([0]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");
 //!         move |batch: &RecordBatch| {
@@ -86,6 +87,6 @@ mod record_batch_operator;
 pub use data_flow_handle::{CancelToken, DataFlowHandle};
 
 pub use record_batch_operator::{
-    RECORD_BATCH_SIZE, RecordBatchOperatorFactory, RecordBatchOperatorSpec,
-    RecordBatchUnaryOperatorFactory, table_input,
+    RECORD_BATCH_SIZE, RecordBatchFactoryBridge, RecordBatchOperatorFactory,
+    RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory, table_input,
 };

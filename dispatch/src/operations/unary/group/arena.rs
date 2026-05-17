@@ -1,5 +1,5 @@
 use crate::env::MAX_INLINE_STRING_VIEW;
-use crate::memory::{BUFFER_SIZE, RING, WriteBuffer, get_write_buffer};
+use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
 use crate::operations::unary::group::ArenaKey;
 use arrow_buffer::Buffer;
 use std::cell::UnsafeCell;
@@ -31,10 +31,10 @@ unsafe impl Sync for SharedArena {}
 impl std::panic::RefUnwindSafe for SharedArena {}
 
 impl SharedArena {
-    /// Create a new shared arena with space for up to [`RING`] amount of write buffers.
-    pub fn new() -> Arc<Self> {
+    /// Create a new shared arena with space for up to [`ring()`] amount of write buffers.
+    pub fn new(buffers: usize) -> Arc<Self> {
         Arc::new(Self {
-            ptrs: (0..RING.len())
+            ptrs: (0..buffers)
                 .map(|_| UnsafeCell::new(ptr::null_mut()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -46,7 +46,7 @@ impl SharedArena {
     /// Allocate a new write buffer, register its pointer, and return it with its index.
     /// The caller owns the buffer for writing; call [`Self::return_buffer`] when done.
     pub fn take_buffer(&self) -> (WriteBuffer, u32) {
-        let wb = get_write_buffer(false);
+        let wb = memory_ctx().get_write_buffer(false);
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
         // Safety: fetch_add guarantees unique idx per caller; no two threads write the same slot.
         unsafe { *self.ptrs[idx as usize].get() = wb.ptr };

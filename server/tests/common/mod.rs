@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use catalog::ParquetCatalog;
+use dispatch::Dispatch;
 use rstest::fixture;
 use server::Server;
 use tokio_postgres::{Client, NoTls};
@@ -42,24 +43,24 @@ pub fn lock_serial() -> MutexGuard<'static, ()> {
 }
 
 /// Lazily start a shared server on a free local port and return that port.
-/// `dispatch::init` and the server's tokio runtime live on a dedicated
-/// background thread so the test runtime stays separate.
+/// `Dispatch::spin_up` and the server's tokio runtime live on a dedicated
+/// background thread so the test runtime stays separate from server work.
 pub fn server_port() -> u16 {
     static PORT: OnceLock<u16> = OnceLock::new();
     *PORT.get_or_init(|| {
         let port = pick_free_port();
         let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
-        let handles = dispatch::init(workers);
         let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
         let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         thread::spawn(move || {
+            let dispatch = Dispatch::spin_up(workers, 32);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let server = Server::new(bind, handles, catalog);
+                let server = Server::new(bind, dispatch, catalog);
                 let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
             });
         });

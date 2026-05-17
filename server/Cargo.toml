@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sysinfo = "0.38.0"
 
 [[bin]]
 name = "pivotdb-server"

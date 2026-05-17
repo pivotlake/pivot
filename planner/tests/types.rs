@@ -12,7 +12,7 @@ use rstest::rstest;
 #[rstest]
 #[ignore = "currently not supported in dispatch"]
 fn boolean_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "bools",
         &[(
             "flag",
@@ -25,7 +25,7 @@ fn boolean_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT flag FROM bools WHERE flag <> false")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -39,7 +39,7 @@ fn boolean_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
 #[rstest]
 #[ignore = "currently not supported in dispatch"]
 fn int8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "int8s",
         &[(
             "value",
@@ -52,7 +52,7 @@ fn int8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT value FROM int8s WHERE value <> 2")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -66,7 +66,7 @@ fn int8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn int16_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "int16s",
         &[(
             "value",
@@ -79,7 +79,7 @@ fn int16_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT value FROM int16s WHERE value <> 20")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -98,7 +98,7 @@ fn int32_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT c FROM example_table WHERE c <> 200")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -114,7 +114,7 @@ fn int32_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn int64_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "int64s",
         &[(
             "value",
@@ -127,7 +127,7 @@ fn int64_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT value FROM int64s WHERE value <> 2")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -146,7 +146,7 @@ fn utf8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT name FROM example_table WHERE name <> 'bob'")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();

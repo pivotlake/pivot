@@ -281,7 +281,7 @@ mod tests {
     fn run_group(worker_batches: Vec<Vec<RecordBatch>>) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
-        let arena = SharedArena::new();
+        let arena = SharedArena::new(64);
         let state = RandomState::new();
         let injector = Arc::new(Injector::new());
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));

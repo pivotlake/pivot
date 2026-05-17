@@ -10,13 +10,14 @@ use dispatch::{Projection, RECORD_BATCH_SIZE, table_input};
 
 #[test]
 fn subsequent_batches_reuse_write_buffer() {
-    init_with_workers(1);
+    let dispatcher = dispatch(1);
     let n = 10_000; // > RECORD_BATCH_SIZE (8192) to produce multiple batches from one page
     let names: Vec<&str> = (0..n).map(|_| "x").collect();
     let values: Vec<i64> = (0..n as i64).collect();
-    let (_dir, table) = parquet_table(&[strings_and_ints(&names, &values)]);
+    let (_dir, table) = parquet_table(&dispatcher, &[strings_and_ints(&names, &values)], true);
 
-    let results = table_input(&table, Projection::columns([1]), false)
+    let results = table_input(&dispatcher, &table, Projection::columns([1]), false)
+        .map(|| |d| d.column(0).to_data().buffers()[0].as_ptr() as usize)
         .collect()
         .unwrap();
 
@@ -25,8 +26,8 @@ fn subsequent_batches_reuse_write_buffer() {
         "expected at least 2 batches, got {}",
         results.len()
     );
-    let ptr0 = results[0].column(0).to_data().buffers()[0].as_ptr() as usize;
-    let ptr1 = results[1].column(0).to_data().buffers()[0].as_ptr() as usize;
+    let ptr0 = results[0];
+    let ptr1 = results[1];
     assert_eq!(
         ptr1 - ptr0,
         RECORD_BATCH_SIZE * 8,
@@ -40,19 +41,19 @@ fn subsequent_batches_reuse_write_buffer() {
 #[test]
 #[ignore]
 fn dropped_batch_memory_is_reused() {
-    init_with_workers(1);
+    let dispatcher = dispatch(1);
     let n = 10_000;
     let names: Vec<&str> = (0..n).map(|_| "x").collect();
     let values: Vec<i64> = (0..n as i64).collect();
-    let (_dir, table) = parquet_table(&[strings_and_ints(&names, &values)]);
+    let (_dir, table) = parquet_table(&dispatcher, &[strings_and_ints(&names, &values)], true);
 
     let ptrs: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(vec![]));
     let ptrs_clone = ptrs.clone();
 
-    table_input(&table, Projection::columns([1]), false)
+    table_input(&dispatcher, &table, Projection::columns([1]), false)
         .project(|| {
             let ptrs = ptrs_clone.clone();
-            move |batch: &RecordBatch| {
+            move |batch: RecordBatch| {
                 ptrs.lock()
                     .unwrap()
                     .push(batch.column(0).to_data().buffers()[0].as_ptr() as usize);
@@ -82,7 +83,7 @@ fn dropped_batch_memory_is_reused() {
 
 #[test]
 fn decompressed_string_buffer_is_reused() {
-    init_with_workers(1);
+    let dispatcher = dispatch(1);
     // ~50K unique strings > 12 bytes → just over 1MB raw, forcing exactly 2 Parquet pages.
     // Each page gets its own decompressed WriteBuffer. After page 1's batches are
     // dropped, page 2's decompression should reuse that same WriteBuffer.
@@ -101,15 +102,15 @@ fn decompressed_string_buffer_is_reused() {
         vec![Arc::new(StringViewArray::from(names))],
     )
     .unwrap();
-    let (_dir, table) = parquet_table_with_opts(&[batch], false);
+    let (_dir, table) = parquet_table(&dispatcher, &[batch], false);
 
     let ptrs: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(vec![]));
     let ptrs_clone = ptrs.clone();
 
-    let res = table_input(&table, Projection::columns([0]), false)
+    let res = table_input(&dispatcher, &table, Projection::columns([0]), false)
         .project(|| {
             let ptrs = ptrs_clone.clone();
-            move |batch: &RecordBatch| {
+            move |batch: RecordBatch| {
                 let sv = batch
                     .column(0)
                     .as_any()
