@@ -9,7 +9,7 @@
 //!
 //! [`FilterMask`]: crate::operations::parquet::types::filter_mask::FilterMask
 
-use crate::memory::{BUFFER_SIZE, get_write_buffer};
+use crate::memory::{BUFFER_SIZE, memory_ctx};
 use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
 use crate::operations::unary::parquet::types::page::{
@@ -55,7 +55,9 @@ impl Decompressor {
 
         let uncompressed_size = page.header.uncompressed_page_size as usize;
         let num_buffers = uncompressed_size.div_ceil(BUFFER_SIZE);
-        let mut write_buffers: Vec<_> = (0..num_buffers).map(|_| get_write_buffer(false)).collect();
+        let mut write_buffers: Vec<_> = (0..num_buffers)
+            .map(|_| memory_ctx().get_write_buffer(false))
+            .collect();
 
         let output_bufs: Vec<&mut [u8]> = write_buffers.iter_mut().map(|b| b.as_mut()).collect();
 

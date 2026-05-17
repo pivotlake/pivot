@@ -1,9 +1,8 @@
 //! Shutdown integration test, isolated in its own test binary.
 //!
-//! `Server::serve` flips the process-global `dispatch::EXIT` flag on shutdown,
-//! which permanently disables every worker for the rest of the process. Living
-//! in a dedicated binary keeps that side-effect from cross-contaminating the
-//! shared-server tests in `integration.rs`.
+//! `Server::serve` joins every dispatch worker on shutdown, so this binary
+//! `Dispatch::spin_up`s its own `Dispatch` on the server's background thread
+//! and asserts the server thread completes cleanly.
 
 mod common;
 
@@ -14,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use catalog::ParquetCatalog;
 use common::{pick_free_port, wait_until_listening};
+use dispatch::Dispatch;
 use server::Server;
 use tokio::sync::oneshot;
 
@@ -23,23 +23,23 @@ use tokio::sync::oneshot;
 #[test]
 fn shutdown_signal_drains_all_worker_threads() {
     let workers = 2;
-    let handles = dispatch::init(workers);
-    assert_eq!(
-        handles.len(),
-        workers,
-        "dispatch should spawn one thread per worker"
-    );
     let bind: SocketAddr = format!("127.0.0.1:{}", pick_free_port()).parse().unwrap();
     let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server_thread = thread::spawn(move || {
+        let dispatch = Dispatch::spin_up(workers, 32);
+        assert_eq!(
+            dispatch.workers(),
+            workers,
+            "dispatch should spawn one thread per worker"
+        );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(bind, handles, catalog);
+            let server = Server::new(bind, dispatch, catalog);
             server
                 .serve(Box::pin(async move {
                     let _ = shutdown_rx.await;

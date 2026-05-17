@@ -13,7 +13,7 @@ fn filter_contains_substring(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT name, b FROM example_table WHERE contains(name, 'ali')")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -33,7 +33,7 @@ fn filter_contains_no_match(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT name FROM example_table WHERE contains(name, 'zzz')")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -44,7 +44,7 @@ fn filter_contains_no_match(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn filter_contains_matches_all(mut testing_planner: TestingPlanner) {
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "substrings",
         &[(
             "s",
@@ -57,7 +57,7 @@ fn filter_contains_matches_all(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT s FROM substrings WHERE contains(s, 'aa')")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -73,7 +73,7 @@ fn contains_then_group_by(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT name, COUNT(*) FROM example_table WHERE contains(name, 'a') GROUP BY name")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();

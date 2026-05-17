@@ -1,6 +1,6 @@
 use crate::memory::slab::slab_buffer::SlabBuffer;
 use crate::memory::slab::{MultiSlabBuffer, Slab};
-use crate::memory::{BUFFER_SIZE, WriteBuffer, get_write_buffer};
+use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
 use std::sync::Arc;
 
 /// Bump allocator that carves [`Slab`]s out of 2MB [`WriteBuffer`]s.
@@ -25,7 +25,7 @@ impl SlabAllocator {
     /// If `zeroed` is true, prefers a pre-zeroed buffer.
     pub fn new(zeroed: bool) -> Self {
         Self {
-            working_buffer: Arc::new(get_write_buffer(zeroed)),
+            working_buffer: Arc::new(memory_ctx().get_write_buffer(zeroed)),
             offset: 0,
         }
     }
@@ -56,7 +56,7 @@ impl SlabAllocator {
     /// Discards the remaining space in the current buffer and acquires a fresh one.
     fn advance_to_new_buffer(&mut self, zeroed: bool) {
         self.offset = 0;
-        self.working_buffer = Arc::new(get_write_buffer(zeroed));
+        self.working_buffer = Arc::new(memory_ctx().get_write_buffer(zeroed));
     }
 
     /// Allocates a single slab of exactly `size` bytes.

@@ -1,4 +1,5 @@
-use crate::memory::{BUFFER_SIZE, RING, WriteBuffer};
+use crate::memory::{BUFFER_SIZE, WriteBuffer};
+use crate::memory_ctx;
 use std::ops::Deref;
 use std::sync::atomic::Ordering;
 
@@ -49,7 +50,7 @@ impl Deref for ReadBuffer {
 /// the count reaches 0 and the slot becomes reclaimable.
 impl Drop for ReadBuffer {
     fn drop(&mut self) {
-        RING.slots[self.slot_idx]
+        memory_ctx().ring().slots[self.slot_idx]
             .used
             .fetch_sub(1, Ordering::Relaxed);
     }
@@ -65,7 +66,9 @@ impl From<WriteBuffer> for ReadBuffer {
         let ptr = value.ptr;
         let slot_idx = value.slot_idx;
         std::mem::forget(value);
-        RING.set_slot_used(slot_idx, 1, Ordering::Release);
+        memory_ctx()
+            .ring()
+            .set_slot_used(slot_idx, 1, Ordering::Release);
         Self { ptr, slot_idx }
     }
 }

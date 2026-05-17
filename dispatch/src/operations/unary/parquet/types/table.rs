@@ -6,7 +6,7 @@
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
 use crate::io::open_direct_read;
-use crate::memory::FILE_CACHE;
+use crate::memory::{has_memory_context, memory_ctx};
 use crate::operations::unary::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
@@ -78,7 +78,18 @@ impl ParquetTable {
     /// Reads and parses the Thrift footer of each file, opens the file with
     /// direct IO, and registers it in the file cache. Row groups are assigned
     /// globally unique indices in the order files are discovered.
+    ///
+    /// Must run on a dispatch worker thread: registering each file in the
+    /// per-thread page cache reaches through [`memory_ctx`], which is only
+    /// installed on workers. Off-worker callers (e.g. the catalog) must hop to
+    /// a worker via [`DataFlowDispatcher::run_on_worker`](crate::DataFlowDispatcher::run_on_worker).
     pub fn from_directory(path: &Path) -> Result<Self> {
+        assert!(
+            has_memory_context(),
+            "ParquetTable::from_directory must run on a dispatch worker thread: \
+             no MemoryContext is installed on the current thread. Off-worker \
+             callers must dispatch via DataFlowDispatcher::run_on_worker."
+        );
         let mut start_offset = 0;
         let row_groups: Vec<_> = fs::read_dir(path)?
             .flatten()
@@ -147,7 +158,7 @@ fn parse_row_group_metadatas(
     let buf = read_parquet_footer(&mut file)?;
     let file_meta = parse_footer_thrift(&buf)?;
     let file = open_direct_read(path)?;
-    FILE_CACHE.open_file_entry(file.as_raw_fd());
+    memory_ctx().file_cache().open_file_entry(file.as_raw_fd());
 
     let file = Arc::new(file);
 
@@ -394,6 +405,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn write_parquet(batch: &RecordBatch, stats: EnabledStatistics) -> (TempDir, ParquetTable) {
+        // `ParquetTable::from_directory` touches `memory_ctx()` (via the file
+        // cache), so every test in this module needs a context on its thread.
+        crate::memory::init_test_free_pool(0);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("data.parquet");
         let props = WriterProperties::builder()

@@ -13,16 +13,14 @@
 //! verifying the location still matches, preventing TOCTOU races with concurrent evictions.
 
 use crate::io::IOLocation;
+use crate::memory::context::memory_ctx;
 use crate::memory::read_buffer::ReadBuffer;
-use crate::memory::ring::{RING, Ring};
 use crate::memory::write_buffer::WriteBuffer;
 use ahash::HashMap;
 use std::cell::UnsafeCell;
 use std::os::fd::RawFd;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{LazyLock, RwLock};
-
-pub static FILE_CACHE: LazyLock<FileCache> = LazyLock::new(FileCache::new);
 
 struct FileCacheEntry {
     ring_idx: usize,
@@ -35,7 +33,6 @@ struct FileCacheEntry {
 /// * `entries` – per-slot metadata (reference bit + cached location), indexed by ring slot.
 /// * `hand` – CLOCK sweep cursor for eviction.
 pub struct FileCache {
-    ring: &'static Ring,
     file_maps: RwLock<HashMap<RawFd, RwLock<HashMap<usize, FileCacheEntry>>>>,
     entries: Box<[UnsafeCell<Entry>]>,
     hand: AtomicUsize,
@@ -55,11 +52,10 @@ struct Entry {
 }
 
 impl FileCache {
-    pub fn new() -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
-            ring: &RING,
             file_maps: Default::default(),
-            entries: (0..RING.len())
+            entries: (0..capacity)
                 .map(|_| {
                     UnsafeCell::new(Entry {
                         ref_bit: Default::default(),
@@ -79,14 +75,14 @@ impl FileCache {
     /// its file-map entry is removed and the slot is returned as a [`WriteBuffer`].
     pub fn evict(&self) -> WriteBuffer {
         loop {
-            let slot_idx = self.hand.fetch_add(1, Ordering::Relaxed) % self.ring.len();
+            let slot_idx = self.hand.fetch_add(1, Ordering::Relaxed) % memory_ctx().ring().len();
             let cell = &self.entries[slot_idx];
             let entry = unsafe { &*cell.get() };
             if entry.ref_bit.swap(false, Ordering::Relaxed) {
                 continue;
             }
 
-            if let Some(r) = self.ring.try_write(slot_idx) {
+            if let Some(r) = memory_ctx().ring().try_write(slot_idx) {
                 // We now know no one is touching entry, since ring guarantees us there can be only
                 // one writer per buffer. We therefore take mut of entry
                 let entry = unsafe { &mut *cell.get() };
@@ -123,7 +119,7 @@ impl FileCache {
                 // try_write returns Some(WriteBuffer), whose Drop pushes
                 // the index back to the free pool. If readers are outstanding
                 // it returns None and the CLOCK sweep reclaims the slot later.
-                drop(self.ring.try_write(entry.ring_idx));
+                drop(memory_ctx().ring().try_write(entry.ring_idx));
             }
         }
         file_maps.insert(raw_fd, Default::default());
@@ -167,7 +163,7 @@ impl FileCache {
 
         // First, try to pin it for reading - after this, we know we're necessarily looking at the "same" slot (ie it
         // can't be written to)
-        let guard = self.ring.try_read(entry.ring_idx)?;
+        let guard = memory_ctx().ring().try_read(entry.ring_idx)?;
         // Now we want to check if the location is the same as the one we're trying to get - we know
         // the location cannot change while we're doing this operation since we have a read guard
         let cell = &self.entries[guard.ring_idx()];
@@ -183,16 +179,24 @@ impl FileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::free_pool::init_test_free_pool;
-    use crate::memory::get_write_buffer;
+    use crate::memory::context::{init_test_free_pool, memory_ctx};
+
+    fn get_write_buffer(prefer_zeroed: bool) -> WriteBuffer {
+        memory_ctx().get_write_buffer(prefer_zeroed)
+    }
 
     fn loc(fd: RawFd, offset: usize) -> IOLocation {
         IOLocation { raw_fd: fd, offset }
     }
 
+    fn file_cache() -> FileCache {
+        FileCache::new(1_000)
+    }
+
     #[test]
     fn get_returns_none_for_uncached_location() {
-        let cache = FileCache::new();
+        init_test_free_pool(4);
+        let cache = file_cache();
         cache.open_file_entry(42);
 
         let result = cache.get(&loc(42, 0));
@@ -203,7 +207,7 @@ mod tests {
     #[test]
     fn insert_then_get_returns_data() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let mut wb = get_write_buffer(false);
         wb[0..5].copy_from_slice(b"hello");
@@ -217,7 +221,7 @@ mod tests {
     #[test]
     fn get_returns_none_for_different_offset() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
         let _rb = cache.insert(loc(42, 0), wb);
@@ -230,7 +234,7 @@ mod tests {
     #[test]
     fn multiple_offsets_same_fd() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let mut wb1 = get_write_buffer(false);
         wb1[0] = 0xAA;
@@ -249,7 +253,7 @@ mod tests {
     #[test]
     fn insert_returns_readable_buffer_with_same_data() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let mut wb = get_write_buffer(false);
         wb[0..4].copy_from_slice(&[1, 2, 3, 4]);
@@ -261,7 +265,8 @@ mod tests {
 
     #[test]
     fn open_file_entry_is_idempotent() {
-        let cache = FileCache::new();
+        init_test_free_pool(0);
+        let cache = file_cache();
 
         cache.open_file_entry(42);
         cache.open_file_entry(42);
@@ -272,7 +277,7 @@ mod tests {
     #[test]
     fn reopen_fd_clears_stale_entries() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let mut wb = get_write_buffer(false);
         wb[0..5].copy_from_slice(b"stale");
@@ -287,7 +292,7 @@ mod tests {
     #[test]
     fn evict_returns_writable_buffer() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
 
         let mut wb = cache.evict();
         wb[0] = 0xFF;
@@ -298,7 +303,7 @@ mod tests {
     #[test]
     fn evict_removes_cached_entry() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
         let slot = wb.slot_idx;
@@ -317,7 +322,7 @@ mod tests {
     #[test]
     fn evict_does_not_evict_referenced_slot() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
         let slot = wb.slot_idx;
@@ -335,7 +340,7 @@ mod tests {
     #[test]
     fn get_refreshes_ref_bit_protecting_from_eviction() {
         init_test_free_pool(4);
-        let cache = FileCache::new();
+        let cache = file_cache();
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
         let slot = wb.slot_idx;

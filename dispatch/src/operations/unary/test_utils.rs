@@ -3,6 +3,7 @@
 use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
+use crate::worker::install_test_worker_waker;
 use arrow_array::{Int32Array, RecordBatch};
 
 /// A [`Sender`] that collects all sent items for later inspection.
@@ -92,6 +93,7 @@ pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
     consumers: Vec<C>,
     worker_batches: Vec<Vec<RecordBatch>>,
 ) -> CollectSender<RecordBatch> {
+    install_test_worker_waker();
     let mut dummy = CollectSender::new();
 
     let mut consumers = consumers;

@@ -1,12 +1,13 @@
 use std::sync::{Arc, Mutex};
 
-use dispatch::{Projection, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
 use planner::Planner;
 use planner::catalog::{Catalog, Column, CreateTableRequest, Table};
 use planner::expression::TableFilter;
 use planner::types::Type;
 
+#[allow(unused_imports)]
 use crate::common::*;
 
 /// Stand-in for a real table that records every `pushdown_filter` call so the
@@ -33,7 +34,11 @@ impl RecordingTable {
 }
 
 impl Table for RecordingTable {
-    fn compile(&self, _projection: Projection) -> RecordBatchOperatorSpec {
+    fn compile(
+        &self,
+        _dispatcher: &DataFlowDispatcher,
+        _projection: Projection,
+    ) -> RecordBatchOperatorSpec {
         unreachable!("plan-only test should not reach compile")
     }
 
@@ -79,7 +84,6 @@ fn two_int_cols() -> Vec<Column> {
 }
 
 fn build_planner(table: RecordingTable) -> Planner {
-    init();
     let catalog = Arc::new(SingleTableCatalog {
         name: "t".to_string(),
         table,

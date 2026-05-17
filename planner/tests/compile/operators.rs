@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{ArrayRef, Int32Array};
+use dispatch::Dispatch;
 
 use crate::common::*;
 use planner::Error as PlannerError;
@@ -19,7 +20,7 @@ fn select_column_subset(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b FROM example_table")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -48,7 +49,7 @@ fn select_all_columns(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b, c FROM example_table")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -77,7 +78,7 @@ fn select_single_column(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT c FROM example_table")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -102,7 +103,7 @@ fn select_single_column(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn filter_not_equal_columns(mut testing_planner: TestingPlanner) {
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "pairs_with_dup",
         &[
             ("a", Type::Int32, int_col(vec![1, 2, 3, 10])),
@@ -114,7 +115,7 @@ fn filter_not_equal_columns(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b FROM pairs_with_dup WHERE a <> b")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -138,7 +139,7 @@ fn filter_not_equal_columns(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn filter_not_equal_no_matches(mut testing_planner: TestingPlanner) {
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "pairs_all_equal",
         &[
             ("a", Type::Int32, int_col(vec![1, 2, 3])),
@@ -150,7 +151,7 @@ fn filter_not_equal_no_matches(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM pairs_all_equal WHERE a <> b")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -165,7 +166,7 @@ fn filter_not_equal_all_pass(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b FROM example_table WHERE a <> b")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -194,7 +195,7 @@ fn filter_not_equal_constant(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a <> 2")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -222,7 +223,7 @@ fn filter_equal_constant(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a = 3")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -240,7 +241,7 @@ fn filter_equal_no_match(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a = 999")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -259,7 +260,7 @@ fn order_by_ascending(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b FROM example_table ORDER BY a ASC")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -286,7 +287,7 @@ fn order_by_descending(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b FROM example_table ORDER BY a DESC")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -313,7 +314,7 @@ fn top_n_limit_1(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 1")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -329,7 +330,7 @@ fn top_n_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table ORDER BY a LIMIT 100")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -344,7 +345,7 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT b FROM example_table ORDER BY a ASC LIMIT 2")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -368,7 +369,7 @@ fn group_by_int_column(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -389,7 +390,7 @@ fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT name, COUNT(*) FROM example_table GROUP BY name")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -415,7 +416,7 @@ fn filter_then_order_by(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b FROM example_table WHERE a <> b ORDER BY a DESC")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -439,7 +440,7 @@ fn filter_then_order_by(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_then_count(mut testing_planner: TestingPlanner) {
     // Every row has a == b, so WHERE a <> b yields 0 rows.
-    testing_planner.catalog.add_table(
+    testing_planner.add_table(
         "pairs_all_equal",
         &[
             ("a", Type::Int32, int_col(vec![1, 2, 3, 4, 5])),
@@ -451,7 +452,7 @@ fn filter_then_count(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT COUNT(*) FROM pairs_all_equal WHERE a <> b")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -467,7 +468,7 @@ fn filter_then_top_n(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap()
-        .compile()
+        .compile(testing_planner.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -500,14 +501,14 @@ impl Catalog for RecordingCatalog {
 // `testing_planner` fixture.
 #[test]
 fn create_table_calls_catalog_once() {
-    init();
+    let dispatch = Dispatch::spin_up(1, 32);
     let catalog = Arc::new(RecordingCatalog::default());
     let mut planner = Planner::new(catalog.clone());
 
     let results = planner
         .plan("CREATE TABLE created_table (id INTEGER, name VARCHAR)")
         .unwrap()
-        .compile()
+        .compile(dispatch.dispatcher())
         .unwrap()
         .collect()
         .unwrap();
@@ -528,14 +529,14 @@ fn create_table_calls_catalog_once() {
 
 #[test]
 fn create_table_passes_with_options_to_catalog() {
-    init();
+    let dispatch = Dispatch::spin_up(1, 32);
     let catalog = Arc::new(RecordingCatalog::default());
     let mut planner = Planner::new(catalog.clone());
 
     let results = planner
         .plan("CREATE TABLE created_table (id INTEGER) WITH (existing_path='/asdf')")
         .unwrap()
-        .compile()
+        .compile(dispatch.dispatcher())
         .unwrap()
         .collect()
         .unwrap();

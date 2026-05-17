@@ -22,8 +22,8 @@ use std::sync::{Arc, RwLock};
 
 use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar};
 use dispatch::{
-    ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec, RowGroupMetadata,
-    table_input,
+    DataFlowDispatcher, ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec,
+    RowGroupMetadata, table_input,
 };
 use planner::catalog::{
     Catalog, Column, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
@@ -135,9 +135,13 @@ pub struct ParquetCatalogTable {
 }
 
 impl Table for ParquetCatalogTable {
-    fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec {
+    fn compile(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        projection: Projection,
+    ) -> RecordBatchOperatorSpec {
         let parquet = Arc::new(self.parquet.clone());
-        table_input(&parquet, projection, false)
+        table_input(dispatcher, &parquet, projection, false)
     }
 
     fn columns(&self) -> Vec<Column> {
@@ -200,11 +204,13 @@ fn should_filter_row_group(
         // `col <> k` is true on every row unless every row in this group
         // equals `k` — provable only when min == max == k.
         CompareType::NotEqual => {
-            bool_kernel(min, constant, arrow_ord::cmp::eq)? && bool_kernel(max, constant, arrow_ord::cmp::eq)?
+            bool_kernel(min, constant, arrow_ord::cmp::eq)?
+                && bool_kernel(max, constant, arrow_ord::cmp::eq)?
         }
         // `col = k` can never match when k is strictly outside [min, max].
         CompareType::Equal => {
-            bool_kernel(constant, min, arrow_ord::cmp::lt)? || bool_kernel(constant, max, arrow_ord::cmp::gt)?
+            bool_kernel(constant, min, arrow_ord::cmp::lt)?
+                || bool_kernel(constant, max, arrow_ord::cmp::gt)?
         }
     })
 }

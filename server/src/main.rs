@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use catalog::ParquetCatalog;
 use clap::Parser;
+use dispatch::{BUFFER_SIZE, Dispatch};
 use server::{Error, Server};
 use tracing::info;
 
@@ -30,8 +31,15 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Error> {
+/// Returns the total physical memory of the machine in bytes.
+pub fn get_total_memory() -> usize {
+    sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+    )
+    .total_memory() as usize
+}
+
+fn main() -> Result<(), Error> {
     init_tracing();
     let args = Args::parse();
 
@@ -41,13 +49,18 @@ async fn main() -> Result<(), Error> {
             .unwrap_or(1)
     });
     info!(workers, "initialising dispatch");
-    let worker_handles = dispatch::init(workers);
+    let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE);
 
-    let catalog = Arc::new(ParquetCatalog::new());
-    let server = Server::new(args.bind, worker_handles, catalog);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
 
-    let shutdown = Box::pin(async {
-        let _ = tokio::signal::ctrl_c().await;
-    });
-    server.serve(shutdown).await
+    rt.block_on(async move {
+        let catalog = Arc::new(ParquetCatalog::new());
+        let server = Server::new(args.bind, dispatch, catalog);
+        let shutdown = Box::pin(async {
+            let _ = tokio::signal::ctrl_c().await;
+        });
+        server.serve(shutdown).await
+    })
 }

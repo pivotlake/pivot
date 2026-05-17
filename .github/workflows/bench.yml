@@ -1,0 +1,131 @@
+name: Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      query:
+        description: "Comma-separated query ids (e.g. 7,20). Empty = all."
+        required: false
+        default: ""
+      iterations:
+        description: "Iterations per query."
+        required: false
+        default: "5"
+      save_if_better:
+        description: "Overwrite GCS baseline if either cold or hot total improved."
+        type: boolean
+        default: true
+
+# Required secrets:
+#   BENCH_SSH_HOST  — hostname/IP of the bench machine
+#   BENCH_SSH_USER  — login user on the bench machine
+#   BENCH_SSH_KEY   — private key authorised on the bench machine
+# Required repository variables:
+#   BENCH_DATA_PATH      — path on the bench machine holding the clickbench parquet
+#                          (mounted into the container at /data)
+#   BENCH_GCS_BASELINE   — gs://bucket/path/to/baseline.json
+# The bench machine is expected to have docker installed and `gcloud auth`
+# configured for the user the workflow logs in as (so ~/.config/gcloud holds
+# credentials capable of writing to the baseline bucket).
+
+env:
+  IMAGE: pivotdb-bench
+  TAG: ${{ github.sha }}
+
+jobs:
+  bench:
+    name: clickbench
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.BENCH_SSH_KEY }}
+          SSH_HOST: ${{ secrets.BENCH_SSH_HOST }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_bench
+          chmod 600 ~/.ssh/id_bench
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<EOF
+          Host bench
+            HostName $SSH_HOST
+            User ${{ secrets.BENCH_SSH_USER }}
+            IdentityFile ~/.ssh/id_bench
+            IdentitiesOnly yes
+            BatchMode yes
+            ServerAliveInterval 30
+          EOF
+
+      - name: Refuse to run if anyone is logged in on the bench host
+        run: |
+          set -euo pipefail
+          # `who` over an SSH session includes our own pty, so the CI itself
+          # counts as one. Anything > 1 means a real user is logged in.
+          count=$(ssh bench 'who | wc -l' | tr -d ' ')
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Other users are logged in on the bench host; refusing to run."
+            ssh bench who
+            exit 1
+          fi
+          echo "No other users logged in (who count: $count)."
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build benchmark image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: benchmarks/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          cache-from: type=gha,scope=bench
+          cache-to: type=gha,scope=bench,mode=max
+
+      - name: Transfer image to bench host
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:${{ env.TAG }}
+        run: |
+          set -euo pipefail
+          docker save "$IMAGE_REF" | ssh bench 'docker load'
+
+      - name: Run clickbench on the bench host
+        env:
+          IMAGE_REF: ${{ env.IMAGE }}:${{ env.TAG }}
+          DATA: ${{ vars.BENCH_DATA_PATH }}
+          BASELINE: ${{ vars.BENCH_GCS_BASELINE }}
+          ITERATIONS: ${{ inputs.iterations }}
+          QUERY: ${{ inputs.query }}
+          SAVE_IF_BETTER: ${{ inputs.save_if_better }}
+        run: |
+          set -euo pipefail
+          # Build the remote script locally so all variables are interpolated
+          # in this shell, then stream it over ssh. Heredoc body runs on bench.
+          ssh bench bash -s <<EOF
+          set -euo pipefail
+
+          extra=()
+          if [ -n '$QUERY' ]; then
+            extra+=(--query '$QUERY')
+          fi
+          if [ '$SAVE_IF_BETTER' = 'true' ]; then
+            extra+=(--save-if-better)
+          fi
+
+          docker run --rm \\
+            --network host \\
+            -v '$DATA':/data:ro \\
+            -v "\$HOME/.config/gcloud":/root/.config/gcloud:ro \\
+            '$IMAGE_REF' \\
+            --suite clickbench \\
+            --suite-dir /app/benchmarks/clickbench \\
+            --source /data \\
+            --baseline '$BASELINE' \\
+            --iterations '$ITERATIONS' \\
+            "\${extra[@]}"
+          EOF

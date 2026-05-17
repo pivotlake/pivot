@@ -70,15 +70,18 @@ pub use count::CountFactory;
 mod filter;
 pub use filter::FilterFactory;
 
-mod project;
-pub use project::ProjectFactory;
+mod map;
+pub use map::MapFactory;
 
 mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 
 pub mod parquet;
 
+mod copy_out;
 mod order_by_limit;
+
+pub use copy_out::CopyOutFactory;
 pub use order_by_limit::{OrderBy, OrderByLimitFactory};
 
 use crate::memory::ReadBuffer;

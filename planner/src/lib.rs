@@ -28,7 +28,7 @@
 //! use std::path::Path;
 //! use std::sync::Arc;
 //!
-//! use dispatch::{ParquetTable, Projection, RecordBatchOperatorSpec, table_input};
+//! use dispatch::{DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec, table_input};
 //! use planner::Planner;
 //! use planner::catalog::{Catalog, Column, CreateTableRequest, Table};
 //! use planner::types::Type;
@@ -40,8 +40,8 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, projection: Projection) -> RecordBatchOperatorSpec {
-//!         table_input(&self.parquet, projection, false)
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection) -> RecordBatchOperatorSpec {
+//!         table_input(dispatcher, &self.parquet, projection, false)
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
 //! }
@@ -78,13 +78,14 @@
 //!
 //! let mut tables = HashMap::new();
 //! tables.insert("hits".to_string(), template);
-//! let catalog = Arc::new(MyCatalog { tables });
+//! let catalog: Arc<dyn Catalog> = Arc::new(MyCatalog { tables });
 //!
+//! let dispatch = Dispatch::spin_up(1, 10);
 //! let mut planner = Planner::new(catalog);
 //!
 //! // SQL -> Pivot Plan -> dispatch operator spec -> execution.
 //! let plan = planner.plan("SELECT COUNT(*) FROM hits WHERE URL <> 'foo'").unwrap();
-//! let spec = plan.compile().unwrap();
+//! let spec = plan.compile(dispatch.dispatcher()).unwrap();
 //! let batches = spec.collect();
 //! ```
 //!
@@ -112,7 +113,7 @@ use std::sync::Arc;
 
 use crate::catalog::Catalog;
 pub use operator::Operator;
-pub use plan::{Plan, PlanContext, PlanNode};
+pub use plan::{Plan, PlanNode};
 use thiserror::Error;
 
 use crate::catalog::DuckDBCatalogAdapter;
@@ -160,9 +161,7 @@ impl Planner {
     pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
         let duckdb_plan = self.planner_context.plan(query)?;
         Ok(Plan {
-            plan_context: PlanContext {
-                catalog: self.catalog.clone(),
-            },
+            catalog: self.catalog.clone(),
             root: PlanNode::try_from(duckdb_plan)?,
         })
     }

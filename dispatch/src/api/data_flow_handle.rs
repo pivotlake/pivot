@@ -1,63 +1,80 @@
-use crate::worker::worker_waker;
-use arrow_array::RecordBatch;
+use crate::worker::WorkerWaker;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
-/// A handle to a running dataflow, allowing the user to interact with a current running dataflow in
-/// dispatch - receiving record batches (from the receiver)
-/// as they arrive, check for errors, and cancel the query across workers.
-pub struct DataFlowHandle {
-    /// A receiver from the last operator in the real Dataflow. All workers have a producer to send
-    /// to here
-    record_batch_rx: mpsc::Receiver<RecordBatch>,
-    /// A receiver for errors that occurred during running.
+/// A handle to a running dataflow that produces items of type `T`.
+///
+/// Generic over the output type so the same handle shape works for record
+/// batches, future DDL responses, materialize-to-disk completions, etc.
+/// Exposes the universal control surface — cancel, cancel_token — plus
+/// iteration and collection of the output stream.
+pub struct DataFlowHandle<T> {
+    rx: mpsc::Receiver<T>,
+    /// Receives errors that a worker queues before dropping its err-sender.
     err_rx: mpsc::Receiver<crate::data_flow::Error>,
-    /// A flag that is by default off - it can be turned on to cause all workers to cancel the
-    /// running query
+    /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
+    /// Shared with the [`DataFlowDispatcher`] so that cancel callers (which
+    /// may not be on a worker thread) can still wake any parked worker.
+    waker: Arc<WorkerWaker>,
 }
 
-impl DataFlowHandle {
+impl<T> DataFlowHandle<T> {
     pub fn new(
-        record_batch_rx: mpsc::Receiver<RecordBatch>,
+        rx: mpsc::Receiver<T>,
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
         cancelled: Arc<AtomicBool>,
+        waker: Arc<WorkerWaker>,
     ) -> Self {
         Self {
-            record_batch_rx,
+            rx,
             err_rx,
             cancelled,
+            waker,
         }
     }
 
-    /// Collect all record batches from the running dataflow across all workers
-    pub fn collect(mut self) -> crate::data_flow::Result<Vec<RecordBatch>> {
-        let mut batches = Vec::new();
-        for batch_res in &mut self {
-            batches.push(batch_res?);
-        }
-        // The record batch channel closes when all workers drop their senders
-        // (e.g. on panic or completion). A worker that panicked/erred may have queued
-        // the error before dropping the sender, so check err_rx after the channel has closed.
-        if let Ok(e) = self.err_rx.try_recv() {
-            return Err(e);
-        }
-        Ok(batches)
-    }
-
-    /// Cancel the current running dataflow. This does NOT wait for all workers to finish running
-    /// it; for that collect must be called.
+    /// Cancel the running dataflow. Doesn't block — workers exit on the next
+    /// iteration of their event loop.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        worker_waker().notify();
+        self.waker.notify();
     }
 
-    /// A cheap, `Clone + Send + Sync` handle that can fire cancellation from a
-    /// thread that doesn't own the [`DataFlowHandle`] — e.g. from an async
-    /// task driving `next()` on a separate blocking thread.
+    /// A cheap, `Clone + Send + Sync` handle that can fire cancellation from
+    /// another thread.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             cancelled: self.cancelled.clone(),
+            waker: self.waker.clone(),
+        }
+    }
+
+    /// Block until every worker drops its output sender, then return all
+    /// items in order, or the first worker error if any occurred.
+    pub fn collect(mut self) -> crate::data_flow::Result<Vec<T>> {
+        let mut items = Vec::new();
+        for item in &mut self {
+            items.push(item?);
+        }
+        // The output channel closes when every worker drops its sender (on
+        // panic or completion). A worker that errored may have queued the
+        // error before dropping, so check err_rx after the channel closes.
+        if let Ok(e) = self.err_rx.try_recv() {
+            return Err(e);
+        }
+        Ok(items)
+    }
+}
+
+impl<T> Iterator for DataFlowHandle<T> {
+    type Item = crate::data_flow::Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Ok(e) = self.err_rx.try_recv() {
+            Some(Err(e))
+        } else {
+            self.rx.recv().ok().map(Ok)
         }
     }
 }
@@ -70,24 +87,13 @@ impl DataFlowHandle {
 #[derive(Clone)]
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
+    waker: Arc<WorkerWaker>,
 }
 
 impl CancelToken {
     /// Signal cancellation. Idempotent.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        worker_waker().notify();
-    }
-}
-
-impl Iterator for DataFlowHandle {
-    type Item = crate::data_flow::Result<RecordBatch>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Ok(e) = self.err_rx.try_recv() {
-            Some(Err(e))
-        } else {
-            self.record_batch_rx.recv().ok().map(Ok)
-        }
+        self.waker.notify();
     }
 }

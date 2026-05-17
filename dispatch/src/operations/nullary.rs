@@ -120,6 +120,69 @@ impl<O: 'static, NF: NullaryFactory<O>> OperatorFactory<O> for NullaryOperatorFa
     }
 }
 
+/// Runs a `FnOnce() -> O` exactly once on the worker it lands on, sends the
+/// result downstream, and finishes.
+///
+/// Used to plumb one-shot setup work (e.g. building a `ParquetTable`) into a
+/// worker thread that has a `MemoryContext`, so the caller doesn't have to
+/// have one. See [`Dispatch::run_on_worker`](crate::Dispatch::run_on_worker).
+pub struct OneShotNullaryFactory<O, F>
+where
+    F: FnOnce() -> O + Send + 'static,
+{
+    func: F,
+    _phantom: PhantomData<fn() -> O>,
+}
+
+impl<O, F> OneShotNullaryFactory<O, F>
+where
+    F: FnOnce() -> O + Send + 'static,
+{
+    pub fn new(func: F) -> Self {
+        Self {
+            func,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<O, F> NullaryFactory<O> for OneShotNullaryFactory<O, F>
+where
+    O: Send + 'static,
+    F: FnOnce() -> O + Send + 'static,
+{
+    type Nullary = OneShotNullary<O, F>;
+
+    fn build_nullary(self) -> Self::Nullary {
+        OneShotNullary {
+            func: Some(self.func),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+pub struct OneShotNullary<O, F: FnOnce() -> O> {
+    func: Option<F>,
+    _phantom: PhantomData<fn() -> O>,
+}
+
+impl<O, F: FnOnce() -> O + Send> Nullary<O> for OneShotNullary<O, F> {
+    fn run<S: Sender<O>>(&mut self, sender: &mut S) -> Result<WorkStatus> {
+        match self.func.take() {
+            Some(f) => {
+                sender.send(f())?;
+                Ok(WorkStatus::Ran)
+            }
+            None => Ok(WorkStatus::Pending),
+        }
+    }
+
+    fn finish<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<bool> {
+        // We're done once `run` has consumed the closure.
+        Ok(self.func.is_none())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

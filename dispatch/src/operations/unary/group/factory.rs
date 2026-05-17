@@ -44,8 +44,9 @@ impl<K: KeyExtractor> GroupFactory<K> {
     pub fn create_for_workers(
         group_column: usize,
         worker_count: usize,
+        buffers: usize,
     ) -> impl IntoIterator<Item = GroupFactory<K>> {
-        let shared_arena = SharedArena::new();
+        let shared_arena = SharedArena::new(buffers);
         let hash_state = RandomState::new();
         let injector = Arc::new(Injector::new());
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));

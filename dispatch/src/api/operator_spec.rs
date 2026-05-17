@@ -1,17 +1,18 @@
 use crate::operations::UnaryOperatorFactory;
 use crate::operations::channels::{
-    ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, return_to_worker_mpsc, stealable,
+    ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, mpsc_channel,
+    return_to_worker_mpsc, stealable,
 };
 use crate::operations::parquet::DecoderFactory;
 use crate::operations::parquet::DecompressorFactory;
 use crate::operations::parquet::types::projection::Projection;
 use crate::operations::parquet::{CompressedPage, DecompressedPage, ParquetTable};
 use crate::operations::parquet::{IndexerFactory, RowGroupBuffer};
-use crate::{Chain, dispatcher};
+use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
 use arrow_array::RecordBatch;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// Generic, strongly-typed spec used internally to build the parquet read pipeline.
 ///
@@ -36,22 +37,66 @@ use std::sync::atomic::AtomicUsize;
 /// trait method either forces the bound onto all users (wrong for `RecordBatch`) or
 /// requires a `where` clause that breaks object safety.
 pub struct OperatorSpec<O, OF: OperatorFactory<O>> {
-    /// Vector of factories, one per worker. These all should build the same `Box<dyn Operator>` within
-    /// different workers.
+    dispatcher: DataFlowDispatcher,
     factories: VecDeque<OF>,
     _phantom: std::marker::PhantomData<O>,
 }
 
 impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
-    pub fn new(factories: impl IntoIterator<Item = OF>) -> Self {
+    pub fn new(dispatcher: DataFlowDispatcher, factories: impl IntoIterator<Item = OF>) -> Self {
         Self {
+            dispatcher,
             factories: factories.into_iter().collect(),
             _phantom: Default::default(),
         }
     }
 
+    pub fn dispatcher(&self) -> &DataFlowDispatcher {
+        &self.dispatcher
+    }
+
+    pub fn into_parts(self) -> (DataFlowDispatcher, VecDeque<OF>) {
+        (self.dispatcher, self.factories)
+    }
+
     pub fn factories(self) -> VecDeque<OF> {
         self.factories
+    }
+}
+
+impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O, OF> {
+    pub fn execute(self) -> DataFlowHandle<O> {
+        let (tx, rx) = mpsc_channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waker = self.dispatcher.waker().clone();
+        self.dispatcher
+            .push_data_flow(self.factories.into_iter().map(|f| {
+                let tx = tx.clone();
+                let build = Box::new(move || Box::new(f).build(tx));
+                DataFlowBuilder::new(build, cancelled.clone(), err_tx.clone())
+            }));
+        // Close our local copies of the senders so the channels close once
+        // every worker drops theirs.
+        drop(err_tx);
+
+        let (rx, _) = rx.into_parts();
+        DataFlowHandle::new(rx, err_rx, cancelled, waker)
+    }
+
+    /// Run the dataflow and drain every produced item into a `Vec`. Shortcut
+    /// for `self.execute().collect()`.
+    pub fn collect(self) -> crate::data_flow::Result<Vec<O>> {
+        self.execute().collect()
+    }
+}
+
+impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
+    /// Re-enter [`RecordBatchOperatorSpec`] so the RB-only fluent methods
+    /// (`.count()`, `.order_by_limit()`, `.group_by_count()`, …) can be
+    /// chained after a `.map()` whose output type is `RecordBatch`.
+    pub fn record_batches(self) -> super::record_batch_operator::RecordBatchOperatorSpec {
+        super::record_batch_operator::RecordBatchOperatorSpec::from_spec(self)
     }
 }
 
@@ -83,39 +128,40 @@ impl<OF: OperatorFactory<RowGroupBuffer>> OperatorSpec<RowGroupBuffer, OF> {
         batch_size: usize,
         add_row_group_metadata: bool,
     ) -> OperatorSpec<RecordBatch, ReadParquet<OF>> {
-        let siblings_left_indexer = Arc::new(AtomicUsize::new(dispatcher().workers()));
-        let siblings_left_decompressor = Arc::new(AtomicUsize::new(dispatcher().workers()));
-        let siblings_left_drain = Arc::new(AtomicUsize::new(dispatcher().workers()));
+        let worker_count = self.factories.len();
+        let siblings_left_indexer = Arc::new(AtomicUsize::new(worker_count));
+        let siblings_left_decompressor = Arc::new(AtomicUsize::new(worker_count));
+        let siblings_left_drain = Arc::new(AtomicUsize::new(worker_count));
 
-        OperatorSpec::new(
-            stealable::<RowGroupBuffer>()
-                .into_iter()
-                .zip(stealable::<CompressedPage>())
-                .zip(return_to_worker_mpsc::<DecompressedPage>())
-                .map(move |((ic, dc), drc)| {
+        let factories: Vec<_> = stealable::<RowGroupBuffer>(worker_count)
+            .into_iter()
+            .zip(stealable::<CompressedPage>(worker_count))
+            .zip(return_to_worker_mpsc::<DecompressedPage>(worker_count))
+            .map(move |((ic, dc), drc)| {
+                UnaryOperatorFactory::new(
                     UnaryOperatorFactory::new(
                         UnaryOperatorFactory::new(
-                            UnaryOperatorFactory::new(
-                                self.factories.pop_front().unwrap(),
-                                IndexerFactory::new(),
-                                ic,
-                                siblings_left_indexer.clone(),
-                            ),
-                            DecompressorFactory::new(),
-                            dc,
-                            siblings_left_decompressor.clone(),
+                            self.factories.pop_front().unwrap(),
+                            IndexerFactory::new(),
+                            ic,
+                            siblings_left_indexer.clone(),
                         ),
-                        DecoderFactory {
-                            batch_size,
-                            table: table.clone(),
-                            projection: projection.clone(),
-                            add_row_group_metadata,
-                        },
-                        drc,
-                        siblings_left_drain.clone(),
-                    )
-                }),
-        )
+                        DecompressorFactory::new(),
+                        dc,
+                        siblings_left_decompressor.clone(),
+                    ),
+                    DecoderFactory {
+                        batch_size,
+                        table: table.clone(),
+                        projection: projection.clone(),
+                        add_row_group_metadata,
+                    },
+                    drc,
+                    siblings_left_drain.clone(),
+                )
+            })
+            .collect();
+        OperatorSpec::new(self.dispatcher, factories)
     }
 }
 
