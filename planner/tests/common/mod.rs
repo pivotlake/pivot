@@ -158,6 +158,7 @@ pub struct TestingPlanner {
     dispatch: Dispatch,
 }
 
+#[allow(dead_code)] // not all test binaries call every helper
 impl TestingPlanner {
     /// Borrow the dispatcher to hand to `Plan::compile`.
     pub fn dispatcher(&self) -> &DataFlowDispatcher {

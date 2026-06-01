@@ -18,7 +18,6 @@ use arrow_schema::{DataType, SchemaRef};
 
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
-use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 
 /// Build a pgwire row schema from an Arrow [`SchemaRef`]. Each Arrow column
@@ -56,13 +55,9 @@ impl From<RecordBatch> for PGRowBatch {
             }
             rows.push(encoder.take_row());
         }
-        Self {
-            rows,
-            fields,
-        }
+        Self { rows, fields }
     }
 }
-
 
 /// Encode a single cell. We always feed the encoder a typed Rust value (or
 /// `Option::None` for SQL NULL) so pgwire's `ToSqlText` impl handles the

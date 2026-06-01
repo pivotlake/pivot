@@ -204,11 +204,13 @@ fn should_filter_row_group(
         // `col <> k` is true on every row unless every row in this group
         // equals `k` — provable only when min == max == k.
         CompareType::NotEqual => {
-            bool_kernel(min, constant, arrow_ord::cmp::eq)? && bool_kernel(max, constant, arrow_ord::cmp::eq)?
+            bool_kernel(min, constant, arrow_ord::cmp::eq)?
+                && bool_kernel(max, constant, arrow_ord::cmp::eq)?
         }
         // `col = k` can never match when k is strictly outside [min, max].
         CompareType::Equal => {
-            bool_kernel(constant, min, arrow_ord::cmp::lt)? || bool_kernel(constant, max, arrow_ord::cmp::gt)?
+            bool_kernel(constant, min, arrow_ord::cmp::lt)?
+                || bool_kernel(constant, max, arrow_ord::cmp::gt)?
         }
     })
 }

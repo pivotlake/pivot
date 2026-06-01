@@ -8,10 +8,10 @@
 //! and sends it to that worker's dedicated mpsc channel. Each worker's receiver sees
 //! only messages destined for it.
 
+use crate::Identifier;
 use crate::operations::channels;
 use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel};
 use crate::operations::channels::{ChannelFactory, Sender};
-use crate::{Identifier};
 
 /// Factory for building a return-to-worker channel.
 ///
@@ -60,11 +60,10 @@ impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
 ///
 /// Sets up N mpsc channels (one per worker). Each factory holds all N senders
 /// (for routing) and its own receiver.
-pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(count: usize)
--> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
-    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
-        .map(|_| mpsc_channel::<T>())
-        .unzip();
+pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
+    count: usize,
+) -> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count).map(|_| mpsc_channel::<T>()).unzip();
 
     receivers.into_iter().map(move |rx| {
         let txs: Vec<_> = senders.to_vec();

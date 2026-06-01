@@ -7,6 +7,7 @@ use planner::catalog::{Catalog, Column, CreateTableRequest, Table};
 use planner::expression::TableFilter;
 use planner::types::Type;
 
+#[allow(unused_imports)]
 use crate::common::*;
 
 /// Stand-in for a real table that records every `pushdown_filter` call so the

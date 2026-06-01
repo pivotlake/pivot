@@ -103,9 +103,7 @@ impl<I> Receiver<I> for StealableReceiver<I> {
 /// Returns an iterator of factories — one per worker. Each factory's stealer list
 /// contains every other worker's deque, so any worker can steal from any other.
 pub fn stealable<T: Send>(count: usize) -> impl IntoIterator<Item = StealableChannelFactory<T>> {
-    let workers: Vec<_> = (0..count)
-        .map(|_| Worker::new_lifo())
-        .collect();
+    let workers: Vec<_> = (0..count).map(|_| Worker::new_lifo()).collect();
 
     let workers_with_stealers = workers
         .iter()

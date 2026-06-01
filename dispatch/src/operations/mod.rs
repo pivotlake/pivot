@@ -18,14 +18,14 @@
 //!   input channel and writes to one output channel, applying a [`Unary`]
 //!   transform. Most query stages (filter, project, count, etc.) are built as unary
 //!   operators. The [`UnaryOperatorFactory`] creates them during the factory build step
-//! 
+//!
 //! # Operator lifecycle
 //!
 //! Operators are created during the factory build step on the worker thread (not before —
 //! some hold `Rc` or other non-`Send` state). Once created, the worker's event loop
 //! repeatedly calls:
 //!
-//! 1. [`run_cpu_work`](Operator::run_cpu_work) — does one 'unit' of CPU work, optionally. 
+//! 1. [`run_cpu_work`](Operator::run_cpu_work) — does one 'unit' of CPU work, optionally.
 //!    Returns [`WorkStatus::Ran`] if it did anything, [`WorkStatus::Pending`] if no work was available
 //!    to do.
 //!

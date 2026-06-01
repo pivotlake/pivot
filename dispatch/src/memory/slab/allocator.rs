@@ -1,6 +1,6 @@
 use crate::memory::slab::slab_buffer::SlabBuffer;
 use crate::memory::slab::{MultiSlabBuffer, Slab};
-use crate::memory::{memory_ctx, WriteBuffer, BUFFER_SIZE};
+use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
 use std::sync::Arc;
 
 /// Bump allocator that carves [`Slab`]s out of 2MB [`WriteBuffer`]s.
@@ -136,7 +136,7 @@ impl SlabAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{init_test_free_pool, BUFFER_SIZE};
+    use crate::memory::{BUFFER_SIZE, init_test_free_pool};
 
     #[test]
     fn returns_zeroed_slab() {

@@ -1,21 +1,18 @@
-use std::cell::{Cell, RefCell};
-use std::ptr;
-use std::sync::{Arc, LazyLock};
-use tracing::debug;
 use crate::env::get_env_var_with_default;
-use crate::memory::free_pool::{FreePool, PoolFactory};
-use crate::memory::{Ring, WriteBuffer, BUFFER_SIZE};
 use crate::memory::file_cache::FileCache;
+use crate::memory::free_pool::{FreePool, PoolFactory};
+use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
 use crate::worker::{NUM_WORKERS, WORKER_IDX};
+use std::cell::{Cell, RefCell};
+use std::sync::{Arc, LazyLock};
 
 static PANIC_ON_EVICT: LazyLock<bool> =
     LazyLock::new(|| get_env_var_with_default("PANIC_ON_EVICT", true));
 
 thread_local! {
-    static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = RefCell::new(None);
+    static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
     static MEMORY_CTX_PTR: Cell<*const MemoryContext> = const { Cell::new(std::ptr::null()) };
 }
-
 
 pub fn init_memory_context(ctx: MemoryContext) {
     MEMORY_CONTEXT_OWNER.with_borrow_mut(|slot| {
@@ -29,17 +26,28 @@ pub fn memory_ctx() -> &'static MemoryContext {
     unsafe { &*MEMORY_CTX_PTR.get() }
 }
 
+/// True when a [`MemoryContext`] is installed on the current thread — i.e. the
+/// caller is running on a dispatch worker (or a test that called
+/// [`init_test_free_pool`]). Worker-only APIs that reach into the per-thread
+/// memory context use this to fail with a clear message instead of letting
+/// [`memory_ctx`] dereference the null context pointer.
+pub fn has_memory_context() -> bool {
+    MEMORY_CTX_PTR.with(|p| !p.get().is_null())
+}
 
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
     file_cache: Arc<FileCache>,
     dirty_pool_factory: PoolFactory,
-    zeroed_pool_factory: PoolFactory
+    zeroed_pool_factory: PoolFactory,
 }
 
 impl MemoryContextFactory {
     pub fn create_many(count: usize, buffers: usize) -> Vec<Self> {
-        assert!(MEMORY_CTX_PTR.get().is_null(), "another memory context is already active!");
+        assert!(
+            MEMORY_CTX_PTR.get().is_null(),
+            "another memory context is already active!"
+        );
 
         let ring = Arc::new(Ring::new(buffers).unwrap());
         let file_cache = Arc::new(FileCache::new(buffers));
@@ -66,12 +74,11 @@ impl MemoryContextFactory {
     }
 }
 
-
 pub struct MemoryContext {
     ring: Arc<Ring>,
     file_cache: Arc<FileCache>,
     dirty_pool: FreePool,
-    zeroed_pool: FreePool
+    zeroed_pool: FreePool,
 }
 
 impl MemoryContext {
@@ -91,8 +98,8 @@ impl MemoryContext {
     pub fn file_cache(&self) -> &FileCache {
         self.file_cache.as_ref()
     }
-    
-    pub fn ring(&self) -> &Ring{
+
+    pub fn ring(&self) -> &Ring {
         self.ring.as_ref()
     }
 
@@ -122,13 +129,14 @@ impl MemoryContext {
         first.pop(true).or_else(|| second.pop(true))
     }
 
-
     /// Pop a dirty buffer from this worker's local deque only (no stealing).
     ///
     /// Used by background buffer-clean passes that should not pull buffers off
     /// peer workers — see [`crate::worker::Worker`]'s `clear_dirty_buffer_or_park`.
     pub fn pop_dirty_buffer(&self) -> Option<WriteBuffer> {
-        self.dirty_pool.pop(false).and_then(|i| memory_ctx().ring().try_write(i))
+        self.dirty_pool
+            .pop(false)
+            .and_then(|i| memory_ctx().ring().try_write(i))
     }
 
     /// Acquire a [`WriteBuffer`] from the free pool, falling back to eviction.
@@ -171,6 +179,7 @@ impl MemoryContext {
 pub fn init_test_free_pool(dirty_count: usize) {
     WORKER_IDX.set(0);
     NUM_WORKERS.set(1);
+    crate::worker::install_test_worker_waker();
     let factory = MemoryContextFactory::create_many(1, 128).pop().unwrap();
     init_memory_context(factory.create_memory_ctx());
     for i in 0..dirty_count {

@@ -13,8 +13,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use catalog::ParquetCatalog;
+use dispatch::{BUFFER_SIZE, Dispatch};
 use server::Server;
 use tokio::sync::oneshot;
+
+fn total_memory_bytes() -> usize {
+    sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
+    )
+    .total_memory() as usize
+}
 
 pub struct ServerHandle {
     port: u16,
@@ -65,9 +73,11 @@ fn wait_until_listening(addr: SocketAddr) -> std::io::Result<()> {
 /// `CREATE TABLE` over the wire to populate it.
 pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
     let port = pick_free_port()?;
-    let bind: SocketAddr = format!("127.0.0.1:{port}").parse().expect("valid socket addr");
+    let bind: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .expect("valid socket addr");
 
-    let handles = dispatch::init(workers);
+    let dispatch = Dispatch::spin_up(workers, total_memory_bytes() / 2 / BUFFER_SIZE);
     let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -80,7 +90,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
                 .build()
                 .expect("build tokio runtime");
             rt.block_on(async move {
-                let server = Server::new(bind, handles, catalog);
+                let server = Server::new(bind, dispatch, catalog);
                 let _ = server
                     .serve(Box::pin(async move {
                         let _ = shutdown_rx.await;

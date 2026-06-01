@@ -3,6 +3,7 @@
 //! Each [`Operator`](crate::operator::Operator) variant has a `compile`
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
+use crate::catalog::Catalog;
 use crate::compile::create_table::CreateTableNullaryFactory;
 use crate::compile::{Error, ExprEvalFn};
 use crate::expression::Expression;
@@ -12,10 +13,12 @@ use crate::operator::{
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
 use arrow_array::{BooleanArray, RecordBatch};
-use dispatch::{DataFlowDispatcher, IntKeyExtractor, OrderBy as DispatchOrderBy, Projection as DispatchProjection, RecordBatchOperatorSpec, StringKeyExtractor};
+use dispatch::{
+    DataFlowDispatcher, IntKeyExtractor, OrderBy as DispatchOrderBy,
+    Projection as DispatchProjection, RecordBatchOperatorSpec, StringKeyExtractor,
+};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use crate::catalog::Catalog;
 
 impl Projection {
     pub fn compile(

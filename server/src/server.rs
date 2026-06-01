@@ -18,19 +18,17 @@
 //! worker watchers, so when [`Server::serve`] returns `Ok(())` every worker
 //! thread has already terminated.
 
+use crate::query_handler::PivotHandlers;
+use dispatch::{Dispatch, Shutdown};
 use pgwire::tokio::process_socket;
 use planner::catalog::Catalog;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
-use dispatch::Dispatch;
-use crate::query_handler::PivotHandlers;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -55,7 +53,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Server {
     bind: SocketAddr,
     worker_watchers: JoinSet<std::thread::Result<()>>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Shutdown,
     handlers: Arc<PivotHandlers>,
 }
 
@@ -66,11 +64,7 @@ impl Server {
     /// dispatcher for the query handler and adopts every worker `JoinHandle`
     /// for the shutdown / fault-detection path. Pass port `0` in `bind` to
     /// let the OS pick a free port (useful in tests).
-    pub fn new(
-        bind: SocketAddr,
-        dispatch: Dispatch,
-        catalog: Arc<dyn Catalog>,
-    ) -> Self {
+    pub fn new(bind: SocketAddr, dispatch: Dispatch, catalog: Arc<dyn Catalog>) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the
         // query handler needs it to compile every plan.
         let dispatcher = dispatch.dispatcher().clone();
@@ -108,14 +102,14 @@ impl Server {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signalled, draining workers");
-                    self.shutdown.store(true, Ordering::Relaxed);
+                    self.shutdown.shutdown();
                     // Wait for every worker to observe the flag and exit. No
                     // need to inspect results — we initiated the shutdown.
                     while self.worker_watchers.join_next().await.is_some() {}
                     return Ok(());
                 }
                 Some(joined) = self.worker_watchers.join_next() => {
-                    self.shutdown.store(true, Ordering::Relaxed);
+                    self.shutdown.shutdown();
                     return Err(match joined {
                         Ok(Ok(())) => {
                             error!("dispatch worker returned unexpectedly");

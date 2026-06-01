@@ -37,7 +37,7 @@ mod reader;
 pub use reader::{MultiBufferReader, ReaderPosition};
 
 mod context;
-pub use context::{MemoryContextFactory, MemoryContext, init_memory_context, memory_ctx};
+pub use context::{MemoryContextFactory, has_memory_context, init_memory_context, memory_ctx};
 
 #[cfg(test)]
 pub use context::init_test_free_pool;

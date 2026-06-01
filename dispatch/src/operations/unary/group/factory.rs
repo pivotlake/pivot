@@ -44,7 +44,7 @@ impl<K: KeyExtractor> GroupFactory<K> {
     pub fn create_for_workers(
         group_column: usize,
         worker_count: usize,
-        buffers: usize
+        buffers: usize,
     ) -> impl IntoIterator<Item = GroupFactory<K>> {
         let shared_arena = SharedArena::new(buffers);
         let hash_state = RandomState::new();

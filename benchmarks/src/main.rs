@@ -188,7 +188,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let suite_run = rt.block_on(runner::run_suite(server.port(), &suite, &opts))?;
 
     if cli.update_results {
-        println!("\nupdated expected output for {} queries — no comparison performed", cli.suite);
+        println!(
+            "\nupdated expected output for {} queries — no comparison performed",
+            cli.suite
+        );
         drop(server);
         return Ok(());
     }

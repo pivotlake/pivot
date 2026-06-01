@@ -24,14 +24,14 @@ mod create_table;
 mod expression;
 mod operator;
 
-use std::sync::Arc;
+use crate::catalog::Catalog;
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
+use std::sync::Arc;
 use thiserror::Error;
-use crate::catalog::Catalog;
 
 #[derive(Debug, Error)]
 pub enum Error {

@@ -13,8 +13,8 @@
 //! verifying the location still matches, preventing TOCTOU races with concurrent evictions.
 
 use crate::io::IOLocation;
-use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::context::memory_ctx;
+use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::write_buffer::WriteBuffer;
 use ahash::HashMap;
 use std::cell::UnsafeCell;
@@ -188,11 +188,11 @@ mod tests {
     fn loc(fd: RawFd, offset: usize) -> IOLocation {
         IOLocation { raw_fd: fd, offset }
     }
-    
+
     fn file_cache() -> FileCache {
         FileCache::new(1_000)
     }
-    
+
     #[test]
     fn get_returns_none_for_uncached_location() {
         init_test_free_pool(4);

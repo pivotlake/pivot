@@ -1,5 +1,8 @@
 use crate::operations::UnaryOperatorFactory;
-use crate::operations::channels::{ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, return_to_worker_mpsc, stealable, mpsc_channel};
+use crate::operations::channels::{
+    ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, mpsc_channel,
+    return_to_worker_mpsc, stealable,
+};
 use crate::operations::parquet::DecoderFactory;
 use crate::operations::parquet::DecompressorFactory;
 use crate::operations::parquet::types::projection::Projection;
@@ -40,10 +43,7 @@ pub struct OperatorSpec<O, OF: OperatorFactory<O>> {
 }
 
 impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
-    pub fn new(
-        dispatcher: DataFlowDispatcher,
-        factories: impl IntoIterator<Item = OF>,
-    ) -> Self {
+    pub fn new(dispatcher: DataFlowDispatcher, factories: impl IntoIterator<Item = OF>) -> Self {
         Self {
             dispatcher,
             factories: factories.into_iter().collect(),
@@ -70,17 +70,12 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let (err_tx, err_rx) = std::sync::mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let waker = self.dispatcher.waker().clone();
-        self.dispatcher.push_data_flow(
-            self.factories
-                .into_iter()
-                .map(|f| {
-                    let tx = tx.clone();
-                    let build = Box::new(move || {
-                        Box::new(f).build(tx)
-                    });
-                    DataFlowBuilder::new(build, cancelled.clone(), err_tx.clone())
-                }),
-        );
+        self.dispatcher
+            .push_data_flow(self.factories.into_iter().map(|f| {
+                let tx = tx.clone();
+                let build = Box::new(move || Box::new(f).build(tx));
+                DataFlowBuilder::new(build, cancelled.clone(), err_tx.clone())
+            }));
         // Close our local copies of the senders so the channels close once
         // every worker drops theirs.
         drop(err_tx);

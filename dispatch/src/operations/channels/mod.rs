@@ -27,7 +27,7 @@ mod stealable;
 pub use stealable::{StealableChannelFactory, stealable};
 
 mod mpsc;
-pub use mpsc::{MpscSender, MpscReceiver, mpsc_channel};
+pub use mpsc::{MpscSender, mpsc_channel};
 
 mod return_to_worker;
 pub use return_to_worker::{ReturnToWorkerMpscFactory, WorkerIdOutput, return_to_worker_mpsc};

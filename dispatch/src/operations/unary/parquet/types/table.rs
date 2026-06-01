@@ -6,6 +6,7 @@
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
 use crate::io::open_direct_read;
+use crate::memory::{has_memory_context, memory_ctx};
 use crate::operations::unary::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
@@ -26,7 +27,6 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
-use crate::memory::memory_ctx;
 
 static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
 
@@ -78,7 +78,18 @@ impl ParquetTable {
     /// Reads and parses the Thrift footer of each file, opens the file with
     /// direct IO, and registers it in the file cache. Row groups are assigned
     /// globally unique indices in the order files are discovered.
+    ///
+    /// Must run on a dispatch worker thread: registering each file in the
+    /// per-thread page cache reaches through [`memory_ctx`], which is only
+    /// installed on workers. Off-worker callers (e.g. the catalog) must hop to
+    /// a worker via [`DataFlowDispatcher::run_on_worker`](crate::DataFlowDispatcher::run_on_worker).
     pub fn from_directory(path: &Path) -> Result<Self> {
+        assert!(
+            has_memory_context(),
+            "ParquetTable::from_directory must run on a dispatch worker thread: \
+             no MemoryContext is installed on the current thread. Off-worker \
+             callers must dispatch via DataFlowDispatcher::run_on_worker."
+        );
         let mut start_offset = 0;
         let row_groups: Vec<_> = fs::read_dir(path)?
             .flatten()

@@ -1,19 +1,17 @@
 #![allow(dead_code)]
 
-use std::ops::Deref;
 use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::ops::Deref;
+use std::sync::{Arc, Once};
 use tempfile::TempDir;
 
-use dispatch::{
-    DataFlowDispatcher, Dispatch, MemoryContextFactory, ParquetTable, init_memory_context,
-};
+use dispatch::{DataFlowDispatcher, Dispatch, ParquetTable};
 
-/// The process-wide dispatcher, created on the first `init*` call.
+// The process-wide dispatcher, created on the first `init*` call.
 // static DISPATCHER: OnceLock<Mutex<DataFlowDispatcher>> = OnceLock::new();
 
 // pub fn init() {
@@ -34,7 +32,6 @@ use dispatch::{
 //         Mutex::new(dispatcher)
 //     });
 // }
-
 
 static INIT: Once = Once::new();
 

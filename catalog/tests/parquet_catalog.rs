@@ -1,18 +1,48 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, Scalar, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
+use dispatch::{DataFlowDispatcher, Dispatch};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 use catalog::{ParquetCatalog, ParquetCatalogTable};
-use planner::catalog::{Catalog as PlannerCatalog, Column, CreateTableRequest, Table};
+use planner::catalog::{
+    Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
+};
 use planner::expression::{Compare, CompareType, Expression, Ref, TableFilter};
 use planner::types::Type;
+
+/// A shared single-worker dispatch pool for the whole test binary.
+///
+/// `ParquetCatalog::create_table` parses each parquet file's footer via
+/// `ParquetTable::from_directory`, which registers the file in the per-worker
+/// page cache and therefore must run on a dispatch worker thread (exactly as
+/// the server does: it compiles `CREATE TABLE` into a worker-side nullary).
+/// Tests create tables the same way — through [`create_table`] below — rather
+/// than calling the catalog on the bare test thread, which has no
+/// `MemoryContext`.
+fn dispatcher() -> DataFlowDispatcher {
+    static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
+    DISPATCH
+        .get_or_init(|| Dispatch::spin_up(1, 32))
+        .dispatcher()
+        .clone()
+}
+
+/// Create a table on a dispatch worker, mirroring how the server runs
+/// `CREATE TABLE`. Returns the catalog's own result so error-path tests can
+/// still assert on the `Err`.
+fn create_table(catalog: &Arc<ParquetCatalog>, request: CreateTableRequest) -> CatalogResult<()> {
+    let catalog = catalog.clone();
+    dispatcher()
+        .run_on_worker(move || catalog.create_table(request))
+        .expect("run_on_worker should drive the create-table closure to completion")
+}
 
 /// Write a parquet file containing each batch as its own row group, so a
 /// per-row-group min/max prune is observable.
@@ -108,24 +138,22 @@ fn row_group_count(table: &ParquetCatalogTable) -> usize {
 #[test]
 fn create_table_succeeds_with_valid_path() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     assert!(catalog.table("t").is_some());
 }
 
 #[test]
 fn create_table_fails_when_path_option_missing() {
     let (_dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
+    let catalog = Arc::new(ParquetCatalog::new());
     let req = CreateTableRequest {
         name: "t".to_string(),
         columns,
         options: HashMap::new(),
         if_not_exists: false,
     };
-    let err = catalog.create_table(req).unwrap_err().to_string();
+    let err = create_table(&catalog, req).unwrap_err().to_string();
     assert!(
         err.contains("path"),
         "expected error to mention path: {err}"
@@ -135,10 +163,9 @@ fn create_table_fails_when_path_option_missing() {
 #[test]
 fn create_table_fails_when_path_does_not_exist() {
     let (_dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
+    let catalog = Arc::new(ParquetCatalog::new());
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
-    let err = catalog
-        .create_table(create_request("t", bogus, columns))
+    let err = create_table(&catalog, create_request("t", bogus, columns))
         .unwrap_err()
         .to_string();
     assert!(
@@ -151,9 +178,8 @@ fn create_table_fails_when_path_does_not_exist() {
 fn create_table_fails_when_path_is_a_file() {
     let (dir, columns) = three_row_table();
     let file_path = dir.path().join("data.parquet");
-    let catalog = ParquetCatalog::new();
-    let err = catalog
-        .create_table(create_request("t", &file_path, columns))
+    let catalog = Arc::new(ParquetCatalog::new());
+    let err = create_table(&catalog, create_request("t", &file_path, columns))
         .unwrap_err()
         .to_string();
     assert!(
@@ -165,10 +191,8 @@ fn create_table_fails_when_path_is_a_file() {
 #[test]
 fn pushdown_filter_always_returns_false() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let mut table = catalog.parquet_table("t").unwrap();
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
@@ -179,10 +203,8 @@ fn pushdown_filter_always_returns_false() {
 #[test]
 fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let mut table = catalog.parquet_table("t").unwrap();
     assert_eq!(row_group_count(&table), 3);
@@ -200,10 +222,8 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
 #[test]
 fn second_bind_is_independent_of_first_bind_pushdown() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let mut first = catalog.parquet_table("t").unwrap();
     first
@@ -219,10 +239,8 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
 #[test]
 fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 999` lies outside every (min,max) → all three row groups drop.
     let mut table = catalog.parquet_table("t").unwrap();
@@ -235,10 +253,8 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
 #[test]
 fn pushdown_filter_eq_keeps_only_matching_row_group() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 20` matches only the row group whose single value is 20.
     let mut table = catalog.parquet_table("t").unwrap();
@@ -251,10 +267,8 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
 #[test]
 fn pushdown_filter_eq_returns_false() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let mut table = catalog.parquet_table("t").unwrap();
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
@@ -265,10 +279,8 @@ fn pushdown_filter_eq_returns_false() {
 #[test]
 fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
     let (dir, columns) = three_row_table();
-    let catalog = ParquetCatalog::new();
-    catalog
-        .create_table(create_request("t", dir.path(), columns))
-        .unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let mut table = catalog.parquet_table("t").unwrap();
     table

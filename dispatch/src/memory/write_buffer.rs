@@ -1,9 +1,7 @@
 use crate::memory::BUFFER_SIZE;
-use crate::memory::context::{memory_ctx, MemoryContext};
-use crate::memory::ring::Ring;
+use crate::memory::context::memory_ctx;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Exclusive, mutable handle to a 2MB slot in the ring buffer.
@@ -46,7 +44,9 @@ impl WriteBuffer {
         unsafe {
             std::ptr::write_bytes(self.ptr, 0, BUFFER_SIZE);
         }
-        memory_ctx().ring().set_slot_used(self.slot_idx, 0, Ordering::Release);
+        memory_ctx()
+            .ring()
+            .set_slot_used(self.slot_idx, 0, Ordering::Release);
         memory_ctx().ring().set_slot_zeroed(self.slot_idx, true);
         memory_ctx().push_free_idx(self.slot_idx, true);
         mem::forget(self);
@@ -86,7 +86,9 @@ impl AsMut<[u8]> for WriteBuffer {
 impl Drop for WriteBuffer {
     fn drop(&mut self) {
         memory_ctx().ring().set_slot_zeroed(self.slot_idx, false);
-        memory_ctx().ring().set_slot_used(self.slot_idx, 0, Ordering::Release);
+        memory_ctx()
+            .ring()
+            .set_slot_used(self.slot_idx, 0, Ordering::Release);
         memory_ctx().push_free_idx(self.slot_idx, false);
     }
 }

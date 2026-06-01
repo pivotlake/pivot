@@ -65,13 +65,13 @@ mod operations;
 mod record_batch_metadata;
 mod worker;
 
-use crate::api::OperatorSpec;
 use crate::operations::nullary::OneShotNullaryFactory;
 use crate::worker::{Worker, WorkerWaker};
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
 pub use io::IORequest;
+pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use operations::channels::{MpscSender, Sender};
@@ -85,7 +85,6 @@ pub use operations::{
     IntKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator, OrderBy,
     Result as OperatorResult, StringKeyExtractor,
 };
-pub use memory::BUFFER_SIZE;
 
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"percpu_arena:percpu,oversize_threshold:0,\
@@ -99,6 +98,20 @@ static GLOBAL: Jemalloc = Jemalloc;
 /// usize which could also be a counter etc) we have an system-wide alias
 pub type Identifier = usize;
 
+pub struct Shutdown {
+    flag: Arc<AtomicBool>,
+    waker: Arc<WorkerWaker>,
+}
+
+impl Shutdown {
+    pub fn shutdown(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        // Workers parked on the waker won't observe `exit_flag` until someone
+        // wakes them. Notify so every parked worker returns from
+        // `wait_if_unchanged` and sees the flag on its next loop iteration.
+        self.waker.notify();
+    }
+}
 
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
@@ -156,7 +169,6 @@ impl DataFlowDispatcher {
     }
 }
 
-
 /// Owns the worker threads and exposes a [`DataFlowDispatcher`] for sending work to them.
 ///
 /// Created via [`Dispatch::spin_up`], which spawns one [`Worker`] per CPU core (pinned
@@ -171,7 +183,7 @@ impl DataFlowDispatcher {
 pub struct Dispatch {
     dataflow_dispatcher: DataFlowDispatcher,
     handles: Vec<JoinHandle<()>>,
-    exit_flag: Arc<AtomicBool>,
+    shutdown: Shutdown,
 }
 
 impl Dispatch {
@@ -195,17 +207,31 @@ impl Dispatch {
         for (i, core) in cores.into_iter().enumerate() {
             let (tx, rx) = channel();
             senders.push(tx);
-            threads.push(Worker::create(i, worker_count, core, should_exit.clone(),
-                                        memory_context_factories.pop().unwrap(),
-                                        rx, barrier.clone(), waker.clone()));
+            threads.push(Worker::create(
+                i,
+                worker_count,
+                core,
+                should_exit.clone(),
+                memory_context_factories.pop().unwrap(),
+                rx,
+                barrier.clone(),
+                waker.clone(),
+            ));
         }
         barrier.wait();
         info!("All workers have begun...");
 
         Dispatch {
-            dataflow_dispatcher: DataFlowDispatcher { senders, buffers, waker },
+            dataflow_dispatcher: DataFlowDispatcher {
+                senders,
+                buffers,
+                waker: waker.clone(),
+            },
             handles: threads,
-            exit_flag: should_exit,
+            shutdown: Shutdown {
+                flag: should_exit,
+                waker,
+            },
         }
     }
 
@@ -217,11 +243,7 @@ impl Dispatch {
     /// Signal every worker to stop and join their threads.
     pub fn exit(self) {
         info!("Shutting down!");
-        self.exit_flag.store(true, Ordering::Relaxed);
-        // Workers parked on the waker won't observe `exit_flag` until someone
-        // wakes them. Notify so every parked worker returns from
-        // `wait_if_unchanged` and sees the flag on its next loop iteration.
-        self.dataflow_dispatcher.waker.notify();
+        self.shutdown.shutdown();
         // Drop our copies of the senders so the worker channels close.
         drop(self.dataflow_dispatcher);
         for handle in self.handles {
@@ -234,7 +256,7 @@ impl Dispatch {
         &self.dataflow_dispatcher
     }
 
-    pub fn into_parts(self) -> (Vec<JoinHandle<()>>, Arc<AtomicBool>) {
-        (self.handles, self.exit_flag)
+    pub fn into_parts(self) -> (Vec<JoinHandle<()>>, Shutdown) {
+        (self.handles, self.shutdown)
     }
 }

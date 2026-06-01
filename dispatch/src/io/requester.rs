@@ -1,7 +1,7 @@
 use crate::Identifier;
 use crate::io::DataFlowRequest;
 use crate::io::backend::IOBackend;
-use crate::memory::{memory_ctx, ReadBuffer, WriteBuffer, BUFFER_SIZE};
+use crate::memory::{BUFFER_SIZE, ReadBuffer, WriteBuffer, memory_ctx};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -67,7 +67,9 @@ impl IORequester {
         let identifiers = self.backend.completions()?;
         Ok(identifiers.into_iter().map(|(_size, i)| {
             let (buffer, request) = self.pending_io_requests.remove(&i).unwrap();
-            let read_buffer = memory_ctx().file_cache().insert(request.request.location.clone(), buffer);
+            let read_buffer = memory_ctx()
+                .file_cache()
+                .insert(request.request.location.clone(), buffer);
             (read_buffer, request)
         }))
     }

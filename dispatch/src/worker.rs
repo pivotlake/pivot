@@ -26,6 +26,7 @@ use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::IORequester;
+use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -36,7 +37,6 @@ use std::thread::JoinHandle;
 use std::{result, thread};
 use thiserror::Error;
 use tracing::{debug, info, instrument, warn};
-use crate::memory::{init_memory_context, memory_ctx, MemoryContextFactory};
 
 thread_local! {
     pub static WORKER_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -125,28 +125,37 @@ impl WorkerWaker {
 
 /// Install this thread's view of the shared [`WorkerWaker`].
 ///
-/// Called by [`Worker::create`] before the event loop starts. The `Arc` is
-/// kept alive by the [`Worker`] itself (and by [`crate::DataFlowDispatcher`]),
-/// so the raw pointer cached here is valid for the lifetime of the worker
-/// thread.
-fn set_worker_waker(waker: &Arc<WorkerWaker>) {
+/// Called by [`Worker::create`] before the event loop starts (and by
+/// [`install_test_worker_waker`] from test setup). The `Arc` is kept alive
+/// by the [`Worker`] itself / by [`crate::DataFlowDispatcher`] / by the
+/// (leaked) test waker, so the raw pointer cached here is valid for the
+/// lifetime of the thread.
+pub fn init_worker_waker(waker: &Arc<WorkerWaker>) {
     WORKER_WAKER.set(Arc::as_ptr(waker));
 }
 
 /// Return the shared [`WorkerWaker`] for code running on a worker thread.
 ///
-/// Panics if called from a thread that has not had a waker installed via
-/// [`set_worker_waker`] — non-worker callers should reach the same waker
-/// through their owned `Arc`, e.g. [`crate::DataFlowDispatcher::waker`],
-/// rather than going through this function.
+/// Expected to always be set on threads that drive dataflow work; mirrors
+/// [`crate::memory::memory_ctx`] in that the caller is trusted to have
+/// installed one via [`init_worker_waker`] (workers do this in
+/// [`Worker::create`]; tests do it via [`install_test_worker_waker`]).
 pub fn worker_waker() -> &'static WorkerWaker {
-    let ptr = WORKER_WAKER.get();
-    assert!(
-        !ptr.is_null(),
-        "worker_waker() called from a non-worker thread; use \
-         DataFlowDispatcher::waker() instead"
-    );
-    unsafe { &*ptr }
+    unsafe { &*WORKER_WAKER.get() }
+}
+
+/// Install a leaked [`WorkerWaker`] on the current test thread.
+///
+/// Operator code unconditionally calls `worker_waker().notify()` on send
+/// paths; tests that drive operators directly (without spinning up a real
+/// [`crate::Dispatch`]) need a waker installed first or the TLS pointer is
+/// null. The waker is leaked because the pointer is cached in TLS for the
+/// lifetime of the test thread — the binary tears down right after.
+#[cfg(test)]
+pub(crate) fn install_test_worker_waker() {
+    let waker = Arc::new(WorkerWaker::new());
+    init_worker_waker(&waker);
+    std::mem::forget(waker);
 }
 
 #[derive(Debug, Error)]
@@ -196,7 +205,7 @@ pub struct Worker {
     /// do background tasks, just as cleaning
     did_work_last_iteration: bool,
     /// Shared park/notify object. Keeping an owned `Arc` here means the
-    /// [`set_worker_waker`] raw pointer stays valid for the lifetime of the
+    /// [`init_worker_waker`] raw pointer stays valid for the lifetime of the
     /// worker thread.
     waker: Arc<WorkerWaker>,
     /// Wake-count snapshot used to decide whether the next park can sleep.
@@ -215,6 +224,7 @@ impl Worker {
     /// iteration and returns from `run` once it flips to `true`; panics
     /// inside the event loop propagate normally and surface through the
     /// returned [`JoinHandle`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         idx: usize,
         num_workers: usize,
@@ -228,8 +238,9 @@ impl Worker {
         thread::spawn(move || {
             WORKER_IDX.set(idx);
             NUM_WORKERS.set(num_workers);
-            set_worker_waker(&waker);
             let last_seen_wake_count = waker.wake_count();
+            debug!("Initializing worker waker {:?}", idx);
+            init_worker_waker(&waker);
             let mut worker = Self {
                 io: IORequester::new(),
                 id: core.id,

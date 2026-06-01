@@ -1,5 +1,5 @@
 use crate::io::{IORequest, create_aligned_read_from_start_end};
-use crate::memory::{memory_ctx, ReadBuffer};
+use crate::memory::{ReadBuffer, memory_ctx};
 use crate::operations::unary::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::operations::unary::parquet::types::projection::Projection;
 use bytes::Bytes;

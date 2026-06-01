@@ -195,8 +195,18 @@ impl Baseline {
         if !self.history.is_empty() {
             // Timestamps are RFC3339 in UTC (`+00:00`), so lexical order is
             // chronological order.
-            let oldest = self.history.iter().map(|r| r.timestamp.as_str()).min().unwrap();
-            let newest = self.history.iter().map(|r| r.timestamp.as_str()).max().unwrap();
+            let oldest = self
+                .history
+                .iter()
+                .map(|r| r.timestamp.as_str())
+                .min()
+                .unwrap();
+            let newest = self
+                .history
+                .iter()
+                .map(|r| r.timestamp.as_str())
+                .max()
+                .unwrap();
             println!();
             println!("history: {} rows, {oldest} … {newest}", self.history.len());
         }
@@ -261,9 +271,11 @@ impl<'a> Location<'a> {
 pub fn load(location_str: &str) -> Result<Option<Baseline>> {
     match Location::parse(location_str) {
         Location::Local(path) => match std::fs::read_to_string(path) {
-            Ok(s) => Ok(Some(serde_json::from_str(&s).map_err(|source| Error::Json {
-                path: path.display().to_string(),
-                source,
+            Ok(s) => Ok(Some(serde_json::from_str(&s).map_err(|source| {
+                Error::Json {
+                    path: path.display().to_string(),
+                    source,
+                }
             })?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(Error::Io {
@@ -511,7 +523,8 @@ impl Comparison {
     /// reads on monochrome terminals.
     pub fn render(&self) {
         fn opt(v: Option<f64>) -> String {
-            v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".to_string())
+            v.map(|x| format!("{x:.1}"))
+                .unwrap_or_else(|| "—".to_string())
         }
         // A Δ% value, right-aligned to the column width and tinted by sign.
         fn delta_cell(pct: f64) -> String {
@@ -572,7 +585,10 @@ impl Comparison {
                     "missing".to_string(),
                 ),
             };
-            println!("{:<8}  {cb}  {cn}  {cd}  {hb}  {hn}  {hd}  {status}", row.query);
+            println!(
+                "{:<8}  {cb}  {cn}  {cd}  {hb}  {hn}  {hd}  {status}",
+                row.query
+            );
         }
     }
 

@@ -27,9 +27,7 @@ pub enum Error {
     Postgres(#[from] tokio_postgres::Error),
     #[error("query {id} returned a non-row message we couldn't decode: {message}")]
     NonRowMessage { id: String, message: String },
-    #[error(
-        "query {id} produced incorrect output\n\nExpected:\n{expected}\n\nActual:\n{actual}\n"
-    )]
+    #[error("query {id} produced incorrect output\n\nExpected:\n{expected}\n\nActual:\n{actual}\n")]
     ResultMismatch {
         id: String,
         expected: String,
@@ -249,7 +247,10 @@ async fn run_query(
 fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result<()> {
     if update {
         write_string(&query.expected_path, actual)?;
-        println!("  wrote expected result → {}", query.expected_path.display());
+        println!(
+            "  wrote expected result → {}",
+            query.expected_path.display()
+        );
         return Ok(());
     }
     let expected = match std::fs::read_to_string(&query.expected_path) {

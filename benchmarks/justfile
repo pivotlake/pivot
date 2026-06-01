@@ -1,0 +1,2 @@
+pgo_dir := "/tmp/benchmarks-pgo"
+import '../pgo.just'

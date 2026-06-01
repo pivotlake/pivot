@@ -1,11 +1,7 @@
-use std::marker::PhantomData;
-use super::record_batch_operator::RecordBatchOperatorFactory;
-use crate::{Identifier, OperatorFactory};
+use crate::Identifier;
 use crate::data_flow::DataFlow;
 use crate::operations::Operator;
-use crate::operations::channels::MpscSender;
 use ahash::HashMap;
-use arrow_array::RecordBatch;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, mpsc};
@@ -71,7 +67,7 @@ pub struct DataFlowBuilder {
     /// A sender for errors that may occur during running
     err_tx: mpsc::Sender<crate::data_flow::Error>,
     /// The last operator in the dataflow
-    build: Box<dyn FnOnce() -> Chain + Send>
+    build: Box<dyn FnOnce() -> Chain + Send>,
 }
 
 impl DataFlowBuilder {
@@ -90,15 +86,14 @@ impl DataFlowBuilder {
     /// Build the full operator chain and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
     pub fn build(self) -> Result<DataFlow> {
-        let chain = catch_unwind(AssertUnwindSafe(|| (self.build)()))
-            .map_err(|e| {
-                let msg = e
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| e.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                Error::PanicOnBuild(msg.to_string())
-            })?;
+        let chain = catch_unwind(AssertUnwindSafe(|| (self.build)())).map_err(|e| {
+            let msg = e
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| e.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Error::PanicOnBuild(msg.to_string())
+        })?;
 
         Ok(chain.into_data_flow(self.cancelled, self.err_tx))
     }

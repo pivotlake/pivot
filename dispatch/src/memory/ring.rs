@@ -16,15 +16,11 @@
 //! Dropping a `WriteBuffer` or all `ReadBuffer`s releases the slot back (see their
 //! respective modules for details).
 
-use crate::memory::context::memory_ctx;
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::write_buffer::WriteBuffer;
 use std::fmt::{Debug, Formatter};
-use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::{io, ptr};
-use tracing::debug;
 
 /// Size of each slot in the ring (2 MB).
 pub const BUFFER_SIZE: usize = 2 * 1024 * 1024;
@@ -32,7 +28,6 @@ pub const BUFFER_SIZE: usize = 2 * 1024 * 1024;
 const BUFFER_ALIGN: usize = 4096;
 /// Bit flag set in `BufferSlot::used` when a writer holds the slot.
 const WRITING: u32 = 1 << 31;
-
 
 /// Metadata for a single 2 MB slot in the ring.
 ///
@@ -65,7 +60,12 @@ pub struct Ring {
 
 impl Debug for Ring {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Ring({} x {}MB)", self.len(), BUFFER_SIZE / (1024 * 1024))
+        write!(
+            f,
+            "Ring({} x {}MB)",
+            self.len(),
+            BUFFER_SIZE / (1024 * 1024)
+        )
     }
 }
 
@@ -179,8 +179,13 @@ impl Ring {
 impl Drop for Ring {
     fn drop(&mut self) {
         if let Some(first) = self.slots.first() {
-            debug!("Unmapping ring...");
             let size = self.slots.len() * BUFFER_SIZE;
+            // NOTE: do not use `tracing` here. `Ring` is held in an `Arc` inside the
+            // per-worker `MemoryContext` thread-local, so the last drop happens during
+            // TLS destruction — and `tracing_subscriber` also relies on TLS. If its
+            // thread-local has already been destroyed, the macro panics with
+            // "cannot access a Thread Local Storage value during or after destruction".
+            //
             // SAFETY: `first.buffer` + `size` describe the exact mmap region
             // created in `Ring::new`. `Drop` is the unique owner — readers
             // and writers can only borrow slots from a `&'static Ring`, and

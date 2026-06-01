@@ -51,7 +51,14 @@ benchmarks/clickbench/
 ```
 
 Adding a query: drop in `qNN.sql` + `qNN.tsv`. The harness picks them up via
-directory listing — no code change.
+directory listing — no code change. Give every query a *total* `ORDER BY`:
+output is compared exact-string, so any tie in row order makes the `.tsv`
+flaky. For the expected `.tsv`, prefer an independent oracle over pivot grading
+its own output — `./run-duckdb.sh --source ~/hits --query NN --write-expected`
+runs the same query through DuckDB on the same parquet and writes `qNN.tsv` in
+pivot's wire format. Then confirm pivot agrees with a plain run. (DuckDB rewrites
+a few columns — chiefly `EventDate` → a real `DATE` — so for `SELECT *`/date
+queries that path won't match; fall back to `--update-results` and eyeball.)
 
 Adding a suite: `mkdir benchmarks/<name>`, fill in `setup.sql` and the
 queries, then run with `--suite <name>`.

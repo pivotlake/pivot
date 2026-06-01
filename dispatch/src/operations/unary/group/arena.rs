@@ -1,5 +1,5 @@
 use crate::env::MAX_INLINE_STRING_VIEW;
-use crate::memory::{memory_ctx, WriteBuffer, BUFFER_SIZE};
+use crate::memory::{BUFFER_SIZE, WriteBuffer, memory_ctx};
 use crate::operations::unary::group::ArenaKey;
 use arrow_buffer::Buffer;
 use std::cell::UnsafeCell;

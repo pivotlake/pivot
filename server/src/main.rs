@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use catalog::ParquetCatalog;
 use clap::Parser;
+use dispatch::{BUFFER_SIZE, Dispatch};
 use server::{Error, Server};
 use tracing::info;
-use dispatch::{Dispatch, BUFFER_SIZE};
 
 /// Postgres-wire-compatible server in front of pivotdb's dispatch engine.
 #[derive(Parser, Debug)]
@@ -31,13 +31,12 @@ fn init_tracing() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
-
 /// Returns the total physical memory of the machine in bytes.
 pub fn get_total_memory() -> usize {
     sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
     )
-        .total_memory() as usize
+    .total_memory() as usize
 }
 
 fn main() -> Result<(), Error> {

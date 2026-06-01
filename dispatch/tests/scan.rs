@@ -15,10 +15,14 @@ use dispatch::{Projection, table_input};
 #[test]
 fn scan_all_columns() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(&dispatch, &[strings_and_ints(
-        &["a", "b", "c", "d", "e"],
-        &[1, 2, 3, 4, 5],
-    )], true);
+    let (_dir, table) = parquet_table(
+        &dispatch,
+        &[strings_and_ints(
+            &["a", "b", "c", "d", "e"],
+            &[1, 2, 3, 4, 5],
+        )],
+        true,
+    );
 
     let results = table_input(&dispatch, &table, Projection::all(2), false)
         .collect()

@@ -16,7 +16,7 @@
 //! Pushing from the home worker hits the local deque; pushing from any other
 //! worker hits the home worker's injector.
 
-use crate::worker::{NUM_WORKERS, WORKER_IDX};
+use crate::worker::WORKER_IDX;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -67,7 +67,6 @@ impl PoolFactory {
             last_stealer_idx: AtomicUsize::new(0),
         }
     }
-
 }
 
 /// A single worker's view of the free pool: a private LIFO deque, peer
@@ -110,9 +109,7 @@ impl FreePool {
 
         let start = self.last_stealer_idx.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.stealers.len() {
-            if let Steal::Success(idx) =
-                self.stealers[(start + i) % self.stealers.len()].steal()
-            {
+            if let Steal::Success(idx) = self.stealers[(start + i) % self.stealers.len()].steal() {
                 return Some(idx);
             }
         }
@@ -144,13 +141,13 @@ mod tests {
     //! that pairing is a `MemoryContext` concept, not a `FreePool` one.
 
     use super::*;
+    use crate::worker::NUM_WORKERS;
 
     /// Build `count` `FreePool`s wired to a shared injector array and stealer
     /// list, without the registration barrier (so a test thread can hold every
     /// pool at once). Returns the pools in worker-index order.
     fn build_pools(count: usize) -> Vec<FreePool> {
-        let injectors: Arc<Vec<_>> =
-            Arc::new((0..count).map(|_| Injector::new()).collect());
+        let injectors: Arc<Vec<_>> = Arc::new((0..count).map(|_| Injector::new()).collect());
         let workers: Vec<Worker<usize>> = (0..count).map(|_| Worker::new_lifo()).collect();
         let stealers: Vec<_> = workers.iter().map(|w| w.stealer()).collect();
         workers

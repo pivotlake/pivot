@@ -46,16 +46,15 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 use arrow_array::{BooleanArray, RecordBatch};
 use crossbeam_deque::Worker;
 
 use crate::api::Chain;
-use crate::api::builder::DataFlowBuilder;
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
 use crate::operations::channels::{
-    ChannelFactory, MpscSender, Sender, StealableChannelFactory, mpsc_channel, stealable,
+    ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::parquet::types::projection::Projection;
 use crate::operations::parquet::{
@@ -63,11 +62,10 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    CountFactory, FilterFactory, GroupFactory, KeyExtractor, LocalCollectFactory, MapFactory,
-    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
-    RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    CopyOutFactory, CountFactory, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
+    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, RootUnaryOperatorFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
-use crate::operations::unary;
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
@@ -235,6 +233,19 @@ pub struct RecordBatchOperatorSpec {
     factories: VecDeque<Box<dyn RecordBatchOperatorFactory>>,
 }
 
+/// Return type of [`RecordBatchOperatorSpec::map`]: a generic
+/// [`OperatorSpec<T, _>`] wrapping the RB→T map stage.
+type MapOperatorSpec<T, F> = OperatorSpec<
+    T,
+    UnaryOperatorFactory<
+        RecordBatch,
+        T,
+        MapFactory<F>,
+        StealableChannelFactory<RecordBatch>,
+        RecordBatchFactoryBridge,
+    >,
+>;
+
 impl RecordBatchOperatorSpec {
     /// Convert a generic [`OperatorSpec`] into a type-erased `RecordBatchOperatorSpec`.
     ///
@@ -302,11 +313,11 @@ impl RecordBatchOperatorSpec {
             factories,
         }
     }
-    
+
     fn worker_count(&self) -> usize {
         self.factories.len()
     }
-    
+
     /// Filter rows from each batch using a boolean mask.
     ///
     /// Takes an **outer builder closure** (`FB`) that is called once per worker thread
@@ -381,19 +392,7 @@ impl RecordBatchOperatorSpec {
     /// })
     /// # ;
     /// ```
-    pub fn map<T, F, FB>(
-        self,
-        builder: FB,
-    ) -> OperatorSpec<
-        T,
-        UnaryOperatorFactory<
-            RecordBatch,
-            T,
-            MapFactory<F>,
-            StealableChannelFactory<RecordBatch>,
-            RecordBatchFactoryBridge,
-        >,
-    >
+    pub fn map<T, F, FB>(self, builder: FB) -> MapOperatorSpec<T, F>
     where
         T: Send + 'static,
         F: FnMut(RecordBatch) -> T + Send + 'static,
@@ -508,10 +507,9 @@ impl RecordBatchOperatorSpec {
         self.unary(GroupFactory::<K>::create_for_workers(
             group_column,
             worker_count,
-            buffers
+            buffers,
         ))
     }
-
 
     /// Materialize additional columns from the underlying parquet table.
     ///
@@ -609,7 +607,7 @@ impl RecordBatchOperatorSpec {
     /// `WriteBuffer`s and are only safe to handle on a thread with a matching
     /// `MemoryContext`. For the usual case prefer
     /// [`collect`](Self::collect), which inserts a
-    /// [`LocalCollect`](crate::operations::LocalCollectFactory) cap so every
+    /// [`CopyOut`](crate::operations::CopyOutFactory) cap so every
     /// batch leaves the worker as plain heap-backed buffers.
     pub fn execute(self) -> DataFlowHandle<RecordBatch> {
         let factories: Vec<_> = self
@@ -622,14 +620,15 @@ impl RecordBatchOperatorSpec {
 
     /// Run the dataflow and collect every batch into a `Vec`.
     ///
-    /// Appends a [`LocalCollect`](crate::operations::LocalCollectFactory)
+    /// Appends a [`CopyOut`](crate::operations::CopyOutFactory)
     /// stage before executing, so the batches you receive are plain
     /// heap-backed (safe to hold on any thread, regardless of
-    /// `MemoryContext`). Ring slots return to the worker's pool the moment
-    /// `LocalCollect`'s on-worker copy drops.
+    /// `MemoryContext`).
     pub fn collect(self) -> crate::data_flow::Result<Vec<RecordBatch>> {
         let count = self.worker_count();
-        self.unary((0..count).into_iter().map(|_| LocalCollectFactory)).execute().collect()
+        self.unary((0..count).map(|_| CopyOutFactory))
+            .execute()
+            .collect()
     }
 }
 

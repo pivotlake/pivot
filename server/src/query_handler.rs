@@ -159,14 +159,19 @@ impl PivotQueryHandler {
             .map_err(Error::WorkerPanic)??;
         guard.defuse();
 
-        let fields = batches.first().map_or(Arc::new(vec![]), |b| b.fields.clone());
-        Ok(Response::Query(QueryResponse::new(fields, stream::iter(batches.into_iter().map(|b| b.rows).flatten().map(Ok)))))
+        let fields = batches
+            .first()
+            .map_or(Arc::new(vec![]), |b| b.fields.clone());
+        Ok(Response::Query(QueryResponse::new(
+            fields,
+            stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
+        )))
     }
 }
 
 #[async_trait]
 impl SimpleQueryHandler for PivotQueryHandler {
-    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -200,7 +205,12 @@ impl NoopStartupHandler for PivotStartupHandler {
 /// Bundle handed to `pgwire::tokio::process_socket` for each connection. Holds
 /// the query handler instance reused across the process.
 ///
-/// The default cancel handler is used as it
+/// The default cancel handler is enough: pgwire routes each `CancelRequest`
+/// packet through the shared `ConnectionManager` (populated by
+/// [`PivotStartupHandler`]) to the in-flight query's `do_query` future, which
+/// is then dropped. The `CancelOnDrop` guard inside [`PivotQueryHandler::run_query`]
+/// fires the dataflow's cancel token from that drop, so we never need to
+/// reach into the dispatch layer from a cancel handler.
 pub struct PivotHandlers {
     query_handler: Arc<PivotQueryHandler>,
     startup_handler: Arc<PivotStartupHandler>,
