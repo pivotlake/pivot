@@ -11,6 +11,7 @@
 #   ./run-duckdb.sh --source ~/hits                       # all queries, 1 run
 #   ./run-duckdb.sh --source ~/hits --query 7,20          # just q07 and q20
 #   ./run-duckdb.sh --source ~/hits --iterations 3        # 3 timed runs each
+#   ./run-duckdb.sh --source ~/hits --iterations 3 --sleep 500   # 500ms between runs
 #   ./run-duckdb.sh --source ~/hits --no-drop-caches      # skip the cache drop
 #   ./run-duckdb.sh --source ~/hits --query 7 --write-expected   # write q07.tsv
 #
@@ -39,9 +40,10 @@ queries=""
 iterations=1
 drop_caches=1
 write_expected=0
+sleep_ms=0
 
 usage() {
-    sed -n '3,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
         --source)     source_path="$2"; shift 2 ;;
         --query)      queries="$2"; shift 2 ;;
         --iterations) iterations="$2"; shift 2 ;;
+        --sleep)      sleep_ms="$2"; shift 2 ;;
         --no-drop-caches) drop_caches=0; shift ;;
         --write-expected) write_expected=1; shift ;;
         -h|--help)    usage 0 ;;
@@ -152,6 +155,10 @@ for f in "${query_files[@]}"; do
         printf '%s\n.output /dev/null\n.timer on\n%s\n' "$setup" "$sql" \
             | duckdb 2>&1 \
             | grep -E 'Run Time|Error' || true
+        # Optionally pause between iterations (sleep takes fractional seconds).
+        if [[ "$sleep_ms" -gt 0 && "$i" -lt "$iterations" ]]; then
+            sleep "$(awk -v m="$sleep_ms" 'BEGIN { printf "%.3f", m / 1000 }')"
+        fi
     done
     echo
 done

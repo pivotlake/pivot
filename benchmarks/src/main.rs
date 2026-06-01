@@ -72,7 +72,7 @@ struct Cli {
     #[arg(long, default_value_t = 1, env = "QUERY_TEST_COUNT")]
     iterations: u32,
 
-    /// Seconds to sleep between iterations. Useful when chasing thermal /
+    /// Milliseconds to sleep between iterations. Useful when chasing thermal /
     /// allocator effects on long suites.
     #[arg(long, env = "SLEEP")]
     sleep: Option<u64>,
@@ -99,6 +99,13 @@ struct Cli {
     /// instead of comparing against them.
     #[arg(long)]
     update_results: bool,
+
+    /// Skip verifying each query's output against its expected `.tsv`. Timings
+    /// are still recorded; only the correctness check is suppressed. Useful
+    /// when running against a dataset whose results don't match the committed
+    /// expectations.
+    #[arg(long, conflicts_with = "update_results")]
+    skip_check: bool,
 
     /// Print the recorded results (current cold/hot per suite & query, plus
     /// per-query run count and last-saved timestamp) from the baseline and
@@ -177,8 +184,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Zero iterations would leave a query with no cold sample; clamp so a
         // stray `--iterations 0` (or `QUERY_TEST_COUNT=0`) still does one run.
         iterations: cli.iterations.max(1),
-        sleep_secs: cli.sleep,
+        sleep_ms: cli.sleep,
         update_results: cli.update_results,
+        skip_check: cli.skip_check,
         query_filter,
     };
 

@@ -160,9 +160,12 @@ impl Planner {
     /// translated into a [`PlanNode`].
     pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
         let duckdb_plan = self.planner_context.plan(query)?;
+        let mut root = PlanNode::try_from(duckdb_plan)?;
+        // Fold DuckDB's `sum/count` AVG lowering back into a single Avg op.
+        root.collapse_avg();
         Ok(Plan {
             catalog: self.catalog.clone(),
-            root: PlanNode::try_from(duckdb_plan)?,
+            root,
         })
     }
 }

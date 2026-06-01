@@ -14,8 +14,8 @@ cd benchmarks
 # run the full clickbench suite
 cargo run --release -- --source ~/hits
 
-# run just q07 and q20, three iterations each, sleeping a second between
-cargo run --release -- --source ~/hits --query 7,20 --iterations 3 --sleep 1
+# run just q07 and q20, three iterations each, sleeping 500ms between
+cargo run --release -- --source ~/hits --query 7,20 --iterations 3 --sleep 500
 
 # regenerate expected output (use after a deliberate semantic change, or
 # when running against a smaller/different dataset)
@@ -130,12 +130,13 @@ isn't a terminal or `NO_COLOR` is set.
 | `--workers <N>` | `WORKER_COUNT` | core count | dispatch worker threads |
 | `--query <IDS>` | `QUERY` | all | comma-separated; `7,20` and `q07,q20` both accepted |
 | `--iterations <N>` | `QUERY_TEST_COUNT` | 1 | per-query iterations |
-| `--sleep <SECS>` | `SLEEP` | 0 | sleep between iterations |
+| `--sleep <MS>` | `SLEEP` | 0 | milliseconds to sleep between iterations |
 | `--baseline <REF>` | — | `<suite_dir>/baseline.json` | local path / `gs://` / `https://` |
 | `--save-if-better` | — | off | save baseline if either cold or hot suite total improved by more than `--regression-pct` |
 | `--force-save` | — | off | save baseline unconditionally |
 | `--regression-pct <PCT>` | — | 5 | threshold for the REGRESSION tag |
 | `--update-results` | — | off | overwrite expected `.tsv` files instead of comparing |
+| `--skip-check` | — | off | skip the output-vs-expected comparison (still records timings) |
 | `--show` | — | off | print the baseline's recorded results and exit; no server, no run |
 
 ## Notes

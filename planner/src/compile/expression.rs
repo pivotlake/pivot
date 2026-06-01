@@ -4,11 +4,12 @@
 //! [`ExprFn`] — a builder closure the filter/project operators
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
-use crate::expression::{Compare, CompareType, Contains, Expression, Function, Ref};
+use crate::expression::{Compare, CompareType, Contains, Divide, Expression, Function, Ref};
 use crate::types::Type;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Datum, RecordBatch};
 use arrow_ord::cmp::{eq, neq};
+use arrow_schema::DataType;
 use dispatch::Contains as DispatchContains;
 use std::sync::Arc;
 
@@ -83,10 +84,32 @@ impl Contains {
     }
 }
 
+impl Divide {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        let left_builder = self.left.compile()?;
+        let right_builder = self.right.compile()?;
+        Ok(Box::new(move || {
+            let mut left_expr = left_builder();
+            let mut right_expr = right_builder();
+            Box::new(move |batch: &RecordBatch| {
+                // Float division: cast both operands to Float64 so integer
+                // inputs (e.g. sum/count for AVG) divide to a real quotient.
+                let left = left_expr(batch);
+                let right = right_expr(batch);
+                let lf = arrow::compute::cast(left.as_datum().get().0, &DataType::Float64).unwrap();
+                let rf =
+                    arrow::compute::cast(right.as_datum().get().0, &DataType::Float64).unwrap();
+                ExprResult::Array(arrow::compute::kernels::numeric::div(&lf, &rf).unwrap())
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Function {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
             Function::Contains(c) => c.compile(),
+            Function::Divide(d) => d.compile(),
         }
     }
 }
