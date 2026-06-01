@@ -82,8 +82,8 @@ pub use operations::parquet::types::metadata::{
 pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::{Error as ParquetTableError, ParquetTable};
 pub use operations::{
-    IntKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator, OrderBy,
-    Result as OperatorResult, StringKeyExtractor,
+    AggKind, AggSpec, IntKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator,
+    OrderBy, Result as OperatorResult, StringKeyExtractor,
 };
 
 #[unsafe(export_name = "_rjem_malloc_conf")]

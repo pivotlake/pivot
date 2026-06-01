@@ -34,6 +34,16 @@ pub enum Type {
     Int16,
     Int32,
     Int64,
+    /// DuckDB `HUGEINT` — the result type of `SUM` over integers. Pivot's
+    /// executor emits `SUM` as `Int64`, so this only needs to round-trip
+    /// through plan translation (e.g. a projection referencing the SUM output).
+    Int128,
+    /// DuckDB `DOUBLE` — the result type of `AVG`.
+    Float64,
+    /// DuckDB `DECIMAL` — the result type of integer division (`AVG` lowers to
+    /// `sum / count`, whose `/` yields DECIMAL). Pivot computes it as `Float64`,
+    /// so this only needs to round-trip through plan translation.
+    Decimal,
     Utf8,
 }
 
@@ -45,6 +55,9 @@ impl fmt::Display for Type {
             Type::Int16 => "Int16",
             Type::Int32 => "Int32",
             Type::Int64 => "Int64",
+            Type::Int128 => "Int128",
+            Type::Float64 => "Float64",
+            Type::Decimal => "Decimal",
             Type::Utf8 => "Utf8",
         };
         f.write_str(name)
@@ -96,6 +109,9 @@ type_conversions! {
     (Type::Int16,     LogicalTypeId::SMALLINT),
     (Type::Int32,     LogicalTypeId::INTEGER),
     (Type::Int64,     LogicalTypeId::BIGINT),
+    (Type::Int128,    LogicalTypeId::HUGEINT),
+    (Type::Float64,   LogicalTypeId::DOUBLE),
+    (Type::Decimal,   LogicalTypeId::DECIMAL),
     (Type::Utf8,      LogicalTypeId::VARCHAR),
 }
 
@@ -130,6 +146,11 @@ pub fn build_scalar_value(
                 .into_inner(),
         ),
         Type::Utf8 => Arc::new(StringViewArray::new_scalar(raw_value).into_inner()),
+        // SUM/AVG result types; never appear as query constants, so we don't
+        // need to materialise them as scalar literals.
+        Type::Int128 | Type::Float64 | Type::Decimal => {
+            return Err(Error::UnsupportedScalarType(pivot_type));
+        }
     };
 
     Ok(Scalar::new(array))
