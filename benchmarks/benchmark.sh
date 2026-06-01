@@ -27,7 +27,9 @@
 #   ./benchmark.sh --source ~/hits                     # all queries, one session
 #   ./benchmark.sh --hits ~/hits --query 7,20          # subset; --hits == --source
 #   ./benchmark.sh --source ~/hits --iterations 5      # 1 cold + 4 hot runs
+#   ./benchmark.sh --source ~/hits --sleep 500         # 500ms between iterations
 #   ./benchmark.sh --source ~/hits --restart-server    # isolate each query
+#   ./benchmark.sh --source ~/hits --skip-check        # don't verify pivot output
 #   ./benchmark.sh --source ~/hits --no-drop-caches    # skip the cache drop
 #
 # --source/--hits accepts a directory (globbed for *.parquet), a single
@@ -43,9 +45,11 @@ queries=""
 iterations=3
 drop_caches=1
 restart_server=0
+sleep_ms=0
+skip_check=0
 
 usage() {
-    sed -n '3,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -54,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --source|--hits)  source_path="$2"; shift 2 ;;
         --query)          queries="$2"; shift 2 ;;
         --iterations)     iterations="$2"; shift 2 ;;
+        --sleep)          sleep_ms="$2"; shift 2 ;;
+        --skip-check)     skip_check=1; shift ;;
         --restart-server) restart_server=1; shift ;;
         --no-drop-caches) drop_caches=0; shift ;;
         -h|--help)        usage 0 ;;
@@ -65,6 +71,10 @@ if [[ -z "$source_path" ]]; then
     echo "error: --source/--hits is required" >&2
     usage 1
 fi
+
+# pivot-bench flag: skip its output-vs-expected check (DuckDB doesn't verify).
+skip_flag=""
+[[ $skip_check -eq 1 ]] && skip_flag="--skip-check"
 
 # Build the list of query IDs to run (stems like "q07"), accepting "7", "q07",
 # or nothing (= every qNN.sql in the suite).
@@ -98,7 +108,8 @@ flush_page_cache() {
 pivot_invoke() {
     local IFS=,
     ( cd "$here" && just pgo-use run --release -- \
-        --source "$source_path" --query "$*" --iterations "$iterations" ) 2>&1
+        --source "$source_path" --query "$*" --iterations "$iterations" \
+        --sleep "$sleep_ms" $skip_flag ) 2>&1
 }
 
 # Run DuckDB for one or more queries (comma-joined), raw output on stdout.
@@ -107,12 +118,14 @@ pivot_invoke() {
 duck_invoke() {
     local IFS=,
     "$here/run-duckdb.sh" --source "$source_path" --query "$*" \
-        --iterations "$iterations" --no-drop-caches 2>&1
+        --iterations "$iterations" --sleep "$sleep_ms" --no-drop-caches 2>&1
 }
 
-# Parse pivot output (any number of queries) into "id cold hot" lines. Cold is
-# iteration 1; hot is the mean of the rest ("-" if there is no rest). The
-# "=== Query qNN ===" headers are skipped — only "[i/N] ..." lines count.
+# Parse pivot output (any number of queries) into "id cold hot it1 it2 …"
+# lines: cold is iteration 1, hot is the mean of the rest ("-" if there is no
+# rest), then every per-iteration ms value. The "=== Query qNN ===" headers are
+# skipped — only "[i/N] ..." lines count. (The table reads just cold/hot; the
+# trailing iterations are for the per-query recap.)
 parse_pivot() {
     awk '
     $1 ~ /^\[/ && $2 == "Query" {
@@ -122,17 +135,18 @@ parse_pivot() {
         if (!(id in seen)) { seen[id] = 1; order[++n] = id }
         if (itn + 0 == 1) cold[id] = t
         else { sum[id] += t; cnt[id]++ }
+        iters[id] = (id in iters ? iters[id] " " : "") sprintf("%.1f", t)
     }
     END {
         for (i = 1; i <= n; i++) {
             k = order[i]
             h = (cnt[k] > 0) ? sprintf("%.1f", sum[k] / cnt[k]) : "-"
-            printf "%s %.1f %s\n", k, cold[k], h
+            printf "%s %.1f %s %s\n", k, cold[k], h, iters[k]
         }
     }'
 }
 
-# Parse run-duckdb.sh output into "id cold hot" lines (seconds → ms).
+# Parse run-duckdb.sh output into "id cold hot it1 it2 …" lines (seconds → ms).
 parse_duck() {
     awk '
     /^=== / { id = $2; if (!(id in seen)) { seen[id] = 1; order[++n] = id } idx = 0; next }
@@ -140,13 +154,14 @@ parse_duck() {
         v = $5 * 1000; idx++
         if (idx == 1) cold[id] = v
         else { sum[id] += v; cnt[id]++ }
+        iters[id] = (id in iters ? iters[id] " " : "") sprintf("%.1f", v)
     }
     END {
         for (i = 1; i <= n; i++) {
             k = order[i]
             if (!(k in cold)) { printf "%s ERR ERR\n", k; continue }
             h = (cnt[k] > 0) ? sprintf("%.1f", sum[k] / cnt[k]) : "-"
-            printf "%s %.1f %s\n", k, cold[k], h
+            printf "%s %.1f %s %s\n", k, cold[k], h, iters[k]
         }
     }'
 }
@@ -190,33 +205,69 @@ spin() {
     wait "$pid" 2>/dev/null || true
 }
 
-tick=$([[ $color -eq 1 ]] && printf '\033[32m✓\033[0m' || printf 'done')
+tick=$([[ $color -eq 1 ]]  && printf '\033[32m✓\033[0m' || printf 'done')
+cross=$([[ $color -eq 1 ]] && printf '\033[31m✗\033[0m' || printf 'FAIL')
 
-# Echo the parsed "id cold hot" lines on stdin as tidy result rows.
+# Echo the parsed "id cold hot it1 it2 …" lines on stdin as tidy result rows,
+# listing every iteration (the first is the cold run, the rest are hot).
 print_results() {
-    while read -r id c h; do
-        printf '  %s %-4s  %s/%s ms (cold/hot)\n' "$tick" "$id" "$c" "$h"
+    local id c h iters
+    while read -r id c h iters; do
+        if [[ "$c" == "ERR" || -z "$iters" ]]; then
+            printf '  %s %-4s  %s\n' "$tick" "$id" "(no result)"
+        else
+            printf '  %s %-4s  %s ms\n' "$tick" "$id" "${iters// /, }"
+        fi
     done
+}
+
+# True if the parsed chunk in $1 has a real (non-ERR) row for every id in $2….
+chunk_ok() {
+    local cf="$1"; shift
+    local id
+    for id in "$@"; do
+        awk -v q="$id" '$1 == q && $2 != "ERR" { ok = 1 } END { exit ok ? 0 : 1 }' \
+            "$cf" || return 1
+    done
+    return 0
+}
+
+# A run produced no usable timings — surface the captured output (build errors,
+# panics, planner errors, …) indented, so the failure is actually visible.
+show_error() {
+    local label="$1" what="$2"
+    printf '  %s %s %s failed — captured output:\n' "$cross" "$label" "$what"
+    if [[ -s "$spin_out" ]]; then
+        sed 's/^/      /' "$spin_out"
+    else
+        printf '      (no output captured)\n'
+    fi
 }
 
 # Collect one engine's timings. $1 = label, $2 = invoke fn, $3 = parse fn,
 # $4 = out tsv. Honours --restart-server: per-query (cache drop each) vs one
-# session (single upfront drop).
+# session (single upfront drop). When a run yields no usable timings, the
+# captured output is printed so the underlying error is visible.
 collect() {
     local label="$1" invoke="$2" parse="$3" out="$4"
     echo "▸ $label"
     : > "$out"
+    local chunk; chunk="$(mktemp)"
     if [[ $restart_server -eq 1 ]]; then
         for id in "${ids[@]}"; do
             flush_page_cache
             spin "$label" "$invoke" "$id"
-            "$parse" < "$spin_out" >> "$out"
+            "$parse" < "$spin_out" > "$chunk"
+            cat "$chunk" >> "$out"
+            chunk_ok "$chunk" "$id" || show_error "$label" "$id"
         done
     else
         flush_page_cache
         spin "$label" "$invoke" "${ids[@]}"
         "$parse" < "$spin_out" > "$out"
+        chunk_ok "$out" "${ids[@]}" || show_error "$label" "one or more queries"
     fi
+    rm -f "$chunk"
     print_results < "$out"
 }
 
