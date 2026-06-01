@@ -28,6 +28,8 @@ pub enum AggKind {
     Sum,
     Count,
     Avg,
+    /// `COUNT(*)` — counts every row regardless of value (column is ignored).
+    CountStar,
 }
 
 /// One requested aggregate: a kind plus the input column it reads.
@@ -101,26 +103,30 @@ pub struct Aggregate {
 }
 
 /// Sum the non-null values of an integer primitive column as `i128`, returning
-/// `(sum, non_null_count)`. The per-batch fold over the native slice is `i64`
-/// (safe for any realistic batch) and widened once per batch.
+/// `(sum, non_null_count)`.
+///
+/// `$acc` is the per-batch accumulator type. For 16/32-bit columns an `i64`
+/// batch fold is safe (a single batch can't overflow it) and fast. For 64-bit
+/// columns the values themselves can approach `i64::MAX` (e.g. `UserID`), so a
+/// batch sum must accumulate in `i128` or it overflows within one batch.
 fn sum_column(arr: &dyn Array) -> (i128, u64) {
     macro_rules! sum_primitive {
-        ($ty:ty) => {{
+        ($ty:ty, $acc:ty) => {{
             let a = arr.as_primitive::<$ty>();
             let non_null = (a.len() - a.null_count()) as u64;
-            let batch_sum: i64 = if a.null_count() == 0 {
-                a.values().iter().map(|&v| v as i64).sum()
+            let batch_sum: $acc = if a.null_count() == 0 {
+                a.values().iter().map(|&v| v as $acc).sum()
             } else {
-                a.iter().flatten().map(|v| v as i64).sum()
+                a.iter().flatten().map(|v| v as $acc).sum()
             };
             (batch_sum as i128, non_null)
         }};
     }
 
     match arr.data_type() {
-        DataType::Int16 => sum_primitive!(Int16Type),
-        DataType::Int32 => sum_primitive!(Int32Type),
-        DataType::Int64 => sum_primitive!(Int64Type),
+        DataType::Int16 => sum_primitive!(Int16Type, i64),
+        DataType::Int32 => sum_primitive!(Int32Type, i64),
+        DataType::Int64 => sum_primitive!(Int64Type, i128),
         other => panic!("aggregate: unsupported column type {other:?}"),
     }
 }
@@ -132,7 +138,7 @@ fn result_column(kind: AggKind, acc: Acc) -> (Field, ArrayRef) {
             Field::new("sum", DataType::Int64, false),
             Arc::new(Int64Array::from(vec![acc.sum as i64])),
         ),
-        AggKind::Count => (
+        AggKind::Count | AggKind::CountStar => (
             Field::new("count", DataType::Int64, false),
             Arc::new(Int64Array::from(vec![acc.count as i64])),
         ),
@@ -157,9 +163,15 @@ impl Unary<RecordBatch, RecordBatch> for Aggregate {
         _output: &mut OP,
     ) -> unary::Result<()> {
         for (i, spec) in self.specs.iter().enumerate() {
-            let (sum, count) = sum_column(batch.column(spec.column));
-            self.local[i].sum += sum;
-            self.local[i].count += count;
+            match spec.kind {
+                // COUNT(*) counts every row and never reads a column.
+                AggKind::CountStar => self.local[i].count += batch.num_rows() as u64,
+                _ => {
+                    let (sum, count) = sum_column(batch.column(spec.column));
+                    self.local[i].sum += sum;
+                    self.local[i].count += count;
+                }
+            }
         }
         Ok(())
     }
@@ -272,6 +284,32 @@ mod tests {
         ops[2].finish(&mut sender).unwrap();
         assert_eq!(sender.items.len(), 1);
         assert_eq!(col_i64(&sender.items[0], 0), 36);
+    }
+
+    #[test]
+    fn large_i64_sum_does_not_overflow() {
+        // A batch of large BIGINTs (e.g. UserID) overflows an i64 accumulator
+        // within a single batch; the i128 fold must keep it exact.
+        let schema = Arc::new(Schema::new(vec![Field::new("u", DataType::Int64, false)]));
+        let vals = vec![i64::MAX, i64::MAX, i64::MAX];
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vals.clone()))],
+        )
+        .unwrap();
+        // Avg of three i64::MAX values is i64::MAX exactly.
+        let op = build(1, vec![AggSpec::new(AggKind::Avg, 0)]).pop().unwrap();
+        let results = run_unary_to_completion(op, vec![batch]);
+        assert_eq!(col_f64(&results[0], 0), i64::MAX as f64);
+    }
+
+    #[test]
+    fn count_star_counts_all_rows() {
+        let op = build(1, vec![AggSpec::new(AggKind::CountStar, 0)])
+            .pop()
+            .unwrap();
+        let results = run_unary_to_completion(op, vec![make_batch(&[5, 6, 7]), make_batch(&[8])]);
+        assert_eq!(col_i64(&results[0], 0), 4);
     }
 
     #[test]

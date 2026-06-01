@@ -109,6 +109,10 @@ impl Aggregate {
                     Expression::AggregateFunc(AggregateFunc::Avg(a)) => {
                         Ok(AggSpec::new(AggKind::Avg, a.column.column_idx))
                     }
+                    // COUNT(*) ignores its column; the index is a placeholder.
+                    Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {
+                        Ok(AggSpec::new(AggKind::CountStar, 0))
+                    }
                     expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
                 })
                 .collect::<Result<Vec<_>, _>>()?;

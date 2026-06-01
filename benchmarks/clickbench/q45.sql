@@ -1,1 +1,0 @@
-SELECT SUM(RegionID) FROM hits;

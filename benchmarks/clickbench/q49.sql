@@ -1,1 +1,0 @@
-SELECT AVG(ResolutionHeight) FROM hits;
