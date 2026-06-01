@@ -1,0 +1,1 @@
+SELECT SUM(ResolutionHeight) FROM hits;

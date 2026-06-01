@@ -1,0 +1,1 @@
+SELECT AVG(RegionID) FROM hits;

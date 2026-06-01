@@ -190,6 +190,13 @@ json build_expression(duckdb::Expression *expr) {
 		new_expression["data"] = build_function_expression(&expr->Cast<duckdb::BoundFunctionExpression>());
 		break;
 	}
+	case duckdb::ExpressionType::OPERATOR_CAST: {
+		// Unwrap casts: pivot's executor aggregates the underlying column
+		// directly (e.g. AVG casts its integer input to DOUBLE in DuckDB,
+		// but pivot sums the raw integer values). Serialize the cast's child
+		// in place of the cast itself.
+		return build_expression(expr->Cast<duckdb::BoundCastExpression>().child.get());
+	}
 	default:
 		throw UnsupportedPlanError("Unsupported expression: " + expr->ToString() + " of type " +
 		                           std::to_string(static_cast<int>(expr->type)));

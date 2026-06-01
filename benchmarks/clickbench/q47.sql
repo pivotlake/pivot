@@ -1,0 +1,1 @@
+SELECT SUM(EventTime) FROM hits;

@@ -62,9 +62,9 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    CopyOutFactory, CountFactory, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
-    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, RootUnaryOperatorFactory,
-    UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    AggSpec, AggregateFactory, CopyOutFactory, CountFactory, FilterFactory, GroupFactory,
+    KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
+    RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -451,6 +451,14 @@ impl RecordBatchOperatorSpec {
     pub fn count(self) -> Self {
         let worker_count = self.worker_count();
         self.unary(CountFactory::create_for_workers(worker_count))
+    }
+
+    /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT`/`AVG` over
+    /// columns, computed in a single pass. Emits one single-row output column
+    /// per spec (`Int64` for SUM/COUNT, `Float64` for AVG).
+    pub fn aggregate(self, specs: Vec<AggSpec>) -> Self {
+        let worker_count = self.worker_count();
+        self.unary(AggregateFactory::create_for_workers(specs, worker_count))
     }
 
     /// Sort by the given columns and keep only the first `limit` rows.

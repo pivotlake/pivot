@@ -1,0 +1,1 @@
+SELECT SUM(AdvEngineID) FROM hits;

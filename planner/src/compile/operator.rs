@@ -5,14 +5,15 @@
 
 use crate::catalog::Catalog;
 use crate::compile::create_table::CreateTableNullaryFactory;
-use crate::compile::{Error, ExprEvalFn};
+use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::expression::Expression;
 use crate::operator::{
     Aggregate, CreateTable, Filter, Input, OrderBy, OrderByDirection, Projection, TopN,
 };
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
+use arrow_schema::{Field, Schema};
 use dispatch::{
     DataFlowDispatcher, IntKeyExtractor, OrderBy as DispatchOrderBy,
     Projection as DispatchProjection, RecordBatchOperatorSpec, StringKeyExtractor,
@@ -25,19 +26,52 @@ impl Projection {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let idxs = Arc::new(
+        // Fast path: every projection is a plain column reference, so we can
+        // select columns zero-copy and preserve the input schema's fields.
+        if let Some(idxs) = self
+            .projections
+            .iter()
+            .map(|e| match e {
+                Expression::Ref(n) => Some(n.column_idx),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        {
+            let idxs = Arc::new(idxs);
+            return Ok(input.project(move || {
+                let idxs = idxs.clone();
+                move |batch: RecordBatch| batch.project(&idxs).unwrap()
+            }));
+        }
+
+        // General path: at least one projection is a computed expression
+        // (e.g. the `sum / count` divide of an AVG). Evaluate each projection
+        // per batch and assemble a new RecordBatch, deriving the output schema
+        // from the produced arrays.
+        let builders: Arc<Vec<ExprFn>> = Arc::new(
             self.projections
                 .iter()
-                .map(|e| match e {
-                    Expression::Ref(n) => Ok(n.column_idx),
-                    _ => Err(Error::UnsupportedProjectionExpression(e.clone())),
-                })
+                .map(|e| e.compile())
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
-        Ok(input.project(|| {
-            let idxs = idxs.clone();
-            move |batch: RecordBatch| batch.project(&idxs).unwrap()
+        Ok(input.project(move || {
+            let mut evals: Vec<ExprEvalFn> = builders.iter().map(|b| b()).collect();
+            move |batch: RecordBatch| {
+                let columns: Vec<ArrayRef> = evals
+                    .iter_mut()
+                    .map(|eval| match eval(&batch) {
+                        ExprResult::Array(a) => a,
+                        ExprResult::Scalar(s) => s.into_inner(),
+                    })
+                    .collect();
+                let fields: Vec<Field> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| Field::new(format!("col{i}"), c.data_type().clone(), true))
+                    .collect();
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+            }
         }))
     }
 }
@@ -47,13 +81,48 @@ impl Aggregate {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        use crate::expression::AggregateFunc;
+        use dispatch::{AggKind, AggSpec};
+
+        // Global aggregates (no GROUP BY). A bare `COUNT(*)` keeps the
+        // dedicated row-counter; anything else (SUM/AVG/COUNT, possibly
+        // several) compiles to the multi-aggregate operator, one output
+        // column per expression.
+        if self.groups.is_empty() {
+            if matches!(
+                self.expressions.as_slice(),
+                [Expression::AggregateFunc(AggregateFunc::CountStar(_))]
+            ) {
+                return Ok(input.count());
+            }
+
+            let specs = self
+                .expressions
+                .iter()
+                .map(|e| match e {
+                    Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
+                        Ok(AggSpec::new(AggKind::Sum, a.column.column_idx))
+                    }
+                    Expression::AggregateFunc(AggregateFunc::Count(a)) => {
+                        Ok(AggSpec::new(AggKind::Count, a.column.column_idx))
+                    }
+                    Expression::AggregateFunc(AggregateFunc::Avg(a)) => {
+                        Ok(AggSpec::new(AggKind::Avg, a.column.column_idx))
+                    }
+                    expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(input.aggregate(specs));
+        }
+
         if self.expressions.len() != 1 {
             return Err(Error::UnsupportedAggregateExpressionAmount(
                 self.expressions.len(),
             ));
         }
+
         match &self.expressions[0] {
-            Expression::AggregateFunc(crate::expression::AggregateFunc::CountStar(_)) => {}
+            Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {}
             expr => return Err(Error::UnsupportedAggregateExpression(expr.clone())),
         }
 

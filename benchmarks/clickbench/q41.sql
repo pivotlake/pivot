@@ -1,0 +1,1 @@
+SELECT AVG(ResolutionWidth) FROM hits;

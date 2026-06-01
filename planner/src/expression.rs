@@ -105,9 +105,44 @@ impl TryFrom<duckdb_expression::AggregateFunc> for CountStar {
 }
 
 /// An aggregate function call (e.g. `SUM`, `COUNT`).
+/// A single-column numeric aggregate (`SUM(col)` / `AVG(col)`). Carries the
+/// bound column reference being aggregated.
+#[derive(Debug, Clone)]
+pub struct NumericAggregate {
+    pub column: Ref,
+}
+
+impl TryFrom<duckdb_expression::AggregateFunc> for NumericAggregate {
+    type Error = Error;
+    fn try_from(a: duckdb_expression::AggregateFunc) -> Result<Self, Self::Error> {
+        if a.params.len() != 1 {
+            return Err(Error::InvalidParameterCount {
+                function: a.aggregate_function,
+                expected: 1,
+                actual: a.params.len(),
+            });
+        }
+        let column = match Expression::try_from(a.params.into_iter().next().unwrap())? {
+            Expression::Ref(r) => r,
+            other => {
+                return Err(Error::UnsupportedAggregateFunction(format!(
+                    "non-column argument: {other}"
+                )));
+            }
+        };
+        Ok(NumericAggregate { column })
+    }
+}
+
+/// An aggregate function call (e.g. `SUM`, `COUNT`).
 #[derive(Debug, Clone)]
 pub enum AggregateFunc {
     CountStar(CountStar),
+    Sum(NumericAggregate),
+    Avg(NumericAggregate),
+    /// `COUNT(col)` — counts non-null values. DuckDB lowers `AVG(col)` to
+    /// `sum(col) / count(col)`, so this shows up in average plans.
+    Count(NumericAggregate),
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
@@ -115,6 +150,9 @@ impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
     fn try_from(a: duckdb_expression::AggregateFunc) -> Result<Self, Self::Error> {
         match a.aggregate_function.as_str() {
             "count_star" => Ok(AggregateFunc::CountStar(a.try_into()?)),
+            "sum" => Ok(AggregateFunc::Sum(a.try_into()?)),
+            "avg" => Ok(AggregateFunc::Avg(a.try_into()?)),
+            "count" => Ok(AggregateFunc::Count(a.try_into()?)),
             _ => Err(Error::UnsupportedAggregateFunction(a.aggregate_function)),
         }
     }
@@ -144,10 +182,35 @@ impl TryFrom<duckdb_expression::Function> for Contains {
     }
 }
 
+/// SQL `lhs / rhs`. Used by `AVG`, which DuckDB lowers to `sum(x) / count(x)`.
+#[derive(Debug, Clone)]
+pub struct Divide {
+    pub left: Box<Expression>,
+    pub right: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Function> for Divide {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        if f.params.len() != 2 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 2,
+                actual,
+            });
+        }
+        let right = Box::new(Expression::try_from(f.params.remove(1))?);
+        let left = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(Divide { left, right })
+    }
+}
+
 /// A scalar function call (e.g. `year`, `substring`).
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
+    Divide(Divide),
 }
 
 impl TryFrom<duckdb_expression::Function> for Function {
@@ -155,6 +218,7 @@ impl TryFrom<duckdb_expression::Function> for Function {
     fn try_from(f: duckdb_expression::Function) -> Result<Self, Self::Error> {
         match f.function.as_str() {
             "contains" => Ok(Function::Contains(f.try_into()?)),
+            "/" => Ok(Function::Divide(f.try_into()?)),
             _ => Err(Error::UnsupportedScalarFunction(f.function)),
         }
     }
@@ -202,9 +266,13 @@ impl Display for Expression {
             ),
             Expression::Constant(c) => f.write_str(&format_constant(c)),
             Expression::AggregateFunc(AggregateFunc::CountStar(_)) => f.write_str("count_star()"),
+            Expression::AggregateFunc(AggregateFunc::Sum(a)) => write!(f, "sum(#{})", a.column.column_idx),
+            Expression::AggregateFunc(AggregateFunc::Avg(a)) => write!(f, "avg(#{})", a.column.column_idx),
+            Expression::AggregateFunc(AggregateFunc::Count(a)) => write!(f, "count(#{})", a.column.column_idx),
             Expression::Function(Function::Contains(c)) => {
                 write!(f, "contains({}, {})", c.haystack, c.needle)
             }
+            Expression::Function(Function::Divide(d)) => write!(f, "({} / {})", d.left, d.right),
         }
     }
 }
