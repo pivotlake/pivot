@@ -232,11 +232,14 @@ impl<K: KeyExtractor> Outputter<RecordBatch> for GroupOutputter<K> {
         if let Some(rx) = self.receiver.take() {
             let tables: Vec<MultiSlabTable<K>> = rx.into_iter().flatten().collect::<Vec<_>>();
             debug!("Outputting {:?} maps", tables.len());
-            let total_entries: usize = tables.iter().map(|m| m.capacity()).sum::<usize>() / 2;
-            // Size each partition's result table with load-factor headroom (×2)
-            // so it never resizes mid-merge — a single resize of a multi-million
-            // entry partition (copying every entry) showed up as ~7% of Q32.
-            let partition_capacity = (total_entries * 2 / PARTITIONS).next_power_of_two();
+            // Estimate the merged entry count from actual occupancy (sum of
+            // lengths), not capacity — capacity over-counts by the table-stack's
+            // ~2x geometric slack. A tighter estimate keeps each partition's
+            // result table near a high load factor instead of 2.5x
+            // over-provisioned, which at ~100M groups is gigabytes less memory
+            // to allocate and zero every query.
+            let total_entries: usize = tables.iter().map(|m| m.len()).sum::<usize>();
+            let partition_capacity = (total_entries / PARTITIONS).next_power_of_two();
             info!("Partition capacity {:?}", partition_capacity);
             let tables = Arc::new(tables);
             for i in 0..PARTITIONS {
