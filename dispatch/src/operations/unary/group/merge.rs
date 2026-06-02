@@ -36,9 +36,13 @@ use super::PARTITIONS;
 ///
 /// For a linear-probing table filled from empty, the cumulative ratio of
 /// total collisions to total insertions is `α / (2(1 − α))` where `α` is
-/// the load factor. A threshold of 1.17 triggers resize at ~70% load,
-/// matching the static `MAX_LOAD_FACTOR` used elsewhere.
-const RESIZE_COLLISION_RATIO: f64 = 1.17;
+/// the load factor. A threshold of 1.5 triggers resize at ~75% load. The
+/// merged result table is built once then scanned sequentially for output, so
+/// a higher load (more probing on insert) is a good trade for less memory to
+/// allocate and zero — significant at ~100M groups. 2.0 corresponds to ~80%
+/// load, so a partition sized for ~78% occupancy doesn't resize (which would
+/// otherwise double it back to the over-provisioned size).
+const RESIZE_COLLISION_RATIO: f64 = 2.0;
 
 const PARTITION_SHIFT: u32 = 64 - PARTITIONS.trailing_zeros();
 const PARTITION_BITS: u32 = PARTITIONS.trailing_zeros();

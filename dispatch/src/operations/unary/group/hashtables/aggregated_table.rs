@@ -47,7 +47,13 @@ impl<K: KeyExtractor> AggregatedTable<K> {
     /// based on whether the byte size fits in one buffer.
     #[inline(always)]
     fn create_new_table(&mut self) {
-        let new_size = self.tables.last().unwrap().capacity() * 2;
+        // Grow by 4x rather than 2x. The frozen tables in the stack are pure
+        // slack that must be allocated and zeroed every query: their cumulative
+        // capacity is `final * r/(r-1)`, so 4x growth wastes ~1.33x the final
+        // size vs doubling's 2x. Fewer, lower-loaded tables also mean fewer
+        // sources for the merge to scan. At ~100M groups this is gigabytes less
+        // memory to zero each query.
+        let new_size = self.tables.last().unwrap().capacity() * 4;
         self.tables
             .push(BaseHashTable::multi_slab(&mut self.allocator, new_size, 0));
     }
