@@ -1,7 +1,6 @@
 use crate::Identifier;
 use crate::io::DataFlowRequest;
 use crate::io::backend::IOBackend;
-use crate::memory::{ReadBuffer, WriteBuffer, memory_ctx};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -23,7 +22,7 @@ const RING_SIZE: u32 = 32;
 /// Held one per worker
 pub struct IORequester {
     backend: IOBackend,
-    pending_io_requests: HashMap<Identifier, (WriteBuffer, DataFlowRequest)>,
+    pending_io_requests: HashMap<Identifier, DataFlowRequest>,
     next_id: Identifier,
 }
 
@@ -36,20 +35,18 @@ impl IORequester {
         }
     }
 
-    /// Acquires a dirty write buffer, submits a read to the backend, and
-    /// flushes immediately.
+    /// Submits the block's read straight into its (pinned) cache slot and
+    /// flushes immediately. No intermediate buffer: the slot region is the read
+    /// target.
     pub fn request(&mut self, request: DataFlowRequest) -> Result<()> {
-        let mut buffer = memory_ctx().get_write_buffer(false);
-
         self.backend.submit_read(
-            request.request.location.raw_fd,
-            request.request.location.offset as u64,
-            &mut buffer,
-            request.request.length,
+            request.request.fd,
+            request.request.block.file_offset as u64,
+            request.request.block.dest(),
+            request.request.block.len,
             self.next_id,
         )?;
-        self.pending_io_requests
-            .insert(self.next_id, (buffer, request));
+        self.pending_io_requests.insert(self.next_id, request);
         self.next_id += 1;
         self.backend.submit()?;
 
@@ -61,18 +58,16 @@ impl IORequester {
         !self.pending_io_requests.is_empty()
     }
 
-    /// Drains completed reads from the backend, inserts each buffer into the
-    /// file cache, and returns them paired with the originating request.
-    pub fn completions(&mut self) -> Result<impl Iterator<Item = (ReadBuffer, DataFlowRequest)>> {
+    /// Drains completed reads — each block's bytes have already landed in its
+    /// cache slot, so we just [`commit`](crate::memory::file_cache::MissingBlock::commit)
+    /// (mark its sub-blocks valid) and yield the originating request so the
+    /// issuing operator can count it down.
+    pub fn completions(&mut self) -> Result<impl Iterator<Item = DataFlowRequest>> {
         let identifiers = self.backend.completions()?;
         Ok(identifiers.into_iter().map(|(_size, i)| {
-            let (buffer, request) = self.pending_io_requests.remove(&i).unwrap();
-            let read_buffer = memory_ctx().file_cache().insert(
-                request.request.location.clone(),
-                buffer,
-                request.request.length,
-            );
-            (read_buffer, request)
+            let request = self.pending_io_requests.remove(&i).unwrap();
+            request.request.block.commit();
+            request
         }))
     }
 

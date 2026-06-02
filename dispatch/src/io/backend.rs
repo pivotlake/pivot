@@ -35,7 +35,6 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(target_os = "linux")]
 mod uring_backend {
     use super::*;
-    use crate::memory::WriteBuffer;
     use io_uring::{IoUring, opcode, types};
     use std::os::unix::io::RawFd;
 
@@ -51,16 +50,17 @@ mod uring_backend {
             })
         }
 
-        /// Pushes a read operation onto the submission queue (does not flush).
+        /// Pushes a read of `length` bytes into `dest` onto the submission queue
+        /// (does not flush). `dest` points into a pinned cache slot.
         pub fn submit_read(
             &mut self,
             fd: RawFd,
             offset: u64,
-            buffer: &mut WriteBuffer,
+            dest: *mut u8,
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
-            let read_op = opcode::Read::new(types::Fd(fd), buffer.as_mut_ptr(), length as u32)
+            let read_op = opcode::Read::new(types::Fd(fd), dest, length as u32)
                 .offset(offset)
                 .build()
                 .user_data(request_id as u64);
@@ -105,7 +105,6 @@ mod uring_backend {
 #[cfg(all(unix, not(target_os = "linux")))]
 mod pread_backend {
     use super::*;
-    use crate::memory::WriteBuffer;
     use std::collections::VecDeque;
     use std::os::fd::BorrowedFd;
     use std::os::unix::io::RawFd;
@@ -138,12 +137,13 @@ mod pread_backend {
             })
         }
 
-        /// Queues a read; the actual `pread` happens at [`submit`](Self::submit) time.
+        /// Queues a read into `dest`; the actual `pread` happens at
+        /// [`submit`](Self::submit) time.
         pub fn submit_read(
             &mut self,
             fd: RawFd,
             offset: u64,
-            buffer: &mut WriteBuffer,
+            dest: *mut u8,
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
@@ -152,7 +152,7 @@ mod pread_backend {
                 offset,
                 length,
                 request_id,
-                buffer_ptr: buffer.as_mut_ptr(),
+                buffer_ptr: dest,
             });
             Ok(())
         }

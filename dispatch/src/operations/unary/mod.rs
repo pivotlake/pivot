@@ -90,7 +90,6 @@ mod order_by_limit;
 pub use copy_out::CopyOutFactory;
 pub use order_by_limit::{OrderBy, OrderByLimitFactory};
 
-use crate::memory::ReadBuffer;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -136,7 +135,6 @@ pub trait Unary<I, O> {
     fn process_disk_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _buffer: ReadBuffer,
         _request: IORequest,
     ) -> Result<()> {
         unreachable!()
@@ -207,14 +205,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(self.unary.next_io_requests()?)
     }
 
-    fn process_disk_response(
-        &mut self,
-        buffer: ReadBuffer,
-        context: IORequest,
-    ) -> super::Result<()> {
+    fn process_disk_response(&mut self, context: IORequest) -> super::Result<()> {
         Ok(self
             .unary
-            .process_disk_response(&mut self.sender, buffer, context)?)
+            .process_disk_response(&mut self.sender, context)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {
