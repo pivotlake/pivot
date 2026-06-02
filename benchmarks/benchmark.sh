@@ -328,3 +328,41 @@ BEGIN {
         id, tm(dc), tm(pc), colored(cs, dc, pc), tm(dh), tm(ph), colored(hs, dh, ph)
 }
 ' "$data"
+
+# ClickBench-style weighted score: the geometric mean over queries of
+# (t + 10ms) / (best_for_that_query + 10ms) — ClickBench's summary metric. The
+# +10ms regularises near-zero queries; lower is better and 1.00 means fastest
+# on every scored query. With two engines the per-query baseline is the faster
+# of the two. Computed over our cold and hot numbers; a query is skipped for a
+# metric when either engine has no timing there (ERR or single-iteration "-").
+awk -v color="$color" '
+function isnum(x) { return x ~ /^[0-9]+(\.[0-9]+)?$/ }
+function gm(logsum, n) { return n ? exp(logsum / n) : 0 }
+function cell(mine, other, n,   s) {
+    if (!n) return sprintf("%8s", "-")
+    s = sprintf("%.2f", mine)
+    if (color && mine <= other) return sprintf("%s%8s%s", grn, s, rst)
+    return sprintf("%8s", s)
+}
+BEGIN { grn = color ? "\033[32m" : ""; rst = color ? "\033[0m" : "" }
+{
+    dc = $2; dh = $3; pc = $4; ph = $5
+    if (isnum(dc) && isnum(pc)) {
+        b = dc < pc ? dc : pc
+        ldc += log((dc + 10) / (b + 10)); lpc += log((pc + 10) / (b + 10)); nc++
+    }
+    if (isnum(dh) && isnum(ph)) {
+        b = dh < ph ? dh : ph
+        ldh += log((dh + 10) / (b + 10)); lph += log((ph + 10) / (b + 10)); nh++
+    }
+}
+END {
+    print ""
+    print "ClickBench score — geomean of (t+10ms)/(best+10ms) per query, lower is better"
+    print "(1.00 = fastest on every scored query):"
+    printf "  %-7s %8s %8s\n", "", "cold", "hot"
+    printf "  %-7s %s %s\n", "pivot",  cell(gm(lpc,nc), gm(ldc,nc), nc), cell(gm(lph,nh), gm(ldh,nh), nh)
+    printf "  %-7s %s %s\n", "duckdb", cell(gm(ldc,nc), gm(lpc,nc), nc), cell(gm(ldh,nh), gm(lph,nh), nh)
+    printf "  scored %d/%d queries (cold/hot)\n", nc, nh
+}
+' "$data"

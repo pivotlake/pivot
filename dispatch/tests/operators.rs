@@ -216,7 +216,7 @@ fn group_by_count_string_keys() {
         .unwrap();
 
     assert_eq!(collect_strings(&results, 0), vec!["alice", "bob", "carol"]);
-    assert_eq!(collect_u64s(&results, 1), vec![3, 2, 1]);
+    assert_eq!(collect_i64s(&results, 1), vec![3, 2, 1]);
 }
 
 #[test]
@@ -235,5 +235,5 @@ fn group_by_count_int_keys() {
         .collect()
         .unwrap();
 
-    assert_eq!(collect_u64s(&results, 1), vec![3, 3, 2]);
+    assert_eq!(collect_i64s(&results, 1), vec![3, 3, 2]);
 }

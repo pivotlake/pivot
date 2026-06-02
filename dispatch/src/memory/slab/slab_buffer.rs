@@ -31,6 +31,14 @@ impl<T> SlabBuffer<T> {
         let byte_offset = index * size_of::<T>();
         unsafe { self.slab.ptr.add(byte_offset) as *mut T }
     }
+
+    /// Consumes the buffer and returns the backing [`Slab`].
+    ///
+    /// Useful for zero-copy handoff to Arrow: wrap the returned `Slab` in `Arc`
+    /// and pass to `Buffer::from_custom_allocation`.
+    pub(crate) fn into_slab(self) -> Slab {
+        self.slab
+    }
 }
 
 impl<T> Index<usize> for SlabBuffer<T> {
