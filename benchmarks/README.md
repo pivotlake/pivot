@@ -136,6 +136,7 @@ isn't a terminal or `NO_COLOR` is set.
 | `--force-save` | — | off | save baseline unconditionally |
 | `--regression-pct <PCT>` | — | 5 | threshold for the REGRESSION tag |
 | `--update-results` | — | off | overwrite expected `.tsv` files instead of comparing |
+| `--skip-check` | — | off | skip the output-vs-expected comparison (still records timings) |
 | `--show` | — | off | print the baseline's recorded results and exit; no server, no run |
 
 ## Notes

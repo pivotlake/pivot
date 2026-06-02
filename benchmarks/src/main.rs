@@ -100,6 +100,13 @@ struct Cli {
     #[arg(long)]
     update_results: bool,
 
+    /// Skip verifying each query's output against its expected `.tsv`. Timings
+    /// are still recorded; only the correctness check is suppressed. Useful
+    /// when running against a dataset whose results don't match the committed
+    /// expectations.
+    #[arg(long, conflicts_with = "update_results")]
+    skip_check: bool,
+
     /// Print the recorded results (current cold/hot per suite & query, plus
     /// per-query run count and last-saved timestamp) from the baseline and
     /// exit — does not boot the server or run anything.
@@ -179,6 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         iterations: cli.iterations.max(1),
         sleep_ms: cli.sleep,
         update_results: cli.update_results,
+        skip_check: cli.skip_check,
         query_filter,
     };
 

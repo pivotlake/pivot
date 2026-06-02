@@ -142,6 +142,8 @@ pub struct RunOptions {
     pub iterations: u32,
     pub sleep_ms: Option<u64>,
     pub update_results: bool,
+    /// Skip the output-vs-expected comparison entirely (still records timings).
+    pub skip_check: bool,
     /// `None` → run every query in `suite.queries`.
     pub query_filter: Option<Vec<String>>,
 }
@@ -306,7 +308,9 @@ pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<Su
             continue;
         }
         let (run, last_output) = run_query(&client, query, opts).await?;
-        check_or_update_expected(query, &last_output, opts.update_results)?;
+        if !opts.skip_check {
+            check_or_update_expected(query, &last_output, opts.update_results)?;
+        }
         runs.push(run);
     }
 
