@@ -7,11 +7,10 @@
 //! [`RowGroupBuffer`] downstream for decompression/decoding.
 
 use crate::io::IORequest;
-use crate::memory::ReadBuffer;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary::parquet::types::requests::RowGroupBuffer;
-use crate::operations::unary::parquet::types::requests::{ColumnBufferContext, RowGroupRequest};
+use crate::operations::unary::parquet::types::requests::RowGroupRequest;
 
 /// Reads column chunks for one row group at a time via async disk IO.
 ///
@@ -74,12 +73,11 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
     fn process_disk_response<S: Sender<RowGroupBuffer>>(
         &mut self,
         sender: &mut S,
-        buffer: ReadBuffer,
-        request: IORequest,
+        _request: IORequest,
     ) -> crate::operations::unary::Result<()> {
-        let row_group_request = self.row_group_request.as_mut().unwrap();
-        let ctx = *request.ctx.downcast::<ColumnBufferContext>().unwrap();
-        row_group_request.enter_buffer_to_column(ctx.column_idx, ctx.buffer_idx, buffer);
+        // The requester already committed this block's bytes into the cache
+        // slot; we just count it off and emit once every block has landed.
+        self.row_group_request.as_mut().unwrap().complete_one();
         self.send_out_buffer_if_complete(sender)?;
         Ok(())
     }

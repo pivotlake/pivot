@@ -20,7 +20,6 @@
 
 use crate::Identifier;
 use crate::io::{DataFlowRequest, IORequest};
-use crate::memory::ReadBuffer;
 use crate::operations::Operator;
 use crate::worker::worker_waker;
 use ahash::HashMap;
@@ -265,12 +264,13 @@ impl DataFlow {
         })
     }
 
-    /// Deliver a completed IO buffer to the operator that requested it.
-    pub fn process_io(&mut self, node_id: Identifier, request: IORequest, buffer: ReadBuffer) {
+    /// Notify the operator that requested it that one of its reads has landed
+    /// (already committed into the cache slot by the requester).
+    pub fn process_io(&mut self, node_id: Identifier, request: IORequest) {
         self.try_run(|d| {
             d.graph.operators[node_id]
                 .operator
-                .process_disk_response(buffer, request)?;
+                .process_disk_response(request)?;
             Ok(())
         });
     }
