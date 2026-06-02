@@ -47,11 +47,12 @@ impl ColumnRequest {
         let read = create_aligned_read_from_start_end(fd, col_start as usize, col_end as usize);
         let mut buffers = Vec::with_capacity(read.locations.len());
 
-        for (j, location) in read.locations.into_iter().enumerate() {
-            match memory_ctx().file_cache().get(&location) {
+        for (j, (location, length)) in read.locations.into_iter().zip(read.lengths).enumerate() {
+            match memory_ctx().file_cache().get(&location, length) {
                 None => {
                     io_requests.push(IORequest {
                         location,
+                        length,
                         ctx: Box::new(ColumnBufferContext {
                             column_idx: column_identifier,
                             buffer_idx: j,

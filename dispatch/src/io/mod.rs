@@ -49,6 +49,12 @@ pub struct IOLocation {
 /// returned alongside the completed read buffer.
 pub struct IORequest {
     pub location: IOLocation,
+    /// Number of bytes to read into the buffer for this block. Reads are sized
+    /// to the actual column-chunk extent (rounded up to the direct-I/O
+    /// alignment) rather than always a full `BUFFER_SIZE`, so a tiny column
+    /// chunk doesn't trigger a wasteful multi-megabyte read. Always
+    /// `<= BUFFER_SIZE`.
+    pub length: usize,
     pub ctx: Box<dyn Any + Send>,
 }
 
@@ -84,18 +90,28 @@ impl DataFlowRequest {
 #[derive(Debug)]
 pub struct AlignedRead {
     pub locations: Vec<IOLocation>,
+    /// Read length for each location, parallel to `locations`. Full blocks are
+    /// `BUFFER_SIZE`; the final block only reads up to the column-chunk end
+    /// (rounded up to the direct-I/O alignment), avoiding read amplification on
+    /// small column chunks.
+    pub lengths: Vec<usize>,
     /// Byte offset into the first buffer where the requested range starts.
     pub first_offset: usize,
     /// Byte offset into the last buffer where the requested range ends.
     pub end_offset: usize,
 }
 
-/// Computes the aligned buffer-sized reads needed to cover the byte range `[start, end)`.
+/// Computes the aligned reads needed to cover the byte range `[start, end)`.
 ///
 /// The start is rounded down to the nearest direct I/O alignment boundary, then
-/// buffer-sized chunks are generated until `end` is covered.
+/// up to `BUFFER_SIZE`-sized blocks are generated until `end` is covered. Each
+/// block's read length is the number of bytes actually needed (capped at
+/// `BUFFER_SIZE`) rounded up to the direct-I/O alignment so O_DIRECT accepts it.
+/// This means a 20 KB column chunk reads ~20 KB, not a full 2 MB block — a large
+/// cold-read saving for the many small columns in a wide table.
 pub fn create_aligned_read_from_start_end(raw_fd: RawFd, start: usize, end: usize) -> AlignedRead {
-    let aligned_offset = start & !(*DIO_ALIGNMENT - 1);
+    let align = *DIO_ALIGNMENT;
+    let aligned_offset = start & !(align - 1);
 
     let mut locations = Vec::new();
     let mut offset = aligned_offset;
@@ -104,9 +120,26 @@ pub fn create_aligned_read_from_start_end(raw_fd: RawFd, start: usize, end: usiz
         offset += BUFFER_SIZE;
     }
 
+    // Per-block read lengths, defaulting to a full `BUFFER_SIZE` per block.
+    //
+    // When a column chunk fits in a *single* block we shrink that read to just
+    // the bytes it occupies (rounded up to the direct-I/O alignment so O_DIRECT
+    // accepts the length). A wide table has many tiny column chunks (e.g. a
+    // ~20 KB dictionary-encoded int column); reading a full 2 MB block for each
+    // is the dominant cold-read cost. The vast majority of column chunks are
+    // single-block, so this captures almost all of the saving while leaving the
+    // multi-block path (large string columns) byte-for-byte unchanged.
+    let mut lengths = vec![BUFFER_SIZE; locations.len()];
+    let last = locations.len() - 1;
+    if locations.len() == 1 {
+        let needed = end - aligned_offset;
+        lengths[0] = needed.next_multiple_of(align).min(BUFFER_SIZE);
+    }
+
     AlignedRead {
-        end_offset: end - locations.last().unwrap().offset,
+        end_offset: end - locations[last].offset,
         locations,
+        lengths,
         first_offset: start - aligned_offset,
     }
 }

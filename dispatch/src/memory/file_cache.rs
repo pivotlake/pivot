@@ -49,6 +49,12 @@ unsafe impl Sync for FileCache {}
 struct Entry {
     ref_bit: AtomicBool,
     location: Option<IOLocation>,
+    /// Number of valid bytes read into this slot. Reads are now sized to the
+    /// column chunk rather than always a full `BUFFER_SIZE`, so a slot may hold
+    /// fewer valid bytes than the buffer's capacity. A lookup that needs more
+    /// bytes than were read must miss (and re-read), even though the file
+    /// offset matches — otherwise it would read stale bytes past `valid_len`.
+    valid_len: usize,
 }
 
 impl FileCache {
@@ -60,6 +66,7 @@ impl FileCache {
                     UnsafeCell::new(Entry {
                         ref_bit: Default::default(),
                         location: None,
+                        valid_len: 0,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -127,9 +134,10 @@ impl FileCache {
 
     /// Insert a completed I/O buffer into the cache, converting it to a [`ReadBuffer`].
     ///
-    /// Records the mapping `(fd, offset) → ring slot`, sets the reference bit, and
-    /// transitions the buffer from write to read mode.
-    pub fn insert(&self, location: IOLocation, buffer: WriteBuffer) -> ReadBuffer {
+    /// Records the mapping `(fd, offset) → ring slot`, the number of valid bytes
+    /// read (`valid_len`), sets the reference bit, and transitions the buffer
+    /// from write to read mode.
+    pub fn insert(&self, location: IOLocation, buffer: WriteBuffer, valid_len: usize) -> ReadBuffer {
         let read_file_maps = self.file_maps.read().unwrap();
         let entry = FileCacheEntry {
             ring_idx: buffer.slot_idx,
@@ -142,17 +150,24 @@ impl FileCache {
         let cell = &self.entries[buffer.slot_idx];
         let slot = unsafe { &mut *cell.get() };
         slot.location = Some(location);
+        slot.valid_len = valid_len;
         slot.ref_bit.store(true, Ordering::Relaxed);
 
         ReadBuffer::from(buffer)
     }
 
-    /// Look up a cached page by location.
+    /// Look up a cached page by location, requiring at least `needed_len` valid
+    /// bytes.
     ///
     /// Pins the slot for reading via the ring's reader-count, then re-checks that the
     /// location still matches (guards against a concurrent eviction that recycled the slot
-    /// between the map lookup and the pin).
-    pub fn get(&self, location: &IOLocation) -> Option<ReadBuffer> {
+    /// between the map lookup and the pin). A slot whose `valid_len` is smaller
+    /// than `needed_len` is treated as a miss: the same file offset may have been
+    /// cached by a smaller read (column chunks are read at their own size now),
+    /// and serving it would expose stale bytes past `valid_len`. The caller
+    /// re-reads with the larger length, which re-caches the same offset with more
+    /// valid bytes (the underlying file bytes are identical, just more of them).
+    pub fn get(&self, location: &IOLocation, needed_len: usize) -> Option<ReadBuffer> {
         let read_file_maps = self.file_maps.read().unwrap();
         let inner_map = read_file_maps
             .get(&location.raw_fd)
@@ -168,7 +183,7 @@ impl FileCache {
         // the location cannot change while we're doing this operation since we have a read guard
         let cell = &self.entries[guard.ring_idx()];
         let entry = unsafe { &*cell.get() };
-        if entry.location.as_ref()? == location {
+        if entry.location.as_ref()? == location && entry.valid_len >= needed_len {
             entry.ref_bit.store(true, Ordering::Relaxed);
             return Some(guard);
         }
@@ -179,6 +194,7 @@ impl FileCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::BUFFER_SIZE;
     use crate::memory::context::{init_test_free_pool, memory_ctx};
 
     fn get_write_buffer(prefer_zeroed: bool) -> WriteBuffer {
@@ -199,7 +215,7 @@ mod tests {
         let cache = file_cache();
         cache.open_file_entry(42);
 
-        let result = cache.get(&loc(42, 0));
+        let result = cache.get(&loc(42, 0), 1);
 
         assert!(result.is_none());
     }
@@ -211,9 +227,9 @@ mod tests {
         cache.open_file_entry(42);
         let mut wb = get_write_buffer(false);
         wb[0..5].copy_from_slice(b"hello");
-        let _rb = cache.insert(loc(42, 0), wb);
+        let _rb = cache.insert(loc(42, 0), wb, BUFFER_SIZE);
 
-        let rb = cache.get(&loc(42, 0)).unwrap();
+        let rb = cache.get(&loc(42, 0), 1).unwrap();
 
         assert_eq!(&rb[0..5], b"hello");
     }
@@ -224,9 +240,9 @@ mod tests {
         let cache = file_cache();
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
-        let _rb = cache.insert(loc(42, 0), wb);
+        let _rb = cache.insert(loc(42, 0), wb, BUFFER_SIZE);
 
-        let result = cache.get(&loc(42, 4096));
+        let result = cache.get(&loc(42, 4096), 1);
 
         assert!(result.is_none());
     }
@@ -240,11 +256,11 @@ mod tests {
         wb1[0] = 0xAA;
         let mut wb2 = get_write_buffer(false);
         wb2[0] = 0xBB;
-        let _r1 = cache.insert(loc(42, 0), wb1);
-        let _r2 = cache.insert(loc(42, 4096), wb2);
+        let _r1 = cache.insert(loc(42, 0), wb1, BUFFER_SIZE);
+        let _r2 = cache.insert(loc(42, 4096), wb2, BUFFER_SIZE);
 
-        let rb1 = cache.get(&loc(42, 0)).unwrap();
-        let rb2 = cache.get(&loc(42, 4096)).unwrap();
+        let rb1 = cache.get(&loc(42, 0), 1).unwrap();
+        let rb2 = cache.get(&loc(42, 4096), 1).unwrap();
 
         assert_eq!(rb1[0], 0xAA);
         assert_eq!(rb2[0], 0xBB);
@@ -258,7 +274,7 @@ mod tests {
         let mut wb = get_write_buffer(false);
         wb[0..4].copy_from_slice(&[1, 2, 3, 4]);
 
-        let rb = cache.insert(loc(42, 0), wb);
+        let rb = cache.insert(loc(42, 0), wb, BUFFER_SIZE);
 
         assert_eq!(&rb[0..4], &[1, 2, 3, 4]);
     }
@@ -271,7 +287,7 @@ mod tests {
         cache.open_file_entry(42);
         cache.open_file_entry(42);
 
-        assert!(cache.get(&loc(42, 0)).is_none());
+        assert!(cache.get(&loc(42, 0), 1).is_none());
     }
 
     #[test]
@@ -281,12 +297,12 @@ mod tests {
         cache.open_file_entry(42);
         let mut wb = get_write_buffer(false);
         wb[0..5].copy_from_slice(b"stale");
-        let _rb = cache.insert(loc(42, 0), wb);
-        assert!(cache.get(&loc(42, 0)).is_some());
+        let _rb = cache.insert(loc(42, 0), wb, BUFFER_SIZE);
+        assert!(cache.get(&loc(42, 0), 1).is_some());
 
         cache.open_file_entry(42);
 
-        assert!(cache.get(&loc(42, 0)).is_none());
+        assert!(cache.get(&loc(42, 0), 1).is_none());
     }
 
     #[test]
@@ -307,7 +323,7 @@ mod tests {
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
         let slot = wb.slot_idx;
-        let rb = cache.insert(loc(42, 0), wb);
+        let rb = cache.insert(loc(42, 0), wb, BUFFER_SIZE);
         drop(rb);
         // First sweep: ref_bit is true from insert - cleared, some other slot evicted
         cache.hand.store(slot, Ordering::Relaxed);
@@ -316,7 +332,7 @@ mod tests {
         cache.hand.store(slot, Ordering::Relaxed);
         let _evicted = cache.evict();
 
-        assert!(cache.get(&loc(42, 0)).is_none());
+        assert!(cache.get(&loc(42, 0), 1).is_none());
     }
 
     #[test]
@@ -326,7 +342,7 @@ mod tests {
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
         let slot = wb.slot_idx;
-        let rb = cache.insert(loc(42, 0), wb);
+        let rb = cache.insert(loc(42, 0), wb, BUFFER_SIZE);
         drop(rb);
         // insert set ref_bit=true — evict should skip our slot (clearing the bit)
         // and evict some other empty slot instead
@@ -334,7 +350,7 @@ mod tests {
 
         let evicted = cache.evict();
         assert_ne!(evicted.slot_idx, slot);
-        assert!(cache.get(&loc(42, 0)).is_some());
+        assert!(cache.get(&loc(42, 0), 1).is_some());
     }
 
     #[test]
@@ -344,7 +360,7 @@ mod tests {
         cache.open_file_entry(42);
         let wb = get_write_buffer(false);
         let slot = wb.slot_idx;
-        let rb = cache.insert(loc(42, 0), wb);
+        let rb = cache.insert(loc(42, 0), wb, BUFFER_SIZE);
         drop(rb);
 
         // First sweep: ref_bit is true from insert — cleared, slot skipped
@@ -352,7 +368,7 @@ mod tests {
         let _other = cache.evict();
 
         // Access the page — get() should re-set ref_bit
-        let rb = cache.get(&loc(42, 0)).unwrap();
+        let rb = cache.get(&loc(42, 0), 1).unwrap();
         drop(rb);
 
         // Second sweep: ref_bit should be true again from the get() — slot skipped
@@ -363,7 +379,7 @@ mod tests {
             "recently accessed slot should not be evicted"
         );
         assert!(
-            cache.get(&loc(42, 0)).is_some(),
+            cache.get(&loc(42, 0), 1).is_some(),
             "page should still be cached after access"
         );
     }
