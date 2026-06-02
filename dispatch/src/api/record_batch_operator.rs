@@ -62,9 +62,9 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    AggSpec, AggregateFactory, CopyOutFactory, CountFactory, FilterFactory, GroupFactory,
-    KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
-    RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    AggSpec, AggregateFactory, CopyOutFactory, CountFactory, FilterFactory, GroupAggSlot,
+    GroupFactory, KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    OrderByLimitFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -513,7 +513,26 @@ impl RecordBatchOperatorSpec {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K>::create_for_workers(
-            group_column,
+            vec![group_column],
+            vec![],
+            worker_count,
+            buffers,
+        ))
+    }
+
+    /// GROUP BY one or more key columns computing one or more aggregate value
+    /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key
+    /// shape (and, via its `Value`, the aggregate arity).
+    pub fn group_by_aggregate<K: KeyExtractor>(
+        self,
+        key_cols: Vec<usize>,
+        value_slots: Vec<GroupAggSlot>,
+    ) -> Self {
+        let worker_count = self.worker_count();
+        let buffers = self.dispatcher.buffers;
+        self.unary(GroupFactory::<K>::create_for_workers(
+            key_cols,
+            value_slots,
             worker_count,
             buffers,
         ))

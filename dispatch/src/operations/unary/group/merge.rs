@@ -211,7 +211,8 @@ mod tests {
     use crate::operations::unary::group::key_extractions::IntKeyExtractor;
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
@@ -223,7 +224,9 @@ mod tests {
     ) -> Vec<MultiSlabTable<IntExtractor>> {
         let mut agg = AggregatedTable::<IntExtractor>::new(state.clone(), arena.clone());
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
-        agg.merge_array(&array);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+        agg.consume_batch(&batch, &[0], &[]);
         agg.flush()
     }
 

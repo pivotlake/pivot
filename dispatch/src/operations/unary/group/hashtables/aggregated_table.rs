@@ -1,12 +1,11 @@
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::SlabAllocator;
+use crate::operations::unary::group::aggregations::GroupAggSlot;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
-use crate::operations::unary::group::hashtables::{
-    DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Value,
-};
+use crate::operations::unary::group::hashtables::{DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable};
 use ahash::RandomState;
-use arrow_array::{Array, ArrayAccessor, ArrayRef};
+use arrow_array::RecordBatch;
 use std::sync::Arc;
 
 /// Per-worker aggregation state for the consume phase.
@@ -53,30 +52,29 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             .push(BaseHashTable::multi_slab(&mut self.allocator, new_size, 0));
     }
 
-    /// Hash every element in `col` using the shared hash state.
+    /// Merge all rows of `batch` into the current table stack, reading the
+    /// key columns and per-row aggregate values through the extractor.
     #[inline(always)]
-    fn compute_hashes(&mut self, col: K::ArrayRef<'_>) {
+    pub fn consume_batch(
+        &mut self,
+        batch: &RecordBatch,
+        key_cols: &[usize],
+        value_slots: &[GroupAggSlot],
+    ) {
+        const PREFETCH_DISTANCE: usize = 16;
+        let reader = K::make_reader(batch, key_cols, value_slots);
+        let length = K::rows(&reader);
+
         let mut i = 0;
-        let length = col.len();
         while i < length {
-            self.hashes[i] = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
+            self.hashes[i] = K::hash(&reader, i, &self.hash_state);
             i += 1;
         }
-    }
-
-    /// Merge all rows from `array` into the current table stack.
-    #[inline(always)]
-    pub fn merge_array(&mut self, array: &ArrayRef) {
-        const PREFETCH_DISTANCE: usize = 16;
-        let array = K::downcast_column(array).unwrap();
-        self.compute_hashes(array);
 
         // We always initialize maps with at least one map, so this is safe
         let mut table = self.tables.last_mut().unwrap();
-        let length = array.len();
 
         let mut i = 0;
-
         while i < length {
             let hash = self.hashes[i];
             if i + PREFETCH_DISTANCE + 1 < length {
@@ -84,8 +82,9 @@ impl<K: KeyExtractor> AggregatedTable<K> {
                 table.prefetch(ph);
             }
 
-            let key = K::live_key(&array, i, &mut self.worker_arena);
-            table.merge::<false, _>(hash, key, K::Value::single());
+            let key = K::live_key(&reader, i, &mut self.worker_arena);
+            let value = K::value(&reader, i);
+            table.merge::<false, _>(hash, key, value);
 
             if table.undersized() {
                 self.create_new_table();

@@ -1,76 +1,82 @@
 //! Key extraction strategies for GROUP BY operations.
 //!
-//! A [`KeyExtractor`] defines how to extract, compare, persist, and output
-//! group keys for a particular data type. It bridges Arrow arrays (the input)
-//! with the hash table's key/value storage (the engine) and Arrow record
-//! batches (the output).
+//! A [`KeyExtractor`] defines how to read group keys and per-row aggregate
+//! values from an input batch, persist/compare keys in the hash table, and
+//! emit the finished table as an Arrow [`RecordBatch`].
 //!
-//! TODO: Right now the KeyExtractor includes definitions for the value- when we have different
-//! group by values this will need to move
+//! ## Reader-based consume
+//!
+//! Extraction is driven through a per-batch [`Reader`](KeyExtractor::Reader):
+//! [`make_reader`](KeyExtractor::make_reader) downcasts the configured key
+//! columns (one or more) and value columns once, then
+//! [`hash`](KeyExtractor::hash), [`live_key`](KeyExtractor::live_key) and
+//! [`value`](KeyExtractor::value) read row `idx` cheaply. This lets a single
+//! trait cover single-column count grouping, multi-column keys, and multi-slot
+//! sum/count/avg values.
 //!
 //! ## Live vs Persisted keys
 //!
-//! Each extractor works with two representations of the same key:
-//!
-//! - **Live key** — a transient reference into the input array (e.g. `&str`
-//!   from a `StringViewArray`). Cheap to create and compare, but borrows
-//!   from the input batch which will be dropped.
-//! - **Persisted key** — an owned, `Copy` value stored inside the hash table
-//!   (e.g. an [`ArenaKey`](super::ArenaKey) pointing into the shared arena).
-//!   Only created when the key is actually new.
-//!
-//! This split avoids copying strings into the arena on every row — only
-//! genuinely new keys pay the persist cost.
-//!
-//! ## Provided extractors
-//!
-//! - [`IntKeyExtractor<T>`] — for Arrow primitive types (i32, u64, etc.).
-//!   Keys are `Copy` integers, so live and persisted forms are identical.
-//! - [`StringKeyExtractor`] — for `StringViewArray`. Live keys borrow
-//!   the raw `&str`; persisted keys are arena-backed `ArenaKey`s that
-//!   share the same u128 layout as Arrow's StringView.
+//! - **Live key** — a transient reference into the input batch (e.g. `&str`).
+//! - **Persisted key** — an owned, `Copy` value stored in the table (an
+//!   [`ArenaKey`](super::ArenaKey) for strings, an integer / packed integer for
+//!   numeric keys). Only created when the key is genuinely new.
 
-use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::operations::unary::group::aggregations::GroupAggSlot;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{
     LiveKey, PersistedKey, Table, TableStorage, Value,
 };
-use arrow_array::{Array, RecordBatch};
+use ahash::RandomState;
+use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
 mod int_key_extractor;
 pub use int_key_extractor::IntKeyExtractor;
 
+mod int_pair_extractor;
+pub use int_pair_extractor::IntPairAggExtractor;
+
 mod string_extractor;
 pub use string_extractor::StringKeyExtractor;
 
-/// Defines how to extract, compare, and output group keys for a data type.
-///
-/// Implementors specify:
-/// - How to read a key from an Arrow array ([`live_key`](Self::live_key))
-/// - How to reconstruct a key from its persisted form ([`resolve_persisted`](Self::resolve_persisted))
-/// - How to downcast an `&dyn Array` to the concrete array type ([`downcast_column`](Self::downcast_column))
-/// - How to convert a finished hash table into an Arrow [`RecordBatch`] ([`create_record_batch`](Self::create_record_batch))
+/// Defines how to extract, compare, and output group keys (and per-row
+/// aggregate values) for a particular key/value shape.
 pub trait KeyExtractor: Send + 'static {
-    /// The concrete Arrow array type this extractor reads from.
-    type ArrayRef<'a>: arrow::array::ArrayAccessor<Item: Hash + Eq> + arrow::array::Array + Copy;
     /// The `Copy` key representation stored inside hash table entries.
     type Persisted: PersistedKey;
-    /// A transient key that borrows from the input array and/or the worker arena.
+    /// A transient key that borrows from the input batch and/or the worker arena.
     type LiveKey<'a, 'b>: LiveKey<Persisted = Self::Persisted>;
     /// A live key reconstructed from an already-persisted key (used during merge).
     type PersistedLiveKey<'a>: LiveKey<Persisted = Self::Persisted>;
-    /// The aggregation value stored alongside each key (e.g. `Count`).
+    /// The aggregation value stored alongside each key.
     type Value: Value + Send;
+    /// Per-batch reader holding downcast key/value column accessors.
+    type Reader<'b>;
 
-    /// Extract a live key from `column` at position `idx`.
+    /// Build a reader over `batch` for the given key columns and value slots.
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        value_slots: &[GroupAggSlot],
+    ) -> Self::Reader<'b>;
+
+    /// Number of rows the reader spans.
+    fn rows(reader: &Self::Reader<'_>) -> usize;
+
+    /// Hash the key at row `idx`.
+    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64;
+
+    /// Extract a live key from row `idx` (may borrow the arena to persist).
     fn live_key<'a, 'b>(
-        column: &Self::ArrayRef<'b>,
+        reader: &Self::Reader<'b>,
         idx: usize,
         arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'b>;
+
+    /// Build the per-row aggregate value at row `idx`.
+    fn value(reader: &Self::Reader<'_>, idx: usize) -> Self::Value;
 
     /// Reconstruct a live key from a persisted key, borrowing from the shared arena.
     fn resolve_persisted(
@@ -78,10 +84,8 @@ pub trait KeyExtractor: Send + 'static {
         persisted: Self::Persisted,
     ) -> Self::PersistedLiveKey<'_>;
 
-    /// Downcast a type-erased `&dyn Array` to this extractor's concrete array type.
-    fn downcast_column<'a>(column: &'a dyn Array) -> Option<Self::ArrayRef<'a>>;
-
-    /// Convert a completed hash table into an Arrow `RecordBatch` with key and value columns.
+    /// Convert a completed hash table into an Arrow `RecordBatch` of key +
+    /// value columns.
     fn create_record_batch<S: TableStorage<Self>>(
         table: Table<Self, S>,
         arena: &Arc<SharedArena>,

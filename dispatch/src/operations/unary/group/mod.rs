@@ -77,10 +77,13 @@ mod factory;
 mod key_extractions;
 mod merge;
 
+pub use aggregations::{AggRow, GroupAggKind, GroupAggSlot};
 pub use factory::GroupFactory;
 mod hashtables;
 
-pub use key_extractions::{IntKeyExtractor, KeyExtractor, StringKeyExtractor};
+pub use key_extractions::{
+    IntKeyExtractor, IntPairAggExtractor, KeyExtractor, StringKeyExtractor,
+};
 
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -119,7 +122,8 @@ const PARTITIONS: usize = 64;
 /// finishes, the accumulated tables are sent to a shared channel and the
 /// `Group` transitions into a [`GroupOutputter`] for the merge phase.
 pub struct Group<K: KeyExtractor> {
-    group_column: usize,
+    key_cols: Vec<usize>,
+    value_slots: Vec<GroupAggSlot>,
 
     aggregated_table: AggregatedTable<K>,
     sender: mpsc::Sender<Vec<MultiSlabTable<K>>>,
@@ -127,17 +131,20 @@ pub struct Group<K: KeyExtractor> {
 }
 
 impl<K: KeyExtractor> Group<K> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         shared_arena: Arc<SharedArena>,
         state: RandomState,
         injector: Arc<Injector<PartitionJob<K>>>,
-        group_column: usize,
+        key_cols: Vec<usize>,
+        value_slots: Vec<GroupAggSlot>,
         sender: mpsc::Sender<Vec<MultiSlabTable<K>>>,
         receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K>>>>,
         partition_jobs_injected: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            group_column,
+            key_cols,
+            value_slots,
             outputter: GroupOutputter {
                 shared_arena: shared_arena.clone(),
                 injector,
@@ -159,7 +166,7 @@ impl<K: KeyExtractor> Consumer<RecordBatch, RecordBatch> for Group<K> {
         _sender: &mut S,
     ) -> unary::Result<()> {
         self.aggregated_table
-            .merge_array(batch.column(self.group_column));
+            .consume_batch(&batch, &self.key_cols, &self.value_slots);
         Ok(())
     }
 
@@ -226,7 +233,10 @@ impl<K: KeyExtractor> Outputter<RecordBatch> for GroupOutputter<K> {
             let tables: Vec<MultiSlabTable<K>> = rx.into_iter().flatten().collect::<Vec<_>>();
             debug!("Outputting {:?} maps", tables.len());
             let total_entries: usize = tables.iter().map(|m| m.capacity()).sum::<usize>() / 2;
-            let partition_capacity = (total_entries / PARTITIONS).next_power_of_two();
+            // Size each partition's result table with load-factor headroom (×2)
+            // so it never resizes mid-merge — a single resize of a multi-million
+            // entry partition (copying every entry) showed up as ~7% of Q32.
+            let partition_capacity = (total_entries * 2 / PARTITIONS).next_power_of_two();
             info!("Partition capacity {:?}", partition_capacity);
             let tables = Arc::new(tables);
             for i in 0..PARTITIONS {
@@ -294,7 +304,8 @@ mod tests {
                     arena.clone(),
                     state.clone(),
                     injector.clone(),
-                    0,
+                    vec![0],
+                    vec![],
                     tx.clone(),
                     rx_opt.take(),
                     partition_jobs_injected.clone(),
