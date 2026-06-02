@@ -1,0 +1,19 @@
+[package]
+name = "pivot-bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pivot-bench"
+path = "src/main.rs"
+
+[dependencies]
+catalog = { path = "../catalog" }
+planner = { path = "../planner" }
+dispatch = { path = "../dispatch" }
+arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
+arrow-array = { path = "../arrow-rs/arrow-array" }
+core_affinity = "0.8.3"
+
+[profile.release]
+debug = true
