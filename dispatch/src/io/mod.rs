@@ -14,22 +14,18 @@
 //!    rather than competing with the OS for the same physical pages.
 //!
 //! Provides direct I/O reads with platform-specific backends (io_uring on Linux,
-//! pread on other Unix). Reads are aligned to the device's direct I/O alignment
-//! and routed through a buffer pool managed by the memory subsystem.
+//! pread on other Unix), reading straight into the file cache's 4 KB-aligned slot
+//! regions.
 //!
 //! # Architecture
 //!
 //! - [`IORequester`] — submits and completes read requests on behalf of dataflows.
 //! - [`backend::IOBackend`] — platform-specific submission/completion engine.
-//! - [`alignment`] — detects direct I/O alignment requirements at runtime.
 
-mod alignment;
 mod backend;
 
 use crate::Identifier;
-use crate::memory::BUFFER_SIZE;
-use alignment::DIO_ALIGNMENT;
-use std::any::Any;
+use crate::memory::file_cache::MissingBlock;
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::os::fd::RawFd;
@@ -38,24 +34,21 @@ use std::path::Path;
 mod requester;
 pub use requester::{Error as IORequesterError, IORequester};
 
-/// A file descriptor and byte offset identifying a single buffer-sized block on disk.
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct IOLocation {
-    pub raw_fd: RawFd,
-    pub offset: usize,
-}
-
-/// A read request targeting an `IOLocation`, carrying an opaque context that is
-/// returned alongside the completed read buffer.
+/// A read request for one `MissingBlock`: read `block.len` bytes from `fd` at
+/// `block.file_offset` straight into the block's `dest` (its pinned cache slot),
+/// then `commit` it. The block carries everything needed to issue and commit
+/// the read.
 pub struct IORequest {
-    pub location: IOLocation,
-    pub ctx: Box<dyn Any + Send>,
+    pub fd: RawFd,
+    pub block: MissingBlock,
 }
 
 impl Debug for IORequest {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IORequest")
-            .field("location", &self.location)
+            .field("fd", &self.fd)
+            .field("file_offset", &self.block.file_offset())
+            .field("len", &self.block.len())
             .finish_non_exhaustive()
     }
 }
@@ -75,39 +68,6 @@ impl DataFlowRequest {
             operator_idx,
             request,
         }
-    }
-}
-
-/// A set of aligned [`IOLocation`]s that cover a byte range, plus the offsets within
-/// the first and last buffers where the requested data actually begins and ends (because the reads
-/// are aligned, there could be extraneous data in the beginning and end).
-#[derive(Debug)]
-pub struct AlignedRead {
-    pub locations: Vec<IOLocation>,
-    /// Byte offset into the first buffer where the requested range starts.
-    pub first_offset: usize,
-    /// Byte offset into the last buffer where the requested range ends.
-    pub end_offset: usize,
-}
-
-/// Computes the aligned buffer-sized reads needed to cover the byte range `[start, end)`.
-///
-/// The start is rounded down to the nearest direct I/O alignment boundary, then
-/// buffer-sized chunks are generated until `end` is covered.
-pub fn create_aligned_read_from_start_end(raw_fd: RawFd, start: usize, end: usize) -> AlignedRead {
-    let aligned_offset = start & !(*DIO_ALIGNMENT - 1);
-
-    let mut locations = Vec::new();
-    let mut offset = aligned_offset;
-    while offset < end {
-        locations.push(IOLocation { raw_fd, offset });
-        offset += BUFFER_SIZE;
-    }
-
-    AlignedRead {
-        end_offset: end - locations.last().unwrap().offset,
-        locations,
-        first_offset: start - aligned_offset,
     }
 }
 

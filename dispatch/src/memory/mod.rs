@@ -20,7 +20,8 @@
 mod ring;
 pub use ring::{BUFFER_SIZE, Ring};
 
-mod file_cache;
+pub mod file_cache;
+pub use file_cache::CacheLookup;
 
 mod free_pool;
 
