@@ -140,7 +140,7 @@ pub struct SuiteRun {
 pub struct RunOptions {
     pub source: PathBuf,
     pub iterations: u32,
-    pub sleep_secs: Option<u64>,
+    pub sleep_ms: Option<u64>,
     pub update_results: bool,
     /// `None` → run every query in `suite.queries`.
     pub query_filter: Option<Vec<String>>,
@@ -226,10 +226,10 @@ async fn run_query(
             elapsed
         );
         last_output = output;
-        if let Some(secs) = opts.sleep_secs
+        if let Some(ms) = opts.sleep_ms
             && i + 1 < opts.iterations
         {
-            sleep(Duration::from_secs(secs));
+            sleep(Duration::from_millis(ms));
         }
     }
 

@@ -72,7 +72,7 @@ struct Cli {
     #[arg(long, default_value_t = 1, env = "QUERY_TEST_COUNT")]
     iterations: u32,
 
-    /// Seconds to sleep between iterations. Useful when chasing thermal /
+    /// Milliseconds to sleep between iterations. Useful when chasing thermal /
     /// allocator effects on long suites.
     #[arg(long, env = "SLEEP")]
     sleep: Option<u64>,
@@ -177,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Zero iterations would leave a query with no cold sample; clamp so a
         // stray `--iterations 0` (or `QUERY_TEST_COUNT=0`) still does one run.
         iterations: cli.iterations.max(1),
-        sleep_secs: cli.sleep,
+        sleep_ms: cli.sleep,
         update_results: cli.update_results,
         query_filter,
     };
