@@ -42,7 +42,6 @@
 
 use crate::data_flow::WorkStatus;
 use crate::io::IORequest;
-use crate::memory::ReadBuffer;
 use thiserror::Error;
 
 pub mod channels;
@@ -83,8 +82,9 @@ pub trait Operator {
     /// The worker will submit them and later call [`process_disk_response`](Self::process_disk_response).
     fn next_io_requests(&mut self) -> Result<Vec<IORequest>>;
 
-    /// Handle a completed disk read. Called by the worker when IO finishes.
-    fn process_disk_response(&mut self, buffer: ReadBuffer, request: IORequest) -> Result<()>;
+    /// Handle a completed disk read (its bytes are already committed to the
+    /// cache). Called by the worker when IO finishes.
+    fn process_disk_response(&mut self, request: IORequest) -> Result<()>;
 
     /// Attempt to finish, return whether the operator is ready to finish. Regardless of whether it
     /// is, this function may be called many times.

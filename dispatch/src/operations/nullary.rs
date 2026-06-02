@@ -8,7 +8,6 @@ use super::Operator;
 use crate::api::{Chain, OperatorFactory};
 use crate::data_flow::WorkStatus;
 use crate::io::IORequest;
-use crate::memory::ReadBuffer;
 use crate::operations::channels::Sender;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -43,7 +42,6 @@ pub trait Nullary<O> {
     fn process_disk_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _buffer: ReadBuffer,
         _request: IORequest,
     ) -> Result<()> {
         unreachable!()
@@ -81,14 +79,10 @@ impl<O, N: Nullary<O>, S: Sender<O>> Operator for NullaryOperator<O, N, S> {
         Ok(self.nullary.next_io_requests()?)
     }
 
-    fn process_disk_response(
-        &mut self,
-        buffer: ReadBuffer,
-        request: IORequest,
-    ) -> super::Result<()> {
+    fn process_disk_response(&mut self, request: IORequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_disk_response(&mut self.sender, buffer, request)?)
+            .process_disk_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {
