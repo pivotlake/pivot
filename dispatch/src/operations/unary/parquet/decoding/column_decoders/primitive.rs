@@ -10,16 +10,15 @@
 
 use std::marker::PhantomData;
 use std::mem;
-use std::ptr::NonNull;
-use std::sync::Arc;
 
 use arrow_array::types::ArrowPrimitiveType;
-use arrow_array::{ArrayRef, PrimitiveArray};
-use arrow_buffer::{ArrowNativeType, BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow_buffer::ArrowNativeType;
 
-use crate::memory::{MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator};
+use crate::memory::{
+    MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
+};
 use crate::operations::unary::parquet::decoding::column_decoders::{
-    ArrayBuilder, DecodePlain, Dict, TypedColumnDecoder,
+    DecodePlain, Dict, TypedColumnDecoder,
 };
 use bytes::Bytes;
 
@@ -89,17 +88,39 @@ impl ReadLeBytes for f64 {
     }
 }
 
-/// Reads `count` fixed-width LE primitive values from scattered buffers into a MultiSlabBuffer.
+/// Lets [`read_primitives`] write into either backing without a per-element slab
+/// lookup in the common case: the single [`SlabBuffer`] of a [`PrimitiveBuilder`]
+/// or the [`MultiSlabBuffer`] of a dictionary.
+trait ElemPtr<T> {
+    fn elem_ptr(&self, index: usize) -> *mut T;
+}
+
+impl<T> ElemPtr<T> for SlabBuffer<T> {
+    #[inline(always)]
+    fn elem_ptr(&self, index: usize) -> *mut T {
+        self.ptr_at_index(index)
+    }
+}
+
+impl<T> ElemPtr<T> for MultiSlabBuffer<T> {
+    #[inline(always)]
+    fn elem_ptr(&self, index: usize) -> *mut T {
+        self.ptr_at_index(index)
+    }
+}
+
+/// Reads `count` fixed-width LE primitive values from scattered buffers into
+/// `output` (a single-slab builder buffer or a multi-slab dictionary buffer).
 ///
 /// Fast path: when many values fit within the current buffer, copies them
 /// in bulk via memcpy (no per-value overhead).
 /// Slow path: when a value straddles a buffer boundary, falls back to
 /// `MultiBufferReader` for that single value, then resumes the fast path.
 #[inline]
-fn read_primitives<N: ReadLeBytes>(
+fn read_primitives<N: ReadLeBytes, B: ElemPtr<N>>(
     data: &[Bytes],
     position: &mut ReaderPosition,
-    output: &mut MultiSlabBuffer<N>,
+    output: &mut B,
     output_len: &mut usize,
     count: usize,
 ) {
@@ -118,7 +139,7 @@ fn read_primitives<N: ReadLeBytes>(
             let byte_count = to_read * byte_width;
             let src = &buf[position.offset..position.offset + byte_count];
             unsafe {
-                let dst = output.ptr_at_index(*output_len) as *mut u8;
+                let dst = output.elem_ptr(*output_len) as *mut u8;
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dst, byte_count);
             }
             *output_len += to_read;
@@ -127,13 +148,13 @@ fn read_primitives<N: ReadLeBytes>(
             let to_read = remaining.min(fit);
             let mut reader = MultiBufferReader::new(data, position);
             for _ in 0..to_read {
-                output[*output_len] = N::read_le(&mut reader);
+                unsafe { *output.elem_ptr(*output_len) = N::read_le(&mut reader) };
                 *output_len += 1;
             }
         } else if available_bytes > 0 {
             // Slow path: value straddles buffer boundary
             let mut reader = MultiBufferReader::new(data, position);
-            output[*output_len] = N::read_le(&mut reader);
+            unsafe { *output.elem_ptr(*output_len) = N::read_le(&mut reader) };
             *output_len += 1;
         } else {
             // Buffer fully consumed, advance to next
@@ -143,59 +164,9 @@ fn read_primitives<N: ReadLeBytes>(
     }
 }
 
-/// [`ArrayBuilder`] for fixed-width primitive Arrow types.
-///
-/// Backed by a [`MultiSlabBuffer`] so that the final array can be produced
-/// with zero copies via [`into_array`](ArrayBuilder::into_array).
-pub struct PrimitiveBuilder<T: ArrowPrimitiveType> {
-    values: MultiSlabBuffer<T::Native>,
-    len: usize,
-}
-
-impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
-    type Element = T::Native;
-
-    fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
-        Self {
-            values: allocator.create_multi_slab_buffer(capacity, false),
-            len: 0,
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    fn push(&mut self, element: &T::Native, amount: usize) {
-        let start = self.len;
-        self.len += amount;
-        let dest =
-            unsafe { std::slice::from_raw_parts_mut(self.values.ptr_at_index(start), amount) };
-        dest.fill(*element);
-    }
-
-    #[inline]
-    fn spare_mut(&mut self, count: usize) -> &mut [T::Native] {
-        let start = self.len;
-        self.len += count;
-        unsafe { std::slice::from_raw_parts_mut(self.values.ptr_at_index(start), count) }
-    }
-
-    fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef {
-        let len = self.len;
-        let byte_len = len * size_of::<T::Native>();
-        let slab = self.values.into_single_slab();
-        let ptr = NonNull::new(slab.ptr).unwrap();
-        let buffer = unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) };
-        let values = ScalarBuffer::new(buffer, 0, len);
-        let nulls = null_buffer
-            .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
-            .filter(|n| n.null_count() != 0);
-        Arc::new(PrimitiveArray::<T>::new(values, nulls))
-    }
-}
+// The primitive [`ArrayBuilder`] now lives in `crate::arrays` (shared with the
+// GROUP BY output); re-exported so this module's decoders keep using it.
+pub use crate::arrays::PrimitiveBuilder;
 
 /// [`DecodePlain`] implementation for fixed-width primitives.
 ///
@@ -225,11 +196,11 @@ where
     }
 
     fn read(&mut self, builder: &mut PrimitiveBuilder<T>, size: usize) {
-        read_primitives::<T::Native>(
+        read_primitives::<T::Native, _>(
             &self.data,
             &mut self.position,
-            &mut builder.values,
-            &mut builder.len,
+            &mut builder.col.values,
+            &mut builder.col.len,
             size,
         );
     }
@@ -261,7 +232,7 @@ where
         let mut entries = allocator.create_multi_slab_buffer(size, false);
         let mut position = ReaderPosition::default();
         let mut len = 0;
-        read_primitives::<T::Native>(&data, &mut position, &mut entries, &mut len, size);
+        read_primitives::<T::Native, _>(&data, &mut position, &mut entries, &mut len, size);
         Self { entries }
     }
 

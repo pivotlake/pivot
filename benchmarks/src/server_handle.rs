@@ -77,7 +77,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
         .parse()
         .expect("valid socket addr");
 
-    let dispatch = Dispatch::spin_up(workers, total_memory_bytes() / 2 / BUFFER_SIZE);
+    let dispatch = Dispatch::spin_up(workers, total_memory_bytes() * 4 / 5 / BUFFER_SIZE);
     let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

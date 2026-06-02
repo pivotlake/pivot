@@ -41,22 +41,6 @@ impl<T> MultiSlabBuffer<T> {
         let offset_in_buffer = byte_offset & BUFFER_MASK;
         unsafe { self.slabs[buffer_idx].ptr.add(offset_in_buffer) as *mut T }
     }
-
-    /// Consumes the buffer and returns the single backing `Slab`.
-    ///
-    /// Useful for zero-copy handoff to Arrow: wrap the returned `Slab` in `Arc` and pass
-    /// to `Buffer::from_custom_allocation`.
-    ///
-    /// Panics (debug) if the buffer spans more than one slab.
-    pub fn into_single_slab(self) -> Slab {
-        debug_assert_eq!(
-            self.slabs.len(),
-            1,
-            "MultiSlabBuffer spans {} slabs, expected 1",
-            self.slabs.len()
-        );
-        self.slabs.into_iter().next().unwrap()
-    }
 }
 
 impl<T> Index<usize> for MultiSlabBuffer<T> {
@@ -116,18 +100,5 @@ mod tests {
 
         assert_eq!(buf[0], 1);
         assert_eq!(buf[elements - 1], 2);
-    }
-
-    #[test]
-    fn into_single_slab() {
-        init_test_free_pool(4);
-        let mut alloc = SlabAllocator::new(true);
-        let mut buf: MultiSlabBuffer<u32> = alloc.create_multi_slab_buffer(8, true);
-        buf[0] = 0xDEAD;
-
-        let slab = buf.into_single_slab();
-
-        let val = unsafe { *(slab.ptr as *const u32) };
-        assert_eq!(val, 0xDEAD);
     }
 }

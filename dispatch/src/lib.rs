@@ -47,6 +47,12 @@
 //! ```
 //!
 
+// Internal engine crate: a handful of public-facing items document their
+// behaviour by linking to the private traits they're built on (e.g. a
+// `KeyExtractor` impl links to the trait). That's intentional here — we're not
+// a published API — so allow public docs to reference private items.
+#![allow(rustdoc::private_intra_doc_links)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier};
@@ -57,6 +63,7 @@ use tracing::info;
 mod env;
 
 mod api;
+mod arrays;
 mod data_flow;
 mod functions;
 mod io;
@@ -82,8 +89,9 @@ pub use operations::parquet::types::metadata::{
 pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::{Error as ParquetTableError, ParquetTable};
 pub use operations::{
-    AggKind, AggSpec, IntKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator,
-    OrderBy, Result as OperatorResult, StringKeyExtractor,
+    AggKind, AggSpec, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled,
+    Count, IntKeyExtractor, IntPairKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory,
+    Operator, OrderBy, Result as OperatorResult, StringKeyExtractor, Sum, ValueExtractor,
 };
 
 #[unsafe(export_name = "_rjem_malloc_conf")]

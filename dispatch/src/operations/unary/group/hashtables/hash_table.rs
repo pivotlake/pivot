@@ -2,8 +2,8 @@
 //!
 //! See [`BaseHashTable`] for the full design rationale.
 
+use crate::memory::MultiSlabBuffer;
 use crate::memory::SlabAllocator;
-use crate::memory::{MultiSlabBuffer, SlabBuffer};
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -51,10 +51,23 @@ impl<P: PersistedKey + PartialEq> LiveKey for P {
 /// Must be `Copy` + `Default` so entries can be zero-initialized and moved
 /// cheaply during resize.
 pub trait Value: Copy + Clone + Default {
-    /// The value for a single occurrence of a key (e.g. count = 1).
-    fn single() -> Self;
     /// Combine two values (e.g. sum counts).
     fn merge(self, v: Self) -> Self;
+}
+
+/// Supplies per-row keys and values to [`BaseHashTable::merge_batch`].
+///
+/// Passed as a single `&mut` so the implementation can hold a mutable borrow
+/// (e.g. of a key arena) internally without it escaping through a closure return
+/// — the methods hand back owned keys/values or a bool, never a borrow tied to
+/// that internal state.
+pub trait BatchRowSource<K: PersistedKey, V: Value> {
+    /// The persisted key for row `i` (allocating in any backing arena as needed).
+    fn persisted(&mut self, i: usize) -> K;
+    /// Whether row `i`'s key equals the already-persisted key `persisted`.
+    fn key_eq(&mut self, i: usize, persisted: &K) -> bool;
+    /// The aggregate value contributed by row `i`.
+    fn value(&mut self, i: usize) -> V;
 }
 
 /// A single slot in the hash table, storing the full hash, key, and value.
@@ -91,6 +104,13 @@ impl<K: PersistedKey, V: Value> Entry<K, V> {
 /// Maximum number of entries allowed for a table with `len` total slots.
 fn max_load_for_len(len: usize) -> usize {
     (len as f64 * MAX_LOAD_FACTOR).round() as usize
+}
+
+/// Remap the empty-slot sentinel: `hash == 0` marks an empty slot, so a real
+/// zero hash is bumped to 1 before it is stored or probed.
+#[inline(always)]
+fn remap_zero(hash: u64) -> u64 {
+    if hash == 0 { 1 } else { hash }
 }
 
 /// A linear probing hash table optimized for never rehashing, exposing a very raw interface allowing
@@ -251,41 +271,9 @@ impl<K: PersistedKey, V: Value> BaseHashTable<K, V, MultiSlabBuffer<Entry<K, V>>
     }
 }
 
-impl<K: PersistedKey, V: Value> BaseHashTable<K, V, SlabBuffer<Entry<K, V>>> {
-    /// Creates a new HashTable backed by a single slab buffer.
-    ///
-    /// `expected_capacity` must be a power of 2 and is used directly as the
-    /// number of slots. The total byte size (`expected_capacity * size_of::<Entry>()`)
-    /// must fit within a single slab (`< BUFFER_SIZE`). The buffer is
-    /// zero-initialized so that all slots start empty (`hash == 0`).
-    pub fn single_slab(
-        allocator: &mut SlabAllocator,
-        expected_capacity: usize,
-        pre_shift: u32,
-    ) -> Self {
-        let buffer = allocator.create_slab_buffer(expected_capacity, true);
-
-        BaseHashTable {
-            mask: expected_capacity - 1,
-            length: 0,
-            max_load: max_load_for_len(expected_capacity),
-            buffer,
-            _phantom: PhantomData,
-            pre_shift,
-            shift: u64::BITS - expected_capacity.trailing_zeros(),
-            collisions: 0,
-        }
-    }
-}
-
 impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>>
     BaseHashTable<K, V, A>
 {
-    /// Bitmask for slot indexing (`capacity - 1`).
-    pub fn mask(&self) -> usize {
-        self.mask
-    }
-
     /// Total number of slots (occupied + empty). Always a power of 2.
     pub fn capacity(&self) -> usize {
         self.mask + 1
@@ -314,7 +302,8 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     }
 
     /// Prefetch the hash table slot where `hash` would land, plus the next cache line
-    /// to cover short probe chains.
+    /// to cover short probe chains. Brings the lines all the way into L1 (`T0`) —
+    /// use this *near* the access (small lookahead).
     #[inline]
     pub fn prefetch(&self, hash: u64) {
         let idx = self.slot_for(hash);
@@ -328,6 +317,23 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
                 ptr.add(128) as *const i8
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = ptr;
+    }
+
+    /// Prefetch the slot's cache line into L2 (`T1`) only. Issued *far* ahead of
+    /// the access and paired with a nearer [`prefetch`](Self::prefetch) (L1) call, this
+    /// software-pipelines the memory hierarchy: the line is pulled DRAM→L2 far
+    /// ahead, then L2→L1 just before use, hiding the full DRAM latency that a
+    /// single L1 prefetch at a short distance can't cover on a multi-GB table.
+    #[inline]
+    pub fn prefetch_l2(&self, hash: u64) {
+        let idx = self.slot_for(hash);
+        let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = ptr;
@@ -423,6 +429,132 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         }
     }
 
+    /// Prefetch the cache line backing slot `idx` into L1.
+    #[inline(always)]
+    fn prefetch_entry(&self, idx: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let ptr = &self.buffer[idx] as *const Entry<K, V> as *const i8;
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = idx;
+    }
+
+    /// Probe row `i` (hash `hash`) against `slot` for [`merge_batch`](Self::merge_batch).
+    ///
+    /// Returns `true` when the row is resolved — either by claiming an empty slot
+    /// (insert) or by merging into a slot holding the same key. On a collision
+    /// (occupied by a different key) it advances `slots[i]` to the next slot and
+    /// returns `false`, so the caller re-queues the row for the following pass.
+    #[inline(always)]
+    fn probe_row_for_slot<S: BatchRowSource<K, V>>(
+        &mut self,
+        i: usize,
+        slot: usize,
+        hash: u64,
+        slots: &mut [usize],
+        rows: &mut S,
+    ) -> bool {
+        let stored = self.buffer[slot].hash;
+        if stored == 0 {
+            let key = rows.persisted(i);
+            let value = rows.value(i);
+            self.buffer[slot] = Entry { hash, key, value };
+            self.length += 1;
+            true
+        } else if stored == hash && rows.key_eq(i, &self.buffer[slot].key) {
+            let value = rows.value(i);
+            self.buffer[slot].value = self.buffer[slot].value.merge(value);
+            true
+        } else {
+            self.collisions += 1;
+            slots[i] = (slot + 1) & self.mask;
+            false
+        }
+    }
+
+    /// Insert/merge a whole batch of rows with a batched, multi-pass linear probe.
+    ///
+    /// The scalar [`merge`](Self::merge) walks one row's probe chain to the end
+    /// before starting the next, so each cache-missing slot is a serial
+    /// dependency. Instead, this advances every unresolved row by just **one**
+    /// slot per pass, so the many probes in a pass hit independent slots and the
+    /// CPU keeps their misses in flight.
+    ///
+    /// Steps:
+    /// 1. **Pass 1** — for each row, compute its home slot and try to resolve it
+    ///    there via [`probe_row_for_slot`](Self::probe_row_for_slot): claim an
+    ///    empty slot (insert), or merge into a slot holding the same key. A row
+    ///    that collides (slot held by a *different* key) has its probe advanced
+    ///    one slot and its index pushed onto the `unresolved` worklist.
+    /// 2. **Passes 2+** — re-probe only the `unresolved` rows at their advanced
+    ///    slots; any that still collide spill into `unresolved_scratch`. Swap the
+    ///    two worklists and repeat over the shrinking set until none remain.
+    ///
+    /// Re-reading the slot each pass keeps duplicate keys within the batch
+    /// correct: the first row claims the slot, the rest take the equal-key merge.
+    ///
+    /// `slots`, `unresolved`, `unresolved_scratch` are caller scratch of length
+    /// ≥ `length`; `hashes` holds the row hashes (0 is remapped to 1 in place to
+    /// keep the empty-slot sentinel). The caller MUST ensure `capacity - len >
+    /// length`, so every probe eventually finds an empty slot and the passes
+    /// terminate.
+    #[inline]
+    pub fn merge_batch<S: BatchRowSource<K, V>>(
+        &mut self,
+        length: usize,
+        hashes: &mut [u64],
+        slots: &mut [usize],
+        unresolved: &mut [u32],
+        unresolved_scratch: &mut [u32],
+        rows: &mut S,
+    ) {
+        /// How far ahead, in row positions, to prefetch each slot.
+        const PREFETCH_DIST: usize = 16;
+
+        // Pass 1: probe every row at its home slot, computing the slot inline.
+        // Rows that resolve here (insert or merge) never touch the scratch
+        // arrays; only collided rows are recorded — advanced slot in `slots[i]`,
+        // index onto `unresolved` — for the follow-up passes. Folding the slot
+        // computation in here avoids materialising a slot for *every* row, which
+        // is pure overhead in the common low-collision / merge-heavy case.
+        let mut collided = 0usize;
+        for i in 0..length {
+            if i + PREFETCH_DIST < length {
+                self.prefetch_entry(self.slot_for(hashes[i + PREFETCH_DIST]));
+            }
+            let hash = remap_zero(hashes[i]);
+            hashes[i] = hash;
+            let slot = self.slot_for(hash);
+            if !self.probe_row_for_slot(i, slot, hash, slots, rows) {
+                unresolved[collided] = i as u32;
+                collided += 1;
+            }
+        }
+
+        // Passes 2+: walk only the still-unresolved rows, ping-ponging the
+        // worklist between the two scratch buffers. Each pass advances every row
+        // by one slot, keeping their probes independent so misses stay in flight.
+        let (mut work, mut spill) = (unresolved, unresolved_scratch);
+        let mut remaining = collided;
+        while remaining > 0 {
+            let mut collided = 0usize;
+            for k in 0..remaining {
+                if k + PREFETCH_DIST < remaining {
+                    self.prefetch_entry(slots[work[k + PREFETCH_DIST] as usize]);
+                }
+                let i = work[k] as usize;
+                if !self.probe_row_for_slot(i, slots[i], hashes[i], slots, rows) {
+                    spill[collided] = i as u32;
+                    collided += 1;
+                }
+            }
+            std::mem::swap(&mut work, &mut spill);
+            remaining = collided;
+        }
+    }
+
     /// Rehash all entries into a new buffer of `new_size` slots.
     ///
     /// Replaces the current buffer with `buffer` (which must be zeroed and
@@ -503,9 +635,6 @@ mod tests {
     struct Count(usize);
 
     impl Value for Count {
-        fn single() -> Self {
-            Count(1)
-        }
         fn merge(self, v: Self) -> Self {
             Count(self.0 + v.0)
         }
@@ -531,7 +660,7 @@ mod tests {
     fn insert_single_entry() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 100u64, Count::single());
+        table.merge::<false, _>(42, 100u64, Count(1));
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -543,9 +672,9 @@ mod tests {
     fn merge_duplicate_keys_sums_values() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 100u64, Count::single());
-        table.merge::<false, _>(42, 100u64, Count::single());
-        table.merge::<false, _>(42, 100u64, Count::single());
+        table.merge::<false, _>(42, 100u64, Count(1));
+        table.merge::<false, _>(42, 100u64, Count(1));
+        table.merge::<false, _>(42, 100u64, Count(1));
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -556,8 +685,8 @@ mod tests {
     fn distinct_keys_same_hash_both_stored() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 1u64, Count::single());
-        table.merge::<false, _>(42, 2u64, Count::single());
+        table.merge::<false, _>(42, 1u64, Count(1));
+        table.merge::<false, _>(42, 2u64, Count(1));
 
         assert_eq!(table.len(), 2);
         let entries: Vec<_> = table.iter(0).collect();
@@ -570,7 +699,7 @@ mod tests {
     fn hash_zero_is_remapped_and_retrievable() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(0, 99u64, Count::single());
+        table.merge::<false, _>(0, 99u64, Count(1));
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -584,11 +713,11 @@ mod tests {
         let max_load = (16.0 * MAX_LOAD_FACTOR).round() as usize;
 
         for i in 0..max_load {
-            table.merge::<false, _>(i as u64 + 1, i as u64, Count::single());
+            table.merge::<false, _>(i as u64 + 1, i as u64, Count(1));
             assert!(!table.undersized());
         }
 
-        table.merge::<false, _>(max_load as u64 + 1, max_load as u64, Count::single());
+        table.merge::<false, _>(max_load as u64 + 1, max_load as u64, Count(1));
 
         assert!(table.undersized());
     }
@@ -597,10 +726,10 @@ mod tests {
     fn collision_counting() {
         let mut table = new_table(16);
 
-        table.merge::<true, _>(42, 1u64, Count::single());
+        table.merge::<true, _>(42, 1u64, Count(1));
         assert_eq!(table.collisions(), 0);
 
-        table.merge::<true, _>(42, 2u64, Count::single());
+        table.merge::<true, _>(42, 2u64, Count(1));
         assert_eq!(table.collisions(), 1);
     }
 
@@ -608,8 +737,8 @@ mod tests {
     fn collision_counting_disabled() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 1u64, Count::single());
-        table.merge::<false, _>(42, 2u64, Count::single());
+        table.merge::<false, _>(42, 1u64, Count(1));
+        table.merge::<false, _>(42, 2u64, Count(1));
 
         assert_eq!(table.collisions(), 0);
     }
@@ -618,8 +747,8 @@ mod tests {
     fn iter_skips_empty_slots() {
         let mut table = new_table(128);
 
-        table.merge::<false, _>(1, 10u64, Count::single());
-        table.merge::<false, _>(2, 20u64, Count::single());
+        table.merge::<false, _>(1, 10u64, Count(1));
+        table.merge::<false, _>(2, 20u64, Count(1));
 
         let entries: Vec<_> = table.iter(0).collect();
         assert_eq!(entries.len(), 2);
@@ -630,7 +759,7 @@ mod tests {
     fn resize_preserves_all_entries() {
         let mut table = new_table(16);
         for i in 0..8u64 {
-            table.merge::<false, _>(i + 1, i, Count::single());
+            table.merge::<false, _>(i + 1, i, Count(1));
         }
 
         let new_buf = vec![Entry::default(); 32];
@@ -647,8 +776,8 @@ mod tests {
     #[test]
     fn resize_resets_collision_counter() {
         let mut table = new_table(16);
-        table.merge::<true, _>(42, 1u64, Count::single());
-        table.merge::<true, _>(42, 2u64, Count::single());
+        table.merge::<true, _>(42, 1u64, Count(1));
+        table.merge::<true, _>(42, 2u64, Count(1));
         let pre_resize_collisions = table.collisions();
         assert!(pre_resize_collisions > 0);
 
@@ -663,7 +792,7 @@ mod tests {
         let mut table = new_table(256);
 
         for i in 0..100u64 {
-            table.merge::<false, _>(i + 1, i, Count::single());
+            table.merge::<false, _>(i + 1, i, Count(1));
         }
 
         assert_eq!(table.len(), 100);
@@ -678,9 +807,9 @@ mod tests {
         let mut table = new_table(16);
         let last_slot_hash = u64::MAX;
 
-        table.merge::<false, _>(last_slot_hash, 1u64, Count::single());
-        table.merge::<false, _>(last_slot_hash, 2u64, Count::single());
-        table.merge::<false, _>(last_slot_hash, 3u64, Count::single());
+        table.merge::<false, _>(last_slot_hash, 1u64, Count(1));
+        table.merge::<false, _>(last_slot_hash, 2u64, Count(1));
+        table.merge::<false, _>(last_slot_hash, 3u64, Count(1));
 
         assert_eq!(table.len(), 3);
         let keys: Vec<u64> = table.iter(0).map(|e| *e.key()).collect();
@@ -701,13 +830,13 @@ mod tests {
     #[test]
     fn merge_after_resize() {
         let mut table = new_table(16);
-        table.merge::<false, _>(42, 1u64, Count::single());
-        table.merge::<false, _>(99, 2u64, Count::single());
+        table.merge::<false, _>(42, 1u64, Count(1));
+        table.merge::<false, _>(99, 2u64, Count(1));
 
         let new_buf = vec![Entry::default(); 32];
         table.resize_with(new_buf, 32);
-        table.merge::<false, _>(42, 1u64, Count::single());
-        table.merge::<false, _>(200, 3u64, Count::single());
+        table.merge::<false, _>(42, 1u64, Count(1));
+        table.merge::<false, _>(200, 3u64, Count(1));
 
         assert_eq!(table.len(), 3);
         let merged = table.iter(0).find(|e| *e.key() == 1).unwrap();
@@ -718,7 +847,7 @@ mod tests {
     #[test]
     fn entry_at_returns_correct_slot() {
         let mut table = new_table(16);
-        table.merge::<false, _>(42, 100u64, Count::single());
+        table.merge::<false, _>(42, 100u64, Count(1));
 
         let occupied: Vec<usize> = (0..table.capacity())
             .filter(|&i| table.entry_at(i).hash() != 0)
@@ -732,7 +861,7 @@ mod tests {
     fn iter_with_start_offset() {
         let mut table = new_table(128);
         for i in 0..20u64 {
-            table.merge::<false, _>(i + 1, i, Count::single());
+            table.merge::<false, _>(i + 1, i, Count(1));
         }
 
         let all_count = table.iter(0).count();

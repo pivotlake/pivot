@@ -11,7 +11,7 @@
 
 use crate::catalog::Catalog;
 use crate::expression::{AggregateFunc, Expression, Function, NumericAggregate, Ref};
-use crate::operator::{self, Operator};
+use crate::operator::{self, Operator, OrderByDirection};
 use crate::types::Type;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -174,6 +174,68 @@ impl PlanNode {
         }
         if let Operator::Projection(p) = &mut self.operator {
             p.projections = new_projs;
+        }
+    }
+
+    /// Detect `grouped Aggregate → (pass-through projections) → TopN(ORDER BY
+    /// <agg col> DESC LIMIT k)` and annotate the aggregate with `top_k`, so the
+    /// group operator emits only each partition's top-k rows instead of every
+    /// group (top-k is decomposable across partitions). Only handles DESC with
+    /// a single ref order key traced through column-ref-only projections.
+    pub(crate) fn annotate_group_topn(&mut self) {
+        for child in &mut self.inputs {
+            child.annotate_group_topn();
+        }
+
+        let (mut col, limit) = match &self.operator {
+            Operator::TopN(t) if t.order_bys.len() == 1 => {
+                let ob = &t.order_bys[0];
+                match (&ob.direction, &ob.expression) {
+                    (OrderByDirection::Desc, Expression::Ref(r)) => (r.column_idx, t.limit),
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+
+        // Walk down single-input projections, mapping the order column, until
+        // we reach the aggregate.
+        let mut node = match self.inputs.first_mut() {
+            Some(n) => n,
+            None => return,
+        };
+        loop {
+            enum Step {
+                Proj(usize),
+                SetAgg(usize),
+                Stop,
+            }
+            let step = match &node.operator {
+                Operator::Projection(p) => match p.projections.get(col) {
+                    Some(Expression::Ref(r)) => Step::Proj(r.column_idx),
+                    _ => Step::Stop,
+                },
+                Operator::Aggregate(a) if !a.groups.is_empty() && col >= a.groups.len() => {
+                    Step::SetAgg(col - a.groups.len())
+                }
+                _ => Step::Stop,
+            };
+            match step {
+                Step::Proj(next) => {
+                    col = next;
+                    node = match node.inputs.first_mut() {
+                        Some(n) => n,
+                        None => return,
+                    };
+                }
+                Step::SetAgg(slot) => {
+                    if let Operator::Aggregate(a) = &mut node.operator {
+                        a.top_k = Some((slot, limit));
+                    }
+                    return;
+                }
+                Step::Stop => return,
+            }
         }
     }
 }

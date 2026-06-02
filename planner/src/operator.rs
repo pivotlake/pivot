@@ -182,12 +182,17 @@ impl fmt::Display for OrderBy {
 pub struct Aggregate {
     pub groups: Vec<Expression>,
     pub expressions: Vec<Expression>,
+    /// Set by the `group → TopN` detection pass to `Some((value_slot, limit))`
+    /// when this grouped aggregate feeds an `ORDER BY <slot> DESC LIMIT limit`,
+    /// so the group operator emits only each partition's top-`limit` rows.
+    pub top_k: Option<(usize, usize)>,
 }
 
 impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
     type Error = Error;
     fn try_from(a: duckdb_operator::Aggregate) -> Result<Self, Self::Error> {
         Ok(Aggregate {
+            top_k: None,
             groups: a
                 .groups
                 .into_iter()

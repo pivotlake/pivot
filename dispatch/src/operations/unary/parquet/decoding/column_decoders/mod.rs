@@ -32,7 +32,6 @@ use crate::memory::{ReaderPosition, SlabAllocator};
 use crate::operations::unary::parquet::types::page::DecompressedPage;
 use crate::operations::unary::parquet::types::thrift::general::Encoding;
 use arrow_array::ArrayRef;
-use arrow_buffer::Buffer;
 use bytes::Bytes;
 use thiserror::Error;
 
@@ -69,27 +68,9 @@ pub trait ColumnDecoder {
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 }
 
-/// Accumulates decoded values of a single type and finalises them into an
-/// Arrow array.
-pub trait ArrayBuilder {
-    type Element: Copy;
-
-    /// Creates a builder pre-allocated for `capacity` elements.
-    fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self;
-
-    /// Number of elements pushed so far.
-    fn len(&self) -> usize;
-
-    /// Appends `element` repeated `amount` times (used by RLE runs).
-    fn push(&mut self, element: &Self::Element, amount: usize);
-
-    /// Returns a mutable slice of `count` uninitialised slots at the end of
-    /// the buffer, advancing the length. Callers must fill every slot.
-    fn spare_mut(&mut self, count: usize) -> &mut [Self::Element];
-
-    /// Consumes the builder and returns the finished Arrow array.
-    fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef;
-}
+// `ArrayBuilder` (and the primitive builder) now live in `crate::arrays` so the
+// GROUP BY output can share them; re-exported here for the parquet decoders.
+pub use crate::arrays::ArrayBuilder;
 
 /// Reads plain-encoded values from raw page bytes into an [`ArrayBuilder`].
 pub trait DecodePlain {

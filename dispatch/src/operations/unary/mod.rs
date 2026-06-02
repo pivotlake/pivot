@@ -41,7 +41,10 @@
 //! - [`GroupFactory`] — Hash-based group-by with aggregation.
 
 mod group;
-pub use group::{GroupFactory, IntKeyExtractor, KeyExtractor, StringKeyExtractor};
+pub use group::{
+    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count, GroupFactory,
+    IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor, Sum, ValueExtractor,
+};
 
 #[cfg(test)]
 pub(crate) mod test_utils;
