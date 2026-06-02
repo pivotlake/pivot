@@ -1,59 +1,74 @@
 use crate::operations::KeyExtractor;
-use crate::operations::unary::group::aggregations::Count;
+use crate::operations::unary::group::aggregations::{Count, GroupAggSlot};
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::arena_key::ResolvedKey;
-use crate::operations::unary::group::hashtables::{Table, TableStorage};
+use crate::operations::unary::group::hashtables::{Table, TableStorage, Value};
 use crate::operations::unary::group::{ArenaKey, StringKey};
+use ahash::RandomState;
 use arrow_array::builder::UInt64Builder;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use std::sync::Arc;
 
-/// A `KeyExtractor` for `StringViewArray` columns. This allows creating group bys with Strings
-/// as keys.
+/// A `KeyExtractor` for a single `StringViewArray` column, counting
+/// occurrences per key (`GROUP BY str_col` → `COUNT(*)`).
 ///
-/// Live keys borrow the raw `&str` from the input array and hold a mutable
-/// reference to the `WorkerArena`. If a key turns out to be new (not
-/// already in the hash table), `LiveKey::persist` pushes the string bytes
-/// into the arena and returns an `ArenaKey` — a u128 with the same layout
-/// as Arrow's StringView (inline for ≤12 bytes, otherwise a buffer
-/// index + offset).
-///
-/// During the merge phase, persisted keys are resolved back to byte slices
-/// via `ResolvedKey`, which borrows from the `SharedArena`.
-///
-/// Output uses zero-copy: the `StringViewArray` in the result batch points
-/// directly into the arena's ring buffers (kept alive via `Arc<SharedArena>`). The u128s are also
-/// copied as is
+/// Live keys borrow the raw `&str` from the input array; new keys are
+/// persisted into the shared arena as an `ArenaKey` (a u128 with the same
+/// layout as Arrow's StringView). Output is zero-copy: the result
+/// `StringViewArray` points directly into the arena's ring buffers.
 pub struct StringKeyExtractor;
 
 impl KeyExtractor for StringKeyExtractor {
-    type ArrayRef<'a> = &'a StringViewArray;
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;
     type PersistedLiveKey<'a> = ResolvedKey<'a>;
     type Value = Count;
+    type Reader<'b> = &'b StringViewArray;
+
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _value_slots: &[GroupAggSlot],
+    ) -> Self::Reader<'b> {
+        batch
+            .column(key_cols[0])
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("string key column type mismatch")
+    }
+
+    #[inline(always)]
+    fn rows(reader: &Self::Reader<'_>) -> usize {
+        reader.len()
+    }
+
+    #[inline(always)]
+    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64 {
+        state.hash_one(unsafe { reader.value_unchecked(idx) })
+    }
 
     #[inline(always)]
     fn live_key<'a, 'b>(
-        column: &Self::ArrayRef<'b>,
+        reader: &Self::Reader<'b>,
         idx: usize,
         arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'b> {
-        let val = unsafe { column.value_unchecked(idx) };
+        let val = unsafe { reader.value_unchecked(idx) };
         StringKey::new(arena, val)
     }
 
-    fn resolve_persisted<'a>(arena: &'a SharedArena, persisted: ArenaKey) -> ResolvedKey<'a> {
+    #[inline(always)]
+    fn value(_reader: &Self::Reader<'_>, _idx: usize) -> Count {
+        Count::single()
+    }
+
+    fn resolve_persisted(arena: &SharedArena, persisted: ArenaKey) -> ResolvedKey<'_> {
         ResolvedKey {
             key: persisted,
             arena,
         }
-    }
-
-    fn downcast_column(column: &dyn Array) -> Option<&StringViewArray> {
-        column.as_any().downcast_ref::<StringViewArray>()
     }
 
     fn create_record_batch<S: TableStorage<Self>>(

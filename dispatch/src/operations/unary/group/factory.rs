@@ -9,7 +9,7 @@
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{KeyExtractor, MultiSlabTable};
-use crate::operations::unary::group::{Group, PartitionJob};
+use crate::operations::unary::group::{Group, GroupAggSlot, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
@@ -29,7 +29,8 @@ use std::sync::{Arc, mpsc};
 /// the channel and inject partition jobs during the output phase.
 pub struct GroupFactory<K: KeyExtractor> {
     shared_arena: Arc<SharedArena>,
-    group_column: usize,
+    key_cols: Vec<usize>,
+    value_slots: Vec<GroupAggSlot>,
     hash_state: RandomState,
     injector: Arc<Injector<PartitionJob<K>>>,
     partition_jobs_injected: Arc<AtomicBool>,
@@ -40,9 +41,11 @@ pub struct GroupFactory<K: KeyExtractor> {
 
 impl<K: KeyExtractor> GroupFactory<K> {
     /// Create `worker_count` factories that share the same arena, hash state,
-    /// and synchronization primitives.
+    /// and synchronization primitives. `key_cols` are the GROUP BY column
+    /// indices; `value_slots` configure the per-group aggregates.
     pub fn create_for_workers(
-        group_column: usize,
+        key_cols: Vec<usize>,
+        value_slots: Vec<GroupAggSlot>,
         worker_count: usize,
         buffers: usize,
     ) -> impl IntoIterator<Item = GroupFactory<K>> {
@@ -55,7 +58,8 @@ impl<K: KeyExtractor> GroupFactory<K> {
 
         (0..worker_count).map(move |_| GroupFactory {
             shared_arena: shared_arena.clone(),
-            group_column,
+            key_cols: key_cols.clone(),
+            value_slots: value_slots.clone(),
             hash_state: hash_state.clone(),
             injector: injector.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
@@ -73,7 +77,8 @@ impl<K: KeyExtractor> UnaryFactory<RecordBatch, RecordBatch> for GroupFactory<K>
             self.shared_arena,
             self.hash_state,
             self.injector,
-            self.group_column,
+            self.key_cols,
+            self.value_slots,
             self.sender,
             self.receiver.take(),
             self.partition_jobs_injected,

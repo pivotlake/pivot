@@ -1,8 +1,9 @@
 use crate::operations::KeyExtractor;
-use crate::operations::unary::group::aggregations::Count;
+use crate::operations::unary::group::aggregations::{Count, GroupAggSlot};
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
-use crate::operations::unary::group::hashtables::{Table, TableStorage};
+use crate::operations::unary::group::hashtables::{Table, TableStorage, Value};
+use ahash::RandomState;
 use arrow_array::builder::{PrimitiveBuilder, UInt64Builder};
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
@@ -19,17 +20,13 @@ macro_rules! impl_persisted_key {
     }
 }
 
-impl_persisted_key!(i8, i16, i32, i64, u8, u16, u32, u64);
+impl_persisted_key!(i8, i16, i32, i64, u8, u16, u32, u64, u128);
 
-/// A `KeyExtractor` for Arrow primitive (integer) columns. This allows creating group bys with ints
-/// as keys.
+/// A `KeyExtractor` for a single Arrow primitive (integer) column, counting
+/// occurrences per key (`GROUP BY int_col` → `COUNT(*)`).
 ///
-/// Since native integer types are `Copy`, the live and persisted key forms
-/// are identical — no arena allocation is needed. This makes integer GROUP BY
-/// essentially zero-copy on the key side.
-///
-/// Parameterized over `T: ArrowPrimitiveType` so a single implementation
-/// covers `Int32Array`, `UInt64Array`, etc.
+/// Native integer types are `Copy`, so live and persisted key forms are
+/// identical — no arena allocation is needed.
 pub struct IntKeyExtractor<T: ArrowPrimitiveType>(PhantomData<T>)
 where
     T::Native: PersistedKey + Hash + Eq;
@@ -43,26 +40,50 @@ impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for IntKeyExtractor<T>
 where
     T::Native: PersistedKey + Hash + Eq,
 {
-    type ArrayRef<'a> = &'a PrimitiveArray<T>;
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;
     type PersistedLiveKey<'a> = T::Native;
     type Value = Count;
+    type Reader<'b> = &'b PrimitiveArray<T>;
 
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _value_slots: &[GroupAggSlot],
+    ) -> Self::Reader<'b> {
+        batch
+            .column(key_cols[0])
+            .as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .expect("int key column type mismatch")
+    }
+
+    #[inline(always)]
+    fn rows(reader: &Self::Reader<'_>) -> usize {
+        reader.len()
+    }
+
+    #[inline(always)]
+    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64 {
+        state.hash_one(unsafe { reader.value_unchecked(idx) })
+    }
+
+    #[inline(always)]
     fn live_key<'a, 'b>(
-        column: &Self::ArrayRef<'b>,
+        reader: &Self::Reader<'b>,
         idx: usize,
         _arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'b> {
-        unsafe { column.value_unchecked(idx) }
+        unsafe { reader.value_unchecked(idx) }
+    }
+
+    #[inline(always)]
+    fn value(_reader: &Self::Reader<'_>, _idx: usize) -> Count {
+        Count::single()
     }
 
     fn resolve_persisted(_arena: &SharedArena, persisted: T::Native) -> T::Native {
         persisted
-    }
-
-    fn downcast_column(column: &dyn Array) -> Option<&PrimitiveArray<T>> {
-        column.as_any().downcast_ref::<PrimitiveArray<T>>()
     }
 
     fn create_record_batch<S: TableStorage<Self>>(
