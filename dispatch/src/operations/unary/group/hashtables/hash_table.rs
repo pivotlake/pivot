@@ -108,6 +108,13 @@ fn max_load_for_len(len: usize) -> usize {
     (len as f64 * MAX_LOAD_FACTOR).round() as usize
 }
 
+/// Remap the empty-slot sentinel: `hash == 0` marks an empty slot, so a real
+/// zero hash is bumped to 1 before it is stored or probed.
+#[inline(always)]
+fn remap_zero(hash: u64) -> u64 {
+    if hash == 0 { 1 } else { hash }
+}
+
 /// A linear probing hash table optimized for never rehashing, exposing a very raw interface allowing
 /// maximum control by the caller.
 ///
@@ -456,6 +463,51 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         }
     }
 
+    /// Prefetch the cache line backing slot `idx` into L1.
+    #[inline(always)]
+    fn prefetch_entry(&self, idx: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let ptr = &self.buffer[idx] as *const Entry<K, V> as *const i8;
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = idx;
+    }
+
+    /// Probe row `i` (hash `hash`) against `slot` for [`merge_batch`](Self::merge_batch).
+    ///
+    /// Returns `true` when the row is resolved — either by claiming an empty slot
+    /// (insert) or by merging into a slot holding the same key. On a collision
+    /// (occupied by a different key) it advances `slots[i]` to the next slot and
+    /// returns `false`, so the caller re-queues the row for the following pass.
+    #[inline(always)]
+    fn resolve_row<S: BatchRowSource<K, V>>(
+        &mut self,
+        i: usize,
+        slot: usize,
+        hash: u64,
+        slots: &mut [usize],
+        src: &mut S,
+    ) -> bool {
+        let stored = self.buffer[slot].hash;
+        if stored == 0 {
+            let key = src.persisted(i);
+            let value = src.value(i);
+            self.buffer[slot] = Entry { hash, key, value };
+            self.length += 1;
+            true
+        } else if stored == hash && src.key_eq(i, &self.buffer[slot].key) {
+            let value = src.value(i);
+            self.buffer[slot].value = self.buffer[slot].value.merge(value);
+            true
+        } else {
+            self.collisions += 1;
+            slots[i] = (slot + 1) & self.mask;
+            false
+        }
+    }
+
     /// Batched, multi-pass probe insert — the structure DuckDB uses in
     /// `FindOrCreateGroupsInternal`.
     ///
@@ -467,11 +519,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     /// keeps many misses in flight; collisions are deferred to the next pass over
     /// the (shrinking) unresolved set.
     ///
-    /// Correctness mirrors `merge` exactly:
-    /// - empty slot (`hash == 0`) → claim it (insert);
-    /// - stored hash equals the row hash and keys compare equal → merge values;
-    /// - otherwise advance one slot and retry next pass.
-    ///
+    /// Correctness mirrors `merge` exactly (see [`resolve_row`](Self::resolve_row)).
     /// Because the slot is re-read each pass, two rows in the same batch with the
     /// same key (same hash → same slot) resolve correctly: the first claims the
     /// slot, the rest fall into the equal-key merge branch.
@@ -493,94 +541,45 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         /// How far ahead, in row positions, to prefetch each slot.
         const PREFETCH_DIST: usize = 16;
 
-        // Pass 1 over every row, slot computed inline. Rows that resolve on the
-        // first probe (empty slot → insert, or matching key → merge) finish here
-        // and never touch the scratch arrays. Only collided rows are recorded —
-        // their advanced slot in `slots[i]`, their index in `next` — for the later
-        // passes. Folding the slot computation into the probe avoids a separate
-        // init pass that would materialise `slots`/`sel` for *every* row, which is
-        // pure overhead in the common (low-collision / merge-heavy) case where
-        // almost everything resolves in this first pass.
-        let mut adv = 0usize;
-        let mut i = 0usize;
-        while i < length {
+        // Pass 1: probe every row at its home slot, computing the slot inline.
+        // Rows that resolve here (insert or merge) never touch the scratch
+        // arrays; only collided rows are recorded — advanced slot in `slots[i]`,
+        // index in `next` — for the follow-up passes. Folding the slot
+        // computation in here avoids materialising `slots`/`sel` for *every* row,
+        // which is pure overhead in the common low-collision / merge-heavy case.
+        let mut collided = 0usize;
+        for i in 0..length {
             if i + PREFETCH_DIST < length {
-                let fh = hashes[i + PREFETCH_DIST];
-                let fh = if fh == 0 { 1 } else { fh };
-                let fptr = &self.buffer[self.slot_for(fh)] as *const Entry<K, V> as *const u8;
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                        fptr as *const i8,
-                    );
-                }
+                self.prefetch_entry(self.slot_for(hashes[i + PREFETCH_DIST]));
             }
-            let h = if hashes[i] == 0 { 1 } else { hashes[i] };
-            hashes[i] = h;
-            let s = self.slot_for(h);
-            let eh = self.buffer[s].hash;
-            if eh == 0 {
-                let key = src.persisted(i);
-                let value = src.value(i);
-                let entry = &mut self.buffer[s];
-                entry.hash = h;
-                entry.key = key;
-                entry.value = value;
-                self.length += 1;
-            } else if eh == h && src.key_eq(i, &self.buffer[s].key) {
-                let value = src.value(i);
-                self.buffer[s].value = self.buffer[s].value.merge(value);
-            } else {
-                self.collisions += 1;
-                slots[i] = (s + 1) & self.mask;
-                next[adv] = i as u32;
-                adv += 1;
+            let hash = remap_zero(hashes[i]);
+            hashes[i] = hash;
+            let slot = self.slot_for(hash);
+            if !self.resolve_row(i, slot, hash, slots, src) {
+                next[collided] = i as u32;
+                collided += 1;
             }
-            i += 1;
         }
 
-        // Passes 2+: only the collided rows, ping-ponging between `next` and `sel`.
-        let (mut cur, mut nxt) = (next, sel);
-        let mut remaining = adv;
+        // Passes 2+: walk only the still-unresolved rows, ping-ponging the
+        // worklist between `next` and `sel`. Each pass advances every row by one
+        // slot, keeping their probes independent so misses stay in flight.
+        let (mut work, mut spill) = (next, sel);
+        let mut remaining = collided;
         while remaining > 0 {
-            let mut adv2 = 0usize;
-            let mut k = 0usize;
-            while k < remaining {
+            let mut collided = 0usize;
+            for k in 0..remaining {
                 if k + PREFETCH_DIST < remaining {
-                    let fi = cur[k + PREFETCH_DIST] as usize;
-                    let fptr = &self.buffer[slots[fi]] as *const Entry<K, V> as *const u8;
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                            fptr as *const i8,
-                        );
-                    }
+                    self.prefetch_entry(slots[work[k + PREFETCH_DIST] as usize]);
                 }
-
-                let i = cur[k] as usize;
-                k += 1;
-                let s = slots[i];
-                let eh = self.buffer[s].hash;
-                if eh == 0 {
-                    let key = src.persisted(i);
-                    let value = src.value(i);
-                    let entry = &mut self.buffer[s];
-                    entry.hash = hashes[i];
-                    entry.key = key;
-                    entry.value = value;
-                    self.length += 1;
-                } else if eh == hashes[i] && src.key_eq(i, &self.buffer[s].key) {
-                    let value = src.value(i);
-                    self.buffer[s].value = self.buffer[s].value.merge(value);
-                } else {
-                    self.collisions += 1;
-                    slots[i] = (s + 1) & self.mask;
-                    nxt[adv2] = i as u32;
-                    adv2 += 1;
+                let i = work[k] as usize;
+                if !self.resolve_row(i, slots[i], hashes[i], slots, src) {
+                    spill[collided] = i as u32;
+                    collided += 1;
                 }
             }
-            std::mem::swap(&mut cur, &mut nxt);
-            remaining = adv2;
+            std::mem::swap(&mut work, &mut spill);
+            remaining = collided;
         }
     }
 
