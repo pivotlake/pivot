@@ -90,6 +90,14 @@ impl Ring {
             return Err(io::Error::last_os_error());
         }
 
+        // Back the ring with transparent huge pages. Slots are BUFFER_SIZE (2MB)
+        // aligned and sized, so each maps to exactly one 2MB page, cutting TLB
+        // entries ~512x versus the default 4KB pages — worthwhile for a multi-GB
+        // region under random access. Best-effort: ignored if THP is unavailable.
+        unsafe {
+            libc::madvise(ptr, buffers * BUFFER_SIZE, libc::MADV_HUGEPAGE);
+        }
+
         // Verify alignment
         assert_eq!(
             ptr as usize % BUFFER_ALIGN,
