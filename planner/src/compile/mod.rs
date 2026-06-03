@@ -75,7 +75,7 @@ pub enum Error {
 
 impl Plan {
     /// Lower this plan into an executable
-    /// [`RecordBatchOperatorSpec`](dispatch::RecordBatchOperatorSpec) on the
+    /// [`dispatch::RecordBatchOperatorSpec`] on the
     /// given dispatcher. The catalog the plan was bound against is read from
     /// [`Plan::catalog`] for operators that need it at runtime
     /// (e.g. `CREATE TABLE`).

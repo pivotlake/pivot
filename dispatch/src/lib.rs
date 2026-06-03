@@ -174,7 +174,7 @@ impl DataFlowDispatcher {
 
 /// Owns the worker threads and exposes a [`DataFlowDispatcher`] for sending work to them.
 ///
-/// Created via [`Dispatch::spin_up`], which spawns one [`Worker`] per CPU core (pinned
+/// Created via [`Dispatch::spin_up`], which spawns one `Worker` per CPU core (pinned
 /// to its core, connected via an mpsc channel for receiving [`DataFlowBuilder`]s) and
 /// then blocks until all workers have completed their startup. Borrow the inner
 /// dispatcher with [`dispatcher`](Self::dispatcher) and shut everything down with

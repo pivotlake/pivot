@@ -144,7 +144,7 @@ impl WorkerWaker {
 /// Install this thread's view of the shared [`WorkerWaker`].
 ///
 /// Called by [`Worker::create`] before the event loop starts (and by
-/// [`install_test_worker_waker`] from test setup). The `Arc` is kept alive
+/// `install_test_worker_waker` from test setup). The `Arc` is kept alive
 /// by the [`Worker`] itself / by [`crate::DataFlowDispatcher`] / by the
 /// (leaked) test waker, so the raw pointer cached here is valid for the
 /// lifetime of the thread.
@@ -157,7 +157,7 @@ pub fn init_worker_waker(waker: &Arc<WorkerWaker>) {
 /// Expected to always be set on threads that drive dataflow work; mirrors
 /// [`crate::memory::memory_ctx`] in that the caller is trusted to have
 /// installed one via [`init_worker_waker`] (workers do this in
-/// [`Worker::create`]; tests do it via [`install_test_worker_waker`]).
+/// [`Worker::create`]; tests do it via `install_test_worker_waker`).
 pub fn worker_waker() -> &'static WorkerWaker {
     unsafe { &*WORKER_WAKER.get() }
 }
@@ -238,7 +238,7 @@ impl Worker {
     /// Spawn a worker thread pinned to `core`. Blocks on `ready_barrier` before
     /// entering the event loop, so all workers start roughly together.
     ///
-    /// The worker checks the process-wide [`crate::EXIT`] flag on every
+    /// The worker checks the shutdown flag set by [`Dispatch::exit`](crate::Dispatch::exit) on every
     /// iteration and returns from `run` once it flips to `true`; panics
     /// inside the event loop propagate normally and surface through the
     /// returned [`JoinHandle`].

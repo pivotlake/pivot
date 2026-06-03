@@ -119,7 +119,7 @@ impl<O: 'static, NF: NullaryFactory<O>> OperatorFactory<O> for NullaryOperatorFa
 ///
 /// Used to plumb one-shot setup work (e.g. building a `ParquetTable`) into a
 /// worker thread that has a `MemoryContext`, so the caller doesn't have to
-/// have one. See [`Dispatch::run_on_worker`](crate::Dispatch::run_on_worker).
+/// have one. See [`DataFlowDispatcher::run_on_worker`](crate::DataFlowDispatcher::run_on_worker).
 pub struct OneShotNullaryFactory<O, F>
 where
     F: FnOnce() -> O + Send + 'static,

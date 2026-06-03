@@ -28,7 +28,7 @@ pub fn memory_ctx() -> &'static MemoryContext {
 
 /// True when a [`MemoryContext`] is installed on the current thread — i.e. the
 /// caller is running on a dispatch worker (or a test that called
-/// [`init_test_free_pool`]). Worker-only APIs that reach into the per-thread
+/// `init_test_free_pool`). Worker-only APIs that reach into the per-thread
 /// memory context use this to fail with a clear message instead of letting
 /// [`memory_ctx`] dereference the null context pointer.
 pub fn has_memory_context() -> bool {

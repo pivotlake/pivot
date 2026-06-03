@@ -202,7 +202,7 @@ impl AsRef<[u8]> for SlotPin {
     }
 }
 
-/// A CLOCK-eviction region cache over the shared [`Ring`].
+/// A CLOCK-eviction region cache over the shared [`Ring`](super::Ring).
 pub struct FileCache {
     file_maps: RwLock<HashMap<RawFd, RwLock<HashMap<usize, FileCacheEntry>>>>,
     entries: Box<[UnsafeCell<Entry>]>,

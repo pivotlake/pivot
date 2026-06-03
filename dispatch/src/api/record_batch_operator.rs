@@ -627,7 +627,7 @@ impl RecordBatchOperatorSpec {
     /// `WriteBuffer`s and are only safe to handle on a thread with a matching
     /// `MemoryContext`. For the usual case prefer
     /// [`collect`](Self::collect), which inserts a
-    /// [`CopyOut`](crate::operations::CopyOutFactory) cap so every
+    /// `CopyOut` cap so every
     /// batch leaves the worker as plain heap-backed buffers.
     pub fn execute(self) -> DataFlowHandle<RecordBatch> {
         let factories: Vec<_> = self
@@ -640,7 +640,7 @@ impl RecordBatchOperatorSpec {
 
     /// Run the dataflow and collect every batch into a `Vec`.
     ///
-    /// Appends a [`CopyOut`](crate::operations::CopyOutFactory)
+    /// Appends a `CopyOut`
     /// stage before executing, so the batches you receive are plain
     /// heap-backed (safe to hold on any thread, regardless of
     /// `MemoryContext`).
