@@ -57,6 +57,21 @@ pub trait Value: Copy + Clone + Default {
     fn merge(self, v: Self) -> Self;
 }
 
+/// Supplies per-row keys and values to [`BaseHashTable::merge_batch`].
+///
+/// Passed as a single `&mut` so the implementation can hold a mutable borrow
+/// (e.g. of a key arena) internally without it escaping through a closure return
+/// — the methods hand back owned keys/values or a bool, never a borrow tied to
+/// that internal state.
+pub trait BatchRowSource<K: PersistedKey, V: Value> {
+    /// The persisted key for row `i` (allocating in any backing arena as needed).
+    fn persisted(&mut self, i: usize) -> K;
+    /// Whether row `i`'s key equals the already-persisted key `persisted`.
+    fn key_eq(&mut self, i: usize, persisted: &K) -> bool;
+    /// The aggregate value contributed by row `i`.
+    fn value(&mut self, i: usize) -> V;
+}
+
 /// A single slot in the hash table, storing the full hash, key, and value.
 ///
 /// `hash == 0` marks an empty slot. Real zero hashes are remapped to 1
@@ -438,6 +453,98 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
 
             // Collision with different key - linear probe to next slot
             idx = (idx + 1) & self.mask;
+        }
+    }
+
+    /// Batched, multi-pass probe insert — the structure DuckDB uses in
+    /// `FindOrCreateGroupsInternal`.
+    ///
+    /// The scalar [`merge`](Self::merge) resolves one row completely before the
+    /// next, so a row's linear-probe chain is a dependency chain the CPU must
+    /// walk one cache-missing slot at a time — terrible memory-level parallelism.
+    /// Here every still-unresolved row is advanced by exactly **one** slot per
+    /// pass, so within a pass the rows touch independent slots and the hardware
+    /// keeps many misses in flight; collisions are deferred to the next pass over
+    /// the (shrinking) unresolved set.
+    ///
+    /// Correctness mirrors `merge` exactly:
+    /// - empty slot (`hash == 0`) → claim it (insert);
+    /// - stored hash equals the row hash and keys compare equal → merge values;
+    /// - otherwise advance one slot and retry next pass.
+    ///
+    /// Because the slot is re-read each pass, two rows in the same batch with the
+    /// same key (same hash → same slot) resolve correctly: the first claims the
+    /// slot, the rest fall into the equal-key merge branch.
+    ///
+    /// `slots`, `sel`, `next` are caller scratch of length ≥ `length`; `hashes`
+    /// holds the row hashes (0 is remapped to 1 in place to preserve the empty
+    /// sentinel). The caller MUST ensure `capacity - len > length` so every probe
+    /// finds an empty slot and the passes terminate.
+    #[inline]
+    pub fn merge_batch<S: BatchRowSource<K, V>>(
+        &mut self,
+        length: usize,
+        hashes: &mut [u64],
+        slots: &mut [usize],
+        sel: &mut [u32],
+        next: &mut [u32],
+        src: &mut S,
+    ) {
+        /// How far ahead, in unresolved-row positions, to prefetch each slot.
+        const PREFETCH_DIST: usize = 16;
+
+        for i in 0..length {
+            let h = if hashes[i] == 0 { 1 } else { hashes[i] };
+            hashes[i] = h;
+            slots[i] = self.slot_for(h);
+            sel[i] = i as u32;
+        }
+
+        let (mut cur, mut nxt) = (sel, next);
+        let mut remaining = length;
+
+        while remaining > 0 {
+            let mut adv = 0usize;
+            let mut k = 0usize;
+            while k < remaining {
+                if k + PREFETCH_DIST < remaining {
+                    let fi = cur[k + PREFETCH_DIST] as usize;
+                    let fptr = &self.buffer[slots[fi]] as *const Entry<K, V> as *const u8;
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                            fptr as *const i8,
+                        );
+                    }
+                }
+
+                let i = cur[k] as usize;
+                k += 1;
+                let s = slots[i];
+                let eh = self.buffer[s].hash;
+                if eh == 0 {
+                    // Empty slot — claim it. The fresh read above means an earlier
+                    // same-pass insert at this slot is already visible, so an
+                    // in-batch duplicate key would have taken the merge branch.
+                    let key = src.persisted(i);
+                    let value = src.value(i);
+                    let entry = &mut self.buffer[s];
+                    entry.hash = hashes[i];
+                    entry.key = key;
+                    entry.value = value;
+                    self.length += 1;
+                } else if eh == hashes[i] && src.key_eq(i, &self.buffer[s].key) {
+                    let value = src.value(i);
+                    self.buffer[s].value = self.buffer[s].value.merge(value);
+                } else {
+                    self.collisions += 1;
+                    slots[i] = (s + 1) & self.mask;
+                    nxt[adv] = i as u32;
+                    adv += 1;
+                }
+            }
+            std::mem::swap(&mut cur, &mut nxt);
+            remaining = adv;
         }
     }
 

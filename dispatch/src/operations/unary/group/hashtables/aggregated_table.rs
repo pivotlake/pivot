@@ -3,10 +3,36 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::aggregations::GroupAggSlot;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
-use crate::operations::unary::group::hashtables::{DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable};
+use crate::operations::unary::group::hashtables::{
+    BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable,
+};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
+
+/// Adapts a [`KeyExtractor`] + key arena into a [`BatchRowSource`] for
+/// [`BaseHashTable::merge_batch`]. Holding the `&mut` arena here (rather than in
+/// a closure that returns a borrowed live key) keeps the arena borrow from
+/// escaping while still allowing string keys to be persisted on insert.
+struct RowSrc<'r, 'b, K: KeyExtractor> {
+    reader: &'r K::Reader<'b>,
+    arena: &'r mut WorkerArena,
+}
+
+impl<K: KeyExtractor> BatchRowSource<K::Persisted, K::Value> for RowSrc<'_, '_, K> {
+    #[inline(always)]
+    fn persisted(&mut self, i: usize) -> K::Persisted {
+        K::live_key(self.reader, i, &mut *self.arena).persist()
+    }
+    #[inline(always)]
+    fn key_eq(&mut self, i: usize, persisted: &K::Persisted) -> bool {
+        K::live_key(self.reader, i, &mut *self.arena).eq_persisted(persisted)
+    }
+    #[inline(always)]
+    fn value(&mut self, i: usize) -> K::Value {
+        K::value(self.reader, i)
+    }
+}
 
 /// Per-worker aggregation state for the consume phase.
 ///
@@ -24,6 +50,11 @@ pub struct AggregatedTable<K: KeyExtractor> {
     allocator: SlabAllocator,
     tables: Vec<MultiSlabTable<K>>,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    /// Scratch for the batched multi-pass probe: current slot per row, and the
+    /// two ping-pong selection vectors of still-unresolved row indices.
+    slots: Box<[usize; RECORD_BATCH_SIZE]>,
+    sel: Box<[u32; RECORD_BATCH_SIZE]>,
+    sel_next: Box<[u32; RECORD_BATCH_SIZE]>,
 }
 
 impl<K: KeyExtractor> AggregatedTable<K> {
@@ -37,6 +68,18 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             allocator,
             tables: vec![table],
             hashes: vec![0u64; RECORD_BATCH_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            slots: vec![0usize; RECORD_BATCH_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            sel: vec![0u32; RECORD_BATCH_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            sel_next: vec![0u32; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
@@ -67,11 +110,6 @@ impl<K: KeyExtractor> AggregatedTable<K> {
         key_cols: &[usize],
         value_slots: &[GroupAggSlot],
     ) {
-        // Two-level software prefetch pipeline: pull the slot DRAM→L2 far ahead
-        // (`L2_DISTANCE`), then L2→L1 nearer the access (`L1_DISTANCE`). A single
-        // L1 prefetch at a short distance can't hide full DRAM latency on the
-        // multi-GB hash table, so the probe/insert stalls on misses; the far L2
-        // prefetch covers that latency.
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
         let reader = K::make_reader(batch, key_cols, value_slots);
@@ -83,9 +121,41 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             i += 1;
         }
 
-        // We always initialize maps with at least one map, so this is safe
-        let mut table = self.tables.last_mut().unwrap();
+        // Batched multi-pass probe when the active table has room for the whole
+        // batch without overflowing (so every probe is guaranteed an empty slot
+        // and we never need to switch tables mid-batch). This resolves all rows
+        // with high memory-level parallelism instead of one stalling probe chain
+        // at a time. The large final table — where ~all of the ~100M inserts land
+        // — always takes this path; only the small early tables fall back to the
+        // scalar loop below.
+        let free = {
+            let t = self.tables.last().unwrap();
+            t.capacity() - t.len()
+        };
+        if free > length {
+            let mut src = RowSrc::<K> {
+                reader: &reader,
+                arena: &mut self.worker_arena,
+            };
+            self.tables.last_mut().unwrap().merge_batch(
+                length,
+                &mut self.hashes[..],
+                &mut self.slots[..],
+                &mut self.sel[..],
+                &mut self.sel_next[..],
+                &mut src,
+            );
+            if self.tables.last().unwrap().undersized() {
+                self.create_new_table();
+            }
+            return;
+        }
 
+        // Scalar fallback: two-level software prefetch (DRAM→L2 far, then L2→L1
+        // near) with a per-row probe; used only for the small early tables, which
+        // can overflow within a single batch and thus need mid-batch table
+        // switching.
+        let mut table = self.tables.last_mut().unwrap();
         let mut i = 0;
         while i < length {
             let hash = self.hashes[i];

@@ -18,7 +18,7 @@ use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 pub use crate::operations::unary::group::key_extractions::KeyExtractor;
 
 mod hash_table;
-pub use hash_table::{Entry, LiveKey, PersistedKey, Value};
+pub use hash_table::{BatchRowSource, Entry, LiveKey, PersistedKey, Value};
 
 mod aggregated_table;
 pub use aggregated_table::AggregatedTable;
