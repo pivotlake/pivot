@@ -5,10 +5,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use catalog::ParquetCatalog;
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch};
+use ingest::{IngestConfig, OtelConfig, SinkDestination};
 use server::{Error, Server};
 use tracing::info;
 
@@ -23,6 +25,86 @@ struct Args {
     /// Number of dispatch worker threads. Defaults to the number of cores.
     #[arg(long)]
     workers: Option<usize>,
+
+    /// Start an OTLP/gRPC ingest receiver. Repeatable — pass `--otel` once per
+    /// receiver to run several (each needs a distinct `addr` and output dirs).
+    ///
+    /// The value is a comma-separated `key=value` spec. Keys: `addr`, `logs`,
+    /// `traces`, `metrics` (destination per signal — at least one enables the
+    /// receiver), `flush_rows`, `flush_secs`. A destination is a local dir or an
+    /// object-store URL (`gs://bucket/prefix`, `s3://bucket/prefix`; object
+    /// storage is write-only — read it elsewhere). Examples:
+    ///
+    ///   --otel 'addr=0.0.0.0:4317,logs=./otel/logs,traces=./otel/traces'
+    ///   --otel 'addr=0.0.0.0:4318,logs=gs://my-bucket/otel/logs'
+    #[arg(long = "otel", value_name = "SPEC")]
+    otel: Vec<OtelSpec>,
+}
+
+impl Args {
+    /// Translate the ingest flags into the configs the server starts. Returns
+    /// an empty vec when no ingest is requested.
+    fn ingests(&self) -> Vec<IngestConfig> {
+        self.otel
+            .iter()
+            .map(|spec| IngestConfig::Otel(spec.0.clone()))
+            .collect()
+    }
+}
+
+/// One `--otel` receiver, parsed from a `key=value,...` spec string.
+#[derive(Clone, Debug)]
+struct OtelSpec(OtelConfig);
+
+impl std::str::FromStr for OtelSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut addr: Option<SocketAddr> = None;
+        let mut logs = None;
+        let mut traces = None;
+        let mut metrics = None;
+        let mut flush_rows = None;
+        let mut flush_secs = None;
+
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let (key, value) = part
+                .split_once('=')
+                .ok_or_else(|| format!("expected `key=value`, got `{part}`"))?;
+            let value = value.trim();
+            match key.trim() {
+                "addr" => addr = Some(value.parse().map_err(|e| format!("addr `{value}`: {e}"))?),
+                "logs" => logs = Some(SinkDestination::parse(value)),
+                "traces" => traces = Some(SinkDestination::parse(value)),
+                "metrics" => metrics = Some(SinkDestination::parse(value)),
+                "flush_rows" => {
+                    flush_rows =
+                        Some(value.parse().map_err(|e| format!("flush_rows `{value}`: {e}"))?)
+                }
+                "flush_secs" => {
+                    flush_secs =
+                        Some(value.parse().map_err(|e| format!("flush_secs `{value}`: {e}"))?)
+                }
+                other => return Err(format!("unknown key `{other}` in --otel spec")),
+            }
+        }
+
+        let addr = match addr {
+            Some(a) => a,
+            None => ingest::DEFAULT_OTLP_ADDR.parse().unwrap(),
+        };
+        let mut cfg = OtelConfig::new(addr);
+        if let Some(rows) = flush_rows {
+            cfg.flush_rows = rows;
+        }
+        if let Some(secs) = flush_secs {
+            cfg.flush_interval = Duration::from_secs(secs);
+        }
+        cfg.logs_dir = logs;
+        cfg.traces_dir = traces;
+        cfg.metrics_dir = metrics;
+        Ok(OtelSpec(cfg))
+    }
 }
 
 fn init_tracing() {
@@ -51,13 +133,15 @@ fn main() -> Result<(), Error> {
     info!(workers, "initialising dispatch");
     let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE);
 
+    let ingests = args.ingests();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     rt.block_on(async move {
         let catalog = Arc::new(ParquetCatalog::new());
-        let server = Server::new(args.bind, dispatch, catalog);
+        let server = Server::new(args.bind, dispatch, catalog, ingests);
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;
         });

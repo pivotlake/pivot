@@ -13,9 +13,12 @@
 //!
 //! The public interface: hand a bind address to [`Server::new`] together
 //! with a [`Dispatch`](dispatch::Dispatch) (from
-//! [`Dispatch::spin_up`](dispatch::Dispatch::spin_up)) and your catalog,
-//! then call [`Server::serve`] with a shutdown future. The returned future
-//! runs the accept loop until shutdown is signalled or a worker dies.
+//! [`Dispatch::spin_up`](dispatch::Dispatch::spin_up)), your catalog, and any
+//! ingest sources (see [`ingest`]); then call [`Server::serve`] with a shutdown
+//! future. The returned future runs the accept loop until shutdown is signalled
+//! or a worker dies. Configured ingest sources (e.g. an OTLP receiver) run
+//! alongside the query path and encode their Parquet on the same dispatch
+//! workers; they are drained before the workers stop.
 //!
 //! # Example
 //!
@@ -33,7 +36,7 @@
 //! let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
 //! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
-//! let server = Server::new(bind, dispatch, catalog);
+//! let server = Server::new(bind, dispatch, catalog, vec![]);
 //! // Returns when ctrl_c fires, or earlier if a dispatch worker dies.
 //! server.serve(Box::pin(async {
 //!     let _ = tokio::signal::ctrl_c().await;
