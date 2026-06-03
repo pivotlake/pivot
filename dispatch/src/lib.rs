@@ -57,6 +57,7 @@ use tracing::info;
 mod env;
 
 mod api;
+mod arrays;
 mod data_flow;
 mod functions;
 mod io;

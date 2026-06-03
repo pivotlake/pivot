@@ -1,3 +1,4 @@
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::arena_key::ResolvedKey;
 use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
@@ -68,7 +69,10 @@ pub struct StringKeyColumns {
 impl KeyColumns for StringKeyColumns {
     type Key = ArenaKey;
 
-    fn with_capacity(rows: usize) -> Self {
+    fn with_capacity(_allocator: &mut SlabAllocator, rows: usize) -> Self {
+        // String keys are emitted as a zero-copy StringViewArray over the shared
+        // arena (already engine memory); the views array is small, so it stays a
+        // plain Vec and the slab allocator is unused here.
         Self {
             views: Vec::with_capacity(rows),
         }

@@ -20,6 +20,7 @@
 //!   [`ArenaKey`](super::ArenaKey) for strings, an integer / packed integer for
 //!   numeric keys). Only created when the key is genuinely new.
 
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
 use ahash::RandomState;
@@ -82,7 +83,10 @@ pub trait KeyExtractor: Send + 'static {
 pub trait KeyColumns {
     type Key;
 
-    fn with_capacity(rows: usize) -> Self;
+    /// Allocate key-column builders over engine memory, sized for `rows` (one
+    /// output chunk; must fit a single 2MB slab). Arena-backed keys (strings)
+    /// ignore the allocator and pull their data from the shared arena at finish.
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self;
     fn push(&mut self, key: &Self::Key);
     fn finish(self, arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>);
 }

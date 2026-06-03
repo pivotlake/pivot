@@ -1,11 +1,13 @@
 //! `COUNT(*)` value extraction: every row contributes 1, no column is read.
 
+use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::aggregations::{Count, GroupAggSlot};
 use crate::operations::unary::group::hashtables::Value;
 use crate::operations::unary::group::value_extractions::{ValueColumns, ValueExtractor};
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::types::UInt64Type;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field};
-use std::sync::Arc;
 
 /// A [`ValueExtractor`] for `COUNT(*)`: a single [`Count`] slot that increments
 /// once per row, independent of any input column. Pairs with any key extractor
@@ -31,29 +33,23 @@ impl ValueExtractor for CountValueExtractor {
     }
 }
 
-/// Emits the single `UInt64` count column.
-///
-/// Pushes into a raw `Vec<u64>` rather than an Arrow `UInt64Builder`: the builder's
-/// `append_value` does not always inline into the generic output combinator, which
-/// at one row per group (millions, for a no-top-k `COUNT(*)`) adds a real per-group
-/// call. `Vec::push` always inlines; the array is built once at `finish`.
-pub struct CountColumns(Vec<u64>);
+/// Emits the single `UInt64` count column into an engine slab buffer.
+pub struct CountColumns(PrimitiveBuilder<UInt64Type>);
 
 impl ValueColumns for CountColumns {
     type Value = Count;
 
-    fn with_capacity(rows: usize) -> Self {
-        Self(Vec::with_capacity(rows))
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+        Self(PrimitiveBuilder::with_capacity(allocator, rows))
     }
 
     #[inline(always)]
     fn push(&mut self, value: &Count) {
-        self.0.push(value.value as u64);
+        self.0.push(&(value.value as u64), 1);
     }
 
     fn finish(self) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![Field::new("value", DataType::UInt64, false)];
-        let columns: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(self.0))];
-        (fields, columns)
+        (fields, vec![self.0.into_array(None)])
     }
 }

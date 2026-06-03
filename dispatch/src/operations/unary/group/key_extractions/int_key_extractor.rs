@@ -1,8 +1,9 @@
+use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
 use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
-use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
 use arrow_schema::Field;
@@ -81,18 +82,17 @@ pub struct IntKeyColumns<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
 impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumns<T> {
     type Key = T::Native;
 
-    fn with_capacity(rows: usize) -> Self {
-        Self(PrimitiveBuilder::<T>::with_capacity(rows))
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+        Self(PrimitiveBuilder::<T>::with_capacity(allocator, rows))
     }
 
     #[inline(always)]
     fn push(&mut self, key: &T::Native) {
-        self.0.append_value(*key);
+        self.0.push(key, 1);
     }
 
-    fn finish(mut self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![Field::new("key", T::DATA_TYPE, false)];
-        let columns: Vec<ArrayRef> = vec![Arc::new(self.0.finish())];
-        (fields, columns)
+        (fields, vec![self.0.into_array(None)])
     }
 }

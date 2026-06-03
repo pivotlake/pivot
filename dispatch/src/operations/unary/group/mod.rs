@@ -87,6 +87,7 @@ mod hashtables;
 pub use key_extractions::{IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
 pub use value_extractions::{AggRowValueExtractor, CountValueExtractor, ValueExtractor};
 
+use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{AggregatedTable, MultiSlabTable};
@@ -154,6 +155,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 receiver,
                 partition_jobs_injected,
                 top_k,
+                output_allocator: None,
             },
             sender,
             aggregated_table: AggregatedTable::new(state, shared_arena),
@@ -194,6 +196,10 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     top_k: Option<(usize, usize)>,
+    /// One allocator per worker for the output columns of every partition this
+    /// worker handles, so small per-partition outputs pack into shared buffers
+    /// instead of each grabbing a fresh 2MB one. Created lazily on the first job.
+    output_allocator: Option<SlabAllocator>,
 }
 
 /// A single partition's merge work unit.
@@ -213,8 +219,13 @@ pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
 
 impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
-    /// Merge all source tables for this partition and send the result batch.
-    pub fn run<S: Sender<RecordBatch>>(self, sender: &mut S) -> Result<()> {
+    /// Merge all source tables for this partition and send the result batches,
+    /// building output columns into `allocator`'s slab memory.
+    pub fn run<S: Sender<RecordBatch>>(
+        self,
+        sender: &mut S,
+        allocator: &mut SlabAllocator,
+    ) -> Result<()> {
         debug!("Merging maps for partition {:?}...", self.index);
         let result_map = merge::merge_partition::<K, V>(
             self.index,
@@ -228,12 +239,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
         }
 
         debug!("Sending record batch {:?}", self.index);
-        sender.send(output::build_record_batch::<K, V, _>(
-            result_map,
-            &self.arena,
-            self.top_k,
-        )?)?;
-        Ok(())
+        output::build_and_send::<K, V, _, _>(result_map, &self.arena, allocator, self.top_k, sender)
     }
 }
 
@@ -270,7 +276,10 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
         let steal = self.injector.steal();
         match steal {
             Steal::Success(job) => {
-                job.run(sender).map_err(unary::Error::from)?;
+                let allocator = self
+                    .output_allocator
+                    .get_or_insert_with(|| SlabAllocator::new(false));
+                job.run(sender, allocator).map_err(unary::Error::from)?;
             }
             Steal::Empty => {
                 if self.partition_jobs_injected.load(Ordering::Relaxed) {

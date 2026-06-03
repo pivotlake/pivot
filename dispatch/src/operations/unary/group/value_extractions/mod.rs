@@ -7,6 +7,7 @@
 //! with any aggregate shape (e.g. `COUNT(*)` or a multi-slot `SUM`) without an
 //! `O(keys × values)` explosion of monolithic extractors.
 
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::aggregations::GroupAggSlot;
 use crate::operations::unary::group::hashtables::Value;
 use arrow_array::{ArrayRef, RecordBatch};
@@ -47,7 +48,10 @@ pub trait ValueExtractor: Send + 'static {
 pub trait ValueColumns {
     type Value;
 
-    fn with_capacity(rows: usize) -> Self;
+    /// Allocate column builders over engine memory, sized for `rows` (one
+    /// output chunk; must fit a single 2MB slab — callers chunk to
+    /// `RECORD_BATCH_SIZE`).
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self;
     fn push(&mut self, value: &Self::Value);
     fn finish(self) -> (Vec<Field>, Vec<ArrayRef>);
 }

@@ -7,10 +7,11 @@
 //! [`ValueExtractor`](crate::operations::unary::group::value_extractions::ValueExtractor)
 //! (typically [`AggRowValueExtractor`](crate::operations::unary::group::value_extractions::AggRowValueExtractor)).
 
+use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
-use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch};
@@ -127,27 +128,25 @@ where
 {
     type Key = u128;
 
-    fn with_capacity(rows: usize) -> Self {
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
         Self {
-            a: PrimitiveBuilder::<A>::with_capacity(rows),
-            b: PrimitiveBuilder::<B>::with_capacity(rows),
+            a: PrimitiveBuilder::<A>::with_capacity(allocator, rows),
+            b: PrimitiveBuilder::<B>::with_capacity(allocator, rows),
         }
     }
 
     #[inline(always)]
     fn push(&mut self, key: &u128) {
         let packed = *key;
-        self.a
-            .append_value(A::Native::from_u64((packed >> 64) as u64));
-        self.b.append_value(B::Native::from_u64(packed as u64));
+        self.a.push(&A::Native::from_u64((packed >> 64) as u64), 1);
+        self.b.push(&B::Native::from_u64(packed as u64), 1);
     }
 
-    fn finish(mut self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![
             Field::new("k0", A::DATA_TYPE, false),
             Field::new("k1", B::DATA_TYPE, false),
         ];
-        let columns: Vec<ArrayRef> = vec![Arc::new(self.a.finish()), Arc::new(self.b.finish())];
-        (fields, columns)
+        (fields, vec![self.a.into_array(None), self.b.into_array(None)])
     }
 }
