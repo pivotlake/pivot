@@ -314,7 +314,8 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     }
 
     /// Prefetch the hash table slot where `hash` would land, plus the next cache line
-    /// to cover short probe chains.
+    /// to cover short probe chains. Brings the lines all the way into L1 (`T0`) —
+    /// use this *near* the access (small lookahead).
     #[inline]
     pub fn prefetch(&self, hash: u64) {
         let idx = self.slot_for(hash);
@@ -328,6 +329,23 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
                 ptr.add(128) as *const i8
             );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = ptr;
+    }
+
+    /// Prefetch the slot's cache line into L2 (`T1`) only. Issued *far* ahead of
+    /// the access and paired with a nearer [`prefetch`] (L1) call, this
+    /// software-pipelines the memory hierarchy: the line is pulled DRAM→L2 far
+    /// ahead, then L2→L1 just before use, hiding the full DRAM latency that a
+    /// single L1 prefetch at a short distance can't cover on a multi-GB table.
+    #[inline]
+    pub fn prefetch_l2(&self, hash: u64) {
+        let idx = self.slot_for(hash);
+        let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = ptr;

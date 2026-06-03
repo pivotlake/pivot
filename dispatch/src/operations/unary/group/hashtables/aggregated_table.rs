@@ -67,7 +67,13 @@ impl<K: KeyExtractor> AggregatedTable<K> {
         key_cols: &[usize],
         value_slots: &[GroupAggSlot],
     ) {
-        const PREFETCH_DISTANCE: usize = 16;
+        // Two-level software prefetch pipeline: pull the slot DRAM→L2 far ahead
+        // (`L2_DISTANCE`), then L2→L1 nearer the access (`L1_DISTANCE`). A single
+        // L1 prefetch at a short distance can't hide full DRAM latency on the
+        // multi-GB hash table, so the probe/insert stalls on misses; the far L2
+        // prefetch covers that latency.
+        const L1_DISTANCE: usize = 16;
+        const L2_DISTANCE: usize = 48;
         let reader = K::make_reader(batch, key_cols, value_slots);
         let length = K::rows(&reader);
 
@@ -83,9 +89,11 @@ impl<K: KeyExtractor> AggregatedTable<K> {
         let mut i = 0;
         while i < length {
             let hash = self.hashes[i];
-            if i + PREFETCH_DISTANCE + 1 < length {
-                let ph = self.hashes[i + PREFETCH_DISTANCE];
-                table.prefetch(ph);
+            if i + L2_DISTANCE < length {
+                table.prefetch_l2(self.hashes[i + L2_DISTANCE]);
+            }
+            if i + L1_DISTANCE < length {
+                table.prefetch(self.hashes[i + L1_DISTANCE]);
             }
 
             let key = K::live_key(&reader, i, &mut self.worker_arena);
