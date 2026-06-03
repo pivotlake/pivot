@@ -200,6 +200,17 @@ fn should_filter_row_group(
         return Ok(false);
     };
 
+    // The min/max statistics come back typed as the physical parquet column
+    // (e.g. a DATE column stored as UInt16), while the constant carries the
+    // logical SQL type (e.g. Date32). The comparison kernels below require
+    // matching types, so when they differ we can't prune from stats — keep the
+    // row group (always safe; just no pruning).
+    let (min_arr, _) = Datum::get(min);
+    let (const_arr, _) = Datum::get(constant);
+    if min_arr.data_type() != const_arr.data_type() {
+        return Ok(false);
+    }
+
     Ok(match compare.compare_type {
         // `col <> k` is true on every row unless every row in this group
         // equals `k` — provable only when min == max == k.
@@ -212,6 +223,14 @@ fn should_filter_row_group(
             bool_kernel(constant, min, arrow_ord::cmp::lt)?
                 || bool_kernel(constant, max, arrow_ord::cmp::gt)?
         }
+        // `col < k` matches nothing when every value is >= k, i.e. min >= k.
+        CompareType::Less => bool_kernel(min, constant, arrow_ord::cmp::gt_eq)?,
+        // `col > k` matches nothing when every value is <= k, i.e. max <= k.
+        CompareType::Greater => bool_kernel(max, constant, arrow_ord::cmp::lt_eq)?,
+        // `col <= k` matches nothing when every value is > k, i.e. min > k.
+        CompareType::LessEqual => bool_kernel(min, constant, arrow_ord::cmp::gt)?,
+        // `col >= k` matches nothing when every value is < k, i.e. max < k.
+        CompareType::GreaterEqual => bool_kernel(max, constant, arrow_ord::cmp::lt)?,
     })
 }
 

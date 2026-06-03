@@ -132,33 +132,43 @@ impl Aggregate {
 
         match self.groups.len() {
             0 => Ok(input.count()),
-            1 => {
-                let group = match &self.groups[0] {
-                    Expression::Ref(r) => r,
-                    expr => return Err(Error::UnexpectedAggExpression(expr.clone())),
-                };
-                let col = group.column_idx;
-                match &group.return_type {
-                    Type::Int8 => {
-                        Ok(input
-                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int8Type>>(col))
+            1 => match &self.groups[0] {
+                Expression::Ref(group) => {
+                    let col = group.column_idx;
+                    match &group.return_type {
+                        Type::Int8 => Ok(input
+                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int8Type>>(col)),
+                        Type::Int16 => Ok(input
+                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int16Type>>(col)),
+                        Type::Int32 => Ok(input
+                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int32Type>>(col)),
+                        Type::Int64 => Ok(input
+                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(col)),
+                        Type::Utf8 => Ok(input.group_by_count::<StringKeyExtractor>(col)),
+                        dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
                     }
-                    Type::Int16 => {
-                        Ok(input
-                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int16Type>>(col))
-                    }
-                    Type::Int32 => {
-                        Ok(input
-                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int32Type>>(col))
-                    }
-                    Type::Int64 => {
-                        Ok(input
-                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(col))
-                    }
-                    Type::Utf8 => Ok(input.group_by_count::<StringKeyExtractor>(col)),
-                    dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
                 }
-            }
+                // Computed group key (e.g. `GROUP BY date_trunc('minute',
+                // EventTime)`). Materialise the key into a single Int64 column
+                // with a projection, then group on that column. date_trunc and
+                // the other supported scalar key expressions all yield Int64.
+                computed => {
+                    let key_fn = computed.compile()?;
+                    let keyed = input.project(move || {
+                        let mut eval = key_fn();
+                        move |batch: RecordBatch| {
+                            let col: ArrayRef = match eval(&batch) {
+                                ExprResult::Array(a) => a,
+                                ExprResult::Scalar(s) => s.into_inner(),
+                            };
+                            let field = Field::new("k", col.data_type().clone(), true);
+                            RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![col])
+                                .unwrap()
+                        }
+                    });
+                    Ok(keyed.group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(0))
+                }
+            },
             n => Err(Error::UnsupportedAggregateGroupAmount(n)),
         }
     }
@@ -254,7 +264,7 @@ impl TopN {
                 Ok(DispatchOrderBy::new(col, descending, false))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(input.order_by_limit(orders, self.limit))
+        Ok(input.order_by_limit_offset(orders, self.limit, self.offset))
     }
 }
 

@@ -13,6 +13,7 @@
 //! `type_conversions!` macro from a single list of pairs, so adding a new
 //! type is one entry instead of two near-identical match arms.
 
+use arrow_array::cast::AsArray;
 use arrow_array::{
     ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
 };
@@ -45,6 +46,14 @@ pub enum Type {
     /// so this only needs to round-trip through plan translation.
     Decimal,
     Utf8,
+    /// DuckDB `DATE` — days since the epoch. The source parquet stores it as a
+    /// small integer (days), so the executor sees an integer column; the type
+    /// exists so `DATE` columns/constants survive plan translation and compare.
+    Date,
+    /// DuckDB `TIMESTAMP` — the type of `EventTime` and the result of
+    /// `date_trunc`. The source parquet stores it as packed epoch *seconds* in
+    /// an `Int64` column, so the executor treats it as `Int64` seconds.
+    Timestamp,
 }
 
 impl fmt::Display for Type {
@@ -59,6 +68,8 @@ impl fmt::Display for Type {
             Type::Float64 => "Float64",
             Type::Decimal => "Decimal",
             Type::Utf8 => "Utf8",
+            Type::Date => "Date",
+            Type::Timestamp => "Timestamp",
         };
         f.write_str(name)
     }
@@ -113,6 +124,8 @@ type_conversions! {
     (Type::Float64,   LogicalTypeId::DOUBLE),
     (Type::Decimal,   LogicalTypeId::DECIMAL),
     (Type::Utf8,      LogicalTypeId::VARCHAR),
+    (Type::Date,      LogicalTypeId::DATE),
+    (Type::Timestamp, LogicalTypeId::TIMESTAMP),
 }
 
 /// Parse a DuckDB [`ScalarValue`] (logical type + raw string) into an arrow
@@ -146,9 +159,29 @@ pub fn build_scalar_value(
                 .into_inner(),
         ),
         Type::Utf8 => Arc::new(StringViewArray::new_scalar(raw_value).into_inner()),
-        // SUM/AVG result types; never appear as query constants, so we don't
+        // DuckDB serialises a DATE constant as "YYYY-MM-DD"; let arrow parse it
+        // to a Date32 (days since epoch). Comparisons coerce both sides to a
+        // common numeric type, so this lines up with the integer day-count the
+        // parquet stores for `EventDate`.
+        Type::Date => {
+            let strs = arrow_array::StringArray::from(vec![raw_value.clone()]);
+            let casted =
+                arrow::compute::cast(&strs, &arrow_schema::DataType::Date32).map_err(|err| {
+                    Error::InvalidScalarValue {
+                        logical_type: logical_type.clone(),
+                        raw_value: raw_value.clone(),
+                        reason: err.to_string(),
+                    }
+                })?;
+            let days = casted
+                .as_primitive::<arrow_array::types::Date32Type>()
+                .value(0);
+            Arc::new(arrow_array::Date32Array::new_scalar(days).into_inner())
+        }
+        // SUM/AVG result types and TIMESTAMP never appear as query *constants*
+        // (TIMESTAMP shows up only as a column / date_trunc result), so we don't
         // need to materialise them as scalar literals.
-        Type::Int128 | Type::Float64 | Type::Decimal => {
+        Type::Int128 | Type::Float64 | Type::Decimal | Type::Timestamp => {
             return Err(Error::UnsupportedScalarType(pivot_type));
         }
     };

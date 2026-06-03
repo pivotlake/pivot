@@ -13,10 +13,12 @@
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 
@@ -121,6 +123,16 @@ json build_comparison_expression(duckdb::BoundComparisonExpression *compare) {
 	};
 }
 
+json build_between_expression(duckdb::BoundBetweenExpression *between) {
+	return {
+		{"input", build_expression(between->input.get())},
+		{"lower", build_expression(between->lower.get())},
+		{"upper", build_expression(between->upper.get())},
+		{"lower_inclusive", between->lower_inclusive},
+		{"upper_inclusive", between->upper_inclusive}
+	};
+}
+
 json build_value_constant_expression(duckdb::BoundConstantExpression *constant) {
 	return {
 		{"logical_type", constant->value.type().id()},
@@ -176,6 +188,10 @@ json build_expression(duckdb::Expression *expr) {
 	case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
 	case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
 		new_expression["data"] = build_comparison_expression(&expr->Cast<duckdb::BoundComparisonExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::COMPARE_BETWEEN: {
+		new_expression["data"] = build_between_expression(&expr->Cast<duckdb::BoundBetweenExpression>());
 		break;
 	}
 	case duckdb::ExpressionType::VALUE_CONSTANT: {
@@ -309,6 +325,7 @@ json build_top_n(duckdb::LogicalTopN *top_n) {
 
     return {
         {"limit", top_n->limit},
+        {"offset", top_n->offset},
         {"order_bys", orders}
 	    };
 }
@@ -410,6 +427,15 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
 
 	try {
 		auto plan = ctx.con.ExtractPlan(std::string(query.data(), query.size()));
+		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
+		// positional BoundReference indices against each operator's actual child
+		// output. Without this we serialized binding.column_index directly, which
+		// only lines up for simple linear chains — once the optimizer reorders a
+		// scan's column_ids or drops a projection (e.g. a grouped/projected
+		// non-filter column above a filter), the raw index points at the wrong
+		// column. This is the standard resolution DuckDB runs before execution.
+		duckdb::ColumnBindingResolver resolver;
+		resolver.VisitOperator(*plan);
 		auto root = build_plan_node_json(plan.get(), tables);
 		result = {{"type", "success"}, {"data", root}};
 	} catch (duckdb::Exception &e) {
