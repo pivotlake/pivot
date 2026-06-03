@@ -120,9 +120,15 @@ echo
 # seconds) a real TIMESTAMP, matching pivot's setup.sql declared types, so
 # date/timestamp queries (e.g. Q42's date_trunc + date-range filter) bind and
 # run the same way on both engines.
+#
+# Use `epoch_ms(EventTime * 1000)` (the same conversion ClickBench's `toDateTime`
+# macro uses) rather than `to_timestamp(...)`: `to_timestamp` returns TIMESTAMP
+# WITH TIME ZONE, whose tz/ICU handling makes the scan ~3x slower (e.g. Q42 ~90ms
+# vs ~28ms) and would unfairly handicap DuckDB. `epoch_ms` yields a plain
+# TIMESTAMP with identical values.
 setup="CREATE VIEW hits AS
 SELECT *
-    REPLACE (make_date(EventDate) AS EventDate, to_timestamp(EventTime)::TIMESTAMP AS EventTime)
+    REPLACE (make_date(EventDate) AS EventDate, epoch_ms(EventTime * 1000) AS EventTime)
 FROM read_parquet('${parquet_glob}', binary_as_string=True);
 CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000);"
 
