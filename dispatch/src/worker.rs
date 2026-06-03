@@ -30,7 +30,18 @@ use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Spin budget while a **dataflow is in flight** but this worker momentarily has
+/// nothing to do (waiting on a pipeline-stage barrier / for a sibling to produce
+/// stealable work). A parked worker pays a condvar/futex wakeup (tens of µs plus
+/// OS scheduling) every stage transition; with many workers and little data per
+/// stage that latency dominates small-query time. The core is idle at a barrier
+/// regardless, so spinning here costs nothing useful and lets the worker resume
+/// in nanoseconds when the next `notify` lands. Generous enough to bridge the
+/// µs-scale gaps between a small query's stages; a longer real stall still falls
+/// through to a park. Large queries keep workers busy and rarely reach this path.
+const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -63,17 +74,21 @@ thread_local! {
 /// parks on the condvar only if the count still matches — if it has advanced,
 /// a `notify` arrived during the work pass and the worker returns immediately
 /// to retry.
-/// State protected by the waker's mutex: the wake counter and the number of
-/// currently parked workers.
+/// State protected by the waker's mutex: the number of currently parked
+/// workers. The wake counter itself lives in a separate atomic so idle workers
+/// can poll it lock-free while spinning before they park (see
+/// [`Worker::clear_dirty_buffer_or_park`]).
 struct WakerState {
-    /// Monotonic counter (wrapping) bumped on every [`WorkerWaker::notify`].
-    wake_count: u64,
     /// How many workers are currently parked on the condvar. Used by
     /// `notify` to skip the `notify_all` syscall when nobody is waiting.
     sleepers: usize,
 }
 
 pub struct WorkerWaker {
+    /// Monotonic counter (wrapping) bumped on every [`WorkerWaker::notify`].
+    /// Lock-free so workers can spin-poll it cheaply before parking; the park
+    /// path re-reads it under `state`'s lock so no wake is lost.
+    wake_count: AtomicU64,
     state: Mutex<WakerState>,
     /// Workers wait here when idle; `notify` wakes all of them.
     cond: Condvar,
@@ -82,10 +97,8 @@ pub struct WorkerWaker {
 impl WorkerWaker {
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(WakerState {
-                wake_count: 0,
-                sleepers: 0,
-            }),
+            wake_count: AtomicU64::new(0),
+            state: Mutex::new(WakerState { sleepers: 0 }),
             cond: Condvar::new(),
         }
     }
@@ -93,17 +106,22 @@ impl WorkerWaker {
     /// Bump the wake count and wake all waiting workers. Skips the `notify_all`
     /// call when no workers are currently parked, avoiding the syscall on
     /// hot send paths that nobody is waiting on.
+    ///
+    /// The count is bumped *before* taking the lock so a worker about to park
+    /// either observes the new count under the lock (and skips the wait) or is
+    /// already parked (and gets the `notify_all`) — no wake is lost.
     pub fn notify(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.wake_count = state.wake_count.wrapping_add(1);
+        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        let state = self.state.lock().unwrap();
         if state.sleepers > 0 {
             self.cond.notify_all();
         }
     }
 
-    /// Current wake count. Workers snapshot this before doing a pass of work.
+    /// Current wake count. Workers snapshot this before doing a pass of work
+    /// and poll it lock-free while spinning before a park.
     pub fn wake_count(&self) -> u64 {
-        self.state.lock().unwrap().wake_count
+        self.wake_count.load(Ordering::SeqCst)
     }
 
     /// If the wake count still matches `last_seen`, block on the condvar until
@@ -114,12 +132,12 @@ impl WorkerWaker {
     /// cannot be lost between sleep cycles.
     pub fn wait_if_unchanged(&self, last_seen: u64) -> u64 {
         let mut state = self.state.lock().unwrap();
-        if state.wake_count == last_seen {
+        if self.wake_count.load(Ordering::SeqCst) == last_seen {
             state.sleepers += 1;
             state = self.cond.wait(state).unwrap();
             state.sleepers -= 1;
         }
-        state.wake_count
+        self.wake_count.load(Ordering::SeqCst)
     }
 }
 
@@ -351,6 +369,24 @@ impl Worker {
             // dataflow / new stealable work isn't starved behind
             // a long cleanup run.
             return;
+        }
+
+        // Spin-before-park, but only while a dataflow is in flight. Parking on
+        // the condvar costs a wakeup (tens of µs + OS scheduling) on the next
+        // `notify`; for a small multi-stage query that per-stage wakeup latency
+        // dominates, so a worker idle at a stage barrier polls the lock-free
+        // wake count and resumes in nanoseconds when the next notify lands (the
+        // core is idle at the barrier anyway). With no dataflow running we're
+        // genuinely idle between queries — park immediately rather than burn CPU.
+        if !self.data_flows.is_empty() {
+            for _ in 0..IN_FLIGHT_SPIN_LIMIT {
+                let now = self.waker.wake_count();
+                if now != self.last_seen_wake_count {
+                    self.last_seen_wake_count = now;
+                    return;
+                }
+                std::hint::spin_loop();
+            }
         }
 
         self.last_seen_wake_count = self.waker.wait_if_unchanged(self.last_seen_wake_count);
