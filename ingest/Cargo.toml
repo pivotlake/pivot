@@ -10,6 +10,7 @@ thriftparquet = { path = "../thriftparquet" }
 
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
+arrow-select = { path = "../arrow-rs/arrow-select" }
 # In-house Parquet encoding (no upstream `parquet` crate): the shared
 # `thriftparquet` metadata/codec layer plus the same snappy lib the reader uses.
 snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "1e20a92f7bcad208bf6869f5394101288850ee2e" }

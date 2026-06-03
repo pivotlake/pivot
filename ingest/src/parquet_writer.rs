@@ -4,16 +4,21 @@
 //! Like the reader, this avoids the upstream `parquet` crate: it reuses the
 //! shared [`thriftparquet`] metadata/codec layer and the in-house snappy
 //! (`snap`). The work is split exactly where the reader parallelizes — at the
-//! **page** level:
+//! **page** level, with pages sized to a ~1 MiB target (the usual Parquet data
+//! page size):
 //!
-//! 1. [`build_page_jobs`] turns a set of [`RecordBatch`]es into one
-//!    [`PageJob`] per `(row group, column)` — each job is one data page.
+//! 1. [`build_page_jobs`] concatenates each column across the flush's batches
+//!    (one row group) and splits it into ~1 MiB [`PageJob`]s.
 //! 2. [`encode_page`] (run in parallel across the worker pool, one job each)
-//!    PLAIN-encodes a column's values, snappy-compresses them, and prepends the
+//!    PLAIN-encodes a page's values, snappy-compresses them, and prepends the
 //!    page header — producing self-contained [`EncodedPage`] bytes.
-//! 3. [`assemble_parquet`] stitches the encoded pages into one file: it lays
-//!    them out back-to-back (recording each column chunk's offset/size) and
-//!    writes the footer. Cheap and serial — just concatenation plus thrift.
+//! 3. [`assemble_parquet`] stitches the pages into one file: pages of a column
+//!    are laid out contiguously as that column's chunk (recording its
+//!    offset/size), then the footer is written. Cheap and serial.
+//!
+//! Parallelism therefore scales with data size (a few-MB flush → a handful of
+//! pages; a large flush → many), just like the reader parallelizes over however
+//! many pages a file contains.
 //!
 //! Format targeted (the reader's supported subset): DATA_PAGE v1, PLAIN
 //! encoding, SNAPPY compression (the reader always snappy-decompresses), and
@@ -38,11 +43,16 @@ use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// Parquet repetition type for a required (non-null) field.
 const REPETITION_REQUIRED: i32 = 0;
+/// Target uncompressed size of one data page. Matches Parquet's usual ~1 MiB
+/// data page size: large enough to amortize per-page overhead and compress
+/// well, small enough to be a useful unit of parallel work.
+const TARGET_PAGE_SIZE: usize = 1024 * 1024;
 
-/// One page to encode: a single column's values for a single row group.
+/// One page to encode: a contiguous slice of one column's values.
 pub struct PageJob {
-    pub row_group: usize,
     pub column: usize,
+    /// Order of this page within its column chunk.
+    pub page_index: usize,
     pub num_rows: i64,
     pub array: ArrayRef,
 }
@@ -50,29 +60,35 @@ pub struct PageJob {
 /// An encoded data page (header + snappy-compressed values), tagged with its
 /// position so [`assemble_parquet`] can place it after the parallel encode.
 pub struct EncodedPage {
-    pub row_group: usize,
     pub column: usize,
+    pub page_index: usize,
     pub num_rows: i64,
     pub bytes: Vec<u8>,
 }
 
-/// Split `batches` into one [`PageJob`] per `(row group, column)`. Each batch
-/// becomes one row group; each column of it, one page. Column arrays are shared
-/// by `Arc` clone, so this is cheap and the batches can be dropped afterwards.
-pub fn build_page_jobs(batches: &[RecordBatch]) -> Vec<PageJob> {
+/// Turn a flush's batches into ~1 MiB page jobs. Each column is concatenated
+/// across all batches (forming one row group) and split into pages; the
+/// concatenation shares buffers by `Arc`, so the batches can be dropped after.
+pub fn build_page_jobs(batches: &[RecordBatch]) -> Result<Vec<PageJob>, String> {
+    let num_columns = batches[0].num_columns();
     let mut jobs = Vec::new();
-    for (row_group, batch) in batches.iter().enumerate() {
-        let num_rows = batch.num_rows() as i64;
-        for (column, array) in batch.columns().iter().enumerate() {
+    for column in 0..num_columns {
+        let arrays: Vec<&dyn Array> = batches.iter().map(|b| b.column(column).as_ref()).collect();
+        let merged = arrow_select::concat::concat(&arrays)
+            .map_err(|e| format!("concat column {column}: {e}"))?;
+        for (page_index, (start, len)) in page_ranges(merged.as_ref(), TARGET_PAGE_SIZE)
+            .into_iter()
+            .enumerate()
+        {
             jobs.push(PageJob {
-                row_group,
                 column,
-                num_rows,
-                array: array.clone(),
+                page_index,
+                num_rows: len as i64,
+                array: merged.slice(start, len),
             });
         }
     }
-    jobs
+    Ok(jobs)
 }
 
 /// Encode one page: PLAIN values + snappy + page header. Runs in parallel
@@ -107,59 +123,57 @@ pub fn encode_page(job: PageJob) -> Result<EncodedPage, String> {
     bytes.extend_from_slice(&compressed);
 
     Ok(EncodedPage {
-        row_group: job.row_group,
         column: job.column,
+        page_index: job.page_index,
         num_rows: job.num_rows,
         bytes,
     })
 }
 
-/// Stitch encoded pages into one Parquet file. `schema` is the batches' Arrow
-/// schema; `num_row_groups` is the batch count. Pages may arrive in any order
-/// (work-stealing) — they are placed by their `(row group, column)` tag.
+/// Stitch encoded pages into one Parquet file (a single row group of
+/// `total_rows` rows). `schema` is the batches' Arrow schema. Pages may arrive
+/// in any order (work-stealing); each column's pages are reordered by
+/// `page_index` and laid out contiguously as that column's chunk.
 pub fn assemble_parquet(
     schema: &SchemaRef,
-    num_row_groups: usize,
+    total_rows: i64,
     pages: Vec<EncodedPage>,
 ) -> Result<Vec<u8>, String> {
     let num_columns = schema.fields().len();
 
-    // Bucket pages into a row-group × column grid, recording each row group's
-    // row count.
-    let mut grid: Vec<Vec<Option<EncodedPage>>> = (0..num_row_groups)
-        .map(|_| (0..num_columns).map(|_| None).collect())
-        .collect();
-    let mut rg_rows = vec![0i64; num_row_groups];
+    let mut by_column: Vec<Vec<EncodedPage>> = (0..num_columns).map(|_| Vec::new()).collect();
     for page in pages {
-        let (rg, col) = (page.row_group, page.column);
-        rg_rows[rg] = page.num_rows;
-        grid[rg][col] = Some(page);
+        by_column[page.column].push(page);
+    }
+    for column in &mut by_column {
+        column.sort_by_key(|p| p.page_index);
     }
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(PARQUET_MAGIC);
 
-    let mut row_groups = Vec::with_capacity(num_row_groups);
-    for (rg, columns_grid) in grid.into_iter().enumerate() {
-        let mut columns = Vec::with_capacity(num_columns);
-        for (col, page) in columns_grid.into_iter().enumerate() {
-            let page = page.ok_or_else(|| format!("missing page for row group {rg} column {col}"))?;
-            let data_page_offset = out.len() as i64;
-            out.extend_from_slice(&page.bytes);
-            columns.push(ColumnChunk {
-                meta_data: Some(ColumnMetaData {
-                    total_compressed_size: out.len() as i64 - data_page_offset,
-                    data_page_offset,
-                    dictionary_page_offset: None,
-                    statistics: None,
-                }),
-            });
+    let mut columns = Vec::with_capacity(num_columns);
+    for (col, pages) in by_column.into_iter().enumerate() {
+        if pages.is_empty() {
+            return Err(format!("no pages produced for column {col}"));
         }
-        row_groups.push(RowGroup {
-            columns,
-            num_rows: rg_rows[rg],
+        let data_page_offset = out.len() as i64;
+        for page in pages {
+            out.extend_from_slice(&page.bytes);
+        }
+        columns.push(ColumnChunk {
+            meta_data: Some(ColumnMetaData {
+                total_compressed_size: out.len() as i64 - data_page_offset,
+                data_page_offset,
+                dictionary_page_offset: None,
+                statistics: None,
+            }),
         });
     }
+    let row_groups = vec![RowGroup {
+        columns,
+        num_rows: total_rows,
+    }];
 
     // Schema: a root group element followed by one leaf per column.
     let mut schema_elements = Vec::with_capacity(num_columns + 1);
@@ -195,6 +209,67 @@ pub fn assemble_parquet(
     out.extend_from_slice(PARQUET_MAGIC);
 
     Ok(out)
+}
+
+/// Split `array` into contiguous `(offset, len)` page ranges, each ~`target`
+/// uncompressed bytes when PLAIN-encoded. Fixed-width types split by row count;
+/// variable-width (BYTE_ARRAY) accumulates the per-value encoded size.
+fn page_ranges(array: &dyn Array, target: usize) -> Vec<(usize, usize)> {
+    let len = array.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    if let Some(width) = plain_fixed_width(array.data_type()) {
+        return fixed_ranges(len, (target / width).max(1));
+    }
+    match array.data_type() {
+        DataType::Utf8 => {
+            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+            var_ranges(len, target, |i| a.value(i).len())
+        }
+        DataType::Utf8View => {
+            let a = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+            var_ranges(len, target, |i| a.value(i).len())
+        }
+        // Unsupported: one page; `encode_plain` will reject it.
+        _ => vec![(0, len)],
+    }
+}
+
+/// PLAIN byte size of one fixed-width value, or `None` for variable-width types.
+fn plain_fixed_width(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Int32 | DataType::Float32 => Some(4),
+        DataType::Int64 | DataType::Float64 => Some(8),
+        _ => None,
+    }
+}
+
+fn fixed_ranges(len: usize, rows_per_page: usize) -> Vec<(usize, usize)> {
+    (0..len)
+        .step_by(rows_per_page)
+        .map(|start| (start, rows_per_page.min(len - start)))
+        .collect()
+}
+
+/// Walk values, cutting a page once the accumulated PLAIN size (4-byte length
+/// prefix + bytes per value) reaches `target`. Always at least one row per page.
+fn var_ranges(len: usize, target: usize, value_len: impl Fn(usize) -> usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut acc = 0usize;
+    for i in 0..len {
+        acc += 4 + value_len(i);
+        if acc >= target {
+            ranges.push((start, i + 1 - start));
+            start = i + 1;
+            acc = 0;
+        }
+    }
+    if start < len {
+        ranges.push((start, len - start));
+    }
+    ranges
 }
 
 /// Serialize a [`WriteThrift`] value (compact protocol) onto `out`.
@@ -287,4 +362,30 @@ fn downcast<A: 'static>(array: &dyn Array) -> Result<&A, String> {
             std::any::type_name::<A>()
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_width_pages_split_by_row_count() {
+        let array = Int64Array::from((0..250).collect::<Vec<i64>>());
+
+        // 8 bytes/value, target 800 bytes => 100 rows/page => 100, 100, 50.
+        let ranges = page_ranges(&array, 800);
+
+        assert_eq!(ranges, vec![(0, 100), (100, 100), (200, 50)]);
+    }
+
+    #[test]
+    fn variable_width_pages_split_by_byte_size() {
+        // Each value encodes as 4 + 6 = 10 bytes ("abcdef").
+        let array = StringArray::from(vec!["abcdef"; 10]);
+
+        // Target 25 bytes => cut after 3 values (30 >= 25): 3, 3, 3, 1.
+        let ranges = page_ranges(&array, 25);
+
+        assert_eq!(ranges, vec![(0, 3), (3, 3), (6, 3), (9, 1)]);
+    }
 }

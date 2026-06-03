@@ -319,7 +319,7 @@ mod tests {
     }
 
     /// Page jobs encoded in parallel across the pool are stitched into one file
-    /// with one row group per input batch (five batches → five row groups).
+    /// with a single row group spanning all the flush's rows.
     #[test]
     fn parallel_pages_assemble_into_one_file() {
         let workers = std::thread::available_parallelism()
@@ -333,11 +333,8 @@ mod tests {
         let table = read_table(&dispatch, dir.path());
 
         assert_eq!(parquet_file_count(dir.path()), 1);
-        assert_eq!(table.row_groups().len(), 5);
-        assert_eq!(
-            table.row_groups().iter().map(|rg| rg.num_rows).sum::<i64>(),
-            10
-        );
+        assert_eq!(table.row_groups().len(), 1);
+        assert_eq!(table.row_groups()[0].num_rows, 10);
 
         dispatch.exit();
     }

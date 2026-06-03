@@ -256,21 +256,21 @@ impl ParquetSink {
         let file_name = format!("{}-{}-{:06}.parquet", self.name, millis, seq);
 
         let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-        let num_row_groups = batches.len();
         let schema = batches[0].schema();
-        let jobs = build_page_jobs(&batches);
-        drop(batches); // the page jobs hold Arc clones of the columns
 
         // Page-level parallel encode on the worker pool, then serial assembly.
         // `collect()` blocks, so park the whole thing on a blocking thread.
         let dispatcher = self.dispatcher.clone();
         let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            // Concatenate each column and cut ~1 MiB pages (one row group).
+            let jobs = build_page_jobs(&batches)?;
+            drop(batches); // the page jobs hold Arc clones of the columns
             let pages = values_input(&dispatcher, jobs)
                 .map_each(encode_page)
                 .collect()
                 .map_err(|e| format!("encode dataflow failed: {e}"))?;
             let pages: Vec<EncodedPage> = pages.into_iter().collect::<Result<Vec<_>, _>>()?;
-            assemble_parquet(&schema, num_row_groups, pages)
+            assemble_parquet(&schema, total_rows as i64, pages)
         })
         .await;
 
