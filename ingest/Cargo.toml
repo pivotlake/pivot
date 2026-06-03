@@ -6,10 +6,13 @@ description = "Receivers that ingest external telemetry (OTLP today) and sink it
 
 [dependencies]
 dispatch = { path = "../dispatch" }
+thriftparquet = { path = "../thriftparquet" }
 
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
-parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+# In-house Parquet encoding (no upstream `parquet` crate): the shared
+# `thriftparquet` metadata/codec layer plus the same snappy lib the reader uses.
+snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "1e20a92f7bcad208bf6869f5394101288850ee2e" }
 
 # OTLP over gRPC. tonic 0.14 split prost codegen into `tonic-prost`; the
 # generated service code lives in `opentelemetry-proto` (gen-tonic), so we only

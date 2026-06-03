@@ -22,16 +22,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
-use dispatch::DataFlowDispatcher;
+use dispatch::{DataFlowDispatcher, values_input};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutPayload};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use tokio::sync::Mutex;
 use tracing::{error, info};
+
+use crate::parquet_writer::{EncodedPage, assemble_parquet, build_page_jobs, encode_page};
 
 /// Subdirectory (inside a local sink directory) where files are written before
 /// being atomically renamed into place. It is a directory, so
@@ -237,10 +236,17 @@ impl ParquetSink {
         }
     }
 
-    /// Encode `batches` into one Parquet file (on a dispatch worker) and write
-    /// it to the destination (on the async runtime), then log the outcome. A
-    /// failed flush drops the batch and logs rather than blocking the pipeline —
-    /// the drop-under-pressure stance OTLP exporters already expect.
+    /// Encode `batches` into one Parquet file, **parallelizing the encode at
+    /// the page level across the dispatch worker pool**, then write the file to
+    /// the destination.
+    ///
+    /// Each `(row group, column)` becomes one page job; the jobs fan out via a
+    /// work-stealing source ([`values_input`]) and each is PLAIN-encoded +
+    /// snappy-compressed on whatever worker steals it (CPU, on the pool). The
+    /// encoded pages are stitched into a single file (cheap, serial) and the
+    /// bytes written/uploaded here on the async runtime (I/O). A failed
+    /// encode/write is logged and dropped rather than blocking the pipeline —
+    /// the drop-under-pressure stance OTLP exporters expect.
     async fn write(&self, batches: Vec<RecordBatch>) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let millis = SystemTime::now()
@@ -249,20 +255,29 @@ impl ParquetSink {
             .unwrap_or(0);
         let file_name = format!("{}-{}-{:06}.parquet", self.name, millis, seq);
 
-        // CPU-bound encode on a worker. `run_on_worker` blocks, so park it on a
-        // blocking thread to keep it off the async runtime.
+        let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let num_row_groups = batches.len();
+        let schema = batches[0].schema();
+        let jobs = build_page_jobs(&batches);
+        drop(batches); // the page jobs hold Arc clones of the columns
+
+        // Page-level parallel encode on the worker pool, then serial assembly.
+        // `collect()` blocks, so park the whole thing on a blocking thread.
         let dispatcher = self.dispatcher.clone();
-        let encoded =
-            tokio::task::spawn_blocking(move || dispatcher.run_on_worker(move || encode(batches)))
-                .await;
-        let (rows, bytes) = match encoded {
-            Ok(Ok(Ok(encoded))) => encoded,
-            Ok(Ok(Err(e))) => {
-                error!(sink = %self.name, error = %e, "parquet encode failed");
-                return;
-            }
+        let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            let pages = values_input(&dispatcher, jobs)
+                .map_each(encode_page)
+                .collect()
+                .map_err(|e| format!("encode dataflow failed: {e}"))?;
+            let pages: Vec<EncodedPage> = pages.into_iter().collect::<Result<Vec<_>, _>>()?;
+            assemble_parquet(&schema, num_row_groups, pages)
+        })
+        .await;
+
+        let bytes = match encoded {
+            Ok(Ok(bytes)) => bytes,
             Ok(Err(e)) => {
-                error!(sink = %self.name, error = %e, "dispatch worker failed while encoding parquet");
+                error!(sink = %self.name, error = %e, "parquet encode failed");
                 return;
             }
             Err(e) => {
@@ -273,31 +288,12 @@ impl ParquetSink {
 
         // I/O on the async runtime (local write or object-store upload).
         match self.backend.put(&file_name, bytes).await {
-            Ok(location) => info!(sink = %self.name, file = %location, rows, "flushed parquet"),
+            Ok(location) => {
+                info!(sink = %self.name, file = %location, rows = total_rows, "flushed parquet")
+            }
             Err(e) => {
                 error!(sink = %self.name, file = %file_name, error = %e, "failed writing parquet")
             }
         }
     }
-}
-
-/// Runs on a dispatch worker: encode every batch into one in-memory Parquet
-/// file. Returns the row count and the encoded bytes. Errors are stringified
-/// because the value crosses the `run_on_worker` boundary (which only requires
-/// `Send`), keeping `parquet` error types out of the dispatch API.
-fn encode(batches: Vec<RecordBatch>) -> Result<(u64, Vec<u8>), String> {
-    let schema = batches[0].schema();
-    let mut buf = Vec::new();
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut writer =
-        ArrowWriter::try_new(&mut buf, schema, Some(props)).map_err(|e| format!("writer: {e}"))?;
-    let mut rows = 0u64;
-    for batch in &batches {
-        rows += batch.num_rows() as u64;
-        writer.write(batch).map_err(|e| format!("write: {e}"))?;
-    }
-    writer.close().map_err(|e| format!("close: {e}"))?;
-    Ok((rows, buf))
 }

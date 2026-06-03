@@ -1,4 +1,7 @@
-use crate::operations::UnaryOperatorFactory;
+use crate::operations::{
+    DefaultUnaryFactory, Forward, InjectorSourceFactory, MapFactory, RootUnaryOperatorFactory,
+    UnaryOperatorFactory,
+};
 use crate::operations::channels::{
     ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, mpsc_channel,
     return_to_worker_mpsc, stealable,
@@ -89,6 +92,68 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     pub fn collect(self) -> crate::data_flow::Result<Vec<O>> {
         self.execute().collect()
     }
+
+    /// Append a parallel 1→1 map stage: every item is transformed by `f` on
+    /// whatever worker handles it. The stage reads through a work-stealing
+    /// channel, so items rebalance across idle workers — the basis of a
+    /// perfectly parallel job pipeline (e.g. [`values_input`] → `map_each` to
+    /// encode one Parquet page per item).
+    ///
+    /// `f` is cloned once per worker, so it must be `Clone` (capture only
+    /// cheap/shared state).
+    pub fn map_each<O2, F>(
+        self,
+        f: F,
+    ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, MapFactory<F>, StealableChannelFactory<O>, OF>>
+    where
+        O2: Send + 'static,
+        F: FnMut(O) -> O2 + Clone + Send + 'static,
+    {
+        let worker_count = self.factories.len();
+        let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let factories: Vec<_> = stealable::<O>(worker_count)
+            .into_iter()
+            .zip(self.factories)
+            .map(|(channel_factory, head)| {
+                UnaryOperatorFactory::new(
+                    head,
+                    MapFactory(f.clone()),
+                    channel_factory,
+                    siblings_left.clone(),
+                )
+            })
+            .collect();
+        OperatorSpec::new(self.dispatcher, factories)
+    }
+}
+
+/// Source: stream a fixed, in-memory set of values across the worker pool.
+///
+/// The items are loaded into a shared work-stealing queue and fan out across
+/// all workers exactly like a table scan distributes row groups — the
+/// in-memory, any-type counterpart of [`table_input`](super::table_input).
+/// Chain [`map_each`](OperatorSpec::map_each) to process each item in parallel.
+#[allow(clippy::type_complexity)]
+pub fn values_input<T: Send + 'static>(
+    dispatcher: &DataFlowDispatcher,
+    items: impl IntoIterator<Item = T>,
+) -> OperatorSpec<
+    T,
+    RootUnaryOperatorFactory<T, T, DefaultUnaryFactory<Forward<T>>, InjectorSourceFactory<T>>,
+> {
+    let worker_count = dispatcher.worker_count();
+    let injector = InjectorSourceFactory::new(items);
+    let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+    let factories: Vec<_> = (0..worker_count)
+        .map(|_| {
+            RootUnaryOperatorFactory::new(
+                DefaultUnaryFactory::<Forward<T>>::new(),
+                injector.clone(),
+                siblings_left.clone(),
+            )
+        })
+        .collect();
+    OperatorSpec::new(dispatcher.clone(), factories)
 }
 
 impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {

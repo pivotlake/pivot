@@ -4,11 +4,24 @@ Receives telemetry from the outside world and sinks it into Parquet files,
 running **inside the pivotdb server** rather than as a standalone process.
 
 It is modelled on the standalone `parquet_sink` (in `pigivm/`), with one key
-difference: the CPU-heavy part — encoding and Snappy-compressing each Parquet
-file — is shipped to a **dispatch worker** via
-`DataFlowDispatcher::run_on_worker` instead of running on the async runtime. The
-heavy lifting lands on the same thread-per-core pool that executes queries, and
-the server's tokio threads stay free to keep accepting telemetry.
+difference: the CPU-heavy part — encoding and Snappy-compressing the Parquet
+data — runs on the **dispatch worker pool**, parallelized at the **page** level
+(the mirror of dispatch's page-parallel reader), instead of on the async
+runtime. The heavy lifting lands on the same thread-per-core pool that executes
+queries, and the server's tokio threads stay free to keep accepting telemetry.
+
+The Parquet encoding is hand-rolled (no upstream `parquet` crate): it reuses the
+shared **`thriftparquet`** crate — the same Thrift compact-protocol codec and
+metadata structures the reader is built on — plus the in-house snappy. A flush
+turns its batches into `(row group, column)` **page jobs**, fans them out across
+the workers via a work-stealing source so each page is PLAIN-encoded +
+compressed on whatever worker steals it, then stitches the encoded pages into
+one file (offsets + footer) — a cheap serial step. One flush → one file.
+
+> Because the encoder emits only the footer fields pivot's reader needs, the
+> output is readable by pivot but not yet a fully spec-compliant Parquet (no
+> per-chunk `codec`/`type`/`num_values`), so other engines (e.g. DuckDB) may
+> reject it. Full-footer output is a follow-up on `thriftparquet`.
 
 ## Shape
 

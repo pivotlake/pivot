@@ -5,7 +5,7 @@ use std::io::Write;
 // LogicalType is a thrift union where most variants are empty structs.
 // We only care about String (id=1) and Integer (id=10).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LogicalType {
+pub enum LogicalType {
     String,
     Integer { bit_width: i8, is_signed: bool },
     Other,
@@ -91,7 +91,7 @@ impl WriteThriftField for LogicalType {
 }
 
 thrift_struct!(
-    pub(crate) struct SchemaElement {
+    pub struct SchemaElement {
         1: optional i32 physical_type;
         3: optional i32 repetition_type;
         4: required string name;
@@ -102,7 +102,7 @@ thrift_struct!(
 );
 
 thrift_struct!(
-    pub(crate) struct Statistics {
+    pub struct Statistics {
         1: optional binary max;
         2: optional binary min;
         3: optional i64 null_count;
@@ -113,7 +113,7 @@ thrift_struct!(
 );
 
 thrift_struct!(
-    pub(crate) struct ColumnMetaData {
+    pub struct ColumnMetaData {
         7: required i64 total_compressed_size;
         9: required i64 data_page_offset;
         11: optional i64 dictionary_page_offset;
@@ -122,20 +122,20 @@ thrift_struct!(
 );
 
 thrift_struct!(
-    pub(crate) struct ColumnChunk {
+    pub struct ColumnChunk {
         3: optional ColumnMetaData meta_data;
     }
 );
 
 thrift_struct!(
-    pub(crate) struct RowGroup {
+    pub struct RowGroup {
         1: required list<ColumnChunk> columns;
         3: required i64 num_rows;
     }
 );
 
 thrift_struct!(
-    pub(crate) struct FileMetaData {
+    pub struct FileMetaData {
         2: required list<SchemaElement> schema;
         4: required list<RowGroup> row_groups;
     }

@@ -244,7 +244,7 @@ impl PageHeader {
     // reader that skips reading page statistics. obtained by running
     // `cargo expand -p parquet --all-features --lib file::metadata::thrift`
     // and modifying the impl of `read_thrift`
-    pub(crate) fn read_thrift_without_stats<'a, R>(prot: &mut R) -> Result<Self>
+    pub fn read_thrift_without_stats<'a, R>(prot: &mut R) -> Result<Self>
     where
         R: ThriftCompactInputProtocol<'a>,
     {

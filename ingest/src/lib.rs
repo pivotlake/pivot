@@ -29,6 +29,7 @@
 //! (re)created — the catalog snapshots a directory at creation time.
 
 mod otel;
+mod parquet_writer;
 mod sink;
 
 use std::sync::Arc;
@@ -186,12 +187,22 @@ fn spawn_flush_timer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch::{BUFFER_SIZE, Dispatch, ParquetTable};
+    use arrow_array::{Array, Int32Array, RecordBatch, StringViewArray};
+    use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, ParquetTable, Projection, table_input};
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::path::Path;
 
+    const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
+    /// Column indices in the `otel_logs` schema, for read-back assertions.
+    const SEVERITY_NUMBER: usize = 4;
+    const SERVICE_NAME: usize = 6;
+    const NUM_LOG_COLUMNS: usize = 11;
+
+    /// An OTLP logs request of `n` records, all `severity_number = 9`,
+    /// `service.name = "svc"`.
     fn log_request(n: usize) -> ExportLogsServiceRequest {
         let records = (0..n)
             .map(|i| LogRecord {
@@ -224,45 +235,109 @@ mod tests {
         }
     }
 
-    /// End to end on a real dispatch pool: append a logs batch, flush it to a
-    /// Parquet file on a worker, then read the file back via
-    /// `ParquetTable::from_directory` (also on a worker) and check the rows.
-    #[test]
-    fn flush_writes_readable_parquet() {
-        let dispatch = Dispatch::spin_up(1, 64 * 1024 * 1024 / BUFFER_SIZE);
-        let dispatcher = dispatch.dispatcher().clone();
-        let dir = tempfile::tempdir().unwrap();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
+    /// Flush `requests` (one batch each) through a sink as a single flush.
+    fn write_logs(dispatcher: &DataFlowDispatcher, dir: &Path, requests: &[ExportLogsServiceRequest]) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let dest = SinkDestination::Local(dir.path().to_path_buf());
-            let sink = ParquetSink::new("otel_logs", &dest, 1_000, dispatcher).unwrap();
-            let batch = otel::convert_logs_for_test(log_request(3)).unwrap();
-            sink.append(batch).await;
+            let dest = SinkDestination::Local(dir.to_path_buf());
+            // usize::MAX threshold: appends never auto-flush, so one flush_now
+            // writes all `requests` as a single multi-row-group file.
+            let sink = ParquetSink::new("otel_logs", &dest, usize::MAX, dispatcher.clone()).unwrap();
+            for request in requests {
+                sink.append(otel::convert_logs_for_test(request.clone()).unwrap())
+                    .await;
+            }
             sink.flush_now().await;
         });
+    }
 
-        // Exactly one file in the directory (the `.inflight` staging dir is a
-        // directory, so it is not counted).
-        let files: Vec<_> = std::fs::read_dir(dir.path())
+    /// Load the written directory back into a `ParquetTable` (on a worker).
+    fn read_table(dispatch: &Dispatch, dir: &Path) -> Arc<ParquetTable> {
+        let dir = dir.to_path_buf();
+        Arc::new(
+            dispatch
+                .dispatcher()
+                .run_on_worker(move || ParquetTable::from_directory(&dir))
+                .unwrap()
+                .unwrap(),
+        )
+    }
+
+    fn parquet_file_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
             .unwrap()
             .flatten()
             .filter(|e| e.path().is_file())
-            .collect();
-        assert_eq!(files.len(), 1, "expected exactly one parquet file");
+            .count()
+    }
 
-        // Read it back through the engine to prove pivot can query it.
-        let dir_path = dir.path().to_path_buf();
-        let table = dispatch
-            .dispatcher()
-            .run_on_worker(move || ParquetTable::from_directory(&dir_path))
-            .unwrap()
+    fn i32_column(batches: &[RecordBatch], col: usize) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let a = b.column(col).as_any().downcast_ref::<Int32Array>().unwrap();
+                (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn str_column(batches: &[RecordBatch], col: usize) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let a = b
+                    .column(col)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap();
+                (0..a.len()).map(|i| a.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// A written file decodes back to the original values through the engine's
+    /// scan (proves the PLAIN int and byte-array encodings are correct).
+    #[test]
+    fn written_pages_decode_to_original_values() {
+        let dispatch = Dispatch::spin_up(1, RING_BUFFERS);
+        let dir = tempfile::tempdir().unwrap();
+
+        write_logs(dispatch.dispatcher(), dir.path(), &[log_request(3)]);
+        let table = read_table(&dispatch, dir.path());
+        let batches = table_input(dispatch.dispatcher(), &table, Projection::all(NUM_LOG_COLUMNS), false)
+            .collect()
             .unwrap();
-        let rows: i64 = table.row_groups().iter().map(|rg| rg.num_rows).sum();
-        assert_eq!(rows, 3);
+
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        assert!(i32_column(&batches, SEVERITY_NUMBER).iter().all(|&v| v == 9));
+        assert!(str_column(&batches, SERVICE_NAME).iter().all(|v| v == "svc"));
+
+        dispatch.exit();
+    }
+
+    /// Page jobs encoded in parallel across the pool are stitched into one file
+    /// with one row group per input batch (five batches → five row groups).
+    #[test]
+    fn parallel_pages_assemble_into_one_file() {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(4);
+        let dispatch = Dispatch::spin_up(workers, RING_BUFFERS);
+        let dir = tempfile::tempdir().unwrap();
+
+        write_logs(dispatch.dispatcher(), dir.path(), &vec![log_request(2); 5]);
+        let table = read_table(&dispatch, dir.path());
+
+        assert_eq!(parquet_file_count(dir.path()), 1);
+        assert_eq!(table.row_groups().len(), 5);
+        assert_eq!(
+            table.row_groups().iter().map(|rg| rg.num_rows).sum::<i64>(),
+            10
+        );
 
         dispatch.exit();
     }
