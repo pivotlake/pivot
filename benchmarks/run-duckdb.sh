@@ -116,9 +116,13 @@ echo
 # string columns (stored as BLOB) as VARCHAR so `URL LIKE ...` binds, and
 # EventDate (days since epoch) is turned into a real DATE. `toDateTime` is the
 # macro the ClickBench queries use to read the packed-seconds timestamp columns.
+# EventDate (days since epoch) becomes a real DATE and EventTime (packed epoch
+# seconds) a real TIMESTAMP, matching pivot's setup.sql declared types, so
+# date/timestamp queries (e.g. Q42's date_trunc + date-range filter) bind and
+# run the same way on both engines.
 setup="CREATE VIEW hits AS
 SELECT *
-    REPLACE (make_date(EventDate) AS EventDate)
+    REPLACE (make_date(EventDate) AS EventDate, to_timestamp(EventTime)::TIMESTAMP AS EventTime)
 FROM read_parquet('${parquet_glob}', binary_as_string=True);
 CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000);"
 

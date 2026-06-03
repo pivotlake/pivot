@@ -65,11 +65,14 @@ impl OrderBy {
 
 /// Merge multiple already-sorted top-k batches into a single global top-k.
 ///
-/// Concatenates all batches, then sorts and truncates to `k` rows.
+/// Concatenates all batches, then sorts, skips `skip` rows, and keeps the next
+/// `fetch - skip` rows. Local stages pass `skip = 0`; the final global stage
+/// passes `skip = offset` to implement `LIMIT … OFFSET`.
 fn get_top_k_from_top_ks(
     batches: Vec<RecordBatch>,
     order_by: &[OrderBy],
-    k: usize,
+    fetch: usize,
+    skip: usize,
 ) -> Result<RecordBatch> {
     if batches.is_empty() {
         panic!("get_top_k_from_top_ks called with no batches");
@@ -78,14 +81,17 @@ fn get_top_k_from_top_ks(
     let schema = batches[0].schema();
     let final_pool = arrow::compute::concat_batches(&schema, &batches)?;
     debug!("Final pool size: {:?}", final_pool.num_rows());
-    get_top_k_from_single(&final_pool, order_by, k)
+    get_top_k_from_single(&final_pool, order_by, fetch, skip)
 }
 
-/// Sort a single batch by `order_by` keys and return the first `k` rows.
+/// Sort a single batch by `order_by` keys, take the first `fetch` rows, then
+/// drop the leading `skip` of them (so the result has at most `fetch - skip`
+/// rows). `skip` is non-zero only at the final global stage, to honour OFFSET.
 fn get_top_k_from_single(
     batch: &RecordBatch,
     order_by: &[OrderBy],
-    k: usize,
+    fetch: usize,
+    skip: usize,
 ) -> Result<RecordBatch> {
     let sort_columns: Vec<SortColumn> = order_by
         .iter()
@@ -101,15 +107,18 @@ fn get_top_k_from_single(
         })
         .collect();
 
-    let indices = lexsort_to_indices(&sort_columns, Some(k))?;
+    let indices = lexsort_to_indices(&sort_columns, Some(fetch))?;
+    let len = indices.len();
+    let skip = skip.min(len);
+    let kept = indices.slice(skip, len - skip);
 
     let columns = batch
         .columns()
         .iter()
-        .map(|c| take(c.as_ref(), &indices, None))
+        .map(|c| take(c.as_ref(), &kept, None))
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    Ok(unsafe { RecordBatch::new_unchecked(batch.schema(), columns, indices.len()) })
+    Ok(unsafe { RecordBatch::new_unchecked(batch.schema(), columns, kept.len()) })
 }
 
 /// Per-worker ORDER BY LIMIT consumer.
@@ -118,6 +127,7 @@ fn get_top_k_from_single(
 /// merges them into one local top-k and sends it to the shared channel.
 pub struct OrderByLimit {
     limit: usize,
+    offset: usize,
     top_k_per_batch: Vec<RecordBatch>,
     order_by: Vec<OrderBy>,
     sender: mpsc::Sender<RecordBatch>,
@@ -128,11 +138,13 @@ impl OrderByLimit {
     pub fn new(
         order_by: Vec<OrderBy>,
         limit: usize,
+        offset: usize,
         sender: mpsc::Sender<RecordBatch>,
         receiver: Option<Receiver<RecordBatch>>,
     ) -> Self {
         Self {
             limit,
+            offset,
             top_k_per_batch: vec![],
             order_by,
             sender,
@@ -150,15 +162,20 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
         _sender: &mut S,
     ) -> unary::Result<()> {
         debug!("Received batch of length {:?}", batch.num_rows());
+        // Local stages keep `limit + offset` candidates (skip = 0); only the
+        // final global merge skips `offset`, since which rows fall in the
+        // offset window can only be decided once all workers' tops are merged.
+        let fetch = self.limit + self.offset;
         self.top_k_per_batch
-            .push(get_top_k_from_single(&batch, &self.order_by, self.limit)?);
+            .push(get_top_k_from_single(&batch, &self.order_by, fetch, 0)?);
         Ok(())
     }
 
     fn into_outputter(self) -> crate::operations::unary::Result<Option<Self::Outputter>> {
+        let fetch = self.limit + self.offset;
         if !self.top_k_per_batch.is_empty() {
             let local_top_k =
-                get_top_k_from_top_ks(self.top_k_per_batch, &self.order_by, self.limit)?;
+                get_top_k_from_top_ks(self.top_k_per_batch, &self.order_by, fetch, 0)?;
             debug!("Sending on {:?}", local_top_k.num_rows());
             self.sender.send(local_top_k).expect("Receiver dropped!");
             worker_waker().notify();
@@ -169,6 +186,7 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
             batches: vec![],
             order_by: self.order_by,
             limit: self.limit,
+            offset: self.offset,
         }))
     }
 }
@@ -180,6 +198,7 @@ pub struct OrderByLimitOutputter {
     batches: Vec<RecordBatch>,
     order_by: Vec<OrderBy>,
     limit: usize,
+    offset: usize,
 }
 
 impl Outputter<RecordBatch> for OrderByLimitOutputter {
@@ -197,7 +216,8 @@ impl Outputter<RecordBatch> for OrderByLimitOutputter {
                     sender.send(get_top_k_from_top_ks(
                         mem::take(&mut self.batches),
                         &self.order_by,
-                        self.limit,
+                        self.limit + self.offset,
+                        self.offset,
                     )?)?;
                     debug!("took {:?}", start.elapsed());
                 }
@@ -235,6 +255,7 @@ mod tests {
                 OrderByLimit::new(
                     vec![OrderBy::new(0, descending, false)],
                     limit,
+                    0,
                     tx.clone(),
                     rx_opt.take(),
                 )

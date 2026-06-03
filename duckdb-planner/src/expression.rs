@@ -50,6 +50,16 @@ pub struct Compare {
     pub return_type: LogicalTypeId,
 }
 
+/// A `BETWEEN` expression (`input BETWEEN lower AND upper`).
+#[derive(CustomDeserializer, Debug)]
+pub struct Between {
+    pub input: Box<Expression>,
+    pub lower: Box<Expression>,
+    pub upper: Box<Expression>,
+    pub lower_inclusive: bool,
+    pub upper_inclusive: bool,
+}
+
 /// An aggregate function call (e.g. `SUM`, `COUNT`).
 #[derive(CustomDeserializer, Debug)]
 pub struct AggregateFunc {
@@ -73,7 +83,13 @@ pub enum Expression {
     Ref(Ref),
     #[type_tag(ExpressionType::COMPARE_EQUAL)]
     #[type_tag(ExpressionType::COMPARE_NOTEQUAL)]
+    #[type_tag(ExpressionType::COMPARE_LESSTHAN)]
+    #[type_tag(ExpressionType::COMPARE_GREATERTHAN)]
+    #[type_tag(ExpressionType::COMPARE_LESSTHANOREQUALTO)]
+    #[type_tag(ExpressionType::COMPARE_GREATERTHANOREQUALTO)]
     Compare(Compare),
+    #[type_tag(ExpressionType::COMPARE_BETWEEN)]
+    Between(Between),
     #[type_tag(ExpressionType::VALUE_CONSTANT)]
     Constant(ScalarValue),
     #[type_tag(ExpressionType::BOUND_AGGREGATE)]
@@ -170,6 +186,11 @@ impl fmt::Display for Expression {
                 compare_symbol(&c.compare_type),
                 c.right,
                 type_name(&c.return_type)
+            ),
+            Expression::Between(b) => write!(
+                f,
+                "{} BETWEEN {} AND {}",
+                b.input, b.lower, b.upper
             ),
             Expression::Constant(c) => write!(f, "{}:{}", c.raw_value, type_name(&c.logical_type)),
             Expression::AggregateFunc(a) => {

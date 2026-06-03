@@ -481,10 +481,17 @@ impl RecordBatchOperatorSpec {
     /// # ;
     /// ```
     pub fn order_by_limit(self, order_by: Vec<OrderBy>, limit: usize) -> Self {
+        self.order_by_limit_offset(order_by, limit, 0)
+    }
+
+    /// Like [`order_by_limit`](Self::order_by_limit) but skips the first
+    /// `offset` rows of the globally sorted result (SQL `LIMIT … OFFSET`).
+    pub fn order_by_limit_offset(self, order_by: Vec<OrderBy>, limit: usize, offset: usize) -> Self {
         let worker_count = self.worker_count();
         self.unary(OrderByLimitFactory::create_for_workers(
             order_by,
             limit,
+            offset,
             worker_count,
         ))
     }
