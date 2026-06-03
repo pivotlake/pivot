@@ -86,6 +86,7 @@ pub struct Filter {
 pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,
+    pub offset: usize,
 }
 
 /// A single column definition inside a CREATE TABLE statement.
@@ -209,7 +210,13 @@ impl fmt::Display for Operator {
             }
             Operator::TopN(t) => {
                 let orders: Vec<String> = t.order_bys.iter().map(|o| o.to_string()).collect();
-                write!(f, "TopN(limit: {}, order: {})", t.limit, orders.join(", "))
+                write!(
+                    f,
+                    "TopN(limit: {}, offset: {}, order: {})",
+                    t.limit,
+                    t.offset,
+                    orders.join(", ")
+                )
             }
             Operator::CreateTable(c) => {
                 let columns: Vec<String> = c

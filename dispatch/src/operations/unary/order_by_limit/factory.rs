@@ -12,6 +12,7 @@ use std::sync::mpsc::Receiver;
 pub struct OrderByLimitFactory {
     order_by: Vec<OrderBy>,
     limit: usize,
+    offset: usize,
     sender: mpsc::Sender<RecordBatch>,
     receiver: Option<Receiver<RecordBatch>>,
 }
@@ -21,6 +22,7 @@ impl OrderByLimitFactory {
     pub fn create_for_workers(
         order_by: Vec<OrderBy>,
         limit: usize,
+        offset: usize,
         worker_count: usize,
     ) -> impl IntoIterator<Item = OrderByLimitFactory> {
         let (tx, rx) = mpsc::channel();
@@ -29,6 +31,7 @@ impl OrderByLimitFactory {
         (0..worker_count).map(move |_| OrderByLimitFactory {
             order_by: order_by.clone(),
             limit,
+            offset,
             sender: tx.clone(),
             receiver: rx_opt.take(),
         })
@@ -42,6 +45,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for OrderByLimitFactory {
         PipelineBreaker::Consuming(OrderByLimit::new(
             self.order_by,
             self.limit,
+            self.offset,
             self.sender,
             self.receiver.take(),
         ))

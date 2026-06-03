@@ -256,6 +256,7 @@ impl fmt::Display for Filter {
 pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,
+    pub offset: usize,
 }
 
 impl TryFrom<duckdb_operator::TopN> for TopN {
@@ -268,6 +269,7 @@ impl TryFrom<duckdb_operator::TopN> for TopN {
                 .map(OrderByNode::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
             limit: t.limit,
+            offset: t.offset,
         })
     }
 }
@@ -280,7 +282,11 @@ impl fmt::Display for TopN {
             .map(|o| o.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        write!(f, "TopN(limit: {}, order: {orders})", self.limit)
+        write!(
+            f,
+            "TopN(limit: {}, offset: {}, order: {orders})",
+            self.limit, self.offset
+        )
     }
 }
 

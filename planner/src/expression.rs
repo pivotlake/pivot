@@ -4,6 +4,7 @@
 use crate::types;
 use crate::types::{Type, build_scalar_value, type_from_logical};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Datum, Scalar};
 use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
 use duckdb_planner::expression as duckdb_expression;
@@ -49,6 +50,10 @@ impl TryFrom<duckdb_expression::Ref> for Ref {
 pub enum CompareType {
     Equal,
     NotEqual,
+    Less,
+    Greater,
+    LessEqual,
+    GreaterEqual,
 }
 
 impl TryFrom<ExpressionType> for CompareType {
@@ -57,6 +62,10 @@ impl TryFrom<ExpressionType> for CompareType {
         match c {
             ExpressionType::COMPARE_EQUAL => Ok(CompareType::Equal),
             ExpressionType::COMPARE_NOTEQUAL => Ok(CompareType::NotEqual),
+            ExpressionType::COMPARE_LESSTHAN => Ok(CompareType::Less),
+            ExpressionType::COMPARE_GREATERTHAN => Ok(CompareType::Greater),
+            ExpressionType::COMPARE_LESSTHANOREQUALTO => Ok(CompareType::LessEqual),
+            ExpressionType::COMPARE_GREATERTHANOREQUALTO => Ok(CompareType::GreaterEqual),
             _ => Err(Error::UnsupportedComparisonType(c)),
         }
     }
@@ -79,6 +88,31 @@ impl TryFrom<duckdb_expression::Compare> for Compare {
             right: Box::<Expression>::try_from(c.right)?,
             compare_type: c.compare_type.try_into()?,
             return_type: type_from_logical(c.return_type)?,
+        })
+    }
+}
+
+/// A `BETWEEN` range test (`input BETWEEN lower AND upper`). DuckDB folds
+/// `x >= a AND x <= b` into this; we compile it back to the conjunction of two
+/// comparisons (respecting the inclusive/exclusive flags).
+#[derive(Debug, Clone)]
+pub struct Between {
+    pub input: Box<Expression>,
+    pub lower: Box<Expression>,
+    pub upper: Box<Expression>,
+    pub lower_inclusive: bool,
+    pub upper_inclusive: bool,
+}
+
+impl TryFrom<duckdb_expression::Between> for Between {
+    type Error = Error;
+    fn try_from(b: duckdb_expression::Between) -> Result<Self, Self::Error> {
+        Ok(Between {
+            input: Box::<Expression>::try_from(b.input)?,
+            lower: Box::<Expression>::try_from(b.lower)?,
+            upper: Box::<Expression>::try_from(b.upper)?,
+            lower_inclusive: b.lower_inclusive,
+            upper_inclusive: b.upper_inclusive,
         })
     }
 }
@@ -206,11 +240,53 @@ impl TryFrom<duckdb_expression::Function> for Divide {
     }
 }
 
+/// SQL `date_trunc(unit, source)` — truncate a timestamp down to `unit`
+/// (e.g. `date_trunc('minute', EventTime)`). DuckDB passes the unit as a string
+/// constant in the first argument and the timestamp expression second.
+#[derive(Debug, Clone)]
+pub struct DateTrunc {
+    pub unit: String,
+    pub source: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Function> for DateTrunc {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        if f.params.len() != 2 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 2,
+                actual,
+            });
+        }
+        let source = Box::new(Expression::try_from(f.params.remove(1))?);
+        let unit = match Expression::try_from(f.params.remove(0))? {
+            Expression::Constant(scalar) => {
+                let (arr, _) = scalar.get();
+                arr.as_string_view_opt()
+                    .ok_or_else(|| {
+                        Error::UnsupportedScalarFunction("date_trunc: unit must be a string".into())
+                    })?
+                    .value(0)
+                    .to_ascii_lowercase()
+            }
+            _ => {
+                return Err(Error::UnsupportedScalarFunction(
+                    "date_trunc: unit must be a constant".into(),
+                ));
+            }
+        };
+        Ok(DateTrunc { unit, source })
+    }
+}
+
 /// A scalar function call (e.g. `year`, `substring`).
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
     Divide(Divide),
+    DateTrunc(DateTrunc),
 }
 
 impl TryFrom<duckdb_expression::Function> for Function {
@@ -219,6 +295,7 @@ impl TryFrom<duckdb_expression::Function> for Function {
         match f.function.as_str() {
             "contains" => Ok(Function::Contains(f.try_into()?)),
             "/" => Ok(Function::Divide(f.try_into()?)),
+            "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),
             _ => Err(Error::UnsupportedScalarFunction(f.function)),
         }
     }
@@ -229,6 +306,7 @@ impl TryFrom<duckdb_expression::Function> for Function {
 pub enum Expression {
     Ref(Ref),
     Compare(Compare),
+    Between(Between),
     Constant(Scalar<ArrayRef>),
     AggregateFunc(AggregateFunc),
     Function(Function),
@@ -239,6 +317,10 @@ impl Display for CompareType {
         match self {
             CompareType::Equal => f.write_str("="),
             CompareType::NotEqual => f.write_str("<>"),
+            CompareType::Less => f.write_str("<"),
+            CompareType::Greater => f.write_str(">"),
+            CompareType::LessEqual => f.write_str("<="),
+            CompareType::GreaterEqual => f.write_str(">="),
         }
     }
 }
@@ -264,6 +346,9 @@ impl Display for Expression {
                 "{} {} {} -> {}",
                 c.left, c.compare_type, c.right, c.return_type
             ),
+            Expression::Between(b) => {
+                write!(f, "{} BETWEEN {} AND {}", b.input, b.lower, b.upper)
+            }
             Expression::Constant(c) => f.write_str(&format_constant(c)),
             Expression::AggregateFunc(AggregateFunc::CountStar(_)) => f.write_str("count_star()"),
             Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
@@ -279,6 +364,9 @@ impl Display for Expression {
                 write!(f, "contains({}, {})", c.haystack, c.needle)
             }
             Expression::Function(Function::Divide(d)) => write!(f, "({} / {})", d.left, d.right),
+            Expression::Function(Function::DateTrunc(dt)) => {
+                write!(f, "date_trunc('{}', {})", dt.unit, dt.source)
+            }
         }
     }
 }
@@ -289,6 +377,7 @@ impl TryFrom<duckdb_expression::Expression> for Expression {
         Ok(match e {
             duckdb_expression::Expression::Ref(r) => Expression::Ref(r.try_into()?),
             duckdb_expression::Expression::Compare(c) => Expression::Compare(c.try_into()?),
+            duckdb_expression::Expression::Between(b) => Expression::Between(b.try_into()?),
             duckdb_expression::Expression::Constant(c) => {
                 Expression::Constant(build_scalar_value(c)?)
             }
