@@ -8,10 +8,9 @@
 
 use crate::operations::unary::group::aggregations::{AggRow, GroupAggKind, GroupAggSlot};
 use crate::operations::unary::group::value_extractions::{ValueColumns, ValueExtractor};
-use arrow_array::builder::Int64Builder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -85,8 +84,13 @@ impl<const N: usize> ValueExtractor for AggRowValueExtractor<N> {
 }
 
 /// Emits one `Int64` column per slot (`v0`, `v1`, …).
+///
+/// Each slot pushes into a raw `Vec<i64>` rather than an Arrow `Int64Builder`,
+/// for the same reason as [`CountColumns`](super::count::CountColumns): the
+/// builder's `append_value` does not reliably inline into the generic output
+/// combinator, adding a per-row call when a group emits every row.
 pub struct AggRowColumns<const N: usize> {
-    builders: Vec<Int64Builder>,
+    cols: Vec<Vec<i64>>,
 }
 
 impl<const N: usize> ValueColumns for AggRowColumns<N> {
@@ -94,23 +98,23 @@ impl<const N: usize> ValueColumns for AggRowColumns<N> {
 
     fn with_capacity(rows: usize) -> Self {
         Self {
-            builders: (0..N).map(|_| Int64Builder::with_capacity(rows)).collect(),
+            cols: (0..N).map(|_| Vec::with_capacity(rows)).collect(),
         }
     }
 
     #[inline(always)]
     fn push(&mut self, value: &AggRow<N>) {
-        for (b, &v) in self.builders.iter_mut().zip(value.0.iter()) {
-            b.append_value(v);
+        for (c, &v) in self.cols.iter_mut().zip(value.0.iter()) {
+            c.push(v);
         }
     }
 
     fn finish(self) -> (Vec<Field>, Vec<ArrayRef>) {
         let mut fields = Vec::with_capacity(N);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(N);
-        for (s, mut b) in self.builders.into_iter().enumerate() {
+        for (s, c) in self.cols.into_iter().enumerate() {
             fields.push(Field::new(format!("v{s}"), DataType::Int64, false));
-            columns.push(Arc::new(b.finish()));
+            columns.push(Arc::new(Int64Array::from(c)));
         }
         (fields, columns)
     }

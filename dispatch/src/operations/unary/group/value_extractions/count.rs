@@ -3,8 +3,7 @@
 use crate::operations::unary::group::aggregations::{Count, GroupAggSlot};
 use crate::operations::unary::group::hashtables::Value;
 use crate::operations::unary::group::value_extractions::{ValueColumns, ValueExtractor};
-use arrow_array::builder::UInt64Builder;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -33,23 +32,28 @@ impl ValueExtractor for CountValueExtractor {
 }
 
 /// Emits the single `UInt64` count column.
-pub struct CountColumns(UInt64Builder);
+///
+/// Pushes into a raw `Vec<u64>` rather than an Arrow `UInt64Builder`: the builder's
+/// `append_value` does not always inline into the generic output combinator, which
+/// at one row per group (millions, for a no-top-k `COUNT(*)`) adds a real per-group
+/// call. `Vec::push` always inlines; the array is built once at `finish`.
+pub struct CountColumns(Vec<u64>);
 
 impl ValueColumns for CountColumns {
     type Value = Count;
 
     fn with_capacity(rows: usize) -> Self {
-        Self(UInt64Builder::with_capacity(rows))
+        Self(Vec::with_capacity(rows))
     }
 
     #[inline(always)]
     fn push(&mut self, value: &Count) {
-        self.0.append_value(value.value as u64);
+        self.0.push(value.value as u64);
     }
 
-    fn finish(mut self) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(self) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![Field::new("value", DataType::UInt64, false)];
-        let columns: Vec<ArrayRef> = vec![Arc::new(self.0.finish())];
+        let columns: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(self.0))];
         (fields, columns)
     }
 }
