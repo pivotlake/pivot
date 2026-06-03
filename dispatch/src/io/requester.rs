@@ -1,6 +1,7 @@
 use crate::Identifier;
 use crate::io::DataFlowRequest;
 use crate::io::backend::IOBackend;
+use crate::memory::ReadBuffer;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -22,7 +23,9 @@ const RING_SIZE: u32 = 32;
 /// Held one per worker
 pub struct IORequester {
     backend: IOBackend,
-    pending_io_requests: HashMap<Identifier, DataFlowRequest>,
+    /// In-flight reads, each holding a pin on its destination slot so it can't
+    /// be evicted out from under the read (e.g. on cancellation).
+    pending_io_requests: HashMap<Identifier, (ReadBuffer, DataFlowRequest)>,
     next_id: Identifier,
 }
 
@@ -37,8 +40,10 @@ impl IORequester {
 
     /// Submits the block's read straight into its (pinned) cache slot and
     /// flushes immediately. No intermediate buffer: the slot region is the read
-    /// target.
+    /// target. We hold our own pin on the slot until the read completes, so it
+    /// survives the read even if the issuing query is cancelled meanwhile.
     pub fn request(&mut self, request: DataFlowRequest) -> Result<()> {
+        let pin = request.request.block.pin();
         self.backend.submit_read(
             request.request.fd,
             request.request.block.file_offset as u64,
@@ -46,7 +51,7 @@ impl IORequester {
             request.request.block.len,
             self.next_id,
         )?;
-        self.pending_io_requests.insert(self.next_id, request);
+        self.pending_io_requests.insert(self.next_id, (pin, request));
         self.next_id += 1;
         self.backend.submit()?;
 
@@ -65,8 +70,9 @@ impl IORequester {
     pub fn completions(&mut self) -> Result<impl Iterator<Item = DataFlowRequest>> {
         let identifiers = self.backend.completions()?;
         Ok(identifiers.into_iter().map(|(_size, i)| {
-            let request = self.pending_io_requests.remove(&i).unwrap();
+            let (pin, request) = self.pending_io_requests.remove(&i).unwrap();
             request.request.block.commit();
+            drop(pin); // release our read-duration pin now the bytes are committed
             request
         }))
     }

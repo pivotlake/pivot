@@ -105,14 +105,26 @@ impl MissingBlock {
         self.dest as *mut u8
     }
 
+    /// Pin the destination slot for the lifetime of this block's read, so it
+    /// can't be evicted out from under an in-flight read — e.g. if the owning
+    /// query is cancelled and drops its [`MissRegion`] (and thus its pin) before
+    /// the read lands. The slot is already pinned by that `MissRegion` when this
+    /// is called, so `try_read` cannot fail.
+    pub fn pin(&self) -> ReadBuffer {
+        memory_ctx()
+            .ring()
+            .try_read(self.slot_idx)
+            .expect("missing-block slot is pinned by its MissRegion")
+    }
+
     /// Mark this block's sub-blocks valid — call once its bytes have been read
-    /// into the slot (`Release` so a reader that observes a valid bit `Acquire`
-    /// is guaranteed to see the bytes the read landed).
+    /// into the slot.
     pub fn commit(&self) {
-        let entry = unsafe { &*memory_ctx().file_cache().entries[self.slot_idx].get() };
-        for s in self.first_sub..self.first_sub + self.sub_count {
-            entry.valid[s / 64].fetch_or(1u64 << (s % 64), Ordering::Release);
-        }
+        memory_ctx()
+            .file_cache()
+            .entry(self.slot_idx)
+            .valid
+            .set(self.first_sub, self.sub_count);
     }
 }
 
@@ -152,6 +164,36 @@ pub struct FileCache {
 unsafe impl Send for FileCache {}
 unsafe impl Sync for FileCache {}
 
+/// A slot's validity bitmap: bit `sub` set means sub-block `sub` (a 4 KB chunk)
+/// has been read into the slot. Keeps all the word/bit indexing — and the
+/// memory ordering that makes the in-place fill sound — in one place.
+#[derive(Default)]
+struct ValidBitmap([AtomicU64; BITMAP_WORDS]);
+
+impl ValidBitmap {
+    /// Is sub-block `sub` present? `Acquire` pairs with `set`'s `Release`, so a
+    /// reader that observes the bit is guaranteed to see the sub-block's bytes.
+    fn is_set(&self, sub: usize) -> bool {
+        self.0[sub / 64].load(Ordering::Acquire) & (1 << (sub % 64)) != 0
+    }
+
+    /// Mark sub-blocks `[first, first + count)` present. `Release` so it only
+    /// becomes visible after the bytes have landed in the slot.
+    fn set(&self, first: usize, count: usize) {
+        for sub in first..first + count {
+            self.0[sub / 64].fetch_or(1 << (sub % 64), Ordering::Release);
+        }
+    }
+
+    /// Reset every sub-block to absent. Sound only while the slot is held
+    /// exclusively (no concurrent readers).
+    fn clear(&self) {
+        for word in &self.0 {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Per-slot CLOCK metadata + validity.
 ///
 /// * `ref_bit` – set on access, cleared by the CLOCK sweep.
@@ -160,7 +202,7 @@ unsafe impl Sync for FileCache {}
 struct Entry {
     ref_bit: AtomicBool,
     region: Option<IOLocation>,
-    valid: [AtomicU64; BITMAP_WORDS],
+    valid: ValidBitmap,
 }
 
 impl FileCache {
@@ -196,65 +238,72 @@ impl FileCache {
                 return self.lookup_pinned(pin, region, start, end);
             }
 
-            // Miss: get a free slot *before* taking the map lock, since
+            // Miss: grab a free slot *before* taking the map lock, since
             // get_write_buffer may evict (which locks the cache itself).
-            let wb = memory_ctx().get_write_buffer(false);
-            let slot_idx = wb.slot_idx;
+            let slot = memory_ctx().get_write_buffer(false);
+            let slot_idx = slot.slot_idx;
 
             // Register region → slot, unless another worker beat us to it.
-            let maps = self.file_maps.read().unwrap();
-            let inner = maps.get(&fd).expect("Missing file in file cache!");
-            let mut inner = inner.write().unwrap();
-            if inner.contains_key(&region) {
-                // Lost the race: release our (untouched) slot and retry the fast
-                // path. We must not have bound `entry.region` yet — otherwise a
-                // later eviction of this slot would remove the winner's mapping.
-                drop(inner);
-                drop(maps);
-                drop(wb); // returns the slot to the free pool, entry untouched
+            let file_maps = self.file_maps.read().unwrap();
+            let fd_regions = file_maps.get(&fd).expect("Missing file in file cache!");
+            let mut fd_regions = fd_regions.write().unwrap();
+            if fd_regions.contains_key(&region) {
+                // Lost the race: drop our untouched slot and retry the fast path.
+                // We must not have bound the slot's region yet — otherwise a
+                // later eviction of it would remove the winner's mapping.
+                drop(fd_regions);
+                drop(file_maps);
+                drop(slot); // returns the slot to the free pool, entry untouched
                 continue;
             }
-            // We won. Initialize the slot while it's still exclusively held
-            // (WRITING) — bitmap zeroed and region bound before any reader can
-            // pin it. `entry.region` is set only now, atomically with the map
-            // insert, so a dropped loser never leaves a dangling region behind.
-            {
-                let entry = unsafe { &mut *self.entries[slot_idx].get() };
-                for w in &entry.valid {
-                    w.store(0, Ordering::Relaxed);
-                }
-                entry.region = Some(location.clone());
-                entry.ref_bit.store(true, Ordering::Relaxed);
-            }
-            inner.insert(region, FileCacheEntry { ring_idx: slot_idx });
-            // Transition WRITING → readable (1 reader = our pin) while still
-            // holding the map lock, so a concurrent `pin_existing` either blocks
-            // on the lock or sees a pinnable slot — never a WRITING one.
-            let pin = ReadBuffer::from(wb);
-            drop(inner);
-            drop(maps);
+            // We won. While the slot is still exclusively held (WRITING, so no
+            // reader can pin it) reset its bitmap and bind its region — set only
+            // now, atomically with the map insert, so a dropped loser never
+            // leaves a dangling region behind.
+            let entry = unsafe { &mut *self.entries[slot_idx].get() };
+            entry.valid.clear();
+            entry.region = Some(location.clone());
+            entry.ref_bit.store(true, Ordering::Relaxed);
+
+            fd_regions.insert(region, FileCacheEntry { ring_idx: slot_idx });
+            // Publish as readable (1 reader = our pin) while still holding the
+            // map lock, so a racing pin_existing waits on the lock rather than
+            // ever seeing a WRITING slot.
+            let pin = ReadBuffer::from(slot);
+            drop(fd_regions);
+            drop(file_maps);
             return self.lookup_pinned(pin, region, start, end);
         }
+    }
+
+    /// Borrow ring slot `idx`'s cache metadata. The atomic `valid`/`ref_bit` are
+    /// always safe to touch; `region` is only mutated while the slot is held
+    /// exclusively (WRITING), which can't coexist with a read pin, so reading it
+    /// under a pin is sound.
+    fn entry(&self, idx: usize) -> &Entry {
+        unsafe { &*self.entries[idx].get() }
     }
 
     /// Pin the slot caching `location`, or `None` if it isn't cached (or a
     /// concurrent eviction recycled it between the map lookup and the pin).
     fn pin_existing(&self, location: &IOLocation) -> Option<ReadBuffer> {
-        let maps = self.file_maps.read().unwrap();
-        let inner = maps.get(&location.raw_fd).unwrap().read().unwrap();
-        let ring_idx = inner.get(&location.offset)?.ring_idx;
-        let guard = memory_ctx().ring().try_read(ring_idx)?;
-        let entry = unsafe { &*self.entries[guard.ring_idx()].get() };
+        let file_maps = self.file_maps.read().unwrap();
+        let fd_regions = file_maps.get(&location.raw_fd).unwrap().read().unwrap();
+        let ring_idx = fd_regions.get(&location.offset)?.ring_idx;
+        let pin = memory_ctx().ring().try_read(ring_idx)?;
+        // Re-check under the pin: eviction may have recycled the slot for a
+        // different region between the map lookup and the pin.
+        let entry = self.entry(pin.ring_idx());
         if entry.region.as_ref() == Some(location) {
             entry.ref_bit.store(true, Ordering::Relaxed);
-            Some(guard)
+            Some(pin)
         } else {
             None
         }
     }
 
     /// Inspect the bitmap of a pinned slot over `[start, end)` and produce a
-    /// `Hit` (all valid) or a `Miss` with the coalesced missing runs.
+    /// `Hit` (all valid) or a `Miss` listing the missing runs to read.
     fn lookup_pinned(
         &self,
         pin: ReadBuffer,
@@ -263,26 +312,27 @@ impl FileCache {
         end: usize,
     ) -> CacheLookup {
         let slot_idx = pin.slot_idx;
-        let base = pin.ptr as usize;
-        let entry = unsafe { &*self.entries[slot_idx].get() };
+        let slot_ptr = pin.ptr as usize;
+        let valid = &self.entry(slot_idx).valid;
 
-        let first = start / SUB_BLOCK_SIZE;
-        let last = (end - 1) / SUB_BLOCK_SIZE;
+        let first_sub = start / SUB_BLOCK_SIZE;
+        let last_sub = (end - 1) / SUB_BLOCK_SIZE;
 
+        // Walk the requested sub-blocks, gathering each maximal run of missing
+        // ones into a single block to read.
         let mut missing = Vec::new();
-        let mut run: Option<usize> = None; // start sub-block of the current missing run
-        for s in first..=last {
-            let present = entry.valid[s / 64].load(Ordering::Acquire) & (1u64 << (s % 64)) != 0;
-            if present {
-                if let Some(a) = run.take() {
-                    missing.push(make_missing_block(region, base, slot_idx, a, s - 1));
+        let mut run_start: Option<usize> = None;
+        for sub in first_sub..=last_sub {
+            if valid.is_set(sub) {
+                if let Some(run_first) = run_start.take() {
+                    missing.push(MissingBlock::new(region, slot_ptr, slot_idx, run_first, sub - 1));
                 }
-            } else if run.is_none() {
-                run = Some(s);
+            } else {
+                run_start.get_or_insert(sub);
             }
         }
-        if let Some(a) = run.take() {
-            missing.push(make_missing_block(region, base, slot_idx, a, last));
+        if let Some(run_first) = run_start.take() {
+            missing.push(MissingBlock::new(region, slot_ptr, slot_idx, run_first, last_sub));
         }
 
         if missing.is_empty() {
@@ -297,29 +347,24 @@ impl FileCache {
         }
     }
 
-    /// Evict a slot using the CLOCK algorithm and return it as a writable buffer.
+    /// Evict a slot using the (second-chance) CLOCK algorithm and return it as a
+    /// writable buffer.
     pub fn evict(&self) -> crate::memory::write_buffer::WriteBuffer {
         loop {
             let slot_idx = self.hand.fetch_add(1, Ordering::Relaxed) % memory_ctx().ring().len();
-            let cell = &self.entries[slot_idx];
-            let entry = unsafe { &*cell.get() };
-            if entry.ref_bit.swap(false, Ordering::Relaxed) {
+            // Give recently-used slots a second chance: clear the ref bit and
+            // skip; an unreferenced slot we can write-lock gets evicted.
+            if self.entry(slot_idx).ref_bit.swap(false, Ordering::Relaxed) {
                 continue;
             }
-
-            if let Some(r) = memory_ctx().ring().try_write(slot_idx) {
-                let entry = unsafe { &mut *cell.get() };
-                if let Some(l) = entry.region.take() {
-                    self.file_maps
-                        .read()
-                        .unwrap()
-                        .get(&l.raw_fd)
-                        .unwrap()
-                        .write()
-                        .unwrap()
-                        .remove(&l.offset);
+            if let Some(write_buffer) = memory_ctx().ring().try_write(slot_idx) {
+                // Exclusive now: unbind the region from the map before reusing.
+                let entry = unsafe { &mut *self.entries[slot_idx].get() };
+                if let Some(region) = entry.region.take() {
+                    let file_maps = self.file_maps.read().unwrap();
+                    file_maps.get(&region.raw_fd).unwrap().write().unwrap().remove(&region.offset);
                 }
-                return r;
+                return write_buffer;
             }
         }
     }
@@ -328,28 +373,35 @@ impl FileCache {
     /// entries from a previous use of the same fd number.
     pub fn open_file_entry(&self, raw_fd: RawFd) {
         let mut file_maps = self.file_maps.write().unwrap();
-        if let Some(old_map) = file_maps.remove(&raw_fd) {
-            for (_, entry) in old_map.into_inner().unwrap() {
-                let cell = &self.entries[entry.ring_idx];
-                let slot = unsafe { &mut *cell.get() };
-                slot.region = None;
-                drop(memory_ctx().ring().try_write(entry.ring_idx));
+        if let Some(stale) = file_maps.remove(&raw_fd) {
+            for (_, FileCacheEntry { ring_idx }) in stale.into_inner().unwrap() {
+                unsafe { &mut *self.entries[ring_idx].get() }.region = None;
+                drop(memory_ctx().ring().try_write(ring_idx));
             }
         }
         file_maps.insert(raw_fd, Default::default());
     }
 }
 
-/// Build a [`MissingBlock`] covering sub-blocks `[a, b]` (inclusive) of a slot.
-#[inline]
-fn make_missing_block(region: usize, base: usize, slot_idx: usize, a: usize, b: usize) -> MissingBlock {
-    MissingBlock {
-        file_offset: region + a * SUB_BLOCK_SIZE,
-        dest: base + a * SUB_BLOCK_SIZE,
-        len: (b - a + 1) * SUB_BLOCK_SIZE,
-        slot_idx,
-        first_sub: a,
-        sub_count: b - a + 1,
+impl MissingBlock {
+    /// A block covering sub-blocks `[first_sub, last_sub]` (inclusive) of the
+    /// slot at `slot_ptr` caching `region`.
+    fn new(
+        region: usize,
+        slot_ptr: usize,
+        slot_idx: usize,
+        first_sub: usize,
+        last_sub: usize,
+    ) -> Self {
+        let sub_count = last_sub - first_sub + 1;
+        MissingBlock {
+            file_offset: region + first_sub * SUB_BLOCK_SIZE,
+            dest: slot_ptr + first_sub * SUB_BLOCK_SIZE,
+            len: sub_count * SUB_BLOCK_SIZE,
+            slot_idx,
+            first_sub,
+            sub_count,
+        }
     }
 }
 
@@ -384,6 +436,30 @@ mod tests {
     fn read_and_commit(block: &MissingBlock, byte: u8) {
         unsafe { std::ptr::write_bytes(block.dest(), byte, block.len) };
         block.commit();
+    }
+
+    /// A deterministic byte for intra-slot offset `off`, so a filled slot's
+    /// contents are predictable for any slice.
+    fn pattern_at(off: usize) -> u8 {
+        off.wrapping_mul(7).wrapping_add(1) as u8
+    }
+
+    /// Read the pattern into every missing block of `miss` and commit it,
+    /// deriving each block's intra-slot offset from its public `file_offset`.
+    fn fill_pattern(region_base: usize, miss: &MissRegion) {
+        for block in miss.missing_blocks() {
+            let slot_off = block.file_offset - region_base;
+            for i in 0..block.len {
+                unsafe { *block.dest().add(i) = pattern_at(slot_off + i) };
+            }
+            block.commit();
+        }
+    }
+
+    fn assert_pattern(bytes: &[u8], slot_start: usize) {
+        for (i, &b) in bytes.iter().enumerate() {
+            assert_eq!(b, pattern_at(slot_start + i), "byte {i}");
+        }
     }
 
     #[test]
@@ -469,5 +545,95 @@ mod tests {
         );
         // ...and a's fill doesn't satisfy b's distant sub-block.
         assert_eq!(b.missing_blocks()[0].first_sub, 5);
+    }
+
+    /// A hit returns the exact byte contents that were read in, reassembled
+    /// across several sub-blocks.
+    #[test]
+    fn hit_reassembles_bytes_across_sub_blocks() {
+        init_test_free_pool(8);
+        cache().open_file_entry(FD);
+        let region = miss(cache().get(FD, 0, SB - 5, 2 * SB + 5));
+        fill_pattern(0, &region);
+        drop(region);
+
+        let bytes = hit(cache().get(FD, 0, SB - 5, 2 * SB + 5));
+
+        assert_pattern(&bytes, SB - 5);
+        assert_eq!(bytes.len(), SB + 10);
+    }
+
+    /// A lookup returns exactly its requested `[start, end)` byte sub-slice, not
+    /// the whole (4 KB-rounded) sub-block it lives in.
+    #[test]
+    fn hit_returns_the_exact_requested_byte_range() {
+        init_test_free_pool(8);
+        cache().open_file_entry(FD);
+        fill_pattern(0, &miss(cache().get(FD, 0, 0, SB)));
+
+        let bytes = hit(cache().get(FD, 0, 3, 9));
+
+        assert_eq!(bytes.len(), 6);
+        assert_pattern(&bytes, 3);
+    }
+
+    /// Bytes committed by one lookup serve a later, differently-aligned lookup
+    /// that overlaps them.
+    #[test]
+    fn committed_bytes_serve_an_overlapping_later_lookup() {
+        init_test_free_pool(8);
+        cache().open_file_entry(FD);
+        let first = miss(cache().get(FD, 0, 0, 2 * SB));
+        fill_pattern(0, &first);
+        drop(first);
+
+        let bytes = hit(cache().get(FD, 0, SB / 2, SB + SB / 2));
+
+        assert_pattern(&bytes, SB / 2);
+    }
+
+    /// The real IO path: take the bytes straight off the `MissRegion` after
+    /// filling its own blocks (no second lookup).
+    #[test]
+    fn into_bytes_yields_the_freshly_filled_range() {
+        init_test_free_pool(8);
+        cache().open_file_entry(FD);
+
+        let region = miss(cache().get(FD, 0, 10, SB + 10));
+        fill_pattern(0, &region);
+        let bytes = region.into_bytes();
+
+        assert_eq!(bytes.len(), SB);
+        assert_pattern(&bytes, 10);
+    }
+
+    /// Validity gaps split into separate runs, and filling them all makes the
+    /// whole range hit with the right bytes.
+    #[test]
+    fn interleaved_gaps_split_then_fill_to_a_full_hit() {
+        init_test_free_pool(8);
+        cache().open_file_entry(FD);
+        fill_pattern(0, &miss(cache().get(FD, 0, 0, 1))); // sub-block 0
+        fill_pattern(0, &miss(cache().get(FD, 0, 2 * SB, 2 * SB + 1))); // sub-block 2
+
+        let gaps = miss(cache().get(FD, 0, 0, 4 * SB));
+        fill_pattern(0, &gaps);
+        drop(gaps);
+        let bytes = hit(cache().get(FD, 0, 0, 4 * SB));
+
+        assert_pattern(&bytes, 0);
+    }
+
+    /// Re-registering a file descriptor forgets everything previously cached for
+    /// it, so the next lookup re-reads.
+    #[test]
+    fn reopening_a_file_forgets_its_cached_regions() {
+        init_test_free_pool(8);
+        cache().open_file_entry(FD);
+        fill_pattern(0, &miss(cache().get(FD, 0, 0, SB)));
+
+        cache().open_file_entry(FD);
+
+        assert!(matches!(cache().get(FD, 0, 0, SB), CacheLookup::Miss(_)));
     }
 }
