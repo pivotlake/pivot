@@ -60,7 +60,12 @@ fn resize_if_needed<K: KeyExtractor>(
     allocator: &mut SlabAllocator,
     target: &mut MultiSlabTable<K>,
 ) {
-    if target.collisions() as f64 / target.len() as f64 > RESIZE_COLLISION_RATIO {
+    // Integer form of `collisions / len > RESIZE_COLLISION_RATIO`. This runs on
+    // the critical path after every insert, so we avoid the int→float converts
+    // and the float division (~20+ cycles each) that would otherwise serialize
+    // the merge's random-access inserts and cap throughput well below DRAM
+    // bandwidth. `RESIZE_COLLISION_RATIO` is 2.0, so the test is `collisions > 2*len`.
+    if target.collisions() > target.len() * RESIZE_COLLISION_RATIO as usize {
         let new_size = target.capacity() << 1;
         target.resize_with(allocator.create_multi_slab_buffer(new_size, true), new_size);
     }
@@ -90,14 +95,19 @@ fn merge_within_partition_bounds<K: KeyExtractor, S: TableStorage<K>>(
         for table in tables {
             for j in i..i + range {
                 if j + PREFETCH_DISTANCE < slot_count {
-                    let future_hash = table.entry_at(j + PREFETCH_DISTANCE).hash();
-                    if future_hash != 0 {
-                        target.prefetch(future_hash);
-                    }
+                    // Prefetch unconditionally: `slot_for(0)` is a valid slot and
+                    // a prefetch is only a hint, so dropping the `!= 0` guard
+                    // removes a ~70/30-biased (load-factor) branch from this hot
+                    // inner loop, which dominated the merge's branch mispredicts.
+                    target.prefetch(table.entry_at(j + PREFETCH_DISTANCE).hash());
                 }
                 let entry = table.entry_at(j);
                 let h = entry.hash();
-                if h != 0 && (h >> PARTITION_SHIFT) as usize == partition {
+                // Single non-short-circuiting `&` so this is one branch instead of
+                // two: both the empty-slot test (`h != 0`) and the partition test
+                // are data-dependent on random hashes and mispredict heavily.
+                let take = (h != 0) & ((h >> PARTITION_SHIFT) as usize == partition);
+                if take {
                     target.merge::<true, _>(
                         h,
                         K::resolve_persisted(arena, *entry.key()),
