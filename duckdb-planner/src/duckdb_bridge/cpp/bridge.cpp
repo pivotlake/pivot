@@ -246,15 +246,34 @@ json build_constant_comparison_filter(duckdb::ConstantFilter &filter, json colum
 json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables) {
 	json columns = json::array();
 	auto &column_ids = get->GetColumnIds();
-	for (size_t i = 0; i < column_ids.size(); i++) {
-		auto &column_id = column_ids[i];
+
+	// A LogicalGet reads `column_ids` but may emit only a subset/reordering of
+	// them, given by `projection_ids` (indices into column_ids); the rest are
+	// read purely to satisfy pushed filters. When set, the GET's *output*
+	// columns — and therefore the positional indices that ColumnBindingResolver
+	// assigns to every ref above this scan — follow projection_ids, NOT
+	// column_ids. We must serialize the columns in that same output order so
+	// pivot's scan produces them in the order downstream refs expect. (DuckDB
+	// sets projection_ids non-deterministically across plans; ignoring it made
+	// e.g. Q42's grouped `date_trunc(EventTime)` intermittently read the wrong
+	// column — collapsing every row into one bucket.)
+	auto emit = [&](size_t col_pos, size_t type_pos) {
 		json data;
-		data["column_idx"] = column_id.GetPrimaryIndex();
-		data["return_type"] = get->types[i].id();
+		data["column_idx"] = column_ids[col_pos].GetPrimaryIndex();
+		data["return_type"] = get->types[type_pos].id();
 		json column;
 		column["type"] = static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF);
 		column["data"] = data;
 		columns.push_back(column);
+	};
+	if (!get->projection_ids.empty()) {
+		for (auto pid : get->projection_ids) {
+			emit(pid, pid);
+		}
+	} else {
+		for (size_t i = 0; i < column_ids.size(); i++) {
+			emit(i, i);
+		}
 	}
 
 	if (!get->GetTable()) {
