@@ -35,7 +35,7 @@
 //! # Concrete unary transforms
 //!
 //! - [`FilterFactory`] — Keeps rows matching a boolean mask.
-//! - [`ProjectFactory`] — Transforms each batch (column selection, computation).
+//! - [`MapFactory`] — Transforms each batch (column selection, computation).
 //! - [`CountFactory`] — Counts rows, coordinating across workers for the total.
 //! - [`OrderByLimitFactory`] — Top-N sort across workers.
 //! - [`GroupFactory`] — Hash-based group-by with aggregation.

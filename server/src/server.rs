@@ -146,7 +146,7 @@ impl Server {
     }
 }
 
-/// Recover a printable message from a [`JoinHandle::join`] `Err` payload
+/// Recover a printable message from a [`JoinHandle::join`](std::thread::JoinHandle::join) `Err` payload
 /// (`Box<dyn Any + Send>`). Best-effort: non-string payloads degrade to a
 /// placeholder.
 fn format_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {

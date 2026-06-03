@@ -31,7 +31,7 @@ unsafe impl Sync for SharedArena {}
 impl std::panic::RefUnwindSafe for SharedArena {}
 
 impl SharedArena {
-    /// Create a new shared arena with space for up to [`ring()`] amount of write buffers.
+    /// Create a new shared arena with space for up to `ring()` amount of write buffers.
     pub fn new(buffers: usize) -> Arc<Self> {
         Arc::new(Self {
             ptrs: (0..buffers)

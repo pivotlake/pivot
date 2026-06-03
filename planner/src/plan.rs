@@ -109,10 +109,9 @@ impl PlanNode {
                 Some(Expression::AggregateFunc(AggregateFunc::Sum(s))),
                 Some(Expression::AggregateFunc(AggregateFunc::Count(c))),
             ) = (agg_exprs.get(li.column_idx), agg_exprs.get(rj.column_idx))
+                && s.column.column_idx == c.column.column_idx
             {
-                if s.column.column_idx == c.column.column_idx {
-                    pairs.push((pos, li.column_idx, rj.column_idx, s.column.clone()));
-                }
+                pairs.push((pos, li.column_idx, rj.column_idx, s.column.clone()));
             }
         }
         if pairs.is_empty() {

@@ -1,6 +1,6 @@
 //! Work-stealing pool of free buffer indices.
 //!
-//! Each [`crate::memory::MemoryContext`] owns one or two [`FreePool`]s (one for
+//! Each `MemoryContext` owns one or two [`FreePool`]s (one for
 //! zeroed buffers, one for dirty). A pool offers three tiers of pop, from
 //! cheapest to most expensive:
 //!
