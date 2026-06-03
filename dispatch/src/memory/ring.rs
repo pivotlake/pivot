@@ -50,7 +50,7 @@ unsafe impl Sync for BufferSlot {}
 
 /// A contiguous mmap-backed arena divided into fixed-size slots.
 ///
-/// Constructed once at startup via [`RING`]. Individual slots are acquired for
+/// Constructed once at startup via [`Ring::new`]. Individual slots are acquired for
 /// writing ([`try_write`](Self::try_write)) or reading
 /// ([`try_read`](Self::try_read)) and released when the returned handle is
 /// dropped.

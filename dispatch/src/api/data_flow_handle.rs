@@ -14,7 +14,7 @@ pub struct DataFlowHandle<T> {
     err_rx: mpsc::Receiver<crate::data_flow::Error>,
     /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
-    /// Shared with the [`DataFlowDispatcher`] so that cancel callers (which
+    /// Shared with the [`DataFlowDispatcher`](crate::DataFlowDispatcher) so that cancel callers (which
     /// may not be on a worker thread) can still wake any parked worker.
     waker: Arc<WorkerWaker>,
 }
