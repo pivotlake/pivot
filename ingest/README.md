@@ -23,10 +23,9 @@ data, done in parallel), then the encoded pages are stitched into one file
 scales with the flush's size (more data → more pages), just like the reader
 parallelizes over the pages a file already contains.
 
-> Because the encoder emits only the footer fields pivot's reader needs, the
-> output is readable by pivot but not yet a fully spec-compliant Parquet (no
-> per-chunk `codec`/`type`/`num_values`), so other engines (e.g. DuckDB) may
-> reject it. Full-footer output is a follow-up on `thriftparquet`.
+> The footer is fully populated (column type/encodings/codec/sizes, row-group
+> and file metadata, string columns marked UTF8), so the output is spec-compliant
+> Parquet — readable by pivot's reader and by strict engines (arrow-rs, DuckDB).
 
 ## Shape
 

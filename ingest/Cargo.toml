@@ -35,3 +35,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Strict, spec-compliant reader used only as a test oracle: if arrow-rs's
+# reader accepts our hand-rolled files, other engines (DuckDB, etc.) will too.
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }

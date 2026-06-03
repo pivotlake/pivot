@@ -114,6 +114,12 @@ thrift_struct!(
 
 thrift_struct!(
     pub struct ColumnMetaData {
+        1: required i32 physical_type;
+        2: required list<i32> encodings;
+        3: required list<string> path_in_schema;
+        4: required i32 codec;
+        5: required i64 num_values;
+        6: required i64 total_uncompressed_size;
         7: required i64 total_compressed_size;
         9: required i64 data_page_offset;
         11: optional i64 dictionary_page_offset;
@@ -123,6 +129,7 @@ thrift_struct!(
 
 thrift_struct!(
     pub struct ColumnChunk {
+        2: required i64 file_offset;
         3: optional ColumnMetaData meta_data;
     }
 );
@@ -130,13 +137,17 @@ thrift_struct!(
 thrift_struct!(
     pub struct RowGroup {
         1: required list<ColumnChunk> columns;
+        2: required i64 total_byte_size;
         3: required i64 num_rows;
     }
 );
 
 thrift_struct!(
     pub struct FileMetaData {
+        1: required i32 version;
         2: required list<SchemaElement> schema;
+        3: required i64 num_rows;
         4: required list<RowGroup> row_groups;
+        6: optional string created_by;
     }
 );

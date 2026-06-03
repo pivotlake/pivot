@@ -23,14 +23,13 @@
 //! pages; a large flush → many), just like the reader parallelizes over however
 //! many pages a file contains.
 //!
-//! Format targeted (the reader's supported subset): DATA_PAGE v1, PLAIN
-//! encoding, SNAPPY compression (the reader always snappy-decompresses), and
-//! **required** columns only — no def/rep levels, so a page is just the
-//! concatenated PLAIN values. The footer carries only the fields the reader
-//! reads, so files are readable by pivot's reader but are not fully
-//! spec-compliant (no per-chunk `codec`/`type`/`num_values`), which other
-//! engines like DuckDB may reject — a follow-up that only needs extra fields on
-//! `thriftparquet`'s `ColumnMetaData`/`SchemaElement`.
+//! Format: DATA_PAGE v1, PLAIN encoding, SNAPPY compression (the reader always
+//! snappy-decompresses), and **required** columns only — no def/rep levels, so a
+//! page is just the concatenated PLAIN values. The footer is fully populated
+//! (column `type`/`encodings`/`path_in_schema`/`codec`/`num_values`/sizes, row
+//! group `total_byte_size`, file `version`/`num_rows`, string columns marked
+//! UTF8), so the output is spec-compliant: it round-trips through pivot's reader
+//! *and* through strict readers like arrow-rs and DuckDB (see the test).
 
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
@@ -46,6 +45,12 @@ use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// Parquet repetition type for a required (non-null) field.
 const REPETITION_REQUIRED: i32 = 0;
+/// Parquet `CompressionCodec::SNAPPY`.
+const SNAPPY_CODEC: i32 = 1;
+/// Parquet `ConvertedType::UTF8` — marks a BYTE_ARRAY column as a string.
+const CONVERTED_TYPE_UTF8: i32 = 0;
+/// Parquet format version written into the footer.
+const PARQUET_VERSION: i32 = 1;
 /// Target uncompressed size of one data page. Matches Parquet's usual ~1 MiB
 /// data page size: large enough to amortize per-page overhead and compress
 /// well, small enough to be a useful unit of parallel work.
@@ -63,10 +68,16 @@ pub struct PageJob {
 
 /// An encoded data page (header + snappy-compressed values), tagged with its
 /// position so [`assemble_parquet`] can place it after the parallel encode.
+/// The sizes feed the column-chunk footer metadata.
 pub struct EncodedPage {
     pub column: usize,
     pub page_index: usize,
     pub num_rows: i64,
+    /// Uncompressed size of the page's values (PLAIN bytes).
+    pub uncompressed_size: usize,
+    /// Size of the page's thrift header (precedes the compressed values).
+    pub header_len: usize,
+    /// The page on the wire: header followed by the compressed values.
     pub bytes: Vec<u8>,
 }
 
@@ -123,12 +134,15 @@ pub fn encode_page(job: PageJob) -> Result<EncodedPage, String> {
 
     let mut bytes = Vec::with_capacity(compressed.len() + 32);
     write_thrift(&header, &mut bytes)?;
+    let header_len = bytes.len();
     bytes.extend_from_slice(&compressed);
 
     Ok(EncodedPage {
         column: job.column,
         page_index: job.page_index,
         num_rows: job.num_rows,
+        uncompressed_size: raw.len(),
+        header_len,
         bytes,
     })
 }
@@ -156,17 +170,32 @@ pub fn assemble_parquet(
     out.extend_from_slice(PARQUET_MAGIC);
 
     let mut columns = Vec::with_capacity(num_columns);
+    let mut row_group_bytes = 0i64;
     for (col, pages) in by_column.into_iter().enumerate() {
         if pages.is_empty() {
             return Err(format!("no pages produced for column {col}"));
         }
+        let field = schema.field(col);
         let data_page_offset = out.len() as i64;
+        let mut num_values = 0i64;
+        let mut uncompressed = 0i64;
         for page in pages {
+            num_values += page.num_rows;
+            uncompressed += (page.header_len + page.uncompressed_size) as i64;
             out.extend_from_slice(&page.bytes);
         }
+        let compressed = out.len() as i64 - data_page_offset;
+        row_group_bytes += uncompressed;
         columns.push(ColumnChunk {
+            file_offset: data_page_offset,
             meta_data: Some(ColumnMetaData {
-                total_compressed_size: out.len() as i64 - data_page_offset,
+                physical_type: physical_type(field.data_type())?,
+                encodings: vec![Encoding::PLAIN as i32],
+                path_in_schema: vec![field.name().clone()],
+                codec: SNAPPY_CODEC,
+                num_values,
+                total_uncompressed_size: uncompressed,
+                total_compressed_size: compressed,
                 data_page_offset,
                 dictionary_page_offset: None,
                 statistics: None,
@@ -175,6 +204,7 @@ pub fn assemble_parquet(
     }
     let row_groups = vec![RowGroup {
         columns,
+        total_byte_size: row_group_bytes,
         num_rows: total_rows,
     }];
 
@@ -194,14 +224,17 @@ pub fn assemble_parquet(
             repetition_type: Some(REPETITION_REQUIRED),
             name: field.name().clone(),
             num_children: None,
-            converted_type: None,
+            converted_type: converted_type(field.data_type()),
             logical_type: None,
         });
     }
 
     let file_meta = FileMetaData {
+        version: PARQUET_VERSION,
         schema: schema_elements,
+        num_rows: total_rows,
         row_groups,
+        created_by: Some("pivotdb-ingest".to_string()),
     };
 
     // Footer: [FileMetaData][u32 LE footer length][PAR1].
@@ -278,6 +311,15 @@ fn slice_range(arrays: &[ArrayRef], start: usize, len: usize) -> Vec<ArrayRef> {
         }
     }
     pieces
+}
+
+/// The Parquet converted type for a column, if any. Marks string columns as
+/// UTF8 so readers surface them as text rather than opaque bytes.
+fn converted_type(data_type: &DataType) -> Option<i32> {
+    match data_type {
+        DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_TYPE_UTF8),
+        _ => None,
+    }
 }
 
 /// PLAIN byte size of one fixed-width value, or `None` for variable-width types.
@@ -389,10 +431,64 @@ fn downcast<A: 'static>(array: &dyn Array) -> Result<&A, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{Field, Schema};
     use std::sync::Arc;
 
     fn arrays<const N: usize>(arrs: [ArrayRef; N]) -> Vec<ArrayRef> {
         arrs.into_iter().collect()
+    }
+
+    /// Encode a batch the way the pipeline does — `build_page_jobs` →
+    /// `encode_page` (here serial) → `assemble_parquet` — and return the bytes.
+    fn encode(batch: &RecordBatch) -> Vec<u8> {
+        let pages: Vec<EncodedPage> = build_page_jobs(std::slice::from_ref(batch))
+            .into_iter()
+            .map(encode_page)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assemble_parquet(&batch.schema(), batch.num_rows() as i64, pages).unwrap()
+    }
+
+    /// The written file is spec-compliant enough for arrow-rs's strict reader
+    /// (our DuckDB-readability proxy): it reads back with the original values.
+    #[test]
+    fn output_is_readable_by_a_strict_parquet_reader() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "bb", "ccc"])),
+            ],
+        )
+        .unwrap();
+
+        let bytes = encode(&batch);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.parquet");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let read: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+
+        assert_eq!(read.len(), 1);
+        let got = &read[0];
+        assert_eq!(
+            got.column(0).as_any().downcast_ref::<Int64Array>().unwrap(),
+            &Int64Array::from(vec![1, 2, 3])
+        );
+        assert_eq!(
+            got.column(1).as_any().downcast_ref::<StringArray>().unwrap(),
+            &StringArray::from(vec!["a", "bb", "ccc"])
+        );
     }
 
     #[test]
