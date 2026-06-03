@@ -4,14 +4,48 @@
 //! [`ExprFn`] — a builder closure the filter/project operators
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
-use crate::expression::{Compare, CompareType, Contains, Divide, Expression, Function, Ref};
+use crate::expression::{
+    Between, Compare, CompareType, Contains, DateTrunc, Divide, Expression, Function, Ref,
+};
 use crate::types::Type;
+use arrow::compute::kernels::boolean::and;
 use arrow_array::cast::AsArray;
-use arrow_array::{ArrayRef, Datum, RecordBatch};
-use arrow_ord::cmp::{eq, neq};
-use arrow_schema::DataType;
+use arrow_array::types::Int64Type;
+use arrow_array::{ArrayRef, BooleanArray, Datum, Int64Array, RecordBatch, Scalar};
+use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow_schema::{ArrowError, DataType};
 use dispatch::Contains as DispatchContains;
 use std::sync::Arc;
+
+/// Signature shared by arrow's scalar comparison kernels.
+type CmpKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<BooleanArray, ArrowError>;
+
+/// Run a comparison kernel, coercing both operands to Int64 when their data
+/// types differ. The declared logical type (e.g. DATE) and the physical parquet
+/// array (e.g. UInt16 day counts) can diverge, and arrow's kernels require
+/// matching types; Int64 is a safe common type for every integer/date/timestamp
+/// column we compare.
+fn compare_coerced(left: &dyn Datum, right: &dyn Datum, kernel: CmpKernel) -> BooleanArray {
+    let (la, l_scalar) = left.get();
+    let (ra, r_scalar) = right.get();
+    if la.data_type() == ra.data_type() {
+        kernel(left, right).unwrap()
+    } else {
+        let lc = arrow::compute::cast(la, &DataType::Int64).unwrap();
+        let rc = arrow::compute::cast(ra, &DataType::Int64).unwrap();
+        let ld: Box<dyn Datum> = if l_scalar {
+            Box::new(Scalar::new(lc))
+        } else {
+            Box::new(lc)
+        };
+        let rd: Box<dyn Datum> = if r_scalar {
+            Box::new(Scalar::new(rc))
+        } else {
+            Box::new(rc)
+        };
+        kernel(ld.as_ref(), rd.as_ref()).unwrap()
+    }
+}
 
 impl Ref {
     pub fn compile(&self) -> Result<ExprFn, Error> {
@@ -24,9 +58,13 @@ impl Ref {
 
 impl Compare {
     pub fn compile(&self) -> Result<ExprFn, Error> {
-        let kernel: fn(&dyn Datum, &dyn Datum) -> _ = match self.compare_type {
+        let kernel: CmpKernel = match self.compare_type {
             CompareType::Equal => eq,
             CompareType::NotEqual => neq,
+            CompareType::Less => lt,
+            CompareType::Greater => gt,
+            CompareType::LessEqual => lt_eq,
+            CompareType::GreaterEqual => gt_eq,
         };
         let left_builder = self.left.compile()?;
         let right_builder = self.right.compile()?;
@@ -36,9 +74,36 @@ impl Compare {
             Box::new(move |batch: &RecordBatch| {
                 let left = left_expr(batch);
                 let right = right_expr(batch);
-                ExprResult::Array(
-                    Arc::new(kernel(left.as_datum(), right.as_datum()).unwrap()) as ArrayRef
-                )
+                ExprResult::Array(Arc::new(compare_coerced(
+                    left.as_datum(),
+                    right.as_datum(),
+                    kernel,
+                )) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Between {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // `input BETWEEN lower AND upper` == `input >= lower AND input <= upper`
+        // (the inclusive/exclusive flags swap >=/> and <=/<).
+        let lower_kernel: CmpKernel = if self.lower_inclusive { gt_eq } else { gt };
+        let upper_kernel: CmpKernel = if self.upper_inclusive { lt_eq } else { lt };
+        let input_builder = self.input.compile()?;
+        let lower_builder = self.lower.compile()?;
+        let upper_builder = self.upper.compile()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            let mut lower_expr = lower_builder();
+            let mut upper_expr = upper_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let lower = lower_expr(batch);
+                let upper = upper_expr(batch);
+                let ge = compare_coerced(input.as_datum(), lower.as_datum(), lower_kernel);
+                let le = compare_coerced(input.as_datum(), upper.as_datum(), upper_kernel);
+                ExprResult::Array(Arc::new(and(&ge, &le).unwrap()) as ArrayRef)
             }) as ExprEvalFn
         }))
     }
@@ -105,11 +170,48 @@ impl Divide {
     }
 }
 
+impl DateTrunc {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // EventTime is stored as Int64 epoch *seconds*, so truncating to a unit
+        // is flooring to that many seconds. `M = (t / secs) * secs`.
+        let secs: i64 = match self.unit.as_str() {
+            "second" => 1,
+            "minute" => 60,
+            "hour" => 3600,
+            "day" => 86400,
+            other => {
+                return Err(Error::UnsupportedExpression(Expression::Function(
+                    Function::DateTrunc(DateTrunc {
+                        unit: other.to_string(),
+                        source: self.source.clone(),
+                    }),
+                )));
+            }
+        };
+        let source_builder = self.source.compile()?;
+        Ok(Box::new(move || {
+            let mut source_expr = source_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let src = source_expr(batch);
+                let (arr, _) = src.as_datum().get();
+                let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
+                let vals = i64arr.as_primitive::<Int64Type>();
+                let truncated: Int64Array = vals
+                    .iter()
+                    .map(|v| v.map(|x| x.div_euclid(secs) * secs))
+                    .collect();
+                ExprResult::Array(Arc::new(truncated) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Function {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
             Function::Contains(c) => c.compile(),
             Function::Divide(d) => d.compile(),
+            Function::DateTrunc(dt) => dt.compile(),
         }
     }
 }
@@ -126,6 +228,7 @@ impl Expression {
                 }))
             }
             Expression::Function(f) => f.compile(),
+            Expression::Between(b) => b.compile(),
             _ => Err(Error::UnsupportedExpression(self.clone())),
         }
     }
