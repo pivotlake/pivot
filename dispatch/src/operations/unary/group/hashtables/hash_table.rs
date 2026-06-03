@@ -490,21 +490,60 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         next: &mut [u32],
         src: &mut S,
     ) {
-        /// How far ahead, in unresolved-row positions, to prefetch each slot.
+        /// How far ahead, in row positions, to prefetch each slot.
         const PREFETCH_DIST: usize = 16;
 
-        for i in 0..length {
+        // Pass 1 over every row, slot computed inline. Rows that resolve on the
+        // first probe (empty slot → insert, or matching key → merge) finish here
+        // and never touch the scratch arrays. Only collided rows are recorded —
+        // their advanced slot in `slots[i]`, their index in `next` — for the later
+        // passes. Folding the slot computation into the probe avoids a separate
+        // init pass that would materialise `slots`/`sel` for *every* row, which is
+        // pure overhead in the common (low-collision / merge-heavy) case where
+        // almost everything resolves in this first pass.
+        let mut adv = 0usize;
+        let mut i = 0usize;
+        while i < length {
+            if i + PREFETCH_DIST < length {
+                let fh = hashes[i + PREFETCH_DIST];
+                let fh = if fh == 0 { 1 } else { fh };
+                let fptr = &self.buffer[self.slot_for(fh)] as *const Entry<K, V> as *const u8;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                        fptr as *const i8,
+                    );
+                }
+            }
             let h = if hashes[i] == 0 { 1 } else { hashes[i] };
             hashes[i] = h;
-            slots[i] = self.slot_for(h);
-            sel[i] = i as u32;
+            let s = self.slot_for(h);
+            let eh = self.buffer[s].hash;
+            if eh == 0 {
+                let key = src.persisted(i);
+                let value = src.value(i);
+                let entry = &mut self.buffer[s];
+                entry.hash = h;
+                entry.key = key;
+                entry.value = value;
+                self.length += 1;
+            } else if eh == h && src.key_eq(i, &self.buffer[s].key) {
+                let value = src.value(i);
+                self.buffer[s].value = self.buffer[s].value.merge(value);
+            } else {
+                self.collisions += 1;
+                slots[i] = (s + 1) & self.mask;
+                next[adv] = i as u32;
+                adv += 1;
+            }
+            i += 1;
         }
 
-        let (mut cur, mut nxt) = (sel, next);
-        let mut remaining = length;
-
+        // Passes 2+: only the collided rows, ping-ponging between `next` and `sel`.
+        let (mut cur, mut nxt) = (next, sel);
+        let mut remaining = adv;
         while remaining > 0 {
-            let mut adv = 0usize;
+            let mut adv2 = 0usize;
             let mut k = 0usize;
             while k < remaining {
                 if k + PREFETCH_DIST < remaining {
@@ -523,9 +562,6 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
                 let s = slots[i];
                 let eh = self.buffer[s].hash;
                 if eh == 0 {
-                    // Empty slot — claim it. The fresh read above means an earlier
-                    // same-pass insert at this slot is already visible, so an
-                    // in-batch duplicate key would have taken the merge branch.
                     let key = src.persisted(i);
                     let value = src.value(i);
                     let entry = &mut self.buffer[s];
@@ -539,12 +575,12 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
                 } else {
                     self.collisions += 1;
                     slots[i] = (s + 1) & self.mask;
-                    nxt[adv] = i as u32;
-                    adv += 1;
+                    nxt[adv2] = i as u32;
+                    adv2 += 1;
                 }
             }
             std::mem::swap(&mut cur, &mut nxt);
-            remaining = adv;
+            remaining = adv2;
         }
     }
 
