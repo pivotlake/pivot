@@ -1102,7 +1102,6 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
- "arrow-select",
  "dispatch",
  "object_store",
  "opentelemetry-proto",

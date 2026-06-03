@@ -262,9 +262,10 @@ impl ParquetSink {
         // `collect()` blocks, so park the whole thing on a blocking thread.
         let dispatcher = self.dispatcher.clone();
         let encoded = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
-            // Concatenate each column and cut ~1 MiB pages (one row group).
-            let jobs = build_page_jobs(&batches)?;
-            drop(batches); // the page jobs hold Arc clones of the columns
+            // Cut each column into ~1 MiB pages (one row group). Pages are
+            // zero-copy slices into the batch arrays, so this copies nothing.
+            let jobs = build_page_jobs(&batches);
+            drop(batches);
             let pages = values_input(&dispatcher, jobs)
                 .map_each(encode_page)
                 .collect()

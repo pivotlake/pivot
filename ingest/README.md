@@ -13,13 +13,15 @@ queries, and the server's tokio threads stay free to keep accepting telemetry.
 The Parquet encoding is hand-rolled (no upstream `parquet` crate): it reuses the
 shared **`thriftparquet`** crate — the same Thrift compact-protocol codec and
 metadata structures the reader is built on — plus the in-house snappy. A flush
-concatenates its batches into one row group and splits each column into **~1 MiB
-data pages** (the usual Parquet page size). The pages fan out across the workers
-via a work-stealing source so each is PLAIN-encoded + compressed on whatever
-worker steals it, then the encoded pages are stitched into one file (offsets +
-footer) — a cheap serial step. One flush → one file; parallelism scales with the
-flush's size (more data → more pages), just like the reader parallelizes over
-the pages a file already contains.
+forms one row group and cuts each column into **~1 MiB data pages** (the usual
+Parquet page size). A page is just a list of zero-copy slices into the batch
+arrays — it may span a batch boundary — so cutting pages copies nothing. The
+pages fan out across the workers via a work-stealing source, so each is
+PLAIN-encoded + compressed on whatever worker steals it (the single copy of the
+data, done in parallel), then the encoded pages are stitched into one file
+(offsets + footer) — a cheap serial step. One flush → one file; parallelism
+scales with the flush's size (more data → more pages), just like the reader
+parallelizes over the pages a file already contains.
 
 > Because the encoder emits only the footer fields pivot's reader needs, the
 > output is readable by pivot but not yet a fully spec-compliant Parquet (no
