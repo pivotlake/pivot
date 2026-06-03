@@ -1,18 +1,17 @@
 //! Key extraction strategies for GROUP BY operations.
 //!
-//! A [`KeyExtractor`] defines how to read group keys and per-row aggregate
-//! values from an input batch, persist/compare keys in the hash table, and
-//! emit the finished table as an Arrow [`RecordBatch`].
+//! A [`KeyExtractor`] defines how to read group keys from an input batch,
+//! persist/compare them in the hash table, and emit the key columns of the
+//! result. The per-row aggregate *value* is the separate concern of a
+//! [`ValueExtractor`](super::value_extractions::ValueExtractor); the two are
+//! mixed freely (any key shape × any aggregate shape).
 //!
 //! ## Reader-based consume
 //!
 //! Extraction is driven through a per-batch [`Reader`](KeyExtractor::Reader):
-//! [`make_reader`](KeyExtractor::make_reader) downcasts the configured key
-//! columns (one or more) and value columns once, then
-//! [`hash`](KeyExtractor::hash), [`live_key`](KeyExtractor::live_key) and
-//! [`value`](KeyExtractor::value) read row `idx` cheaply. This lets a single
-//! trait cover single-column count grouping, multi-column keys, and multi-slot
-//! sum/count/avg values.
+//! [`make_reader`](KeyExtractor::make_reader) downcasts the key columns once,
+//! then [`hash`](KeyExtractor::hash) and [`live_key`](KeyExtractor::live_key)
+//! read row `idx` cheaply.
 //!
 //! ## Live vs Persisted keys
 //!
@@ -21,28 +20,24 @@
 //!   [`ArenaKey`](super::ArenaKey) for strings, an integer / packed integer for
 //!   numeric keys). Only created when the key is genuinely new.
 
-use std::sync::Arc;
-
-use crate::operations::unary::group::aggregations::GroupAggSlot;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::hashtables::{
-    LiveKey, PersistedKey, Table, TableStorage, Value,
-};
+use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
 use ahash::RandomState;
-use arrow_array::RecordBatch;
-use arrow_schema::ArrowError;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::Field;
+use std::sync::Arc;
 
 mod int_key_extractor;
 pub use int_key_extractor::IntKeyExtractor;
 
 mod int_pair_extractor;
-pub use int_pair_extractor::IntPairAggExtractor;
+pub use int_pair_extractor::IntPairKeyExtractor;
 
 mod string_extractor;
 pub use string_extractor::StringKeyExtractor;
 
-/// Defines how to extract, compare, and output group keys (and per-row
-/// aggregate values) for a particular key/value shape.
+/// Defines how to extract, compare, and output group keys for a particular key
+/// shape.
 pub trait KeyExtractor: Send + 'static {
     /// The `Copy` key representation stored inside hash table entries.
     type Persisted: PersistedKey;
@@ -50,17 +45,13 @@ pub trait KeyExtractor: Send + 'static {
     type LiveKey<'a, 'b>: LiveKey<Persisted = Self::Persisted>;
     /// A live key reconstructed from an already-persisted key (used during merge).
     type PersistedLiveKey<'a>: LiveKey<Persisted = Self::Persisted>;
-    /// The aggregation value stored alongside each key.
-    type Value: Value + Send;
-    /// Per-batch reader holding downcast key/value column accessors.
+    /// Per-batch reader holding downcast key-column accessors.
     type Reader<'b>;
+    /// Accumulates persisted keys into the result's leading key column(s).
+    type Columns: KeyColumns<Key = Self::Persisted>;
 
-    /// Build a reader over `batch` for the given key columns and value slots.
-    fn make_reader<'b>(
-        batch: &'b RecordBatch,
-        key_cols: &[usize],
-        value_slots: &[GroupAggSlot],
-    ) -> Self::Reader<'b>;
+    /// Build a reader over `batch` for the given key columns.
+    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b>;
 
     /// Number of rows the reader spans.
     fn rows(reader: &Self::Reader<'_>) -> usize;
@@ -75,24 +66,23 @@ pub trait KeyExtractor: Send + 'static {
         arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'b>;
 
-    /// Build the per-row aggregate value at row `idx`.
-    fn value(reader: &Self::Reader<'_>, idx: usize) -> Self::Value;
-
     /// Reconstruct a live key from a persisted key, borrowing from the shared arena.
     fn resolve_persisted(
         arena: &SharedArena,
         persisted: Self::Persisted,
     ) -> Self::PersistedLiveKey<'_>;
+}
 
-    /// Convert a completed hash table into an Arrow `RecordBatch` of key +
-    /// value columns.
-    ///
-    /// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
-    /// `ORDER BY <value_slot> DESC LIMIT limit`; the extractor may then emit
-    /// only this partition's top-`limit` rows instead of every group.
-    fn create_record_batch<S: TableStorage<Self>>(
-        table: Table<Self, S>,
-        arena: &Arc<SharedArena>,
-        top_k: Option<(usize, usize)>,
-    ) -> Result<RecordBatch, ArrowError>;
+/// Builds the leading key column(s) of a GROUP BY result, one group at a time.
+///
+/// The output combinator pushes each surviving group's persisted key, then
+/// `finish` materialises the Arrow columns and their fields. `finish` takes the
+/// [`SharedArena`] so arena-backed keys (strings) can emit zero-copy views into
+/// the ring buffers; non-arena keys ignore it.
+pub trait KeyColumns {
+    type Key;
+
+    fn with_capacity(rows: usize) -> Self;
+    fn push(&mut self, key: &Self::Key);
+    fn finish(self, arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>);
 }

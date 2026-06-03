@@ -35,8 +35,9 @@
 //! 1. Scans every source table for entries belonging to its partition.
 //! 2. Merges them into a single result table (see [`merge`] module for
 //!    the batched, prefetched merge strategy).
-//! 3. Converts the result table into an Arrow [`RecordBatch`] via
-//!    [`KeyExtractor::create_record_batch`] and sends it downstream.
+//! 3. Converts the result table into an Arrow [`RecordBatch`] via the
+//!    [`output`] combinator — key columns from the [`KeyExtractor`], value
+//!    columns from the [`ValueExtractor`] — and sends it downstream.
 //!
 //! ## Why partitioned merging works across different table sizes
 //!
@@ -76,14 +77,15 @@ mod arena_key;
 mod factory;
 mod key_extractions;
 mod merge;
+mod output;
+mod value_extractions;
 
-pub use aggregations::{AggRow, GroupAggKind, GroupAggSlot};
+pub use aggregations::{GroupAggKind, GroupAggSlot};
 pub use factory::GroupFactory;
 mod hashtables;
 
-pub use key_extractions::{
-    IntKeyExtractor, IntPairAggExtractor, KeyExtractor, StringKeyExtractor,
-};
+pub use key_extractions::{IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
+pub use value_extractions::{AggRowValueExtractor, CountValueExtractor, ValueExtractor};
 
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -121,26 +123,26 @@ const PARTITIONS: usize = 64;
 /// rows and inserts them into its local [`AggregatedTable`]. When consumption
 /// finishes, the accumulated tables are sent to a shared channel and the
 /// `Group` transitions into a [`GroupOutputter`] for the merge phase.
-pub struct Group<K: KeyExtractor> {
+pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     key_cols: Vec<usize>,
     value_slots: Vec<GroupAggSlot>,
 
-    aggregated_table: AggregatedTable<K>,
-    sender: mpsc::Sender<Vec<MultiSlabTable<K>>>,
-    outputter: GroupOutputter<K>,
+    aggregated_table: AggregatedTable<K, V>,
+    sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
+    outputter: GroupOutputter<K, V>,
 }
 
-impl<K: KeyExtractor> Group<K> {
+impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shared_arena: Arc<SharedArena>,
         state: RandomState,
-        injector: Arc<Injector<PartitionJob<K>>>,
+        injector: Arc<Injector<PartitionJob<K, V>>>,
         key_cols: Vec<usize>,
         value_slots: Vec<GroupAggSlot>,
         top_k: Option<(usize, usize)>,
-        sender: mpsc::Sender<Vec<MultiSlabTable<K>>>,
-        receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K>>>>,
+        sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
+        receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
         partition_jobs_injected: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -159,8 +161,8 @@ impl<K: KeyExtractor> Group<K> {
     }
 }
 
-impl<K: KeyExtractor> Consumer<RecordBatch, RecordBatch> for Group<K> {
-    type Outputter = GroupOutputter<K>;
+impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for Group<K, V> {
+    type Outputter = GroupOutputter<K, V>;
 
     fn consume<S: Sender<RecordBatch>>(
         &mut self,
@@ -186,10 +188,10 @@ impl<K: KeyExtractor> Consumer<RecordBatch, RecordBatch> for Group<K> {
 /// tables, and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
-pub struct GroupOutputter<K: KeyExtractor> {
+pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     shared_arena: Arc<SharedArena>,
-    injector: Arc<Injector<PartitionJob<K>>>,
-    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K>>>>,
+    injector: Arc<Injector<PartitionJob<K, V>>>,
+    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     top_k: Option<(usize, usize)>,
 }
@@ -200,21 +202,21 @@ pub struct GroupOutputter<K: KeyExtractor> {
 /// shared [`Injector`] for work-stealing execution. Each job merges all
 /// source tables for partition `index` into one result table and sends the
 /// output as a [`RecordBatch`].
-pub struct PartitionJob<K: KeyExtractor> {
-    tables: Arc<Vec<MultiSlabTable<K>>>,
+pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
+    tables: Arc<Vec<MultiSlabTable<K, V>>>,
     index: usize,
     arena: Arc<SharedArena>,
     partition_capacity: usize,
     top_k: Option<(usize, usize)>,
 }
 
-unsafe impl<K: KeyExtractor> Send for PartitionJob<K> {}
+unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
 
-impl<K: KeyExtractor> PartitionJob<K> {
+impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
     /// Merge all source tables for this partition and send the result batch.
     pub fn run<S: Sender<RecordBatch>>(self, sender: &mut S) -> Result<()> {
         debug!("Merging maps for partition {:?}...", self.index);
-        let result_map = merge::merge_partition::<K>(
+        let result_map = merge::merge_partition::<K, V>(
             self.index,
             &self.tables,
             &self.arena,
@@ -226,15 +228,19 @@ impl<K: KeyExtractor> PartitionJob<K> {
         }
 
         debug!("Sending record batch {:?}", self.index);
-        sender.send(K::create_record_batch(result_map, &self.arena, self.top_k)?)?;
+        sender.send(output::build_record_batch::<K, V, _>(
+            result_map,
+            &self.arena,
+            self.top_k,
+        )?)?;
         Ok(())
     }
 }
 
-impl<K: KeyExtractor> Outputter<RecordBatch> for GroupOutputter<K> {
+impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputter<K, V> {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let tables: Vec<MultiSlabTable<K>> = rx.into_iter().flatten().collect::<Vec<_>>();
+            let tables: Vec<MultiSlabTable<K, V>> = rx.into_iter().flatten().collect::<Vec<_>>();
             debug!("Outputting {:?} maps", tables.len());
             // Estimate the merged entry count from actual occupancy (sum of
             // lengths), not capacity — capacity over-counts by the table-stack's
@@ -283,12 +289,14 @@ mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::key_extractions::IntKeyExtractor;
+    use crate::operations::unary::group::value_extractions::CountValueExtractor;
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
+    type CountValue = CountValueExtractor;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -308,7 +316,7 @@ mod tests {
 
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
-                Group::<IntExtractor>::new(
+                Group::<IntExtractor, CountValue>::new(
                     arena.clone(),
                     state.clone(),
                     injector.clone(),

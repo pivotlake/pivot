@@ -62,9 +62,10 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    AggSpec, AggregateFactory, CopyOutFactory, CountFactory, FilterFactory, GroupAggSlot,
-    GroupFactory, KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
-    OrderByLimitFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    AggSpec, AggregateFactory, CopyOutFactory, CountFactory, CountValueExtractor, FilterFactory,
+    GroupAggSlot, GroupFactory, KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory,
+    OrderBy, OrderByLimitFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperator,
+    UnaryOperatorFactory, ValueExtractor,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -522,21 +523,13 @@ impl RecordBatchOperatorSpec {
     /// # ;
     /// ```
     pub fn group_by_count<K: KeyExtractor>(self, group_column: usize) -> Self {
-        let worker_count = self.worker_count();
-        let buffers = self.dispatcher.buffers;
-        self.unary(GroupFactory::<K>::create_for_workers(
-            vec![group_column],
-            vec![],
-            None,
-            worker_count,
-            buffers,
-        ))
+        self.group_by_aggregate::<K, CountValueExtractor>(vec![group_column], vec![], None)
     }
 
     /// GROUP BY one or more key columns computing one or more aggregate value
     /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key
-    /// shape (and, via its `Value`, the aggregate arity).
-    pub fn group_by_aggregate<K: KeyExtractor>(
+    /// shape, `V` the aggregate shape (e.g. its arity).
+    pub fn group_by_aggregate<K: KeyExtractor, V: ValueExtractor>(
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<GroupAggSlot>,
@@ -544,7 +537,7 @@ impl RecordBatchOperatorSpec {
     ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
-        self.unary(GroupFactory::<K>::create_for_workers(
+        self.unary(GroupFactory::<K, V>::create_for_workers(
             key_cols,
             value_slots,
             top_k,

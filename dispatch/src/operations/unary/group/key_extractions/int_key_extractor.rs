@@ -1,13 +1,11 @@
-use crate::operations::KeyExtractor;
-use crate::operations::unary::group::aggregations::{Count, GroupAggSlot};
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
-use crate::operations::unary::group::hashtables::{Table, TableStorage, Value};
+use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
-use arrow_array::builder::{PrimitiveBuilder, UInt64Builder};
+use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::Field;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -22,8 +20,7 @@ macro_rules! impl_persisted_key {
 
 impl_persisted_key!(i8, i16, i32, i64, u8, u16, u32, u64, u128);
 
-/// A `KeyExtractor` for a single Arrow primitive (integer) column, counting
-/// occurrences per key (`GROUP BY int_col` → `COUNT(*)`).
+/// A [`KeyExtractor`] for a single Arrow primitive (integer) column.
 ///
 /// Native integer types are `Copy`, so live and persisted key forms are
 /// identical — no arena allocation is needed.
@@ -43,14 +40,10 @@ where
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;
     type PersistedLiveKey<'a> = T::Native;
-    type Value = Count;
     type Reader<'b> = &'b PrimitiveArray<T>;
+    type Columns = IntKeyColumns<T>;
 
-    fn make_reader<'b>(
-        batch: &'b RecordBatch,
-        key_cols: &[usize],
-        _value_slots: &[GroupAggSlot],
-    ) -> Self::Reader<'b> {
+    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
         batch
             .column(key_cols[0])
             .as_any()
@@ -77,36 +70,29 @@ where
         unsafe { reader.value_unchecked(idx) }
     }
 
-    #[inline(always)]
-    fn value(_reader: &Self::Reader<'_>, _idx: usize) -> Count {
-        Count::single()
-    }
-
     fn resolve_persisted(_arena: &SharedArena, persisted: T::Native) -> T::Native {
         persisted
     }
+}
 
-    fn create_record_batch<S: TableStorage<Self>>(
-        table: Table<Self, S>,
-        _arena: &Arc<SharedArena>,
-        _top_k: Option<(usize, usize)>,
-    ) -> Result<RecordBatch, ArrowError> {
-        let mut key_b = PrimitiveBuilder::<T>::with_capacity(table.len());
-        let mut val_b = UInt64Builder::with_capacity(table.len());
+/// Emits the single primitive key column.
+pub struct IntKeyColumns<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
 
-        for entry in table.iter(0) {
-            key_b.append_value(*entry.key());
-            val_b.append_value(entry.value().value as u64);
-        }
+impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumns<T> {
+    type Key = T::Native;
 
-        let keys: ArrayRef = Arc::new(key_b.finish());
-        let vals: ArrayRef = Arc::new(val_b.finish());
+    fn with_capacity(rows: usize) -> Self {
+        Self(PrimitiveBuilder::<T>::with_capacity(rows))
+    }
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", T::DATA_TYPE, false),
-            Field::new("value", DataType::UInt64, false),
-        ]));
+    #[inline(always)]
+    fn push(&mut self, key: &T::Native) {
+        self.0.append_value(*key);
+    }
 
-        RecordBatch::try_new(schema, vec![keys, vals])
+    fn finish(mut self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+        let fields = vec![Field::new("key", T::DATA_TYPE, false)];
+        let columns: Vec<ArrayRef> = vec![Arc::new(self.0.finish())];
+        (fields, columns)
     }
 }

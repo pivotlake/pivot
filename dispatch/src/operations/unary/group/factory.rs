@@ -8,7 +8,7 @@
 
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
-use crate::operations::unary::group::hashtables::{KeyExtractor, MultiSlabTable};
+use crate::operations::unary::group::hashtables::{KeyExtractor, MultiSlabTable, ValueExtractor};
 use crate::operations::unary::group::{Group, GroupAggSlot, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
@@ -27,20 +27,20 @@ use std::sync::{Arc, mpsc};
 ///
 /// Only the first worker receives the channel receiver; it will drain
 /// the channel and inject partition jobs during the output phase.
-pub struct GroupFactory<K: KeyExtractor> {
+pub struct GroupFactory<K: KeyExtractor, V: ValueExtractor> {
     shared_arena: Arc<SharedArena>,
     key_cols: Vec<usize>,
     value_slots: Vec<GroupAggSlot>,
     top_k: Option<(usize, usize)>,
     hash_state: RandomState,
-    injector: Arc<Injector<PartitionJob<K>>>,
+    injector: Arc<Injector<PartitionJob<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
 
-    sender: mpsc::Sender<Vec<MultiSlabTable<K>>>,
-    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K>>>>,
+    sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
+    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
 }
 
-impl<K: KeyExtractor> GroupFactory<K> {
+impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {
     /// Create `worker_count` factories that share the same arena, hash state,
     /// and synchronization primitives. `key_cols` are the GROUP BY column
     /// indices; `value_slots` configure the per-group aggregates.
@@ -50,7 +50,7 @@ impl<K: KeyExtractor> GroupFactory<K> {
         top_k: Option<(usize, usize)>,
         worker_count: usize,
         buffers: usize,
-    ) -> impl IntoIterator<Item = GroupFactory<K>> {
+    ) -> impl IntoIterator<Item = GroupFactory<K, V>> {
         let shared_arena = SharedArena::new(buffers);
         let hash_state = RandomState::new();
         let injector = Arc::new(Injector::new());
@@ -72,10 +72,10 @@ impl<K: KeyExtractor> GroupFactory<K> {
     }
 }
 
-impl<K: KeyExtractor> UnaryFactory<RecordBatch, RecordBatch> for GroupFactory<K> {
-    type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K>>;
+impl<K: KeyExtractor, V: ValueExtractor> UnaryFactory<RecordBatch, RecordBatch> for GroupFactory<K, V> {
+    type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>;
 
-    fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K>> {
+    fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>> {
         PipelineBreaker::Consuming(Group::new(
             self.shared_arena,
             self.hash_state,

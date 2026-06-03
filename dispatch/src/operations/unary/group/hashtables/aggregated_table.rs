@@ -4,33 +4,40 @@ use crate::operations::unary::group::aggregations::GroupAggSlot;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable,
+    BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
 };
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
-/// Adapts a [`KeyExtractor`] + key arena into a [`BatchRowSource`] for
-/// [`BaseHashTable::merge_batch`]. Holding the `&mut` arena here (rather than in
-/// a closure that returns a borrowed live key) keeps the arena borrow from
-/// escaping while still allowing string keys to be persisted on insert.
-struct RowSrc<'r, 'b, K: KeyExtractor> {
-    reader: &'r K::Reader<'b>,
+/// Adapts a [`KeyExtractor`] + [`ValueExtractor`] + key arena into a
+/// [`BatchRowSource`] for [`BaseHashTable::merge_batch`]. Holding the `&mut`
+/// arena here (rather than in a closure that returns a borrowed live key) keeps
+/// the arena borrow from escaping while still allowing string keys to be
+/// persisted on insert.
+struct RowSrc<'r, 'b, K: KeyExtractor, V: ValueExtractor> {
+    key_reader: &'r K::Reader<'b>,
+    // Held by value (not `&`): for a `COUNT(*)` value extractor the reader is a
+    // ZST, so this is a zero-size field and `value()` compiles to a constant with
+    // no per-row load — what a `&V::Reader` would otherwise force on every insert.
+    value_reader: V::Reader<'b>,
     arena: &'r mut WorkerArena,
 }
 
-impl<K: KeyExtractor> BatchRowSource<K::Persisted, K::Value> for RowSrc<'_, '_, K> {
+impl<K: KeyExtractor, V: ValueExtractor> BatchRowSource<K::Persisted, V::Value>
+    for RowSrc<'_, '_, K, V>
+{
     #[inline(always)]
     fn persisted(&mut self, i: usize) -> K::Persisted {
-        K::live_key(self.reader, i, &mut *self.arena).persist()
+        K::live_key(self.key_reader, i, &mut *self.arena).persist()
     }
     #[inline(always)]
     fn key_eq(&mut self, i: usize, persisted: &K::Persisted) -> bool {
-        K::live_key(self.reader, i, &mut *self.arena).eq_persisted(persisted)
+        K::live_key(self.key_reader, i, &mut *self.arena).eq_persisted(persisted)
     }
     #[inline(always)]
-    fn value(&mut self, i: usize) -> K::Value {
-        K::value(self.reader, i)
+    fn value(&mut self, i: usize) -> V::Value {
+        V::value(&self.value_reader, i)
     }
 }
 
@@ -44,11 +51,11 @@ impl<K: KeyExtractor> BatchRowSource<K::Persisted, K::Value> for RowSrc<'_, '_, 
 ///
 /// After consumption finishes, [`flush`](Self::flush) returns all tables
 /// for merging in the output phase.
-pub struct AggregatedTable<K: KeyExtractor> {
+pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     hash_state: RandomState,
     worker_arena: WorkerArena,
     allocator: SlabAllocator,
-    tables: Vec<MultiSlabTable<K>>,
+    tables: Vec<MultiSlabTable<K, V>>,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
     /// Scratch for the batched multi-pass probe: current slot per row, and the
     /// two ping-pong selection vectors of still-unresolved row indices.
@@ -57,7 +64,7 @@ pub struct AggregatedTable<K: KeyExtractor> {
     sel_next: Box<[u32; RECORD_BATCH_SIZE]>,
 }
 
-impl<K: KeyExtractor> AggregatedTable<K> {
+impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     /// Create a new aggregation state with a single small table.
     pub fn new(state: RandomState, shared_arena: Arc<SharedArena>) -> Self {
         let mut allocator = SlabAllocator::new(true);
@@ -101,8 +108,8 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             .push(BaseHashTable::multi_slab(&mut self.allocator, new_size, 0));
     }
 
-    /// Merge all rows of `batch` into the current table stack, reading the
-    /// key columns and per-row aggregate values through the extractor.
+    /// Merge all rows of `batch` into the current table stack, reading the key
+    /// columns through `K` and the per-row aggregate values through `V`.
     #[inline(always)]
     pub fn consume_batch(
         &mut self,
@@ -112,12 +119,13 @@ impl<K: KeyExtractor> AggregatedTable<K> {
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
-        let reader = K::make_reader(batch, key_cols, value_slots);
-        let length = K::rows(&reader);
+        let key_reader = K::make_reader(batch, key_cols);
+        let value_reader = V::make_reader(batch, value_slots);
+        let length = K::rows(&key_reader);
 
         let mut i = 0;
         while i < length {
-            self.hashes[i] = K::hash(&reader, i, &self.hash_state);
+            self.hashes[i] = K::hash(&key_reader, i, &self.hash_state);
             i += 1;
         }
 
@@ -133,8 +141,11 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             t.capacity() - t.len()
         };
         if free > length {
-            let mut src = RowSrc::<K> {
-                reader: &reader,
+            // Move `value_reader` into `src`. The scalar fallback below only runs
+            // on the `else` path, so it never observes the move.
+            let mut src = RowSrc::<K, V> {
+                key_reader: &key_reader,
+                value_reader,
                 arena: &mut self.worker_arena,
             };
             self.tables.last_mut().unwrap().merge_batch(
@@ -166,8 +177,8 @@ impl<K: KeyExtractor> AggregatedTable<K> {
                 table.prefetch(self.hashes[i + L1_DISTANCE]);
             }
 
-            let key = K::live_key(&reader, i, &mut self.worker_arena);
-            let value = K::value(&reader, i);
+            let key = K::live_key(&key_reader, i, &mut self.worker_arena);
+            let value = V::value(&value_reader, i);
             table.merge::<false, _>(hash, key, value);
 
             if table.undersized() {
@@ -177,8 +188,9 @@ impl<K: KeyExtractor> AggregatedTable<K> {
             i += 1;
         }
     }
+
     /// Finalize this worker's aggregation: flush the arena and return all tables.
-    pub fn flush(self) -> Vec<MultiSlabTable<K>> {
+    pub fn flush(self) -> Vec<MultiSlabTable<K, V>> {
         self.worker_arena.flush();
         self.tables
     }

@@ -195,7 +195,7 @@ impl Aggregate {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-        use dispatch::{GroupAggKind, GroupAggSlot, IntPairAggExtractor};
+        use dispatch::{AggRowValueExtractor, GroupAggKind, GroupAggSlot, IntPairKeyExtractor};
 
         let key_refs: Vec<&crate::expression::Ref> = self
             .groups
@@ -234,13 +234,14 @@ impl Aggregate {
         // Monomorphise over the two key types and the slot arity (N).
         macro_rules! by_arity {
             ($a:ty, $b:ty) => {{
+                type Key = IntPairKeyExtractor<$a, $b>;
                 match slots.len() {
-                    1 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 1>>(key_cols, slots, top_k)),
-                    2 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 2>>(key_cols, slots, top_k)),
-                    3 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 3>>(key_cols, slots, top_k)),
-                    4 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 4>>(key_cols, slots, top_k)),
-                    5 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 5>>(key_cols, slots, top_k)),
-                    6 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 6>>(key_cols, slots, top_k)),
+                    1 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<1>>(key_cols, slots, top_k)),
+                    2 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<2>>(key_cols, slots, top_k)),
+                    3 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<3>>(key_cols, slots, top_k)),
+                    4 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<4>>(key_cols, slots, top_k)),
+                    5 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<5>>(key_cols, slots, top_k)),
+                    6 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<6>>(key_cols, slots, top_k)),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             }};

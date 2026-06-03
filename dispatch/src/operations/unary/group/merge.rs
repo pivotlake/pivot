@@ -27,7 +27,7 @@
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
-    DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage,
+    DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage, ValueExtractor,
 };
 
 use super::PARTITIONS;
@@ -56,9 +56,9 @@ const PREFETCH_DISTANCE: usize = 8;
 
 /// Try to resize `target` if cumulative collision pressure is too high.
 #[inline]
-fn resize_if_needed<K: KeyExtractor>(
+fn resize_if_needed<K: KeyExtractor, V: ValueExtractor>(
     allocator: &mut SlabAllocator,
-    target: &mut MultiSlabTable<K>,
+    target: &mut MultiSlabTable<K, V>,
 ) {
     // Integer form of `collisions / len > RESIZE_COLLISION_RATIO`. This runs on
     // the critical path after every insert, so we avoid the int→float converts
@@ -77,13 +77,13 @@ fn resize_if_needed<K: KeyExtractor>(
 /// Slots are processed in small batches ([`SCAN_BATCH_SIZE`]) so that when
 /// we round-robin through the source tables, the target region stays in
 /// cache. Each batch also prefetches [`PREFETCH_DISTANCE`] slots ahead.
-fn merge_within_partition_bounds<K: KeyExtractor, S: TableStorage<K>>(
+fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
     slot_count: usize,
-    tables: &[&Table<K, S>],
-    target: &mut MultiSlabTable<K>,
+    tables: &[&Table<K, V, S>],
+    target: &mut MultiSlabTable<K, V>,
 ) {
     let start = (partition * slot_count) >> PARTITION_BITS;
     let end = ((partition + 1) * slot_count) >> PARTITION_BITS;
@@ -113,7 +113,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, S: TableStorage<K>>(
                         K::resolve_persisted(arena, *entry.key()),
                         *entry.value(),
                     );
-                    resize_if_needed::<K>(allocator, target);
+                    resize_if_needed::<K, V>(allocator, target);
                 }
             }
         }
@@ -127,13 +127,13 @@ fn merge_within_partition_bounds<K: KeyExtractor, S: TableStorage<K>>(
 /// Entries displaced by collisions can land just past `end`. For the last
 /// partition this means wrapping around to slot 0. We follow each source
 /// table's probe chain until hitting an empty slot (`hash == 0`).
-fn merge_past_partition_bounds<K: KeyExtractor, S: TableStorage<K>>(
+fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
     slot_count: usize,
-    tables: &[&Table<K, S>],
-    target: &mut MultiSlabTable<K>,
+    tables: &[&Table<K, V, S>],
+    target: &mut MultiSlabTable<K, V>,
 ) {
     let end = ((partition + 1) * slot_count) >> PARTITION_BITS;
     let mask = slot_count - 1;
@@ -152,7 +152,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, S: TableStorage<K>>(
                     K::resolve_persisted(arena, *entry.key()),
                     *entry.value(),
                 );
-                resize_if_needed::<K>(allocator, target);
+                resize_if_needed::<K, V>(allocator, target);
             }
             i = (i + 1) & mask;
         }
@@ -160,30 +160,30 @@ fn merge_past_partition_bounds<K: KeyExtractor, S: TableStorage<K>>(
 }
 
 /// Merge entries from `tables` that belong to `partition` into `target`.
-fn merge_into_partition<K: KeyExtractor, S: TableStorage<K>>(
+fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
     slot_count: usize,
-    tables: Vec<&Table<K, S>>,
-    target: &mut MultiSlabTable<K>,
+    tables: Vec<&Table<K, V, S>>,
+    target: &mut MultiSlabTable<K, V>,
 ) {
-    merge_within_partition_bounds::<K, S>(allocator, arena, partition, slot_count, &tables, target);
-    merge_past_partition_bounds::<K, S>(allocator, arena, partition, slot_count, &tables, target);
+    merge_within_partition_bounds::<K, V, S>(allocator, arena, partition, slot_count, &tables, target);
+    merge_past_partition_bounds::<K, V, S>(allocator, arena, partition, slot_count, &tables, target);
 }
 
 /// Merge all per-worker tables for a single partition into one result table.
 ///
 /// Source tables are grouped by capacity so that same-sized tables share
 /// the same slot range and can be walked together for better locality.
-pub(super) fn merge_partition<K: KeyExtractor>(
+pub(super) fn merge_partition<K: KeyExtractor, V: ValueExtractor>(
     partition: usize,
-    tables: &[MultiSlabTable<K>],
+    tables: &[MultiSlabTable<K, V>],
     arena: &SharedArena,
     partition_capacity: usize,
-) -> MultiSlabTable<K> {
+) -> MultiSlabTable<K, V> {
     let mut allocator = SlabAllocator::new(true);
-    let mut target: MultiSlabTable<K> = <MultiSlabTable<K>>::multi_slab(
+    let mut target: MultiSlabTable<K, V> = <MultiSlabTable<K, V>>::multi_slab(
         &mut allocator,
         partition_capacity.max(DEFAULT_CAPACITY),
         PARTITIONS.trailing_zeros(),
@@ -192,7 +192,7 @@ pub(super) fn merge_partition<K: KeyExtractor>(
     // Group source tables by capacity so same-sized tables can be walked in
     // lockstep — entries at the same slot index have similar hashes and hit
     // the same target region, keeping it cache-hot.
-    let mut by_size: Vec<(usize, Vec<&MultiSlabTable<K>>)> = Vec::new();
+    let mut by_size: Vec<(usize, Vec<&MultiSlabTable<K, V>>)> = Vec::new();
     for table in tables {
         let slot_count = table.capacity();
         if let Some(group) = by_size.iter_mut().find(|(s, _)| *s == slot_count) {
@@ -203,7 +203,7 @@ pub(super) fn merge_partition<K: KeyExtractor>(
     }
 
     for (slot_count, group) in by_size.into_iter() {
-        merge_into_partition::<K, _>(
+        merge_into_partition::<K, V, _>(
             &mut allocator,
             arena,
             partition,
@@ -223,6 +223,7 @@ mod tests {
     use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::hashtables::AggregatedTable;
     use crate::operations::unary::group::key_extractions::IntKeyExtractor;
+    use crate::operations::unary::group::value_extractions::CountValueExtractor;
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
@@ -230,13 +231,14 @@ mod tests {
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
+    type CountValue = CountValueExtractor;
 
     fn make_worker_tables(
         state: &RandomState,
         arena: &Arc<SharedArena>,
         values: &[i32],
-    ) -> Vec<MultiSlabTable<IntExtractor>> {
-        let mut agg = AggregatedTable::<IntExtractor>::new(state.clone(), arena.clone());
+    ) -> Vec<MultiSlabTable<IntExtractor, CountValue>> {
+        let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone());
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
@@ -245,7 +247,7 @@ mod tests {
     }
 
     fn merge_all_partitions(
-        tables: &[MultiSlabTable<IntExtractor>],
+        tables: &[MultiSlabTable<IntExtractor, CountValue>],
         arena: &SharedArena,
     ) -> Vec<(i32, usize)> {
         let total_cap: usize = tables.iter().map(|t| t.capacity()).sum::<usize>() / 2;
@@ -253,7 +255,7 @@ mod tests {
 
         let mut all_entries = vec![];
         for p in 0..PARTITIONS {
-            let result = merge_partition::<IntExtractor>(p, tables, arena, partition_cap);
+            let result = merge_partition::<IntExtractor, CountValue>(p, tables, arena, partition_cap);
             for entry in result.iter(0) {
                 all_entries.push((*entry.key(), entry.value().value));
             }
@@ -350,7 +352,7 @@ mod tests {
         let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
         let mut total = 0;
         for p in 0..PARTITIONS {
-            let result = merge_partition::<IntExtractor>(p, &tables, &arena, partition_cap);
+            let result = merge_partition::<IntExtractor, CountValue>(p, &tables, &arena, partition_cap);
             total += result.iter(0).count();
         }
 

@@ -1,23 +1,20 @@
-//! Two-integer-key GROUP BY with multiple sum/count value slots.
+//! Two-integer-key GROUP BY.
 //!
 //! Keys: a pair of integer columns (e.g. `WatchID`, `ClientIP`) packed into a
 //! single `u128` (first key's bits in the high 64, second's in the low 64),
-//! which is `Copy`/`Hash`/`Eq` and needs no arena.
-//!
-//! Value: an [`AggRow<N>`] of `N` `i64` slots, one per `COUNT(*)` / `SUM` /
-//! `COUNT(col)` in the query. `N` is monomorphised per arity so each hash-table
-//! entry is exactly as wide as the query needs.
+//! which is `Copy`/`Hash`/`Eq` and needs no arena. The aggregate value is the
+//! separate concern of a
+//! [`ValueExtractor`](crate::operations::unary::group::value_extractions::ValueExtractor)
+//! (typically [`AggRowValueExtractor`](crate::operations::unary::group::value_extractions::AggRowValueExtractor)).
 
-use crate::operations::KeyExtractor;
-use crate::operations::unary::group::aggregations::{AggRow, GroupAggKind, GroupAggSlot};
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::hashtables::{Table, TableStorage};
+use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
-use arrow_array::builder::{Int64Builder, PrimitiveBuilder};
+use arrow_array::builder::PrimitiveBuilder;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{ArrowPrimitiveType, Int16Type, Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_array::types::ArrowPrimitiveType;
+use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch};
+use arrow_schema::Field;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -40,32 +37,16 @@ macro_rules! impl_int_bits {
 }
 impl_int_bits!(i8 => u8, i16 => u16, i32 => u32, i64 => u64, u8 => u8, u16 => u16, u32 => u32, u64 => u64);
 
-/// Per-slot reader: how to produce slot `s`'s contribution for a given row.
-enum SlotReader<'b> {
-    /// `COUNT(*)` or `COUNT(non-null col)` — contributes 1.
-    One,
-    SumI16(&'b PrimitiveArray<Int16Type>),
-    SumI32(&'b PrimitiveArray<Int32Type>),
-    SumI64(&'b PrimitiveArray<Int64Type>),
+/// Pack a key pair into a `u128`: first key's bits in the high 64, second's low.
+#[inline(always)]
+fn pack<A: IntBits, B: IntBits>(a: A, b: B) -> u128 {
+    ((a.to_u64() as u128) << 64) | (b.to_u64() as u128)
 }
 
-impl SlotReader<'_> {
-    #[inline(always)]
-    fn at(&self, idx: usize) -> i64 {
-        match self {
-            SlotReader::One => 1,
-            SlotReader::SumI16(a) => unsafe { a.value_unchecked(idx) as i64 },
-            SlotReader::SumI32(a) => unsafe { a.value_unchecked(idx) as i64 },
-            SlotReader::SumI64(a) => unsafe { a.value_unchecked(idx) },
-        }
-    }
-}
-
-/// Per-batch reader for the pair extractor.
+/// Per-batch reader for the pair extractor: the two key columns.
 pub struct PairReader<'b, A: ArrowPrimitiveType, B: ArrowPrimitiveType> {
     a: &'b PrimitiveArray<A>,
     b: &'b PrimitiveArray<B>,
-    slots: Vec<SlotReader<'b>>,
 }
 
 impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> PairReader<'_, A, B>
@@ -74,24 +55,19 @@ where
     B::Native: IntBits,
 {
     #[inline(always)]
-    fn pack(&self, idx: usize) -> u128 {
-        let a = unsafe { self.a.value_unchecked(idx) }.to_u64();
-        let b = unsafe { self.b.value_unchecked(idx) }.to_u64();
-        ((a as u128) << 64) | (b as u128)
+    fn packed(&self, idx: usize) -> u128 {
+        let a = unsafe { self.a.value_unchecked(idx) };
+        let b = unsafe { self.b.value_unchecked(idx) };
+        pack(a, b)
     }
 }
 
-/// `GROUP BY (A, B)` with `N` sum/count value slots.
-pub struct IntPairAggExtractor<A: ArrowPrimitiveType, B: ArrowPrimitiveType, const N: usize>(
-    PhantomData<(A, B)>,
-);
+/// `GROUP BY (A, B)` over two integer key columns.
+pub struct IntPairKeyExtractor<A: ArrowPrimitiveType, B: ArrowPrimitiveType>(PhantomData<(A, B)>);
 
-unsafe impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType, const N: usize> Send
-    for IntPairAggExtractor<A, B, N>
-{
-}
+unsafe impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> Send for IntPairKeyExtractor<A, B> {}
 
-impl<A, B, const N: usize> KeyExtractor for IntPairAggExtractor<A, B, N>
+impl<A, B> KeyExtractor for IntPairKeyExtractor<A, B>
 where
     A: ArrowPrimitiveType + Send + 'static,
     B: ArrowPrimitiveType + Send + 'static,
@@ -101,33 +77,13 @@ where
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
     type PersistedLiveKey<'a> = u128;
-    type Value = AggRow<N>;
     type Reader<'b> = PairReader<'b, A, B>;
+    type Columns = IntPairKeyColumns<A, B>;
 
-    fn make_reader<'b>(
-        batch: &'b RecordBatch,
-        key_cols: &[usize],
-        value_slots: &[GroupAggSlot],
-    ) -> Self::Reader<'b> {
-        assert_eq!(value_slots.len(), N, "slot count must match N");
+    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
         let a = batch.column(key_cols[0]).as_primitive::<A>();
         let b = batch.column(key_cols[1]).as_primitive::<B>();
-        let slots = value_slots
-            .iter()
-            .map(|slot| match slot.kind {
-                GroupAggKind::CountStar | GroupAggKind::Count => SlotReader::One,
-                GroupAggKind::Sum => {
-                    let col = batch.column(slot.column);
-                    match col.data_type() {
-                        DataType::Int16 => SlotReader::SumI16(col.as_primitive::<Int16Type>()),
-                        DataType::Int32 => SlotReader::SumI32(col.as_primitive::<Int32Type>()),
-                        DataType::Int64 => SlotReader::SumI64(col.as_primitive::<Int64Type>()),
-                        other => panic!("grouped SUM: unsupported column type {other:?}"),
-                    }
-                }
-            })
-            .collect();
-        PairReader { a, b, slots }
+        PairReader { a, b }
     }
 
     #[inline(always)]
@@ -137,7 +93,7 @@ where
 
     #[inline(always)]
     fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64 {
-        state.hash_one(reader.pack(idx))
+        state.hash_one(reader.packed(idx))
     }
 
     #[inline(always)]
@@ -146,97 +102,52 @@ where
         idx: usize,
         _arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'b> {
-        reader.pack(idx)
-    }
-
-    // (resolve_persisted / value / create_record_batch below)
-
-    #[inline(always)]
-    fn value(reader: &Self::Reader<'_>, idx: usize) -> AggRow<N> {
-        let mut out = [0i64; N];
-        for (s, slot) in reader.slots.iter().enumerate() {
-            out[s] = slot.at(idx);
-        }
-        AggRow(out)
+        reader.packed(idx)
     }
 
     fn resolve_persisted(_arena: &SharedArena, persisted: u128) -> u128 {
         persisted
     }
+}
 
-    fn create_record_batch<S: TableStorage<Self>>(
-        table: Table<Self, S>,
-        _arena: &Arc<SharedArena>,
-        top_k: Option<(usize, usize)>,
-    ) -> Result<RecordBatch, ArrowError> {
-        // When this group feeds an `ORDER BY <agg slot> DESC LIMIT k`, only the
-        // top-k rows of *this partition* can survive the global top-k (top-k is
-        // decomposable across partitions). Emitting just those instead of every
-        // group avoids materialising ~100M output rows that the downstream
-        // TopN would immediately discard.
-        let top_rows: Option<Vec<(u128, [i64; N])>> = match top_k {
-            Some((slot, limit)) if limit < table.len() => {
-                use std::cmp::Reverse;
-                use std::collections::BinaryHeap;
-                // Size-`limit` min-heap keyed by the sort slot; keeps the
-                // `limit` largest entries.
-                let mut heap: BinaryHeap<Reverse<(i64, u128, [i64; N])>> =
-                    BinaryHeap::with_capacity(limit + 1);
-                for entry in table.iter(0) {
-                    let row = entry.value().0;
-                    let k = row[slot];
-                    if heap.len() < limit {
-                        heap.push(Reverse((k, *entry.key(), row)));
-                    } else if k > heap.peek().unwrap().0.0 {
-                        heap.pop();
-                        heap.push(Reverse((k, *entry.key(), row)));
-                    }
-                }
-                Some(heap.into_iter().map(|Reverse((_, key, row))| (key, row)).collect())
-            }
-            _ => None,
-        };
+/// Emits the two unpacked key columns (`k0`, `k1`).
+pub struct IntPairKeyColumns<A: ArrowPrimitiveType, B: ArrowPrimitiveType>
+where
+    A::Native: IntBits,
+    B::Native: IntBits,
+{
+    a: PrimitiveBuilder<A>,
+    b: PrimitiveBuilder<B>,
+}
 
-        let len = top_rows.as_ref().map_or_else(|| table.len(), |r| r.len());
-        let mut a_b = PrimitiveBuilder::<A>::with_capacity(len);
-        let mut b_b = PrimitiveBuilder::<B>::with_capacity(len);
-        let mut val_bs: Vec<Int64Builder> =
-            (0..N).map(|_| Int64Builder::with_capacity(len)).collect();
+impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> KeyColumns for IntPairKeyColumns<A, B>
+where
+    A::Native: IntBits,
+    B::Native: IntBits,
+{
+    type Key = u128;
 
-        macro_rules! emit {
-            ($packed:expr, $row:expr) => {{
-                let packed: u128 = $packed;
-                let row: [i64; N] = $row;
-                a_b.append_value(A::Native::from_u64((packed >> 64) as u64));
-                b_b.append_value(B::Native::from_u64(packed as u64));
-                for (s, vb) in val_bs.iter_mut().enumerate() {
-                    vb.append_value(row[s]);
-                }
-            }};
+    fn with_capacity(rows: usize) -> Self {
+        Self {
+            a: PrimitiveBuilder::<A>::with_capacity(rows),
+            b: PrimitiveBuilder::<B>::with_capacity(rows),
         }
-        match &top_rows {
-            Some(rows) => {
-                for (packed, row) in rows {
-                    emit!(*packed, *row);
-                }
-            }
-            None => {
-                for entry in table.iter(0) {
-                    emit!(*entry.key(), entry.value().0);
-                }
-            }
-        }
+    }
 
-        let mut fields = vec![
+    #[inline(always)]
+    fn push(&mut self, key: &u128) {
+        let packed = *key;
+        self.a
+            .append_value(A::Native::from_u64((packed >> 64) as u64));
+        self.b.append_value(B::Native::from_u64(packed as u64));
+    }
+
+    fn finish(mut self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+        let fields = vec![
             Field::new("k0", A::DATA_TYPE, false),
             Field::new("k1", B::DATA_TYPE, false),
         ];
-        let mut columns: Vec<ArrayRef> = vec![Arc::new(a_b.finish()), Arc::new(b_b.finish())];
-        for (s, mut vb) in val_bs.into_iter().enumerate() {
-            fields.push(Field::new(format!("v{s}"), DataType::Int64, false));
-            columns.push(Arc::new(vb.finish()));
-        }
-
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        let columns: Vec<ArrayRef> = vec![Arc::new(self.a.finish()), Arc::new(self.b.finish())];
+        (fields, columns)
     }
 }
