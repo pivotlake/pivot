@@ -246,15 +246,33 @@ json build_constant_comparison_filter(duckdb::ConstantFilter &filter, json colum
 json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables) {
 	json columns = json::array();
 	auto &column_ids = get->GetColumnIds();
-	for (size_t i = 0; i < column_ids.size(); i++) {
-		auto &column_id = column_ids[i];
+    // A LogicalGet reads `column_ids` off disk but may *output* only a subset /
+    // reordering of them, given by `projection_ids` (indices into column_ids).
+    // This happens when a filter is pushed all the way into the scan: columns
+    // referenced only by that pushed-down predicate are read but not emitted.
+    // When `projection_ids` is set, the scan's output order — and therefore the
+    // positional indices ColumnBindingResolver assigns to every ref above the
+    // scan — follow projection_ids, NOT column_ids, so we serialize in that
+    // order. This is the scan-level twin of the LogicalFilter `projection_map`
+    // handling in build_plan_node_json (the latter is what actually fixed Q42,
+    // where the filter stayed a separate node)
+	auto emit = [&](size_t col_pos, size_t type_pos) {
 		json data;
-		data["column_idx"] = column_id.GetPrimaryIndex();
-		data["return_type"] = get->types[i].id();
+		data["column_idx"] = column_ids[col_pos].GetPrimaryIndex();
+		data["return_type"] = get->types[type_pos].id();
 		json column;
 		column["type"] = static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF);
 		column["data"] = data;
 		columns.push_back(column);
+	};
+	if (!get->projection_ids.empty()) {
+		for (auto pid : get->projection_ids) {
+			emit(pid, pid);
+		}
+	} else {
+		for (size_t i = 0; i < column_ids.size(); i++) {
+			emit(i, i);
+		}
 	}
 
 	if (!get->GetTable()) {
@@ -417,6 +435,41 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	}
 
 	new_node["operator"] = new_operator;
+
+	// A LogicalFilter may carry a `projection_map`: it does NOT output all of its
+	// child's columns, only the subset/reordering listed there (the rest exist
+	// solely to evaluate the filter predicates and are dropped). DuckDB's
+	// ColumnBindingResolver assigns positional indices to every ref *above* the
+	// filter against that projected output — so e.g. with projection_map=[4] the
+	// lone surviving column becomes index 0. pivot's filter passes every input
+	// column through unchanged, so without replaying the projection those indices
+	// point at the wrong columns (this is what made grouped `date_trunc(EventTime)`
+	// read CounterID and collapse every row into one bucket). Replay it by wrapping
+	// the filter in a Projection that selects exactly `projection_map`, positionally,
+	// from the filter's (pass-through) output.
+	if (op->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
+		auto &filter = op->Cast<duckdb::LogicalFilter>();
+		if (!filter.projection_map.empty()) {
+			json projections = json::array();
+			for (size_t i = 0; i < filter.projection_map.size(); i++) {
+				json data;
+				data["column_idx"] = static_cast<uint64_t>(filter.projection_map[i]);
+				data["return_type"] = filter.types[i].id();
+				json col;
+				col["type"] = static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF);
+				col["data"] = data;
+				projections.push_back(col);
+			}
+			json proj_op = json::object();
+			proj_op["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_PROJECTION);
+			proj_op["data"] = json{{"projections", projections}};
+			json wrapper = json::object();
+			wrapper["name"] = "FILTER_PROJECTION";
+			wrapper["inputs"] = json::array({new_node});
+			wrapper["operator"] = proj_op;
+			return wrapper;
+		}
+	}
 
 	return new_node;
 }
