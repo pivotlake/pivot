@@ -39,8 +39,8 @@ use ahash::HashMap;
 use bytes::Bytes;
 use std::cell::UnsafeCell;
 use std::os::fd::RawFd;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// Sub-block granularity for validity tracking and disk reads (the direct-I/O
 /// alignment). A read never pulls less than this, and every cached byte range
@@ -77,6 +77,10 @@ pub enum CacheLookup {
 /// region inside the pinned slot) directly — no intermediate buffer — and once
 /// it lands the run is marked valid wholesale via [`commit`].
 ///
+/// Holds an [`Arc`] on the slot pin shared with its [`MissRegion`], so the slot
+/// can't be evicted while a read targeting it is in flight — even if the owning
+/// query is cancelled and drops the `MissRegion` first.
+///
 /// [`dest`]: MissingBlock::dest
 /// [`commit`]: MissingBlock::commit
 #[derive(Clone)]
@@ -93,28 +97,18 @@ pub struct MissingBlock {
     first_sub: usize,
     /// How many sub-blocks this run covers.
     sub_count: usize,
+    /// Keeps the destination slot pinned for the read's whole lifetime.
+    _pin: Arc<ReadBuffer>,
 }
 
 impl MissingBlock {
     /// The destination to read this block's `len` bytes into: a 4 KB-aligned
     /// region `[dest, dest+len)` inside the pinned slot — a valid O_DIRECT
-    /// target. The slot stays alive for the read because the owning `MissRegion`
-    /// pins it, and only this block's (currently invalid) sub-blocks live here,
+    /// target. The slot stays alive for the read because this block holds a pin
+    /// (`_pin`), and only this block's (currently invalid) sub-blocks live here,
     /// so the read never races a reader of the slot's valid bytes.
     pub fn dest(&self) -> *mut u8 {
         self.dest as *mut u8
-    }
-
-    /// Pin the destination slot for the lifetime of this block's read, so it
-    /// can't be evicted out from under an in-flight read — e.g. if the owning
-    /// query is cancelled and drops its [`MissRegion`] (and thus its pin) before
-    /// the read lands. The slot is already pinned by that `MissRegion` when this
-    /// is called, so `try_read` cannot fail.
-    pub fn pin(&self) -> ReadBuffer {
-        memory_ctx()
-            .ring()
-            .try_read(self.slot_idx)
-            .expect("missing-block slot is pinned by its MissRegion")
     }
 
     /// Mark this block's sub-blocks valid — call once its bytes have been read
@@ -128,13 +122,25 @@ impl MissingBlock {
     }
 }
 
+/// Owns a slot pin and exposes its 2 MB contents, so a [`Bytes`] can borrow a
+/// slice of the slot zero-copy while keeping the slot pinned.
+struct SlotPin(Arc<ReadBuffer>);
+
+impl AsRef<[u8]> for SlotPin {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 /// A pinned region slot with an outstanding set of [`MissingBlock`]s. The
 /// caller reads each block into its [`dest`](MissingBlock::dest) and
 /// [`commit`](MissingBlock::commit)s it on completion, then takes the assembled
 /// [`Bytes`] for its `[start, end)` slice once the whole range is resident.
 pub struct MissRegion {
-    /// Keeps the slot alive (and un-evictable) until the data is taken.
-    pin: ReadBuffer,
+    /// Keeps the slot alive (and un-evictable) until the data is taken; shared
+    /// with this region's [`MissingBlock`]s so an in-flight read keeps it alive
+    /// too.
+    pin: Arc<ReadBuffer>,
     start: usize,
     end: usize,
     missing: Vec<MissingBlock>,
@@ -150,7 +156,7 @@ impl MissRegion {
     /// missing block has been filled; the bytes are a zero-copy view into the
     /// slot, kept alive by the owned pin.
     pub fn into_bytes(self) -> Bytes {
-        Bytes::from_owner(self.pin).slice(self.start..self.end)
+        Bytes::from_owner(SlotPin(self.pin)).slice(self.start..self.end)
     }
 }
 
@@ -319,32 +325,41 @@ impl FileCache {
         let last_sub = (end - 1) / SUB_BLOCK_SIZE;
 
         // Walk the requested sub-blocks, gathering each maximal run of missing
-        // ones into a single block to read.
-        let mut missing = Vec::new();
+        // ones (`[run_first, run_last]`) into a single block to read.
+        let mut runs = Vec::new();
         let mut run_start: Option<usize> = None;
         for sub in first_sub..=last_sub {
             if valid.is_set(sub) {
                 if let Some(run_first) = run_start.take() {
-                    missing.push(MissingBlock::new(region, slot_ptr, slot_idx, run_first, sub - 1));
+                    runs.push((run_first, sub - 1));
                 }
             } else {
                 run_start.get_or_insert(sub);
             }
         }
         if let Some(run_first) = run_start.take() {
-            missing.push(MissingBlock::new(region, slot_ptr, slot_idx, run_first, last_sub));
+            runs.push((run_first, last_sub));
         }
 
-        if missing.is_empty() {
-            CacheLookup::Hit(Bytes::from_owner(pin).slice(start..end))
-        } else {
-            CacheLookup::Miss(MissRegion {
-                pin,
-                start,
-                end,
-                missing,
-            })
+        if runs.is_empty() {
+            return CacheLookup::Hit(Bytes::from_owner(pin).slice(start..end));
         }
+
+        // Share one pin across the region and all its blocks, so the slot stays
+        // alive as long as the region *or* any in-flight read references it.
+        let pin = Arc::new(pin);
+        let missing = runs
+            .into_iter()
+            .map(|(first, last)| {
+                MissingBlock::new(region, slot_ptr, slot_idx, first, last, pin.clone())
+            })
+            .collect();
+        CacheLookup::Miss(MissRegion {
+            pin,
+            start,
+            end,
+            missing,
+        })
     }
 
     /// Evict a slot using the (second-chance) CLOCK algorithm and return it as a
@@ -385,13 +400,14 @@ impl FileCache {
 
 impl MissingBlock {
     /// A block covering sub-blocks `[first_sub, last_sub]` (inclusive) of the
-    /// slot at `slot_ptr` caching `region`.
+    /// slot at `slot_ptr` caching `region`, sharing the region's slot pin.
     fn new(
         region: usize,
         slot_ptr: usize,
         slot_idx: usize,
         first_sub: usize,
         last_sub: usize,
+        pin: Arc<ReadBuffer>,
     ) -> Self {
         let sub_count = last_sub - first_sub + 1;
         MissingBlock {
@@ -401,6 +417,7 @@ impl MissingBlock {
             slot_idx,
             first_sub,
             sub_count,
+            _pin: pin,
         }
     }
 }
