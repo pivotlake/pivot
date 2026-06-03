@@ -187,11 +187,7 @@ impl fmt::Display for Expression {
                 c.right,
                 type_name(&c.return_type)
             ),
-            Expression::Between(b) => write!(
-                f,
-                "{} BETWEEN {} AND {}",
-                b.input, b.lower, b.upper
-            ),
+            Expression::Between(b) => write!(f, "{} BETWEEN {} AND {}", b.input, b.lower, b.upper),
             Expression::Constant(c) => write!(f, "{}:{}", c.raw_value, type_name(&c.logical_type)),
             Expression::AggregateFunc(a) => {
                 let params: Vec<String> = a.params.iter().map(|p| p.to_string()).collect();
