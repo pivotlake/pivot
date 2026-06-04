@@ -84,6 +84,7 @@ pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use operations::parquet::RowGroupFilter;
+pub use operations::parquet::ScanEqualityPredicate;
 pub use operations::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };

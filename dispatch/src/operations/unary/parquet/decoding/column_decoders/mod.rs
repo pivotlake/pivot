@@ -66,6 +66,15 @@ pub trait ColumnDecoder {
 
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
+
+    /// For a column carrying a pushed-down equality constant: once the
+    /// dictionary has been loaded, returns `Some(true)` if the constant is
+    /// **absent** from the dictionary (so no dictionary-encoded row can match),
+    /// `Some(false)` if present. Returns `None` when no constant was pushed or
+    /// the dictionary has not been loaded yet (so no decision can be made).
+    fn dict_excludes_constant(&self) -> Option<bool> {
+        None
+    }
 }
 
 // `ArrayBuilder` (and the primitive builder) now live in `crate::arrays` so the
@@ -93,6 +102,9 @@ pub trait Dict {
 
     /// Builds the dictionary from raw page bytes containing `size` entries.
     fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self;
+
+    /// Number of entries in the dictionary.
+    fn len(&self) -> usize;
 
     /// Looks up the value at `idx` in the dictionary.
     fn entry(&self, idx: usize) -> Self::Item;

@@ -1,3 +1,4 @@
+use super::general::{Encoding, PageType};
 use super::parquet_thrift::*;
 use crate::{general_err, thrift_struct};
 use std::io::Write;
@@ -113,11 +114,24 @@ thrift_struct!(
 );
 
 thrift_struct!(
+    /// Per-(page-type, encoding) page counts for a column chunk. Lets a reader
+    /// tell, without scanning the data, whether every data page is dictionary
+    /// encoded — the precondition for soundly pruning a row group by its
+    /// dictionary contents.
+    pub(crate) struct PageEncodingStats {
+        1: required PageType page_type;
+        2: required Encoding encoding;
+        3: required i32 count;
+    }
+);
+
+thrift_struct!(
     pub(crate) struct ColumnMetaData {
         7: required i64 total_compressed_size;
         9: required i64 data_page_offset;
         11: optional i64 dictionary_page_offset;
         12: optional Statistics statistics;
+        13: optional list<PageEncodingStats> encoding_stats;
     }
 );
 

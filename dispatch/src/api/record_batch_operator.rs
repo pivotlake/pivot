@@ -59,7 +59,7 @@ use crate::operations::channels::{
 use crate::operations::parquet::types::projection::Projection;
 use crate::operations::parquet::{
     MaterializerFactory, ParquetTable, RowGroupFetcherFactory, RowGroupFilter,
-    RowGroupInjectorFactory, RowGroupRequest,
+    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
 };
 use crate::operations::{
     AggSpec, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory, Count,
@@ -613,6 +613,7 @@ impl RecordBatchOperatorSpec {
             projection,
             RECORD_BATCH_SIZE,
             false,
+            Arc::new(Vec::new()),
         ))
     }
 
@@ -722,7 +723,14 @@ pub fn table_input(
     projection: Projection,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
-    table_input_with_filter(dispatcher, table, projection, add_row_group_metadata, None)
+    table_input_with_filter_and_eq_predicates(
+        dispatcher,
+        table,
+        projection,
+        add_row_group_metadata,
+        None,
+        Arc::new(Vec::new()),
+    )
 }
 
 /// Like [`table_input`] but with an optional [`RowGroupFilter`] consulted as
@@ -734,6 +742,28 @@ pub fn table_input_with_filter(
     projection: Projection,
     add_row_group_metadata: bool,
     filter: Option<RowGroupFilter>,
+) -> RecordBatchOperatorSpec {
+    table_input_with_filter_and_eq_predicates(
+        dispatcher,
+        table,
+        projection,
+        add_row_group_metadata,
+        filter,
+        Arc::new(Vec::new()),
+    )
+}
+
+/// Like [`table_input`] but with both a dynamic [`RowGroupFilter`] (a Top-N
+/// above the scan pruning against a live predicate) and pushed-down equality
+/// predicates (the parquet decoder pruning row groups by dictionary contents).
+/// Either can be inert (`None` / empty `Vec`).
+pub fn table_input_with_filter_and_eq_predicates(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    projection: Projection,
+    add_row_group_metadata: bool,
+    filter: Option<RowGroupFilter>,
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
     let worker_count = dispatcher.worker_count();
     let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter);
@@ -753,5 +783,6 @@ pub fn table_input_with_filter(
         projection,
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
+        eq_predicates,
     ))
 }

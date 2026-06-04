@@ -156,6 +156,11 @@ impl Dict for ViewDict {
     }
 
     #[inline(always)]
+    fn len(&self) -> usize {
+        self.views.len()
+    }
+
+    #[inline(always)]
     fn entry(&self, idx: usize) -> Self::Item {
         self.view(idx)
     }

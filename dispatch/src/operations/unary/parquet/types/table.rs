@@ -10,7 +10,10 @@ use crate::memory::{has_memory_context, memory_ctx};
 use crate::operations::unary::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
-use crate::operations::unary::parquet::types::thrift::footer::{FileMetaData, Statistics};
+use crate::operations::unary::parquet::types::thrift::footer::{
+    FileMetaData, PageEncodingStats, Statistics,
+};
+use crate::operations::unary::parquet::types::thrift::general::{Encoding, PageType};
 use crate::operations::unary::parquet::types::thrift::parquet_thrift::{
     ReadThrift, ThriftSliceInputProtocol,
 };
@@ -180,12 +183,15 @@ fn parse_row_group_metadatas(
                     let statistics = meta
                         .statistics
                         .and_then(|s| decode_statistics(s, schema.field(j).data_type()));
+                    let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
+                        && data_pages_all_dictionary(meta.encoding_stats.as_deref());
                     ColumnChunkMeta {
                         dictionary_page_offset: meta.dictionary_page_offset,
                         data_page_offset: meta.data_page_offset,
                         total_compressed_size: meta.total_compressed_size,
                         max_def_level: def_levels[j],
                         statistics,
+                        data_pages_all_dictionary,
                     }
                 })
                 .collect();
@@ -201,6 +207,31 @@ fn parse_row_group_metadatas(
         .collect();
 
     Ok(row_groups)
+}
+
+/// Returns `true` when `encoding_stats` proves every *data* page in the chunk
+/// is dictionary-encoded (`PLAIN_DICTIONARY` / `RLE_DICTIONARY`). Requires at
+/// least one data page and no data page using any other encoding. Returns
+/// `false` when stats are absent — a missing signal is not proof, so we must
+/// not prune.
+fn data_pages_all_dictionary(encoding_stats: Option<&[PageEncodingStats]>) -> bool {
+    let Some(stats) = encoding_stats else {
+        return false;
+    };
+    let mut saw_data_page = false;
+    for s in stats {
+        if s.page_type != PageType::DATA_PAGE && s.page_type != PageType::DATA_PAGE_V2 {
+            continue;
+        }
+        if s.count == 0 {
+            continue;
+        }
+        saw_data_page = true;
+        if s.encoding != Encoding::PLAIN_DICTIONARY && s.encoding != Encoding::RLE_DICTIONARY {
+            return false;
+        }
+    }
+    saw_data_page
 }
 
 /// Decode a Parquet `Statistics` blob into our [`ColumnStatistics`], using
@@ -427,6 +458,53 @@ mod tests {
             .statistics
             .clone()
             .expect("stats should be present")
+    }
+
+    fn enc_stat(page_type: PageType, encoding: Encoding, count: i32) -> PageEncodingStats {
+        PageEncodingStats {
+            page_type,
+            encoding,
+            count,
+        }
+    }
+
+    /// All data pages dictionary-encoded → prunable.
+    #[test]
+    fn all_dict_when_data_pages_are_dictionary() {
+        let stats = [
+            enc_stat(PageType::DICTIONARY_PAGE, Encoding::PLAIN_DICTIONARY, 1),
+            enc_stat(PageType::DATA_PAGE, Encoding::PLAIN_DICTIONARY, 3),
+        ];
+        assert!(data_pages_all_dictionary(Some(&stats)));
+    }
+
+    /// A single non-dictionary (PLAIN) data page disables pruning, even
+    /// alongside dictionary-encoded data pages.
+    #[test]
+    fn not_all_dict_when_a_data_page_is_plain() {
+        let stats = [
+            enc_stat(PageType::DICTIONARY_PAGE, Encoding::PLAIN, 1),
+            enc_stat(PageType::DATA_PAGE, Encoding::PLAIN_DICTIONARY, 2),
+            enc_stat(PageType::DATA_PAGE, Encoding::PLAIN, 1),
+        ];
+        assert!(!data_pages_all_dictionary(Some(&stats)));
+    }
+
+    /// Missing encoding stats are not proof of anything → not prunable.
+    #[test]
+    fn not_all_dict_when_stats_absent() {
+        assert!(!data_pages_all_dictionary(None));
+    }
+
+    /// A dictionary page with no data pages is not prunable (nothing to prove).
+    #[test]
+    fn not_all_dict_when_no_data_pages() {
+        let stats = [enc_stat(
+            PageType::DICTIONARY_PAGE,
+            Encoding::PLAIN_DICTIONARY,
+            1,
+        )];
+        assert!(!data_pages_all_dictionary(Some(&stats)));
     }
 
     /// End-to-end: write a parquet file with several column types, then read it
