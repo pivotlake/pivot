@@ -83,8 +83,8 @@ fn top_n(mut planner: PlannerContext) {
         .plan("SELECT * FROM users ORDER BY age LIMIT 5")
         .unwrap()
         .to_string();
-    assert_snapshot!(plan, @r"
-    TopN(limit: 5, order: #3:INTEGER ASC)
+    assert_snapshot!(plan, @"
+    TopN(limit: 5, offset: 0, order: #3:INTEGER ASC)
       Projection(#0:INTEGER, #1:VARCHAR, #2:INTEGER, #3:INTEGER, #4:BOOLEAN)
         Input([#0:INTEGER, #1:VARCHAR, #2:INTEGER, #3:INTEGER, #4:BOOLEAN])
     ");
