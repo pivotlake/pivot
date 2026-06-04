@@ -126,6 +126,12 @@ pub struct TypedColumnDecoder<
     read_page: Option<ReadPage<D, B, P>>,
     /// Dictionary built from a dictionary page, if one has been received.
     dict: Option<D>,
+    /// Pushed-down equality constant for dictionary pruning, if any.
+    eq_const: Option<B::Element>,
+    /// Cached result of scanning the dictionary for [`Self::eq_const`]:
+    /// `Some(true)` when the constant is absent, `Some(false)` when present,
+    /// `None` before the dictionary is built (or when no constant is set).
+    dict_excludes: Option<bool>,
     phantom_data: PhantomData<B>,
 }
 
@@ -141,8 +147,17 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
             max_def_level,
             read_page: None,
             dict: None,
+            eq_const: None,
+            dict_excludes: None,
             phantom_data: Default::default(),
         }
+    }
+
+    /// Installs a pushed-down equality constant. When the dictionary is later
+    /// built, it is scanned once for this value; if absent, the enclosing row
+    /// group can be pruned (see [`ColumnDecoder::dict_excludes_constant`]).
+    pub fn set_eq_constant(&mut self, value: B::Element) {
+        self.eq_const = Some(value);
     }
 
     /// Selects the appropriate [`ValueDecoder`] (plain or RLE-dictionary)
@@ -219,7 +234,13 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
 
 impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Builder = B>>
     ColumnDecoder for TypedColumnDecoder<D, B, P>
+where
+    B::Element: PartialEq,
 {
+    fn dict_excludes_constant(&self) -> Option<bool> {
+        self.dict_excludes
+    }
+
     fn available(&self) -> usize {
         let (mut available, mut page_idx) = if let Some(s) = &self.read_page {
             (s.remaining, self.page_idx + 1)
@@ -252,7 +273,12 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
     fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
         match page.data {
             DecompressedPageType::Dict { header, data } => {
-                self.dict = Some(D::new(data, header.num_values as usize, allocator));
+                let dict = D::new(data, header.num_values as usize, allocator);
+                if let Some(needle) = self.eq_const.as_ref() {
+                    let present = (0..dict.len()).any(|i| dict.entry(i) == *needle);
+                    self.dict_excludes = Some(!present);
+                }
+                self.dict = Some(dict);
             }
             DecompressedPageType::Data(data) => {
                 let idx = page.idx;
@@ -453,6 +479,52 @@ mod tests {
         dec.insert_page(page, &mut alloc);
 
         assert_eq!(dec.available(), 0);
+    }
+
+    // -- Dictionary pruning (pushed-down equality constant) --
+
+    /// No constant set → never reports a pruning decision.
+    #[test]
+    fn test_dict_excludes_none_without_constant() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
+
+        assert_eq!(dec.dict_excludes_constant(), None);
+    }
+
+    /// Constant set but dictionary not yet loaded → no decision.
+    #[test]
+    fn test_dict_excludes_none_before_dict_loaded() {
+        let mut dec = Dec::new(0);
+        dec.set_eq_constant(20);
+
+        assert_eq!(dec.dict_excludes_constant(), None);
+    }
+
+    /// Constant present in the dictionary → `Some(false)` (cannot prune).
+    #[test]
+    fn test_dict_excludes_false_when_present() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.set_eq_constant(20);
+        dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
+
+        assert_eq!(dec.dict_excludes_constant(), Some(false));
+    }
+
+    /// Constant absent from the dictionary → `Some(true)` (row group prunable).
+    #[test]
+    fn test_dict_excludes_true_when_absent() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.set_eq_constant(99);
+        dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
+
+        assert_eq!(dec.dict_excludes_constant(), Some(true));
     }
 
     // -- Page insertion order --

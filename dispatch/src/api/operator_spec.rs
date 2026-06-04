@@ -7,7 +7,7 @@ use crate::operations::parquet::DecoderFactory;
 use crate::operations::parquet::DecompressorFactory;
 use crate::operations::parquet::types::projection::Projection;
 use crate::operations::parquet::{CompressedPage, DecompressedPage, ParquetTable};
-use crate::operations::parquet::{IndexerFactory, RowGroupBuffer};
+use crate::operations::parquet::{IndexerFactory, RowGroupBuffer, ScanEqualityPredicate};
 use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
 use arrow_array::RecordBatch;
 use std::collections::VecDeque;
@@ -127,6 +127,7 @@ impl<OF: OperatorFactory<RowGroupBuffer>> OperatorSpec<RowGroupBuffer, OF> {
         projection: Projection,
         batch_size: usize,
         add_row_group_metadata: bool,
+        eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     ) -> OperatorSpec<RecordBatch, ReadParquet<OF>> {
         let worker_count = self.factories.len();
         let siblings_left_indexer = Arc::new(AtomicUsize::new(worker_count));
@@ -155,6 +156,7 @@ impl<OF: OperatorFactory<RowGroupBuffer>> OperatorSpec<RowGroupBuffer, OF> {
                         table: table.clone(),
                         projection: projection.clone(),
                         add_row_group_metadata,
+                        eq_predicates: eq_predicates.clone(),
                     },
                     drc,
                     siblings_left_drain.clone(),
