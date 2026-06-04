@@ -13,6 +13,7 @@ use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use std::fs::File;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Decoded min/max from a column chunk's footer statistics. Each side is
 /// stored as an arrow [`Scalar<ArrayRef>`] — the same shape the planner uses
@@ -91,6 +92,11 @@ pub struct QueryRowGroupMetadata {
     pub filtered_indices: Option<Vec<u32>>,
     /// Global row-group index (same as [`RowGroupMetadata::global_row_group_idx`]).
     pub row_group_index: usize,
+    /// Shared across every page of this row group: the decoder flips it once the
+    /// row group is pruned (e.g. a dictionary excludes a pushed-down equality
+    /// constant), letting the decompressor skip the remaining, not-yet-touched
+    /// pages instead of decompressing them only for the decoder to discard.
+    pruned: Arc<AtomicBool>,
 }
 
 impl QueryRowGroupMetadata {
@@ -99,7 +105,26 @@ impl QueryRowGroupMetadata {
             row_group_metadata: table.row_groups[index].clone(),
             filtered_indices,
             row_group_index: index,
+            pruned: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether this row group has been pruned (no row can match a pushed-down
+    /// predicate), so its remaining pages need not be decompressed or decoded.
+    pub fn is_pruned(&self) -> bool {
+        self.pruned.load(Ordering::Relaxed)
+    }
+
+    /// Mark this row group pruned. Visible (best-effort) to every page sharing
+    /// this metadata — in particular to the decompressor handling later pages.
+    pub fn mark_pruned(&self) {
+        self.pruned.store(true, Ordering::Relaxed);
+    }
+
+    /// A handle to the shared pruned flag, for a holder (the row-group decoder)
+    /// that needs to flip it later. Cloning is cheap — an `Arc` bump.
+    pub fn pruned_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pruned)
     }
 
     /// Get the corresponding RowGroupMetadata from the table
