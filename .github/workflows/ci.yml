@@ -12,126 +12,40 @@ env:
   RUSTDOCFLAGS: "-D warnings"
 
 jobs:
-  test:
-    name: Test (${{ matrix.crate.name }})
+  # Derive the check×crate matrix from ci.sh so the crate/check lists live in
+  # exactly one place (shared with local `./ci.sh` runs).
+  matrix:
+    name: Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      cells: ${{ steps.gen.outputs.cells }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: echo "cells=$(./ci.sh --matrix)" >> "$GITHUB_OUTPUT"
+
+  # One job per (check, crate) cell — each runs the same ./ci.sh used locally,
+  # but shows up separately in the UI (e.g. "clippy (planner)") so a failure
+  # points at the exact check and crate.
+  check:
+    needs: matrix
+    name: ${{ matrix.check }} (${{ matrix.crate }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        crate:
-          - name: dispatch
-            workdir: dispatch
-          - name: planner
-            workdir: planner
-          - name: duckdb-planner
-            workdir: duckdb-planner
-          - name: server
-            workdir: server
+        include: ${{ fromJSON(needs.matrix.outputs.cells) }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ matrix.crate.workdir }}
+          workspaces: ${{ matrix.crate }}
 
-      - name: Run tests
-        working-directory: ${{ matrix.crate.workdir }}
-        run: cargo test
-
-  clippy:
-    name: Clippy (${{ matrix.crate.name }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - name: dispatch
-            workdir: dispatch
-          - name: planner
-            workdir: planner
-          - name: duckdb-planner
-            workdir: duckdb-planner
-          - name: server
-            workdir: server
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ${{ matrix.crate.workdir }}
-
-      - name: Run clippy
-        working-directory: ${{ matrix.crate.workdir }}
-        run: cargo clippy --all-targets
-
-  fmt:
-    name: Format (${{ matrix.crate.name }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - name: dispatch
-            workdir: dispatch
-          - name: planner
-            workdir: planner
-          - name: duckdb-planner
-            workdir: duckdb-planner
-          - name: server
-            workdir: server
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        working-directory: ${{ matrix.crate.workdir }}
-        run: cargo fmt --check
-
-  doc:
-    name: Doc (${{ matrix.crate.name }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - name: dispatch
-            workdir: dispatch
-          - name: planner
-            workdir: planner
-          - name: duckdb-planner
-            workdir: duckdb-planner
-          - name: server
-            workdir: server
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: ${{ matrix.crate.workdir }}
-
-      - name: Check public documentation
-        working-directory: ${{ matrix.crate.workdir }}
-        run: cargo doc --no-deps
-
-      - name: Check internal documentation
-        working-directory: ${{ matrix.crate.workdir }}
-        run: cargo doc --document-private-items --no-deps
+      - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
