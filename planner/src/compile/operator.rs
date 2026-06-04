@@ -6,17 +6,20 @@
 use crate::catalog::Catalog;
 use crate::compile::create_table::CreateTableNullaryFactory;
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
+use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use crate::operator::{
     Aggregate, CreateTable, Filter, Input, OrderBy, OrderByDirection, Projection, TopN,
 };
+use crate::row_group_stats::row_group_eliminated;
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use dispatch::{
     DataFlowDispatcher, IntKeyExtractor, OrderBy as DispatchOrderBy,
-    Projection as DispatchProjection, RecordBatchOperatorSpec, StringKeyExtractor,
+    Projection as DispatchProjection, RecordBatchOperatorSpec, RowGroupFilter, RowGroupMetadata,
+    StringKeyExtractor,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -276,8 +279,42 @@ impl Input {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
-        Ok(self.table.compile(dispatcher, projection))
+        let row_group_filter = build_dynamic_filter_predicate(&self.dynamic_filters);
+        Ok(self
+            .table
+            .compile(dispatcher, projection, row_group_filter))
     }
+}
+
+/// Build a per-row-group predicate that prunes against the live values in each
+/// dynamic-filter slot. Returns `None` when there are no dynamic filters, so the
+/// scan keeps its zero-cost fast path.
+///
+/// The closure runs once per row group at steal time. For each filter it reads
+/// the current boundary from the shared slot; an empty slot (producer hasn't
+/// published yet) contributes no pruning. Otherwise the value is tested against
+/// the row group's min/max via [`row_group_eliminated`]; if any filter proves
+/// the group can't match, the predicate returns `false` and the scan skips it.
+fn build_dynamic_filter_predicate(filters: &[DynamicFilter]) -> Option<RowGroupFilter> {
+    if filters.is_empty() {
+        return None;
+    }
+    let entries: Vec<_> = filters
+        .iter()
+        .map(|df| (df.column_idx, df.compare_type, Arc::clone(&df.slot)))
+        .collect();
+    Some(Arc::new(move |row_group: &RowGroupMetadata| -> bool {
+        for (column_idx, compare_type, slot) in &entries {
+            let Some(constant) = slot.read().expect("dynamic filter slot poisoned").clone() else {
+                continue;
+            };
+            if let Ok(true) = row_group_eliminated(row_group, *column_idx, *compare_type, &constant)
+            {
+                return false;
+            }
+        }
+        true
+    }))
 }
 
 impl Filter {
@@ -349,7 +386,15 @@ impl TopN {
                 Ok(DispatchOrderBy::new(col, descending, false))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(input.order_by_limit_offset(orders, self.limit, self.offset))
+        // If DuckDB's Top-N optimizer marked this node as a dynamic-filter
+        // producer, forward the shared slot so the operator publishes its
+        // running boundary into it, tightening row-group pruning at sibling
+        // scans.
+        let dynamic_filter = self
+            .produces_dynamic_filter
+            .as_ref()
+            .map(|df| Arc::clone(&df.slot));
+        Ok(input.order_by_limit_offset(orders, self.limit, self.offset, dynamic_filter))
     }
 }
 

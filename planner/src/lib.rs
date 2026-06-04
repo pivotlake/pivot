@@ -28,7 +28,7 @@
 //! use std::path::Path;
 //! use std::sync::Arc;
 //!
-//! use dispatch::{DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec, table_input};
+//! use dispatch::{DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec, RowGroupFilter, table_input};
 //! use planner::Planner;
 //! use planner::catalog::{Catalog, Column, CreateTableRequest, Table};
 //! use planner::types::Type;
@@ -40,7 +40,7 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection) -> RecordBatchOperatorSpec {
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filter: Option<RowGroupFilter>) -> RecordBatchOperatorSpec {
 //!         table_input(dispatcher, &self.parquet, projection, false)
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
@@ -105,9 +105,11 @@
 
 pub mod catalog;
 pub mod compile;
+pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;
 pub mod plan;
+pub mod row_group_stats;
 pub mod types;
 use std::sync::Arc;
 

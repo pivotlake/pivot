@@ -46,7 +46,7 @@ impl TryFrom<duckdb_expression::Ref> for Ref {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum CompareType {
     Equal,
     NotEqual,

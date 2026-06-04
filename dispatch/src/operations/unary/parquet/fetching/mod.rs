@@ -21,4 +21,4 @@ mod fetcher;
 mod table_source;
 use crate::operations::DefaultUnaryFactory;
 use crate::operations::unary::parquet::fetching::fetcher::RowGroupFetcher;
-pub use table_source::RowGroupInjectorFactory;
+pub use table_source::{RowGroupFilter, RowGroupInjectorFactory};

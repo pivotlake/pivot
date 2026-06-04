@@ -80,12 +80,14 @@ pub use operations::nullary::Result as NullaryResult;
 pub use operations::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
+pub use operations::parquet::RowGroupFilter;
 pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::{Error as ParquetTableError, ParquetTable};
 pub use operations::{
-    AggKind, AggRowValueExtractor, AggSpec, CountValueExtractor, GroupAggKind, GroupAggSlot,
-    IntKeyExtractor, IntPairKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator,
-    OrderBy, Result as OperatorResult, StringKeyExtractor, ValueExtractor,
+    AggKind, AggRowValueExtractor, AggSpec, CountValueExtractor, DynamicFilterSlot, GroupAggKind,
+    GroupAggSlot, IntKeyExtractor, IntPairKeyExtractor, Nullary, NullaryFactory,
+    NullaryOperatorFactory, Operator, OrderBy, Result as OperatorResult, StringKeyExtractor,
+    ValueExtractor,
 };
 
 #[unsafe(export_name = "_rjem_malloc_conf")]

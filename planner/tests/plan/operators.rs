@@ -20,10 +20,11 @@ fn filter(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a <> b")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int32)
-      Filter(#0:Int32 <> #1:Int32 -> Boolean)
-        Input([#0:Int32, #1:Int32])
+      Projection(#0:Int32)
+        Filter(#0:Int32 <> #1:Int32 -> Boolean)
+          Input([#0:Int32, #1:Int32])
     ");
 }
 
@@ -33,8 +34,8 @@ fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    TopN(limit: 2, order: #0:Int32 DESC)
+    assert_snapshot!(plan.to_string(), @"
+    TopN(limit: 2, offset: 0, order: #0:Int32 DESC)
       Projection(#0:Int32)
         Input([#0:Int32])
     ");
@@ -140,10 +141,11 @@ fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    TopN(limit: 2, order: #0:Int32 DESC)
+    assert_snapshot!(plan.to_string(), @"
+    TopN(limit: 2, offset: 0, order: #0:Int32 DESC)
       Projection(#0:Int32)
-        Filter(#0:Int32 <> #1:Int32 -> Boolean)
-          Input([#0:Int32, #1:Int32])
+        Projection(#0:Int32)
+          Filter(#0:Int32 <> #1:Int32 -> Boolean)
+            Input([#0:Int32, #1:Int32])
     ");
 }

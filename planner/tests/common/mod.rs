@@ -12,7 +12,8 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use dispatch::{
-    DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec, table_input,
+    DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec,
+    RowGroupFilter, table_input_with_filter,
 };
 use planner::Planner;
 use planner::catalog::{Catalog, Column, Table};
@@ -74,8 +75,15 @@ impl Table for TestTable {
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
+        row_group_filter: Option<RowGroupFilter>,
     ) -> RecordBatchOperatorSpec {
-        table_input(dispatcher, &self.parquet_table, projection, false)
+        table_input_with_filter(
+            dispatcher,
+            &self.parquet_table,
+            projection,
+            false,
+            row_group_filter,
+        )
     }
 
     fn columns(&self) -> Vec<Column> {
