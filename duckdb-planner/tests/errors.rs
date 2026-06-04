@@ -84,7 +84,7 @@ fn exception_location() {
 #[test]
 fn unsupported_plan_returns_error() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT CAST(id AS BIGINT) FROM t");
+    let result = p.plan("SELECT CASE WHEN id > 0 THEN 1 ELSE 0 END FROM t");
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::UnsupportedPlan(message)) => {

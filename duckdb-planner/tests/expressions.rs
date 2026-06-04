@@ -84,10 +84,11 @@ fn compare_equal_two_columns(mut planner: PlannerContext) {
         .plan("SELECT id FROM users WHERE id = score")
         .unwrap()
         .to_string();
-    assert_snapshot!(plan, @r"
+    assert_snapshot!(plan, @"
     Projection(#0:INTEGER)
-      Filter(#0:INTEGER = #1:INTEGER -> BOOLEAN)
-        Input([#0:INTEGER, #2:INTEGER])
+      Projection(#0:INTEGER)
+        Filter(#0:INTEGER = #1:INTEGER -> BOOLEAN)
+          Input([#0:INTEGER, #2:INTEGER])
     ");
 }
 

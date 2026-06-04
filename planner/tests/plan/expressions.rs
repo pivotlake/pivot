@@ -24,8 +24,9 @@ fn compare_notequal_columns(mut testing_planner: TestingPlanner) {
         .unwrap();
     assert_snapshot!(plan.to_string(), @r"
     Projection(#0:Int32)
-      Filter(#0:Int32 <> #1:Int32 -> Boolean)
-        Input([#0:Int32, #1:Int32])
+      Projection(#0:Int32)
+        Filter(#0:Int32 <> #1:Int32 -> Boolean)
+          Input([#0:Int32, #1:Int32])
     ");
 }
 
@@ -38,8 +39,9 @@ fn compare_equal_columns(mut testing_planner: TestingPlanner) {
         .unwrap();
     assert_snapshot!(plan.to_string(), @r"
     Projection(#0:Int32)
-      Filter(#0:Int32 = #1:Int32 -> Boolean)
-        Input([#0:Int32, #1:Int32])
+      Projection(#0:Int32)
+        Filter(#0:Int32 = #1:Int32 -> Boolean)
+          Input([#0:Int32, #1:Int32])
     ");
 }
 

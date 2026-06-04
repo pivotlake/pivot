@@ -84,7 +84,7 @@ fn contains_then_group_by(mut testing_planner: TestingPlanner) {
     // alice (2 rows), charlie (1), dave (1) all contain "a"; bob does not.
     assert_eq!(rows.len(), 3);
     let alice = rows.iter().find(|r| r["key"] == "alice").unwrap();
-    assert_eq!(alice["value"], 2);
+    assert_eq!(alice["v0"], 2);
     assert!(rows.iter().all(|r| r["key"] != "bob"));
 }
 

@@ -380,7 +380,7 @@ fn group_by_int_column(mut testing_planner: TestingPlanner) {
     // Each value of a (1..=5) appears exactly once.
     assert_eq!(rows.len(), 5);
     for row in &rows {
-        assert_eq!(row["value"], 1);
+        assert_eq!(row["v0"], 1);
     }
 }
 
@@ -401,9 +401,9 @@ fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
     // alice appears twice, bob/charlie/dave each once.
     assert_eq!(rows.len(), 4);
     let alice = rows.iter().find(|r| r["key"] == "alice").unwrap();
-    assert_eq!(alice["value"], 2);
+    assert_eq!(alice["v0"], 2);
     let bob = rows.iter().find(|r| r["key"] == "bob").unwrap();
-    assert_eq!(bob["value"], 1);
+    assert_eq!(bob["v0"], 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +559,6 @@ fn create_table_passes_with_options_to_catalog() {
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
     let result = testing_planner
         .planner
-        .plan("SELECT SUM(b) FROM example_table");
+        .plan("SELECT MIN(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }
