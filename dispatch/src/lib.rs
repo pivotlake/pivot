@@ -83,6 +83,7 @@ pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
+pub use operations::parquet::RowGroupFilter;
 pub use operations::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
@@ -90,8 +91,9 @@ pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::{Error as ParquetTableError, ParquetTable};
 pub use operations::{
     AggKind, AggSpec, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled,
-    Count, IntKeyExtractor, IntPairKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory,
-    Operator, OrderBy, Result as OperatorResult, StringKeyExtractor, Sum, ValueExtractor,
+    Count, DynamicFilterSlot, IntKeyExtractor, IntPairKeyExtractor, Nullary, NullaryFactory,
+    NullaryOperatorFactory, Operator, OrderBy, Result as OperatorResult, StringKeyExtractor, Sum,
+    ValueExtractor,
 };
 
 #[unsafe(export_name = "_rjem_malloc_conf")]

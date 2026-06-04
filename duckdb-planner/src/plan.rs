@@ -48,16 +48,20 @@ impl PlanNode {
         Ok(())
     }
 
-    /// Walk the plan tree and turn each `RawInput` into a resolved
-    /// [`Input`](crate::operator::Input), moving the `Box<dyn DuckDBTable>`
-    /// at index `table_id` out of `tables`.
+    /// Walk the plan tree and upgrade each `RawInput` to a resolved
+    /// [`Input`](crate::operator::Input) by moving the `Box<dyn DuckDBTable>`
+    /// at index `table_id` out of `tables` (consumed exactly once).
     ///
     /// `Box<dyn DuckDBTable>` is not `Clone`, so each `table_id` must be
     /// referenced by at most one `RawInput`. The walker enforces this by
-    /// wrapping each table with Option, and swapping out the table when accessed.
+    /// wrapping each table with `Option` and taking it when accessed.
+    ///
+    /// Dynamic-filter references are left as-is here — they carry only a
+    /// `slot_id` and are bound to a shared slot later, at compile time.
     pub(crate) fn resolve_inputs(self, tables: Vec<Box<dyn DuckDBTable>>) -> Self {
-        let mut slots: Vec<Option<Box<dyn DuckDBTable>>> = tables.into_iter().map(Some).collect();
-        self.resolve_inputs_walker(&mut slots)
+        let mut table_slots: Vec<Option<Box<dyn DuckDBTable>>> =
+            tables.into_iter().map(Some).collect();
+        self.resolve_inputs_walker(&mut table_slots)
     }
 
     fn resolve_inputs_walker(mut self, tables: &mut [Option<Box<dyn DuckDBTable>>]) -> Self {
@@ -79,6 +83,7 @@ impl PlanNode {
                     .take()
                     .expect("table id already consumed by another Input"),
                 columns: raw.columns,
+                dynamic_filters: raw.dynamic_filters,
             }),
         }
     }

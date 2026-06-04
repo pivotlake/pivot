@@ -29,9 +29,21 @@ use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
-use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, DynamicFilterSlot, RecordBatchOperatorSpec};
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
+
+/// Per-`compile` registry of dynamic-filter slots, keyed by `slot_id`.
+///
+/// Each [`Plan::compile`] starts with an empty registry; the producer (`TopN`)
+/// and consumer (`Input`) for a given `slot_id` lazily get-or-create one shared
+/// [`DynamicFilterSlot`] from it, so they end up holding the same `Arc`. The
+/// registry is intentionally *not* part of the (cacheable) `Plan`: a fresh set
+/// of empty slots is minted on every compile, so a reused plan never carries a
+/// stale boundary — or a slice of a previous run's pooled scan buffers — across
+/// executions.
+pub(crate) type DynamicFilterSlots = HashMap<usize, Arc<DynamicFilterSlot>>;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -83,7 +95,8 @@ impl Plan {
         &self,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        self.root.compile(dispatcher, &self.catalog)
+        let mut slots = DynamicFilterSlots::new();
+        self.root.compile(dispatcher, &self.catalog, &mut slots)
     }
 }
 
@@ -92,20 +105,20 @@ impl PlanNode {
         &self,
         dispatcher: &DataFlowDispatcher,
         catalog: &Arc<dyn Catalog>,
+        slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let mut inputs = self
-            .inputs
-            .iter()
-            .map(|i| i.compile(dispatcher, catalog))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut inputs = Vec::with_capacity(self.inputs.len());
+        for input in &self.inputs {
+            inputs.push(input.compile(dispatcher, catalog, slots)?);
+        }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher),
+            crate::Operator::Input(o) => o.compile(dispatcher, slots),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
-            crate::Operator::TopN(o) => o.compile(inputs.remove(0)),
+            crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);

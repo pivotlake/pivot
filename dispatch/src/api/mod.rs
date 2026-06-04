@@ -88,5 +88,5 @@ pub use data_flow_handle::{CancelToken, DataFlowHandle};
 
 pub use record_batch_operator::{
     RECORD_BATCH_SIZE, RecordBatchFactoryBridge, RecordBatchOperatorFactory,
-    RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory, table_input,
+    RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory, table_input, table_input_with_filter,
 };

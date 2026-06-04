@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::expression::TableFilter;
 use crate::types::{Type, logical_from_type};
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, RowGroupFilter};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
 use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
@@ -60,10 +60,16 @@ pub struct CreateTableRequest {
 /// [`RecordBatchOperatorSpec`].
 pub trait Table: Debug + Send + Sync {
     /// Build a dispatch scan spec that reads this table.
+    ///
+    /// `row_group_filter`, when present, is consulted as each row group is
+    /// pulled and lets a Top-N (or other producer) above the scan prune row
+    /// groups against a live predicate. Tables that don't support pruning can
+    /// ignore it — always correct, just without the optimization.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
+        row_group_filter: Option<RowGroupFilter>,
     ) -> RecordBatchOperatorSpec;
 
     /// Return the table's schema.

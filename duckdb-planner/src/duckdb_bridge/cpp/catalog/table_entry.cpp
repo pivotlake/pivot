@@ -100,15 +100,15 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	TableFunction func(name, {}, nullptr, nullptr);
 	func.get_bind_info = PivotScanGetBindInfo;
 	func.pushdown_complex_filter = PivotScanPushdownComplexFilter;
-	// Intentionally disabled even though we implement pushdown_complex_filter.
-	//
-	// With filter_pushdown=false + pushdown_complex_filter set, DuckDB still
-	// routes every filter (simple or complex) through the complex hook, but
-	// skips its own post-callback pass that would otherwise extract
-	// `col op const` leftovers into get.table_filters. Filters the table
-	// rejects stay in the complex-filter vector and DuckDB turns them into a
-	// LogicalFilter above the LogicalGet on its own.
-	func.filter_pushdown = false;
+	// Enabling filter_pushdown lets DuckDB's optimizer passes install filters
+	// into get.table_filters — both `col op const` leftovers and the
+	// DynamicFilters produced by the Top-N pushdown pass. The Rust catalog
+	// doesn't consume TableFilters directly; `build_plan_node_json` in
+	// bridge.cpp splits each Get's table_filters back into a synthetic
+	// LogicalFilter (for the static predicates, keeping the Rust-facing shape
+	// identical to filter_pushdown=false) plus dynamic-filter slot references
+	// attached to the Input and its producing Top-N.
+	func.filter_pushdown = true;
 	func.projection_pushdown = true;
 	return func;
 }
