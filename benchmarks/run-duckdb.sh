@@ -127,7 +127,7 @@ echo
 # tz/ICU handling is ~3x slower.
 setup="CREATE VIEW hits AS
 SELECT *
-    REPLACE (make_date(EventDate) AS EventDate, epoch_ms(EventTime * 1000) AS EventTime)
+    REPLACE (make_date(EventDate) AS EventDate)
 FROM read_parquet('${parquet_glob}', binary_as_string=True);
 CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000);"
 
