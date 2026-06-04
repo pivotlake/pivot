@@ -167,20 +167,63 @@ where
     fn create_record_batch<S: TableStorage<Self>>(
         table: Table<Self, S>,
         _arena: &Arc<SharedArena>,
+        top_k: Option<(usize, usize)>,
     ) -> Result<RecordBatch, ArrowError> {
-        let len = table.len();
+        // When this group feeds an `ORDER BY <agg slot> DESC LIMIT k`, only the
+        // top-k rows of *this partition* can survive the global top-k (top-k is
+        // decomposable across partitions). Emitting just those instead of every
+        // group avoids materialising ~100M output rows that the downstream
+        // TopN would immediately discard.
+        let top_rows: Option<Vec<(u128, [i64; N])>> = match top_k {
+            Some((slot, limit)) if limit < table.len() => {
+                use std::cmp::Reverse;
+                use std::collections::BinaryHeap;
+                // Size-`limit` min-heap keyed by the sort slot; keeps the
+                // `limit` largest entries.
+                let mut heap: BinaryHeap<Reverse<(i64, u128, [i64; N])>> =
+                    BinaryHeap::with_capacity(limit + 1);
+                for entry in table.iter(0) {
+                    let row = entry.value().0;
+                    let k = row[slot];
+                    if heap.len() < limit {
+                        heap.push(Reverse((k, *entry.key(), row)));
+                    } else if k > heap.peek().unwrap().0.0 {
+                        heap.pop();
+                        heap.push(Reverse((k, *entry.key(), row)));
+                    }
+                }
+                Some(heap.into_iter().map(|Reverse((_, key, row))| (key, row)).collect())
+            }
+            _ => None,
+        };
+
+        let len = top_rows.as_ref().map_or_else(|| table.len(), |r| r.len());
         let mut a_b = PrimitiveBuilder::<A>::with_capacity(len);
         let mut b_b = PrimitiveBuilder::<B>::with_capacity(len);
         let mut val_bs: Vec<Int64Builder> =
             (0..N).map(|_| Int64Builder::with_capacity(len)).collect();
 
-        for entry in table.iter(0) {
-            let packed = *entry.key();
-            a_b.append_value(A::Native::from_u64((packed >> 64) as u64));
-            b_b.append_value(B::Native::from_u64(packed as u64));
-            let row = entry.value().0;
-            for (s, vb) in val_bs.iter_mut().enumerate() {
-                vb.append_value(row[s]);
+        macro_rules! emit {
+            ($packed:expr, $row:expr) => {{
+                let packed: u128 = $packed;
+                let row: [i64; N] = $row;
+                a_b.append_value(A::Native::from_u64((packed >> 64) as u64));
+                b_b.append_value(B::Native::from_u64(packed as u64));
+                for (s, vb) in val_bs.iter_mut().enumerate() {
+                    vb.append_value(row[s]);
+                }
+            }};
+        }
+        match &top_rows {
+            Some(rows) => {
+                for (packed, row) in rows {
+                    emit!(*packed, *row);
+                }
+            }
+            None => {
+                for entry in table.iter(0) {
+                    emit!(*entry.key(), entry.value().0);
+                }
             }
         }
 

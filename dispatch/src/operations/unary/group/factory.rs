@@ -31,6 +31,7 @@ pub struct GroupFactory<K: KeyExtractor> {
     shared_arena: Arc<SharedArena>,
     key_cols: Vec<usize>,
     value_slots: Vec<GroupAggSlot>,
+    top_k: Option<(usize, usize)>,
     hash_state: RandomState,
     injector: Arc<Injector<PartitionJob<K>>>,
     partition_jobs_injected: Arc<AtomicBool>,
@@ -46,6 +47,7 @@ impl<K: KeyExtractor> GroupFactory<K> {
     pub fn create_for_workers(
         key_cols: Vec<usize>,
         value_slots: Vec<GroupAggSlot>,
+        top_k: Option<(usize, usize)>,
         worker_count: usize,
         buffers: usize,
     ) -> impl IntoIterator<Item = GroupFactory<K>> {
@@ -60,6 +62,7 @@ impl<K: KeyExtractor> GroupFactory<K> {
             shared_arena: shared_arena.clone(),
             key_cols: key_cols.clone(),
             value_slots: value_slots.clone(),
+            top_k,
             hash_state: hash_state.clone(),
             injector: injector.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
@@ -79,6 +82,7 @@ impl<K: KeyExtractor> UnaryFactory<RecordBatch, RecordBatch> for GroupFactory<K>
             self.injector,
             self.key_cols,
             self.value_slots,
+            self.top_k,
             self.sender,
             self.receiver.take(),
             self.partition_jobs_injected,

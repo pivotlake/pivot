@@ -74,6 +74,7 @@ impl KeyExtractor for StringKeyExtractor {
     fn create_record_batch<S: TableStorage<Self>>(
         table: Table<Self, S>,
         arena: &Arc<SharedArena>,
+        _top_k: Option<(usize, usize)>,
     ) -> Result<RecordBatch, ArrowError> {
         let mut views: Vec<u128> = Vec::with_capacity(table.len());
         let mut val_b = UInt64Builder::with_capacity(table.len());

@@ -527,6 +527,7 @@ impl RecordBatchOperatorSpec {
         self.unary(GroupFactory::<K>::create_for_workers(
             vec![group_column],
             vec![],
+            None,
             worker_count,
             buffers,
         ))
@@ -539,12 +540,14 @@ impl RecordBatchOperatorSpec {
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<GroupAggSlot>,
+        top_k: Option<(usize, usize)>,
     ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K>::create_for_workers(
             key_cols,
             value_slots,
+            top_k,
             worker_count,
             buffers,
         ))

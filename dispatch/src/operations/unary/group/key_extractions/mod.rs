@@ -86,8 +86,13 @@ pub trait KeyExtractor: Send + 'static {
 
     /// Convert a completed hash table into an Arrow `RecordBatch` of key +
     /// value columns.
+    ///
+    /// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
+    /// `ORDER BY <value_slot> DESC LIMIT limit`; the extractor may then emit
+    /// only this partition's top-`limit` rows instead of every group.
     fn create_record_batch<S: TableStorage<Self>>(
         table: Table<Self, S>,
         arena: &Arc<SharedArena>,
+        top_k: Option<(usize, usize)>,
     ) -> Result<RecordBatch, ArrowError>;
 }

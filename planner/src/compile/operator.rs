@@ -229,16 +229,18 @@ impl Aggregate {
             return Err(Error::UnsupportedAggregateGroupAmount(key_cols.len()));
         }
 
+        let top_k = self.top_k;
+
         // Monomorphise over the two key types and the slot arity (N).
         macro_rules! by_arity {
             ($a:ty, $b:ty) => {{
                 match slots.len() {
-                    1 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 1>>(key_cols, slots)),
-                    2 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 2>>(key_cols, slots)),
-                    3 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 3>>(key_cols, slots)),
-                    4 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 4>>(key_cols, slots)),
-                    5 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 5>>(key_cols, slots)),
-                    6 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 6>>(key_cols, slots)),
+                    1 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 1>>(key_cols, slots, top_k)),
+                    2 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 2>>(key_cols, slots, top_k)),
+                    3 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 3>>(key_cols, slots, top_k)),
+                    4 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 4>>(key_cols, slots, top_k)),
+                    5 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 5>>(key_cols, slots, top_k)),
+                    6 => Ok(input.group_by_aggregate::<IntPairAggExtractor<$a, $b, 6>>(key_cols, slots, top_k)),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             }};

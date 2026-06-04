@@ -312,9 +312,9 @@ impl Worker {
 
     /// Deliver completed IO buffers back to the operators that requested them.
     fn process_io_completions(&mut self) -> Result<()> {
-        for request in self.io.completions()? {
+        for (buffer, request) in self.io.completions()? {
             let data_flow = self.data_flows.get_mut(&request.data_flow_id).unwrap();
-            data_flow.process_io(request.operator_idx, request.request);
+            data_flow.process_io(request.operator_idx, request.request, buffer);
         }
         Ok(())
     }

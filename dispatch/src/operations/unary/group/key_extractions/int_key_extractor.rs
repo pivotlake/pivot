@@ -89,6 +89,7 @@ where
     fn create_record_batch<S: TableStorage<Self>>(
         table: Table<Self, S>,
         _arena: &Arc<SharedArena>,
+        _top_k: Option<(usize, usize)>,
     ) -> Result<RecordBatch, ArrowError> {
         let mut key_b = PrimitiveBuilder::<T>::with_capacity(table.len());
         let mut val_b = UInt64Builder::with_capacity(table.len());

@@ -138,6 +138,7 @@ impl<K: KeyExtractor> Group<K> {
         injector: Arc<Injector<PartitionJob<K>>>,
         key_cols: Vec<usize>,
         value_slots: Vec<GroupAggSlot>,
+        top_k: Option<(usize, usize)>,
         sender: mpsc::Sender<Vec<MultiSlabTable<K>>>,
         receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K>>>>,
         partition_jobs_injected: Arc<AtomicBool>,
@@ -150,6 +151,7 @@ impl<K: KeyExtractor> Group<K> {
                 injector,
                 receiver,
                 partition_jobs_injected,
+                top_k,
             },
             sender,
             aggregated_table: AggregatedTable::new(state, shared_arena),
@@ -189,6 +191,7 @@ pub struct GroupOutputter<K: KeyExtractor> {
     injector: Arc<Injector<PartitionJob<K>>>,
     receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
+    top_k: Option<(usize, usize)>,
 }
 
 /// A single partition's merge work unit.
@@ -202,6 +205,7 @@ pub struct PartitionJob<K: KeyExtractor> {
     index: usize,
     arena: Arc<SharedArena>,
     partition_capacity: usize,
+    top_k: Option<(usize, usize)>,
 }
 
 unsafe impl<K: KeyExtractor> Send for PartitionJob<K> {}
@@ -222,7 +226,7 @@ impl<K: KeyExtractor> PartitionJob<K> {
         }
 
         debug!("Sending record batch {:?}", self.index);
-        sender.send(K::create_record_batch(result_map, &self.arena)?)?;
+        sender.send(K::create_record_batch(result_map, &self.arena, self.top_k)?)?;
         Ok(())
     }
 }
@@ -248,6 +252,7 @@ impl<K: KeyExtractor> Outputter<RecordBatch> for GroupOutputter<K> {
                     index: i,
                     arena: self.shared_arena.clone(),
                     partition_capacity,
+                    top_k: self.top_k,
                 })
             }
             self.partition_jobs_injected.store(true, Ordering::Relaxed);
@@ -309,6 +314,7 @@ mod tests {
                     injector.clone(),
                     vec![0],
                     vec![],
+                    None,
                     tx.clone(),
                     rx_opt.take(),
                     partition_jobs_injected.clone(),
