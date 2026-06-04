@@ -134,7 +134,6 @@ pub trait Unary<I, O> {
     fn process_disk_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _buffer: ReadBuffer,
         _request: IORequest,
     ) -> Result<()> {
         unreachable!()
@@ -207,12 +206,11 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
 
     fn process_disk_response(
         &mut self,
-        buffer: ReadBuffer,
         context: IORequest,
     ) -> super::Result<()> {
         Ok(self
             .unary
-            .process_disk_response(&mut self.sender, buffer, context)?)
+            .process_disk_response(&mut self.sender, context)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {
