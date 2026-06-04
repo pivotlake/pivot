@@ -108,18 +108,26 @@ flush_page_cache() {
 # pivot-bench prints "[i/N] Query q07 — 12ms" lines (integer ms).
 pivot_invoke() {
     local IFS=,
+    # Unless cache-dropping is disabled, have pivot-bench evict its file cache
+    # *and* the OS page cache before each query, so every query's iteration 1 is
+    # a true cold read within the one warm server session (no restart needed).
+    local cold_flag=""
+    [[ $drop_caches -eq 1 ]] && cold_flag="--drop-caches"
     ( cd "$here" && just pgo-use run --release -- \
         --source "$source_path" --query "$*" --iterations "$iterations" \
-        --sleep "$sleep_ms" $skip_flag ) 2>&1
+        --sleep "$sleep_ms" $skip_flag $cold_flag ) 2>&1
 }
 
 # Run DuckDB for one or more queries (comma-joined), raw output on stdout.
-# run-duckdb.sh prints "Run Time (s): real 0.008 ..." lines; we manage the
-# cache drop here, so tell it not to.
+# run-duckdb.sh prints "Run Time (s): real 0.008 ..." lines. Unless dropping is
+# disabled, let run-duckdb.sh flush the page cache before each query (it runs
+# each query's iterations in one process), matching pivot's per-query cold.
 duck_invoke() {
     local IFS=,
+    local duck_cache_flag="--no-drop-caches"
+    [[ $drop_caches -eq 1 ]] && duck_cache_flag=""
     "$here/run-duckdb.sh" --source "$source_path" --query "$*" \
-        --iterations "$iterations" --sleep "$sleep_ms" --no-drop-caches 2>&1
+        --iterations "$iterations" --sleep "$sleep_ms" $duck_cache_flag 2>&1
 }
 
 # Parse pivot output (any number of queries) into "id cold hot it1 it2 …"

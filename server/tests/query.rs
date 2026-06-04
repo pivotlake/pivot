@@ -109,6 +109,39 @@ async fn second_connection_sees_table_created_by_first(#[future] conn: Conn) {
     );
 }
 
+/// Decode a one-row, one-column integer result (e.g. `SELECT drop_cache()`).
+async fn select_one_i64(client: &Client, sql: &str) -> i64 {
+    let rows = select_rows(client, sql).await;
+    assert_eq!(rows.len(), 1, "expected exactly one row from `{sql}`");
+    rows[0][0]
+        .as_deref()
+        .expect("non-null scalar")
+        .parse()
+        .expect("integer scalar")
+}
+
+/// `SELECT drop_cache()` evicts pivot's file cache: after a scan populates it,
+/// the first drop reports ≥1 region freed and an immediate second drop reports
+/// 0 (nothing left to evict). Serialised against the shared server by the
+/// `conn` fixture, so no other query touches the cache in between.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_cache_evicts_file_cache(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_drop_cache", dir.path()).await;
+
+    // Scan the table so its parquet region lands in the file cache.
+    let rows = select_rows(&conn, "SELECT id, name FROM people_drop_cache").await;
+    assert_eq!(rows.len(), 3);
+
+    // First drop frees the cached region(s); an immediate second drop finds none.
+    let first = select_one_i64(&conn, "SELECT drop_cache()").await;
+    assert!(first >= 1, "expected ≥1 region evicted, got {first}");
+    let second = select_one_i64(&conn, "SELECT drop_cache()").await;
+    assert_eq!(second, 0, "second drop should find an empty cache");
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

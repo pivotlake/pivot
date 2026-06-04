@@ -532,6 +532,12 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 		new_operator["data"] = build_projection(&op->Cast<duckdb::LogicalProjection>());
 		break;
 	}
+	case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN: {
+		// The single-row source under a FROM-less SELECT (e.g.
+		// `SELECT drop_cache()`). No payload — pivot emits one empty row.
+		new_operator["data"] = json::object();
+		break;
+	}
 	case duckdb::LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op->Cast<duckdb::LogicalGet>();
 		auto split = split_table_filters(get, df_dedup);

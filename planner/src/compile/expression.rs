@@ -212,6 +212,15 @@ impl Function {
             Function::Contains(c) => c.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
+            // `drop_cache()` evicts pivot's file cache as a side effect, then
+            // returns the regions dropped. Evaluated over the single `DummyScan`
+            // row on a worker thread (where `memory_ctx` is valid), so the
+            // eviction happens exactly once; the returned array matches the
+            // (one-row) batch.
+            Function::DropCache => Ok(stateless_expr(|batch: &RecordBatch| {
+                let evicted = dispatch::memory_ctx().file_cache().clear() as i64;
+                ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
+            })),
         }
     }
 }

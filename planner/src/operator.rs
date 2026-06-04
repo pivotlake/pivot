@@ -378,6 +378,25 @@ impl fmt::Display for CreateTable {
     }
 }
 
+/// The single-row source under a `FROM`-less `SELECT` (see
+/// [`duckdb_operator::DummyScan`]).
+#[derive(Debug)]
+pub struct DummyScan;
+
+impl TryFrom<duckdb_operator::DummyScan> for DummyScan {
+    type Error = Error;
+
+    fn try_from(_: duckdb_operator::DummyScan) -> Result<Self, Self::Error> {
+        Ok(DummyScan)
+    }
+}
+
+impl fmt::Display for DummyScan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DummyScan")
+    }
+}
+
 /// An operator in the query plan.
 #[derive(Debug)]
 pub enum Operator {
@@ -388,6 +407,7 @@ pub enum Operator {
     Filter(Filter),
     TopN(TopN),
     CreateTable(CreateTable),
+    DummyScan(DummyScan),
 }
 
 impl TryFrom<duckdb_operator::Operator> for Operator {
@@ -402,6 +422,7 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
             duckdb_operator::Operator::Filter(f) => Operator::Filter(f.try_into()?),
             duckdb_operator::Operator::TopN(t) => Operator::TopN(t.try_into()?),
             duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
+            duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
             duckdb_operator::Operator::RawInput(_) => {
                 unreachable!("RawInput should be resolved to Input before reaching the planner")
             }
@@ -419,6 +440,7 @@ impl fmt::Display for Operator {
             Operator::Filter(fl) => write!(f, "{fl}"),
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
+            Operator::DummyScan(d) => write!(f, "{d}"),
         }
     }
 }

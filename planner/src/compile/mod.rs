@@ -21,6 +21,7 @@
 //!
 
 mod create_table;
+mod dummy_scan;
 mod expression;
 mod operator;
 
@@ -125,6 +126,7 @@ impl PlanNode {
                 }
                 o.compile(dispatcher, catalog)
             }
+            crate::Operator::DummyScan(o) => o.compile(dispatcher),
         }
     }
 }

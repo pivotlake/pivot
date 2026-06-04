@@ -5,11 +5,12 @@
 
 use crate::catalog::Catalog;
 use crate::compile::create_table::CreateTableNullaryFactory;
+use crate::compile::dummy_scan::DummyScanNullaryFactory;
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{CompareType, Expression};
 use crate::operator::{
-    Aggregate, CreateTable, Filter, Input, OrderBy, OrderByDirection, Projection, TopN,
+    Aggregate, CreateTable, DummyScan, Filter, Input, OrderBy, OrderByDirection, Projection, TopN,
 };
 use crate::row_group_stats::row_group_eliminated;
 use crate::types::Type;
@@ -504,6 +505,21 @@ impl CreateTable {
                     already_created.clone(),
                 )
             }),
+        ))
+    }
+}
+
+impl DummyScan {
+    pub(crate) fn compile(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        // One nullary per worker sharing a flag, so exactly one emits the single
+        // dummy row the parent projection runs over (mirrors `CreateTable`).
+        let emitted = Arc::new(AtomicBool::new(false));
+        Ok(RecordBatchOperatorSpec::from_nullary(
+            dispatcher,
+            (0..dispatcher.worker_count()).map(|_| DummyScanNullaryFactory::new(emitted.clone())),
         ))
     }
 }

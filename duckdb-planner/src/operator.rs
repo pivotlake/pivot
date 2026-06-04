@@ -116,6 +116,13 @@ pub struct CreateTable {
     pub constraint_count: usize,
 }
 
+/// The single-row source DuckDB places under a `FROM`-less `SELECT` (e.g.
+/// `SELECT drop_cache()` or `SELECT 1`). Carries no payload; compiles to a
+/// source that emits one empty row, over which the parent projection evaluates
+/// its expressions exactly once.
+#[derive(CustomDeserializer, Debug)]
+pub struct DummyScan {}
+
 /// A logical operator in the query plan. Discriminated by DuckDB's
 /// [`LogicalOperatorType`].
 #[derive(CustomDeserializer, Debug)]
@@ -139,6 +146,8 @@ pub enum Operator {
     TopN(TopN),
     #[type_tag(LogicalOperatorType::LOGICAL_CREATE_TABLE)]
     CreateTable(CreateTable),
+    #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
+    DummyScan(DummyScan),
 }
 
 impl Operator {
@@ -154,6 +163,7 @@ impl Operator {
             | Operator::OrderBy(_)
             | Operator::TopN(_)
             | Operator::CreateTable(_)
+            | Operator::DummyScan(_)
             | Operator::RawInput(_) => None,
         }
     }
@@ -245,6 +255,7 @@ impl fmt::Display for Operator {
                     options_str.join(", "),
                 )
             }
+            Operator::DummyScan(_) => write!(f, "DummyScan"),
         }
     }
 }

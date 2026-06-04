@@ -433,6 +433,33 @@ impl FileCache {
         }
         file_maps.insert(raw_fd, Default::default());
     }
+
+    /// Evict every cached region: unbind all `(fd, region) → slot` mappings,
+    /// reset each slot's metadata, and return the ring slots to the free pool —
+    /// so subsequent reads miss and re-read from disk. Registered file
+    /// descriptors stay open (their region maps are just emptied). Returns the
+    /// number of regions evicted.
+    ///
+    /// Intended for benchmarking true cold reads (`SELECT drop_cache()`). Sound
+    /// only while no query is in flight: it write-locks and recycles every bound
+    /// slot, which must not race a reader holding a pin.
+    pub fn clear(&self) -> usize {
+        let file_maps = self.file_maps.read().unwrap();
+        let mut evicted = 0;
+        for fd_regions in file_maps.values() {
+            for (_region, FileCacheEntry { ring_idx }) in fd_regions.write().unwrap().drain() {
+                let entry = unsafe { &mut *self.entries[ring_idx].get() };
+                entry.region = None;
+                entry.valid.clear();
+                entry.ref_bit.store(false, Ordering::Relaxed);
+                // Acquiring then dropping the write buffer returns the slot to
+                // the free pool (same recycle path as `open_file_entry`).
+                drop(memory_ctx().ring().try_write(ring_idx));
+                evicted += 1;
+            }
+        }
+        evicted
+    }
 }
 
 #[cfg(test)]
