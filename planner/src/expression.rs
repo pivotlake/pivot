@@ -287,6 +287,12 @@ pub enum Function {
     Contains(Contains),
     Divide(Divide),
     DateTrunc(DateTrunc),
+    /// `drop_cache()` — evict pivot's file cache, returning the regions dropped.
+    /// A side-effecting admin function; evaluated once over the [`DummyScan`]
+    /// row of a `FROM`-less `SELECT`. See its compile impl.
+    ///
+    /// [`DummyScan`]: crate::operator::DummyScan
+    DropCache,
 }
 
 impl TryFrom<duckdb_expression::Function> for Function {
@@ -296,6 +302,16 @@ impl TryFrom<duckdb_expression::Function> for Function {
             "contains" => Ok(Function::Contains(f.try_into()?)),
             "/" => Ok(Function::Divide(f.try_into()?)),
             "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),
+            "drop_cache" => {
+                if !f.params.is_empty() {
+                    return Err(Error::InvalidParameterCount {
+                        function: f.function,
+                        expected: 0,
+                        actual: f.params.len(),
+                    });
+                }
+                Ok(Function::DropCache)
+            }
             _ => Err(Error::UnsupportedScalarFunction(f.function)),
         }
     }
@@ -367,6 +383,7 @@ impl Display for Expression {
             Expression::Function(Function::DateTrunc(dt)) => {
                 write!(f, "date_trunc('{}', {})", dt.unit, dt.source)
             }
+            Expression::Function(Function::DropCache) => write!(f, "drop_cache()"),
         }
     }
 }

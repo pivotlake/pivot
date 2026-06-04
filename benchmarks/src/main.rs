@@ -107,6 +107,12 @@ struct Cli {
     #[arg(long, conflicts_with = "update_results")]
     skip_check: bool,
 
+    /// Before each query, evict pivot's file cache (`SELECT drop_cache()`) and
+    /// flush the OS page cache, so each query's first iteration is a true cold
+    /// read without restarting the warm server. Needs passwordless sudo (Linux).
+    #[arg(long)]
+    drop_caches: bool,
+
     /// Print the recorded results (current cold/hot per suite & query, plus
     /// per-query run count and last-saved timestamp) from the baseline and
     /// exit — does not boot the server or run anything.
@@ -188,6 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         update_results: cli.update_results,
         skip_check: cli.skip_check,
         query_filter,
+        drop_caches: cli.drop_caches,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

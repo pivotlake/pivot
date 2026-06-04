@@ -146,6 +146,25 @@ pub struct RunOptions {
     pub skip_check: bool,
     /// `None` → run every query in `suite.queries`.
     pub query_filter: Option<Vec<String>>,
+    /// Before each query, evict pivot's file cache (`SELECT drop_cache()`) and
+    /// flush the OS page cache, so each query's first iteration is a true cold
+    /// read — without restarting the warm server. Needs passwordless sudo.
+    pub drop_caches: bool,
+}
+
+/// Clear pivot's file cache *and* the OS page cache so the next query reads cold
+/// from disk, without tearing down the server. Best-effort on the page cache
+/// (needs root) — a failure warns and continues, like ClickBench's runner.
+async fn cold_clear(client: &Client) -> Result<()> {
+    client.simple_query("SELECT drop_cache()").await?;
+    let dropped = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null")
+        .status();
+    if !matches!(dropped, Ok(status) if status.success()) {
+        eprintln!("  warning: OS page-cache drop failed (need sudo/Linux); continuing");
+    }
+    Ok(())
 }
 
 fn read_to_string(path: &Path) -> Result<String> {
@@ -306,6 +325,9 @@ pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<Su
             && !filter.contains(&query.id)
         {
             continue;
+        }
+        if opts.drop_caches {
+            cold_clear(&client).await?;
         }
         let (run, last_output) = run_query(&client, query, opts).await?;
         if !opts.skip_check {
