@@ -11,8 +11,9 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 
@@ -151,6 +152,15 @@ fn encode_cell(encoder: &mut DataRowEncoder, arr: &dyn Array, row: usize) {
                 .unwrap()
                 .value(row),
         ),
+        // Decimal128 (e.g. the SUM aggregate output). `value_as_string`
+        // renders the integer/decimal with its scale applied — scale 0 yields
+        // a plain integer like "12345".
+        DataType::Decimal128(_, _) => encoder.encode_field(
+            &arr.as_any()
+                .downcast_ref::<Decimal128Array>()
+                .unwrap()
+                .value_as_string(row),
+        ),
         // Best-effort fallback: stringify and ship as text.
         _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
     };
@@ -170,6 +180,7 @@ fn pg_type_for_arrow(dt: &DataType) -> Type {
         DataType::UInt64 => Type::TEXT,
         DataType::Float32 => Type::FLOAT4,
         DataType::Float64 => Type::FLOAT8,
+        DataType::Decimal128(_, _) => Type::NUMERIC,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Type::TEXT,
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Type::BYTEA,
         _ => Type::TEXT,
@@ -336,6 +347,27 @@ mod tests {
         assert_eq!(decoded[0], vec![Some("1".to_string())]);
         assert_eq!(decoded[1], vec![None]);
         assert_eq!(decoded[2], vec![Some("3".to_string())]);
+    }
+
+    #[test]
+    fn encode_batch_encodes_decimal128_as_integer() {
+        let col: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![15_i128, 9_223_372_036_854_775_807_i128 * 3])
+                .with_precision_and_scale(38, 0)
+                .unwrap(),
+        );
+        let b = batch(vec![("sum", DataType::Decimal128(38, 0))], vec![col]);
+
+        let decoded = rows(&b);
+
+        assert_eq!(decoded[0], vec![Some("15".to_string())]);
+        assert_eq!(decoded[1], vec![Some("27670116110564327421".to_string())]);
+    }
+
+    #[test]
+    fn decimal128_maps_to_numeric() {
+        let fields = build_field_info(&schema(vec![("s", DataType::Decimal128(38, 0))]));
+        assert_eq!(fields[0].datatype(), &Type::NUMERIC);
     }
 
     #[test]

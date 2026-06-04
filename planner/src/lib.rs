@@ -161,8 +161,6 @@ impl Planner {
     pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
         let duckdb_plan = self.planner_context.plan(query)?;
         let mut root = PlanNode::try_from(duckdb_plan)?;
-        // Fold DuckDB's `sum/count` AVG lowering back into a single Avg op.
-        root.collapse_avg();
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
         Ok(Plan {
