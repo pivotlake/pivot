@@ -322,7 +322,9 @@ impl FileCache {
 
             // Register region → slot, unless another worker beat us to it.
             let file_maps = self.file_maps.read().unwrap();
-            let fd_regions = file_maps.get(location).expect("Missing file in file cache!");
+            let fd_regions = file_maps
+                .get(location)
+                .expect("Missing file in file cache!");
             let mut fd_regions = fd_regions.write().unwrap();
             if fd_regions.contains_key(&region) {
                 // Another worker already cached this region; retry the fast path

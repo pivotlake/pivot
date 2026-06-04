@@ -2,7 +2,7 @@
 //!
 //! The engine is **ring-less**: on Linux it submits its socket `connect`/`send`/
 //! `recv` SQEs onto the worker's *existing* file io_uring (the same one disk reads
-//! use) and is fed back the CQEs whose `user_data` carries the [`HTTP_TAG`] bit.
+//! use) and is fed back the CQEs whose `user_data` carries the `HTTP_TAG` bit.
 //! Sharing one ring per core is the standard io_uring pattern and means a single
 //! submit/wait point — no separate network ring to coordinate. rustls is sans-IO,
 //! so TLS is just shuttling ciphertext between the socket and rustls's buffers;
@@ -364,7 +364,10 @@ mod uring_engine {
                                 // pinned slot region; content_length <= req_len ==
                                 // block length (validated when parsing the head).
                                 let dst = unsafe {
-                                    std::slice::from_raw_parts_mut(dest.add(*body_written), remaining)
+                                    std::slice::from_raw_parts_mut(
+                                        dest.add(*body_written),
+                                        remaining,
+                                    )
                                 };
                                 match tls.reader().read(dst) {
                                     Ok(0) => break,
@@ -475,7 +478,12 @@ mod uring_engine {
 
         /// Begin a range read: bind it to a pooled or fresh connection and submit
         /// the first SQE onto `ring`.
-        pub fn start(&mut self, ring: &mut IoUring, id: Identifier, read: RemoteRead) -> Result<()> {
+        pub fn start(
+            &mut self,
+            ring: &mut IoUring,
+            id: Identifier,
+            read: RemoteRead,
+        ) -> Result<()> {
             let key = host_key(&read.remote);
             self.active += 1;
 

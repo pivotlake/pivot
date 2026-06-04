@@ -29,7 +29,7 @@ const RING_SIZE: u32 = 64;
 /// A single per-core io_uring serves **both** disk reads and HTTP(S) range reads
 /// (the standard io_uring pattern): file reads are one SQE→one CQE, while HTTP
 /// reads are driven by the ring-less [`HttpEngine`], which submits its socket SQEs
-/// onto this same ring. Completions are disambiguated by the [`HTTP_TAG`] bit in
+/// onto this same ring. Completions are disambiguated by the `HTTP_TAG` bit in
 /// `user_data`.
 ///
 /// Held one per worker.
@@ -75,11 +75,10 @@ impl IORequester {
     /// target. The block holds an `Arc` on the slot pin, so it stays alive for
     /// the read even if the issuing query is cancelled meanwhile.
     pub fn request(&mut self, request: DataFlowRequest) -> Result<()> {
-        let fd = request
-            .request
-            .location
-            .as_raw_fd()
-            .expect("IORequester::request only handles Local files; remote ones use request_http");
+        let fd =
+            request.request.location.as_raw_fd().expect(
+                "IORequester::request only handles Local files; remote ones use request_http",
+            );
         self.backend.submit_read(
             fd,
             request.request.block.file_offset() as u64,
@@ -215,7 +214,8 @@ mod tests {
             _server_name: &rustls::pki_types::ServerName<'_>,
             _ocsp: &[u8],
             _now: rustls::pki_types::UnixTime,
-        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+        {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         }
 
@@ -247,13 +247,14 @@ mod tests {
     }
 
     fn client_config() -> Arc<rustls::ClientConfig> {
-        let config =
-            rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
         Arc::new(config)
     }
 
@@ -262,18 +263,18 @@ mod tests {
     fn spawn_server(num_requests: usize) -> u16 {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = cert.cert.der().clone();
-        let key_der =
-            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server_config =
-            rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-                .with_safe_default_protocol_versions()
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(
-                    vec![cert_der],
-                    rustls::pki_types::PrivateKeyDer::Pkcs8(key_der),
-                )
-                .unwrap();
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert_der],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key_der),
+        )
+        .unwrap();
         let server_config = Arc::new(server_config);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

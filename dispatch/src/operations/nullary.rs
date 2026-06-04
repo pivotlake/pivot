@@ -39,7 +39,7 @@ pub trait Nullary<O> {
     }
 
     /// Return any pending HTTP requests (reads of remote regions). See
-    /// [`Operator::next_http_requests`](super::Operator::next_http_requests).
+    /// [`Operator::next_http_requests`].
     fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
         Ok(vec![])
     }

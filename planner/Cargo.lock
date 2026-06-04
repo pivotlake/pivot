@@ -623,6 +623,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "catalog"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrow-array 58.0.0",
+ "arrow-buffer 58.0.0",
+ "arrow-ord 58.0.0",
+ "arrow-schema 58.0.0",
+ "bytes",
+ "crossbeam-deque",
+ "dispatch",
+ "planner",
+ "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=1e20a92f7bcad208bf6869f5394101288850ee2e)",
+ "thiserror 2.0.18",
+ "thriftparquet",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -934,7 +952,6 @@ dependencies = [
  "memchr",
  "nix",
  "rustls",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=1e20a92f7bcad208bf6869f5394101288850ee2e)",
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "tracing",
@@ -1769,6 +1786,7 @@ dependencies = [
  "arrow-json 58.0.0",
  "arrow-ord 58.0.0",
  "arrow-schema 58.0.0",
+ "catalog",
  "core_affinity",
  "dispatch",
  "duckdb-planner",
@@ -2309,6 +2327,10 @@ dependencies = [
  "integer-encoding",
  "ordered-float",
 ]
+
+[[package]]
+name = "thriftparquet"
+version = "0.1.0"
 
 [[package]]
 name = "tikv-jemalloc-sys"
