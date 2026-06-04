@@ -99,20 +99,22 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
     }
 }
 
-/// A fixed-capacity primitive builder for query **output** columns.
+/// A fixed-capacity column of `T` backed by a single [`SlabBuffer`], materialised
+/// zero-copy into an Arrow [`Buffer`].
 ///
-/// Where [`PrimitiveBuilder`] is backed by a [`MultiSlabBuffer`] (so the parquet
-/// decoders can append run-by-run across slab boundaries), this is backed by a
-/// single [`SlabBuffer`]. Output columns are emitted one slab-sized chunk at a
-/// time, so a single slab always suffices — and indexing it is a lone pointer
-/// offset, with none of `MultiSlabBuffer`'s per-element `slabs[idx]` lookup. The
-/// result is non-null (GROUP BY keys and aggregates never produce nulls).
-pub struct OutputPrimitiveBuilder<T: ArrowPrimitiveType> {
-    values: SlabBuffer<T::Native>,
+/// Where [`PrimitiveBuilder`] uses a [`MultiSlabBuffer`] (so the parquet decoders
+/// can append run-by-run across slab boundaries), a query **output** column is
+/// emitted one slab-sized chunk at a time, so a single slab always suffices —
+/// indexing it is a lone pointer write at `ptr + len`, with none of
+/// `MultiSlabBuffer`'s per-element `slabs[idx]` lookup, and `len` stays in a
+/// register across the build loop. Handing the slab to Arrow keeps the column on
+/// our pre-faulted, huge-paged, accounted memory.
+pub struct SlabColumn<T: Copy> {
+    values: SlabBuffer<T>,
     len: usize,
 }
 
-impl<T: ArrowPrimitiveType> OutputPrimitiveBuilder<T> {
+impl<T: Copy> SlabColumn<T> {
     pub fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
         Self {
             values: allocator.create_slab_buffer(capacity, false),
@@ -120,22 +122,48 @@ impl<T: ArrowPrimitiveType> OutputPrimitiveBuilder<T> {
         }
     }
 
-    /// Appends `value`. The backing slab is single, so this is a pointer write
-    /// at `ptr + len` with no slab lookup; `len` stays in a register across the
-    /// build loop.
     #[inline(always)]
-    pub fn push(&mut self, value: T::Native) {
+    pub fn push(&mut self, value: T) {
         unsafe { self.values.ptr_at_index(self.len).write(value) };
         self.len += 1;
     }
 
-    /// Consumes the builder, producing a zero-copy Arrow array over the slab.
-    pub fn into_array(self) -> ArrayRef {
-        let byte_len = self.len * size_of::<T::Native>();
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Consumes the column, handing its slab to Arrow as a zero-copy [`Buffer`].
+    /// The caller wraps it in the appropriate typed buffer / array.
+    pub fn into_buffer(self) -> Buffer {
+        let byte_len = self.len * size_of::<T>();
         let slab = self.values.into_slab();
         let ptr = NonNull::new(slab.ptr).unwrap();
-        let buffer = unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) };
-        let values = ScalarBuffer::new(buffer, 0, self.len);
+        unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) }
+    }
+}
+
+/// A [`SlabColumn`]-backed builder for primitive query **output** columns. The
+/// result is non-null (GROUP BY keys and aggregates never produce nulls).
+pub struct OutputPrimitiveBuilder<T: ArrowPrimitiveType> {
+    col: SlabColumn<T::Native>,
+}
+
+impl<T: ArrowPrimitiveType> OutputPrimitiveBuilder<T> {
+    pub fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
+        Self {
+            col: SlabColumn::with_capacity(allocator, capacity),
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, value: T::Native) {
+        self.col.push(value);
+    }
+
+    /// Consumes the builder, producing a zero-copy Arrow array over the slab.
+    pub fn into_array(self) -> ArrayRef {
+        let len = self.col.len();
+        let values = ScalarBuffer::new(self.col.into_buffer(), 0, len);
         Arc::new(PrimitiveArray::<T>::new(values, None))
     }
 }

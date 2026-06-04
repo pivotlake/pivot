@@ -1,3 +1,4 @@
+use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::arena_key::ResolvedKey;
@@ -63,18 +64,18 @@ impl KeyExtractor for StringKeyExtractor {
 /// Emits the string key column as a zero-copy `StringViewArray` whose views
 /// point into the shared arena's ring buffers.
 pub struct StringKeyColumns {
-    views: Vec<u128>,
+    views: SlabColumn<u128>,
 }
 
 impl KeyColumns for StringKeyColumns {
     type Key = ArenaKey;
 
-    fn with_capacity(_allocator: &mut SlabAllocator, rows: usize) -> Self {
-        // String keys are emitted as a zero-copy StringViewArray over the shared
-        // arena (already engine memory); the views array is small, so it stays a
-        // plain Vec and the slab allocator is unused here.
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+        // The view headers (one `u128` per group) are built onto a slab, like the
+        // primitive output columns; the string bytes they point at already live
+        // on the shared arena's ring buffers.
         Self {
-            views: Vec::with_capacity(rows),
+            views: SlabColumn::with_capacity(allocator, rows),
         }
     }
 
@@ -84,11 +85,13 @@ impl KeyColumns for StringKeyColumns {
     }
 
     fn finish(self, arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+        let len = self.views.len();
+        let views = ScalarBuffer::<u128>::new(self.views.into_buffer(), 0, len);
         let buffers = arena.to_arrow_buffers();
         // Safety: views were built from valid ArenaKeys; SharedArena (via Arc in
         // each Buffer) keeps the ring memory alive as long as the array exists.
         let keys: ArrayRef = Arc::new(unsafe {
-            StringViewArray::new_unchecked(ScalarBuffer::from(self.views), buffers, None)
+            StringViewArray::new_unchecked(views, buffers, None)
         });
         let fields = vec![Field::new("key", DataType::Utf8View, false)];
         (fields, vec![keys])
