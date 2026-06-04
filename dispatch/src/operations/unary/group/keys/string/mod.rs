@@ -89,9 +89,8 @@ impl KeyColumns for StringKeyColumn {
         let buffers = arena.to_arrow_buffers();
         // Safety: views were built from valid ArenaKeys; SharedArena (via Arc in
         // each Buffer) keeps the ring memory alive as long as the array exists.
-        let keys: ArrayRef = Arc::new(unsafe {
-            StringViewArray::new_unchecked(views, buffers, None)
-        });
+        let keys: ArrayRef =
+            Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
         let fields = vec![Field::new("key", DataType::Utf8View, false)];
         (fields, vec![keys])
     }

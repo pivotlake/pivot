@@ -168,8 +168,12 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
     tables: Vec<&Table<K, V, S>>,
     target: &mut MultiSlabTable<K, V>,
 ) {
-    merge_within_partition_bounds::<K, V, S>(allocator, arena, partition, slot_count, &tables, target);
-    merge_past_partition_bounds::<K, V, S>(allocator, arena, partition, slot_count, &tables, target);
+    merge_within_partition_bounds::<K, V, S>(
+        allocator, arena, partition, slot_count, &tables, target,
+    );
+    merge_past_partition_bounds::<K, V, S>(
+        allocator, arena, partition, slot_count, &tables, target,
+    );
 }
 
 /// Merge all per-worker tables for a single partition into one result table.
@@ -223,7 +227,9 @@ mod tests {
     use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::hashtables::AggregatedTable;
     use crate::operations::unary::group::keys::IntKeyExtractor;
-    use crate::operations::unary::group::values::CountValueExtractor;
+    use crate::operations::unary::group::values::{
+        AggregationKind, AggregationSlot, Compiled, Count,
+    };
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
@@ -231,18 +237,23 @@ mod tests {
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = CountValueExtractor;
+    type CountValue = Compiled<(Count,)>;
 
     fn make_worker_tables(
         state: &RandomState,
         arena: &Arc<SharedArena>,
         values: &[i32],
     ) -> Vec<MultiSlabTable<IntExtractor, CountValue>> {
-        let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone());
+        let mut agg =
+            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone());
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        agg.consume_batch(&batch, &[0], &[]);
+        agg.consume_batch(
+            &batch,
+            &[0],
+            &[AggregationSlot::new(AggregationKind::CountStar, 0)],
+        );
         agg.flush()
     }
 
@@ -255,9 +266,10 @@ mod tests {
 
         let mut all_entries = vec![];
         for p in 0..PARTITIONS {
-            let result = merge_partition::<IntExtractor, CountValue>(p, tables, arena, partition_cap);
+            let result =
+                merge_partition::<IntExtractor, CountValue>(p, tables, arena, partition_cap);
             for entry in result.iter(0) {
-                all_entries.push((*entry.key(), entry.value().value));
+                all_entries.push((*entry.key(), entry.value().0[0] as usize));
             }
         }
         all_entries.sort_by_key(|(k, _)| *k);
@@ -352,7 +364,8 @@ mod tests {
         let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
         let mut total = 0;
         for p in 0..PARTITIONS {
-            let result = merge_partition::<IntExtractor, CountValue>(p, &tables, &arena, partition_cap);
+            let result =
+                merge_partition::<IntExtractor, CountValue>(p, &tables, &arena, partition_cap);
             total += result.iter(0).count();
         }
 

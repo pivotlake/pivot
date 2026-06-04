@@ -12,11 +12,13 @@ use crate::operations::unary::group::hashtables::Value;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 
-mod agg_row;
-mod count;
+mod aggregate;
+mod aggregation_row;
+mod compiled;
 
-pub use agg_row::AggRowValueExtractor;
-pub use count::CountValueExtractor;
+pub use aggregate::{Count, Sum};
+pub use aggregation_row::AggregationRowValueExtractor;
+pub use compiled::Compiled;
 
 /// Which per-group aggregate a value slot accumulates during the consume phase.
 ///
@@ -24,7 +26,7 @@ pub use count::CountValueExtractor;
 /// with a divide projection, so a grouped average arrives as a `Sum` slot plus a
 /// `Count` slot and the division happens in the downstream projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GroupAggKind {
+pub enum AggregationKind {
     /// `COUNT(*)` — +1 per row, ignores the column.
     CountStar,
     /// `COUNT(col)` — +1 per non-null row.
@@ -35,13 +37,13 @@ pub enum GroupAggKind {
 
 /// One aggregate output slot: which aggregate, over which input column.
 #[derive(Clone, Copy, Debug)]
-pub struct GroupAggSlot {
-    pub kind: GroupAggKind,
+pub struct AggregationSlot {
+    pub kind: AggregationKind,
     pub column: usize,
 }
 
-impl GroupAggSlot {
-    pub fn new(kind: GroupAggKind, column: usize) -> Self {
+impl AggregationSlot {
+    pub fn new(kind: AggregationKind, column: usize) -> Self {
         Self { kind, column }
     }
 }
@@ -56,7 +58,8 @@ pub trait ValueExtractor: Send + 'static {
     type Columns: ValueColumns<Value = Self::Value>;
 
     /// Build a reader over `batch` for the configured aggregate `value_slots`.
-    fn make_reader<'b>(batch: &'b RecordBatch, value_slots: &[GroupAggSlot]) -> Self::Reader<'b>;
+    fn make_reader<'b>(batch: &'b RecordBatch, value_slots: &[AggregationSlot])
+    -> Self::Reader<'b>;
 
     /// Build the per-row aggregate value at row `idx`.
     fn value(reader: &Self::Reader<'_>, idx: usize) -> Self::Value;

@@ -14,7 +14,9 @@ use std::mem;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_buffer::ArrowNativeType;
 
-use crate::memory::{MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer};
+use crate::memory::{
+    MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
+};
 use crate::operations::unary::parquet::decoding::column_decoders::{
     DecodePlain, Dict, TypedColumnDecoder,
 };

@@ -66,8 +66,8 @@
 //!   ([`IntKeyExtractor`], [`StringKeyExtractor`]), each co-located with its key
 //!   type (e.g. `keys::string` owns [`ArenaKey`])
 //! - [`values`] — the [`ValueExtractor`] trait and implementations, each
-//!   co-located with its value/aggregate type (`Count`, `AggRow`) plus
-//!   [`GroupAggKind`]/[`GroupAggSlot`]
+//!   co-located with its value/aggregate type (`Count`, `AggregationRow`) plus
+//!   [`AggregationKind`]/[`AggregationSlot`]
 //! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
 //!   and associated type machinery
 //! - [`merge`] — partition-parallel merge of per-worker tables
@@ -86,7 +86,8 @@ mod hashtables;
 
 pub use keys::{ArenaKey, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
 pub use values::{
-    AggRowValueExtractor, CountValueExtractor, GroupAggKind, GroupAggSlot, ValueExtractor,
+    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count, Sum,
+    ValueExtractor,
 };
 
 use crate::memory::SlabAllocator;
@@ -127,7 +128,7 @@ const PARTITIONS: usize = 64;
 /// `Group` transitions into a [`GroupOutputter`] for the merge phase.
 pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     key_cols: Vec<usize>,
-    value_slots: Vec<GroupAggSlot>,
+    value_slots: Vec<AggregationSlot>,
 
     aggregated_table: AggregatedTable<K, V>,
     sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
@@ -141,7 +142,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         state: RandomState,
         injector: Arc<Injector<PartitionJob<K, V>>>,
         key_cols: Vec<usize>,
-        value_slots: Vec<GroupAggSlot>,
+        value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
         sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
         receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
@@ -299,14 +300,13 @@ mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::keys::IntKeyExtractor;
-    use crate::operations::unary::group::values::CountValueExtractor;
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = CountValueExtractor;
+    type CountValue = Compiled<(Count,)>;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -331,7 +331,7 @@ mod tests {
                     state.clone(),
                     injector.clone(),
                     vec![0],
-                    vec![],
+                    vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                     None,
                     tx.clone(),
                     rx_opt.take(),

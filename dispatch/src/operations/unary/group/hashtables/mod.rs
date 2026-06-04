@@ -28,8 +28,7 @@ pub use aggregated_table::AggregatedTable;
 pub const DEFAULT_CAPACITY: usize = 128;
 
 /// The `Entry` stored in a table for a given key/value extractor pair.
-pub type ExtractorEntry<K, V> =
-    Entry<<K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value>;
+pub type ExtractorEntry<K, V> = Entry<<K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value>;
 
 /// Marker trait for any backing storage that can index a key/value `Entry` by
 /// `usize`.

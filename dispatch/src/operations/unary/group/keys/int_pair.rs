@@ -142,6 +142,9 @@ where
             Field::new("k0", A::DATA_TYPE, false),
             Field::new("k1", B::DATA_TYPE, false),
         ];
-        (fields, vec![self.a.into_array(None), self.b.into_array(None)])
+        (
+            fields,
+            vec![self.a.into_array(None), self.b.into_array(None)],
+        )
     }
 }

@@ -42,8 +42,8 @@
 
 mod group;
 pub use group::{
-    AggRowValueExtractor, CountValueExtractor, GroupAggKind, GroupAggSlot, GroupFactory,
-    IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor, ValueExtractor,
+    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count, GroupFactory,
+    IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor, Sum, ValueExtractor,
 };
 
 #[cfg(test)]
@@ -204,10 +204,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(self.unary.next_io_requests()?)
     }
 
-    fn process_disk_response(
-        &mut self,
-        context: IORequest,
-    ) -> super::Result<()> {
+    fn process_disk_response(&mut self, context: IORequest) -> super::Result<()> {
         Ok(self
             .unary
             .process_disk_response(&mut self.sender, context)?)

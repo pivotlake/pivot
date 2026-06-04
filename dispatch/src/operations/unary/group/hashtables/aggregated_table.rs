@@ -1,11 +1,11 @@
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::values::GroupAggSlot;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
     BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
 };
+use crate::operations::unary::group::values::AggregationSlot;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
@@ -119,7 +119,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         &mut self,
         batch: &RecordBatch,
         key_cols: &[usize],
-        value_slots: &[GroupAggSlot],
+        value_slots: &[AggregationSlot],
     ) {
         let key_reader = K::make_reader(batch, key_cols);
         let value_reader = V::make_reader(batch, value_slots);

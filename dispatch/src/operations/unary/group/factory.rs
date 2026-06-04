@@ -9,7 +9,7 @@
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{KeyExtractor, MultiSlabTable, ValueExtractor};
-use crate::operations::unary::group::{Group, GroupAggSlot, PartitionJob};
+use crate::operations::unary::group::{AggregationSlot, Group, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
@@ -30,7 +30,7 @@ use std::sync::{Arc, mpsc};
 pub struct GroupFactory<K: KeyExtractor, V: ValueExtractor> {
     shared_arena: Arc<SharedArena>,
     key_cols: Vec<usize>,
-    value_slots: Vec<GroupAggSlot>,
+    value_slots: Vec<AggregationSlot>,
     top_k: Option<(usize, usize)>,
     hash_state: RandomState,
     injector: Arc<Injector<PartitionJob<K, V>>>,
@@ -46,7 +46,7 @@ impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {
     /// indices; `value_slots` configure the per-group aggregates.
     pub fn create_for_workers(
         key_cols: Vec<usize>,
-        value_slots: Vec<GroupAggSlot>,
+        value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
         worker_count: usize,
         buffers: usize,
@@ -72,7 +72,9 @@ impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> UnaryFactory<RecordBatch, RecordBatch> for GroupFactory<K, V> {
+impl<K: KeyExtractor, V: ValueExtractor> UnaryFactory<RecordBatch, RecordBatch>
+    for GroupFactory<K, V>
+{
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>;
 
     fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>> {

@@ -62,10 +62,10 @@ use crate::operations::parquet::{
     RowGroupRequest,
 };
 use crate::operations::{
-    AggSpec, AggregateFactory, CopyOutFactory, CountFactory, CountValueExtractor, FilterFactory,
-    GroupAggSlot, GroupFactory, KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory,
-    OrderBy, OrderByLimitFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperator,
-    UnaryOperatorFactory, ValueExtractor,
+    AggSpec, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory, Count,
+    CountFactory, FilterFactory, GroupFactory, KeyExtractor, MapFactory, NullaryFactory,
+    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, RootUnaryOperatorFactory, UnaryFactory,
+    UnaryOperator, UnaryOperatorFactory, ValueExtractor,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -523,7 +523,12 @@ impl RecordBatchOperatorSpec {
     /// # ;
     /// ```
     pub fn group_by_count<K: KeyExtractor>(self, group_column: usize) -> Self {
-        self.group_by_aggregate::<K, CountValueExtractor>(vec![group_column], vec![], None)
+        // `COUNT(*)` is one aggregate slot whose column is unused.
+        self.group_by_aggregate::<K, Compiled<(Count,)>>(
+            vec![group_column],
+            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            None,
+        )
     }
 
     /// GROUP BY one or more key columns computing one or more aggregate value
@@ -532,7 +537,7 @@ impl RecordBatchOperatorSpec {
     pub fn group_by_aggregate<K: KeyExtractor, V: ValueExtractor>(
         self,
         key_cols: Vec<usize>,
-        value_slots: Vec<GroupAggSlot>,
+        value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
     ) -> Self {
         let worker_count = self.worker_count();

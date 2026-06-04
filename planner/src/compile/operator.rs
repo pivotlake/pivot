@@ -195,7 +195,10 @@ impl Aggregate {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-        use dispatch::{AggRowValueExtractor, GroupAggKind, GroupAggSlot, IntPairKeyExtractor};
+        use dispatch::{
+            AggregationRowValueExtractor, Compiled, Count, AggregationKind, AggregationSlot, IntPairKeyExtractor,
+            Sum,
+        };
 
         let key_refs: Vec<&crate::expression::Ref> = self
             .groups
@@ -208,18 +211,18 @@ impl Aggregate {
 
         let key_cols: Vec<usize> = key_refs.iter().map(|r| r.column_idx).collect();
 
-        let slots: Vec<GroupAggSlot> = self
+        let slots: Vec<AggregationSlot> = self
             .expressions
             .iter()
             .map(|e| match e {
                 Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {
-                    Ok(GroupAggSlot::new(GroupAggKind::CountStar, 0))
+                    Ok(AggregationSlot::new(AggregationKind::CountStar, 0))
                 }
                 Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
-                    Ok(GroupAggSlot::new(GroupAggKind::Sum, a.column.column_idx))
+                    Ok(AggregationSlot::new(AggregationKind::Sum, a.column.column_idx))
                 }
                 Expression::AggregateFunc(AggregateFunc::Count(a)) => {
-                    Ok(GroupAggSlot::new(GroupAggKind::Count, a.column.column_idx))
+                    Ok(AggregationSlot::new(AggregationKind::Count, a.column.column_idx))
                 }
                 expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
             })
@@ -229,20 +232,49 @@ impl Aggregate {
             return Err(Error::UnsupportedAggregateGroupAmount(key_cols.len()));
         }
 
+        // Per-slot signature (kind + the `SUM` column's type), used to pick a
+        // compiled, monomorphised value extractor when the signature matches one
+        // we've specialised; any other signature falls back to the generic enum
+        // extractor (`AggregationRowValueExtractor<N>`) below.
+        enum Sig {
+            Count,
+            Sum(Type),
+        }
+        let sig: Vec<Sig> = self
+            .expressions
+            .iter()
+            .map(|e| match e {
+                Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
+                    Sig::Sum(a.column.return_type.clone())
+                }
+                // CountStar / Count — validated above when building `slots`.
+                _ => Sig::Count,
+            })
+            .collect();
+
         let top_k = self.top_k;
 
         // Monomorphise over the two key types and the slot arity (N).
         macro_rules! by_arity {
             ($a:ty, $b:ty) => {{
                 type Key = IntPairKeyExtractor<$a, $b>;
-                match slots.len() {
-                    1 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<1>>(key_cols, slots, top_k)),
-                    2 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<2>>(key_cols, slots, top_k)),
-                    3 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<3>>(key_cols, slots, top_k)),
-                    4 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<4>>(key_cols, slots, top_k)),
-                    5 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<5>>(key_cols, slots, top_k)),
-                    6 => Ok(input.group_by_aggregate::<Key, AggRowValueExtractor<6>>(key_cols, slots, top_k)),
-                    n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                match sig.as_slice() {
+                    // COUNT(*), SUM(i16), SUM(i16), COUNT — compiled to straight-line
+                    // code with no per-row enum dispatch. (q32: count + sum + avg.)
+                    [Sig::Count, Sig::Sum(Type::Int16), Sig::Sum(Type::Int16), Sig::Count] => {
+                        type V = Compiled<(Count, Sum<Int16Type>, Sum<Int16Type>, Count)>;
+                        Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
+                    }
+                    // Fallback: the generic enum extractor, monomorphised by arity.
+                    _ => match slots.len() {
+                        1 => Ok(input.group_by_aggregate::<Key, AggregationRowValueExtractor<1>>(key_cols, slots, top_k)),
+                        2 => Ok(input.group_by_aggregate::<Key, AggregationRowValueExtractor<2>>(key_cols, slots, top_k)),
+                        3 => Ok(input.group_by_aggregate::<Key, AggregationRowValueExtractor<3>>(key_cols, slots, top_k)),
+                        4 => Ok(input.group_by_aggregate::<Key, AggregationRowValueExtractor<4>>(key_cols, slots, top_k)),
+                        5 => Ok(input.group_by_aggregate::<Key, AggregationRowValueExtractor<5>>(key_cols, slots, top_k)),
+                        6 => Ok(input.group_by_aggregate::<Key, AggregationRowValueExtractor<6>>(key_cols, slots, top_k)),
+                        n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                    },
                 }
             }};
         }
