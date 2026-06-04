@@ -23,6 +23,8 @@ use arrow_array::types::{
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 use std::cmp::min;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -111,7 +113,12 @@ pub struct RowGroupDecoder {
     /// Set once a `prunable_columns` entry's dictionary is found to exclude
     /// its constant: the row group cannot contain a matching row, so it emits
     /// nothing and is treated as exhausted.
-    pruned: bool,
+    /// The row group's shared pruned flag — the same `Arc` every page of this
+    /// row group carries. Set here when a prunable column's dictionary excludes
+    /// its constant; read by the decompressor so it can skip the row group's
+    /// remaining, not-yet-decompressed pages instead of decompressing them only
+    /// for this decoder to discard.
+    pruned: Arc<AtomicBool>,
 }
 
 impl RowGroupDecoder {
@@ -123,6 +130,7 @@ impl RowGroupDecoder {
         add_row_group_metadata: bool,
         eq_predicates: &[ScanEqualityPredicate],
     ) -> Result<Self> {
+        let pruned = row_group_metadata.pruned_flag();
         let columns = row_group_metadata.columns();
         let fields = schema.fields();
         let mut prunable_columns = Vec::new();
@@ -157,7 +165,7 @@ impl RowGroupDecoder {
             row_offset: 0,
             add_row_group_metadata,
             prunable_columns,
-            pruned: false,
+            pruned,
         })
     }
 
@@ -169,13 +177,13 @@ impl RowGroupDecoder {
     /// Returns `true` when the row group has been pruned (no row can match a
     /// pushed-down equality predicate) or all its rows have been emitted.
     pub fn exhausted(&self) -> bool {
-        self.pruned || self.total - self.row_offset == 0
+        self.pruned() || self.total - self.row_offset == 0
     }
 
     /// Returns `true` if this row group was pruned by dictionary pushdown and
     /// should be dropped without emitting any rows.
     pub fn pruned(&self) -> bool {
-        self.pruned
+        self.pruned.load(Ordering::Relaxed)
     }
 
     /// Routes a decompressed page to the appropriate column decoder, then
@@ -184,13 +192,16 @@ impl RowGroupDecoder {
     /// dropped before its data pages are decoded).
     pub fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
         self.column_decoders[page.column_idx].insert_page(page, allocator);
-        if !self.pruned
+        if !self.pruned()
             && self
                 .prunable_columns
                 .iter()
                 .any(|&pos| self.column_decoders[pos].dict_excludes_constant() == Some(true))
         {
-            self.pruned = true;
+            // Publish to the shared flag (seen by every page of this row group):
+            // the decoder discards the rest, and the decompressor can skip the
+            // row group's remaining, not-yet-decompressed pages.
+            self.pruned.store(true, Ordering::Relaxed);
         }
     }
 
@@ -200,7 +211,7 @@ impl RowGroupDecoder {
     /// rows, `Ok(None)` if more pages are needed, or an error if decoding
     /// fails.
     pub fn try_read(&mut self, allocator: &mut SlabAllocator) -> Result<Option<RecordBatch>> {
-        if self.pruned {
+        if self.pruned() {
             return Ok(None);
         }
         let size = min(self.batch_size, self.total - self.row_offset);
