@@ -214,9 +214,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
     }
 
     fn process_io_response(&mut self, context: IORequest) -> super::Result<()> {
-        Ok(self
-            .unary
-            .process_io_response(&mut self.sender, context)?)
+        Ok(self.unary.process_io_response(&mut self.sender, context)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {

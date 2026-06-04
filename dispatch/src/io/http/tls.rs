@@ -12,13 +12,12 @@ use std::sync::{Arc, OnceLock};
 /// Build a client config trusting the given roots, using the `ring` provider and
 /// safe default protocol versions.
 pub fn client_config_with_roots(roots: rustls::RootCertStore) -> Arc<ClientConfig> {
-    let config = ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("ring provider supports the default protocol versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
+    let config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("ring provider supports the default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
     Arc::new(config)
 }
 

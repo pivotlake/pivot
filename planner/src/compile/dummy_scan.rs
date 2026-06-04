@@ -7,7 +7,7 @@
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
-use dispatch::{IORequest, Nullary, NullaryFactory, NullaryResult, Sender, WorkStatus};
+use dispatch::{FsRequest, IORequest, Nullary, NullaryFactory, NullaryResult, Sender, WorkStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -61,11 +61,11 @@ impl Nullary<RecordBatch> for DummyScanDispatchOperator {
         Ok(WorkStatus::Ran)
     }
 
-    fn next_io_requests(&mut self) -> NullaryResult<Vec<IORequest>> {
+    fn next_fs_requests(&mut self) -> NullaryResult<Vec<FsRequest>> {
         Ok(vec![])
     }
 
-    fn process_disk_response<S: Sender<RecordBatch>>(
+    fn process_io_response<S: Sender<RecordBatch>>(
         &mut self,
         _sender: &mut S,
         _request: IORequest,

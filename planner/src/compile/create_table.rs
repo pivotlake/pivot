@@ -5,7 +5,7 @@
 //! catalog exactly once across all workers.
 
 use arrow_array::RecordBatch;
-use dispatch::{IORequest, Nullary, NullaryFactory, NullaryResult, Sender, WorkStatus};
+use dispatch::{Nullary, NullaryFactory, NullaryResult, Sender, WorkStatus};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -75,17 +75,8 @@ impl Nullary<RecordBatch> for CreateTableDispatchOperator {
         Ok(WorkStatus::Ran)
     }
 
-    fn next_io_requests(&mut self) -> NullaryResult<Vec<IORequest>> {
-        Ok(vec![])
-    }
-
-    fn process_disk_response<S: Sender<RecordBatch>>(
-        &mut self,
-        _sender: &mut S,
-        _request: IORequest,
-    ) -> NullaryResult<()> {
-        unreachable!("CreateTableDispatchOperator does not issue IO")
-    }
+    // No IO: `next_fs_requests` / `next_http_requests` / `process_io_response`
+    // use the `Nullary` trait defaults (none / unreachable).
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> NullaryResult<bool> {
         Ok(self.ran)

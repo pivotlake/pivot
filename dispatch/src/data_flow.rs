@@ -12,8 +12,9 @@
 //!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
 //!   means the stealing worker picks up data early in the dataflow, to not interrupt current
 //!   hot-in-cache processing
-//! - [`get_next_io_request`](DataFlow::get_next_io_request) — collect pending IO
-//!   requests from operators (e.g. parquet page reads).
+//! - [`get_next_fs_request`](DataFlow::get_next_fs_request) /
+//!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending IO
+//!   requests from operators (e.g. parquet page reads, or HTTP range reads).
 //! - [`process_io`](DataFlow::process_io) — deliver a completed IO buffer to the
 //!   operator that requested it.
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.

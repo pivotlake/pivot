@@ -24,9 +24,9 @@ mod tls;
 
 pub use tls::default_client_config;
 
-pub(crate) use backend::HttpEngine;
 #[cfg(target_os = "linux")]
 pub(crate) use backend::HTTP_TAG;
+pub(crate) use backend::HttpEngine;
 
 #[derive(Debug, Error)]
 pub enum Error {

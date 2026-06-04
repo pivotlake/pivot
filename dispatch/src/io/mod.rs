@@ -130,7 +130,9 @@ impl RemoteFile {
     pub fn open(url: Url) -> std::io::Result<Self> {
         let host = url
             .host_str()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "url has no host"))?
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "url has no host")
+            })?
             .to_string();
         let is_https = match url.scheme() {
             "https" => true,
@@ -142,14 +144,17 @@ impl RemoteFile {
                 ));
             }
         };
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "url has no port"))?;
+        let port = url.port_or_known_default().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "url has no port")
+        })?;
         let addr = (host.as_str(), port)
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "host resolved to no addresses")
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "host resolved to no addresses",
+                )
             })?;
 
         let mut request_target = url.path().to_string();

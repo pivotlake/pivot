@@ -94,9 +94,9 @@ pub trait Operator {
     /// [`process_io_response`](Self::process_io_response) — by the time it is
     /// called the bytes are already committed to the cache slot, identical to a
     /// disk read.
-        fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
-            Ok(vec![])
-        }
+    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
+        Ok(vec![])
+    }
 
     /// Handle a completed read (disk or HTTP); its bytes are already committed to
     /// the cache. Called by the worker when IO finishes.
