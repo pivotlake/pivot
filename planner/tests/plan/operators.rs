@@ -20,7 +20,7 @@ fn filter(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a <> b")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int32)
       Projection(#0:Int32)
         Filter(#0:Int32 <> #1:Int32 -> Boolean)

@@ -51,6 +51,7 @@
 
 pub mod catalog_provider;
 pub mod duckdb_bridge;
+pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;
 pub mod plan;

@@ -10,6 +10,7 @@
 //! [`crate::compile`].
 
 use crate::catalog::{CreateTableRequest, DuckDBTableAdapter, Table};
+use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{self, Expression};
 use crate::types::{self, type_from_logical};
 use duckdb_planner::operator as duckdb_operator;
@@ -32,6 +33,10 @@ pub enum Error {
 pub struct Input {
     pub table: Box<dyn Table>,
     pub columns: Vec<Expression>,
+    /// Runtime-populated predicates the scan reads from shared slots — installed
+    /// by a Top-N (or, in future, a hash join) elsewhere in the plan. Each
+    /// prunes row groups against the producer's live boundary value.
+    pub dynamic_filters: Vec<DynamicFilter>,
 }
 
 impl TryFrom<duckdb_operator::Input> for Input {
@@ -47,6 +52,11 @@ impl TryFrom<duckdb_operator::Input> for Input {
                 .columns
                 .into_iter()
                 .map(Expression::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            dynamic_filters: s
+                .dynamic_filters
+                .into_iter()
+                .map(DynamicFilter::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
         })
     }
@@ -262,6 +272,10 @@ pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,
     pub offset: usize,
+    /// When set, this Top-N is a dynamic-filter producer: at runtime it
+    /// publishes its current boundary value into the shared slot so consumer
+    /// scans elsewhere in the plan can prune row groups against it.
+    pub produces_dynamic_filter: Option<DynamicFilter>,
 }
 
 impl TryFrom<duckdb_operator::TopN> for TopN {
@@ -275,6 +289,10 @@ impl TryFrom<duckdb_operator::TopN> for TopN {
                 .collect::<Result<Vec<_>, _>>()?,
             limit: t.limit,
             offset: t.offset,
+            produces_dynamic_filter: t
+                .produces_dynamic_filter
+                .map(DynamicFilter::try_from)
+                .transpose()?,
         })
     }
 }

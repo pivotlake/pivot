@@ -58,14 +58,14 @@ use crate::operations::channels::{
 };
 use crate::operations::parquet::types::projection::Projection;
 use crate::operations::parquet::{
-    MaterializerFactory, ParquetTable, RowGroupFetcherFactory, RowGroupInjectorFactory,
-    RowGroupRequest,
+    MaterializerFactory, ParquetTable, RowGroupFetcherFactory, RowGroupFilter,
+    RowGroupInjectorFactory, RowGroupRequest,
 };
 use crate::operations::{
     AggSpec, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory, Count,
-    CountFactory, FilterFactory, GroupFactory, KeyExtractor, MapFactory, NullaryFactory,
-    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, RootUnaryOperatorFactory, UnaryFactory,
-    UnaryOperator, UnaryOperatorFactory, ValueExtractor,
+    CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
+    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, RootUnaryOperatorFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory, ValueExtractor,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -482,16 +482,19 @@ impl RecordBatchOperatorSpec {
     /// # ;
     /// ```
     pub fn order_by_limit(self, order_by: Vec<OrderBy>, limit: usize) -> Self {
-        self.order_by_limit_offset(order_by, limit, 0)
+        self.order_by_limit_offset(order_by, limit, 0, None)
     }
 
     /// Like [`order_by_limit`](Self::order_by_limit) but skips the first
-    /// `offset` rows of the globally sorted result (SQL `LIMIT … OFFSET`).
+    /// `offset` rows of the globally sorted result (SQL `LIMIT … OFFSET`), and
+    /// optionally publishes the running boundary into a shared
+    /// [`DynamicFilterSlot`] so sibling scans can prune row groups.
     pub fn order_by_limit_offset(
         self,
         order_by: Vec<OrderBy>,
         limit: usize,
         offset: usize,
+        dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> Self {
         let worker_count = self.worker_count();
         self.unary(OrderByLimitFactory::create_for_workers(
@@ -499,6 +502,7 @@ impl RecordBatchOperatorSpec {
             limit,
             offset,
             worker_count,
+            dynamic_filter,
         ))
     }
 
@@ -718,8 +722,21 @@ pub fn table_input(
     projection: Projection,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
+    table_input_with_filter(dispatcher, table, projection, add_row_group_metadata, None)
+}
+
+/// Like [`table_input`] but with an optional [`RowGroupFilter`] consulted as
+/// each row group is stolen, so a Top-N (or any producer) above the scan can
+/// prune row groups against a live predicate. See [`RowGroupFilter`].
+pub fn table_input_with_filter(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    projection: Projection,
+    add_row_group_metadata: bool,
+    filter: Option<RowGroupFilter>,
+) -> RecordBatchOperatorSpec {
     let worker_count = dispatcher.worker_count();
-    let injector = RowGroupInjectorFactory::new(table, projection.clone());
+    let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter);
     let siblings_left = Arc::new(AtomicUsize::new(worker_count));
     let factories: Vec<_> = (0..worker_count)
         .map(|_| {

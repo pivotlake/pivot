@@ -88,7 +88,7 @@ mod copy_out;
 mod order_by_limit;
 
 pub use copy_out::CopyOutFactory;
-pub use order_by_limit::{OrderBy, OrderByLimitFactory};
+pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
 #[derive(Debug, Error)]
 pub enum Error {
