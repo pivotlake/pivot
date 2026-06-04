@@ -10,15 +10,15 @@ use crate::parquet::types::requests::RowGroupBuffer;
 use crate::parquet::types::requests::RowGroupRequest;
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::io::IORequest;
+use dispatch::io::{FsRequest, IORequest};
 
 /// Reads column chunks for one row group at a time via async disk IO.
 ///
 /// Processes at most one [`RowGroupRequest`] concurrently:
 /// 1. `consume` — stores the request (which already contains pending IO
 ///    requests for cache-missed blocks).
-/// 2. `next_io_requests` — hands the pending reads to the IO scheduler.
-/// 3. `process_disk_response` — slots completed buffers into the right column.
+/// 2. `next_fs_requests` — hands the pending reads to the IO scheduler.
+/// 3. `process_io_response` — slots completed buffers into the right column.
 /// 4. Once all buffers arrive (`complete()`), the finished [`RowGroupBuffer`]
 ///    is sent downstream.
 #[derive(Default)]
@@ -57,7 +57,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         Ok(())
     }
 
-    fn next_io_requests(&mut self) -> dispatch::UnaryResult<Vec<IORequest>> {
+    fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
         if let Some(rg) = self.row_group_request.as_mut()
             && !rg.pending_io().is_empty()
         {
@@ -70,7 +70,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         self.row_group_request.is_none()
     }
 
-    fn process_disk_response<S: Sender<RowGroupBuffer>>(
+    fn process_io_response<S: Sender<RowGroupBuffer>>(
         &mut self,
         sender: &mut S,
         _request: IORequest,
