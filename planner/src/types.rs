@@ -36,8 +36,8 @@ pub enum Type {
     Int32,
     Int64,
     /// DuckDB `HUGEINT` — the result type of `SUM` over integers. Pivot's
-    /// executor emits `SUM` as `Int64`, so this only needs to round-trip
-    /// through plan translation (e.g. a projection referencing the SUM output).
+    /// executor emits `SUM` as a `Decimal128(38, 0)` column matching this
+    /// width, so large sums (e.g. `SUM(UserID)`) stay exact.
     Int128,
     /// DuckDB `DOUBLE` — the result type of `AVG`.
     Float64,

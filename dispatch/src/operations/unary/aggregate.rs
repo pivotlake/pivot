@@ -8,16 +8,19 @@
 //! output column per aggregate.
 //!
 //! The sum is accumulated in `i128` so a full ClickBench-scale scan of a
-//! 16/32/64-bit integer column never overflows. `Sum`/`Count` emit `Int64`
-//! cells; `Avg` emits a `Float64`. (DuckDB lowers `AVG(x)` to
-//! `sum(x) / count(x)` over two aggregates plus a divide projection, so the
-//! `Avg` kind here is only used for an undecomposed average.)
+//! 16/32/64-bit integer column never overflows. `Sum` emits that full `i128`
+//! as a `Decimal128(38, 0)` cell (matching DuckDB's `HUGEINT` result type) so
+//! large sums like `SUM(UserID)` are exact; `Count` emits `Int64` and `Avg` a
+//! `Float64`. (DuckDB lowers `AVG(x)` to `sum(x) / count(x)` over two
+//! aggregates plus a divide projection; that divide casts both operands to
+//! `f64`, so the full-precision `Decimal128` sum yields a correct average and
+//! the `Avg` kind here is only used for an undecomposed average.)
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::{self, Unary, UnaryFactory};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -134,9 +137,17 @@ fn sum_column(arr: &dyn Array) -> (i128, u64) {
 /// Build the single output column for one aggregate spec from its accumulator.
 fn result_column(kind: AggKind, acc: Acc) -> (Field, ArrayRef) {
     match kind {
+        // Emit the full i128 sum as Decimal128(38, 0) (scale 0 = a plain
+        // integer) so large sums survive without the i64 truncation that an
+        // Int64 output column would force. Precision 38 is the max Decimal128
+        // holds and comfortably covers any i128 a real scan produces.
         AggKind::Sum => (
-            Field::new("sum", DataType::Int64, false),
-            Arc::new(Int64Array::from(vec![acc.sum as i64])),
+            Field::new("sum", DataType::Decimal128(38, 0), false),
+            Arc::new(
+                Decimal128Array::from(vec![acc.sum])
+                    .with_precision_and_scale(38, 0)
+                    .unwrap(),
+            ),
         ),
         AggKind::Count | AggKind::CountStar => (
             Field::new("count", DataType::Int64, false),
@@ -166,7 +177,15 @@ impl Unary<RecordBatch, RecordBatch> for Aggregate {
             match spec.kind {
                 // COUNT(*) counts every row and never reads a column.
                 AggKind::CountStar => self.local[i].count += batch.num_rows() as u64,
-                _ => {
+                // COUNT(c) needs only the non-null count, not the values — read
+                // it straight off the null bitmap instead of summing the column.
+                // This keeps `AVG(c)` (lowered to `Sum(c)`/`Count(c)`) to a
+                // single value-summing pass instead of scanning twice.
+                AggKind::Count => {
+                    let col = batch.column(spec.column);
+                    self.local[i].count += (col.len() - col.null_count()) as u64;
+                }
+                AggKind::Sum | AggKind::Avg => {
                     let (sum, count) = sum_column(batch.column(spec.column));
                     self.local[i].sum += sum;
                     self.local[i].count += count;
@@ -232,6 +251,14 @@ mod tests {
     fn col_i64(batch: &RecordBatch, i: usize) -> i64 {
         batch.column(i).as_primitive::<Int64Type>().value(0)
     }
+    fn col_i128(batch: &RecordBatch, i: usize) -> i128 {
+        batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap()
+            .value(0)
+    }
     fn col_f64(batch: &RecordBatch, i: usize) -> f64 {
         batch
             .column(i)
@@ -247,7 +274,7 @@ mod tests {
         let results =
             run_unary_to_completion(op, vec![make_batch(&[1, 2, 3]), make_batch(&[4, 5])]);
         assert_eq!(results.len(), 1);
-        assert_eq!(col_i64(&results[0], 0), 15);
+        assert_eq!(col_i128(&results[0], 0), 15);
     }
 
     #[test]
@@ -263,7 +290,7 @@ mod tests {
         .unwrap();
         let results = run_unary_to_completion(op, vec![make_batch(&[2, 4, 6, 8])]);
         assert_eq!(results.len(), 1);
-        assert_eq!(col_i64(&results[0], 0), 20); // sum
+        assert_eq!(col_i128(&results[0], 0), 20); // sum
         assert_eq!(col_i64(&results[0], 1), 4); // count
     }
 
@@ -287,7 +314,7 @@ mod tests {
         assert!(sender.items.is_empty());
         ops[2].finish(&mut sender).unwrap();
         assert_eq!(sender.items.len(), 1);
-        assert_eq!(col_i64(&sender.items[0], 0), 36);
+        assert_eq!(col_i128(&sender.items[0], 0), 36);
     }
 
     #[test]
@@ -308,6 +335,25 @@ mod tests {
     }
 
     #[test]
+    fn large_i64_sum_is_exact() {
+        // Three i64::MAX values sum past i64::MAX; the Decimal128 output must
+        // keep the full i128 instead of truncating to i64.
+        let schema = Arc::new(Schema::new(vec![Field::new("u", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::Int64Array::from(vec![
+                i64::MAX,
+                i64::MAX,
+                i64::MAX,
+            ]))],
+        )
+        .unwrap();
+        let op = build(1, vec![AggSpec::new(AggKind::Sum, 0)]).pop().unwrap();
+        let results = run_unary_to_completion(op, vec![batch]);
+        assert_eq!(col_i128(&results[0], 0), 3 * i64::MAX as i128);
+    }
+
+    #[test]
     fn count_star_counts_all_rows() {
         let op = build(1, vec![AggSpec::new(AggKind::CountStar, 0)])
             .pop()
@@ -321,6 +367,6 @@ mod tests {
         let op = build(1, vec![AggSpec::new(AggKind::Sum, 0)]).pop().unwrap();
         let results = run_unary_to_completion(op, vec![]);
         assert_eq!(results.len(), 1);
-        assert_eq!(col_i64(&results[0], 0), 0);
+        assert_eq!(col_i128(&results[0], 0), 0);
     }
 }
