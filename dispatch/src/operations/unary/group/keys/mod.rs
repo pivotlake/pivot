@@ -3,7 +3,7 @@
 //! A [`KeyExtractor`] defines how to read group keys from an input batch,
 //! persist/compare them in the hash table, and emit the key columns of the
 //! result. The per-row aggregate *value* is the separate concern of a
-//! [`ValueExtractor`](super::value_extractions::ValueExtractor); the two are
+//! [`ValueExtractor`](super::values::ValueExtractor); the two are
 //! mixed freely (any key shape × any aggregate shape).
 //!
 //! ## Reader-based consume
@@ -17,7 +17,7 @@
 //!
 //! - **Live key** — a transient reference into the input batch (e.g. `&str`).
 //! - **Persisted key** — an owned, `Copy` value stored in the table (an
-//!   [`ArenaKey`](super::ArenaKey) for strings, an integer / packed integer for
+//!   [`ArenaKey`] for strings, an integer / packed integer for
 //!   numeric keys). Only created when the key is genuinely new.
 
 use crate::memory::SlabAllocator;

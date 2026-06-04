@@ -72,7 +72,7 @@ pub trait ValueExtractor: Send + 'static {
 /// Builds the trailing value column(s) of a GROUP BY result, one group at a time.
 ///
 /// The value-side analog of
-/// [`KeyColumns`](super::key_extractions::KeyColumns): the output combinator
+/// [`KeyColumns`](super::keys::KeyColumns): the output combinator
 /// pushes each surviving group's value, then `finish` materialises the Arrow
 /// columns and their fields.
 pub trait ValueColumns {

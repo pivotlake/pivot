@@ -47,6 +47,12 @@
 //! ```
 //!
 
+// Internal engine crate: a handful of public-facing items document their
+// behaviour by linking to the private traits they're built on (e.g. a
+// `KeyExtractor` impl links to the trait). That's intentional here — we're not
+// a published API — so allow public docs to reference private items.
+#![allow(rustdoc::private_intra_doc_links)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier};

@@ -116,7 +116,7 @@ fn filter_then_group_by_then_order_by() {
         .unwrap();
 
     let keys = collect_strings(&results, 0);
-    let counts = collect_u64s(&results, 1);
+    let counts = collect_i64s(&results, 1);
     assert_eq!(keys[0], "google.com");
     assert_eq!(counts, vec![4, 2, 2]);
 }

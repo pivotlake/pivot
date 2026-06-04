@@ -1,10 +1,13 @@
-//! Multi-slot `COUNT(*)`/`COUNT(col)`/`SUM(col)` value extraction.
+//! The runtime-dispatched value extractor — the fallback for aggregate
+//! signatures we haven't specialised. (See [`compiled`](super::compiled) for the
+//! monomorphised path; the planner sends a query here only when no compiled
+//! shape matches.)
 //!
-//! Each of the `N` output slots accumulates into an `i64` ([`AggregationRow<N>`]). The
-//! per-slot [`AggregationKind`] only matters here, during extraction: a count slot
-//! contributes `1`, a sum slot contributes the (widened) column value. `N` is
-//! monomorphised per query arity so each hash-table entry is exactly as wide as
-//! the query needs.
+//! Each of the `N` output slots accumulates into an `i64` ([`AggregationRow<N>`]),
+//! and a per-slot enum resolves the per-row contribution at runtime from the
+//! slot's [`AggregationKind`] / column type: a count slot contributes `1`, a sum
+//! slot the (widened) column value. `N` is monomorphised per query arity so each
+//! hash-table entry is exactly as wide as the query needs.
 
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
@@ -110,11 +113,7 @@ impl<const N: usize> ValueExtractor for AggregationRowValueExtractor<N> {
 
     #[inline(always)]
     fn value(reader: &AggregationRowReader<'_, N>, idx: usize) -> AggregationRow<N> {
-        let mut out = [0i64; N];
-        for s in 0..N {
-            out[s] = reader.slots[s].at(idx);
-        }
-        AggregationRow(out)
+        AggregationRow(std::array::from_fn(|s| reader.slots[s].at(idx)))
     }
 
     #[inline(always)]

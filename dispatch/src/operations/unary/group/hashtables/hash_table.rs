@@ -2,8 +2,8 @@
 //!
 //! See [`BaseHashTable`] for the full design rationale.
 
+use crate::memory::MultiSlabBuffer;
 use crate::memory::SlabAllocator;
-use crate::memory::{MultiSlabBuffer, SlabBuffer};
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -271,41 +271,9 @@ impl<K: PersistedKey, V: Value> BaseHashTable<K, V, MultiSlabBuffer<Entry<K, V>>
     }
 }
 
-impl<K: PersistedKey, V: Value> BaseHashTable<K, V, SlabBuffer<Entry<K, V>>> {
-    /// Creates a new HashTable backed by a single slab buffer.
-    ///
-    /// `expected_capacity` must be a power of 2 and is used directly as the
-    /// number of slots. The total byte size (`expected_capacity * size_of::<Entry>()`)
-    /// must fit within a single slab (`< BUFFER_SIZE`). The buffer is
-    /// zero-initialized so that all slots start empty (`hash == 0`).
-    pub fn single_slab(
-        allocator: &mut SlabAllocator,
-        expected_capacity: usize,
-        pre_shift: u32,
-    ) -> Self {
-        let buffer = allocator.create_slab_buffer(expected_capacity, true);
-
-        BaseHashTable {
-            mask: expected_capacity - 1,
-            length: 0,
-            max_load: max_load_for_len(expected_capacity),
-            buffer,
-            _phantom: PhantomData,
-            pre_shift,
-            shift: u64::BITS - expected_capacity.trailing_zeros(),
-            collisions: 0,
-        }
-    }
-}
-
 impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>>
     BaseHashTable<K, V, A>
 {
-    /// Bitmask for slot indexing (`capacity - 1`).
-    pub fn mask(&self) -> usize {
-        self.mask
-    }
-
     /// Total number of slots (occupied + empty). Always a power of 2.
     pub fn capacity(&self) -> usize {
         self.mask + 1
@@ -355,7 +323,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     }
 
     /// Prefetch the slot's cache line into L2 (`T1`) only. Issued *far* ahead of
-    /// the access and paired with a nearer [`prefetch`] (L1) call, this
+    /// the access and paired with a nearer [`prefetch`](Self::prefetch) (L1) call, this
     /// software-pipelines the memory hierarchy: the line is pulled DRAM→L2 far
     /// ahead, then L2→L1 just before use, hiding the full DRAM latency that a
     /// single L1 prefetch at a short distance can't cover on a multi-GB table.

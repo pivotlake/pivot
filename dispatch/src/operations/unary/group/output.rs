@@ -122,6 +122,37 @@ where
     Ok(())
 }
 
+/// Build `total` `(key, value)` pairs from `rows` into output `RecordBatch`es —
+/// one per [`OUTPUT_CHUNK_ROWS`]-row chunk, on `allocator`'s slab memory.
+fn emit_chunks<K, V, Snd, I>(
+    mut rows: I,
+    total: usize,
+    arena: &Arc<SharedArena>,
+    allocator: &mut SlabAllocator,
+    sender: &mut Snd,
+) -> Result<()>
+where
+    K: KeyExtractor,
+    V: ValueExtractor,
+    Snd: Sender<RecordBatch>,
+    I: Iterator<Item = (K::Persisted, V::Value)>,
+{
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(OUTPUT_CHUNK_ROWS);
+        let mut keys = K::Columns::with_capacity(allocator, chunk);
+        let mut values = V::Columns::with_capacity(allocator, chunk);
+        for _ in 0..chunk {
+            let (key, value) = rows.next().expect("iterator yields `total` items");
+            keys.push(&key);
+            values.push(&value);
+        }
+        emit::<K, V, Snd>(keys, values, arena, sender)?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
 /// Convert a completed partition table into output `RecordBatch`es (one per
 /// [`OUTPUT_CHUNK_ROWS`]-row chunk), built into `allocator`'s slab memory.
 ///
@@ -144,32 +175,13 @@ where
     match top_k {
         Some((slot, limit)) if limit < table.len() => {
             let rows = top_k_rows::<K, V, S>(&table, slot, limit);
-            for chunk in rows.chunks(OUTPUT_CHUNK_ROWS) {
-                let mut keys = K::Columns::with_capacity(allocator, chunk.len());
-                let mut values = V::Columns::with_capacity(allocator, chunk.len());
-                for (key, value) in chunk {
-                    keys.push(key);
-                    values.push(value);
-                }
-                emit::<K, V, Snd>(keys, values, arena, sender)?;
-            }
+            let total = rows.len();
+            emit_chunks::<K, V, Snd, _>(rows.into_iter(), total, arena, allocator, sender)
         }
         _ => {
-            let mut entries = table.iter(0);
-            let mut remaining = table.len();
-            while remaining > 0 {
-                let chunk = remaining.min(OUTPUT_CHUNK_ROWS);
-                let mut keys = K::Columns::with_capacity(allocator, chunk);
-                let mut values = V::Columns::with_capacity(allocator, chunk);
-                for _ in 0..chunk {
-                    let entry = entries.next().expect("iterator yields table.len() entries");
-                    keys.push(entry.key());
-                    values.push(entry.value());
-                }
-                emit::<K, V, Snd>(keys, values, arena, sender)?;
-                remaining -= chunk;
-            }
+            let total = table.len();
+            let rows = table.iter(0).map(|e| (*e.key(), *e.value()));
+            emit_chunks::<K, V, Snd, _>(rows, total, arena, allocator, sender)
         }
     }
-    Ok(())
 }

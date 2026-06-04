@@ -13,7 +13,7 @@
 //! 1. Hashes all keys in the group column (all workers share the same
 //!    [`RandomState`] so hashes are consistent).
 //! 2. Inserts each key/value into its local hash table via
-//!    [`AggregatedTable::merge_array`]. Duplicate keys within the same
+//!    [`AggregatedTable::consume_batch`]. Duplicate keys within the same
 //!    worker are merged immediately (e.g. counts are summed).
 //! 3. If the hash table exceeds its load threshold, a new, larger table is
 //!    created and subsequent rows go there. The old table is kept — its

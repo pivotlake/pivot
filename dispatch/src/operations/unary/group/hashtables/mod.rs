@@ -4,11 +4,11 @@
 //! [`KeyExtractor`] trait to produce concrete table types parameterized
 //! by key extraction strategy.
 //!
-//! - [`Table<K, S>`] — a `BaseHashTable` whose key/value types are derived
+//! - [`Table<K, V, S>`] — a `BaseHashTable` whose key/value types are derived
 //!   from `K: KeyExtractor`, generic over the storage backend `S`.
-//! - [`MultiSlabTable<K>`] — a concrete [`Table`] backed by a
+//! - [`MultiSlabTable<K, V>`] — a concrete [`Table`] backed by a
 //!   [`MultiSlabBuffer`] (supports tables larger than one slab).
-//! - [`AggregatedTable<K>`] — the per-worker accumulator used during the
+//! - [`AggregatedTable<K, V>`] — the per-worker accumulator used during the
 //!   consume phase.
 
 use std::ops::{Index, IndexMut};

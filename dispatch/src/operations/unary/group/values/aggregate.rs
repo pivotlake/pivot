@@ -23,7 +23,7 @@ use arrow_array::{PrimitiveArray, RecordBatch};
 ///
 /// The op's *type* fixes which aggregate it is, so it's only ever told its input
 /// `column` — never a kind. (Selecting which op to use from a query's
-/// [`GroupAggKind`](super::AggregationKind) happens earlier: at plan time for the
+/// [`AggregationKind`](super::AggregationKind) happens earlier: at plan time for the
 /// compiled path, in the runtime `match` for the fallback.)
 ///
 /// This describes only the per-row *input*; accumulating it across rows is
