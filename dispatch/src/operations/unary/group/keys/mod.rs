@@ -28,14 +28,14 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
 
-mod int_key_extractor;
-pub use int_key_extractor::IntKeyExtractor;
+mod int;
+pub use int::IntKeyExtractor;
 
-mod int_pair_extractor;
-pub use int_pair_extractor::IntPairKeyExtractor;
+mod int_pair;
+pub use int_pair::IntPairKeyExtractor;
 
-mod string_extractor;
-pub use string_extractor::StringKeyExtractor;
+mod string;
+pub use string::{ArenaKey, StringKeyExtractor};
 
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
@@ -53,9 +53,6 @@ pub trait KeyExtractor: Send + 'static {
 
     /// Build a reader over `batch` for the given key columns.
     fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b>;
-
-    /// Number of rows the reader spans.
-    fn rows(reader: &Self::Reader<'_>) -> usize;
 
     /// Hash the key at row `idx`.
     fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64;

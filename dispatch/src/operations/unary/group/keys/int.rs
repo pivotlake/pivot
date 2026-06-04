@@ -2,7 +2,7 @@ use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
-use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
@@ -42,7 +42,7 @@ where
     type LiveKey<'a, 'b> = T::Native;
     type PersistedLiveKey<'a> = T::Native;
     type Reader<'b> = &'b PrimitiveArray<T>;
-    type Columns = IntKeyColumns<T>;
+    type Columns = IntKeyColumn<T>;
 
     fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
         batch
@@ -50,11 +50,6 @@ where
             .as_any()
             .downcast_ref::<PrimitiveArray<T>>()
             .expect("int key column type mismatch")
-    }
-
-    #[inline(always)]
-    fn rows(reader: &Self::Reader<'_>) -> usize {
-        reader.len()
     }
 
     #[inline(always)]
@@ -77,9 +72,9 @@ where
 }
 
 /// Emits the single primitive key column.
-pub struct IntKeyColumns<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
+pub struct IntKeyColumn<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
 
-impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumns<T> {
+impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumn<T> {
     type Key = T::Native;
 
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {

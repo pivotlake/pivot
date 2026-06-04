@@ -21,8 +21,8 @@ use crate::memory::{BUFFER_SIZE, SlabAllocator};
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
-use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::value_extractions::{ValueColumns, ValueExtractor};
+use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::values::{ValueColumns, ValueExtractor};
 
 use super::Result;
 
@@ -63,8 +63,8 @@ impl<P, Val> Ord for TopK<P, Val> {
 ///
 /// Top-k is decomposable across partitions, so emitting only the local top-k
 /// (instead of every group) lets a downstream `ORDER BY … DESC LIMIT` discard
-/// nothing it would otherwise have to materialise — at ~100M groups that is the
-/// difference between emitting ~100M rows and emitting `limit` of them.
+/// nothing it would otherwise have to materialise — at very large group counts that is the
+/// difference between emitting every group and emitting `limit` of them.
 fn top_k_rows<K, V, S>(
     table: &Table<K, V, S>,
     slot: usize,

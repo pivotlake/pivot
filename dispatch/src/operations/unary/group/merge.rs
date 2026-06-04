@@ -39,7 +39,7 @@ use super::PARTITIONS;
 /// the load factor. A threshold of 1.5 triggers resize at ~75% load. The
 /// merged result table is built once then scanned sequentially for output, so
 /// a higher load (more probing on insert) is a good trade for less memory to
-/// allocate and zero — significant at ~100M groups. 2.0 corresponds to ~80%
+/// allocate and zero — significant at very large group counts. 2.0 corresponds to ~80%
 /// load, so a partition sized for ~78% occupancy doesn't resize (which would
 /// otherwise double it back to the over-provisioned size).
 const RESIZE_COLLISION_RATIO: f64 = 2.0;
@@ -222,8 +222,8 @@ mod tests {
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::hashtables::AggregatedTable;
-    use crate::operations::unary::group::key_extractions::IntKeyExtractor;
-    use crate::operations::unary::group::value_extractions::CountValueExtractor;
+    use crate::operations::unary::group::keys::IntKeyExtractor;
+    use crate::operations::unary::group::values::CountValueExtractor;
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};

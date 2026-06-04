@@ -482,23 +482,23 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     /// (occupied by a different key) it advances `slots[i]` to the next slot and
     /// returns `false`, so the caller re-queues the row for the following pass.
     #[inline(always)]
-    fn resolve_row<S: BatchRowSource<K, V>>(
+    fn probe_row_for_slot<S: BatchRowSource<K, V>>(
         &mut self,
         i: usize,
         slot: usize,
         hash: u64,
         slots: &mut [usize],
-        src: &mut S,
+        rows: &mut S,
     ) -> bool {
         let stored = self.buffer[slot].hash;
         if stored == 0 {
-            let key = src.persisted(i);
-            let value = src.value(i);
+            let key = rows.persisted(i);
+            let value = rows.value(i);
             self.buffer[slot] = Entry { hash, key, value };
             self.length += 1;
             true
-        } else if stored == hash && src.key_eq(i, &self.buffer[slot].key) {
-            let value = src.value(i);
+        } else if stored == hash && rows.key_eq(i, &self.buffer[slot].key) {
+            let value = rows.value(i);
             self.buffer[slot].value = self.buffer[slot].value.merge(value);
             true
         } else {
@@ -508,35 +508,41 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         }
     }
 
-    /// Batched, multi-pass probe insert — the structure DuckDB uses in
-    /// `FindOrCreateGroupsInternal`.
+    /// Insert/merge a whole batch of rows with a batched, multi-pass linear probe.
     ///
-    /// The scalar [`merge`](Self::merge) resolves one row completely before the
-    /// next, so a row's linear-probe chain is a dependency chain the CPU must
-    /// walk one cache-missing slot at a time — terrible memory-level parallelism.
-    /// Here every still-unresolved row is advanced by exactly **one** slot per
-    /// pass, so within a pass the rows touch independent slots and the hardware
-    /// keeps many misses in flight; collisions are deferred to the next pass over
-    /// the (shrinking) unresolved set.
+    /// The scalar [`merge`](Self::merge) walks one row's probe chain to the end
+    /// before starting the next, so each cache-missing slot is a serial
+    /// dependency. Instead, this advances every unresolved row by just **one**
+    /// slot per pass, so the many probes in a pass hit independent slots and the
+    /// CPU keeps their misses in flight.
     ///
-    /// Correctness mirrors `merge` exactly (see [`resolve_row`](Self::resolve_row)).
-    /// Because the slot is re-read each pass, two rows in the same batch with the
-    /// same key (same hash → same slot) resolve correctly: the first claims the
-    /// slot, the rest fall into the equal-key merge branch.
+    /// Steps:
+    /// 1. **Pass 1** — for each row, compute its home slot and try to resolve it
+    ///    there via [`probe_row_for_slot`](Self::probe_row_for_slot): claim an
+    ///    empty slot (insert), or merge into a slot holding the same key. A row
+    ///    that collides (slot held by a *different* key) has its probe advanced
+    ///    one slot and its index pushed onto the `unresolved` worklist.
+    /// 2. **Passes 2+** — re-probe only the `unresolved` rows at their advanced
+    ///    slots; any that still collide spill into `unresolved_scratch`. Swap the
+    ///    two worklists and repeat over the shrinking set until none remain.
     ///
-    /// `slots`, `sel`, `next` are caller scratch of length ≥ `length`; `hashes`
-    /// holds the row hashes (0 is remapped to 1 in place to preserve the empty
-    /// sentinel). The caller MUST ensure `capacity - len > length` so every probe
-    /// finds an empty slot and the passes terminate.
+    /// Re-reading the slot each pass keeps duplicate keys within the batch
+    /// correct: the first row claims the slot, the rest take the equal-key merge.
+    ///
+    /// `slots`, `unresolved`, `unresolved_scratch` are caller scratch of length
+    /// ≥ `length`; `hashes` holds the row hashes (0 is remapped to 1 in place to
+    /// keep the empty-slot sentinel). The caller MUST ensure `capacity - len >
+    /// length`, so every probe eventually finds an empty slot and the passes
+    /// terminate.
     #[inline]
     pub fn merge_batch<S: BatchRowSource<K, V>>(
         &mut self,
         length: usize,
         hashes: &mut [u64],
         slots: &mut [usize],
-        sel: &mut [u32],
-        next: &mut [u32],
-        src: &mut S,
+        unresolved: &mut [u32],
+        unresolved_scratch: &mut [u32],
+        rows: &mut S,
     ) {
         /// How far ahead, in row positions, to prefetch each slot.
         const PREFETCH_DIST: usize = 16;
@@ -544,9 +550,9 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         // Pass 1: probe every row at its home slot, computing the slot inline.
         // Rows that resolve here (insert or merge) never touch the scratch
         // arrays; only collided rows are recorded — advanced slot in `slots[i]`,
-        // index in `next` — for the follow-up passes. Folding the slot
-        // computation in here avoids materialising `slots`/`sel` for *every* row,
-        // which is pure overhead in the common low-collision / merge-heavy case.
+        // index onto `unresolved` — for the follow-up passes. Folding the slot
+        // computation in here avoids materialising a slot for *every* row, which
+        // is pure overhead in the common low-collision / merge-heavy case.
         let mut collided = 0usize;
         for i in 0..length {
             if i + PREFETCH_DIST < length {
@@ -555,16 +561,16 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             let hash = remap_zero(hashes[i]);
             hashes[i] = hash;
             let slot = self.slot_for(hash);
-            if !self.resolve_row(i, slot, hash, slots, src) {
-                next[collided] = i as u32;
+            if !self.probe_row_for_slot(i, slot, hash, slots, rows) {
+                unresolved[collided] = i as u32;
                 collided += 1;
             }
         }
 
         // Passes 2+: walk only the still-unresolved rows, ping-ponging the
-        // worklist between `next` and `sel`. Each pass advances every row by one
-        // slot, keeping their probes independent so misses stay in flight.
-        let (mut work, mut spill) = (next, sel);
+        // worklist between the two scratch buffers. Each pass advances every row
+        // by one slot, keeping their probes independent so misses stay in flight.
+        let (mut work, mut spill) = (unresolved, unresolved_scratch);
         let mut remaining = collided;
         while remaining > 0 {
             let mut collided = 0usize;
@@ -573,7 +579,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
                     self.prefetch_entry(slots[work[k + PREFETCH_DIST] as usize]);
                 }
                 let i = work[k] as usize;
-                if !self.resolve_row(i, slots[i], hashes[i], slots, src) {
+                if !self.probe_row_for_slot(i, slots[i], hashes[i], slots, rows) {
                     spill[collided] = i as u32;
                     collided += 1;
                 }

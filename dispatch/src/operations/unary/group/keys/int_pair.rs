@@ -1,16 +1,16 @@
 //! Two-integer-key GROUP BY.
 //!
-//! Keys: a pair of integer columns (e.g. `WatchID`, `ClientIP`) packed into a
-//! single `u128` (first key's bits in the high 64, second's in the low 64),
+//! Keys: a pair of integer columns packed into a single `u128` (first key's
+//! bits in the high 64, second's in the low 64),
 //! which is `Copy`/`Hash`/`Eq` and needs no arena. The aggregate value is the
 //! separate concern of a
-//! [`ValueExtractor`](crate::operations::unary::group::value_extractions::ValueExtractor)
-//! (typically [`AggRowValueExtractor`](crate::operations::unary::group::value_extractions::AggRowValueExtractor)).
+//! [`ValueExtractor`](crate::operations::unary::group::values::ValueExtractor)
+//! (typically [`AggRowValueExtractor`](crate::operations::unary::group::values::AggRowValueExtractor)).
 
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
@@ -85,11 +85,6 @@ where
         let a = batch.column(key_cols[0]).as_primitive::<A>();
         let b = batch.column(key_cols[1]).as_primitive::<B>();
         PairReader { a, b }
-    }
-
-    #[inline(always)]
-    fn rows(reader: &Self::Reader<'_>) -> usize {
-        reader.a.len()
     }
 
     #[inline(always)]

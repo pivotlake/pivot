@@ -1,9 +1,13 @@
+mod arena_key;
+mod live_key;
+
+pub use arena_key::ArenaKey;
+pub use live_key::{ResolvedKey, StringKey};
+
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::arena_key::ResolvedKey;
-use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::{ArenaKey, StringKey};
+use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
 use arrow_buffer::ScalarBuffer;
@@ -23,7 +27,7 @@ impl KeyExtractor for StringKeyExtractor {
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;
     type PersistedLiveKey<'a> = ResolvedKey<'a>;
     type Reader<'b> = &'b StringViewArray;
-    type Columns = StringKeyColumns;
+    type Columns = StringKeyColumn;
 
     fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
         batch
@@ -31,11 +35,6 @@ impl KeyExtractor for StringKeyExtractor {
             .as_any()
             .downcast_ref::<StringViewArray>()
             .expect("string key column type mismatch")
-    }
-
-    #[inline(always)]
-    fn rows(reader: &Self::Reader<'_>) -> usize {
-        reader.len()
     }
 
     #[inline(always)]
@@ -63,11 +62,11 @@ impl KeyExtractor for StringKeyExtractor {
 
 /// Emits the string key column as a zero-copy `StringViewArray` whose views
 /// point into the shared arena's ring buffers.
-pub struct StringKeyColumns {
+pub struct StringKeyColumn {
     views: SlabColumn<u128>,
 }
 
-impl KeyColumns for StringKeyColumns {
+impl KeyColumns for StringKeyColumn {
     type Key = ArenaKey;
 
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {

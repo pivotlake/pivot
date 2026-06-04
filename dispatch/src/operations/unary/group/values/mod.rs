@@ -1,14 +1,13 @@
 //! Value extraction strategies for GROUP BY aggregation.
 //!
 //! A [`ValueExtractor`] is the value-side counterpart to a
-//! [`KeyExtractor`](super::key_extractions::KeyExtractor): it reads the per-row
-//! aggregate value(s) from an input batch and emits the trailing value columns
-//! of the result. Splitting it from the key extractor lets any key shape pair
-//! with any aggregate shape (e.g. `COUNT(*)` or a multi-slot `SUM`) without an
+//! [`KeyExtractor`](super::keys::KeyExtractor): it reads the per-row aggregate
+//! value(s) from an input batch and emits the trailing value columns of the
+//! result. Splitting it from the key extractor lets any key shape pair with any
+//! aggregate shape (e.g. `COUNT(*)` or a multi-slot `SUM`) without an
 //! `O(keys × values)` explosion of monolithic extractors.
 
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::aggregations::GroupAggSlot;
 use crate::operations::unary::group::hashtables::Value;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
@@ -18,6 +17,34 @@ mod count;
 
 pub use agg_row::AggRowValueExtractor;
 pub use count::CountValueExtractor;
+
+/// Which per-group aggregate a value slot accumulates during the consume phase.
+///
+/// `Avg` is not represented here: `AVG(c)` is lowered to `sum(c)` + `count(c)`
+/// with a divide projection, so a grouped average arrives as a `Sum` slot plus a
+/// `Count` slot and the division happens in the downstream projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupAggKind {
+    /// `COUNT(*)` — +1 per row, ignores the column.
+    CountStar,
+    /// `COUNT(col)` — +1 per non-null row.
+    Count,
+    /// `SUM(col)` — += the (widened) column value.
+    Sum,
+}
+
+/// One aggregate output slot: which aggregate, over which input column.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupAggSlot {
+    pub kind: GroupAggKind,
+    pub column: usize,
+}
+
+impl GroupAggSlot {
+    pub fn new(kind: GroupAggKind, column: usize) -> Self {
+        Self { kind, column }
+    }
+}
 
 /// Reads the per-row aggregate value for a GROUP BY and emits the value columns.
 pub trait ValueExtractor: Send + 'static {

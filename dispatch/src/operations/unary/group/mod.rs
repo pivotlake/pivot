@@ -62,30 +62,32 @@
 //!
 //! ## Module layout
 //!
-//! - [`key_extractions`] — the [`KeyExtractor`] trait and implementations
-//!   ([`IntKeyExtractor`], [`StringKeyExtractor`])
+//! - [`keys`] — the [`KeyExtractor`] trait and implementations
+//!   ([`IntKeyExtractor`], [`StringKeyExtractor`]), each co-located with its key
+//!   type (e.g. `keys::string` owns [`ArenaKey`])
+//! - [`values`] — the [`ValueExtractor`] trait and implementations, each
+//!   co-located with its value/aggregate type (`Count`, `AggRow`) plus
+//!   [`GroupAggKind`]/[`GroupAggSlot`]
 //! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
 //!   and associated type machinery
 //! - [`merge`] — partition-parallel merge of per-worker tables
-//! - [`arena`] / [`arena_key`] — shared string storage and the [`ArenaKey`] type
+//! - [`arena`] — shared string storage backing string keys
 //! - [`factory`] — [`GroupFactory`] for creating per-worker [`Group`] instances
-//! - [`aggregations`] — value types (currently [`Count`](aggregations::Count))
 
-mod aggregations;
 pub(crate) mod arena;
-mod arena_key;
 mod factory;
-mod key_extractions;
+mod keys;
 mod merge;
 mod output;
-mod value_extractions;
+mod values;
 
-pub use aggregations::{GroupAggKind, GroupAggSlot};
 pub use factory::GroupFactory;
 mod hashtables;
 
-pub use key_extractions::{IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
-pub use value_extractions::{AggRowValueExtractor, CountValueExtractor, ValueExtractor};
+pub use keys::{ArenaKey, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
+pub use values::{
+    AggRowValueExtractor, CountValueExtractor, GroupAggKind, GroupAggSlot, ValueExtractor,
+};
 
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
@@ -101,7 +103,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use thiserror::Error;
 use tracing::{debug, info};
-pub use unary::group::arena_key::{ArenaKey, StringKey};
 use unary::pipeline_breaker::{Consumer, Outputter};
 
 #[derive(Debug, Error)]
@@ -252,7 +253,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
             // lengths), not capacity — capacity over-counts by the table-stack's
             // ~2x geometric slack. A tighter estimate keeps each partition's
             // result table near a high load factor instead of 2.5x
-            // over-provisioned, which at ~100M groups is gigabytes less memory
+            // over-provisioned, which at very large group counts is gigabytes less memory
             // to allocate and zero every query.
             let total_entries: usize = tables.iter().map(|m| m.len()).sum::<usize>();
             let partition_capacity = (total_entries / PARTITIONS).next_power_of_two();
@@ -297,8 +298,8 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::group::key_extractions::IntKeyExtractor;
-    use crate::operations::unary::group::value_extractions::CountValueExtractor;
+    use crate::operations::unary::group::keys::IntKeyExtractor;
+    use crate::operations::unary::group::values::CountValueExtractor;
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};

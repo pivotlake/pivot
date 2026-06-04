@@ -1,6 +1,6 @@
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::aggregations::GroupAggSlot;
+use crate::operations::unary::group::values::GroupAggSlot;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
@@ -101,7 +101,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         // slack that must be allocated and zeroed every query: their cumulative
         // capacity is `final * r/(r-1)`, so 4x growth wastes ~1.33x the final
         // size vs doubling's 2x. Fewer, lower-loaded tables also mean fewer
-        // sources for the merge to scan. At ~100M groups this is gigabytes less
+        // sources for the merge to scan. At very large group counts this is gigabytes less
         // memory to zero each query.
         let new_size = self.tables.last().unwrap().capacity() * 4;
         self.tables
@@ -110,6 +110,10 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
 
     /// Merge all rows of `batch` into the current table stack, reading the key
     /// columns through `K` and the per-row aggregate values through `V`.
+    ///
+    /// Hashes the whole batch up front, then dispatches to either the batched
+    /// multi-pass probe ([`consume_batched`](Self::consume_batched)) or the
+    /// scalar per-row fallback ([`consume_scalar`](Self::consume_scalared)).
     #[inline(always)]
     pub fn consume_batch(
         &mut self,
@@ -117,11 +121,9 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         key_cols: &[usize],
         value_slots: &[GroupAggSlot],
     ) {
-        const L1_DISTANCE: usize = 16;
-        const L2_DISTANCE: usize = 48;
         let key_reader = K::make_reader(batch, key_cols);
         let value_reader = V::make_reader(batch, value_slots);
-        let length = K::rows(&key_reader);
+        let length = batch.num_rows();
 
         let mut i = 0;
         while i < length {
@@ -129,43 +131,66 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             i += 1;
         }
 
-        // Batched multi-pass probe when the active table has room for the whole
-        // batch without overflowing (so every probe is guaranteed an empty slot
-        // and we never need to switch tables mid-batch). This resolves all rows
-        // with high memory-level parallelism instead of one stalling probe chain
-        // at a time. The large final table — where ~all of the ~100M inserts land
-        // — always takes this path; only the small early tables fall back to the
-        // scalar loop below.
+        // The active table can take the whole batch iff no probe can overflow it
+        // mid-batch — only then is the batched path safe (every probe is
+        // guaranteed an empty slot). The large final table, where ~all of the
+        // inserts land, always meets this; only the small early tables fall
+        // back to the scalar loop.
         let free = {
             let t = self.tables.last().unwrap();
             t.capacity() - t.len()
         };
         if free > length {
-            // Move `value_reader` into `src`. The scalar fallback below only runs
-            // on the `else` path, so it never observes the move.
-            let mut src = RowSrc::<K, V> {
-                key_reader: &key_reader,
-                value_reader,
-                arena: &mut self.worker_arena,
-            };
-            self.tables.last_mut().unwrap().merge_batch(
-                length,
-                &mut self.hashes[..],
-                &mut self.slots[..],
-                &mut self.sel[..],
-                &mut self.sel_next[..],
-                &mut src,
-            );
-            if self.tables.last().unwrap().undersized() {
-                self.create_new_table();
-            }
-            return;
+            self.consume_batched(length, &key_reader, value_reader);
+        } else {
+            self.consume_scalared(length, &key_reader, &value_reader);
         }
+    }
 
-        // Scalar fallback: two-level software prefetch (DRAM→L2 far, then L2→L1
-        // near) with a per-row probe; used only for the small early tables, which
-        // can overflow within a single batch and thus need mid-batch table
-        // switching.
+    /// Resolve a whole batch against the active table in one batched multi-pass
+    /// probe — used when the table has room for every row, so no mid-batch table
+    /// switch is needed. Resolves all rows with high memory-level parallelism
+    /// instead of one stalling probe chain at a time.
+    #[inline(always)]
+    fn consume_batched<'b>(
+        &mut self,
+        length: usize,
+        key_reader: &K::Reader<'b>,
+        value_reader: V::Reader<'b>,
+    ) {
+        // `value_reader` is moved into `src` (held by value so a ZST value reader
+        // stays zero-size); the scalar path takes it by reference instead.
+        let mut src = RowSrc::<K, V> {
+            key_reader,
+            value_reader,
+            arena: &mut self.worker_arena,
+        };
+        self.tables.last_mut().unwrap().merge_batch(
+            length,
+            &mut self.hashes[..],
+            &mut self.slots[..],
+            &mut self.sel[..],
+            &mut self.sel_next[..],
+            &mut src,
+        );
+        if self.tables.last().unwrap().undersized() {
+            self.create_new_table();
+        }
+    }
+
+    /// Resolve a batch row-by-row, switching to a fresh table when the current
+    /// one overflows mid-batch — used only for the small early tables. Two-level
+    /// software prefetch (DRAM→L2 far, then L2→L1 near) hides the per-row probe
+    /// latency.
+    #[inline(always)]
+    fn consume_scalared<'b>(
+        &mut self,
+        length: usize,
+        key_reader: &K::Reader<'b>,
+        value_reader: &V::Reader<'b>,
+    ) {
+        const L1_DISTANCE: usize = 16;
+        const L2_DISTANCE: usize = 48;
         let mut table = self.tables.last_mut().unwrap();
         let mut i = 0;
         while i < length {
@@ -177,8 +202,8 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 table.prefetch(self.hashes[i + L1_DISTANCE]);
             }
 
-            let key = K::live_key(&key_reader, i, &mut self.worker_arena);
-            let value = V::value(&value_reader, i);
+            let key = K::live_key(key_reader, i, &mut self.worker_arena);
+            let value = V::value(value_reader, i);
             table.merge::<false, _>(hash, key, value);
 
             if table.undersized() {

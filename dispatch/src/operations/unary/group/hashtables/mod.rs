@@ -15,8 +15,8 @@ use std::ops::{Index, IndexMut};
 
 use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
-pub use crate::operations::unary::group::key_extractions::KeyExtractor;
-pub use crate::operations::unary::group::value_extractions::ValueExtractor;
+pub use crate::operations::unary::group::keys::KeyExtractor;
+pub use crate::operations::unary::group::values::ValueExtractor;
 
 mod hash_table;
 pub use hash_table::{BatchRowSource, Entry, LiveKey, PersistedKey, Value};

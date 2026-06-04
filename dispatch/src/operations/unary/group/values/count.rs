@@ -2,12 +2,37 @@
 
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::aggregations::{Count, GroupAggSlot};
 use crate::operations::unary::group::hashtables::Value;
-use crate::operations::unary::group::value_extractions::{ValueColumns, ValueExtractor};
+use crate::operations::unary::group::values::{GroupAggSlot, ValueColumns, ValueExtractor};
 use arrow_array::types::UInt64Type;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field};
+
+/// A simple counting aggregation that sits inline in a hash-table entry and
+/// holds the running count for a key.
+#[derive(Default, Copy, Clone)]
+pub struct Count {
+    pub value: usize,
+}
+
+impl Count {
+    /// Create a count with a specific initial value.
+    pub fn new(size: usize) -> Self {
+        Self { value: size }
+    }
+}
+
+impl Value for Count {
+    #[inline]
+    fn single() -> Self {
+        Self { value: 1 }
+    }
+
+    fn merge(mut self, v: Self) -> Self {
+        self.value += v.value;
+        self
+    }
+}
 
 /// A [`ValueExtractor`] for `COUNT(*)`: a single [`Count`] slot that increments
 /// once per row, independent of any input column. Pairs with any key extractor
@@ -17,7 +42,7 @@ pub struct CountValueExtractor;
 impl ValueExtractor for CountValueExtractor {
     type Value = Count;
     type Reader<'b> = ();
-    type Columns = CountColumns;
+    type Columns = CountColumn;
 
     #[inline(always)]
     fn make_reader<'b>(_batch: &'b RecordBatch, _value_slots: &[GroupAggSlot]) {}
@@ -34,9 +59,9 @@ impl ValueExtractor for CountValueExtractor {
 }
 
 /// Emits the single `UInt64` count column into an engine slab buffer.
-pub struct CountColumns(PrimitiveBuilder<UInt64Type>);
+pub struct CountColumn(PrimitiveBuilder<UInt64Type>);
 
-impl ValueColumns for CountColumns {
+impl ValueColumns for CountColumn {
     type Value = Count;
 
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
