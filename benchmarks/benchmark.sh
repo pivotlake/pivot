@@ -89,6 +89,7 @@ if [[ -n "$queries" ]]; then
     done
 else
     for f in "$suite_dir"/q*.sql; do
+        [[ "$f" == *-duckdb.sql ]] && continue   # DuckDB-only overrides, not queries
         ids+=("$(basename "$f" .sql)")
     done
 fi

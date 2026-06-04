@@ -99,6 +99,7 @@ if [[ -n "$queries" ]]; then
     done
 else
     for f in "$suite_dir"/q*.sql; do
+        [[ "$f" == *-duckdb.sql ]] && continue   # overrides, not standalone queries
         query_files+=("$f")
     done
 fi
@@ -112,28 +113,30 @@ else
 fi
 echo
 
-# Official ClickBench DuckDB setup. `binary_as_string=True` decodes the parquet
+# ClickBench's upstream DuckDB setup. `binary_as_string=True` decodes the parquet
 # string columns (stored as BLOB) as VARCHAR so `URL LIKE ...` binds, and
-# EventDate (days since epoch) is turned into a real DATE. `toDateTime` is the
-# macro the ClickBench queries use to read the packed-seconds timestamp columns.
-# EventDate (days since epoch) becomes a real DATE and EventTime (packed epoch
-# seconds) a real TIMESTAMP, matching pivot's setup.sql declared types, so
-# date/timestamp queries (e.g. Q42's date_trunc + date-range filter) bind and
-# run the same way on both engines.
+# `make_date(EventDate)` turns EventDate (days since epoch) into a real DATE.
 #
-# Use `epoch_ms(EventTime * 1000)` (the same conversion ClickBench's `toDateTime`
-# macro uses) rather than `to_timestamp(...)`: `to_timestamp` returns TIMESTAMP
-# WITH TIME ZONE, whose tz/ICU handling makes the scan ~3x slower (e.g. Q42 ~90ms
-# vs ~28ms) and would unfairly handicap DuckDB. `epoch_ms` yields a plain
-# TIMESTAMP with identical values.
+# EventTime is left as its raw packed-seconds integer — matching ClickBench's
+# upstream setup and pivot (whose planner also treats EventTime as an integer).
+# So `ORDER BY EventTime` (q24/q26) sorts the raw integer rather than converting
+# all ~100M rows per query. The one query that needs it as a timestamp — Q42's
+# `date_trunc` — converts it inline via the `toDateTime` macro in q42-duckdb.sql
+# (the same trick ClickBench uses), applied only to the rows surviving Q42's
+# filter. `epoch_ms` (not `to_timestamp`) avoids TIMESTAMP WITH TIME ZONE, whose
+# tz/ICU handling is ~3x slower.
 setup="CREATE VIEW hits AS
 SELECT *
-    REPLACE (make_date(EventDate) AS EventDate, epoch_ms(EventTime * 1000) AS EventTime)
+    REPLACE (make_date(EventDate) AS EventDate)
 FROM read_parquet('${parquet_glob}', binary_as_string=True);
 CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000);"
 
 for f in "${query_files[@]}"; do
     stem="$(basename "$f" .sql)"
+    # Prefer a DuckDB-specific override (e.g. q42-duckdb.sql) when one exists, so
+    # a query can differ for DuckDB (e.g. wrapping EventTime in toDateTime) while
+    # the shared qNN.sql stays the one pivot runs.
+    [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
     sql="$(cat "$f")"
     echo "=== $stem ==="
 
@@ -157,18 +160,19 @@ for f in "${query_files[@]}"; do
     # and any later iterations measure hot, cache-resident performance —
     # pivot-bench's cold/hot split.
     flush_page_cache
-    for ((i = 1; i <= iterations; i++)); do
-        # Fresh process per iteration keeps DuckDB's own caches from making
-        # later runs look artificially hot. `.timer on` measures the query;
-        # `.output /dev/null` throws away the result rows (q23 is SELECT *)
-        # while leaving the timing line on stderr.
-        printf '%s\n.output /dev/null\n.timer on\n%s\n' "$setup" "$sql" \
-            | duckdb 2>&1 \
-            | grep -E 'Run Time|Error' || true
-        # Optionally pause between iterations (sleep takes fractional seconds).
-        if [[ "$sleep_ms" -gt 0 && "$i" -lt "$iterations" ]]; then
-            sleep "$(awk -v m="$sleep_ms" 'BEGIN { printf "%.3f", m / 1000 }')"
-        fi
-    done
+    # Run every iteration in ONE duckdb process with the Parquet metadata cache
+    # on — matching ClickBench's run.sh (and pivot's single warm server session):
+    # iteration 1 is cold, later iterations are true hot. A fresh process per
+    # iteration (the old approach) re-parsed all ~100 files' Parquet metadata on
+    # every run — a fixed ~15ms tax that unfairly inflated every "hot" DuckDB
+    # time relative to pivot's warm session. `.output /dev/null` discards result
+    # rows (q23 is SELECT *); `.timer on` leaves the per-run timing line. (No
+    # inter-iteration sleep: the runs are back-to-back in-process, as upstream.)
+    {
+        printf '%s\nSET parquet_metadata_cache=true;\n.output /dev/null\n.timer on\n' "$setup"
+        for ((i = 1; i <= iterations; i++)); do
+            printf '%s\n' "$sql"
+        done
+    } | duckdb 2>&1 | grep -E 'Run Time|Error' || true
     echo
 done
