@@ -18,7 +18,7 @@ use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 
-use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use crate::memory::{MultiSlabBuffer, SlabAllocator, SlabBuffer};
 
 /// Accumulates values into engine memory and produces a finished Arrow array.
 pub trait ArrayBuilder {
@@ -96,5 +96,46 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
             .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
             .filter(|n| n.null_count() != 0);
         Arc::new(PrimitiveArray::<T>::new(values, nulls))
+    }
+}
+
+/// A fixed-capacity primitive builder for query **output** columns.
+///
+/// Where [`PrimitiveBuilder`] is backed by a [`MultiSlabBuffer`] (so the parquet
+/// decoders can append run-by-run across slab boundaries), this is backed by a
+/// single [`SlabBuffer`]. Output columns are emitted one slab-sized chunk at a
+/// time, so a single slab always suffices — and indexing it is a lone pointer
+/// offset, with none of `MultiSlabBuffer`'s per-element `slabs[idx]` lookup. The
+/// result is non-null (GROUP BY keys and aggregates never produce nulls).
+pub struct OutputPrimitiveBuilder<T: ArrowPrimitiveType> {
+    values: SlabBuffer<T::Native>,
+    len: usize,
+}
+
+impl<T: ArrowPrimitiveType> OutputPrimitiveBuilder<T> {
+    pub fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
+        Self {
+            values: allocator.create_slab_buffer(capacity, false),
+            len: 0,
+        }
+    }
+
+    /// Appends `value`. The backing slab is single, so this is a pointer write
+    /// at `ptr + len` with no slab lookup; `len` stays in a register across the
+    /// build loop.
+    #[inline(always)]
+    pub fn push(&mut self, value: T::Native) {
+        unsafe { self.values.ptr_at_index(self.len).write(value) };
+        self.len += 1;
+    }
+
+    /// Consumes the builder, producing a zero-copy Arrow array over the slab.
+    pub fn into_array(self) -> ArrayRef {
+        let byte_len = self.len * size_of::<T::Native>();
+        let slab = self.values.into_slab();
+        let ptr = NonNull::new(slab.ptr).unwrap();
+        let buffer = unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) };
+        let values = ScalarBuffer::new(buffer, 0, self.len);
+        Arc::new(PrimitiveArray::<T>::new(values, None))
     }
 }

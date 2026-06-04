@@ -1,4 +1,4 @@
-use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
+use crate::arrays::OutputPrimitiveBuilder;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
@@ -77,22 +77,22 @@ where
 }
 
 /// Emits the single primitive key column.
-pub struct IntKeyColumns<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
+pub struct IntKeyColumns<T: ArrowPrimitiveType>(OutputPrimitiveBuilder<T>);
 
 impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumns<T> {
     type Key = T::Native;
 
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
-        Self(PrimitiveBuilder::<T>::with_capacity(allocator, rows))
+        Self(OutputPrimitiveBuilder::<T>::with_capacity(allocator, rows))
     }
 
     #[inline(always)]
     fn push(&mut self, key: &T::Native) {
-        self.0.push(key, 1);
+        self.0.push(*key);
     }
 
     fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![Field::new("key", T::DATA_TYPE, false)];
-        (fields, vec![self.0.into_array(None)])
+        (fields, vec![self.0.into_array()])
     }
 }

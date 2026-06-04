@@ -1,6 +1,6 @@
 //! `COUNT(*)` value extraction: every row contributes 1, no column is read.
 
-use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
+use crate::arrays::OutputPrimitiveBuilder;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::aggregations::{Count, GroupAggSlot};
 use crate::operations::unary::group::hashtables::Value;
@@ -34,22 +34,22 @@ impl ValueExtractor for CountValueExtractor {
 }
 
 /// Emits the single `UInt64` count column into an engine slab buffer.
-pub struct CountColumns(PrimitiveBuilder<UInt64Type>);
+pub struct CountColumns(OutputPrimitiveBuilder<UInt64Type>);
 
 impl ValueColumns for CountColumns {
     type Value = Count;
 
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
-        Self(PrimitiveBuilder::with_capacity(allocator, rows))
+        Self(OutputPrimitiveBuilder::with_capacity(allocator, rows))
     }
 
     #[inline(always)]
     fn push(&mut self, value: &Count) {
-        self.0.push(&(value.value as u64), 1);
+        self.0.push(value.value as u64);
     }
 
     fn finish(self) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![Field::new("value", DataType::UInt64, false)];
-        (fields, vec![self.0.into_array(None)])
+        (fields, vec![self.0.into_array()])
     }
 }
