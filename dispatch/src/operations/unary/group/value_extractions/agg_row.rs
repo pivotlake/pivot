@@ -6,7 +6,7 @@
 //! monomorphised per query arity so each hash-table entry is exactly as wide as
 //! the query needs.
 
-use crate::arrays::OutputPrimitiveBuilder;
+use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::aggregations::{AggRow, GroupAggKind, GroupAggSlot};
 use crate::operations::unary::group::value_extractions::{ValueColumns, ValueExtractor};
@@ -86,7 +86,7 @@ impl<const N: usize> ValueExtractor for AggRowValueExtractor<N> {
 
 /// Emits one `Int64` column per slot (`v0`, `v1`, …), each into an engine slab.
 pub struct AggRowColumns<const N: usize> {
-    cols: Vec<OutputPrimitiveBuilder<Int64Type>>,
+    cols: Vec<PrimitiveBuilder<Int64Type>>,
 }
 
 impl<const N: usize> ValueColumns for AggRowColumns<N> {
@@ -95,7 +95,7 @@ impl<const N: usize> ValueColumns for AggRowColumns<N> {
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
         Self {
             cols: (0..N)
-                .map(|_| OutputPrimitiveBuilder::with_capacity(allocator, rows))
+                .map(|_| PrimitiveBuilder::with_capacity(allocator, rows))
                 .collect(),
         }
     }
@@ -103,7 +103,7 @@ impl<const N: usize> ValueColumns for AggRowColumns<N> {
     #[inline(always)]
     fn push(&mut self, value: &AggRow<N>) {
         for (c, &v) in self.cols.iter_mut().zip(value.0.iter()) {
-            c.push(v);
+            c.push(&v, 1);
         }
     }
 
@@ -112,7 +112,7 @@ impl<const N: usize> ValueColumns for AggRowColumns<N> {
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(N);
         for (s, c) in self.cols.into_iter().enumerate() {
             fields.push(Field::new(format!("v{s}"), DataType::Int64, false));
-            columns.push(c.into_array());
+            columns.push(c.into_array(None));
         }
         (fields, columns)
     }

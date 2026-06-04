@@ -14,7 +14,7 @@ use std::mem;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_buffer::ArrowNativeType;
 
-use crate::memory::{MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator};
+use crate::memory::{MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer};
 use crate::operations::unary::parquet::decoding::column_decoders::{
     DecodePlain, Dict, TypedColumnDecoder,
 };
@@ -86,17 +86,39 @@ impl ReadLeBytes for f64 {
     }
 }
 
-/// Reads `count` fixed-width LE primitive values from scattered buffers into a MultiSlabBuffer.
+/// Lets [`read_primitives`] write into either backing without a per-element slab
+/// lookup in the common case: the single [`SlabBuffer`] of a [`PrimitiveBuilder`]
+/// or the [`MultiSlabBuffer`] of a dictionary.
+trait ElemPtr<T> {
+    fn elem_ptr(&self, index: usize) -> *mut T;
+}
+
+impl<T> ElemPtr<T> for SlabBuffer<T> {
+    #[inline(always)]
+    fn elem_ptr(&self, index: usize) -> *mut T {
+        self.ptr_at_index(index)
+    }
+}
+
+impl<T> ElemPtr<T> for MultiSlabBuffer<T> {
+    #[inline(always)]
+    fn elem_ptr(&self, index: usize) -> *mut T {
+        self.ptr_at_index(index)
+    }
+}
+
+/// Reads `count` fixed-width LE primitive values from scattered buffers into
+/// `output` (a single-slab builder buffer or a multi-slab dictionary buffer).
 ///
 /// Fast path: when many values fit within the current buffer, copies them
 /// in bulk via memcpy (no per-value overhead).
 /// Slow path: when a value straddles a buffer boundary, falls back to
 /// `MultiBufferReader` for that single value, then resumes the fast path.
 #[inline]
-fn read_primitives<N: ReadLeBytes>(
+fn read_primitives<N: ReadLeBytes, B: ElemPtr<N>>(
     data: &[Bytes],
     position: &mut ReaderPosition,
-    output: &mut MultiSlabBuffer<N>,
+    output: &mut B,
     output_len: &mut usize,
     count: usize,
 ) {
@@ -115,7 +137,7 @@ fn read_primitives<N: ReadLeBytes>(
             let byte_count = to_read * byte_width;
             let src = &buf[position.offset..position.offset + byte_count];
             unsafe {
-                let dst = output.ptr_at_index(*output_len) as *mut u8;
+                let dst = output.elem_ptr(*output_len) as *mut u8;
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dst, byte_count);
             }
             *output_len += to_read;
@@ -124,13 +146,13 @@ fn read_primitives<N: ReadLeBytes>(
             let to_read = remaining.min(fit);
             let mut reader = MultiBufferReader::new(data, position);
             for _ in 0..to_read {
-                output[*output_len] = N::read_le(&mut reader);
+                unsafe { *output.elem_ptr(*output_len) = N::read_le(&mut reader) };
                 *output_len += 1;
             }
         } else if available_bytes > 0 {
             // Slow path: value straddles buffer boundary
             let mut reader = MultiBufferReader::new(data, position);
-            output[*output_len] = N::read_le(&mut reader);
+            unsafe { *output.elem_ptr(*output_len) = N::read_le(&mut reader) };
             *output_len += 1;
         } else {
             // Buffer fully consumed, advance to next
@@ -172,11 +194,11 @@ where
     }
 
     fn read(&mut self, builder: &mut PrimitiveBuilder<T>, size: usize) {
-        read_primitives::<T::Native>(
+        read_primitives::<T::Native, _>(
             &self.data,
             &mut self.position,
-            &mut builder.values,
-            &mut builder.len,
+            &mut builder.col.values,
+            &mut builder.col.len,
             size,
         );
     }
@@ -208,7 +230,7 @@ where
         let mut entries = allocator.create_multi_slab_buffer(size, false);
         let mut position = ReaderPosition::default();
         let mut len = 0;
-        read_primitives::<T::Native>(&data, &mut position, &mut entries, &mut len, size);
+        read_primitives::<T::Native, _>(&data, &mut position, &mut entries, &mut len, size);
         Self { entries }
     }
 

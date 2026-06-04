@@ -18,7 +18,7 @@ use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{ArrayRef, PrimitiveArray};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 
-use crate::memory::{MultiSlabBuffer, SlabAllocator, SlabBuffer};
+use crate::memory::{SlabAllocator, SlabBuffer};
 
 /// Accumulates values into engine memory and produces a finished Arrow array.
 pub trait ArrayBuilder {
@@ -41,77 +41,26 @@ pub trait ArrayBuilder {
     fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef;
 }
 
-/// [`ArrayBuilder`] for fixed-width primitive Arrow types.
-///
-/// Backed by a [`MultiSlabBuffer`] so that the final array can be produced
-/// with zero copies via [`into_array`](ArrayBuilder::into_array). The capacity
-/// must fit in a single 2MB slab (see [`into_array`](ArrayBuilder::into_array)).
-pub struct PrimitiveBuilder<T: ArrowPrimitiveType> {
-    // `pub(crate)` so bulk decoders (e.g. the parquet primitive decoder) can copy
-    // straight into the backing buffer via `MultiSlabBuffer::ptr_at_index` and
-    // advance the length, rather than going value-by-value through `push`.
-    pub(crate) values: MultiSlabBuffer<T::Native>,
-    pub(crate) len: usize,
-}
-
-impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
-    type Element = T::Native;
-
-    fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
-        Self {
-            values: allocator.create_multi_slab_buffer(capacity, false),
-            len: 0,
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    fn push(&mut self, element: &T::Native, amount: usize) {
-        let start = self.len;
-        self.len += amount;
-        let dest =
-            unsafe { std::slice::from_raw_parts_mut(self.values.ptr_at_index(start), amount) };
-        dest.fill(*element);
-    }
-
-    #[inline]
-    fn spare_mut(&mut self, count: usize) -> &mut [T::Native] {
-        let start = self.len;
-        self.len += count;
-        unsafe { std::slice::from_raw_parts_mut(self.values.ptr_at_index(start), count) }
-    }
-
-    fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef {
-        let len = self.len;
-        let byte_len = len * size_of::<T::Native>();
-        let slab = self.values.into_single_slab();
-        let ptr = NonNull::new(slab.ptr).unwrap();
-        let buffer = unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) };
-        let values = ScalarBuffer::new(buffer, 0, len);
-        let nulls = null_buffer
-            .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
-            .filter(|n| n.null_count() != 0);
-        Arc::new(PrimitiveArray::<T>::new(values, nulls))
-    }
-}
-
 /// A fixed-capacity column of `T` backed by a single [`SlabBuffer`], materialised
 /// zero-copy into an Arrow [`Buffer`].
 ///
-/// Where [`PrimitiveBuilder`] uses a [`MultiSlabBuffer`] (so the parquet decoders
-/// can append run-by-run across slab boundaries), a query **output** column is
-/// emitted one slab-sized chunk at a time, so a single slab always suffices —
-/// indexing it is a lone pointer write at `ptr + len`, with none of
-/// `MultiSlabBuffer`'s per-element `slabs[idx]` lookup, and `len` stays in a
-/// register across the build loop. Handing the slab to Arrow keeps the column on
-/// our pre-faulted, huge-paged, accounted memory.
+/// A column is built one slab-sized chunk at a time — the parquet decoder caps a
+/// batch at `RECORD_BATCH_SIZE`, and GROUP BY output chunks to one slab — so a
+/// single slab always suffices. Indexing is then a lone pointer write at
+/// `ptr + len`, with none of
+/// [`MultiSlabBuffer`](crate::memory::MultiSlabBuffer)'s per-element `slabs[idx]`
+/// lookup, and `len` stays in a register across the build loop. Handing the slab
+/// to Arrow keeps the column on our pre-faulted, huge-paged, accounted memory.
+///
+/// This is the shared core: [`PrimitiveBuilder`] wraps it for Arrow primitive
+/// columns, and the GROUP BY string-view headers use it directly (their `u128`
+/// view type is not an [`ArrowPrimitiveType`]).
 pub struct SlabColumn<T: Copy> {
-    values: SlabBuffer<T>,
-    len: usize,
+    // `pub(crate)` so bulk decoders (e.g. the parquet primitive decoder) can copy
+    // straight into the backing buffer via `SlabBuffer::ptr_at_index` and advance
+    // the length, rather than going value-by-value through `push`.
+    pub(crate) values: SlabBuffer<T>,
+    pub(crate) len: usize,
 }
 
 impl<T: Copy> SlabColumn<T> {
@@ -128,6 +77,16 @@ impl<T: Copy> SlabColumn<T> {
         self.len += 1;
     }
 
+    /// Returns a mutable slice of `count` uninitialised slots at the end of the
+    /// column, advancing the length. Callers must fill every slot. The slice is
+    /// contiguous, since the backing is a single slab.
+    #[inline(always)]
+    pub fn spare_mut(&mut self, count: usize) -> &mut [T] {
+        let start = self.len;
+        self.len += count;
+        unsafe { std::slice::from_raw_parts_mut(self.values.ptr_at_index(start), count) }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -142,28 +101,43 @@ impl<T: Copy> SlabColumn<T> {
     }
 }
 
-/// A [`SlabColumn`]-backed builder for primitive query **output** columns. The
-/// result is non-null (GROUP BY keys and aggregates never produce nulls).
-pub struct OutputPrimitiveBuilder<T: ArrowPrimitiveType> {
-    col: SlabColumn<T::Native>,
+/// [`ArrayBuilder`] for fixed-width primitive Arrow types, backed by a single-slab
+/// [`SlabColumn`]. Used by both the parquet primitive decoders and the GROUP BY
+/// output columns.
+pub struct PrimitiveBuilder<T: ArrowPrimitiveType> {
+    pub(crate) col: SlabColumn<T::Native>,
 }
 
-impl<T: ArrowPrimitiveType> OutputPrimitiveBuilder<T> {
-    pub fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
+impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
+    type Element = T::Native;
+
+    fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
         Self {
             col: SlabColumn::with_capacity(allocator, capacity),
         }
     }
 
-    #[inline(always)]
-    pub fn push(&mut self, value: T::Native) {
-        self.col.push(value);
+    #[inline]
+    fn len(&self) -> usize {
+        self.col.len()
     }
 
-    /// Consumes the builder, producing a zero-copy Arrow array over the slab.
-    pub fn into_array(self) -> ArrayRef {
+    #[inline(always)]
+    fn push(&mut self, element: &T::Native, amount: usize) {
+        self.col.spare_mut(amount).fill(*element);
+    }
+
+    #[inline]
+    fn spare_mut(&mut self, count: usize) -> &mut [T::Native] {
+        self.col.spare_mut(count)
+    }
+
+    fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef {
         let len = self.col.len();
         let values = ScalarBuffer::new(self.col.into_buffer(), 0, len);
-        Arc::new(PrimitiveArray::<T>::new(values, None))
+        let nulls = null_buffer
+            .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
+            .filter(|n| n.null_count() != 0);
+        Arc::new(PrimitiveArray::<T>::new(values, nulls))
     }
 }

@@ -7,7 +7,7 @@
 //! [`ValueExtractor`](crate::operations::unary::group::value_extractions::ValueExtractor)
 //! (typically [`AggRowValueExtractor`](crate::operations::unary::group::value_extractions::AggRowValueExtractor)).
 
-use crate::arrays::OutputPrimitiveBuilder;
+use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::key_extractions::{KeyColumns, KeyExtractor};
@@ -117,8 +117,8 @@ where
     A::Native: IntBits,
     B::Native: IntBits,
 {
-    a: OutputPrimitiveBuilder<A>,
-    b: OutputPrimitiveBuilder<B>,
+    a: PrimitiveBuilder<A>,
+    b: PrimitiveBuilder<B>,
 }
 
 impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> KeyColumns for IntPairKeyColumns<A, B>
@@ -130,16 +130,16 @@ where
 
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
         Self {
-            a: OutputPrimitiveBuilder::<A>::with_capacity(allocator, rows),
-            b: OutputPrimitiveBuilder::<B>::with_capacity(allocator, rows),
+            a: PrimitiveBuilder::<A>::with_capacity(allocator, rows),
+            b: PrimitiveBuilder::<B>::with_capacity(allocator, rows),
         }
     }
 
     #[inline(always)]
     fn push(&mut self, key: &u128) {
         let packed = *key;
-        self.a.push(A::Native::from_u64((packed >> 64) as u64));
-        self.b.push(B::Native::from_u64(packed as u64));
+        self.a.push(&A::Native::from_u64((packed >> 64) as u64), 1);
+        self.b.push(&B::Native::from_u64(packed as u64), 1);
     }
 
     fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
@@ -147,6 +147,6 @@ where
             Field::new("k0", A::DATA_TYPE, false),
             Field::new("k1", B::DATA_TYPE, false),
         ];
-        (fields, vec![self.a.into_array(), self.b.into_array()])
+        (fields, vec![self.a.into_array(None), self.b.into_array(None)])
     }
 }
