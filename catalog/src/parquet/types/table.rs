@@ -14,7 +14,7 @@ use arrow_array::{
     Int64Array, Scalar, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use dispatch::io::open_direct_read;
+use dispatch::io::{FileLocation, open_direct_read};
 use dispatch::memory::{has_memory_context, memory_ctx};
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
@@ -155,7 +155,9 @@ fn parse_row_group_metadatas(
     let buf = read_parquet_footer(&mut file)?;
     let file_meta = parse_footer_thrift(&buf)?;
     let file = open_direct_read(path)?;
-    memory_ctx().file_cache().open_file_entry(file.as_raw_fd());
+    memory_ctx()
+        .file_cache()
+        .open_entry(FileLocation::Local(file.as_raw_fd()));
 
     let file = Arc::new(file);
 

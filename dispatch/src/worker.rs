@@ -218,7 +218,8 @@ pub struct Worker {
     /// The identifier of the worker (every worker has a unique ID)
     id: Identifier,
     should_exit: Arc<AtomicBool>,
-    /// A requester (through uring) for any IO necessary
+    /// A requester (through a single per-core uring) for all IO — both disk reads
+    /// and HTTP(S) reads of remote regions share the one ring.
     io: IORequester,
     /// A queue of dataflows for the worker to work on. The worker can work on many dataflows
     /// simultaneously
@@ -287,19 +288,42 @@ impl Worker {
         })
     }
 
-    /// Submit IO requests from dataflows until the IO queue is full or no more requests remain.
+    /// Submit disk reads from dataflows until the disk queue is busy or no more
+    /// requests remain.
     fn saturate_io(&mut self) -> Result<()> {
         for flow in self.data_flows.values_mut() {
-            if self.io.has_pending() {
+            if self.io.has_file_pending() {
                 break;
             }
 
-            while let Some(requests) = flow.get_next_io_request() {
+            while let Some(requests) = flow.get_next_fs_request() {
                 for r in requests {
                     self.io.request(r)?;
                 }
 
-                if self.io.has_pending() {
+                if self.io.has_file_pending() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit HTTP reads from dataflows onto the same ring until the network
+    /// transport is busy or no more requests remain. Gated on HTTP activity only
+    /// (not disk) so the two queues fill independently.
+    fn saturate_http(&mut self) -> Result<()> {
+        for flow in self.data_flows.values_mut() {
+            if self.io.has_http_pending() {
+                break;
+            }
+
+            while let Some(requests) = flow.get_next_http_request() {
+                for r in requests {
+                    self.io.request_http(r)?;
+                }
+
+                if self.io.has_http_pending() {
                     break;
                 }
             }
@@ -316,9 +340,9 @@ impl Worker {
         }
     }
 
-    /// Deliver completed IO back to the operators that requested it. The
-    /// requester has already committed each read's bytes into its cache slot,
-    /// so we just hand the originating request to its operator to count down.
+    /// Deliver completed reads (disk and HTTP) back to the operators that
+    /// requested them; by the time we're here each block's bytes are already
+    /// committed to its cache slot.
     fn process_io_completions(&mut self) -> Result<()> {
         for request in self.io.completions()? {
             let data_flow = self.data_flows.get_mut(&request.data_flow_id).unwrap();
@@ -435,12 +459,15 @@ impl Worker {
 
             self.process_io_completions()?;
             self.saturate_io()?;
+            self.saturate_http()?;
 
             self.step_run_ready_cpu_work();
 
             self.try_finishing_dataflows();
 
             if !self.did_work_last_iteration {
+                // One ring serves both disk and HTTP, so a single wait wakes on
+                // either kind of completion — no dual-ring coordination needed.
                 if self.io.has_pending() {
                     debug!("Waiting for IO...");
                     self.io.wait()?;

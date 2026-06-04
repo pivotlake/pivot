@@ -31,13 +31,13 @@
 //! the slot at [`MissingBlock::dest`], then marked valid via
 //! [`MissingBlock::commit`], after which `data` is valid to read.
 
+use crate::io::FileLocation;
 use crate::memory::context::memory_ctx;
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::ring::BUFFER_SIZE;
 use ahash::HashMap;
 use bytes::Bytes;
 use std::cell::UnsafeCell;
-use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -208,8 +208,12 @@ impl AsRef<[u8]> for SlotPin {
 }
 
 /// A CLOCK-eviction region cache over the shared [`Ring`](super::Ring).
+///
+/// Regions are bucketed by [`FileLocation`], so the same cache serves both local
+/// files and remote HTTP objects — only the transport that fills a missing block
+/// differs.
 pub struct FileCache {
-    file_maps: RwLock<HashMap<RawFd, RwLock<HashMap<usize, FileCacheEntry>>>>,
+    file_maps: RwLock<HashMap<FileLocation, RwLock<HashMap<usize, FileCacheEntry>>>>,
     entries: Box<[UnsafeCell<Entry>]>,
     hand: AtomicUsize,
 }
@@ -250,11 +254,11 @@ impl ValidBitmap {
 /// Per-slot CLOCK metadata + validity.
 ///
 /// * `ref_bit` – set on access, cleared by the CLOCK sweep.
-/// * `region` – the `(fd, region_base)` currently cached here, or `None` if unused.
+/// * `region` – the `(location, region_base)` currently cached here, or `None` if unused.
 /// * `valid` – which of the slot's 4 KB sub-blocks are resident.
 struct Entry {
     ref_bit: AtomicBool,
-    region: Option<(RawFd, usize)>,
+    region: Option<(FileLocation, usize)>,
     valid: ValidBitmap,
 }
 
@@ -281,27 +285,33 @@ impl FileCache {
     /// [`CacheLookup`] per region in file order — callers never deal in regions
     /// themselves: read & fill every lookup's [`missing`](CacheLookup::missing)
     /// blocks, then concatenate the parts' bytes.
-    pub fn get(&self, fd: RawFd, offset: usize, len: usize) -> Vec<CacheLookup> {
+    pub fn get(&self, location: &FileLocation, offset: usize, len: usize) -> Vec<CacheLookup> {
         let end = offset + len;
         let mut lookups = Vec::new();
         let mut at = offset;
         while at < end {
             let region = region_base_of(at);
             let region_end = (region + BUFFER_SIZE).min(end);
-            lookups.push(self.get_region(fd, region, at - region, region_end - region));
+            lookups.push(self.get_region(location, region, at - region, region_end - region));
             at = region_end;
         }
         lookups
     }
 
     /// Look up `[start, end)` (intra-region byte offsets) of one 2 MB `region`
-    /// of file `fd`, allocating the slot on a miss. See [`CacheLookup`].
-    fn get_region(&self, fd: RawFd, region: usize, start: usize, end: usize) -> CacheLookup {
+    /// of `location`, allocating the slot on a miss. See [`CacheLookup`].
+    fn get_region(
+        &self,
+        location: &FileLocation,
+        region: usize,
+        start: usize,
+        end: usize,
+    ) -> CacheLookup {
         debug_assert!(start < end && end <= BUFFER_SIZE);
         debug_assert_eq!(region_base_of(region), region);
         loop {
             // Fast path: the region is already cached — pin it and inspect.
-            if let Some(buffer) = self.get_buffer(fd, region) {
+            if let Some(buffer) = self.get_buffer(location, region) {
                 return self.get_lookup_within_existing_region(buffer, region, start, end);
             }
 
@@ -312,7 +322,7 @@ impl FileCache {
 
             // Register region → slot, unless another worker beat us to it.
             let file_maps = self.file_maps.read().unwrap();
-            let fd_regions = file_maps.get(&fd).expect("Missing file in file cache!");
+            let fd_regions = file_maps.get(location).expect("Missing file in file cache!");
             let mut fd_regions = fd_regions.write().unwrap();
             if fd_regions.contains_key(&region) {
                 // Another worker already cached this region; retry the fast path
@@ -326,7 +336,7 @@ impl FileCache {
             // leaves a dangling region behind.
             let entry = unsafe { &mut *self.entries[slot_idx].get() };
             entry.valid.clear();
-            entry.region = Some((fd, region));
+            entry.region = Some((location.clone(), region));
             entry.ref_bit.store(true, Ordering::Relaxed);
 
             fd_regions.insert(region, FileCacheEntry { ring_idx: slot_idx });
@@ -351,17 +361,23 @@ impl FileCache {
         unsafe { &*self.entries[idx].get() }
     }
 
-    /// Get cached buffer for `location` in the file, or `None` if it isn't cached (or a
-    /// concurrent eviction recycled it between the map lookup and the pin).
-    fn get_buffer(&self, fd: RawFd, region: usize) -> Option<ReadBuffer> {
+    /// Get the cached buffer for `region` of `location`, or `None` if it isn't
+    /// cached (or a concurrent eviction recycled it between the map lookup and
+    /// the pin).
+    fn get_buffer(&self, location: &FileLocation, region: usize) -> Option<ReadBuffer> {
         let file_maps = self.file_maps.read().unwrap();
-        let fd_regions = file_maps.get(&fd).unwrap().read().unwrap();
+        let fd_regions = file_maps.get(location).unwrap().read().unwrap();
         let ring_idx = fd_regions.get(&region)?.ring_idx;
         let buffer = memory_ctx().ring().try_read(ring_idx)?;
         // Re-check under the pin: eviction may have recycled the slot for a
-        // different region between the map lookup and the pin.
+        // different region between the map lookup and the pin. Comparing by
+        // reference avoids cloning the (possibly Arc-backed) location.
         let entry = self.entry(buffer.ring_idx());
-        if entry.region == Some((fd, region)) {
+        if entry
+            .region
+            .as_ref()
+            .is_some_and(|(loc, r)| loc == location && *r == region)
+        {
             entry.ref_bit.store(true, Ordering::Relaxed);
             Some(buffer)
         } else {
@@ -417,26 +433,32 @@ impl FileCache {
             if let Some(write_buffer) = memory_ctx().ring().try_write(slot_idx) {
                 // Exclusive now: unbind the region from the map before reusing.
                 let entry = unsafe { &mut *self.entries[slot_idx].get() };
-                if let Some((fd, region)) = entry.region.take() {
+                if let Some((location, region)) = entry.region.take() {
                     let file_maps = self.file_maps.read().unwrap();
-                    file_maps.get(&fd).unwrap().write().unwrap().remove(&region);
+                    file_maps
+                        .get(&location)
+                        .unwrap()
+                        .write()
+                        .unwrap()
+                        .remove(&region);
                 }
                 return write_buffer;
             }
         }
     }
 
-    /// Register a file descriptor so its regions can be cached. Clears any stale
-    /// entries from a previous use of the same fd number.
-    pub fn open_file_entry(&self, raw_fd: RawFd) {
+    /// Register a [`FileLocation`] (a local fd or a remote object) so its regions
+    /// can be cached. Clears any stale entries from a previous registration of an
+    /// equal location (e.g. a reused fd number).
+    pub fn open_entry(&self, location: FileLocation) {
         let mut file_maps = self.file_maps.write().unwrap();
-        if let Some(stale) = file_maps.remove(&raw_fd) {
+        if let Some(stale) = file_maps.remove(&location) {
             for (_, FileCacheEntry { ring_idx }) in stale.into_inner().unwrap() {
                 unsafe { &mut *self.entries[ring_idx].get() }.region = None;
                 drop(memory_ctx().ring().try_write(ring_idx));
             }
         }
-        file_maps.insert(raw_fd, Default::default());
+        file_maps.insert(location, Default::default());
     }
 
     /// Evict every cached region: unbind all `(fd, region) → slot` mappings,
@@ -473,7 +495,8 @@ mod tests {
     use crate::memory::context::{init_test_free_pool, memory_ctx};
 
     const SB: usize = SUB_BLOCK_SIZE;
-    const FD: RawFd = 7;
+    // A local location used as the cache key throughout these tests.
+    const FD: FileLocation = FileLocation::Local(7);
 
     fn cache() -> &'static FileCache {
         memory_ctx().file_cache()
@@ -533,10 +556,10 @@ mod tests {
     #[test]
     fn miss_then_fill_then_hit() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
         // A fresh region: looking up the first sub-block misses with one block.
-        let region = miss(cache().get_region(FD, 0, 0, 10));
+        let region = miss(cache().get_region(&FD, 0, 0, 10));
         assert_eq!(region.missing().len(), 1);
         let block = region.missing()[0].clone();
         assert_eq!((block.first_sub, block.sub_count, block.len), (0, 1, SB));
@@ -545,17 +568,17 @@ mod tests {
         read_and_commit(&block, 0xAB);
         drop(region);
 
-        let bytes = hit(cache().get_region(FD, 0, 0, 10));
+        let bytes = hit(cache().get_region(&FD, 0, 0, 10));
         assert_eq!(&bytes[..], &[0xAB; 10]);
     }
 
     #[test]
     fn coalesces_contiguous_missing_sub_blocks_into_one_block() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
         // Range spanning three sub-blocks, none present → a single coalesced run.
-        let region = miss(cache().get_region(FD, 0, 0, 2 * SB + 1));
+        let region = miss(cache().get_region(&FD, 0, 0, 2 * SB + 1));
         assert_eq!(region.missing().len(), 1);
         let block = &region.missing()[0];
         assert_eq!(
@@ -567,15 +590,15 @@ mod tests {
     #[test]
     fn partial_validity_only_reports_the_holes() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
         // Fill sub-block 0 only.
-        let region = miss(cache().get_region(FD, 0, 0, 10));
+        let region = miss(cache().get_region(&FD, 0, 0, 10));
         read_and_commit(&region.missing()[0].clone(), 1);
         drop(region);
 
         // Now ask for sub-blocks 0..=2; only 1 and 2 are missing, coalesced.
-        let region = miss(cache().get_region(FD, 0, 0, 2 * SB + 1));
+        let region = miss(cache().get_region(&FD, 0, 0, 2 * SB + 1));
         assert_eq!(region.missing().len(), 1);
         let block = &region.missing()[0];
         assert_eq!((block.first_sub, block.sub_count), (1, 2));
@@ -584,21 +607,21 @@ mod tests {
     #[test]
     fn distinct_regions_use_distinct_slots() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
-        let r0 = miss(cache().get_region(FD, 0, 0, 10));
-        let r1 = miss(cache().get_region(FD, BUFFER_SIZE, 0, 10));
+        let r0 = miss(cache().get_region(&FD, 0, 0, 10));
+        let r1 = miss(cache().get_region(&FD, BUFFER_SIZE, 0, 10));
         assert_ne!(r0.missing()[0].slot_idx, r1.missing()[0].slot_idx);
     }
 
     #[test]
     fn second_column_in_same_region_shares_the_slot() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
         // Two disjoint ranges within the same 2 MB region resolve to one slot.
-        let a = miss(cache().get_region(FD, 0, 0, 10));
-        let b = miss(cache().get_region(FD, 0, 5 * SB, 5 * SB + 10));
+        let a = miss(cache().get_region(&FD, 0, 0, 10));
+        let b = miss(cache().get_region(&FD, 0, 5 * SB, 5 * SB + 10));
         assert_eq!(a.missing()[0].slot_idx, b.missing()[0].slot_idx);
         // ...and a's fill doesn't satisfy b's distant sub-block.
         assert_eq!(b.missing()[0].first_sub, 5);
@@ -609,12 +632,12 @@ mod tests {
     #[test]
     fn hit_reassembles_bytes_across_sub_blocks() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
-        let region = miss(cache().get_region(FD, 0, SB - 5, 2 * SB + 5));
+        cache().open_entry(FD);
+        let region = miss(cache().get_region(&FD, 0, SB - 5, 2 * SB + 5));
         fill_pattern(0, &region);
         drop(region);
 
-        let bytes = hit(cache().get_region(FD, 0, SB - 5, 2 * SB + 5));
+        let bytes = hit(cache().get_region(&FD, 0, SB - 5, 2 * SB + 5));
 
         assert_pattern(&bytes, SB - 5);
         assert_eq!(bytes.len(), SB + 10);
@@ -625,10 +648,10 @@ mod tests {
     #[test]
     fn hit_returns_the_exact_requested_byte_range() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
-        fill_pattern(0, &miss(cache().get_region(FD, 0, 0, SB)));
+        cache().open_entry(FD);
+        fill_pattern(0, &miss(cache().get_region(&FD, 0, 0, SB)));
 
-        let bytes = hit(cache().get_region(FD, 0, 3, 9));
+        let bytes = hit(cache().get_region(&FD, 0, 3, 9));
 
         assert_eq!(bytes.len(), 6);
         assert_pattern(&bytes, 3);
@@ -639,12 +662,12 @@ mod tests {
     #[test]
     fn committed_bytes_serve_an_overlapping_later_lookup() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
-        let first = miss(cache().get_region(FD, 0, 0, 2 * SB));
+        cache().open_entry(FD);
+        let first = miss(cache().get_region(&FD, 0, 0, 2 * SB));
         fill_pattern(0, &first);
         drop(first);
 
-        let bytes = hit(cache().get_region(FD, 0, SB / 2, SB + SB / 2));
+        let bytes = hit(cache().get_region(&FD, 0, SB / 2, SB + SB / 2));
 
         assert_pattern(&bytes, SB / 2);
     }
@@ -654,9 +677,9 @@ mod tests {
     #[test]
     fn into_data_yields_the_freshly_filled_range() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
-        let region = miss(cache().get_region(FD, 0, 10, SB + 10));
+        let region = miss(cache().get_region(&FD, 0, 10, SB + 10));
         fill_pattern(0, &region);
         let bytes = region.into_data();
 
@@ -669,14 +692,14 @@ mod tests {
     #[test]
     fn interleaved_gaps_split_then_fill_to_a_full_hit() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
-        fill_pattern(0, &miss(cache().get_region(FD, 0, 0, 1))); // sub-block 0
-        fill_pattern(0, &miss(cache().get_region(FD, 0, 2 * SB, 2 * SB + 1))); // sub-block 2
+        cache().open_entry(FD);
+        fill_pattern(0, &miss(cache().get_region(&FD, 0, 0, 1))); // sub-block 0
+        fill_pattern(0, &miss(cache().get_region(&FD, 0, 2 * SB, 2 * SB + 1))); // sub-block 2
 
-        let gaps = miss(cache().get_region(FD, 0, 0, 4 * SB));
+        let gaps = miss(cache().get_region(&FD, 0, 0, 4 * SB));
         fill_pattern(0, &gaps);
         drop(gaps);
-        let bytes = hit(cache().get_region(FD, 0, 0, 4 * SB));
+        let bytes = hit(cache().get_region(&FD, 0, 0, 4 * SB));
 
         assert_pattern(&bytes, 0);
     }
@@ -686,12 +709,12 @@ mod tests {
     #[test]
     fn reopening_a_file_forgets_its_cached_regions() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
-        fill_pattern(0, &miss(cache().get_region(FD, 0, 0, SB)));
+        cache().open_entry(FD);
+        fill_pattern(0, &miss(cache().get_region(&FD, 0, 0, SB)));
 
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
-        assert!(!cache().get_region(FD, 0, 0, SB).missing().is_empty());
+        assert!(!cache().get_region(&FD, 0, 0, SB).missing().is_empty());
     }
 
     /// The public range API hides bucketing: a range within one 2 MB window is a
@@ -699,10 +722,10 @@ mod tests {
     #[test]
     fn get_splits_a_range_across_buckets() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
 
-        let within_one = cache().get(FD, 100, SB);
-        let across_two = cache().get(FD, BUFFER_SIZE - SB, 2 * SB);
+        let within_one = cache().get(&FD, 100, SB);
+        let across_two = cache().get(&FD, BUFFER_SIZE - SB, 2 * SB);
 
         assert_eq!(within_one.len(), 1);
         assert_eq!(across_two.len(), 2);
@@ -713,13 +736,13 @@ mod tests {
     #[test]
     fn get_spanning_cached_and_uncached_windows() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
         fill_pattern(
             0,
-            &miss(cache().get_region(FD, 0, BUFFER_SIZE - SB, BUFFER_SIZE)),
+            &miss(cache().get_region(&FD, 0, BUFFER_SIZE - SB, BUFFER_SIZE)),
         );
 
-        let parts = cache().get(FD, BUFFER_SIZE - SB, 2 * SB);
+        let parts = cache().get(&FD, BUFFER_SIZE - SB, 2 * SB);
         assert!(parts[0].missing().is_empty()); // cached window: full hit
         assert!(!parts[1].missing().is_empty()); // uncached window: has holes
         fill_pattern(BUFFER_SIZE, &parts[1]);
@@ -737,13 +760,13 @@ mod tests {
     #[test]
     fn a_partially_cached_window_is_one_miss_that_keeps_the_cached_bytes() {
         init_test_free_pool(8);
-        cache().open_file_entry(FD);
+        cache().open_entry(FD);
         read_and_commit(
-            &miss(cache().get_region(FD, 0, 0, 1)).missing()[0].clone(),
+            &miss(cache().get_region(&FD, 0, 0, 1)).missing()[0].clone(),
             0xAA,
         );
 
-        let m = miss(cache().get_region(FD, 0, 0, 2 * SB));
+        let m = miss(cache().get_region(&FD, 0, 0, 2 * SB));
         assert_eq!(m.missing().len(), 1);
         assert_eq!(m.missing()[0].file_offset, SB); // only the hole (sub-block 1)
         read_and_commit(&m.missing()[0].clone(), 0xBB);

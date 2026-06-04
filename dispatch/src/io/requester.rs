@@ -1,8 +1,13 @@
 use crate::Identifier;
-use crate::io::DataFlowRequest;
 use crate::io::backend::IOBackend;
+use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
+use crate::io::{DataFlowRequest, FileLocation};
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
+
+#[cfg(target_os = "linux")]
+use crate::io::http::HTTP_TAG;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -10,20 +15,35 @@ pub enum Error {
     Backend(#[from] super::backend::Error),
     #[error("{0}")]
     IO(#[from] std::io::Error),
+    #[error("{0}")]
+    Http(#[from] crate::io::http::Error),
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-const RING_SIZE: u32 = 32;
+const RING_SIZE: u32 = 64;
 
-/// Bridges dataflow operators and the I/O backend, holding state on outstanding requests and
-/// returning responses together with the original requested context.
+/// Bridges dataflow operators and the I/O backend, holding state on outstanding
+/// requests and returning responses together with the original requested context.
 ///
-/// Held one per worker
+/// A single per-core io_uring serves **both** disk reads and HTTP(S) range reads
+/// (the standard io_uring pattern): file reads are one SQE→one CQE, while HTTP
+/// reads are driven by the ring-less [`HttpEngine`], which submits its socket SQEs
+/// onto this same ring. Completions are disambiguated by the [`HTTP_TAG`] bit in
+/// `user_data`.
+///
+/// Held one per worker.
 pub struct IORequester {
     backend: IOBackend,
+    /// In-flight disk reads, keyed by their `user_data` id.
     pending_io_requests: HashMap<Identifier, DataFlowRequest>,
     next_id: Identifier,
+
+    /// HTTP transport (shares `backend`'s ring on Linux).
+    http: HttpEngine,
+    /// In-flight HTTP reads, keyed by their engine request id.
+    http_pending: HashMap<Identifier, DataFlowRequest>,
+    next_http_id: Identifier,
 }
 
 impl Default for IORequester {
@@ -34,10 +54,19 @@ impl Default for IORequester {
 
 impl IORequester {
     pub fn new() -> Self {
+        Self::with_http_config(default_client_config())
+    }
+
+    /// Build a requester with a specific rustls client config for the HTTP engine
+    /// (tests inject one trusting a loopback test server).
+    pub fn with_http_config(http_config: Arc<rustls::ClientConfig>) -> Self {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             pending_io_requests: Default::default(),
             next_id: 0,
+            http: HttpEngine::new(http_config).expect("Unable to create http engine"),
+            http_pending: Default::default(),
+            next_http_id: 0,
         }
     }
 
@@ -46,8 +75,13 @@ impl IORequester {
     /// target. The block holds an `Arc` on the slot pin, so it stays alive for
     /// the read even if the issuing query is cancelled meanwhile.
     pub fn request(&mut self, request: DataFlowRequest) -> Result<()> {
+        let fd = request
+            .request
+            .location
+            .as_raw_fd()
+            .expect("IORequester::request only handles Local files; remote ones use request_http");
         self.backend.submit_read(
-            request.request.fd,
+            fd,
             request.request.block.file_offset() as u64,
             request.request.block.dest(),
             request.request.block.len(),
@@ -60,27 +94,309 @@ impl IORequester {
         Ok(())
     }
 
-    /// Returns `true` if any reads have not yet completed.
-    pub fn has_pending(&mut self) -> bool {
+    /// Submit an HTTP(S) range read for a [`Remote`](FileLocation::Remote) region.
+    /// The engine drives connect/handshake/request/response on the shared ring
+    /// (Linux) or synchronously (other platforms); the body lands in the block's
+    /// pinned cache slot just like a disk read.
+    pub fn request_http(&mut self, request: DataFlowRequest) -> Result<()> {
+        let read = remote_read(&request);
+        let id = self.next_http_id;
+        #[cfg(target_os = "linux")]
+        self.http.start(&mut self.backend.ring, id, read)?;
+        #[cfg(not(target_os = "linux"))]
+        self.http.start(id, read)?;
+        self.http_pending.insert(id, request);
+        self.next_http_id += 1;
+        Ok(())
+    }
+
+    /// Returns `true` if any read (disk or HTTP) has not yet completed.
+    pub fn has_pending(&self) -> bool {
+        self.has_file_pending() || self.has_http_pending()
+    }
+
+    /// Returns `true` if any disk read is in flight.
+    pub fn has_file_pending(&self) -> bool {
         !self.pending_io_requests.is_empty()
     }
 
-    /// Drains completed reads — each block's bytes have already landed in its
-    /// cache slot, so we just [`commit`](crate::memory::file_cache::MissingBlock::commit)
-    /// (mark its sub-blocks valid) and yield the originating request so the
-    /// issuing operator can count it down.
-    pub fn completions(&mut self) -> Result<impl Iterator<Item = DataFlowRequest>> {
-        let identifiers = self.backend.completions()?;
-        Ok(identifiers.into_iter().map(|(_size, i)| {
-            let request = self.pending_io_requests.remove(&i).unwrap();
-            request.request.block.commit();
-            request
-        }))
+    /// Returns `true` if any HTTP read is in flight.
+    pub fn has_http_pending(&self) -> bool {
+        self.http.has_active()
     }
 
-    /// Blocks until at least one pending read completes.
+    /// Drain completed reads. Each block's bytes have already landed in its cache
+    /// slot, so we [`commit`](crate::memory::file_cache::MissingBlock::commit) it
+    /// and yield the originating request. Disk completions come straight off the
+    /// ring; HTTP completions are routed through the [`HttpEngine`] (which may
+    /// submit follow-up SQEs) before the finished ones are harvested.
+    pub fn completions(&mut self) -> Result<Vec<DataFlowRequest>> {
+        let raw = self.backend.completions()?;
+        let mut out = Vec::new();
+        for (size, ud) in raw {
+            #[cfg(target_os = "linux")]
+            if (ud as u64) & HTTP_TAG != 0 {
+                self.http.on_cqe(&mut self.backend.ring, ud as u64, size)?;
+                continue;
+            }
+            let _ = size;
+            let request = self.pending_io_requests.remove(&ud).unwrap();
+            request.request.block.commit();
+            out.push(request);
+        }
+
+        for id in self.http.take_completed() {
+            let request = self.http_pending.remove(&id).unwrap();
+            request.request.block.commit();
+            out.push(request);
+        }
+
+        Ok(out)
+    }
+
+    /// Blocks until at least one pending read (disk or HTTP) makes progress.
     pub fn wait(&mut self) -> Result<()> {
         self.backend.submit_and_wait(1)?;
         Ok(())
+    }
+}
+
+/// Extract a [`RemoteRead`] descriptor from a remote request.
+fn remote_read(request: &DataFlowRequest) -> RemoteRead {
+    let remote = match &request.request.location {
+        FileLocation::Remote(remote) => remote.clone(),
+        FileLocation::Local(_) => {
+            panic!("request_http only handles Remote files; local ones use request")
+        }
+    };
+    let block = &request.request.block;
+    RemoteRead {
+        remote,
+        offset: block.file_offset() as u64,
+        len: block.len(),
+        dest: block.dest(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end HTTPS plumbing test: a loopback TLS server serves `206` range
+    //! responses, and we drive a remote read through [`IORequester`] into a real
+    //! cache slot, asserting the bytes land and `commit` makes the region a hit.
+    //!
+    //! On macOS this exercises the blocking engine; on Linux the same flow runs
+    //! over the shared io_uring. It also covers per-host keep-alive reuse by
+    //! issuing a second read for a different region of the same object.
+
+    use super::*;
+    use crate::io::{IORequest, RemoteFile};
+    use crate::memory::{init_test_free_pool, memory_ctx};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::thread;
+    use url::Url;
+
+    /// Body byte for absolute file offset `off`, so a served range is predictable.
+    fn pattern(off: usize) -> u8 {
+        (off % 251) as u8
+    }
+
+    /// A client cert verifier that accepts anything — the test server uses a
+    /// self-signed cert and we only care about the transport, not validation.
+    #[derive(Debug)]
+    struct NoVerify;
+
+    impl rustls::client::danger::ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    fn client_config() -> Arc<rustls::ClientConfig> {
+        let config =
+            rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify))
+                .with_no_client_auth();
+        Arc::new(config)
+    }
+
+    /// Spawn a loopback HTTPS server that serves `num_requests` range GETs on a
+    /// single keep-alive connection, returning the bound port.
+    fn spawn_server(num_requests: usize) -> u16 {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let server_config =
+            rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![cert_der],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(key_der),
+                )
+                .unwrap();
+        let server_config = Arc::new(server_config);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            for _ in 0..num_requests {
+                let head = read_head(&mut tls);
+                let (start, end) = parse_range(&head);
+                let len = end - start + 1;
+                let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
+                let resp = format!(
+                    "HTTP/1.1 206 Partial Content\r\n\
+                     Content-Length: {len}\r\n\
+                     Content-Range: bytes {start}-{end}/1000000\r\n\
+                     Connection: keep-alive\r\n\r\n"
+                );
+                tls.write_all(resp.as_bytes()).unwrap();
+                tls.write_all(&body).unwrap();
+                tls.flush().unwrap();
+            }
+        });
+
+        port
+    }
+
+    /// Read a request head (up to and including the blank-line terminator).
+    fn read_head<R: Read>(r: &mut R) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let n = r.read(&mut byte).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+            if buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        buf
+    }
+
+    /// Parse the inclusive `[start, end]` from a `Range: bytes=START-END` header.
+    fn parse_range(head: &[u8]) -> (usize, usize) {
+        let text = String::from_utf8_lossy(head);
+        let line = text
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+            .expect("request has a Range header");
+        let spec = line.split('=').nth(1).unwrap().trim();
+        let mut parts = spec.split('-');
+        let start = parts.next().unwrap().parse().unwrap();
+        let end = parts.next().unwrap().parse().unwrap();
+        (start, end)
+    }
+
+    /// Fetch `[offset, offset + len)` of `loc` via the requester and block until
+    /// it completes.
+    fn fetch(requester: &mut IORequester, loc: &FileLocation, offset: usize, len: usize) {
+        let lookups = memory_ctx().file_cache().get(loc, offset, len);
+        let mut submitted = 0;
+        for lookup in &lookups {
+            for block in lookup.missing() {
+                let req = IORequest {
+                    location: loc.clone(),
+                    block: block.clone(),
+                };
+                requester
+                    .request_http(DataFlowRequest::new(0, 0, req))
+                    .unwrap();
+                submitted += 1;
+            }
+        }
+        assert!(submitted > 0, "expected a cache miss to drive over http");
+
+        // Drive completions until everything submitted has landed.
+        let mut completed = 0;
+        while completed < submitted {
+            if requester.has_pending() {
+                requester.wait().unwrap();
+            }
+            completed += requester.completions().unwrap().len();
+        }
+        // Keep the lookups' pins alive until after the reads committed.
+        drop(lookups);
+    }
+
+    /// Assert `[offset, offset + len)` of `loc` is now a full cache hit holding
+    /// the expected pattern.
+    fn assert_cached(loc: &FileLocation, offset: usize, len: usize) {
+        let hit = memory_ctx().file_cache().get(loc, offset, len);
+        assert_eq!(hit.len(), 1);
+        assert!(hit[0].missing().is_empty(), "expected a cache hit");
+        let bytes = hit.into_iter().next().unwrap().into_data();
+        assert_eq!(bytes.len(), len);
+        for (i, &b) in bytes.iter().enumerate() {
+            assert_eq!(b, pattern(offset + i), "byte {i}");
+        }
+    }
+
+    #[test]
+    fn https_range_read_lands_in_cache_and_reuses_connection() {
+        init_test_free_pool(16);
+        let port = spawn_server(2);
+
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
+        let remote = Arc::new(RemoteFile::open(url).unwrap());
+        let loc = FileLocation::Remote(remote);
+        memory_ctx().file_cache().open_entry(loc.clone());
+
+        let mut requester = IORequester::with_http_config(client_config());
+
+        // First read: connect + TLS handshake + range GET into the cache slot.
+        fetch(&mut requester, &loc, 0, 4096);
+        assert_cached(&loc, 0, 4096);
+
+        // Second read of a different region: must reuse the pooled keep-alive
+        // connection (the server only accepts one TCP connection).
+        fetch(&mut requester, &loc, 4096, 2 * 4096);
+        assert_cached(&loc, 4096, 2 * 4096);
     }
 }

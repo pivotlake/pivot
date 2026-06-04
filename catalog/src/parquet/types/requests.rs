@@ -1,7 +1,7 @@
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use bytes::Bytes;
-use dispatch::io::IORequest;
+use dispatch::io::{FileLocation, FsRequest};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use std::os::fd::{AsRawFd, RawFd};
 
@@ -20,14 +20,15 @@ struct ColumnRequest {
 impl ColumnRequest {
     /// Build a `ColumnRequest` from column chunk metadata, queueing the reads
     /// for any missing sub-blocks onto `io_requests`.
-    fn from(meta: &ColumnChunkMeta, fd: RawFd, io_requests: &mut Vec<IORequest>) -> Self {
+    fn from(meta: &ColumnChunkMeta, fd: RawFd, io_requests: &mut Vec<FsRequest>) -> Self {
         let col_start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
         let len = meta.total_compressed_size as usize;
 
-        let parts = memory_ctx().file_cache().get(fd, col_start, len);
+        let location = FileLocation::Local(fd);
+        let parts = memory_ctx().file_cache().get(&location, col_start, len);
         for lookup in &parts {
             for block in lookup.missing() {
-                io_requests.push(IORequest {
+                io_requests.push(FsRequest {
                     fd,
                     block: block.clone(),
                 });
@@ -53,8 +54,8 @@ impl ColumnRequest {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     column_requests: Vec<ColumnRequest>,
-    /// IO requests not yet submitted to io-uring.
-    pending_io: Vec<IORequest>,
+    /// Filesystem read requests not yet submitted to io-uring.
+    pending_io: Vec<FsRequest>,
     /// Outstanding read count (pending + in-flight).
     remaining: usize,
 }
@@ -90,8 +91,8 @@ impl RowGroupRequest {
         self.remaining == 0
     }
 
-    /// Returns IO requests that haven't been submitted yet.
-    pub fn pending_io(&mut self) -> &mut Vec<IORequest> {
+    /// Returns filesystem read requests that haven't been submitted yet.
+    pub fn pending_io(&mut self) -> &mut Vec<FsRequest> {
         &mut self.pending_io
     }
 
