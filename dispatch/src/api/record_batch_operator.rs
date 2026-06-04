@@ -59,7 +59,7 @@ use crate::operations::channels::{
 use crate::operations::parquet::types::projection::Projection;
 use crate::operations::parquet::{
     MaterializerFactory, ParquetTable, RowGroupFetcherFactory, RowGroupInjectorFactory,
-    RowGroupRequest,
+    RowGroupRequest, ScanEqualityPredicate,
 };
 use crate::operations::{
     AggSpec, AggregateFactory, CopyOutFactory, CountFactory, CountValueExtractor, FilterFactory,
@@ -604,6 +604,7 @@ impl RecordBatchOperatorSpec {
             projection,
             RECORD_BATCH_SIZE,
             false,
+            Arc::new(Vec::new()),
         ))
     }
 
@@ -713,6 +714,25 @@ pub fn table_input(
     projection: Projection,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
+    table_input_with_eq_predicates(
+        dispatcher,
+        table,
+        projection,
+        add_row_group_metadata,
+        Arc::new(Vec::new()),
+    )
+}
+
+/// Like [`table_input`], but with pushed-down equality predicates that the
+/// parquet decoder uses to prune row groups by dictionary contents. Pass an
+/// empty `Vec` for no pruning (equivalent to [`table_input`]).
+pub fn table_input_with_eq_predicates(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    projection: Projection,
+    add_row_group_metadata: bool,
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+) -> RecordBatchOperatorSpec {
     let worker_count = dispatcher.worker_count();
     let injector = RowGroupInjectorFactory::new(table, projection.clone());
     let siblings_left = Arc::new(AtomicUsize::new(worker_count));
@@ -731,5 +751,6 @@ pub fn table_input(
         projection,
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
+        eq_predicates,
     ))
 }

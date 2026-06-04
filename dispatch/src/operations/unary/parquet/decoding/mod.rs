@@ -20,7 +20,7 @@ use crate::operations::unary::parquet::types::projection::Projection;
 use crate::operations::unary::parquet::types::table::ParquetTable;
 use crate::operations::{Unary, UnaryFactory};
 use ahash::HashSet;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_schema::{Schema, SchemaRef};
 use std::sync::Arc;
 
@@ -28,6 +28,17 @@ mod column_decoders;
 
 mod row_group_decoder;
 pub use row_group_decoder::{Error as RowGroupDecoderError, RowGroupDecoder};
+
+/// A pushed-down equality predicate (`column == value`) used for dictionary
+/// pruning at scan time. `column_idx` indexes the table's full schema. When a
+/// row group's dictionary for this column excludes `value` (and the column
+/// chunk is fully dictionary encoded), the row group can emit no rows and is
+/// dropped without decoding its data pages.
+#[derive(Clone, Debug)]
+pub struct ScanEqualityPredicate {
+    pub column_idx: usize,
+    pub value: Scalar<ArrayRef>,
+}
 
 /// Factory for creating [`Decoder`] instances, one per worker thread.
 pub struct DecoderFactory {
@@ -40,6 +51,8 @@ pub struct DecoderFactory {
     /// Whether to append row-group-id and row-index metadata columns to each
     /// output batch (used by the materializer path).
     pub add_row_group_metadata: bool,
+    /// Pushed-down equality predicates for dictionary pruning (may be empty).
+    pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 }
 
 impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
@@ -51,6 +64,7 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
             self.table,
             self.projection,
             self.add_row_group_metadata,
+            self.eq_predicates,
         )
     }
 }
@@ -83,6 +97,8 @@ pub struct Decoder {
     /// are silently dropped.
     closed_row_groups: HashSet<usize>,
     add_row_group_metadata: bool,
+    /// Pushed-down equality predicates for dictionary pruning (may be empty).
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 }
 
 impl Decoder {
@@ -91,6 +107,7 @@ impl Decoder {
         table: Arc<ParquetTable>,
         projection: Projection,
         add_row_group_metadata: bool,
+        eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     ) -> Self {
         let schema = Arc::new(project_schema(table.schema(), &projection));
         Self {
@@ -101,6 +118,7 @@ impl Decoder {
             row_group_decoders: Vec::new(),
             closed_row_groups: Default::default(),
             add_row_group_metadata,
+            eq_predicates,
         }
     }
 
@@ -123,6 +141,7 @@ impl Decoder {
             &self.projection,
             self.batch_size,
             self.add_row_group_metadata,
+            &self.eq_predicates,
         )?);
         Ok(self.row_group_decoders.len() - 1)
     }
@@ -175,6 +194,16 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
 
         let pos = self.get_or_create_row_group_decoder_idx(&page.query_row_group_metadata)?;
         self.row_group_decoders[pos].insert_page(page, &mut self.allocator);
+
+        // A just-inserted dictionary page may have pruned the row group (its
+        // dictionary excludes a pushed-down equality constant). Drop it without
+        // emitting, and ignore its remaining in-flight data pages.
+        if self.row_group_decoders[pos].pruned() {
+            let row_group_idx = self.row_group_decoders[pos].row_group_idx();
+            self.closed_row_groups.insert(row_group_idx);
+            self.row_group_decoders.remove(pos);
+            return Ok(());
+        }
 
         // Try sending from the decoder that just got a page; this page might be hot!
         if let Some(b) = self.row_group_decoders[pos].try_read(&mut self.allocator)? {
@@ -243,6 +272,7 @@ mod tests {
                     total_compressed_size: 0,
                     max_def_level: 0,
                     statistics: None,
+                    data_pages_all_dictionary: false,
                 })
                 .collect(),
             num_rows,
@@ -315,6 +345,7 @@ mod tests {
             table.clone(),
             Projection::all_from_schema(table.schema()),
             false,
+            Arc::new(Vec::new()),
         )
     }
 

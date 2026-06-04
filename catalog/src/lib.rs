@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar};
 use dispatch::{
     DataFlowDispatcher, ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec,
-    RowGroupMetadata, table_input,
+    RowGroupMetadata, ScanEqualityPredicate, table_input_with_eq_predicates,
 };
 use planner::catalog::{
     Catalog, Column, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
@@ -100,6 +100,7 @@ impl ParquetCatalog {
         let table = ParquetCatalogTable {
             columns: request.columns,
             parquet,
+            eq_predicates: Vec::new(),
         };
 
         match self.tables.write().unwrap().entry(request.name) {
@@ -132,6 +133,10 @@ impl Catalog for ParquetCatalog {
 pub struct ParquetCatalogTable {
     pub columns: Vec<Column>,
     pub parquet: ParquetTable,
+    /// Equality predicates pushed down by DuckDB. The scan uses them to prune
+    /// row groups by dictionary contents; the upstream `Filter` still runs, so
+    /// pruning is a pure optimization.
+    pub eq_predicates: Vec<ScanEqualityPredicate>,
 }
 
 impl Table for ParquetCatalogTable {
@@ -141,7 +146,13 @@ impl Table for ParquetCatalogTable {
         projection: Projection,
     ) -> RecordBatchOperatorSpec {
         let parquet = Arc::new(self.parquet.clone());
-        table_input(dispatcher, &parquet, projection, false)
+        table_input_with_eq_predicates(
+            dispatcher,
+            &parquet,
+            projection,
+            false,
+            Arc::new(self.eq_predicates.clone()),
+        )
     }
 
     fn columns(&self) -> Vec<Column> {
@@ -172,6 +183,17 @@ impl Table for ParquetCatalogTable {
             }
         });
         retain_err?;
+
+        // Record equality predicates so the scan can prune row groups whose
+        // dictionary for this column excludes the constant. The upstream
+        // `Filter` is kept (we return `Ok(false)`), so this is purely an
+        // optimization and never affects correctness.
+        if matches!(compare.compare_type, CompareType::Equal) {
+            self.eq_predicates.push(ScanEqualityPredicate {
+                column_idx: reference.column_idx,
+                value: constant.clone(),
+            });
+        }
 
         Ok(false)
     }

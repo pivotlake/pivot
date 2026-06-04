@@ -5,7 +5,7 @@ mod decompressor;
 pub use decompressor::{DecompressorFactory, Error as DecompressorError};
 
 mod decoding;
-pub use decoding::{DecoderFactory, RowGroupDecoderError};
+pub use decoding::{DecoderFactory, RowGroupDecoderError, ScanEqualityPredicate};
 
 mod fetching;
 pub use fetching::{RowGroupFetcherFactory, RowGroupInjectorFactory};

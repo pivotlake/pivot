@@ -217,6 +217,7 @@ where
     T::Native: ReadLeBytes,
 {
     entries: MultiSlabBuffer<T::Native>,
+    size: usize,
 }
 
 impl<T: ArrowPrimitiveType> Dict for PrimitiveDict<T>
@@ -231,7 +232,12 @@ where
         let mut position = ReaderPosition::default();
         let mut len = 0;
         read_primitives::<T::Native, _>(&data, &mut position, &mut entries, &mut len, size);
-        Self { entries }
+        Self { entries, size }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.size
     }
 
     #[inline(always)]

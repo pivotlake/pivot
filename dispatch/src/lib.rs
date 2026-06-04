@@ -80,6 +80,7 @@ pub use operations::nullary::Result as NullaryResult;
 pub use operations::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };
+pub use operations::parquet::ScanEqualityPredicate;
 pub use operations::parquet::types::projection::Projection;
 pub use operations::parquet::types::table::{Error as ParquetTableError, ParquetTable};
 pub use operations::{

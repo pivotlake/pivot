@@ -47,6 +47,12 @@ pub struct ColumnChunkMeta {
     /// Decoded min/max for this chunk, when the writer recorded statistics
     /// and the column's Arrow type is one we know how to decode.
     pub statistics: Option<ColumnStatistics>,
+    /// True when this chunk has a dictionary page and every one of its data
+    /// pages is dictionary-encoded (per the footer's `encoding_stats`). Only
+    /// then is it sound to prune the whole row group when the dictionary does
+    /// not contain a pushed-down equality constant — otherwise a non-dictionary
+    /// data page could hold a matching value absent from the dictionary.
+    pub data_pages_all_dictionary: bool,
 }
 
 /// Static, file-level metadata for a single Parquet row group.
