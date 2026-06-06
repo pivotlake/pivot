@@ -1,24 +1,50 @@
 //! ORDER BY … LIMIT k operator.
 //!
-//! A pipeline breaker that keeps only the top-k rows per sort key across
-//! all input batches. Like GROUP BY, it has two phases:
+//! A pipeline breaker that keeps only the top-k rows per sort key across all
+//! input batches, where k = `limit + offset` ("fetch").
 //!
-//! ## Phase 1: Consume
+//! ## Consume
 //!
-//! Each worker receives [`RecordBatch`]es and immediately reduces each one
-//! to its local top-k via [`get_top_k_from_single`] (Arrow `lexsort_to_indices`
-//! with a limit). The per-batch top-k results are accumulated in a `Vec`.
+//! Each worker merges every incoming batch into a single running top-k
+//! ([`running_top_k`](OrderByLimit::running_top_k)), so it holds at most `fetch`
+//! rows at a time. On finalization it sends that to a shared mpsc channel.
 //!
-//! When consumption finishes ([`into_outputter`](Consumer::into_outputter)),
-//! the worker merges its accumulated top-k batches into a single local
-//! top-k and sends it to a shared mpsc channel.
+//! ## Output
 //!
-//! ## Phase 2: Output
+//! The worker holding the receiver concatenates the per-worker top-ks and does
+//! the final global top-k sort, emitting one [`RecordBatch`] of at most `limit`
+//! rows in sorted order (after skipping `offset`).
 //!
-//! The worker holding the channel receiver collects all per-worker top-k
-//! batches, concatenates them, and performs a final global top-k sort.
-//! The result is a single [`RecordBatch`] with at most `limit` rows in
-//! sorted order, sent downstream.
+//! ## Rejecting batches before sorting
+//!
+//! Once the running window is full we cache its fetch-th-best key
+//! ([`reject_boundary`](OrderByLimit::reject_boundary)) and test each new batch
+//! against it, so rows that can't reach the global top-k are never sorted. Only
+//! sound for a single nulls-last sort key (then that key is the whole key, and a
+//! null can't enter a full window); multi-key / nulls-first sorts merge plainly.
+//!
+//! One vectorized `cmp(col, boundary)` gives both the reject *and* the count:
+//! `n_keep` = rows that beat the boundary. If `n_keep == 0` the whole batch is
+//! dropped with no sort. Otherwise the rows that beat the boundary are *exactly*
+//! the `n_keep` best by key, so a single-key top-k capped at `min(fetch, n_keep)`
+//! yields precisely the survivors — no `filter` pass, the specialized
+//! single-column sort, and never more than `fetch` rows.
+//!
+//! Why this and not the shapes we tried:
+//! * `min`/`max` value-reject skips the comparison mask but needs a vectorized
+//!   reduction per type; strings have none, so it degrades to a scalar per-row
+//!   `min` that is *slower* than `cmp` on the common rejected path. `cmp`
+//!   prefix-compares against a constant and is uniformly fast.
+//! * `filter`-then-sort materializes survivors into an intermediate batch; the
+//!   `n_keep` cap gets the same survivor-limiting with one fewer pass.
+//! * `lexsort([keep, key])` forces the generic multi-column comparator; sorting
+//!   the key alone keeps the specialized single-column sort (the survivors are
+//!   already the best `n_keep`, so the `keep` column buys nothing in the sort).
+//!
+//! Not handled yet: for a very large `fetch`, merging each accepted batch into
+//! the running top-k re-sorts ~`fetch` rows (concat-and-re-sort). A linear merge
+//! of the two already-sorted runs would make that O(fetch + survivors); deferred
+//! until a large-`fetch` workload needs it.
 
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -135,12 +161,12 @@ fn get_top_k_from_single(
 
 /// Per-worker ORDER BY LIMIT consumer.
 ///
-/// Accumulates a local top-k from each incoming batch. On finalization,
-/// merges them into one local top-k and sends it to the shared channel.
+/// Merges each incoming batch into one running top-k, rejecting batches that
+/// can't reach it once the window is full (see the module docs), then sends the
+/// running top-k to the shared channel on finalization.
 pub struct OrderByLimit {
     limit: usize,
     offset: usize,
-    top_k_per_batch: Vec<RecordBatch>,
     order_by: Vec<OrderBy>,
     sender: mpsc::Sender<RecordBatch>,
     receiver: Option<Receiver<RecordBatch>>,
@@ -148,6 +174,19 @@ pub struct OrderByLimit {
     /// publishes its current Nth-best leading sort key here so sibling scans
     /// can prune row groups that can't reach the global top-N.
     dynamic_filter: Option<Arc<DynamicFilterSlot>>,
+    /// The worker's running top-k: every batch is merged into this single
+    /// `limit + offset`-row batch, so the worker holds one top-k at a time.
+    running_top_k: Option<RecordBatch>,
+    /// Whether to reject whole batches up front against the running boundary.
+    /// Only sound for a single sort key (the leading key is the whole key) with
+    /// nulls ordered last (a null can't enter a full window), so multi-key /
+    /// nulls-first sorts fall back to plain merging.
+    boundary_reject: bool,
+    /// Cached fetch-th-best key: the reject boundary. Rebuilt only after a merge
+    /// actually changes the running top-k, so the common rejected batch reads it
+    /// by reference with no per-batch slice. `Some` only once the window is full
+    /// (and that key is non-null) on a `boundary_reject` sort.
+    reject_boundary: Option<Scalar<ArrayRef>>,
 }
 
 impl OrderByLimit {
@@ -159,15 +198,61 @@ impl OrderByLimit {
         receiver: Option<Receiver<RecordBatch>>,
         dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> Self {
+        let boundary_reject = order_by.len() == 1 && !order_by[0].nulls_first;
         Self {
             limit,
             offset,
-            top_k_per_batch: vec![],
             order_by,
             sender,
             receiver,
             dynamic_filter,
+            running_top_k: None,
+            boundary_reject,
+            reject_boundary: None,
         }
+    }
+
+    /// Reduce an incoming batch to the rows worth merging into the running
+    /// top-k: at most `fetch` already-sorted rows, or `None` if the whole batch
+    /// is provably outside the running top-k (see the module docs).
+    fn reduce_batch(
+        &self,
+        batch: &RecordBatch,
+        fetch: usize,
+    ) -> unary::Result<Option<RecordBatch>> {
+        let Some(boundary) = self.reject_boundary.as_ref() else {
+            // No boundary yet (window not full, or a multi-key / nulls-first sort
+            // that never rejects): nothing to reject against, just take the top-k.
+            return Ok(Some(get_top_k_from_single(
+                batch,
+                &self.order_by,
+                fetch,
+                0,
+            )?));
+        };
+        let ordering = &self.order_by[0];
+        let kernel = if ordering.descending {
+            cmp::gt
+        } else {
+            cmp::lt
+        };
+        let column = batch.column(ordering.column_idx) as &dyn Datum;
+        let keep = kernel(column, boundary as &dyn Datum).map_err(Error::Arrow)?;
+        let n_keep = keep.true_count();
+        if n_keep == 0 {
+            // Nothing beats the boundary → the whole batch is out, with no sort.
+            return Ok(None);
+        }
+        // The rows that beat the boundary are exactly the `n_keep` best by key, so
+        // a single-key top-k capped at `n_keep` yields precisely the survivors —
+        // no `filter` pass, the specialized single-column sort, and never more
+        // than `fetch` rows even when `fetch` is large.
+        Ok(Some(get_top_k_from_single(
+            batch,
+            &self.order_by,
+            fetch.min(n_keep),
+            0,
+        )?))
     }
 
     /// Publish this batch's Nth-best leading key into the shared slot, if the
@@ -234,17 +319,41 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
         // final global merge skips `offset`, since which rows fall in the
         // offset window can only be decided once all workers' tops are merged.
         let fetch = self.limit + self.offset;
-        let batch_top_k = get_top_k_from_single(&batch, &self.order_by, fetch, 0)?;
-        self.publish_boundary(&batch_top_k);
-        self.top_k_per_batch.push(batch_top_k);
+
+        // Reduce the batch to its contribution (or drop it entirely if it can't
+        // reach the running top-k); see `reduce_batch` / the module docs.
+        let Some(candidates) = self.reduce_batch(&batch, fetch)? else {
+            return Ok(());
+        };
+
+        // Merge into the running top-k. Candidates are few once the boundary is
+        // tight, so this is a small sort; before the window fills it's the whole
+        // batch's top-k, exactly as a plain per-batch top-k would be.
+        let merged = match self.running_top_k.take() {
+            None => candidates,
+            Some(prev) => get_top_k_from_top_ks(vec![prev, candidates], &self.order_by, fetch, 0)?,
+        };
+
+        // Publish from the running top-k: its boundary is the worst of the best
+        // `fetch` rows seen so far, so it's at least as tight as any single
+        // batch's — tighter bounds prune more row groups in sibling scans.
+        self.publish_boundary(&merged);
+        // Refresh the cached reject boundary now the top-k has changed. Only the
+        // surviving batches that reach here pay this; rejected batches don't.
+        if self.boundary_reject && merged.num_rows() >= fetch {
+            let last = merged
+                .column(self.order_by[0].column_idx)
+                .slice(merged.num_rows() - 1, 1);
+            if last.is_valid(0) {
+                self.reject_boundary = Some(Scalar::new(last));
+            }
+        }
+        self.running_top_k = Some(merged);
         Ok(())
     }
 
     fn into_outputter(self) -> crate::operations::unary::Result<Option<Self::Outputter>> {
-        let fetch = self.limit + self.offset;
-        if !self.top_k_per_batch.is_empty() {
-            let local_top_k =
-                get_top_k_from_top_ks(self.top_k_per_batch, &self.order_by, fetch, 0)?;
+        if let Some(local_top_k) = self.running_top_k {
             debug!("Sending on {:?}", local_top_k.num_rows());
             self.sender.send(local_top_k).expect("Receiver dropped!");
             worker_waker().notify();
@@ -335,10 +444,13 @@ mod tests {
     }
 
     #[test]
-    fn publishes_boundary_and_keeps_tighter() {
+    fn publishes_running_boundary() {
         let slot = Arc::new(DynamicFilterSlot::new(None));
         let (tx, _rx) = mpsc::channel();
-        // ORDER BY v DESC LIMIT 2 → publish each batch's 2nd-largest, keep the max.
+        // ORDER BY v DESC LIMIT 2 takes the single-key fast path: each batch is
+        // merged into a running top-2, and the boundary published is that
+        // running top-2's 2nd-largest — i.e. the true global 2nd-largest so
+        // far, which is at least as tight as any single batch's boundary.
         let mut op = OrderByLimit::new(
             vec![OrderBy::new(0, true, false)],
             2,
@@ -350,13 +462,13 @@ mod tests {
         let mut sink = CollectSender::new();
 
         op.consume(batch(&[10, 20, 30]), &mut sink).unwrap();
-        assert_eq!(slot_value(&slot), Some(20)); // top-2 of this batch is [30, 20]
+        assert_eq!(slot_value(&slot), Some(20)); // running top-2 [30, 20]
 
         op.consume(batch(&[100, 5]), &mut sink).unwrap();
-        assert_eq!(slot_value(&slot), Some(20)); // batch boundary 5 is looser, ignored
+        assert_eq!(slot_value(&slot), Some(30)); // running top-2 now [100, 30]
 
         op.consume(batch(&[50, 60]), &mut sink).unwrap();
-        assert_eq!(slot_value(&slot), Some(50)); // batch boundary 50 is tighter
+        assert_eq!(slot_value(&slot), Some(60)); // running top-2 now [100, 60]
     }
 
     #[test]
