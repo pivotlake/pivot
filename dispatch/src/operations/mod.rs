@@ -46,6 +46,9 @@ use thiserror::Error;
 
 pub mod channels;
 
+pub mod in_memory;
+pub use in_memory::{Forward, InjectorSourceFactory};
+
 pub mod nullary;
 pub use nullary::*;
 

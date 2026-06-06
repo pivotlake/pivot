@@ -1,6 +1,9 @@
-use crate::operations::UnaryOperatorFactory;
+use crate::operations::{
+    DefaultUnaryFactory, Forward, InjectorSourceFactory, MapFactory, RootUnaryOperatorFactory,
+    UnaryFactory, UnaryOperatorFactory,
+};
 use crate::operations::channels::{
-    ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, mpsc_channel,
+    ChannelFactory, ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, mpsc_channel,
     return_to_worker_mpsc, stealable,
 };
 use crate::operations::parquet::DecoderFactory;
@@ -89,6 +92,91 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     pub fn collect(self) -> crate::data_flow::Result<Vec<O>> {
         self.execute().collect()
     }
+
+    /// Append one unary stage to the pipeline: one operator per worker, the
+    /// `i`th reading through `channels[i]` and transforming with `unaries[i]`.
+    /// Both vecs must have one entry per worker.
+    ///
+    /// This is the general stage-builder the parquet read pipeline writes out by
+    /// hand and that [`map_each`](Self::map_each) is a special case of. Choosing
+    /// the channel kind lets a stage fan out work ([`stealable`]) or pin items
+    /// to a worker ([`return_to_worker_mpsc`]); per-worker `unaries` let a
+    /// pipeline breaker give one worker a distinct role (e.g. the receiver end
+    /// of a worker-0 merge). The `siblings_left` finishing counter is set up for
+    /// you.
+    pub fn chain<O2, UF, C>(
+        self,
+        channels: Vec<C>,
+        unaries: Vec<UF>,
+    ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, UF, C, OF>>
+    where
+        O2: Send + 'static,
+        UF: UnaryFactory<O, O2>,
+        C: ChannelFactory<O>,
+    {
+        let siblings_left = Arc::new(AtomicUsize::new(self.factories.len()));
+        let factories: Vec<_> = channels
+            .into_iter()
+            .zip(unaries)
+            .zip(self.factories)
+            .map(|((channel, unary), head)| {
+                UnaryOperatorFactory::new(head, unary, channel, siblings_left.clone())
+            })
+            .collect();
+        OperatorSpec::new(self.dispatcher, factories)
+    }
+
+    /// Append a parallel 1→1 map stage: every item is transformed by `f` on
+    /// whatever worker handles it. The stage reads through a work-stealing
+    /// channel, so items rebalance across idle workers — the basis of a
+    /// perfectly parallel job pipeline (e.g. [`values_input`] → `map_each` to
+    /// encode one Parquet page per item).
+    ///
+    /// A thin wrapper over [`chain`](Self::chain): a [`stealable`] channel and
+    /// `f` cloned once per worker (so `f` must be `Clone` — capture only
+    /// cheap/shared state).
+    pub fn map_each<O2, F>(
+        self,
+        f: F,
+    ) -> OperatorSpec<O2, UnaryOperatorFactory<O, O2, MapFactory<F>, StealableChannelFactory<O>, OF>>
+    where
+        O2: Send + 'static,
+        F: FnMut(O) -> O2 + Clone + Send + 'static,
+    {
+        let worker_count = self.factories.len();
+        let channels: Vec<_> = stealable::<O>(worker_count).into_iter().collect();
+        let unaries: Vec<_> = (0..worker_count).map(|_| MapFactory(f.clone())).collect();
+        self.chain(channels, unaries)
+    }
+}
+
+/// Source: stream a fixed, in-memory set of values across the worker pool.
+///
+/// The items are loaded into a shared work-stealing queue and fan out across
+/// all workers exactly like a table scan distributes row groups — the
+/// in-memory, any-type counterpart of [`table_input`](super::table_input).
+/// Chain [`map_each`](OperatorSpec::map_each) to process each item in parallel.
+#[allow(clippy::type_complexity)]
+pub fn values_input<T: Send + 'static>(
+    dispatcher: &DataFlowDispatcher,
+    items: impl IntoIterator<Item = T>,
+) -> OperatorSpec<
+    T,
+    RootUnaryOperatorFactory<T, T, DefaultUnaryFactory<Forward<T>>, InjectorSourceFactory<T>>,
+> {
+    let worker_count = dispatcher.worker_count();
+    let injector = InjectorSourceFactory::new(items);
+    let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+    let factories: Vec<_> = (0..worker_count)
+        .map(|_| {
+            RootUnaryOperatorFactory::new(
+                DefaultUnaryFactory::<Forward<T>>::new(),
+                injector.clone(),
+                siblings_left.clone(),
+            )
+        })
+        .collect();
+    OperatorSpec::new(dispatcher.clone(), factories)
 }
 
 impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {

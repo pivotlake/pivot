@@ -85,6 +85,17 @@ pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use operations::parquet::RowGroupFilter;
 pub use operations::parquet::ScanEqualityPredicate;
+
+pub use operations::channels::{
+    ChannelFactory, FanInChannelFactory, MpscReceiver, Receiver, ReturnToWorkerMpscFactory,
+    RootChannelFactory, StealableChannelFactory, WorkerAwareSender, WorkerIdOutput, fan_in,
+    mpsc_channel, return_to_worker_mpsc, stealable,
+};
+pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
+pub use operations::{
+    Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
+    RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+};
 pub use operations::parquet::types::metadata::{
     ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
 };

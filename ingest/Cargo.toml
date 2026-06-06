@@ -1,0 +1,43 @@
+[package]
+name = "ingest"
+version = "0.1.0"
+edition = "2024"
+description = "Receivers that ingest external telemetry (OTLP today) and sink it into Parquet files, offloading the CPU-heavy encode onto dispatch workers."
+
+[dependencies]
+dispatch = { path = "../dispatch" }
+thriftparquet = { path = "../thriftparquet" }
+
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+# In-house Parquet encoding (no upstream `parquet` crate): the shared
+# `thriftparquet` metadata/codec layer plus the same snappy lib the reader uses.
+snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "1e20a92f7bcad208bf6869f5394101288850ee2e" }
+
+# OTLP over gRPC. tonic 0.14 split prost codegen into `tonic-prost`; the
+# generated service code lives in `opentelemetry-proto` (gen-tonic), so we only
+# need tonic's server transport here.
+tonic = { version = "0.14", features = ["server", "transport", "router", "codegen", "gzip"] }
+prost = "0.14"
+opentelemetry-proto = { version = "0.31", default-features = false, features = [
+    "gen-tonic",
+    "logs",
+    "trace",
+    "metrics",
+] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+# Upload Parquet to object storage (gs://, s3://). Local writes bypass this.
+object_store = { version = "0.12", features = ["gcp", "aws"] }
+# OTLP column mappings are configured via TOML (see `otel::config`).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# Strict, spec-compliant reader used only as a test oracle: if arrow-rs's
+# reader accepts our hand-rolled files, other engines (DuckDB, etc.) will too.
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }

@@ -9,6 +9,7 @@ arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
 arrow-buffer = { path = "../arrow-rs/arrow-buffer"}
+thriftparquet = { path = "../thriftparquet" }
 
 crossbeam-deque = "0.8.6"
 core_affinity = "0.8.3"
