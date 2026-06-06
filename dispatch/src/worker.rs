@@ -310,7 +310,9 @@ impl Worker {
         }
     }
 
-    /// Deliver completed IO buffers back to the operators that requested them.
+    /// Deliver completed IO back to the operators that requested it. The
+    /// requester has already committed each read's bytes into its cache slot,
+    /// so we just hand the originating request to its operator to count down.
     fn process_io_completions(&mut self) -> Result<()> {
         for request in self.io.completions()? {
             let data_flow = self.data_flows.get_mut(&request.data_flow_id).unwrap();

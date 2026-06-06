@@ -86,6 +86,7 @@ mod data_flow_handle;
 mod record_batch_operator;
 pub use data_flow_handle::{CancelToken, DataFlowHandle};
 
+pub use operator_spec::values_input;
 pub use record_batch_operator::{
     RECORD_BATCH_SIZE, RecordBatchFactoryBridge, RecordBatchOperatorFactory,
     RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory, table_input, table_input_with_filter,

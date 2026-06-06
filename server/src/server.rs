@@ -19,7 +19,8 @@
 //! thread has already terminated.
 
 use crate::query_handler::PivotHandlers;
-use dispatch::{Dispatch, Shutdown};
+use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
+use ingest::{IngestConfig, Ingestor};
 use pgwire::tokio::process_socket;
 use planner::catalog::Catalog;
 use std::io;
@@ -55,6 +56,11 @@ pub struct Server {
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
     handlers: Arc<PivotHandlers>,
+    /// Cloned dispatcher handed to the ingest sources so their Parquet encodes
+    /// run on the same worker pool as queries.
+    dispatcher: DataFlowDispatcher,
+    /// Ingest sources to start when [`serve`](Self::serve) runs.
+    ingests: Vec<IngestConfig>,
 }
 
 impl Server {
@@ -64,9 +70,15 @@ impl Server {
     /// dispatcher for the query handler and adopts every worker `JoinHandle`
     /// for the shutdown / fault-detection path. Pass port `0` in `bind` to
     /// let the OS pick a free port (useful in tests).
-    pub fn new(bind: SocketAddr, dispatch: Dispatch, catalog: Arc<dyn Catalog>) -> Self {
-        // Clone the dispatcher out *before* `into_parts` drops it; the
-        // query handler needs it to compile every plan.
+    pub fn new(
+        bind: SocketAddr,
+        dispatch: Dispatch,
+        catalog: Arc<dyn Catalog>,
+        ingests: Vec<IngestConfig>,
+    ) -> Self {
+        // Clone the dispatcher out *before* `into_parts` drops it; the query
+        // handler needs it to compile every plan, and the ingest sources need
+        // it to encode Parquet on the worker pool.
         let dispatcher = dispatch.dispatcher().clone();
         let (handles, shutdown) = dispatch.into_parts();
         let mut watchers = JoinSet::new();
@@ -77,7 +89,9 @@ impl Server {
             bind,
             shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(catalog, dispatcher)),
+            handlers: Arc::new(PivotHandlers::new(catalog, dispatcher.clone())),
+            dispatcher,
+            ingests,
         }
     }
 
@@ -95,13 +109,25 @@ impl Server {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, "listening for psql connections");
 
+        // Start the configured ingest sources (OTLP receivers, etc.). They
+        // encode Parquet on the dispatch workers, so they must be drained
+        // before the workers stop. `Option` so the two terminal arms below can
+        // each take ownership without the borrow checker tripping over the loop.
+        let mut ingestor =
+            Some(Ingestor::start(std::mem::take(&mut self.ingests), self.dispatcher.clone())?);
+
         loop {
             tokio::select! {
                 // Prefer a clean shutdown over a worker exit if both fire on
                 // the same poll: shutdown should look clean.
                 biased;
                 _ = &mut shutdown => {
-                    info!("shutdown signalled, draining workers");
+                    info!("shutdown signalled, draining ingest then workers");
+                    // Drain ingest first — the final flush encodes on the
+                    // workers, which must still be alive.
+                    if let Some(ingestor) = ingestor.take() {
+                        ingestor.shutdown().await;
+                    }
                     self.shutdown.shutdown();
                     // Wait for every worker to observe the flag and exit. No
                     // need to inspect results — we initiated the shutdown.
@@ -109,6 +135,11 @@ impl Server {
                     return Ok(());
                 }
                 Some(joined) = self.worker_watchers.join_next() => {
+                    // A worker died: flushing would hang on a dead worker, so
+                    // stop the receivers without a final flush.
+                    if let Some(ingestor) = ingestor.take() {
+                        ingestor.abort();
+                    }
                     self.shutdown.shutdown();
                     return Err(match joined {
                         Ok(Ok(())) => {
@@ -193,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
-        let server = Server::new(bind(), Dispatch::spin_up(1, 32), catalog());
+        let server = Server::new(bind(), Dispatch::spin_up(1, 32), catalog(), vec![]);
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;

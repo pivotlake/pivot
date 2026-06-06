@@ -65,7 +65,7 @@ use super::channels::{Receiver, Sender};
 use crate::worker::worker_waker;
 
 mod pipeline_breaker;
-pub use pipeline_breaker::Consumer;
+pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 
 mod count;
 pub use count::CountFactory;

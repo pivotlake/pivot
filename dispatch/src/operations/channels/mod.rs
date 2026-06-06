@@ -27,10 +27,15 @@ mod stealable;
 pub use stealable::{StealableChannelFactory, stealable};
 
 mod mpsc;
-pub use mpsc::{MpscSender, mpsc_channel};
+pub use mpsc::{MpscReceiver, MpscSender, mpsc_channel};
+
+mod fan_in;
+pub use fan_in::{FanInChannelFactory, fan_in};
 
 mod return_to_worker;
-pub use return_to_worker::{ReturnToWorkerMpscFactory, WorkerIdOutput, return_to_worker_mpsc};
+pub use return_to_worker::{
+    ReturnToWorkerMpscFactory, WorkerAwareSender, WorkerIdOutput, return_to_worker_mpsc,
+};
 
 use crate::operations::unary::parquet::RowGroupRequest;
 
