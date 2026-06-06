@@ -131,8 +131,9 @@ duck_invoke() {
 }
 
 # Parse pivot output (any number of queries) into "id cold hot it1 it2 …"
-# lines: cold is iteration 1, hot is the mean of the rest ("-" if there is no
-# rest), then every per-iteration ms value. The "=== Query qNN ===" headers are
+# lines: cold is iteration 1, hot is the min of the rest ("-" if there is no
+# rest), then every per-iteration ms value. ClickBench's hot metric is the
+# minimum of the warm runs, not their mean. The "=== Query qNN ===" headers are
 # skipped — only "[i/N] ..." lines count. (The table reads just cold/hot; the
 # trailing iterations are for the per-query recap.)
 parse_pivot() {
@@ -143,33 +144,34 @@ parse_pivot() {
         split($1, a, "/"); itn = a[1]; gsub(/[^0-9]/, "", itn)
         if (!(id in seen)) { seen[id] = 1; order[++n] = id }
         if (itn + 0 == 1) cold[id] = t
-        else { sum[id] += t; cnt[id]++ }
+        else { if (!(id in cnt) || t < hmin[id]) hmin[id] = t; cnt[id]++ }
         iters[id] = (id in iters ? iters[id] " " : "") sprintf("%.1f", t)
     }
     END {
         for (i = 1; i <= n; i++) {
             k = order[i]
-            h = (cnt[k] > 0) ? sprintf("%.1f", sum[k] / cnt[k]) : "-"
+            h = (cnt[k] > 0) ? sprintf("%.1f", hmin[k]) : "-"
             printf "%s %.1f %s %s\n", k, cold[k], h, iters[k]
         }
     }'
 }
 
 # Parse run-duckdb.sh output into "id cold hot it1 it2 …" lines (seconds → ms).
+# Hot is the min of the warm runs (ClickBench's hot metric), not their mean.
 parse_duck() {
     awk '
     /^=== / { id = $2; if (!(id in seen)) { seen[id] = 1; order[++n] = id } idx = 0; next }
     /Run Time/ && id != "" {
         v = $5 * 1000; idx++
         if (idx == 1) cold[id] = v
-        else { sum[id] += v; cnt[id]++ }
+        else { if (!(id in cnt) || v < hmin[id]) hmin[id] = v; cnt[id]++ }
         iters[id] = (id in iters ? iters[id] " " : "") sprintf("%.1f", v)
     }
     END {
         for (i = 1; i <= n; i++) {
             k = order[i]
             if (!(k in cold)) { printf "%s ERR ERR\n", k; continue }
-            h = (cnt[k] > 0) ? sprintf("%.1f", sum[k] / cnt[k]) : "-"
+            h = (cnt[k] > 0) ? sprintf("%.1f", hmin[k]) : "-"
             printf "%s %.1f %s %s\n", k, cold[k], h, iters[k]
         }
     }'
