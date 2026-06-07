@@ -26,11 +26,15 @@ serde_json = "1"
 # call to sign S3 requests (the tokio it transitively pulls is never driven).
 # Credentials are read from the environment ourselves. GCS uses an OAuth bearer
 # over the JSON API. The hot data path uses none of this — it's on the ring.
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
 aws-sigv4 = "1"
 aws-credential-types = "1"
 # Parse S3 ListObjectsV2 XML; GCS listing is JSON via serde_json.
 quick-xml = { version = "0.37", features = ["serialize"] }
+# GCS OAuth: sign service-account JWTs (RS256) with ring (already in the tree via
+# rustls) and base64-encode the JWT segments.
+ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 # `test-util` exposes dispatch's single-operator test harness for the moved

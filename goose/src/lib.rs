@@ -21,6 +21,7 @@
 // published API — so allow public docs to reference private items.
 #![allow(rustdoc::private_intra_doc_links)]
 
+pub mod lake;
 pub mod metadata;
 pub mod parquet;
 pub mod store;
@@ -43,10 +44,11 @@ use planner::expression::{CompareType, Expression, TableFilter};
 use thiserror::Error;
 
 const PATH_OPTION: &str = "path";
+const URL_OPTION: &str = "url";
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("CREATE TABLE missing required option `{PATH_OPTION}`")]
+    #[error("CREATE TABLE needs a `{PATH_OPTION}` (local directory) or `{URL_OPTION}` (goose catalog) option")]
     MissingPath,
     #[error("path `{0}` does not exist")]
     PathNotFound(String),
@@ -60,6 +62,10 @@ pub enum Error {
     TableExists(String),
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
+    #[error(transparent)]
+    Store(#[from] store::StoreError),
+    #[error("data file `{0}` is on remote object storage; remote data reads are not wired up yet")]
+    RemoteDataNotSupported(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -113,8 +119,82 @@ impl ParquetCatalog {
             parquet,
             eq_predicates: Vec::new(),
         };
+        self.insert(request.name, table)
+    }
 
-        match self.tables.write().unwrap().entry(request.name) {
+    /// Create a table from a goose catalog snapshot (`WITH (url = '…')`).
+    ///
+    /// The URL names one catalog root (one table). If the latest snapshot
+    /// already defines a table, we attach to it — building a [`ParquetTable`]
+    /// over its recorded data files. If the catalog is empty, we CAS-commit a
+    /// new snapshot defining this table (declared columns, no data files yet);
+    /// ingest fills in data files via its own commits.
+    ///
+    /// Remote (`s3://`/`gs://`) *data* files are not yet readable, so attaching
+    /// a catalog whose files live on object storage errors clearly; the catalog
+    /// metadata itself may still live on object storage.
+    ///
+    /// Runs on a dispatch worker (it calls [`ParquetTable::from_files`]).
+    fn create_lake_table(&self, request: CreateTableRequest) -> Result<()> {
+        if request.if_not_exists {
+            return Err(Error::IfNotExistsUnsupported);
+        }
+        let url = request.options.get(URL_OPTION).ok_or(Error::MissingPath)?;
+        let store = store::open_store(url)?;
+        let snapshot = store::latest_snapshot(store.as_ref())?;
+
+        // The URL identifies a single table, so take the sole table the snapshot
+        // describes (if any).
+        let existing = snapshot.schemas.iter().flat_map(|s| &s.tables).next();
+
+        let parquet = match existing {
+            Some(table) => {
+                let mut paths = Vec::with_capacity(table.files.len());
+                for file in &table.files {
+                    match lake::local_path(url, &file.location) {
+                        Some(p) => paths.push(p),
+                        None => {
+                            return Err(Error::RemoteDataNotSupported(file.location.clone()));
+                        }
+                    }
+                }
+                ParquetTable::from_files(&paths)?
+            }
+            None => {
+                // New catalog: commit an initial snapshot defining this table.
+                let columns: Vec<metadata::Column> = request
+                    .columns
+                    .iter()
+                    .map(|c| metadata::Column {
+                        name: c.name.clone(),
+                        type_sql: lake::pivot_type_to_sql(&c.col_type).to_string(),
+                    })
+                    .collect();
+                let name = request.name.clone();
+                store::commit(store.as_ref(), |snap| {
+                    let schema = ensure_main_schema(snap);
+                    schema.tables.push(metadata::Table {
+                        name: name.clone(),
+                        columns: columns.clone(),
+                        files: Vec::new(),
+                    });
+                    Ok(())
+                })?;
+                ParquetTable::new(Vec::new())
+            }
+        };
+
+        let table = ParquetCatalogTable {
+            columns: request.columns,
+            parquet,
+            eq_predicates: Vec::new(),
+        };
+        self.insert(request.name, table)
+    }
+
+    /// Insert a built table, failing if the name is already taken.
+    fn insert(&self, name: String, table: ParquetCatalogTable) -> Result<()> {
+        match self.tables.write().unwrap().entry(name) {
             Entry::Occupied(entry) => Err(Error::TableExists(entry.key().clone())),
             Entry::Vacant(entry) => {
                 entry.insert(table);
@@ -122,6 +202,27 @@ impl ParquetCatalog {
             }
         }
     }
+
+    /// Route a `CREATE TABLE` to the local-directory or goose-catalog backend
+    /// based on which option it carries.
+    fn create_any(&self, request: CreateTableRequest) -> Result<()> {
+        if request.options.contains_key(URL_OPTION) {
+            self.create_lake_table(request)
+        } else {
+            self.create_parquet_table(request)
+        }
+    }
+}
+
+/// Get the `main` schema, creating it if a snapshot somehow lacks one.
+fn ensure_main_schema(snap: &mut metadata::CatalogSnapshot) -> &mut metadata::Schema {
+    if !snap.schemas.iter().any(|s| s.name == "main") {
+        snap.schemas.push(metadata::Schema {
+            name: "main".to_string(),
+            tables: Vec::new(),
+        });
+    }
+    snap.schemas.iter_mut().find(|s| s.name == "main").unwrap()
 }
 
 impl Catalog for ParquetCatalog {
@@ -134,7 +235,7 @@ impl Catalog for ParquetCatalog {
     }
 
     fn create_table(&self, request: CreateTableRequest) -> CatalogResult<()> {
-        Ok(self.create_parquet_table(request)?)
+        Ok(self.create_any(request)?)
     }
 }
 

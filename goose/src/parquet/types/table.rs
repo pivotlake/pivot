@@ -109,6 +109,35 @@ impl ParquetTable {
         Ok(Self::new(row_groups))
     }
 
+    /// Creates a table from an explicit, ordered list of Parquet files.
+    ///
+    /// Like [`from_directory`](Self::from_directory) but the files are named
+    /// directly (e.g. the data-file locations recorded in a goose catalog
+    /// snapshot) rather than discovered by listing a directory. Row groups are
+    /// assigned global indices in the order the files are given. Same
+    /// worker-thread requirement as `from_directory`.
+    pub fn from_files<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
+        assert!(
+            has_memory_context(),
+            "ParquetTable::from_files must run on a dispatch worker thread: \
+             no MemoryContext is installed on the current thread. Off-worker \
+             callers must dispatch via DataFlowDispatcher::run_on_worker."
+        );
+        let mut start_offset = 0;
+        let row_groups: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                parse_row_group_metadatas(start_offset, p.as_ref())
+                    .inspect(|v| start_offset += v.len())
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .map(Arc::new)
+            .collect();
+        Ok(Self::new(row_groups))
+    }
+
     /// Returns the Arrow schema (taken from the first row group).
     pub fn schema(&self) -> &SchemaRef {
         if self.row_groups.is_empty() {

@@ -14,12 +14,19 @@ use crate::metadata::{CatalogSnapshot, MetadataError};
 use std::fmt::Debug;
 use std::path::PathBuf;
 
+mod gcs;
 mod s3;
+pub use gcs::GcsStore;
 pub use s3::S3Store;
 
 /// Directory (key prefix) under the catalog root holding the versioned snapshot
 /// files: `_goose_log/<zero-padded-version>.json`.
 const LOG_DIR: &str = "_goose_log";
+/// Zero-pad versions to a fixed width so lexical key order matches numeric
+/// version order.
+const VERSION_WIDTH: usize = 20;
+/// Optimistic-retry ceiling for a contended commit.
+const MAX_COMMIT_RETRIES: u32 = 10_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -37,6 +44,8 @@ pub enum StoreError {
     Config(String),
     #[error(transparent)]
     Metadata(#[from] MetadataError),
+    #[error("catalog commit lost too many races (>{0} retries)")]
+    TooMuchContention(u32),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -76,9 +85,7 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     if uri.starts_with("s3://") || uri.starts_with("s3a://") {
         Ok(Box::new(S3Store::from_uri(uri)?))
     } else if uri.starts_with("gs://") {
-        Err(StoreError::UnsupportedUri(format!(
-            "{uri}: gs:// not implemented yet"
-        )))
+        Ok(Box::new(GcsStore::from_uri(uri)?))
     } else {
         let path = uri.strip_prefix("file://").unwrap_or(uri);
         Ok(Box::new(LocalStore::new(path)))
@@ -104,6 +111,32 @@ pub fn latest_snapshot(store: &dyn ObjectStore) -> Result<CatalogSnapshot> {
         .get(&key)?
         .ok_or_else(|| StoreError::Http(format!("snapshot {key} vanished between list and get")))?;
     Ok(CatalogSnapshot::from_slice(&bytes)?)
+}
+
+/// Compare-and-swap commit: read the latest snapshot, apply `mutate` to a copy,
+/// then atomically create `_goose_log/<version+1>.json`. On a lost race
+/// (another writer committed that version first) it reloads and retries. This
+/// single create-if-absent is the only synchronization the catalog needs.
+///
+/// `mutate` may return an error to abort the commit (no retry); a storage error
+/// on the create also aborts. Returns the committed snapshot.
+pub fn commit<F>(store: &dyn ObjectStore, mut mutate: F) -> Result<CatalogSnapshot>
+where
+    F: FnMut(&mut CatalogSnapshot) -> Result<()>,
+{
+    for _ in 0..MAX_COMMIT_RETRIES {
+        let mut snap = latest_snapshot(store)?;
+        let base = snap.version;
+        mutate(&mut snap)?;
+        snap.version = base + 1;
+        snap.format_version = crate::metadata::FORMAT_VERSION;
+        let key = format!("{LOG_DIR}/{:0width$}.json", snap.version, width = VERSION_WIDTH);
+        match store.put_if_absent(&key, &snap.to_vec())? {
+            PutOutcome::Created => return Ok(snap),
+            PutOutcome::AlreadyExists => continue,
+        }
+    }
+    Err(StoreError::TooMuchContention(MAX_COMMIT_RETRIES))
 }
 
 /// Parse a snapshot version from a `_goose_log/<version>.json` key.
