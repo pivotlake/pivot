@@ -30,7 +30,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::parquet::{
     ParquetTable, ParquetTableError, ScanEqualityPredicate, row_group_eliminated,
-    row_group_filter_from, table_input_with_filter_and_eq_predicates,
+    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
@@ -156,12 +156,16 @@ impl Table for ParquetCatalogTable {
         dynamic_filters: Vec<DynamicScanPredicate>,
     ) -> RecordBatchOperatorSpec {
         let parquet = Arc::new(self.parquet.clone());
+        // Order the scan by the Top-N's key so its boundary tightens after the
+        // first row group and the rest get pruned, instead of racing file order.
+        let scan_order = scan_order_from(&dynamic_filters);
         table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
             projection,
             false,
             row_group_filter_from(dynamic_filters),
+            scan_order,
             Arc::new(self.eq_predicates.clone()),
         )
     }

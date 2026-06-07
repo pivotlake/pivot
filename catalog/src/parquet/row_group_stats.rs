@@ -49,6 +49,40 @@ pub fn row_group_filter_from(predicates: Vec<DynamicScanPredicate>) -> Option<Ro
 /// is always correct, just without the optimization.
 pub type RowGroupFilter = Arc<dyn Fn(&RowGroupMetadata) -> bool + Send + Sync>;
 
+/// The order in which a scan should hand out row groups when a Top-N publishes a
+/// dynamic boundary on `column_idx`. Stealing the most-promising row groups
+/// first (smallest `min` for an ascending Top-N, largest `max` for a descending
+/// one) makes the boundary tighten after the very first group, so the rest get
+/// pruned instead of decoded — turning a scan-order race into near-ideal
+/// pruning. Purely an optimization: any steal order is correct (the Top-N
+/// re-sorts), this just minimizes how much gets read.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanOrder {
+    pub column_idx: usize,
+    /// `true` for a descending Top-N (order by `max` desc); `false` ascending
+    /// (order by `min` asc).
+    pub descending: bool,
+}
+
+/// Derive a [`ScanOrder`] from dynamic predicates: a single predicate is a Top-N
+/// boundary on one key, so order by it. The compare direction tells us which:
+/// `col < / <= boundary` keeps the smallest (ascending), `col > / >=` the
+/// largest (descending). With zero or multiple predicates there's no single key
+/// to order by, so keep file order (`None`).
+pub fn scan_order_from(predicates: &[DynamicScanPredicate]) -> Option<ScanOrder> {
+    let [pred] = predicates else {
+        return None;
+    };
+    let descending = matches!(
+        pred.compare_type,
+        CompareType::Greater | CompareType::GreaterEqual
+    );
+    Some(ScanOrder {
+        column_idx: pred.column_idx,
+        descending,
+    })
+}
+
 /// Returns `Ok(true)` when min/max statistics prove no row in `row_group` can
 /// satisfy `column_idx <compare_type> constant`, so the row group can be
 /// skipped. Returns `Ok(false)` when it must still be scanned — including when
