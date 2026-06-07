@@ -1,28 +1,21 @@
-//! Object storage for the catalog: listing the `_goose_log/` directory and
-//! fetching snapshot bytes.
+//! Object storage for the catalog: the **control plane** — listing the
+//! `_goose_log/` directory, fetching snapshot bytes, and the atomic
+//! create-if-absent that the CAS commit loop is built on.
 //!
-//! This is the catalog **control plane** — a thin wrapper over the
-//! [`object_store`] crate (local fs, S3, GCS). Per query the planner asks for
-//! the latest snapshot ([`GooseStore::latest_snapshot`]); that's one LIST plus
-//! one GET of a few KB of JSON. It runs off the io_uring ring because
-//! `object_store` already owns the cloud credentials and a LIST is not a
-//! range-GET the ring can serve — but it's rare and tiny, so it costs nothing
-//! next to the hot column-chunk reads (which stay on the ring). Data-file
-//! *bytes* never flow through here.
-//!
-//! `object_store`'s API is async; we drive it from the synchronous planner via a
-//! per-store current-thread Tokio runtime. The calls are infrequent and off the
-//! hot path, so `block_on` is fine. (Planning is synchronous — it is not invoked
-//! from inside another runtime, so there is no nested-runtime hazard.)
+//! Everything here is **synchronous** and pulls in no async runtime: local
+//! access is plain `std::fs`; S3/GCS go over [`ureq`] (blocking HTTP + rustls).
+//! S3 requests are signed with `aws_sigv4::http_request::sign` — a pure function
+//! we call inline (the tokio it transitively links is never driven). Credentials
+//! come from the environment. This runs off the io_uring ring on purpose: a
+//! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
+//! per query) next to the hot column-chunk reads, which stay on the ring.
 
 use crate::metadata::{CatalogSnapshot, MetadataError};
-use object_store::aws::AmazonS3Builder;
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::local::LocalFileSystem;
-use object_store::path::Path as StorePath;
-use object_store::ObjectStore;
-use std::sync::Arc;
-use tokio::runtime::Runtime;
+use std::fmt::Debug;
+use std::path::PathBuf;
+
+mod s3;
+pub use s3::S3Store;
 
 /// Directory (key prefix) under the catalog root holding the versioned snapshot
 /// files: `_goose_log/<zero-padded-version>.json`.
@@ -30,131 +23,195 @@ const LOG_DIR: &str = "_goose_log";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("object store error: {0}")]
-    ObjectStore(#[from] object_store::Error),
+    #[error("io error on `{key}`: {source}")]
+    Io {
+        key: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("http error talking to object store: {0}")]
+    Http(String),
     #[error("unsupported catalog uri `{0}` (expected a local path, file://, s3://, or gs://)")]
     UnsupportedUri(String),
-    #[error("building object store for `{uri}`: {source}")]
-    Build {
-        uri: String,
-        #[source]
-        source: object_store::Error,
-    },
+    #[error("missing credential/config: {0}")]
+    Config(String),
     #[error(transparent)]
     Metadata(#[from] MetadataError),
-    #[error("could not start async runtime for object store: {0}")]
-    Runtime(#[source] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// A catalog root on some object store: the backing client, the base prefix
-/// within it (everything — `_goose_log/` and data files — lives under this), and
-/// a runtime to drive the async API synchronously.
-pub struct GooseStore {
-    store: Arc<dyn ObjectStore>,
-    root: StorePath,
-    rt: Runtime,
-    uri: String,
+/// The outcome of an atomic create-if-absent — the CAS primitive underlying a
+/// catalog commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutOutcome {
+    /// The object did not exist and now holds our bytes.
+    Created,
+    /// Another writer won the race; our bytes were not written.
+    AlreadyExists,
 }
 
-impl std::fmt::Debug for GooseStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GooseStore").field("uri", &self.uri).finish()
-    }
+/// A flat key→bytes object store rooted at one catalog (which, in goose, is one
+/// table). Keys are relative to that root, e.g. `_goose_log/0000…1.json`.
+pub trait ObjectStore: Debug + Send + Sync {
+    /// Fetch an object in full, or `None` if it does not exist.
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Atomically create `key` only if it does not already exist. This single
+    /// operation is the catalog's compare-and-swap: a lost race returns
+    /// [`PutOutcome::AlreadyExists`] without overwriting.
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<PutOutcome>;
+
+    /// List object keys directly under `prefix` (one level, not recursive),
+    /// returned as full keys relative to the root.
+    fn list(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// A human-readable description of where this store points, for diagnostics.
+    fn describe(&self) -> String;
 }
 
-impl GooseStore {
-    /// Open the catalog root at `uri`: `s3://bucket/prefix`, `gs://bucket/prefix`,
-    /// or a local path (optionally `file://`). Cloud credentials come from the
-    /// environment (`AWS_*`, `GOOGLE_APPLICATION_CREDENTIALS`, workload identity),
-    /// resolved by `object_store`.
-    pub fn open(uri: &str) -> Result<Self> {
-        let (store, root) = build_object_store(uri)?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(StoreError::Runtime)?;
-        Ok(Self {
-            store,
-            root,
-            rt,
-            uri: uri.to_string(),
-        })
-    }
-
-    /// The once-per-query "latest snapshot" load: LIST `_goose_log/`, pick the
-    /// highest version, GET and parse it. Returns the empty snapshot if the log
-    /// is empty (a catalog root that exists but has no commits yet).
-    pub fn latest_snapshot(&self) -> Result<CatalogSnapshot> {
-        let log_prefix = self.root.child(LOG_DIR);
-
-        let latest_key = self.rt.block_on(async {
-            // The log is a flat directory of `<version>.json` files, so a single
-            // delimited list (not a recursive stream) enumerates every commit.
-            let listing = self.store.list_with_delimiter(Some(&log_prefix)).await?;
-            let best = listing
-                .objects
-                .into_iter()
-                .filter_map(|meta| parse_version(&meta.location).map(|v| (v, meta.location)))
-                .max_by_key(|(v, _)| *v)
-                .map(|(_, key)| key);
-            Ok::<_, object_store::Error>(best)
-        })?;
-
-        let Some(key) = latest_key else {
-            return Ok(CatalogSnapshot::empty());
-        };
-
-        let bytes = self
-            .rt
-            .block_on(async { self.store.get(&key).await?.bytes().await })?;
-        Ok(CatalogSnapshot::from_slice(&bytes)?)
-    }
-
-    /// The catalog root URI, for diagnostics.
-    pub fn uri(&self) -> &str {
-        &self.uri
-    }
-}
-
-/// Parse a snapshot version from a `_goose_log/<version>.json` path's filename.
-/// Returns `None` for anything that isn't a `<digits>.json` file.
-fn parse_version(path: &StorePath) -> Option<i64> {
-    path.filename()?.strip_suffix(".json")?.parse::<i64>().ok()
-}
-
-/// Build an [`ObjectStore`] and base prefix from a catalog-root URI. Mirrors
-/// ingest's `build_object_store` so the workspace resolves one client per scheme.
-fn build_object_store(uri: &str) -> Result<(Arc<dyn ObjectStore>, StorePath)> {
-    let build_err = |source| StoreError::Build {
-        uri: uri.to_string(),
-        source,
-    };
-
-    if let Some(rest) = uri.strip_prefix("gs://") {
-        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-        let store = GoogleCloudStorageBuilder::from_env()
-            .with_bucket_name(bucket)
-            .build()
-            .map_err(build_err)?;
-        Ok((Arc::new(store), StorePath::from(prefix)))
-    } else if let Some(rest) = uri
-        .strip_prefix("s3://")
-        .or_else(|| uri.strip_prefix("s3a://"))
-    {
-        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-        let store = AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .build()
-            .map_err(build_err)?;
-        Ok((Arc::new(store), StorePath::from(prefix)))
+/// Open the object store for a catalog root URI: `s3://bucket/prefix`,
+/// `gs://bucket/prefix`, or a local path (optionally `file://`).
+pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
+    if uri.starts_with("s3://") || uri.starts_with("s3a://") {
+        Ok(Box::new(S3Store::from_uri(uri)?))
+    } else if uri.starts_with("gs://") {
+        Err(StoreError::UnsupportedUri(format!(
+            "{uri}: gs:// not implemented yet"
+        )))
     } else {
-        // Local filesystem. The store is rooted at the directory, so the base
-        // prefix within it is empty.
         let path = uri.strip_prefix("file://").unwrap_or(uri);
-        let store = LocalFileSystem::new_with_prefix(path).map_err(build_err)?;
-        Ok((Arc::new(store), StorePath::default()))
+        Ok(Box::new(LocalStore::new(path)))
+    }
+}
+
+/// Load the latest committed snapshot for a catalog: LIST `_goose_log/`, take
+/// the highest version, GET and parse it. This is the once-per-query "latest"
+/// read, called when resolving a remote table. Returns the empty snapshot if the
+/// log has no commits yet.
+pub fn latest_snapshot(store: &dyn ObjectStore) -> Result<CatalogSnapshot> {
+    let keys = store.list(LOG_DIR)?;
+    let latest = keys
+        .iter()
+        .filter_map(|k| parse_version(k).map(|v| (v, k)))
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, k)| k.clone());
+
+    let Some(key) = latest else {
+        return Ok(CatalogSnapshot::empty());
+    };
+    let bytes = store
+        .get(&key)?
+        .ok_or_else(|| StoreError::Http(format!("snapshot {key} vanished between list and get")))?;
+    Ok(CatalogSnapshot::from_slice(&bytes)?)
+}
+
+/// Parse a snapshot version from a `_goose_log/<version>.json` key.
+fn parse_version(key: &str) -> Option<i64> {
+    key.rsplit('/')
+        .next()?
+        .strip_suffix(".json")?
+        .parse::<i64>()
+        .ok()
+}
+
+/// The local-filesystem backend: keys are paths under `root`.
+#[derive(Debug)]
+pub struct LocalStore {
+    root: PathBuf,
+}
+
+impl LocalStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn path_for(&self, key: &str) -> PathBuf {
+        self.root.join(key)
+    }
+}
+
+impl ObjectStore for LocalStore {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        match std::fs::read(self.path_for(key)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<PutOutcome> {
+        let path = self.path_for(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                key: key.to_string(),
+                source,
+            })?;
+        }
+        // `create_new` is an atomic O_EXCL create — the local CAS primitive.
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(data).map_err(|source| StoreError::Io {
+                    key: key.to_string(),
+                    source,
+                })?;
+                Ok(PutOutcome::Created)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(PutOutcome::AlreadyExists),
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        let dir = self.path_for(prefix);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // A not-yet-created log directory lists as empty, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    key: prefix.to_string(),
+                    source,
+                });
+            }
+        };
+        let mut keys = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| StoreError::Io {
+                key: prefix.to_string(),
+                source,
+            })?;
+            if let Some(name) = entry.file_name().to_str() {
+                keys.push(format!("{}/{}", prefix.trim_end_matches('/'), name));
+            }
+        }
+        Ok(keys)
+    }
+
+    fn describe(&self) -> String {
+        format!("local:{}", self.root.display())
+    }
+}
+
+/// Join a relative catalog key onto an in-bucket prefix, preserving the prefix's
+/// (possibly empty) value. Shared by the remote backends.
+fn join_prefix(prefix: &str, key: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        key.trim_start_matches('/').to_string()
+    } else {
+        format!("{prefix}/{}", key.trim_start_matches('/'))
     }
 }
 
@@ -162,7 +219,6 @@ fn build_object_store(uri: &str) -> Result<(Arc<dyn ObjectStore>, StorePath)> {
 mod tests {
     use super::*;
     use crate::metadata::{Column, DataFile, Schema, Table, FORMAT_VERSION};
-    use std::fs;
 
     fn snapshot(version: i64, table: &str) -> CatalogSnapshot {
         CatalogSnapshot {
@@ -174,7 +230,7 @@ mod tests {
                     name: table.into(),
                     columns: vec![Column { name: "id".into(), type_sql: "INTEGER".into() }],
                     files: vec![DataFile {
-                        location: "_goose_data/main/t/a.parquet".into(),
+                        location: "_goose_data/a.parquet".into(),
                         size: Some(123),
                         row_count: 1,
                     }],
@@ -183,42 +239,64 @@ mod tests {
         }
     }
 
-    fn write_log(root: &std::path::Path, version: i64, snap: &CatalogSnapshot) {
-        let log = root.join(LOG_DIR);
-        fs::create_dir_all(&log).unwrap();
-        fs::write(log.join(format!("{version:020}.json")), snap.to_vec()).unwrap();
+    fn commit(store: &dyn ObjectStore, version: i64, snap: &CatalogSnapshot) {
+        let key = format!("{LOG_DIR}/{version:020}.json");
+        assert_eq!(
+            store.put_if_absent(&key, &snap.to_vec()).unwrap(),
+            PutOutcome::Created
+        );
     }
 
     #[test]
-    fn empty_log_yields_empty_snapshot() {
+    fn local_put_if_absent_is_a_cas() {
         let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(LOG_DIR)).unwrap();
-        let store = GooseStore::open(dir.path().to_str().unwrap()).unwrap();
-        let snap = store.latest_snapshot().unwrap();
-        assert_eq!(snap.version, 0);
+        let store = LocalStore::new(dir.path());
+        assert_eq!(store.put_if_absent("k", b"first").unwrap(), PutOutcome::Created);
+        // Second writer loses the race; original bytes are untouched.
+        assert_eq!(
+            store.put_if_absent("k", b"second").unwrap(),
+            PutOutcome::AlreadyExists
+        );
+        assert_eq!(store.get("k").unwrap().unwrap(), b"first");
     }
 
     #[test]
-    fn picks_highest_version_across_commits() {
+    fn local_get_missing_is_none_and_list_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        // Write out of order to prove it sorts by parsed version, not listing order.
-        write_log(dir.path(), 2, &snapshot(2, "events"));
-        write_log(dir.path(), 10, &snapshot(10, "latest"));
-        write_log(dir.path(), 1, &snapshot(1, "first"));
+        let store = LocalStore::new(dir.path());
+        assert!(store.get("nope").unwrap().is_none());
+        assert!(store.list(LOG_DIR).unwrap().is_empty());
+    }
 
-        let store = GooseStore::open(dir.path().to_str().unwrap()).unwrap();
-        let snap = store.latest_snapshot().unwrap();
+    #[test]
+    fn latest_snapshot_picks_highest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        // Commit out of order to prove sorting is by parsed version.
+        commit(&store, 2, &snapshot(2, "events"));
+        commit(&store, 10, &snapshot(10, "latest"));
+        commit(&store, 1, &snapshot(1, "first"));
+
+        let snap = latest_snapshot(&store).unwrap();
         assert_eq!(snap.version, 10);
         assert!(snap.table("main", "latest").is_some());
         assert!(snap.table("main", "events").is_none());
     }
 
     #[test]
-    fn file_uri_prefix_is_accepted() {
+    fn latest_snapshot_of_empty_log_is_version_zero() {
         let dir = tempfile::tempdir().unwrap();
-        write_log(dir.path(), 1, &snapshot(1, "t"));
+        let store = LocalStore::new(dir.path());
+        assert_eq!(latest_snapshot(&store).unwrap().version, 0);
+    }
+
+    #[test]
+    fn open_store_routes_local_and_file_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path().to_str().unwrap()).unwrap();
+        commit(store.as_ref(), 1, &snapshot(1, "t"));
         let uri = format!("file://{}", dir.path().to_str().unwrap());
-        let store = GooseStore::open(&uri).unwrap();
-        assert_eq!(store.latest_snapshot().unwrap().version, 1);
+        let reopened = open_store(&uri).unwrap();
+        assert_eq!(latest_snapshot(reopened.as_ref()).unwrap().version, 1);
     }
 }

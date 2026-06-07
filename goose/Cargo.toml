@@ -20,13 +20,17 @@ snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "1e20a92f7
 # snapshots). serde replaces goose's hand-rolled json parser.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Object storage (s3://, gs://) for the catalog snapshot and remote data files.
-# Same version/features ingest uses, so one resolution across the workspace.
-object_store = { version = "0.12", features = ["gcp", "aws"] }
-# object_store's API is async; the catalog drives it synchronously (off the hot
-# path) via a small current-thread runtime. `net`/`time` are what its cloud HTTP
-# client needs.
-tokio = { version = "1", features = ["rt", "net", "time"] }
+# Synchronous object-store access for the catalog control plane (LIST/GET/PUT of
+# the `_goose_log/` snapshots), so the engine never spins up an async runtime.
+# `ureq` is blocking HTTP + rustls; `aws-sigv4::sign` is a pure sync function we
+# call to sign S3 requests (the tokio it transitively pulls is never driven).
+# Credentials are read from the environment ourselves. GCS uses an OAuth bearer
+# over the JSON API. The hot data path uses none of this — it's on the ring.
+ureq = "2"
+aws-sigv4 = "1"
+aws-credential-types = "1"
+# Parse S3 ListObjectsV2 XML; GCS listing is JSON via serde_json.
+quick-xml = { version = "0.37", features = ["serialize"] }
 
 [dev-dependencies]
 # `test-util` exposes dispatch's single-operator test harness for the moved
