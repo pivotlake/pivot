@@ -66,20 +66,25 @@ pub fn is_remote_location(loc: &str) -> bool {
     loc.starts_with("s3://") || loc.starts_with("s3a://") || loc.starts_with("gs://")
 }
 
-/// The local filesystem path for a data-file location, or `None` if it is
-/// remote (`s3://`/`gs://`). A relative location is resolved against `root`
-/// (the catalog root); an absolute one (`/…`, `file://…`) is used directly.
+/// The local filesystem path for a data-file location, or `None` if it
+/// resolves to remote object storage. An absolute location (`/…`, `file://…`)
+/// is used directly; an absolute remote one (`s3://`/`gs://`) is `None`; a
+/// *relative* location is resolved against `root` — and is only local when the
+/// root itself is local (a relative file under an `s3://` root lives in the
+/// bucket, so it's remote too).
 pub fn local_path(root: &str, loc: &str) -> Option<PathBuf> {
     if is_remote_location(loc) {
         return None;
     }
-    let loc = loc.strip_prefix("file://").unwrap_or(loc);
-    if loc.starts_with('/') {
-        Some(PathBuf::from(loc))
-    } else {
-        let root = root.strip_prefix("file://").unwrap_or(root);
-        Some(PathBuf::from(root).join(loc))
+    let stripped = loc.strip_prefix("file://").unwrap_or(loc);
+    if stripped.starts_with('/') {
+        return Some(PathBuf::from(stripped));
     }
+    if is_remote_location(root) {
+        return None;
+    }
+    let root = root.strip_prefix("file://").unwrap_or(root);
+    Some(PathBuf::from(root).join(stripped))
 }
 
 #[cfg(test)]
