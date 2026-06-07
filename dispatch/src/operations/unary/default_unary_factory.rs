@@ -19,6 +19,12 @@ impl<U> DefaultUnaryFactory<U> {
     }
 }
 
+impl<U> Default for DefaultUnaryFactory<U> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 unsafe impl<U> Send for DefaultUnaryFactory<U> {}
 unsafe impl<U> Sync for DefaultUnaryFactory<U> {}
 

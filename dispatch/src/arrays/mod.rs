@@ -30,6 +30,11 @@ pub trait ArrayBuilder {
     /// Number of elements pushed so far.
     fn len(&self) -> usize;
 
+    /// Whether no elements have been pushed yet.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Appends `element` repeated `amount` times (used by RLE runs).
     fn push(&mut self, element: &Self::Element, amount: usize);
 
@@ -56,11 +61,12 @@ pub trait ArrayBuilder {
 /// columns, and the GROUP BY string-view headers use it directly (their `u128`
 /// view type is not an [`ArrowPrimitiveType`]).
 pub struct SlabColumn<T: Copy> {
-    // `pub(crate)` so bulk decoders (e.g. the parquet primitive decoder) can copy
-    // straight into the backing buffer via `SlabBuffer::ptr_at_index` and advance
-    // the length, rather than going value-by-value through `push`.
-    pub(crate) values: SlabBuffer<T>,
-    pub(crate) len: usize,
+    // `pub` so out-of-crate bulk decoders (the Parquet primitive decoder, now in
+    // `catalog`) can copy straight into the backing buffer via
+    // `SlabBuffer::ptr_at_index` and advance the length, rather than going
+    // value-by-value through `push`.
+    pub values: SlabBuffer<T>,
+    pub len: usize,
 }
 
 impl<T: Copy> SlabColumn<T> {
@@ -91,6 +97,10 @@ impl<T: Copy> SlabColumn<T> {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Consumes the column, handing its slab to Arrow as a zero-copy [`Buffer`].
     /// The caller wraps it in the appropriate typed buffer / array.
     pub fn into_buffer(self) -> Buffer {
@@ -105,7 +115,7 @@ impl<T: Copy> SlabColumn<T> {
 /// [`SlabColumn`]. Used by both the parquet primitive decoders and the GROUP BY
 /// output columns.
 pub struct PrimitiveBuilder<T: ArrowPrimitiveType> {
-    pub(crate) col: SlabColumn<T::Native>,
+    pub col: SlabColumn<T::Native>,
 }
 
 impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {

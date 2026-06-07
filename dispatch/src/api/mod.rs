@@ -4,7 +4,7 @@
 //!
 //! Build a query by chaining operations on [`RecordBatchOperatorSpec`]:
 //!
-//! ```no_run
+//! ```ignore
 //! # use std::sync::Arc;
 //! # use arrow_array::{RecordBatch, StringViewArray};
 //! # use dispatch::*;
@@ -61,14 +61,14 @@
 //!   Holds `VecDeque<Box<dyn RecordBatchOperatorFactory>>` (one per worker).
 //!
 //! - [`OperatorFactory<O>`](OperatorFactory) — Generic factory trait with
-//!   `build<S: Sender<O>>`. Not object-safe (generic method), but used internally for
-//!   the parquet pipeline where data flows through non-RecordBatch types
-//!   (`RowGroupBuffer → CompressedPage → DecompressedPage → RecordBatch`).
+//!   `build<S: Sender<O>>`. Not object-safe (generic method), but used for
+//!   pipelines that flow through non-RecordBatch intermediate types — e.g. the
+//!   multi-stage decode in `catalog`'s Parquet reader.
 //!
 //! - [`OperatorSpec<O, OF>`](OperatorSpec) — Generic spec holding `VecDeque<OF>`. Can be used for
-//!   any operator that does not expose `RecordBatch`
-//!   Only used internally by `table_input` and `read_parquet` to build the parquet
-//!   read stages before erasing into `RecordBatchOperatorSpec` via `from_spec`.
+//!   any operator that does not expose `RecordBatch`. Used to build multi-stage
+//!   pipelines (e.g. `catalog`'s Parquet reader) before erasing into
+//!   `RecordBatchOperatorSpec` via `from_spec`.
 //!
 //! - [`Chain`] — Accumulates `Box<dyn Operator>` during the build step, then converts
 //!   to a `DataFlow`.
@@ -89,6 +89,5 @@ pub use data_flow_handle::{CancelToken, DataFlowHandle};
 pub use operator_spec::values_input;
 pub use record_batch_operator::{
     RECORD_BATCH_SIZE, RecordBatchFactoryBridge, RecordBatchOperatorFactory,
-    RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory, table_input, table_input_with_filter,
-    table_input_with_filter_and_eq_predicates,
+    RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory,
 };

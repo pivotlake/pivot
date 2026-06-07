@@ -974,9 +974,7 @@ dependencies = [
  "libc",
  "memchr",
  "nix",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=1e20a92f7bcad208bf6869f5394101288850ee2e)",
  "thiserror 2.0.18",
- "thriftparquet",
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
@@ -1732,7 +1730,7 @@ dependencies = [
  "paste",
  "seq-macro",
  "simdutf8",
- "snap 1.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "snap",
  "thrift",
  "twox-hash",
  "zstd",
@@ -2098,11 +2096,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
-name = "snap"
-version = "1.1.1"
-source = "git+https://github.com/Epsio-Labs/rust-snappy.git?rev=1e20a92f7bcad208bf6869f5394101288850ee2e#1e20a92f7bcad208bf6869f5394101288850ee2e"
-
-[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2211,10 +2204,6 @@ dependencies = [
  "integer-encoding",
  "ordered-float",
 ]
-
-[[package]]
-name = "thriftparquet"
-version = "0.1.0"
 
 [[package]]
 name = "tikv-jemalloc-sys"

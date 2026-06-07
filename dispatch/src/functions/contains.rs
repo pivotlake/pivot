@@ -45,7 +45,7 @@ impl BufferFindOffsets {
 /// pointers to underlying buffers or inlined strings. These underlying buffers can be re-used
 /// across RecordBatches, and the same string may be pointed to many types from different places
 /// (for example if it's in a Dict). They are also usually very large - they may be the original
-/// allocations of the pages decompressed from the RowGroup.
+/// allocations of the decompressed source pages.
 /// The implementation here aims to only run the  memchr::memchr::Finder *once* per entire
 /// underlying physical buffer.
 ///

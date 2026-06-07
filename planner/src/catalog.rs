@@ -14,9 +14,9 @@
 
 use std::collections::HashMap;
 
-use crate::expression::TableFilter;
+use crate::expression::{CompareType, TableFilter};
 use crate::types::{Type, logical_from_type};
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, RowGroupFilter};
+use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
 use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
@@ -31,6 +31,19 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A single-column predicate whose constant is supplied at runtime from a shared
+/// [`DynamicFilterSlot`] (filled by a Top-N as it tightens its boundary).
+///
+/// It is a purely logical predicate — "column `column_idx` `compare_type` the
+/// current slot value". A storage backend may use it to skip data that cannot
+/// match the live boundary (e.g. Parquet row-group elimination), or ignore it
+/// entirely; ignoring is always correct, just without the optimization.
+pub struct DynamicScanPredicate {
+    pub column_idx: usize,
+    pub compare_type: CompareType,
+    pub slot: Arc<DynamicFilterSlot>,
+}
 
 /// A single column in a [`Table`]'s schema: name plus Pivot [`Type`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,15 +74,16 @@ pub struct CreateTableRequest {
 pub trait Table: Debug + Send + Sync {
     /// Build a dispatch scan spec that reads this table.
     ///
-    /// `row_group_filter`, when present, is consulted as each row group is
-    /// pulled and lets a Top-N (or other producer) above the scan prune row
-    /// groups against a live predicate. Tables that don't support pruning can
-    /// ignore it — always correct, just without the optimization.
+    /// `dynamic_filters` are logical single-column predicates whose constants are
+    /// filled in at runtime (by a Top-N above the scan tightening its boundary).
+    /// A backend may use them to skip data that can't match — e.g. Parquet
+    /// row-group elimination — or ignore them; ignoring is always correct, just
+    /// without the optimization.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
-        row_group_filter: Option<RowGroupFilter>,
+        dynamic_filters: Vec<DynamicScanPredicate>,
     ) -> RecordBatchOperatorSpec;
 
     /// Return the table's schema.

@@ -27,7 +27,7 @@ impl<T> SlabBuffer<T> {
     /// Returns a raw pointer to the element at `index`.
     /// Simple pointer arithmetic — no slab lookup needed.
     #[inline(always)]
-    pub(crate) fn ptr_at_index(&self, index: usize) -> *mut T {
+    pub fn ptr_at_index(&self, index: usize) -> *mut T {
         let byte_offset = index * size_of::<T>();
         unsafe { self.slab.ptr.add(byte_offset) as *mut T }
     }

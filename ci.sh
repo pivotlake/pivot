@@ -16,7 +16,7 @@ set -uo pipefail
 
 # The crates CI checks and the checks it runs. Edit these in one place; both the
 # local run-all and the CI matrix follow.
-CRATES=(dispatch planner duckdb-planner server ingest)
+CRATES=(dispatch planner duckdb-planner catalog server ingest)
 CHECKS=(fmt clippy test doc)
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"

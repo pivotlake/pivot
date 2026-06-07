@@ -101,12 +101,18 @@ impl std::str::FromStr for OtelSpec {
                 "traces" => traces = Some(SinkDestination::parse(value)),
                 "metrics" => metrics = Some(SinkDestination::parse(value)),
                 "flush_rows" => {
-                    flush_rows =
-                        Some(value.parse().map_err(|e| format!("flush_rows `{value}`: {e}"))?)
+                    flush_rows = Some(
+                        value
+                            .parse()
+                            .map_err(|e| format!("flush_rows `{value}`: {e}"))?,
+                    )
                 }
                 "flush_secs" => {
-                    flush_secs =
-                        Some(value.parse().map_err(|e| format!("flush_secs `{value}`: {e}"))?)
+                    flush_secs = Some(
+                        value
+                            .parse()
+                            .map_err(|e| format!("flush_secs `{value}`: {e}"))?,
+                    )
                 }
                 other => return Err(format!("unknown key `{other}` in --otel spec")),
             }
@@ -131,7 +137,8 @@ impl std::str::FromStr for OtelSpec {
             (Signal::Metrics, metrics),
         ] {
             if let Some(dest) = dest {
-                cfg.enable_default(signal, dest).map_err(|e| e.to_string())?;
+                cfg.enable_default(signal, dest)
+                    .map_err(|e| e.to_string())?;
             }
         }
         Ok(OtelSpec(cfg))

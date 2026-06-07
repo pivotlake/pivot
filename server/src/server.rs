@@ -113,8 +113,10 @@ impl Server {
         // encode Parquet on the dispatch workers, so they must be drained
         // before the workers stop. `Option` so the two terminal arms below can
         // each take ownership without the borrow checker tripping over the loop.
-        let mut ingestor =
-            Some(Ingestor::start(std::mem::take(&mut self.ingests), self.dispatcher.clone())?);
+        let mut ingestor = Some(Ingestor::start(
+            std::mem::take(&mut self.ingests),
+            self.dispatcher.clone(),
+        )?);
 
         loop {
             tokio::select! {

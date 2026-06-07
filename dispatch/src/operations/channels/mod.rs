@@ -37,8 +37,6 @@ pub use return_to_worker::{
     ReturnToWorkerMpscFactory, WorkerAwareSender, WorkerIdOutput, return_to_worker_mpsc,
 };
 
-use crate::operations::unary::parquet::RowGroupRequest;
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
@@ -85,8 +83,8 @@ pub trait Receiver<I> {
     fn steal(&self) -> Option<I>;
 }
 
-impl Sender<RowGroupRequest> for Injector<RowGroupRequest> {
-    fn send(&mut self, item: RowGroupRequest) -> Result<()> {
+impl<T> Sender<T> for Injector<T> {
+    fn send(&mut self, item: T) -> Result<()> {
         self.push(item);
         Ok(())
     }

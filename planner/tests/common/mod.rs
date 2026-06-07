@@ -11,12 +11,10 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use dispatch::{
-    DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec,
-    RowGroupFilter, table_input_with_filter,
-};
+use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
+use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 use planner::Planner;
-use planner::catalog::{Catalog, Column, Table};
+use planner::catalog::{Catalog, Column, DynamicScanPredicate, Table};
 use planner::types::Type;
 
 #[derive(Clone, Debug)]
@@ -75,14 +73,14 @@ impl Table for TestTable {
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
-        row_group_filter: Option<RowGroupFilter>,
+        dynamic_filters: Vec<DynamicScanPredicate>,
     ) -> RecordBatchOperatorSpec {
         table_input_with_filter(
             dispatcher,
             &self.parquet_table,
             projection,
             false,
-            row_group_filter,
+            row_group_filter_from(dynamic_filters),
         )
     }
 

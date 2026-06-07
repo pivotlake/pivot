@@ -3,24 +3,22 @@
 //! Each [`Operator`](crate::operator::Operator) variant has a `compile`
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, DynamicScanPredicate};
 use crate::compile::create_table::CreateTableNullaryFactory;
 use crate::compile::dummy_scan::DummyScanNullaryFactory;
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
-use crate::expression::{CompareType, Expression};
+use crate::expression::Expression;
 use crate::operator::{
     Aggregate, CreateTable, DummyScan, Filter, Input, OrderBy, OrderByDirection, Projection, TopN,
 };
-use crate::row_group_stats::row_group_eliminated;
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::{Field, Schema};
 use dispatch::{
     DataFlowDispatcher, DynamicFilterSlot, IntKeyExtractor, OrderBy as DispatchOrderBy,
-    Projection as DispatchProjection, RecordBatchOperatorSpec, RowGroupFilter, RowGroupMetadata,
-    StringKeyExtractor,
+    Projection as DispatchProjection, RecordBatchOperatorSpec, StringKeyExtractor,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
@@ -340,8 +338,8 @@ impl Input {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
-        let row_group_filter = build_dynamic_filter_predicate(&self.dynamic_filters, slots);
-        Ok(self.table.compile(dispatcher, projection, row_group_filter))
+        let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
+        Ok(self.table.compile(dispatcher, projection, dynamic_filters))
     }
 }
 
@@ -357,38 +355,22 @@ fn slot_for(slots: &mut DynamicFilterSlots, slot_id: usize) -> Arc<DynamicFilter
     )
 }
 
-/// Build a per-row-group predicate that prunes against the live values in each
-/// dynamic-filter slot. Returns `None` when there are no dynamic filters, so the
-/// scan keeps its zero-cost fast path.
-///
-/// The closure runs once per row group at steal time. For each filter it reads
-/// the current boundary from the shared slot; an empty slot (producer hasn't
-/// published yet) contributes no pruning. Otherwise the value is tested against
-/// the row group's min/max via [`row_group_eliminated`]; if any filter proves
-/// the group can't match, the predicate returns `false` and the scan skips it.
-fn build_dynamic_filter_predicate(
+/// Lower the Top-N's dynamic filters into logical [`DynamicScanPredicate`]s the
+/// table can use for pruning. Each carries the column, comparison, and the
+/// shared slot the Top-N fills with its live boundary; turning that into actual
+/// (e.g. row-group) elimination is the storage backend's job.
+fn build_dynamic_scan_predicates(
     filters: &[DynamicFilter],
     slots: &mut DynamicFilterSlots,
-) -> Option<RowGroupFilter> {
-    if filters.is_empty() {
-        return None;
-    }
-    let entries: Vec<(usize, CompareType, Arc<DynamicFilterSlot>)> = filters
+) -> Vec<DynamicScanPredicate> {
+    filters
         .iter()
-        .map(|df| (df.column_idx, df.compare_type, slot_for(slots, df.slot_id)))
-        .collect();
-    Some(Arc::new(move |row_group: &RowGroupMetadata| -> bool {
-        for (column_idx, compare_type, slot) in &entries {
-            let Some(constant) = slot.read().expect("dynamic filter slot poisoned").clone() else {
-                continue;
-            };
-            if let Ok(true) = row_group_eliminated(row_group, *column_idx, *compare_type, &constant)
-            {
-                return false;
-            }
-        }
-        true
-    }))
+        .map(|df| DynamicScanPredicate {
+            column_idx: df.column_idx,
+            compare_type: df.compare_type,
+            slot: slot_for(slots, df.slot_id),
+        })
+        .collect()
 }
 
 impl Filter {

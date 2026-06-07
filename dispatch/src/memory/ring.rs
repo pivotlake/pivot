@@ -127,6 +127,11 @@ impl Ring {
         self.slots.len()
     }
 
+    /// Whether the ring has no slots.
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// Overwrites the `used` word for slot `idx` (writer flag + reader count).
     #[inline(always)]
     pub fn set_slot_used(&self, idx: usize, used: u32, ordering: Ordering) {
