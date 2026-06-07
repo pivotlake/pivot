@@ -23,6 +23,7 @@
 
 pub mod metadata;
 pub mod parquet;
+pub mod store;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

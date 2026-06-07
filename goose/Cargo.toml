@@ -23,6 +23,10 @@ serde_json = "1"
 # Object storage (s3://, gs://) for the catalog snapshot and remote data files.
 # Same version/features ingest uses, so one resolution across the workspace.
 object_store = { version = "0.12", features = ["gcp", "aws"] }
+# object_store's API is async; the catalog drives it synchronously (off the hot
+# path) via a small current-thread runtime. `net`/`time` are what its cloud HTTP
+# client needs.
+tokio = { version = "1", features = ["rt", "net", "time"] }
 
 [dev-dependencies]
 # `test-util` exposes dispatch's single-operator test harness for the moved
