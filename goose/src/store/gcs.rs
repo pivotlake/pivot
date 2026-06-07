@@ -291,7 +291,8 @@ impl ObjectStore for GcsStore {
         let canonical_request = format!(
             "GET\n{canonical_uri}\n{canonical_query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD"
         );
-        let hashed = hex(ring::digest::digest(&ring::digest::SHA256, canonical_request.as_bytes()).as_ref());
+        let hashed =
+            hex(ring::digest::digest(&ring::digest::SHA256, canonical_request.as_bytes()).as_ref());
         let string_to_sign = format!("GOOG4-RSA-SHA256\n{datetime}\n{scope}\n{hashed}");
         let signature = hex(&rs256_sign(&private_key, string_to_sign.as_bytes())?);
 

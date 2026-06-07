@@ -1800,6 +1800,7 @@ dependencies = [
  "thiserror 2.0.18",
  "thriftparquet",
  "ureq",
+ "url",
 ]
 
 [[package]]
