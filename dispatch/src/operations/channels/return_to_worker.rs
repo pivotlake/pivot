@@ -1,7 +1,7 @@
 //! Worker-affinity channel that routes messages back to a specific worker.
 //!
 //! Some messages must be processed by the worker that owns related state. For example,
-//! a [`DecompressedPage`](crate::operations::parquet::DecompressedPage) must return to
+//! a `DecompressedPage` must return to
 //! the worker whose decoder holds the corresponding row group context.
 //!
 //! [`WorkerAwareSender`] inspects each message's [`worker_id`](WorkerIdOutput::worker_id)

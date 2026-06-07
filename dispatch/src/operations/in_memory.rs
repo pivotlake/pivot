@@ -1,7 +1,7 @@
 //! Work-stealing source over an in-memory set of values.
 //!
-//! The write-side mirror of the parquet row-group injector: instead of
-//! pre-loading row groups from disk, it pre-loads caller-provided items of any
+//! The in-memory counterpart of `catalog`'s Parquet row-group injector: instead
+//! of pre-loading row groups from disk, it pre-loads caller-provided items of any
 //! type `T` into a shared [`Injector`] queue. Every worker gets an
 //! [`InjectorSource`] that steals items on demand, so a fixed `Vec<T>` fans out
 //! across the whole pool exactly like a table scan distributes row groups.

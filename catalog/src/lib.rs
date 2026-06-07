@@ -15,20 +15,29 @@
 //! still satisfy the predicate and drops the rest. Pushdown always reports
 //! `false` because per-row evaluation is still required on the survivors.
 
+// Internal engine crate: the Parquet pipeline's public factories document their
+// behaviour by linking to the private operators they build (e.g.
+// `DecompressorFactory` → `Decompressor`). That's intentional here — we're not a
+// published API — so allow public docs to reference private items.
+#![allow(rustdoc::private_intra_doc_links)]
+
+pub mod parquet;
+
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use dispatch::{
-    DataFlowDispatcher, ParquetTable, ParquetTableError, Projection, RecordBatchOperatorSpec,
-    RowGroupFilter, ScanEqualityPredicate, table_input_with_filter_and_eq_predicates,
+use crate::parquet::{
+    ParquetTable, ParquetTableError, ScanEqualityPredicate, row_group_eliminated,
+    row_group_filter_from, table_input_with_filter_and_eq_predicates,
 };
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
-    Catalog, Column, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
+    Catalog, Column, CreateTableRequest, DynamicScanPredicate, Error as CatalogError,
+    Result as CatalogResult, Table,
 };
 use planner::expression::{CompareType, Expression, TableFilter};
-use planner::row_group_stats::row_group_eliminated;
 use thiserror::Error;
 
 const PATH_OPTION: &str = "path";
@@ -144,7 +153,7 @@ impl Table for ParquetCatalogTable {
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
-        row_group_filter: Option<RowGroupFilter>,
+        dynamic_filters: Vec<DynamicScanPredicate>,
     ) -> RecordBatchOperatorSpec {
         let parquet = Arc::new(self.parquet.clone());
         table_input_with_filter_and_eq_predicates(
@@ -152,7 +161,7 @@ impl Table for ParquetCatalogTable {
             &parquet,
             projection,
             false,
-            row_group_filter,
+            row_group_filter_from(dynamic_filters),
             Arc::new(self.eq_predicates.clone()),
         )
     }
@@ -178,7 +187,12 @@ impl Table for ParquetCatalogTable {
         // the shared stats logic (also used for dynamic filters at scan time).
         let mut retain_err: CatalogResult<()> = Ok(());
         self.parquet.row_groups_mut().retain(|rg| {
-            match row_group_eliminated(rg, reference.column_idx, compare.compare_type, constant) {
+            match row_group_eliminated(
+                rg.as_ref(),
+                reference.column_idx,
+                compare.compare_type,
+                constant,
+            ) {
                 Ok(eliminated) => !eliminated,
                 Err(e) => {
                     retain_err = Err(CatalogError::Other(Box::new(e)));

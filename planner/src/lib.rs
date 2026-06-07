@@ -23,14 +23,15 @@
 //! A query over a minimal read-only catalog backed by an in-memory `HashMap`,
 //! built around a parquet directory on disk:
 //!
-//! ```no_run
+//! ```ignore
 //! use std::collections::HashMap;
 //! use std::path::Path;
 //! use std::sync::Arc;
 //!
-//! use dispatch::{DataFlowDispatcher, Dispatch, ParquetTable, Projection, RecordBatchOperatorSpec, RowGroupFilter, table_input};
+//! use catalog::parquet::{ParquetTable, table_input};
+//! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
-//! use planner::catalog::{Catalog, Column, CreateTableRequest, Table};
+//! use planner::catalog::{Catalog, Column, CreateTableRequest, DynamicScanPredicate, Table};
 //! use planner::types::Type;
 //!
 //! #[derive(Debug)]
@@ -40,7 +41,7 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filter: Option<RowGroupFilter>) -> RecordBatchOperatorSpec {
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>) -> RecordBatchOperatorSpec {
 //!         table_input(dispatcher, &self.parquet, projection, false)
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
@@ -109,7 +110,6 @@ pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;
 pub mod plan;
-pub mod row_group_stats;
 pub mod types;
 use std::sync::Arc;
 

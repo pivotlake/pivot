@@ -1,37 +1,14 @@
 #![allow(dead_code)]
+//! Shared helpers for dispatch's format-agnostic integration tests. The
+//! Parquet-specific helpers live in `catalog`'s copy of this file, alongside the
+//! Parquet reader tests that moved there.
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use std::ops::Deref;
 use std::sync::{Arc, Once};
-use tempfile::TempDir;
 
-use dispatch::{DataFlowDispatcher, Dispatch, ParquetTable};
-
-// The process-wide dispatcher, created on the first `init*` call.
-// static DISPATCHER: OnceLock<Mutex<DataFlowDispatcher>> = OnceLock::new();
-
-// pub fn init() {
-//     init_with_workers(core_affinity::get_core_ids().unwrap().len());
-// }
-
-// pub fn init_with_workers(num_workers: usize) {
-//     // Each test thread also drops result `RecordBatch`es here, so it needs its
-//     // own `MemoryContext`. Create a 1-worker context and install it.
-//     let factory = MemoryContextFactory::create_many(1)
-//         .into_iter()
-//         .next()
-//         .unwrap();
-//     init_memory_context(factory.create_memory_ctx());
-//
-//     DISPATCHER.get_or_init(|| {
-//         let (exit, handles, dispatcher) = Dispatch::new(num_workers).into_parts();
-//         Mutex::new(dispatcher)
-//     });
-// }
+use dispatch::{DataFlowDispatcher, Dispatch};
 
 static INIT: Once = Once::new();
 
@@ -46,9 +23,8 @@ fn init_tracing() {
     });
 }
 
-/// RAII wrapper around the owned `Dispatch`: derefs to its
-/// `DataFlowDispatcher` for `table_input(&dispatch, …)` usage and calls
-/// [`Dispatch::exit`] on drop to clean up worker threads.
+/// RAII wrapper around the owned `Dispatch`: derefs to its `DataFlowDispatcher`
+/// and calls [`Dispatch::exit`] on drop to clean up worker threads.
 pub struct DispatchGuard(Option<Dispatch>);
 
 impl Deref for DispatchGuard {
@@ -69,44 +45,6 @@ impl Drop for DispatchGuard {
 pub fn dispatch(workers: usize) -> DispatchGuard {
     init_tracing();
     DispatchGuard(Some(Dispatch::spin_up(workers, 10)))
-}
-
-pub fn parquet_table(
-    dispatch: &DispatchGuard,
-    batches: &[RecordBatch],
-    dictionary: bool,
-) -> (TempDir, Arc<ParquetTable>) {
-    // Write the parquet file on the test thread (`ArrowWriter` is plain
-    // `std::fs` IO — no `MemoryContext` needed).
-    let dir = TempDir::new().unwrap();
-    let schema = batches[0].schema();
-    let path = dir.path().join("data.parquet");
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .set_dictionary_enabled(dictionary)
-        .build();
-    let mut writer =
-        ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props)).unwrap();
-    for batch in batches {
-        writer.write(batch).unwrap();
-    }
-    writer.close().unwrap();
-
-    let table = parquet_table_from_dir(dispatch, dir.path());
-    (dir, table)
-}
-
-/// Load a `ParquetTable` from an already-populated directory. Runs
-/// `ParquetTable::from_directory` on a worker because it touches
-/// `memory_ctx()` via the file cache.
-pub fn parquet_table_from_dir(
-    dispatch: &DispatchGuard,
-    dir: &std::path::Path,
-) -> Arc<ParquetTable> {
-    let dir_path = dir.to_owned();
-    dispatch
-        .run_on_worker(move || Arc::new(ParquetTable::from_directory(&dir_path).unwrap()))
-        .expect("ParquetTable::from_directory failed")
 }
 
 pub fn strings_and_ints(names: &[&str], values: &[i64]) -> RecordBatch {

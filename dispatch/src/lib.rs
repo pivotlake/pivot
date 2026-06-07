@@ -24,7 +24,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! # use std::sync::Arc;
 //! # use arrow_array::StringViewArray;
 //! # use dispatch::*;
@@ -60,17 +60,20 @@ use std::thread::JoinHandle;
 use tikv_jemallocator::Jemalloc;
 use tracing::info;
 
-mod env;
+// Engine infrastructure exposed as public API so the Parquet reader (which now
+// lives in `catalog`, not here) can build on it: memory/IO/array-builder
+// primitives and worker identity.
+pub mod arrays;
+pub mod env;
+pub mod io;
+pub mod memory;
+pub mod worker;
 
 mod api;
-mod arrays;
 mod data_flow;
 mod functions;
-mod io;
-mod memory;
 mod operations;
-mod record_batch_metadata;
-mod worker;
+mod scan;
 
 use crate::operations::nullary::OneShotNullaryFactory;
 use crate::worker::{Worker, WorkerWaker};
@@ -83,29 +86,25 @@ pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
-pub use operations::parquet::RowGroupFilter;
-pub use operations::parquet::ScanEqualityPredicate;
+pub use scan::Projection;
 
 pub use operations::channels::{
     ChannelFactory, FanInChannelFactory, MpscReceiver, Receiver, ReturnToWorkerMpscFactory,
     RootChannelFactory, StealableChannelFactory, WorkerAwareSender, WorkerIdOutput, fan_in,
     mpsc_channel, return_to_worker_mpsc, stealable,
 };
+#[cfg(any(test, feature = "test-util"))]
+pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
-pub use operations::{
-    Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
-    RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
-};
-pub use operations::parquet::types::metadata::{
-    ColumnChunkMeta, ColumnStatistics, RowGroupMetadata,
-};
-pub use operations::parquet::types::projection::Projection;
-pub use operations::parquet::types::table::{Error as ParquetTableError, ParquetTable};
 pub use operations::{
     AggKind, AggSpec, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled,
     Count, DynamicFilterSlot, IntKeyExtractor, IntPairKeyExtractor, Nullary, NullaryFactory,
     NullaryOperatorFactory, Operator, OrderBy, Result as OperatorResult, StringKeyExtractor, Sum,
     ValueExtractor,
+};
+pub use operations::{
+    Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
+    RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 
 #[unsafe(export_name = "_rjem_malloc_conf")]

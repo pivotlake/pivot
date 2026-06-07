@@ -1,4 +1,4 @@
-//! Operators, channels, and the parquet read pipeline.
+//! Operators and channels: the parallel execution toolkit.
 //!
 //! This module contains everything that executes within a worker's
 //! `DataFlow`:

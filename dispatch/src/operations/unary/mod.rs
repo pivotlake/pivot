@@ -2,8 +2,9 @@
 //!
 //! A unary operator reads items of type `I` from its input channel, applies a
 //! transform, and writes items of type `O` to its output channel. Most query stages
-//! are unary: filter, project, count, order-by-limit, group-by, and the entire
-//! parquet decode pipeline (indexer, decompressor, decoder).
+//! are unary: filter, project, count, order-by-limit, and group-by. The Parquet
+//! decode pipeline in `catalog` (indexer, decompressor, decoder) is built from
+//! these same primitives.
 //!
 //! # Key types
 //!
@@ -46,8 +47,8 @@ pub use group::{
     IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor, Sum, ValueExtractor,
 };
 
-#[cfg(test)]
-pub(crate) mod test_utils;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_utils;
 
 mod factory;
 pub use factory::*;
@@ -82,8 +83,6 @@ pub use map::MapFactory;
 mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 
-pub mod parquet;
-
 mod copy_out;
 mod order_by_limit;
 
@@ -100,12 +99,10 @@ pub enum Error {
     OrderByLimit(#[from] order_by_limit::Error),
     #[error("{0}")]
     Group(#[from] group::Error),
+    /// An error from an operator defined outside this crate (e.g. the Parquet
+    /// reader, now in `catalog`). Such operators map their own error into this.
     #[error("{0}")]
-    Decompressor(#[from] crate::operations::parquet::DecompressorError),
-    #[error("{0}")]
-    Parquet(#[from] crate::operations::parquet::types::thrift::parquet_thrift::ParquetError),
-    #[error("{0}")]
-    Decoder(#[from] crate::operations::parquet::RowGroupDecoderError),
+    Operator(Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

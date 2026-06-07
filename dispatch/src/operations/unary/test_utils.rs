@@ -17,6 +17,12 @@ impl<T> CollectSender<T> {
     }
 }
 
+impl<T> Default for CollectSender<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CollectSender<RecordBatch> {
     /// Total number of rows across all collected batches.
     pub fn total_rows(&self) -> usize {

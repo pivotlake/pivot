@@ -175,7 +175,7 @@ impl MemoryContext {
 ///
 /// Each test thread gets its own context (and its own [`Ring`]), so tests
 /// don't share state and don't need a serializing lock.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub fn init_test_free_pool(dirty_count: usize) {
     WORKER_IDX.set(0);
     NUM_WORKERS.set(1);

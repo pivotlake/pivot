@@ -1,28 +1,23 @@
+use crate::operations::channels::{
+    ChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
+};
 use crate::operations::{
     DefaultUnaryFactory, Forward, InjectorSourceFactory, MapFactory, RootUnaryOperatorFactory,
     UnaryFactory, UnaryOperatorFactory,
 };
-use crate::operations::channels::{
-    ChannelFactory, ReturnToWorkerMpscFactory, Sender, StealableChannelFactory, mpsc_channel,
-    return_to_worker_mpsc, stealable,
-};
-use crate::operations::parquet::DecoderFactory;
-use crate::operations::parquet::DecompressorFactory;
-use crate::operations::parquet::types::projection::Projection;
-use crate::operations::parquet::{CompressedPage, DecompressedPage, ParquetTable};
-use crate::operations::parquet::{IndexerFactory, RowGroupBuffer, ScanEqualityPredicate};
 use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
 use arrow_array::RecordBatch;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-/// Generic, strongly-typed spec used internally to build the parquet read pipeline.
+/// Generic, strongly-typed spec for building multi-stage pipelines.
 ///
 /// Holds one factory per worker, where the factory type `OF` carries the full nested
 /// generic chain (e.g. `UnaryOperatorFactory<..., UnaryOperatorFactory<..., OF>>`).
-/// This is needed because the parquet pipeline flows through non-RecordBatch types
-/// (`RowGroupBuffer → CompressedPage → DecompressedPage → RecordBatch`), and each
+/// This is needed when a pipeline flows through non-RecordBatch types — e.g.
+/// `catalog`'s Parquet reader, whose decode stages pass format-specific buffers
+/// between them before producing `RecordBatch`es, where each
 /// stage uses a different channel/sender type — including `WorkerAwareSender` which
 /// requires `O: WorkerIdOutput`.
 ///
@@ -97,10 +92,11 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     /// `i`th reading through `channels[i]` and transforming with `unaries[i]`.
     /// Both vecs must have one entry per worker.
     ///
-    /// This is the general stage-builder the parquet read pipeline writes out by
-    /// hand and that [`map_each`](Self::map_each) is a special case of. Choosing
+    /// This is the general stage-builder that out-of-crate pipelines (e.g.
+    /// `catalog`'s Parquet reader) compose, and that [`map_each`](Self::map_each)
+    /// is a special case of. Choosing
     /// the channel kind lets a stage fan out work ([`stealable`]) or pin items
-    /// to a worker ([`return_to_worker_mpsc`]); per-worker `unaries` let a
+    /// to a worker (`return_to_worker_mpsc`); per-worker `unaries` let a
     /// pipeline breaker give one worker a distinct role (e.g. the receiver end
     /// of a worker-0 merge). The `siblings_left` finishing counter is set up for
     /// you.
@@ -135,6 +131,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     /// A thin wrapper over [`chain`](Self::chain): a [`stealable`] channel and
     /// `f` cloned once per worker (so `f` must be `Clone` — capture only
     /// cheap/shared state).
+    #[allow(clippy::type_complexity)] // the fully-spelled builder factory type is the point
     pub fn map_each<O2, F>(
         self,
         f: F,
@@ -154,7 +151,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
 ///
 /// The items are loaded into a shared work-stealing queue and fan out across
 /// all workers exactly like a table scan distributes row groups — the
-/// in-memory, any-type counterpart of [`table_input`](super::table_input).
+/// in-memory, any-type counterpart of `table_input`.
 /// Chain [`map_each`](OperatorSpec::map_each) to process each item in parallel.
 #[allow(clippy::type_complexity)]
 pub fn values_input<T: Send + 'static>(
@@ -185,73 +182,6 @@ impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
     /// chained after a `.map()` whose output type is `RecordBatch`.
     pub fn record_batches(self) -> super::record_batch_operator::RecordBatchOperatorSpec {
         super::record_batch_operator::RecordBatchOperatorSpec::from_spec(self)
-    }
-}
-
-type ReadParquet<OF> = UnaryOperatorFactory<
-    DecompressedPage,
-    RecordBatch,
-    DecoderFactory,
-    ReturnToWorkerMpscFactory<DecompressedPage>,
-    UnaryOperatorFactory<
-        CompressedPage,
-        DecompressedPage,
-        DecompressorFactory,
-        StealableChannelFactory<CompressedPage>,
-        UnaryOperatorFactory<
-            RowGroupBuffer,
-            CompressedPage,
-            IndexerFactory,
-            StealableChannelFactory<RowGroupBuffer>,
-            OF,
-        >,
-    >,
->;
-
-impl<OF: OperatorFactory<RowGroupBuffer>> OperatorSpec<RowGroupBuffer, OF> {
-    pub fn read_parquet(
-        mut self,
-        table: &Arc<ParquetTable>,
-        projection: Projection,
-        batch_size: usize,
-        add_row_group_metadata: bool,
-        eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
-    ) -> OperatorSpec<RecordBatch, ReadParquet<OF>> {
-        let worker_count = self.factories.len();
-        let siblings_left_indexer = Arc::new(AtomicUsize::new(worker_count));
-        let siblings_left_decompressor = Arc::new(AtomicUsize::new(worker_count));
-        let siblings_left_drain = Arc::new(AtomicUsize::new(worker_count));
-
-        let factories: Vec<_> = stealable::<RowGroupBuffer>(worker_count)
-            .into_iter()
-            .zip(stealable::<CompressedPage>(worker_count))
-            .zip(return_to_worker_mpsc::<DecompressedPage>(worker_count))
-            .map(move |((ic, dc), drc)| {
-                UnaryOperatorFactory::new(
-                    UnaryOperatorFactory::new(
-                        UnaryOperatorFactory::new(
-                            self.factories.pop_front().unwrap(),
-                            IndexerFactory::new(),
-                            ic,
-                            siblings_left_indexer.clone(),
-                        ),
-                        DecompressorFactory::new(),
-                        dc,
-                        siblings_left_decompressor.clone(),
-                    ),
-                    DecoderFactory {
-                        batch_size,
-                        table: table.clone(),
-                        projection: projection.clone(),
-                        add_row_group_metadata,
-                        eq_predicates: eq_predicates.clone(),
-                    },
-                    drc,
-                    siblings_left_drain.clone(),
-                )
-            })
-            .collect();
-        OperatorSpec::new(self.dispatcher, factories)
     }
 }
 

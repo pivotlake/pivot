@@ -172,6 +172,11 @@ impl MissingBlock {
         self.len
     }
 
+    /// Whether this block covers zero bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// The destination to read this block's [`len`](Self::len) bytes into: a
     /// 4 KB-aligned region `[dest, dest+len)` inside the pinned slot — a valid
     /// O_DIRECT target. The slot stays alive for the read because this block

@@ -26,6 +26,12 @@ pub struct IORequester {
     next_id: Identifier,
 }
 
+impl Default for IORequester {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IORequester {
     pub fn new() -> Self {
         Self {

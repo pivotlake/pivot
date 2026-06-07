@@ -35,7 +35,7 @@ impl<T> MultiSlabBuffer<T> {
     ///
     /// Computes the byte offset, determines which slab it falls in via bit-shift, and
     /// the offset within that slab via bit-mask.
-    pub(crate) fn ptr_at_index(&self, index: usize) -> *mut T {
+    pub fn ptr_at_index(&self, index: usize) -> *mut T {
         let byte_offset = index * size_of::<T>();
         let buffer_idx = byte_offset >> BUFFER_SHIFT;
         let offset_in_buffer = byte_offset & BUFFER_MASK;

@@ -94,6 +94,12 @@ pub struct WorkerWaker {
     cond: Condvar,
 }
 
+impl Default for WorkerWaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkerWaker {
     pub fn new() -> Self {
         Self {
@@ -169,7 +175,7 @@ pub fn worker_waker() -> &'static WorkerWaker {
 /// [`crate::Dispatch`]) need a waker installed first or the TLS pointer is
 /// null. The waker is leaked because the pointer is cached in TLS for the
 /// lifetime of the test thread — the binary tears down right after.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn install_test_worker_waker() {
     let waker = Arc::new(WorkerWaker::new());
     init_worker_waker(&waker);
