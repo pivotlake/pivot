@@ -98,14 +98,24 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
         page: CompressedPage,
         output: &mut OP,
     ) -> dispatch::UnaryResult<()> {
-        // Skip decompression for a data page whose rows are all filtered out, or
-        // whose row group has been pruned downstream (dictionary pushdown set the
-        // shared flag). Either way the decoder discards it, so emit a SkippedData
-        // marker instead of paying snappy. Only data pages carry a
-        // `data_page_header`; dictionary pages (rare, cheap) decompress normally.
+        // A data page whose row group was pruned downstream (dictionary pushdown
+        // set the shared flag) is never read: the decoder has already dropped the
+        // row group and ignores its late-arriving pages (via `closed_row_groups`).
+        // Drop it here entirely — not even a SkippedData marker — saving the
+        // marker allocation and the channel round-trip for every data page of
+        // every pruned row group. Completion is stream-based (no page-count
+        // wait), so a dropped page can't stall it. Dictionary pages carry no
+        // `data_page_header` and still decompress (needed for the membership
+        // scan).
+        if page.header.data_page_header.is_some() && page.row_group.is_pruned() {
+            return Ok(());
+        }
+
+        // Skip snappy for a data page whose rows are all filtered out by a filter
+        // mask: the decoder still needs the page slot for accounting, so emit a
+        // SkippedData marker instead of paying decompression.
         let skip = page.header.data_page_header.is_some()
-            && (page.row_group.is_pruned()
-                || page.filter_mask.as_ref().is_some_and(|f| f.all_false()));
+            && page.filter_mask.as_ref().is_some_and(|f| f.all_false());
         let decompressed_page = if skip {
             DecompressedPage {
                 worker_id: page.worker_id,

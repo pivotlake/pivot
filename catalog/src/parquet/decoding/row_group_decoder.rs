@@ -142,16 +142,29 @@ impl RowGroupDecoder {
                 let predicate = eq_predicates.iter().find(|p| p.column_idx == col_idx);
                 // Only a column chunk whose data pages are all dictionary
                 // encoded can be soundly pruned by dictionary contents.
-                if predicate.is_some() && columns[col_idx].data_pages_all_dictionary {
+                let prunable = predicate.is_some() && columns[col_idx].data_pages_all_dictionary;
+                if prunable {
                     prunable_columns.push(schema_idx);
                 }
+                // Install the equality constant only when the column is prunable.
+                // The decoder uses it to skip building a dictionary that excludes
+                // the constant — sound only when an excluded dictionary prunes the
+                // whole row group. On a non-prunable column (e.g. PLAIN fallback
+                // data pages) the row group is still scanned, so the dictionary
+                // must be built to decode it.
+                let eq_value = if prunable {
+                    predicate.map(|p| &p.value)
+                } else {
+                    None
+                };
                 column_decoder_for_type(
                     fields[schema_idx].data_type(),
                     columns[col_idx].max_def_level,
-                    predicate.map(|p| &p.value),
+                    eq_value,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+
         Ok(Self {
             row_group_idx: row_group_metadata.index(),
             column_decoders,

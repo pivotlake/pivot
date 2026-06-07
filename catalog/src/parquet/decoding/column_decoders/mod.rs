@@ -103,8 +103,15 @@ pub trait Dict {
     /// Builds the dictionary from raw page bytes containing `size` entries.
     fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self;
 
-    /// Number of entries in the dictionary.
-    fn len(&self) -> usize;
+    /// Whether `needle` appears among the first `size` raw entries of `data`,
+    /// *without* building the dictionary. Used for equality pushdown: when the
+    /// constant is absent the row group is pruned, so we avoid the (allocate +
+    /// copy) cost of materializing a dictionary we'd never read. Defaults to
+    /// `true` (assume present → never prune here, always sound); overridden by
+    /// impls that support the pushdown.
+    fn contains(_data: &[Bytes], _size: usize, _needle: &Self::Item) -> bool {
+        true
+    }
 
     /// Looks up the value at `idx` in the dictionary.
     fn entry(&self, idx: usize) -> Self::Item;

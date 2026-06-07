@@ -271,12 +271,28 @@ where
     fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
         match page.data {
             DecompressedPageType::Dict { header, data } => {
-                let dict = D::new(data, header.num_values as usize, allocator);
+                let size = header.num_values as usize;
                 if let Some(needle) = self.eq_const.as_ref() {
-                    let present = (0..dict.len()).any(|i| dict.entry(i) == *needle);
+                    // Equality pushdown: scan the raw dictionary for the constant
+                    // before materializing it. If absent, the row group is pruned
+                    // — so skip building the dictionary entirely (no allocation,
+                    // no copy of values we'd never read).
+                    let present = D::contains(&data, size, needle);
                     self.dict_excludes = Some(!present);
+                    if !present {
+                        // Row group will be pruned. Install an *empty* dictionary
+                        // instead of the real one: this skips the copy but keeps
+                        // the invariant that a dict-encoded column has
+                        // `dict.is_some()`, so `available()` and worker scheduling
+                        // behave exactly as on the build path. (Leaving `dict`
+                        // `None` makes `available()` report 0, parking every
+                        // worker before the prune completes → lost-wakeup hang.)
+                        // The dictionary is never read — the row group is pruned.
+                        self.dict = Some(D::new(data, 0, allocator));
+                        return;
+                    }
                 }
-                self.dict = Some(dict);
+                self.dict = Some(D::new(data, size, allocator));
             }
             DecompressedPageType::Data(data) => {
                 let idx = page.idx;
@@ -300,6 +316,7 @@ where
         if let Some(d) = self.dict.as_ref() {
             d.register_onto(&mut builder)
         }
+
         while builder.len() < size {
             if self.read_page.is_none() {
                 match self.create_next_read_page()? {
