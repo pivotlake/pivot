@@ -149,8 +149,14 @@ mod tests {
                 tables: vec![Table {
                     name: "events".to_string(),
                     columns: vec![
-                        Column { name: "id".into(), type_sql: "INTEGER".into() },
-                        Column { name: "name".into(), type_sql: "VARCHAR".into() },
+                        Column {
+                            name: "id".into(),
+                            type_sql: "INTEGER".into(),
+                        },
+                        Column {
+                            name: "name".into(),
+                            type_sql: "VARCHAR".into(),
+                        },
                     ],
                     files: vec![
                         DataFile {
@@ -208,7 +214,10 @@ mod tests {
         let json = br#"{"format_version": 999, "version": 1, "schemas": []}"#;
         assert!(matches!(
             CatalogSnapshot::from_slice(json),
-            Err(MetadataError::UnsupportedFormat { found: 999, expected: 1 })
+            Err(MetadataError::UnsupportedFormat {
+                found: 999,
+                expected: 1
+            })
         ));
     }
 

@@ -8,14 +8,15 @@
 //! identity on Google compute). RS256 signing uses `ring`; everything is
 //! synchronous, no async runtime.
 
-use super::{join_prefix, ObjectStore, PutOutcome, Result, StoreError};
+use super::{ObjectStore, PutOutcome, Result, StoreError, join_prefix};
 use base64::Engine;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TOKEN_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const OAUTH_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
-const METADATA_TOKEN_URI: &str = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+const METADATA_TOKEN_URI: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
 
 #[derive(Debug)]
 pub struct GcsStore {

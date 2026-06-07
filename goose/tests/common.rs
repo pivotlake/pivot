@@ -9,8 +9,8 @@ use std::ops::Deref;
 use std::sync::{Arc, Once};
 use tempfile::TempDir;
 
-use goose::parquet::ParquetTable;
 use dispatch::{DataFlowDispatcher, Dispatch};
+use goose::parquet::ParquetTable;
 
 // The process-wide dispatcher, created on the first `init*` call.
 // static DISPATCHER: OnceLock<Mutex<DataFlowDispatcher>> = OnceLock::new();

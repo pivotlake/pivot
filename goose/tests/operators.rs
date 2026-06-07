@@ -7,9 +7,9 @@ use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field, Schema};
 
-use goose::parquet::table_input;
 use common::*;
 use dispatch::{Contains, IntKeyExtractor, OrderBy, Projection, StringKeyExtractor};
+use goose::parquet::table_input;
 
 #[test]
 fn count() {

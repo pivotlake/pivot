@@ -6,10 +6,10 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{join_prefix, ObjectStore, PutOutcome, Result, StoreError};
+use super::{ObjectStore, PutOutcome, Result, StoreError, join_prefix};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    sign, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings,
+    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
 use std::io::Read;
@@ -143,9 +143,7 @@ impl S3Store {
 
     /// Apply signed + extra headers to a ureq request builder.
     fn apply(req: ureq::Request, headers: &[(String, String)]) -> ureq::Request {
-        headers
-            .iter()
-            .fold(req, |r, (k, v)| r.set(k, v))
+        headers.iter().fold(req, |r, (k, v)| r.set(k, v))
     }
 }
 
@@ -246,7 +244,8 @@ fn env_any(keys: &[&str]) -> Option<String> {
 }
 
 fn env_req(key: &str) -> Result<String> {
-    std::env::var(key).map_err(|_| StoreError::Config(format!("environment variable {key} not set")))
+    std::env::var(key)
+        .map_err(|_| StoreError::Config(format!("environment variable {key} not set")))
 }
 
 /// Percent-encode an S3 object key for a query-string value per RFC 3986

@@ -130,7 +130,11 @@ where
         mutate(&mut snap)?;
         snap.version = base + 1;
         snap.format_version = crate::metadata::FORMAT_VERSION;
-        let key = format!("{LOG_DIR}/{:0width$}.json", snap.version, width = VERSION_WIDTH);
+        let key = format!(
+            "{LOG_DIR}/{:0width$}.json",
+            snap.version,
+            width = VERSION_WIDTH
+        );
         match store.put_if_absent(&key, &snap.to_vec())? {
             PutOutcome::Created => return Ok(snap),
             PutOutcome::AlreadyExists => continue,
@@ -198,7 +202,9 @@ impl ObjectStore for LocalStore {
                 })?;
                 Ok(PutOutcome::Created)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(PutOutcome::AlreadyExists),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(PutOutcome::AlreadyExists)
+            }
             Err(source) => Err(StoreError::Io {
                 key: key.to_string(),
                 source,
@@ -251,7 +257,7 @@ fn join_prefix(prefix: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::{Column, DataFile, Schema, Table, FORMAT_VERSION};
+    use crate::metadata::{Column, DataFile, FORMAT_VERSION, Schema, Table};
 
     fn snapshot(version: i64, table: &str) -> CatalogSnapshot {
         CatalogSnapshot {
@@ -261,7 +267,10 @@ mod tests {
                 name: "main".into(),
                 tables: vec![Table {
                     name: table.into(),
-                    columns: vec![Column { name: "id".into(), type_sql: "INTEGER".into() }],
+                    columns: vec![Column {
+                        name: "id".into(),
+                        type_sql: "INTEGER".into(),
+                    }],
                     files: vec![DataFile {
                         location: "_goose_data/a.parquet".into(),
                         size: Some(123),
@@ -284,7 +293,10 @@ mod tests {
     fn local_put_if_absent_is_a_cas() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path());
-        assert_eq!(store.put_if_absent("k", b"first").unwrap(), PutOutcome::Created);
+        assert_eq!(
+            store.put_if_absent("k", b"first").unwrap(),
+            PutOutcome::Created
+        );
         // Second writer loses the race; original bytes are untouched.
         assert_eq!(
             store.put_if_absent("k", b"second").unwrap(),

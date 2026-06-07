@@ -16,12 +16,12 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use dispatch::Projection;
+use goose::ParquetCatalog;
 use goose::metadata::{
-    CatalogSnapshot, Column as MetaColumn, DataFile, Schema as MetaSchema, Table as MetaTable,
-    FORMAT_VERSION,
+    CatalogSnapshot, Column as MetaColumn, DataFile, FORMAT_VERSION, Schema as MetaSchema,
+    Table as MetaTable,
 };
 use goose::parquet::table_input;
-use goose::ParquetCatalog;
 use planner::catalog::{Catalog, Column, CreateTableRequest, Result as CatalogResult};
 use planner::types::Type;
 
@@ -61,8 +61,14 @@ fn create(
 
 fn columns() -> Vec<Column> {
     vec![
-        Column { name: "name".to_string(), col_type: Type::Utf8 },
-        Column { name: "value".to_string(), col_type: Type::Int64 },
+        Column {
+            name: "name".to_string(),
+            col_type: Type::Utf8,
+        },
+        Column {
+            name: "value".to_string(),
+            col_type: Type::Int64,
+        },
     ]
 }
 
@@ -85,8 +91,14 @@ fn attach_existing_lake_table_and_scan_rows() {
             tables: vec![MetaTable {
                 name: "events".to_string(),
                 columns: vec![
-                    MetaColumn { name: "name".into(), type_sql: "VARCHAR".into() },
-                    MetaColumn { name: "value".into(), type_sql: "BIGINT".into() },
+                    MetaColumn {
+                        name: "name".into(),
+                        type_sql: "VARCHAR".into(),
+                    },
+                    MetaColumn {
+                        name: "value".into(),
+                        type_sql: "BIGINT".into(),
+                    },
                 ],
                 files: vec![DataFile {
                     location: "_goose_data/a.parquet".to_string(),
@@ -104,7 +116,12 @@ fn attach_existing_lake_table_and_scan_rows() {
     .unwrap();
 
     let catalog = Arc::new(ParquetCatalog::new());
-    create(&dispatch, &catalog, lake_request("events", dir.path(), columns())).unwrap();
+    create(
+        &dispatch,
+        &catalog,
+        lake_request("events", dir.path(), columns()),
+    )
+    .unwrap();
 
     let table = catalog
         .parquet_table("events")
@@ -132,7 +149,12 @@ fn create_new_lake_table_cas_commits_a_snapshot() {
     let dir = TempDir::new().unwrap(); // empty: no _goose_log yet
 
     let catalog = Arc::new(ParquetCatalog::new());
-    create(&dispatch, &catalog, lake_request("t", dir.path(), columns())).unwrap();
+    create(
+        &dispatch,
+        &catalog,
+        lake_request("t", dir.path(), columns()),
+    )
+    .unwrap();
 
     // Exactly one snapshot was committed via create-if-absent.
     let logs: Vec<_> = fs::read_dir(dir.path().join("_goose_log"))

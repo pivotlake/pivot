@@ -11,8 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use goose::ParquetCatalog;
 use dispatch::Dispatch;
+use goose::ParquetCatalog;
 use rstest::fixture;
 use server::Server;
 use tokio_postgres::{Client, NoTls};

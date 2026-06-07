@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 
-use goose::parquet::table_input;
 use common::*;
 use dispatch::{Projection, RECORD_BATCH_SIZE};
+use goose::parquet::table_input;
 
 #[test]
 fn subsequent_batches_reuse_write_buffer() {

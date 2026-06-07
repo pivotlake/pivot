@@ -30,11 +30,11 @@ use arrow_array::{BooleanArray, Int16Array, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use goose::parquet::{ParquetTable, materialize, table_input};
 use dispatch::{
     Contains, DataFlowDispatcher, Dispatch, IntKeyExtractor, OrderBy, Projection,
     StringKeyExtractor,
 };
+use goose::parquet::{ParquetTable, materialize, table_input};
 
 static SOURCE_DIRECTORY: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(std::env::var("SOURCE_DIRECTORY").unwrap()));

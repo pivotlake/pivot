@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use goose::ParquetCatalog;
 use dispatch::{BUFFER_SIZE, Dispatch};
+use goose::ParquetCatalog;
 use server::Server;
 use tokio::sync::oneshot;
 

@@ -9,9 +9,9 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use goose::parquet::table_input;
 use common::*;
 use dispatch::Projection;
+use goose::parquet::table_input;
 
 #[test]
 fn scan_all_columns() {

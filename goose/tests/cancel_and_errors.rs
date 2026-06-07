@@ -3,9 +3,9 @@ mod common;
 use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 
-use goose::parquet::table_input;
 use common::*;
 use dispatch::Projection;
+use goose::parquet::table_input;
 
 /// A panicking filter on every batch should surface as an error from
 /// `.collect()`, not a silent empty result.

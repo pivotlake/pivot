@@ -189,8 +189,8 @@ mod tests {
     use super::*;
     use crate::sink::ParquetSink;
     use arrow_array::{Array, Int32Array, RecordBatch, StringViewArray};
-    use goose::parquet::{ParquetTable, table_input};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, Projection};
+    use goose::parquet::{ParquetTable, table_input};
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};

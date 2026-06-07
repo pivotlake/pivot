@@ -48,7 +48,9 @@ const URL_OPTION: &str = "url";
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("CREATE TABLE needs a `{PATH_OPTION}` (local directory) or `{URL_OPTION}` (goose catalog) option")]
+    #[error(
+        "CREATE TABLE needs a `{PATH_OPTION}` (local directory) or `{URL_OPTION}` (goose catalog) option"
+    )]
     MissingPath,
     #[error("path `{0}` does not exist")]
     PathNotFound(String),

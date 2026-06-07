@@ -16,10 +16,10 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use goose::parquet::table_input_with_filter;
-use goose::parquet::{RowGroupFilter, RowGroupMetadata};
 use common::*;
 use dispatch::Projection;
+use goose::parquet::table_input_with_filter;
+use goose::parquet::{RowGroupFilter, RowGroupMetadata};
 
 /// Write a single Int64 column with one row group per three rows, so each row
 /// group carries distinct min/max statistics.
