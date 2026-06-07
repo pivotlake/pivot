@@ -11,7 +11,7 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
+use goose::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 use planner::Planner;
 use planner::catalog::{Catalog, Column, DynamicScanPredicate, Table};

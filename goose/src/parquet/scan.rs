@@ -1,7 +1,7 @@
 //! Builders that assemble the Parquet read pipeline into a dispatch dataflow.
 //!
 //! These were inherent methods on dispatch's `OperatorSpec` / `RecordBatchOperatorSpec`
-//! before the Parquet pipeline moved into `catalog`; they're now free functions
+//! before the Parquet pipeline moved into `goose`; they're now free functions
 //! built on dispatch's public operator toolkit (`OperatorSpec::chain`,
 //! `RootUnaryOperatorFactory`, the channel factories). The stages are: row-group
 //! injection + fetching (source) → index → decompress → decode.

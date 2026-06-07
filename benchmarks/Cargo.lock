@@ -775,11 +775,11 @@ dependencies = [
 name = "benchmarks"
 version = "0.1.0"
 dependencies = [
- "catalog",
  "chrono",
  "clap",
  "core_affinity",
  "dispatch",
+ "goose",
  "planner",
  "serde",
  "serde_json",
@@ -892,24 +892,6 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
-
-[[package]]
-name = "catalog"
-version = "0.1.0"
-dependencies = [
- "ahash 0.8.12",
- "arrow-array 58.0.0",
- "arrow-buffer 58.0.0",
- "arrow-ord 58.0.0",
- "arrow-schema 58.0.0",
- "bytes",
- "crossbeam-deque",
- "dispatch",
- "planner",
- "snap",
- "thiserror 2.0.18",
- "thriftparquet",
-]
 
 [[package]]
 name = "cc"
@@ -1662,6 +1644,24 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
+name = "goose"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "arrow-array 58.0.0",
+ "arrow-buffer 58.0.0",
+ "arrow-ord 58.0.0",
+ "arrow-schema 58.0.0",
+ "bytes",
+ "crossbeam-deque",
+ "dispatch",
+ "planner",
+ "snap",
+ "thiserror 2.0.18",
+ "thriftparquet",
+]
 
 [[package]]
 name = "h2"
@@ -3552,10 +3552,10 @@ dependencies = [
  "arrow-array 58.0.0",
  "arrow-schema 58.0.0",
  "async-trait",
- "catalog",
  "clap",
  "dispatch",
  "futures",
+ "goose",
  "ingest",
  "pgwire",
  "planner",

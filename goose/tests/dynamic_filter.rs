@@ -16,8 +16,8 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::parquet::table_input_with_filter;
-use catalog::parquet::{RowGroupFilter, RowGroupMetadata};
+use goose::parquet::table_input_with_filter;
+use goose::parquet::{RowGroupFilter, RowGroupMetadata};
 use common::*;
 use dispatch::Projection;
 
@@ -26,7 +26,7 @@ use dispatch::Projection;
 fn row_group_per_three(
     dispatch: &DispatchGuard,
     rows: &[i64],
-) -> (TempDir, Arc<catalog::parquet::ParquetTable>) {
+) -> (TempDir, Arc<goose::parquet::ParquetTable>) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("data.parquet");
     let schema = Arc::new(Schema::new(vec![Field::new(

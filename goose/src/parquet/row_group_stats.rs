@@ -2,7 +2,7 @@
 //!
 //! Given a single-column predicate `col <op> constant`, decide whether a row
 //! group is guaranteed to contain no matching row from its min/max statistics.
-//! Shared by static filter pushdown (in `catalog::ParquetCatalogTable`) and by
+//! Shared by static filter pushdown (in `goose::ParquetCatalogTable`) and by
 //! dynamic-filter pruning at scan time, so both reason about stats identically.
 
 use std::sync::Arc;

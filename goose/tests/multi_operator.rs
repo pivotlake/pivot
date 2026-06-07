@@ -3,7 +3,7 @@ mod common;
 use arrow_array::{Array, BooleanArray, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 
-use catalog::parquet::table_input;
+use goose::parquet::table_input;
 use common::*;
 use dispatch::{Contains, OrderBy, Projection, StringKeyExtractor};
 

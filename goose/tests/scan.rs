@@ -9,7 +9,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::parquet::table_input;
+use goose::parquet::table_input;
 use common::*;
 use dispatch::Projection;
 

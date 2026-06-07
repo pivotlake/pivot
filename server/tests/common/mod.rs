@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
+use goose::ParquetCatalog;
 use dispatch::Dispatch;
 use rstest::fixture;
 use server::Server;

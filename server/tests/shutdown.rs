@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
+use goose::ParquetCatalog;
 use common::{pick_free_port, wait_until_listening};
 use dispatch::Dispatch;
 use server::Server;

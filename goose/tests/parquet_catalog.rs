@@ -10,7 +10,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
-use catalog::{ParquetCatalog, ParquetCatalogTable};
+use goose::{ParquetCatalog, ParquetCatalogTable};
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };

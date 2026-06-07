@@ -28,7 +28,7 @@
 //! use std::path::Path;
 //! use std::sync::Arc;
 //!
-//! use catalog::parquet::{ParquetTable, table_input};
+//! use goose::parquet::{ParquetTable, table_input};
 //! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
 //! use planner::catalog::{Catalog, Column, CreateTableRequest, DynamicScanPredicate, Table};

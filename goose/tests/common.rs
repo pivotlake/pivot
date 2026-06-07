@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Once};
 use tempfile::TempDir;
 
-use catalog::parquet::ParquetTable;
+use goose::parquet::ParquetTable;
 use dispatch::{DataFlowDispatcher, Dispatch};
 
 // The process-wide dispatcher, created on the first `init*` call.
