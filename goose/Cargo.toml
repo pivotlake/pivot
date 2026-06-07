@@ -35,6 +35,8 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 # rustls) and base64-encode the JWT segments.
 ring = "0.17"
 base64 = "0.22"
+# Build/parse the concrete URLs handed to the io_uring HTTP reader.
+url = "2"
 
 [dev-dependencies]
 # `test-util` exposes dispatch's single-operator test harness for the moved

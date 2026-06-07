@@ -41,14 +41,14 @@ pub use types::table::{Error as ParquetTableError, ParquetTable};
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::parquet::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
+    use crate::parquet::types::metadata::{FileSource, QueryRowGroupMetadata, RowGroupMetadata};
     use crate::parquet::types::table::ParquetTable;
     use arrow_schema::Schema;
     use std::sync::Arc;
 
     pub fn dummy_row_group() -> Arc<RowGroupMetadata> {
         Arc::new(RowGroupMetadata {
-            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            source: FileSource::Local(Arc::new(std::fs::File::open("/dev/null").unwrap())),
             schema: Arc::new(Schema::empty()),
             columns: vec![],
             num_rows: 0,

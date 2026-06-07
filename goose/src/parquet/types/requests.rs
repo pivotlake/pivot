@@ -1,9 +1,8 @@
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use bytes::Bytes;
-use dispatch::io::{FileLocation, FsRequest};
+use dispatch::io::{FileLocation, FsRequest, HttpRequest};
 use dispatch::memory::{CacheLookup, memory_ctx};
-use std::os::fd::{AsRawFd, RawFd};
 
 /// Tracks the IO state for a single column chunk within a row group.
 ///
@@ -19,19 +18,30 @@ struct ColumnRequest {
 
 impl ColumnRequest {
     /// Build a `ColumnRequest` from column chunk metadata, queueing the reads
-    /// for any missing sub-blocks onto `io_requests`.
-    fn from(meta: &ColumnChunkMeta, fd: RawFd, io_requests: &mut Vec<FsRequest>) -> Self {
+    /// for any missing sub-blocks onto the filesystem or HTTP request list
+    /// according to where the file lives.
+    fn from(
+        meta: &ColumnChunkMeta,
+        location: &FileLocation,
+        fs_requests: &mut Vec<FsRequest>,
+        http_requests: &mut Vec<HttpRequest>,
+    ) -> Self {
         let col_start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
         let len = meta.total_compressed_size as usize;
 
-        let location = FileLocation::Local(fd);
-        let parts = memory_ctx().file_cache().get(&location, col_start, len);
+        let parts = memory_ctx().file_cache().get(location, col_start, len);
         for lookup in &parts {
             for block in lookup.missing() {
-                io_requests.push(FsRequest {
-                    fd,
-                    block: block.clone(),
-                });
+                match location {
+                    FileLocation::Local(fd) => fs_requests.push(FsRequest {
+                        fd: *fd,
+                        block: block.clone(),
+                    }),
+                    FileLocation::Remote(remote) => http_requests.push(HttpRequest {
+                        remote: remote.clone(),
+                        block: block.clone(),
+                    }),
+                }
             }
         }
         Self { parts }
@@ -54,8 +64,10 @@ impl ColumnRequest {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     column_requests: Vec<ColumnRequest>,
-    /// Filesystem read requests not yet submitted to io-uring.
-    pending_io: Vec<FsRequest>,
+    /// Local filesystem read requests not yet submitted to io-uring.
+    pending_fs: Vec<FsRequest>,
+    /// Remote HTTP range-read requests not yet submitted to the ring.
+    pending_http: Vec<HttpRequest>,
     /// Outstanding read count (pending + in-flight).
     remaining: usize,
 }
@@ -63,20 +75,29 @@ pub struct RowGroupRequest {
 impl RowGroupRequest {
     /// Build a request for all projected columns in the given row group.
     pub fn from(metadata_handle: QueryRowGroupMetadata, projection: &Projection) -> Self {
-        let fd = metadata_handle.get_metadata().file.as_raw_fd();
+        let location = metadata_handle.get_metadata().source.location();
         let columns = metadata_handle.columns();
 
-        let mut pending_io = vec![];
+        let mut pending_fs = vec![];
+        let mut pending_http = vec![];
         let column_requests = projection
             .indices()
             .iter()
-            .map(|&col_idx| ColumnRequest::from(&columns[col_idx], fd, &mut pending_io))
+            .map(|&col_idx| {
+                ColumnRequest::from(
+                    &columns[col_idx],
+                    &location,
+                    &mut pending_fs,
+                    &mut pending_http,
+                )
+            })
             .collect();
 
         Self {
             column_requests,
-            remaining: pending_io.len(),
-            pending_io,
+            remaining: pending_fs.len() + pending_http.len(),
+            pending_fs,
+            pending_http,
             metadata: metadata_handle,
         }
     }
@@ -91,9 +112,14 @@ impl RowGroupRequest {
         self.remaining == 0
     }
 
-    /// Returns filesystem read requests that haven't been submitted yet.
-    pub fn pending_io(&mut self) -> &mut Vec<FsRequest> {
-        &mut self.pending_io
+    /// Returns local filesystem read requests that haven't been submitted yet.
+    pub fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
+        &mut self.pending_fs
+    }
+
+    /// Returns remote HTTP range-read requests that haven't been submitted yet.
+    pub fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
+        &mut self.pending_http
     }
 
     /// Consume this request into a `RowGroupBuffer`.

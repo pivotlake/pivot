@@ -11,9 +11,34 @@
 use crate::parquet::types::table::ParquetTable;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
+use dispatch::io::{FileLocation, RemoteFile};
 use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Where a row group's bytes live, and how the file cache addresses them: a
+/// local file (read via the io_uring file path) or a remote object (read via
+/// HTTP range requests on the same ring). A [`FileLocation`] is derived from
+/// this to key the cache and to tell the fetcher which kind of IO to issue.
+#[derive(Clone)]
+pub enum FileSource {
+    /// An open local file. The `Arc<File>` keeps the fd alive for the cache.
+    Local(Arc<File>),
+    /// A remote object addressed by an (already DNS-resolved, possibly
+    /// presigned) URL.
+    Remote(Arc<RemoteFile>),
+}
+
+impl FileSource {
+    /// The [`FileLocation`] used to key the file cache and select the IO path.
+    pub fn location(&self) -> FileLocation {
+        match self {
+            FileSource::Local(file) => FileLocation::Local(file.as_raw_fd()),
+            FileSource::Remote(remote) => FileLocation::Remote(remote.clone()),
+        }
+    }
+}
 
 /// Decoded min/max (and counts) for one column of a row group. Each bound is an
 /// arrow [`Scalar<ArrayRef>`] — the same shape the planner uses for SQL
@@ -63,8 +88,8 @@ pub struct ColumnChunkMeta {
 /// queries may reference the same row group.
 #[derive(Clone)]
 pub struct RowGroupMetadata {
-    /// Open file handle for the Parquet file that contains this row group.
-    pub file: Arc<File>,
+    /// Where the Parquet file's bytes live (local fd or remote object).
+    pub source: FileSource,
     /// Arrow schema describing the columns in this row group.
     pub schema: SchemaRef,
     /// Per-column-chunk byte layout (offsets and sizes).

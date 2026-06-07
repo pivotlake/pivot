@@ -10,7 +10,7 @@ use crate::parquet::types::requests::RowGroupBuffer;
 use crate::parquet::types::requests::RowGroupRequest;
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::io::{FsRequest, IORequest};
+use dispatch::io::{FsRequest, HttpRequest, IORequest};
 
 /// Reads column chunks for one row group at a time via async disk IO.
 ///
@@ -59,9 +59,18 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
 
     fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
         if let Some(rg) = self.row_group_request.as_mut()
-            && !rg.pending_io().is_empty()
+            && !rg.pending_fs().is_empty()
         {
-            return Ok(std::mem::take(rg.pending_io()));
+            return Ok(std::mem::take(rg.pending_fs()));
+        }
+        Ok(vec![])
+    }
+
+    fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
+        if let Some(rg) = self.row_group_request.as_mut()
+            && !rg.pending_http().is_empty()
+        {
+            return Ok(std::mem::take(rg.pending_http()));
         }
         Ok(vec![])
     }

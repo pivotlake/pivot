@@ -1371,6 +1371,7 @@ dependencies = [
  "thriftparquet",
  "tracing-subscriber",
  "ureq",
+ "url",
 ]
 
 [[package]]

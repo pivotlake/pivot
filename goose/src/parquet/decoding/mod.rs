@@ -243,7 +243,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
 mod tests {
     use crate::parquet::decoding::Decoder;
     use crate::parquet::types::metadata::{
-        ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata,
+        ColumnChunkMeta, FileSource, QueryRowGroupMetadata, RowGroupMetadata,
     };
     use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
     use crate::parquet::types::projection::Projection;
@@ -261,7 +261,7 @@ mod tests {
         let num_cols = schema.fields().len();
         let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
-            file,
+            source: FileSource::Local(file),
             schema,
             columns: (0..num_cols)
                 .map(|_| ColumnChunkMeta {
