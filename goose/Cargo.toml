@@ -16,6 +16,13 @@ bytes = "1.11.0"
 crossbeam-deque = "0.8.6"
 ahash = "0.8.12"
 snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "1e20a92f7bcad208bf6869f5394101288850ee2e" }
+# Catalog metadata is serialized as JSON (the `_goose_log/<version>.json`
+# snapshots). serde replaces goose's hand-rolled json parser.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Object storage (s3://, gs://) for the catalog snapshot and remote data files.
+# Same version/features ingest uses, so one resolution across the workspace.
+object_store = { version = "0.12", features = ["gcp", "aws"] }
 
 [dev-dependencies]
 # `test-util` exposes dispatch's single-operator test harness for the moved

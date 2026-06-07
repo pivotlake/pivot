@@ -21,6 +21,7 @@
 // published API — so allow public docs to reference private items.
 #![allow(rustdoc::private_intra_doc_links)]
 
+pub mod metadata;
 pub mod parquet;
 
 use std::collections::HashMap;
