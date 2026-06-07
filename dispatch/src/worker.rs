@@ -262,12 +262,19 @@ impl Worker {
         thread::spawn(move || {
             WORKER_IDX.set(idx);
             NUM_WORKERS.set(num_workers);
+            let core_id = core.id;
+            // Pin to the assigned core *before* pre-faulting the ring, so each ring
+            // page is first-touched on this core's NUMA node (Linux places anon
+            // pages on the faulting thread's node). With workers confined to one
+            // node (see `Dispatch::spin_up`), this keeps the ring node-local
+            // without a hard `mbind`.
+            core_affinity::set_for_current(core);
             let last_seen_wake_count = waker.wake_count();
             debug!("Initializing worker waker {:?}", idx);
             init_worker_waker(&waker);
             let mut worker = Self {
                 io: IORequester::new(),
-                id: core.id,
+                id: core_id,
                 data_flows: HashMap::new(),
                 data_flow_queue: receiver,
                 did_work_last_iteration: false,
@@ -279,7 +286,6 @@ impl Worker {
             init_memory_context(memory_context_factory.create_memory_ctx());
             debug!("Pre-faulting for worker {:?}", idx);
             memory_ctx().prefault_buffers();
-            core_affinity::set_for_current(core);
             debug!("Waiting for barrier for worker {:?}", idx);
             ready_barrier.wait();
             debug!("Starting worker {:?}", idx);

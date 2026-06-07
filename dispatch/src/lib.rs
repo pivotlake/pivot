@@ -210,6 +210,96 @@ pub struct Dispatch {
     shutdown: Shutdown,
 }
 
+/// Decide which cores to run workers on and how large the ring may be.
+///
+/// On a single-NUMA-node machine: the first `worker_count` cores and the
+/// requested `buffers`, unchanged.
+///
+/// On a **multi-NUMA-node** machine (e.g. a 2-socket box) automatically confine
+/// workers to the first node's CPUs and cap the ring to 4/5 of that node's RAM.
+/// Combined with pinning-before-prefault in [`Worker::create`], the ring is
+/// first-touched (and thus placed) on that one node — keeping memory-bound queries
+/// off the slow, erratic cross-socket path. This relies on affinity + first-touch
+/// rather than a hard `mbind`, which can trip a lost-wakeup hang.
+///
+/// Set `PIVOT_NUMA_CONFINE=0` to opt out and use every core.
+fn select_cores_and_buffers(
+    cores: Vec<core_affinity::CoreId>,
+    worker_count: usize,
+    buffers: usize,
+) -> (Vec<core_affinity::CoreId>, usize) {
+    let confine = std::env::var("PIVOT_NUMA_CONFINE").map(|v| v != "0").unwrap_or(true);
+    if confine && numa_node_count() > 1 {
+        let allowed = read_id_list("/sys/devices/system/node/node0/cpulist");
+        if !allowed.is_empty() {
+            let node_cores: Vec<core_affinity::CoreId> =
+                cores.into_iter().filter(|c| allowed.contains(&c.id)).collect();
+            let buffers = buffers.min(node0_ring_cap_buffers());
+            info!(
+                "multi-NUMA box detected: confining workers to node0 ({} cores), ring capped to {} buffers",
+                node_cores.len(),
+                buffers
+            );
+            return (node_cores, buffers);
+        }
+    }
+    (cores.into_iter().take(worker_count).collect(), buffers)
+}
+
+/// Number of online NUMA nodes (from `/sys/devices/system/node/online`, e.g.
+/// `0-1`). Returns 1 when the topology can't be read.
+fn numa_node_count() -> usize {
+    read_id_list("/sys/devices/system/node/online").len().max(1)
+}
+
+/// Parse a Linux sysfs id-list file (e.g. `0-95` or `0-3,8-11`) into the set of
+/// ids it names. Empty set if the file can't be read.
+fn read_id_list(path: &str) -> std::collections::HashSet<usize> {
+    let mut set = std::collections::HashSet::new();
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return set;
+    };
+    for part in s.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                    set.extend(a..=b);
+                }
+            }
+            None => {
+                if let Ok(a) = part.trim().parse::<usize>() {
+                    set.insert(a);
+                }
+            }
+        }
+    }
+    set
+}
+
+/// Cap the ring at 4/5 of node0's RAM (in [`BUFFER_SIZE`] slots), from
+/// `/sys/devices/system/node/node0/meminfo` (`Node 0 MemTotal: <kB> kB`).
+/// Falls back to no cap (`usize::MAX`) if unreadable.
+fn node0_ring_cap_buffers() -> usize {
+    let Ok(s) = std::fs::read_to_string("/sys/devices/system/node/node0/meminfo") else {
+        return usize::MAX;
+    };
+    for line in s.lines() {
+        if line.contains("MemTotal:") {
+            // ".. MemTotal:   198045696 kB" -> number is the second-to-last token
+            if let Some(kb) = line
+                .split_whitespace()
+                .rev()
+                .nth(1)
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                // kB -> bytes (*1024), take 4/5, then convert to BUFFER_SIZE slots.
+                return kb.saturating_mul(1024) / 5 * 4 / BUFFER_SIZE;
+            }
+        }
+    }
+    usize::MAX
+}
+
 impl Dispatch {
     /// Spawn `worker_count` worker threads (capped by available cores) and return a
     /// `Dispatch` that owns them. `buffers` sets the size of the shared ring (in 2MB
@@ -219,7 +309,10 @@ impl Dispatch {
         let cores = core_affinity::get_core_ids().unwrap();
         info!("Setting up io...");
 
-        let cores: Vec<_> = cores.into_iter().take(worker_count).collect();
+        let (cores, buffers) = select_cores_and_buffers(cores, worker_count, buffers);
+        // Number of workers actually spawned (may be < requested when confined to
+        // a single NUMA node); used for prefault striding and `NUM_WORKERS`.
+        let worker_count = cores.len();
         let mut threads = vec![];
         info!("Creating memory context ({})...", cores.len());
         let barrier = Arc::new(Barrier::new(cores.len() + 1));
