@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use url::Url;
 
 use dispatch::Projection;
-use goose::parquet::{table_input, ParquetTable};
+use goose::parquet::{ParquetTable, table_input};
 
 /// Serve `bytes` over loopback HTTP, answering `Range` requests with `206`.
 /// Returns the bound URL. The server thread is detached and lives for the
@@ -80,7 +80,10 @@ fn handle_conn(mut stream: TcpStream, bytes: &[u8]) {
 fn parse_range(head: &str, total: usize) -> (usize, usize) {
     let spec = head
         .lines()
-        .find_map(|l| l.strip_prefix("Range:").or_else(|| l.strip_prefix("range:")))
+        .find_map(|l| {
+            l.strip_prefix("Range:")
+                .or_else(|| l.strip_prefix("range:"))
+        })
         .and_then(|v| v.trim().strip_prefix("bytes="))
         .unwrap_or("")
         .trim();
@@ -111,12 +114,18 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn parquet_bytes(batch: &arrow_array::RecordBatch) -> Vec<u8> {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("d.parquet");
+    // One row group per row, so a multi-row file produces several row groups —
+    // exercising the remote fetcher's many-in-flight concurrency.
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(1))
         .build();
-    let mut writer =
-        ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), batch.schema(), Some(props))
-            .unwrap();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&path).unwrap(),
+        batch.schema(),
+        Some(props),
+    )
+    .unwrap();
     writer.write(batch).unwrap();
     writer.close().unwrap();
     std::fs::read(&path).unwrap()
@@ -136,7 +145,10 @@ fn scans_a_remote_parquet_file_over_http() {
             .run_on_worker(move || Arc::new(ParquetTable::from_remote_files(&[url]).unwrap()))
             .expect("from_remote_files on a worker")
     };
-    assert!(!table.row_groups().is_empty(), "footer parsed from the remote file");
+    assert!(
+        !table.row_groups().is_empty(),
+        "footer parsed from the remote file"
+    );
 
     // Scan it: the column chunks are fetched as HTTP range reads on the ring.
     let results = table_input(&dispatch, &table, Projection::all(2), false)

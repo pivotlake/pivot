@@ -18,7 +18,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dispatch::io::{FileLocation, RemoteFile, open_direct_read};
 use dispatch::memory::{has_memory_context, memory_ctx};
-use url::Url;
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -27,6 +26,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
+use url::Url;
 
 static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
 
@@ -41,6 +41,16 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// The storage medium a [`ParquetTable`]'s files live on. A table is
+/// homogeneous (all local or all remote) by construction — `from_files` yields
+/// `Local`, `from_remote_files` yields `Remote` — so this is derived from the
+/// row groups and is used to pick the fetcher (disk vs HTTP) at scan time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableMedium {
+    Local,
+    Remote,
+}
 
 /// A logical table backed by one or more Parquet files.
 ///
@@ -178,6 +188,15 @@ impl ParquetTable {
             &self.row_groups[0].schema
         }
     }
+
+    /// The medium this table's files live on, which selects the fetcher used to
+    /// read them. An empty table reports `Local` (it issues no reads anyway).
+    pub fn medium(&self) -> TableMedium {
+        match self.row_groups.first().map(|rg| &rg.source) {
+            Some(FileSource::Remote(_)) => TableMedium::Remote,
+            _ => TableMedium::Local,
+        }
+    }
 }
 
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
@@ -239,7 +258,11 @@ fn parse_row_group_metadatas_remote(
     memory_ctx()
         .file_cache()
         .open_entry(FileLocation::Remote(remote.clone()));
-    build_row_groups(global_row_group_offset, file_meta, FileSource::Remote(remote))
+    build_row_groups(
+        global_row_group_offset,
+        file_meta,
+        FileSource::Remote(remote),
+    )
 }
 
 /// Build the per-row-group metadata from a parsed footer and a (local or

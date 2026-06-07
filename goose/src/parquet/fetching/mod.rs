@@ -13,12 +13,20 @@
 //! - [`RowGroupFetcherFactory`] / [`fetcher::RowGroupFetcher`] — the unary
 //!   operator that receives a `RowGroupRequest`, submits aligned IO requests
 //!   for each projected column, collects completions, and emits the finished
-//!   `RowGroupBuffer` downstream.
+//!   `RowGroupBuffer` downstream. Used for **local** (disk) tables.
+//! - [`RemoteRowGroupFetcherFactory`] / [`remote_fetcher::RemoteRowGroupFetcher`]
+//!   — the same role for **remote** (HTTP) tables, but keeping many row groups
+//!   in flight per worker to hide network latency.
 
+/// Disk fetcher: one row group at a time per worker (io-uring depth).
 pub type RowGroupFetcherFactory = DefaultUnaryFactory<RowGroupFetcher>;
+/// HTTP fetcher: many row groups in flight per worker (latency hiding).
+pub type RemoteRowGroupFetcherFactory = DefaultUnaryFactory<RemoteRowGroupFetcher>;
 mod fetcher;
+mod remote_fetcher;
 
 mod table_source;
 use crate::parquet::fetching::fetcher::RowGroupFetcher;
+use crate::parquet::fetching::remote_fetcher::RemoteRowGroupFetcher;
 use dispatch::DefaultUnaryFactory;
 pub use table_source::RowGroupInjectorFactory;
