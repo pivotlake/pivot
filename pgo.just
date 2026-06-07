@@ -10,7 +10,7 @@ pgo-gen *args:
     mkdir -p {{pgo_dir}}
     RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
         cargo {{args}}
-    $(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
+    $(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
 
 # Run a cargo command using the merged PGO profile.
 #
