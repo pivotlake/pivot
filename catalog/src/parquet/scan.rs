@@ -20,7 +20,7 @@ use dispatch::{
 use super::{
     CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
     MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
+    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
 };
 
 /// Append the index → decompress → decode stages onto a source of
@@ -76,6 +76,7 @@ pub fn table_input(
         projection,
         add_row_group_metadata,
         None,
+        None,
         Arc::new(Vec::new()),
     )
 }
@@ -95,6 +96,7 @@ pub fn table_input_with_filter(
         projection,
         add_row_group_metadata,
         filter,
+        None,
         Arc::new(Vec::new()),
     )
 }
@@ -108,10 +110,11 @@ pub fn table_input_with_filter_and_eq_predicates(
     projection: Projection,
     add_row_group_metadata: bool,
     filter: Option<RowGroupFilter>,
+    scan_order: Option<ScanOrder>,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
-    let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter);
+    let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
     let siblings = Arc::new(AtomicUsize::new(n));
     let factories: Vec<_> = (0..n)
         .map(|_| {

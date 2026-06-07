@@ -8,7 +8,9 @@ pub(crate) fn op_err(e: impl std::error::Error + Send + Sync + 'static) -> dispa
 mod record_batch_metadata;
 
 mod row_group_stats;
-pub use row_group_stats::{RowGroupFilter, row_group_eliminated, row_group_filter_from};
+pub use row_group_stats::{
+    RowGroupFilter, ScanOrder, row_group_eliminated, row_group_filter_from, scan_order_from,
+};
 
 mod indexer;
 pub use indexer::IndexerFactory;
