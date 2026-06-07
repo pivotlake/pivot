@@ -75,8 +75,39 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// returned as full keys relative to the root.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 
+    /// Produce a time-limited URL that GETs `key` with no auth headers — so the
+    /// io_uring HTTP reader can range-read it directly. Remote backends sign a
+    /// URL; the local backend has no URL and returns an error (callers resolve
+    /// local files to filesystem paths instead).
+    fn presign_get(&self, key: &str) -> Result<url::Url> {
+        Err(StoreError::Config(format!(
+            "{} cannot presign `{key}`: only object-store backends produce URLs",
+            self.describe()
+        )))
+    }
+
     /// A human-readable description of where this store points, for diagnostics.
     fn describe(&self) -> String;
+}
+
+/// Presign a GET URL for an absolute object-store location (`s3://…`/`gs://…`):
+/// open the right backend for its bucket and sign the object's key. Used to turn
+/// a snapshot's remote data-file location into something the ring can fetch.
+pub fn presign_get(location: &str) -> Result<url::Url> {
+    let (root, key) = split_bucket(location)?;
+    open_store(&root)?.presign_get(&key)
+}
+
+/// Split an absolute object URI into `(bucket-root-uri, object-key)`, e.g.
+/// `s3://b/p/x.parquet` → (`s3://b`, `p/x.parquet`).
+fn split_bucket(location: &str) -> Result<(String, String)> {
+    for scheme in ["s3://", "s3a://", "gs://"] {
+        if let Some(rest) = location.strip_prefix(scheme) {
+            let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
+            return Ok((format!("{scheme}{bucket}"), key.to_string()));
+        }
+    }
+    Err(StoreError::UnsupportedUri(location.to_string()))
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,

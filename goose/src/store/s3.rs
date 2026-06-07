@@ -9,11 +9,11 @@
 use super::{ObjectStore, PutOutcome, Result, StoreError, join_prefix};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
+    PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
 use std::io::Read;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub struct S3Store {
@@ -218,6 +218,55 @@ impl ObjectStore for S3Store {
             .into_iter()
             .map(|c| c.key.strip_prefix(&strip).unwrap_or(&c.key).to_string())
             .collect())
+    }
+
+    fn presign_get(&self, key: &str) -> Result<url::Url> {
+        let object = join_prefix(&self.prefix, key);
+        let url = self.url_for(&object);
+
+        let creds = Credentials::new(
+            &self.access_key,
+            &self.secret_key,
+            self.session_token.clone(),
+            None,
+            "goose-env",
+        );
+        let identity = creds.into();
+
+        let mut settings = SigningSettings::default();
+        settings.signature_location = SignatureLocation::QueryParams;
+        settings.expires_in = Some(Duration::from_secs(3600));
+
+        let params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.region)
+            .name("s3")
+            .time(SystemTime::now())
+            .settings(settings)
+            .build()
+            .map_err(|e| StoreError::Http(format!("sigv4 presign params: {e}")))?;
+
+        // A presigned GET signs only `host`; the payload is unsigned so the ring
+        // can add a `Range` header the signature doesn't cover.
+        let host_header = [("host", self.host.as_str())];
+        let signable = SignableRequest::new(
+            "GET",
+            &url,
+            host_header.iter().copied(),
+            SignableBody::UnsignedPayload,
+        )
+        .map_err(|e| StoreError::Http(format!("sigv4 presign signable: {e}")))?;
+
+        let (instructions, _signature) = sign(signable, &params.into())
+            .map_err(|e| StoreError::Http(format!("sigv4 presign: {e}")))?
+            .into_parts();
+
+        let mut signed = url::Url::parse(&url)
+            .map_err(|e| StoreError::Http(format!("parsing presign url: {e}")))?;
+        for (name, value) in instructions.params() {
+            signed.query_pairs_mut().append_pair(name, value);
+        }
+        Ok(signed)
     }
 
     fn describe(&self) -> String {

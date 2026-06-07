@@ -244,9 +244,113 @@ impl ObjectStore for GcsStore {
             .collect())
     }
 
+    fn presign_get(&self, key: &str) -> Result<url::Url> {
+        // V4 signed URLs require RSA signing with a service-account private key;
+        // the metadata-server / authorized-user token flows can't presign.
+        let cred_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").map_err(|_| {
+            StoreError::Config(
+                "GCS presigning needs a service-account key in \
+                 GOOGLE_APPLICATION_CREDENTIALS"
+                    .to_string(),
+            )
+        })?;
+        let bytes = std::fs::read(&cred_path).map_err(|source| StoreError::Io {
+            key: cred_path.clone(),
+            source,
+        })?;
+        let creds: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| StoreError::Config(format!("parsing {cred_path}: {e}")))?;
+        if creds.get("type").and_then(|t| t.as_str()) != Some("service_account") {
+            return Err(StoreError::Config(
+                "GCS presigning needs a service_account key (other credential \
+                 types can't sign URLs)"
+                    .to_string(),
+            ));
+        }
+        let client_email = field(&creds, "client_email")?;
+        let private_key = field(&creds, "private_key")?;
+
+        let object = join_prefix(&self.prefix, key);
+        let canonical_uri = format!("/{}/{}", self.bucket, encode_path(&object));
+        let (date, datetime) = goog_v4_timestamp();
+        let scope = format!("{date}/auto/storage/goog4_request");
+        let credential = format!("{client_email}/{scope}");
+
+        // Canonical query: the X-Goog-* params, percent-encoded and sorted by key
+        // (these five are already in sorted order).
+        let canonical_query = [
+            ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_string()),
+            ("X-Goog-Credential", percent_encode(&credential)),
+            ("X-Goog-Date", datetime.clone()),
+            ("X-Goog-Expires", "3600".to_string()),
+            ("X-Goog-SignedHeaders", "host".to_string()),
+        ]
+        .map(|(k, v)| format!("{k}={v}"))
+        .join("&");
+
+        let canonical_request = format!(
+            "GET\n{canonical_uri}\n{canonical_query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD"
+        );
+        let hashed = hex(ring::digest::digest(&ring::digest::SHA256, canonical_request.as_bytes()).as_ref());
+        let string_to_sign = format!("GOOG4-RSA-SHA256\n{datetime}\n{scope}\n{hashed}");
+        let signature = hex(&rs256_sign(&private_key, string_to_sign.as_bytes())?);
+
+        let url = format!(
+            "https://storage.googleapis.com{canonical_uri}?{canonical_query}&X-Goog-Signature={signature}"
+        );
+        url::Url::parse(&url).map_err(|e| StoreError::Config(format!("building signed url: {e}")))
+    }
+
     fn describe(&self) -> String {
         format!("gs://{}/{}", self.bucket, self.prefix)
     }
+}
+
+/// Percent-encode an object name for a URL *path*, preserving the `/`
+/// separators between segments.
+fn encode_path(object: &str) -> String {
+    object
+        .split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Lowercase hex encoding.
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Current UTC time as GCS V4 expects it: `(YYYYMMDD, YYYYMMDDTHHMMSSZ)`.
+fn goog_v4_timestamp() -> (String, String) {
+    let secs = unix_now();
+    let days = (secs / 86_400) as i64;
+    let tod = secs % 86_400;
+    let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let (y, mo, d) = civil_from_days(days);
+    (
+        format!("{y:04}{mo:02}{d:02}"),
+        format!("{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z"),
+    )
+}
+
+/// Convert a count of days since the Unix epoch to a civil `(year, month, day)`
+/// (Howard Hinnant's algorithm). Valid for all dates we'll ever stamp.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[derive(serde::Deserialize)]

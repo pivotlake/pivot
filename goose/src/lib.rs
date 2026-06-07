@@ -66,8 +66,8 @@ pub enum Error {
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
     Store(#[from] store::StoreError),
-    #[error("data file `{0}` is on remote object storage; remote data reads are not wired up yet")]
-    RemoteDataNotSupported(String),
+    #[error("table mixes local and remote data files, which is not supported")]
+    MixedDataFiles,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -151,16 +151,24 @@ impl ParquetCatalog {
 
         let parquet = match existing {
             Some(table) => {
-                let mut paths = Vec::with_capacity(table.files.len());
+                // Resolve each data file to a local path or a presigned remote
+                // URL. A table's files share the root's store, so they're either
+                // all local or all remote.
+                let mut paths = Vec::new();
+                let mut urls = Vec::new();
                 for file in &table.files {
-                    match lake::local_path(url, &file.location) {
-                        Some(p) => paths.push(p),
-                        None => {
-                            return Err(Error::RemoteDataNotSupported(file.location.clone()));
-                        }
+                    match lake::resolve_data_file(url, &file.location) {
+                        lake::Resolved::Local(p) => paths.push(p),
+                        lake::Resolved::Remote(uri) => urls.push(store::presign_get(&uri)?),
                     }
                 }
-                ParquetTable::from_files(&paths)?
+                match (paths.is_empty(), urls.is_empty()) {
+                    (_, true) => ParquetTable::from_files(&paths)?,
+                    (true, false) => ParquetTable::from_remote_files(&urls)?,
+                    (false, false) => {
+                        return Err(Error::MixedDataFiles);
+                    }
+                }
             }
             None => {
                 // New catalog: commit an initial snapshot defining this table.

@@ -66,6 +66,36 @@ pub fn is_remote_location(loc: &str) -> bool {
     loc.starts_with("s3://") || loc.starts_with("s3a://") || loc.starts_with("gs://")
 }
 
+/// A data-file location resolved to how it should be read.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resolved {
+    /// A local filesystem path.
+    Local(PathBuf),
+    /// An absolute object-store URI (`s3://…`/`gs://…`) to be presigned and
+    /// range-read over HTTP.
+    Remote(String),
+}
+
+/// Resolve a snapshot data-file `loc` (under catalog `root`) to a local path or
+/// an absolute remote URI. A relative location is interpreted against the root:
+/// local root → local path; remote root → an absolute object URI in the same
+/// bucket.
+pub fn resolve_data_file(root: &str, loc: &str) -> Resolved {
+    if let Some(path) = local_path(root, loc) {
+        return Resolved::Local(path);
+    }
+    if is_remote_location(loc) {
+        Resolved::Remote(loc.to_string())
+    } else {
+        // Relative location under a remote root: join onto the root URI.
+        Resolved::Remote(format!(
+            "{}/{}",
+            root.trim_end_matches('/'),
+            loc.trim_start_matches('/')
+        ))
+    }
+}
+
 /// The local filesystem path for a data-file location, or `None` if it
 /// resolves to remote object storage. An absolute location (`/…`, `file://…`)
 /// is used directly; an absolute remote one (`s3://`/`gs://`) is `None`; a
