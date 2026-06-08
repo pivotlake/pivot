@@ -17,6 +17,7 @@
 //! the `Avg` kind here is only used for an undecomposed average.)
 
 use crate::operations::channels::Sender;
+use crate::operations::unary::group::{Aggregate as RowAggregate, Sum};
 use crate::operations::unary::{self, Unary, UnaryFactory};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
@@ -108,6 +109,11 @@ pub struct Aggregate {
 /// Sum the non-null values of an integer primitive column as `i128`, returning
 /// `(sum, non_null_count)`.
 ///
+/// The per-row value read (downcast + widen to `i64`) is delegated to the GROUP
+/// BY [`Sum`] op — the single source of truth for what `SUM` contributes per
+/// row — so this path only layers on the two concerns that op leaves out: null
+/// skipping, and an accumulator wide enough for a whole batch.
+///
 /// `$acc` is the per-batch accumulator type. For 16/32-bit columns an `i64`
 /// batch fold is safe (a single batch can't overflow it) and fast. For 64-bit
 /// columns the values themselves can approach `i64::MAX`, so a
@@ -117,10 +123,11 @@ fn sum_column(arr: &dyn Array) -> (i128, u64) {
         ($ty:ty, $acc:ty) => {{
             let a = arr.as_primitive::<$ty>();
             let non_null = (a.len() - a.null_count()) as u64;
+            let contribution = |i: usize| Sum::<$ty>::contribution(&a, i) as $acc;
             let batch_sum: $acc = if a.null_count() == 0 {
-                a.values().iter().map(|&v| v as $acc).sum()
+                (0..a.len()).map(contribution).sum()
             } else {
-                a.iter().flatten().map(|v| v as $acc).sum()
+                (0..a.len()).filter(|&i| a.is_valid(i)).map(contribution).sum()
             };
             (batch_sum as i128, non_null)
         }};

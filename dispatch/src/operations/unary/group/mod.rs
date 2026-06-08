@@ -99,7 +99,7 @@ mod hashtables;
 
 pub use keys::{ArenaKey, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
 pub use values::{
-    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count, Sum,
+    Aggregate, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count, Sum,
     ValueExtractor,
 };
 

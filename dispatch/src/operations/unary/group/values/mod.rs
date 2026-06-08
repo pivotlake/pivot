@@ -16,7 +16,7 @@ mod aggregate;
 mod aggregation_row;
 mod compiled;
 
-pub use aggregate::{Count, Sum};
+pub use aggregate::{Aggregate, Count, Sum};
 pub use aggregation_row::AggregationRowValueExtractor;
 pub use compiled::Compiled;
 
