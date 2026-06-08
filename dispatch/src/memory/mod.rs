@@ -32,7 +32,7 @@ mod read_buffer;
 pub use read_buffer::ReadBuffer;
 
 mod slab;
-pub use slab::{MultiSlabBuffer, SlabAllocator, SlabBuffer};
+pub use slab::{MultiSlabBuffer, SlabAllocator, SlabBuffer, SlabVec};
 
 mod reader;
 pub use reader::{MultiBufferReader, ReaderPosition};

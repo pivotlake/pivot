@@ -453,7 +453,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         i: usize,
         slot: usize,
         hash: u64,
-        slots: &mut [usize],
+        probe_slots: &mut [usize],
         rows: &mut S,
     ) -> bool {
         let stored = self.buffer[slot].hash;
@@ -469,7 +469,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             true
         } else {
             self.collisions += 1;
-            slots[i] = (slot + 1) & self.mask;
+            probe_slots[i] = (slot + 1) & self.mask;
             false
         }
     }
@@ -505,7 +505,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         &mut self,
         length: usize,
         hashes: &mut [u64],
-        slots: &mut [usize],
+        probe_slots: &mut [usize],
         unresolved: &mut [u32],
         unresolved_scratch: &mut [u32],
         rows: &mut S,
@@ -527,7 +527,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             let hash = remap_zero(hashes[i]);
             hashes[i] = hash;
             let slot = self.slot_for(hash);
-            if !self.probe_row_for_slot(i, slot, hash, slots, rows) {
+            if !self.probe_row_for_slot(i, slot, hash, probe_slots, rows) {
                 unresolved[collided] = i as u32;
                 collided += 1;
             }
@@ -542,10 +542,10 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             let mut collided = 0usize;
             for k in 0..remaining {
                 if k + PREFETCH_DIST < remaining {
-                    self.prefetch_entry(slots[work[k + PREFETCH_DIST] as usize]);
+                    self.prefetch_entry(probe_slots[work[k + PREFETCH_DIST] as usize]);
                 }
                 let i = work[k] as usize;
-                if !self.probe_row_for_slot(i, slots[i], hashes[i], slots, rows) {
+                if !self.probe_row_for_slot(i, probe_slots[i], hashes[i], probe_slots, rows) {
                     spill[collided] = i as u32;
                     collided += 1;
                 }

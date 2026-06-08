@@ -4,7 +4,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
 use crate::worker::install_test_worker_waker;
-use arrow_array::{Int32Array, RecordBatch};
+use arrow_array::{Int32Array, Int64Array, RecordBatch, StringViewArray};
 
 /// A [`Sender`] that collects all sent items for later inspection.
 pub struct CollectSender<T = RecordBatch> {
@@ -48,6 +48,40 @@ impl CollectSender<RecordBatch> {
                     .values()
                     .iter()
                     .copied()
+            })
+            .collect()
+    }
+
+    /// All values from column `col` as i64s, preserving order (e.g. aggregate
+    /// outputs like `COUNT(*)`, which are `Int64`).
+    pub fn i64_column(&self, col: usize) -> Vec<i64> {
+        self.items
+            .iter()
+            .flat_map(|b| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// All values from a `Utf8View` column `col` as owned strings, in order
+    /// (e.g. string group-by keys).
+    pub fn string_column(&self, col: usize) -> Vec<String> {
+        self.items
+            .iter()
+            .flat_map(|b| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.unwrap().to_string())
+                    .collect::<Vec<_>>()
             })
             .collect()
     }

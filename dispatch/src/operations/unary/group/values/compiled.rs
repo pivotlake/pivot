@@ -78,8 +78,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
-    /// The q32-shaped signature: `COUNT(*), SUM(i16), SUM(i16), COUNT` — the
-    /// straight-line value matches what the enum extractor would produce.
+    /// A mixed multi-aggregate signature: `COUNT(*), SUM(i16), SUM(i16), COUNT`
+    /// — the straight-line value matches what the enum extractor would produce.
     #[test]
     fn count_sum_sum_count() {
         let a = Int16Array::from(vec![1i16, 2, 3]);

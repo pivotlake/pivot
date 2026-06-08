@@ -19,8 +19,14 @@
 //!    created and subsequent rows go there. The old table is kept — its
 //!    entries will be merged in phase 2.  See [Why partitioned merging works](#why-partitioned-merging-works-across-different-table-sizes).
 //!
-//! When consumption finishes, each worker sends its `Vec<MultiSlabTable>` to a
-//! shared mpsc channel and transitions into a [`GroupOutputter`].
+//! For high-cardinality integer keys a worker instead **switches to radix**
+//! partway through: rather than growing its in-place table further it scatters
+//! later rows into [`RADIX_PARTITIONS`] per-partition buffers (no probing),
+//! deferring their aggregation to a finer-grained, cache-resident phase-2 merge.
+//! Strings and low-cardinality keys never switch and stay fully in-place.
+//!
+//! When consumption finishes, each worker sends its tables (plus any radix
+//! buffers) to a shared mpsc channel and transitions into a [`GroupOutputter`].
 //!
 //! ## Phase 2: Output / Merge (parallel via work-stealing)
 //!
@@ -38,6 +44,11 @@
 //! 3. Converts the result table into an Arrow [`RecordBatch`] via the
 //!    [`output`] combinator — key columns from the [`KeyExtractor`], value
 //!    columns from the [`ValueExtractor`] — and sends it downstream.
+//!
+//! When any worker switched to radix, the same machinery runs at
+//! [`RADIX_PARTITIONS`] granularity, and each job additionally aggregates its
+//! partition's scatter buffers (where most of phase 1's aggregation was deferred)
+//! alongside the in-place stacks.
 //!
 //! ## Why partitioned merging works across different table sizes
 //!
@@ -75,6 +86,8 @@
 //! - [`factory`] — [`GroupFactory`] for creating per-worker [`Group`] instances
 
 pub(crate) mod arena;
+mod hll;
+use hll::Hll;
 mod factory;
 mod keys;
 mod merge;
@@ -93,7 +106,10 @@ pub use values::{
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::group::hashtables::{AggregatedTable, MultiSlabTable};
+use crate::operations::unary::group::hashtables::{
+    AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
+    PartitionBuffers, RadixConfig,
+};
 use crate::worker::worker_waker;
 use ahash::RandomState;
 use arena::SharedArena;
@@ -103,7 +119,6 @@ use crossbeam_deque::{Injector, Steal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use thiserror::Error;
-use tracing::{debug, info};
 use unary::pipeline_breaker::{Consumer, Outputter};
 
 #[derive(Debug, Error)]
@@ -120,6 +135,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Each partition is merged independently, enabling parallel output.
 const PARTITIONS: usize = 64;
 
+/// Number of radix partitions for the scatter + merge of high-cardinality
+/// (switched) workers. Larger than [`PARTITIONS`] so each radix target stays
+/// cache-resident at high group counts.
+const RADIX_PARTITIONS: usize = 4096;
+
 /// Per-worker GROUP BY consumer.
 ///
 /// During the consume phase, each worker owns a `Group` that hashes incoming
@@ -131,7 +151,7 @@ pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     value_slots: Vec<AggregationSlot>,
 
     aggregated_table: AggregatedTable<K, V>,
-    sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
+    sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
     outputter: GroupOutputter<K, V>,
 }
 
@@ -144,9 +164,10 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
-        sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
-        receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
+        sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
+        receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
+        radix: RadixConfig,
     ) -> Self {
         Self {
             key_cols,
@@ -160,7 +181,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 output_allocator: None,
             },
             sender,
-            aggregated_table: AggregatedTable::new(state, shared_arena),
+            aggregated_table: AggregatedTable::new(state, shared_arena, radix),
         }
     }
 }
@@ -195,7 +216,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
 pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     shared_arena: Arc<SharedArena>,
     injector: Arc<Injector<PartitionJob<K, V>>>,
-    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
+    receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     top_k: Option<(usize, usize)>,
     /// One allocator per worker for the output columns of every partition this
@@ -211,36 +232,40 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
 /// source tables for partition `index` into one result table and sends the
 /// output as a [`RecordBatch`].
 pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
+    /// Switched workers' scatter buffers (empty Vec in the all-in-place case).
+    buffers: Arc<Vec<PartitionBuffers<K, V>>>,
+    /// Every worker's in-place stack: switched workers' pre-switch tables and
+    /// non-switched workers' full stacks. Slot-range-merged at `num_partitions`.
     tables: Arc<Vec<MultiSlabTable<K, V>>>,
     index: usize,
     arena: Arc<SharedArena>,
     partition_capacity: usize,
+    /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
+    num_partitions: usize,
     top_k: Option<(usize, usize)>,
 }
 
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
 
 impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
-    /// Merge all source tables for this partition and send the result batches,
-    /// building output columns into `allocator`'s slab memory.
+    /// Merge this partition's scatter buffers and in-place stacks into one result
+    /// table and send the output batches, building columns into `allocator`.
     pub fn run<S: Sender<RecordBatch>>(
         self,
         sender: &mut S,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
-        debug!("Merging maps for partition {:?}...", self.index);
-        let result_map = merge::merge_partition::<K, V>(
+        let result_map = merge::merge_combined::<K, V>(
             self.index,
+            &self.buffers,
             &self.tables,
-            &self.arena,
             self.partition_capacity,
+            self.num_partitions,
+            &self.arena,
         );
-
         if result_map.len() == 0 {
             return Ok(());
         }
-
-        debug!("Sending record batch {:?}", self.index);
         output::build_and_send::<K, V, _, _>(result_map, &self.arena, allocator, self.top_k, sender)
     }
 }
@@ -248,27 +273,58 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
 impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputter<K, V> {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let tables: Vec<MultiSlabTable<K, V>> = rx.into_iter().flatten().collect::<Vec<_>>();
-            debug!("Outputting {:?} maps", tables.len());
-            // Estimate the merged entry count from actual occupancy (sum of
-            // lengths), not capacity — capacity over-counts by the table-stack's
-            // ~2x geometric slack. A tighter estimate keeps each partition's
-            // result table near a high load factor instead of 2.5x
-            // over-provisioned, which at very large group counts is gigabytes less memory
-            // to allocate and zero every query.
-            let total_entries: usize = tables.iter().map(|m| m.len()).sum::<usize>();
-            let partition_capacity = (total_entries / PARTITIONS).next_power_of_two();
-            info!("Partition capacity {:?}", partition_capacity);
-            let tables = Arc::new(tables);
-            for i in 0..PARTITIONS {
+            let mut all_tables = Vec::new();
+            let mut all_buffers = Vec::new();
+            let mut hll = Hll::new();
+            for out in rx.into_iter() {
+                all_tables.extend(out.tables);
+                if let Some(b) = out.buffers {
+                    all_buffers.push(b);
+                }
+                hll.merge(&out.hll);
+            }
+
+            // Pick the partition count: nobody switched -> the cheap PARTITIONS-way
+            // slot-range merge (don't blow a small group-by into a 4096-way
+            // merge); any switch -> RADIX_PARTITIONS so each radix target
+            // stays cache-resident. Either way, one merge_combined job per partition
+            // combines that partition's scatter buffers and in-place stacks.
+            let (num_partitions, partition_capacity) = if all_buffers.is_empty() {
+                let total: usize = all_tables.iter().map(|t| t.len()).sum();
+                (
+                    PARTITIONS,
+                    (total / PARTITIONS)
+                        .next_power_of_two()
+                        .max(DEFAULT_CAPACITY),
+                )
+            } else {
+                // Every switched worker scattered into the same partition count
+                // (their RadixConfig); read it back off the buffers. Size each
+                // radix target so its distinct-per-partition groups sit at
+                // MAX_LOAD_FACTOR — the merge's resize threshold — so it fills
+                // without ever resizing.
+                let parts = all_buffers[0].0.len();
+                let per_partition = hll.estimate() as f64 / parts as f64;
+                let capacity = ((per_partition / MAX_LOAD_FACTOR).ceil() as usize)
+                    .next_power_of_two()
+                    .max(DEFAULT_CAPACITY);
+                (parts, capacity)
+            };
+
+            let buffers = Arc::new(all_buffers);
+            let tables = Arc::new(all_tables);
+            for i in 0..num_partitions {
                 self.injector.push(PartitionJob {
+                    buffers: buffers.clone(),
                     tables: tables.clone(),
                     index: i,
                     arena: self.shared_arena.clone(),
                     partition_capacity,
+                    num_partitions,
                     top_k: self.top_k,
-                })
+                });
             }
+
             self.partition_jobs_injected.store(true, Ordering::Relaxed);
 
             // Wake up all workers so that they can start working on partitions
@@ -299,14 +355,16 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::group::keys::IntKeyExtractor;
+    use crate::operations::unary::group::keys::{IntKeyExtractor, StringKeyExtractor};
+    use crate::operations::unary::group::values::Sum;
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
     type CountValue = Compiled<(Count,)>;
+    type SumValue = Compiled<(Sum<Int32Type>,)>;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -314,7 +372,70 @@ mod tests {
         RecordBatch::try_new(schema, vec![col]).unwrap()
     }
 
+    /// An `Int32` key column (0) plus an `Int32` value column (1), for `SUM`.
+    fn keyed_i32_batch(keys: &[i32], vals: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(keys.to_vec())),
+            Arc::new(Int32Array::from(vals.to_vec())),
+        ];
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    /// A single `Utf8View` key column.
+    fn string_key_batch(values: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "key",
+            DataType::Utf8View,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(StringViewArray::from(values.to_vec()));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    fn count_slots() -> Vec<AggregationSlot> {
+        vec![AggregationSlot::new(AggregationKind::CountStar, 0)]
+    }
+
+    /// Common case: `Int32` keys, `COUNT(*)`, key column 0, no LIMIT, default radix.
     fn run_group(worker_batches: Vec<Vec<RecordBatch>>) -> CollectSender {
+        run_group_full::<IntExtractor, CountValue>(
+            worker_batches,
+            vec![0],
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        )
+    }
+
+    /// Common case with a chosen [`RadixConfig`] — a small one forces the radix
+    /// switch + scatter merge to run within the test slab pool.
+    fn run_group_with_radix(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        radix: RadixConfig,
+    ) -> CollectSender {
+        run_group_full::<IntExtractor, CountValue>(
+            worker_batches,
+            vec![0],
+            count_slots(),
+            None,
+            radix,
+        )
+    }
+
+    /// General harness: choose the key/value extractors, key columns, aggregates,
+    /// LIMIT pushdown, and radix config. The common-case wrappers above cover
+    /// `Int32` keys + `COUNT(*)`.
+    fn run_group_full<K: KeyExtractor, V: ValueExtractor>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        top_k: Option<(usize, usize)>,
+        radix: RadixConfig,
+    ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
         let arena = SharedArena::new(64);
@@ -326,16 +447,17 @@ mod tests {
 
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
-                Group::<IntExtractor, CountValue>::new(
+                Group::<K, V>::new(
                     arena.clone(),
                     state.clone(),
                     injector.clone(),
-                    vec![0],
-                    vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
-                    None,
+                    key_cols.clone(),
+                    value_slots.clone(),
+                    top_k,
                     tx.clone(),
                     rx_opt.take(),
                     partition_jobs_injected.clone(),
+                    radix,
                 )
             })
             .collect();
@@ -419,5 +541,154 @@ mod tests {
         ]);
 
         assert_eq!(sender.total_rows(), 1);
+    }
+
+    /// (key, count) pairs from a finished `COUNT(*)` group-by, sorted by key.
+    fn group_counts(sender: &CollectSender) -> Vec<(i32, i64)> {
+        let mut pairs: Vec<_> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn counts_aggregate_within_and_across_workers() {
+        let batches = vec![
+            vec![batch_with_column(&[1, 2, 3])],
+            vec![batch_with_column(&[2, 2, 3, 4])],
+        ];
+
+        let sender = run_group(batches);
+
+        assert_eq!(group_counts(&sender), vec![(1, 1), (2, 3), (3, 2), (4, 1)]);
+    }
+
+    #[test]
+    fn counts_survive_in_place_stack_growth() {
+        let mut values: Vec<i32> = (0..3000).collect();
+        values.extend(0..3000);
+
+        let sender = run_group(vec![vec![batch_with_column(&values)]]);
+
+        assert_eq!(
+            group_counts(&sender),
+            (0..3000).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn radix_switch_single_worker_aggregates_counts() {
+        // A small config makes a radix-eligible (integer) worker switch to scatter
+        // after ~a couple hundred keys and scatter into 16 partitions, exercising
+        // the whole radix path within the test pool.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let mut values: Vec<i32> = (0..500).collect();
+        values.extend(0..500);
+
+        let sender = run_group_with_radix(vec![vec![batch_with_column(&values)]], radix);
+
+        assert_eq!(
+            group_counts(&sender),
+            (0..500).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn radix_switch_merges_across_workers() {
+        // Two workers each switch to scatter; the radix merge has to combine both
+        // workers' per-partition buffers and pre-switch stacks for every key.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let worker = || vec![batch_with_column(&(0..500).collect::<Vec<_>>())];
+
+        let sender = run_group_with_radix(vec![worker(), worker()], radix);
+
+        assert_eq!(
+            group_counts(&sender),
+            (0..500).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
+    }
+
+    /// (string key, count) pairs from a finished string group-by, sorted by key.
+    fn string_group_pairs(sender: &CollectSender) -> Vec<(String, i64)> {
+        let mut pairs: Vec<_> = sender
+            .string_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn string_keys_dedup_and_count() {
+        let batches = vec![vec![string_key_batch(&["a", "b", "a", "c", "b", "a"])]];
+
+        let sender = run_group_full::<StringKeyExtractor, CountValue>(
+            batches,
+            vec![0],
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        assert_eq!(
+            string_group_pairs(&sender),
+            vec![
+                ("a".to_string(), 3),
+                ("b".to_string(), 2),
+                ("c".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn sum_aggregates_value_per_group() {
+        // key 1 -> 10+30, key 2 -> 20, key 3 -> 5+5.
+        let batch = keyed_i32_batch(&[1, 2, 1, 3, 3], &[10, 20, 30, 5, 5]);
+        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 1)];
+
+        let sender = run_group_full::<IntExtractor, SumValue>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        assert_eq!(group_counts(&sender), vec![(1, 40), (2, 20), (3, 10)]);
+    }
+
+    #[test]
+    fn top_k_limits_output_keeping_partition_maxima() {
+        // key 0 dominates (count 100); keys 1..1000 appear once. ORDER BY count
+        // LIMIT 1 is applied per partition, collapsing ~1000 groups to at most one
+        // row per partition — always the partition's largest, so key 0 survives.
+        let mut values: Vec<i32> = vec![0; 100];
+        values.extend(1..1000);
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            vec![vec![batch_with_column(&values)]],
+            vec![0],
+            count_slots(),
+            Some((0, 1)),
+            RadixConfig::DEFAULT,
+        );
+
+        let pairs = group_counts(&sender);
+        assert!(pairs.contains(&(0, 100)), "dominant group kept");
+        assert!(pairs.len() <= PARTITIONS, "at most one row per partition");
+        assert!(
+            pairs.iter().all(|&(k, c)| k == 0 || c == 1),
+            "every survivor is its partition's max"
+        );
     }
 }
