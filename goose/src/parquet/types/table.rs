@@ -22,7 +22,7 @@ use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
@@ -38,9 +38,33 @@ pub enum Error {
     ColumnNotFound(String),
     #[error("reading remote parquet `{url}`: {message}")]
     Remote { url: String, message: String },
+    #[error("fetching row-group metadata: {0}")]
+    Materialize(String),
 }
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Where one data file lives. A [`ParquetSource`] is a list of these; the
+/// scan's first phase materializes each into [`RowGroupMetadata`] by reading its
+/// footer (across workers, in parallel).
+#[derive(Clone, Debug)]
+pub enum DataFileLocation {
+    /// A local file path.
+    Local(PathBuf),
+    /// A remote object addressed by a concrete fetchable URL (presigned for
+    /// S3/GCS, or plain `http(s)://`).
+    Remote(Url),
+}
+
+/// Read one data file's footer into its [`RowGroupMetadata`]s, with row-group
+/// indices local to the file (global indices are assigned after all files are
+/// collected). Must run on a dispatch worker (registers the file in the cache).
+pub fn parse_file_metadatas(location: &DataFileLocation) -> Result<Vec<RowGroupMetadata>> {
+    match location {
+        DataFileLocation::Local(path) => parse_row_group_metadatas(0, path),
+        DataFileLocation::Remote(url) => parse_row_group_metadatas_remote(0, url),
+    }
+}
 
 /// A logical table backed by one or more Parquet files.
 ///

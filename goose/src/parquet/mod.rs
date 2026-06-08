@@ -22,7 +22,9 @@ mod decoding;
 pub use decoding::{DecoderFactory, RowGroupDecoderError, ScanEqualityPredicate};
 
 mod fetching;
-pub use fetching::{RowGroupFetcherFactory, RowGroupInjectorFactory};
+pub use fetching::{
+    ParquetSource, RowGroupFetcherFactory, RowGroupInjectorFactory, materialize_metadata,
+};
 
 pub(crate) mod types;
 
@@ -37,7 +39,7 @@ pub use scan::{
 pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
 pub use types::page::{CompressedPage, DecompressedPage};
 pub use types::requests::{RowGroupBuffer, RowGroupRequest};
-pub use types::table::{Error as ParquetTableError, ParquetTable};
+pub use types::table::{DataFileLocation, Error as ParquetTableError, ParquetTable};
 
 #[cfg(test)]
 pub(crate) mod test_utils {

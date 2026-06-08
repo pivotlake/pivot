@@ -35,7 +35,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::parquet::{
-    ParquetTable, ParquetTableError, ScanEqualityPredicate, row_group_eliminated,
+    ParquetSource, ParquetTable, ParquetTableError, ScanEqualityPredicate, row_group_eliminated,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use arrow_array::{ArrayRef, Scalar};
@@ -118,11 +118,11 @@ impl ParquetCatalog {
         if !path_buf.is_dir() {
             return Err(Error::PathNotDirectory(path.clone()));
         }
-        let parquet = ParquetTable::from_directory(path_buf)?;
+        let source = ParquetSource::from_directory(path_buf)?;
 
         let table = ParquetCatalogTable {
             columns: request.columns,
-            parquet,
+            source,
             predicates: Vec::new(),
         };
         self.insert(request.name, table)
@@ -155,7 +155,7 @@ impl ParquetCatalog {
         // describes (if any).
         let existing = snapshot.schemas.iter().flat_map(|s| &s.tables).next();
 
-        let parquet = match existing {
+        let source = match existing {
             Some(table) => {
                 // Resolve each data file to a local path or a presigned remote
                 // URL. A table's files share the root's store, so they're either
@@ -169,8 +169,8 @@ impl ParquetCatalog {
                     }
                 }
                 match (paths.is_empty(), urls.is_empty()) {
-                    (_, true) => ParquetTable::from_files(&paths)?,
-                    (true, false) => ParquetTable::from_remote_files(&urls)?,
+                    (_, true) => ParquetSource::from_files(&paths),
+                    (true, false) => ParquetSource::from_remote_files(&urls),
                     (false, false) => {
                         return Err(Error::MixedDataFiles);
                     }
@@ -196,13 +196,13 @@ impl ParquetCatalog {
                     });
                     Ok(())
                 })?;
-                ParquetTable::new(Vec::new())
+                ParquetSource::from_files::<&Path>(&[])
             }
         };
 
         let table = ParquetCatalogTable {
             columns: request.columns,
-            parquet,
+            source,
             predicates: Vec::new(),
         };
         self.insert(request.name, table)
@@ -273,7 +273,9 @@ struct PushedPredicate {
 #[derive(Clone, Debug)]
 pub struct ParquetCatalogTable {
     pub columns: Vec<Column>,
-    pub parquet: ParquetTable,
+    /// The table's data files, by location. The row-group metadata is fetched
+    /// (in parallel) when the scan is compiled, not held here.
+    pub source: ParquetSource,
     /// Single-column predicates pushed down for this binding (recorded here
     /// because the `Table` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
@@ -299,7 +301,9 @@ impl Table for ParquetCatalogTable {
             })
             .collect();
 
-        let parquet = Arc::new(self.pruned_parquet());
+        // Fetch this table's row-group metadata (in parallel across workers),
+        // then prune by the pushed-down predicates' stats.
+        let parquet = Arc::new(self.pruned_parquet(dispatcher)?);
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -346,19 +350,20 @@ impl Table for ParquetCatalogTable {
 }
 
 impl ParquetCatalogTable {
-    /// The row groups that survive this binding's pushed-down predicates — i.e.
-    /// what [`Table::compile`] actually scans. A min/max stat that proves no row
-    /// in a group can match drops it; a stats-comparison error means "can't
-    /// prune" (kept) — never wrong, just unoptimized. Exposed so pruning can be
-    /// asserted without running a full query.
-    pub fn pruned_parquet(&self) -> ParquetTable {
-        let mut parquet = self.parquet.clone();
+    /// Materialize this table's row-group metadata (reading every footer in
+    /// parallel) and keep only the row groups that survive this binding's
+    /// pushed-down predicates — i.e. what [`Table::compile`] actually scans. A
+    /// min/max stat that proves no row in a group can match drops it; a
+    /// stats-comparison error means "can't prune" (kept) — never wrong, just
+    /// unoptimized. Exposed so resolution + pruning can be asserted directly.
+    pub fn pruned_parquet(&self, dispatcher: &DataFlowDispatcher) -> Result<ParquetTable> {
+        let mut parquet = self.source.materialize(dispatcher)?;
         parquet.row_groups_mut().retain(|rg| {
             !self.predicates.iter().any(|p| {
                 row_group_eliminated(rg.as_ref(), p.column_idx, p.compare_type, &p.value)
                     .unwrap_or(false)
             })
         });
-        parquet
+        Ok(parquet)
     }
 }

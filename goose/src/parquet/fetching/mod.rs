@@ -18,8 +18,10 @@
 
 pub type RowGroupFetcherFactory = DefaultUnaryFactory<RowGroupFetcher>;
 mod fetcher;
+mod metadata;
 
 mod table_source;
 use crate::parquet::fetching::fetcher::RowGroupFetcher;
 use dispatch::DefaultUnaryFactory;
+pub use metadata::{ParquetSource, materialize_metadata};
 pub use table_source::RowGroupInjectorFactory;

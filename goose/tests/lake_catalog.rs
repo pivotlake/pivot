@@ -127,13 +127,14 @@ fn attach_existing_lake_table_and_scan_rows() {
         .parquet_table("events")
         .expect("table resolved from the snapshot");
     assert_eq!(table.columns.len(), 2);
+    // Materialize the row-group metadata from the recorded file locations.
+    let parquet = Arc::new(table.source.materialize(&dispatch).unwrap());
     assert!(
-        !table.parquet.row_groups().is_empty(),
+        !parquet.row_groups().is_empty(),
         "the data file's footer was parsed into row groups"
     );
 
     // Scan it end-to-end and check the rows came back.
-    let parquet = Arc::new(table.parquet.clone());
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -164,7 +165,13 @@ fn create_new_lake_table_cas_commits_a_snapshot() {
 
     // The table resolves (empty — no data files committed yet).
     let t = catalog.parquet_table("t").expect("new table resolves");
-    assert!(t.parquet.row_groups().is_empty());
+    assert!(
+        t.source
+            .materialize(&dispatch)
+            .unwrap()
+            .row_groups()
+            .is_empty()
+    );
 
     // The committed snapshot records the table and its declared columns,
     // round-tripped to SQL type spellings.
