@@ -2,6 +2,21 @@ use crate::common::*;
 use insta::assert_snapshot;
 use rstest::rstest;
 
+// A user `IN`/`EXISTS` subquery lowers to a semi-join, which pivot can't
+// execute. It must NOT be mistaken for the row-id semi-join DuckDB's late
+// materialization produces (the bridge only collapses the latter) — it should
+// surface as a plain unsupported-plan error, not a mis-collapsed Materialize.
+#[rstest]
+fn in_subquery_semijoin_is_unsupported_not_late_materialized(mut testing_planner: TestingPlanner) {
+    let result = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table WHERE a IN (SELECT b FROM example_table WHERE b > 20)");
+    assert!(
+        result.is_err(),
+        "a user semi-join must error, not be collapsed as late materialization; got: {result:?}"
+    );
+}
+
 #[rstest]
 fn simple_select(mut testing_planner: TestingPlanner) {
     let plan = testing_planner

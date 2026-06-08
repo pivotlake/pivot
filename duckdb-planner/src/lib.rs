@@ -16,6 +16,7 @@
 //! struct UsersTable;
 //!
 //! impl DuckDBTable for UsersTable {
+//!     fn clone_box(&self) -> Box<dyn DuckDBTable> { Box::new(UsersTable) }
 //!     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
 //!         vec![DuckDBColumn {
 //!             name: "name".to_string(),

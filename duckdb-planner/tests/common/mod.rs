@@ -11,6 +11,10 @@ struct ColTable {
 }
 
 impl DuckDBTable for ColTable {
+    fn clone_box(&self) -> Box<dyn DuckDBTable> {
+        Box::new(self.clone())
+    }
+
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         self.columns
             .iter()

@@ -10,6 +10,15 @@ struct PivotScanBindData : public duckdb::TableFunctionData {
 	    : catalog_entry(catalog_entry), table(table) {}
 	duckdb::TableCatalogEntry &catalog_entry;
 	OptionalTableWrapper &table;
+
+	// Late materialization clones the scan's bind data to build a second
+	// (full-column) Get of the same table. Both copies reference the same
+	// catalog entry and table handle — fine, since we only plan (never execute)
+	// with DuckDB, and the bridge collapses the resulting join back into a
+	// single pivot scan + materializer.
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		return duckdb::make_uniq<PivotScanBindData>(catalog_entry, table);
+	}
 };
 
 class PivotTableCatalogEntry : public duckdb::TableCatalogEntry {

@@ -24,6 +24,14 @@ pub trait DuckDBTable: Any {
     /// resolve column references and determine output types.
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn>;
 
+    /// Clone this table into a fresh boxed trait object.
+    ///
+    /// A single `table_id` can be referenced by more than one plan node — a
+    /// late-materialized query's narrow scan and its `Materialize` share one —
+    /// so `resolve_inputs` hands each reference its own clone rather than moving
+    /// the one resolved table out.
+    fn clone_box(&self) -> Box<dyn DuckDBTable>;
+
     /// Called from DuckDB's `pushdown_complex_filter` hook with the current
     /// scan-local filter expressions deserialized into a [`TableFilter`].
     ///

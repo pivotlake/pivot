@@ -21,6 +21,9 @@ pub struct RawInput {
     pub table_id: usize,
     pub columns: Vec<Expression>,
     pub dynamic_filters: Vec<DynamicFilter>,
+    /// Set by the bridge on a late-materialized query's narrow scan so it tags
+    /// each row with row-group metadata for the downstream [`Materialize`].
+    pub emit_row_group_metadata: bool,
 }
 
 /// Resolved table scan with the `DuckDBTable` trait object attached.
@@ -30,6 +33,7 @@ pub struct Input {
     pub table: Box<dyn crate::catalog_provider::DuckDBTable>,
     pub columns: Vec<Expression>,
     pub dynamic_filters: Vec<DynamicFilter>,
+    pub emit_row_group_metadata: bool,
 }
 
 impl fmt::Debug for Input {
@@ -116,6 +120,43 @@ pub struct CreateTable {
     pub constraint_count: usize,
 }
 
+/// Late-materialization fetch, synthesized by the bridge from DuckDB's
+/// `late_materialization` optimizer output.
+///
+/// DuckDB rewrites `SELECT <wide> ... ORDER BY ... LIMIT n` into a row-id SEMI
+/// join (full-column scan SEMI-joined against a narrow Top-N pipeline). The
+/// bridge collapses that join — which pivot can't execute — into this node: its
+/// single child is the narrow pipeline (which carries DuckDB's row-id column,
+/// stripped later), and `columns` are the table-schema column indices the
+/// full-column side fetched, which pivot re-reads for the surviving rows via its
+/// own row-group materializer. Tagged with `LOGICAL_COMPARISON_JOIN` because a
+/// raw comparison join never otherwise reaches the Rust deserializer.
+///
+/// `table_id` is the *same* index as the narrow scan beneath it (both sides of
+/// DuckDB's join are the one table), so `resolve_inputs` hands this node a clone
+/// of that scan's resolved table — same instance, same filter-pushdown state,
+/// which the materializer needs to index row groups by the scan's global ids.
+#[derive(CustomDeserializer, Debug)]
+pub struct RawMaterialize {
+    pub table_id: usize,
+    pub columns: Vec<usize>,
+}
+
+/// Resolved late-materialization fetch, with its table attached. Produced from
+/// [`RawMaterialize`] during `resolve_inputs`.
+pub struct Materialize {
+    pub table: Box<dyn crate::catalog_provider::DuckDBTable>,
+    pub columns: Vec<usize>,
+}
+
+impl fmt::Debug for Materialize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Materialize")
+            .field("columns", &self.columns)
+            .finish()
+    }
+}
+
 /// The single-row source DuckDB places under a `FROM`-less `SELECT` (e.g.
 /// `SELECT drop_cache()` or `SELECT 1`). Carries no payload; compiles to a
 /// source that emits one empty row, over which the parent projection evaluates
@@ -148,6 +189,15 @@ pub enum Operator {
     CreateTable(CreateTable),
     #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
     DummyScan(DummyScan),
+    // The bridge collapses DuckDB's late-materialization SEMI join into this
+    // node and emits it tagged with LOGICAL_COMPARISON_JOIN (a raw join never
+    // otherwise reaches Rust). Resolved to `Materialize` (table attached) the
+    // same way `RawInput` becomes `Input`.
+    #[type_tag(LogicalOperatorType::LOGICAL_COMPARISON_JOIN)]
+    #[doc(hidden)]
+    RawMaterialize(RawMaterialize),
+    #[skip_deserialize]
+    Materialize(Materialize),
 }
 
 impl Operator {
@@ -164,6 +214,8 @@ impl Operator {
             | Operator::TopN(_)
             | Operator::CreateTable(_)
             | Operator::DummyScan(_)
+            | Operator::Materialize(_)
+            | Operator::RawMaterialize(_)
             | Operator::RawInput(_) => None,
         }
     }
@@ -256,6 +308,14 @@ impl fmt::Display for Operator {
                 )
             }
             Operator::DummyScan(_) => write!(f, "DummyScan"),
+            Operator::RawMaterialize(m) => {
+                let cols: Vec<String> = m.columns.iter().map(|c| format!("#{c}")).collect();
+                write!(f, "Materialize([{}])", cols.join(", "))
+            }
+            Operator::Materialize(m) => {
+                let cols: Vec<String> = m.columns.iter().map(|c| format!("#{c}")).collect();
+                write!(f, "Materialize([{}])", cols.join(", "))
+            }
         }
     }
 }
