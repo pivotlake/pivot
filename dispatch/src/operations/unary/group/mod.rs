@@ -107,7 +107,6 @@ use crossbeam_deque::{Injector, Steal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use thiserror::Error;
-use tracing::debug;
 use unary::pipeline_breaker::{Consumer, Outputter};
 
 #[derive(Debug, Error)]

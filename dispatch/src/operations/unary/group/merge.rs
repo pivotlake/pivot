@@ -244,13 +244,10 @@ pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
     let mut cap = partition_capacity;
     let mut target: MultiSlabTable<K, V> =
         <MultiSlabTable<K, V>>::multi_slab(&mut allocator, cap, pre_shift);
+
     for wb in worker_buffers {
         wb.0[partition].for_each(|(hash, key, value)| {
-            if target.undersized() {
-                cap *= 4;
-                let nb = allocator.create_multi_slab_buffer(cap, true);
-                target.resize_with(nb, cap);
-            }
+            grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
             let live = K::resolve_persisted(arena, key);
             target.merge::<false, _>(hash, live, value);
         });
@@ -261,15 +258,27 @@ pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
     for table in inplace_tables {
         for entry in table.iter(0) {
             if (entry.hash() >> shift) as usize == partition {
-                if target.undersized() {
-                    cap *= 4;
-                    let nb = allocator.create_multi_slab_buffer(cap, true);
-                    target.resize_with(nb, cap);
-                }
+                grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
                 let live = K::resolve_persisted(arena, *entry.key());
                 target.merge::<false, _>(entry.hash(), live, *entry.value());
             }
         }
     }
     target
+}
+
+/// Grow a merge target by 4x if it has crossed its load threshold. A safety net:
+/// `partition_capacity` is sized (from the HLL estimate) to hold the partition's
+/// groups, so with a sound estimate this never fires.
+#[inline]
+fn grow_if_full<K: KeyExtractor, V: ValueExtractor>(
+    allocator: &mut SlabAllocator,
+    target: &mut MultiSlabTable<K, V>,
+    cap: &mut usize,
+) {
+    if target.undersized() {
+        *cap *= 4;
+        let nb = allocator.create_multi_slab_buffer(*cap, true);
+        target.resize_with(nb, *cap);
+    }
 }

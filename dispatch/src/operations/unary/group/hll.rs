@@ -9,6 +9,12 @@ pub struct Hll {
     registers: Box<[u8; M]>,
 }
 
+impl Default for Hll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Hll {
     pub fn new() -> Self {
         Self {
@@ -50,5 +56,3 @@ impl Hll {
         raw.round() as usize
     }
 }
-
-unsafe impl Send for Hll {}

@@ -59,13 +59,6 @@ impl<T: Copy> SlabList<T> {
         self.last_len += 1;
     }
 
-    pub fn len(&self) -> usize {
-        match self.chunks.len() {
-            0 => 0,
-            n => (n - 1) * CHUNK_CAP + self.last_len,
-        }
-    }
-
     /// Visit every element in insertion order — sequentially off each chunk's base.
     #[inline(always)]
     pub fn for_each(&self, mut f: impl FnMut(T)) {
@@ -235,7 +228,9 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     }
 
     /// Row-by-row probe, switching tables (or to radix) when the active table
-    /// overflows mid-batch. On switch, the remaining rows are scattered.
+    /// overflows mid-batch. On switch, the remaining rows are scattered. A
+    /// two-level software prefetch (DRAM→L2 far, L2→L1 near) hides the per-row
+    /// probe latency on the large in-place tables this path handles.
     #[inline(always)]
     fn consume_scalared<'b>(
         &mut self,
@@ -243,17 +238,25 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         key_reader: &K::Reader<'b>,
         value_reader: &V::Reader<'b>,
     ) {
+        const L1_DISTANCE: usize = 16;
+        const L2_DISTANCE: usize = 48;
         let mut i = 0;
         while i < length {
             let hash = self.hashes[i];
-            let key = K::live_key(key_reader, i, &mut self.worker_arena);
-            let value = V::value(value_reader, i);
-            self.tables
-                .last_mut()
-                .unwrap()
-                .merge::<false, _>(hash, key, value);
-
-            if self.tables.last().unwrap().undersized() && self.grow_or_switch() {
+            let overflowed = {
+                let table = self.tables.last_mut().unwrap();
+                if i + L2_DISTANCE < length {
+                    table.prefetch_l2(self.hashes[i + L2_DISTANCE]);
+                }
+                if i + L1_DISTANCE < length {
+                    table.prefetch(self.hashes[i + L1_DISTANCE]);
+                }
+                let key = K::live_key(key_reader, i, &mut self.worker_arena);
+                let value = V::value(value_reader, i);
+                table.merge::<false, _>(hash, key, value);
+                table.undersized()
+            };
+            if overflowed && self.grow_or_switch() {
                 self.scatter_range(i + 1, length, key_reader, value_reader);
                 return;
             }
