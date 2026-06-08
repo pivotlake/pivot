@@ -30,7 +30,7 @@ use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -110,7 +110,7 @@ fn sum_column<A: Accumulator>(arr: &dyn Array) -> A {
             let a = arr.as_primitive::<$ty>();
             let mut acc = A::default();
             for i in 0..a.len() {
-                acc += A::from_i64(Sum::<$ty>::contribution(&a, i));
+                acc += A::from(Sum::<$ty>::contribution(&a, i));
             }
             acc
         }};
@@ -127,12 +127,12 @@ fn sum_column<A: Accumulator>(arr: &dyn Array) -> A {
 /// Build the single output column for one aggregate slot from its accumulator.
 fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, ArrayRef) {
     match kind {
-        // `Int64` or `Decimal128(38, 0)` per the accumulator width — see
-        // [`Accumulator::sum_datatype`].
-        AggregationKind::Sum => (
-            Field::new("sum", A::sum_datatype(), false),
-            A::one_sum_array(value),
-        ),
+        // `Int64` or `Decimal128(38, 0)` per the accumulator width.
+        AggregationKind::Sum => {
+            let array =
+                A::finalize(Arc::new(PrimitiveArray::<A::Arrow>::from_iter_values([value])));
+            (Field::new("sum", array.data_type().clone(), false), array)
+        }
         AggregationKind::Count | AggregationKind::CountStar => (
             Field::new("count", DataType::Int64, false),
             Arc::new(Int64Array::from(vec![value.as_i64()])),
@@ -151,12 +151,12 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
         for (i, slot) in self.slots.iter().enumerate() {
             self.local[i] += match slot.kind {
                 // COUNT(*) counts every row and never reads a column.
-                AggregationKind::CountStar => A::from_i64(batch.num_rows() as i64),
+                AggregationKind::CountStar => A::from(batch.num_rows() as i64),
                 // COUNT(c) needs only the non-null count, not the values — read
                 // it straight off the null bitmap instead of summing the column.
                 AggregationKind::Count => {
                     let col = batch.column(slot.column);
-                    A::from_i64((col.len() - col.null_count()) as i64)
+                    A::from((col.len() - col.null_count()) as i64)
                 }
                 AggregationKind::Sum => sum_column::<A>(batch.column(slot.column)),
             };

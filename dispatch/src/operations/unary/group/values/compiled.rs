@@ -52,7 +52,7 @@ macro_rules! impl_compiled {
 
             #[inline(always)]
             fn value(reader: &Self::Reader<'_>, idx: usize) -> AggregationRow<$n, Acc> {
-                AggregationRow([$( Acc::from_i64($Op::contribution(&reader.$idx, idx)), )+])
+                AggregationRow([$( Acc::from($Op::contribution(&reader.$idx, idx)), )+])
             }
 
             #[inline(always)]

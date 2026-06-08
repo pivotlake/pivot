@@ -124,7 +124,7 @@ impl<const N: usize, A: Accumulator> ValueExtractor for AggregationRowValueExtra
 
     #[inline(always)]
     fn value(reader: &AggregationRowReader<'_, N>, idx: usize) -> AggregationRow<N, A> {
-        AggregationRow(std::array::from_fn(|s| A::from_i64(reader.slots[s].at(idx))))
+        AggregationRow(std::array::from_fn(|s| A::from(reader.slots[s].at(idx))))
     }
 
     #[inline(always)]
@@ -159,8 +159,9 @@ impl<const N: usize, A: Accumulator> ValueColumns for AggregationRowColumns<N, A
         let mut fields = Vec::with_capacity(N);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(N);
         for (s, c) in self.cols.into_iter().enumerate() {
-            fields.push(Field::new(format!("v{s}"), A::sum_datatype(), false));
-            columns.push(A::finish_sum(c));
+            let array = A::finalize(c.into_array(None));
+            fields.push(Field::new(format!("v{s}"), array.data_type().clone(), false));
+            columns.push(array);
         }
         (fields, columns)
     }
