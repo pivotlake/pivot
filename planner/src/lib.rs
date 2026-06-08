@@ -41,8 +41,8 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>) -> RecordBatchOperatorSpec {
-//!         table_input(dispatcher, &self.parquet, projection, false)
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>) -> planner::catalog::Result<RecordBatchOperatorSpec> {
+//!         Ok(table_input(dispatcher, &self.parquet, projection, false))
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
 //! }

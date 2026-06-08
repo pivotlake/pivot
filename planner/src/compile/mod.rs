@@ -84,6 +84,8 @@ pub enum Error {
     UnsupportedCreateTableConstraints(usize),
     #[error("CREATE TABLE nodes should not have input operators")]
     UnexpectedCreateTableInputs,
+    #[error("compiling table scan: {0}")]
+    TableScan(crate::catalog::Error),
 }
 
 impl Plan {

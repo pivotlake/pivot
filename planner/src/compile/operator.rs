@@ -339,7 +339,9 @@ impl Input {
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
-        Ok(self.table.compile(dispatcher, projection, dynamic_filters))
+        self.table
+            .compile(dispatcher, projection, dynamic_filters)
+            .map_err(Error::TableScan)
     }
 }
 

@@ -286,7 +286,7 @@ impl Table for ParquetCatalogTable {
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
-    ) -> RecordBatchOperatorSpec {
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
         // Equality predicates additionally let the decoder skip row groups whose
         // dictionary for that column excludes the constant.
         let eq_predicates: Vec<ScanEqualityPredicate> = self
@@ -303,7 +303,7 @@ impl Table for ParquetCatalogTable {
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
-        table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
             projection,
@@ -311,7 +311,7 @@ impl Table for ParquetCatalogTable {
             row_group_filter_from(dynamic_filters),
             scan_order,
             Arc::new(eq_predicates),
-        )
+        ))
     }
 
     fn columns(&self) -> Vec<Column> {

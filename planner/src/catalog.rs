@@ -84,7 +84,7 @@ pub trait Table: Debug + Send + Sync {
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
-    ) -> RecordBatchOperatorSpec;
+    ) -> Result<RecordBatchOperatorSpec>;
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;

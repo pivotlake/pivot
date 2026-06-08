@@ -74,14 +74,14 @@ impl Table for TestTable {
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
-    ) -> RecordBatchOperatorSpec {
-        table_input_with_filter(
+    ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
+        Ok(table_input_with_filter(
             dispatcher,
             &self.parquet_table,
             projection,
             false,
             row_group_filter_from(dynamic_filters),
-        )
+        ))
     }
 
     fn columns(&self) -> Vec<Column> {

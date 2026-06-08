@@ -39,7 +39,7 @@ impl Table for RecordingTable {
         _dispatcher: &DataFlowDispatcher,
         _projection: Projection,
         _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
-    ) -> RecordBatchOperatorSpec {
+    ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("plan-only test should not reach compile")
     }
 
