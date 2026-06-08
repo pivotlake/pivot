@@ -1,120 +1,119 @@
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::SlabAllocator;
+use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use crate::operations::unary::group::PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
-use crate::operations::unary::group::hashtables::{
-    BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
-};
+use crate::operations::unary::group::hashtables::{KeyExtractor, LiveKey, ValueExtractor};
 use crate::operations::unary::group::values::AggregationSlot;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
-/// Adapts a [`KeyExtractor`] + [`ValueExtractor`] + key arena into a
-/// [`BatchRowSource`] for [`BaseHashTable::merge_batch`]. Holding the `&mut`
-/// arena here (rather than in a closure that returns a borrowed live key) keeps
-/// the arena borrow from escaping while still allowing string keys to be
-/// persisted on insert.
-struct RowSrc<'r, 'b, K: KeyExtractor, V: ValueExtractor> {
-    key_reader: &'r K::Reader<'b>,
-    // Held by value (not `&`): for a `COUNT(*)` value extractor the reader is a
-    // ZST, so this is a zero-size field and `value()` compiles to a constant with
-    // no per-row load — what a `&V::Reader` would otherwise force on every insert.
-    value_reader: V::Reader<'b>,
-    arena: &'r mut WorkerArena,
+/// One scattered row: `(hash, persisted key, per-row value contribution)`.
+pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value);
+
+/// Elements per chunk in a [`SlabList`]. ~`CHUNK_CAP * size_of::<RadixRow>()`
+/// bytes, kept under one 2MB slab so each chunk is a single slab.
+const CHUNK_CAP: usize = 1 << 11; // 2048
+
+/// A growable, **engine-backed** (slab-pool) buffer, as a list of fixed-size
+/// chunks. Appending never reallocates/copies the data (unlike `Vec`), and the
+/// rows live in the pre-faulted, accounted slab pool rather than the heap — only
+/// the small vector of chunk handles is on the heap. This is what lets the radix
+/// scatter use our memory system instead of `std::Vec`.
+pub struct SlabList<T: Copy> {
+    chunks: Vec<MultiSlabBuffer<T>>,
+    /// Cached base pointer of the current (last) chunk. Each chunk is a single
+    /// slab (CHUNK_CAP * size_of::<T>() < 2MB), so its elements are contiguous
+    /// and we can write/read sequentially off the base — avoiding the per-element
+    /// `Index` (which pays a div/mod for the per-slab packing) on the hot path.
+    cur_base: *mut T,
+    last_len: usize,
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> BatchRowSource<K::Persisted, V::Value>
-    for RowSrc<'_, '_, K, V>
-{
-    #[inline(always)]
-    fn persisted(&mut self, i: usize) -> K::Persisted {
-        K::live_key(self.key_reader, i, &mut *self.arena).persist()
+// SAFETY: same as the hash table — for string keys the stored value embeds an
+// `ArenaKey` (raw pointer into the `Arc`'d arena, which outlives the merge), so
+// moving these to a merge worker is sound. `cur_base` points into a slab the
+// `chunks` keep alive.
+unsafe impl<T: Copy> Send for SlabList<T> {}
+
+impl<T: Copy> SlabList<T> {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            cur_base: std::ptr::null_mut(),
+            last_len: 0,
+        }
     }
+
     #[inline(always)]
-    fn key_eq(&mut self, i: usize, persisted: &K::Persisted) -> bool {
-        K::live_key(self.key_reader, i, &mut *self.arena).eq_persisted(persisted)
+    fn push(&mut self, allocator: &mut SlabAllocator, val: T) {
+        if self.chunks.is_empty() || self.last_len == CHUNK_CAP {
+            let chunk = allocator.create_multi_slab_buffer(CHUNK_CAP, false);
+            self.cur_base = chunk.ptr_at_index(0);
+            self.chunks.push(chunk);
+            self.last_len = 0;
+        }
+        unsafe { *self.cur_base.add(self.last_len) = val };
+        self.last_len += 1;
     }
+
+    pub fn len(&self) -> usize {
+        match self.chunks.len() {
+            0 => 0,
+            n => (n - 1) * CHUNK_CAP + self.last_len,
+        }
+    }
+
+    /// Visit every element in insertion order — sequentially off each chunk's
+    /// base pointer (a contiguous single slab), so no per-element index math.
     #[inline(always)]
-    fn value(&mut self, i: usize) -> V::Value {
-        V::value(&self.value_reader, i)
+    pub fn for_each(&self, mut f: impl FnMut(T)) {
+        let n = self.chunks.len();
+        for (ci, chunk) in self.chunks.iter().enumerate() {
+            let len = if ci + 1 == n { self.last_len } else { CHUNK_CAP };
+            let base = chunk.ptr_at_index(0) as *const T;
+            let slice = unsafe { std::slice::from_raw_parts(base, len) };
+            for &val in slice {
+                f(val);
+            }
+        }
     }
 }
 
-/// Per-worker aggregation state for the consume phase.
+/// A worker's scatter output: one engine-backed buffer of raw (un-aggregated)
+/// rows per partition. Aggregated once, in the merge phase.
+pub struct PartitionBuffers<K: KeyExtractor, V: ValueExtractor>(pub Vec<SlabList<RadixRow<K, V>>>);
+unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionBuffers<K, V> {}
+
+/// Per-worker consume state — **single-level radix** on engine buffers.
 ///
-/// Holds a stack of [`MultiSlabTable`]s. Incoming arrays are merged into the
-/// top table. When that table exceeds its load threshold, it is frozen
-/// (pushed onto the stack) and a new, 2x-larger table is created for
-/// subsequent rows. This avoids expensive in-place resizing while keeping
-/// most insertions in a single hot table.
-///
-/// After consumption finishes, [`flush`](Self::flush) returns all tables
-/// for merging in the output phase.
+/// The consume phase does *no* aggregation: it scatters each row into one of
+/// [`PARTITIONS`] per-partition [`SlabList`]s (slab-pool memory) by the top hash
+/// bits. Each partition's rows from all workers are then aggregated exactly once
+/// in a cache-resident table by the merge phase.
 pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     hash_state: RandomState,
     worker_arena: WorkerArena,
     allocator: SlabAllocator,
-    tables: Vec<MultiSlabTable<K, V>>,
+    buffers: Vec<SlabList<RadixRow<K, V>>>,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
-    /// Scratch for the batched multi-pass probe: current slot per row, and the
-    /// two ping-pong selection vectors of still-unresolved row indices.
-    slots: Box<[usize; RECORD_BATCH_SIZE]>,
-    sel: Box<[u32; RECORD_BATCH_SIZE]>,
-    sel_next: Box<[u32; RECORD_BATCH_SIZE]>,
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
-    /// Create a new aggregation state with a single small table.
     pub fn new(state: RandomState, shared_arena: Arc<SharedArena>) -> Self {
-        let mut allocator = SlabAllocator::new(true);
-        let table = BaseHashTable::multi_slab(&mut allocator, DEFAULT_CAPACITY, 0);
         Self {
             hash_state: state,
             worker_arena: WorkerArena::new(shared_arena),
-            allocator,
-            tables: vec![table],
+            allocator: SlabAllocator::new(false),
+            buffers: (0..PARTITIONS).map(|_| SlabList::new()).collect(),
             hashes: vec![0u64; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-            slots: vec![0usize; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-            sel: vec![0u32; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-            sel_next: vec![0u32; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
         }
     }
 
-    /// Allocate a new table with `size` slots, choosing single- or multi-slab
-    /// based on whether the byte size fits in one buffer.
-    #[inline(always)]
-    fn create_new_table(&mut self) {
-        // Grow by 4x rather than 2x. The frozen tables in the stack are pure
-        // slack that must be allocated and zeroed every query: their cumulative
-        // capacity is `final * r/(r-1)`, so 4x growth wastes ~1.33x the final
-        // size vs doubling's 2x. Fewer, lower-loaded tables also mean fewer
-        // sources for the merge to scan. At very large group counts this is gigabytes less
-        // memory to zero each query.
-        let new_size = self.tables.last().unwrap().capacity() * 4;
-        self.tables
-            .push(BaseHashTable::multi_slab(&mut self.allocator, new_size, 0));
-    }
-
-    /// Merge all rows of `batch` into the current table stack, reading the key
-    /// columns through `K` and the per-row aggregate values through `V`.
-    ///
-    /// Hashes the whole batch up front, then dispatches to either the batched
-    /// multi-pass probe ([`consume_batched`](Self::consume_batched)) or the
-    /// scalar per-row fallback ([`consume_scalar`](Self::consume_scalared)).
-    #[inline(always)]
+    /// Scatter every row of `batch` into its partition buffer.
     pub fn consume_batch(
         &mut self,
         batch: &RecordBatch,
@@ -125,98 +124,33 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 
-        let mut i = 0;
-        while i < length {
-            self.hashes[i] = K::hash(&key_reader, i, &self.hash_state);
-            i += 1;
+        // Destructure so the per-partition buffer and the shared allocator can be
+        // borrowed mutably at once (disjoint fields).
+        let Self {
+            hash_state,
+            worker_arena,
+            allocator,
+            buffers,
+            hashes,
+        } = self;
+
+        for i in 0..length {
+            hashes[i] = K::hash(&key_reader, i, hash_state);
         }
 
-        // The active table can take the whole batch iff no probe can overflow it
-        // mid-batch — only then is the batched path safe (every probe is
-        // guaranteed an empty slot). The large final table, where ~all of the
-        // inserts land, always meets this; only the small early tables fall
-        // back to the scalar loop.
-        let free = {
-            let t = self.tables.last().unwrap();
-            t.capacity() - t.len()
-        };
-        if free > length {
-            self.consume_batched(length, &key_reader, value_reader);
-        } else {
-            self.consume_scalared(length, &key_reader, &value_reader);
-        }
-    }
-
-    /// Resolve a whole batch against the active table in one batched multi-pass
-    /// probe — used when the table has room for every row, so no mid-batch table
-    /// switch is needed. Resolves all rows with high memory-level parallelism
-    /// instead of one stalling probe chain at a time.
-    #[inline(always)]
-    fn consume_batched<'b>(
-        &mut self,
-        length: usize,
-        key_reader: &K::Reader<'b>,
-        value_reader: V::Reader<'b>,
-    ) {
-        // `value_reader` is moved into `src` (held by value so a ZST value reader
-        // stays zero-size); the scalar path takes it by reference instead.
-        let mut src = RowSrc::<K, V> {
-            key_reader,
-            value_reader,
-            arena: &mut self.worker_arena,
-        };
-        self.tables.last_mut().unwrap().merge_batch(
-            length,
-            &mut self.hashes[..],
-            &mut self.slots[..],
-            &mut self.sel[..],
-            &mut self.sel_next[..],
-            &mut src,
-        );
-        if self.tables.last().unwrap().undersized() {
-            self.create_new_table();
+        let shift = u64::BITS - PARTITIONS.trailing_zeros();
+        for i in 0..length {
+            let hash = hashes[i];
+            let p = (hash >> shift) as usize;
+            let key = K::live_key(&key_reader, i, worker_arena).persist();
+            let value = V::value(&value_reader, i);
+            buffers[p].push(allocator, (hash, key, value));
         }
     }
 
-    /// Resolve a batch row-by-row, switching to a fresh table when the current
-    /// one overflows mid-batch — used only for the small early tables. Two-level
-    /// software prefetch (DRAM→L2 far, then L2→L1 near) hides the per-row probe
-    /// latency.
-    #[inline(always)]
-    fn consume_scalared<'b>(
-        &mut self,
-        length: usize,
-        key_reader: &K::Reader<'b>,
-        value_reader: &V::Reader<'b>,
-    ) {
-        const L1_DISTANCE: usize = 16;
-        const L2_DISTANCE: usize = 48;
-        let mut table = self.tables.last_mut().unwrap();
-        let mut i = 0;
-        while i < length {
-            let hash = self.hashes[i];
-            if i + L2_DISTANCE < length {
-                table.prefetch_l2(self.hashes[i + L2_DISTANCE]);
-            }
-            if i + L1_DISTANCE < length {
-                table.prefetch(self.hashes[i + L1_DISTANCE]);
-            }
-
-            let key = K::live_key(key_reader, i, &mut self.worker_arena);
-            let value = V::value(value_reader, i);
-            table.merge::<false, _>(hash, key, value);
-
-            if table.undersized() {
-                self.create_new_table();
-                table = self.tables.last_mut().unwrap();
-            }
-            i += 1;
-        }
-    }
-
-    /// Finalize this worker's aggregation: flush the arena and return all tables.
-    pub fn flush(self) -> Vec<MultiSlabTable<K, V>> {
+    /// Hand the per-partition scatter buffers to the merge phase.
+    pub fn flush(self) -> PartitionBuffers<K, V> {
         self.worker_arena.flush();
-        self.tables
+        PartitionBuffers(self.buffers)
     }
 }

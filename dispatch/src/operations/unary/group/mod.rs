@@ -93,7 +93,7 @@ pub use values::{
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::group::hashtables::{AggregatedTable, MultiSlabTable};
+use crate::operations::unary::group::hashtables::{AggregatedTable, PartitionBuffers};
 use crate::worker::worker_waker;
 use ahash::RandomState;
 use arena::SharedArena;
@@ -103,7 +103,7 @@ use crossbeam_deque::{Injector, Steal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::debug;
 use unary::pipeline_breaker::{Consumer, Outputter};
 
 #[derive(Debug, Error)]
@@ -118,7 +118,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Number of hash partitions for the output merge phase.
 /// Each partition is merged independently, enabling parallel output.
-const PARTITIONS: usize = 64;
+const PARTITIONS: usize = 1024;
 
 /// Per-worker GROUP BY consumer.
 ///
@@ -131,7 +131,7 @@ pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     value_slots: Vec<AggregationSlot>,
 
     aggregated_table: AggregatedTable<K, V>,
-    sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
+    sender: mpsc::Sender<PartitionBuffers<K, V>>,
     outputter: GroupOutputter<K, V>,
 }
 
@@ -144,8 +144,8 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
-        sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
-        receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
+        sender: mpsc::Sender<PartitionBuffers<K, V>>,
+        receiver: Option<mpsc::Receiver<PartitionBuffers<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -195,7 +195,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
 pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     shared_arena: Arc<SharedArena>,
     injector: Arc<Injector<PartitionJob<K, V>>>,
-    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
+    receiver: Option<mpsc::Receiver<PartitionBuffers<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     top_k: Option<(usize, usize)>,
     /// One allocator per worker for the output columns of every partition this
@@ -211,10 +211,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
 /// source tables for partition `index` into one result table and sends the
 /// output as a [`RecordBatch`].
 pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
-    tables: Arc<Vec<MultiSlabTable<K, V>>>,
+    tables: Arc<Vec<PartitionBuffers<K, V>>>,
     index: usize,
     arena: Arc<SharedArena>,
-    partition_capacity: usize,
     top_k: Option<(usize, usize)>,
 }
 
@@ -229,12 +228,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
         debug!("Merging maps for partition {:?}...", self.index);
-        let result_map = merge::merge_partition::<K, V>(
-            self.index,
-            &self.tables,
-            &self.arena,
-            self.partition_capacity,
-        );
+        let result_map = merge::aggregate_partition::<K, V>(self.index, &self.tables, &self.arena);
 
         if result_map.len() == 0 {
             return Ok(());
@@ -248,7 +242,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
 impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputter<K, V> {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let tables: Vec<MultiSlabTable<K, V>> = rx.into_iter().flatten().collect::<Vec<_>>();
+            let tables: Vec<PartitionBuffers<K, V>> = rx.into_iter().collect::<Vec<_>>();
             debug!("Outputting {:?} maps", tables.len());
             // Estimate the merged entry count from actual occupancy (sum of
             // lengths), not capacity — capacity over-counts by the table-stack's
@@ -256,16 +250,12 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
             // result table near a high load factor instead of 2.5x
             // over-provisioned, which at very large group counts is gigabytes less memory
             // to allocate and zero every query.
-            let total_entries: usize = tables.iter().map(|m| m.len()).sum::<usize>();
-            let partition_capacity = (total_entries / PARTITIONS).next_power_of_two();
-            info!("Partition capacity {:?}", partition_capacity);
             let tables = Arc::new(tables);
             for i in 0..PARTITIONS {
                 self.injector.push(PartitionJob {
                     tables: tables.clone(),
                     index: i,
                     arena: self.shared_arena.clone(),
-                    partition_capacity,
                     top_k: self.top_k,
                 })
             }

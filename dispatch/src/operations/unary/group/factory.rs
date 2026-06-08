@@ -8,7 +8,7 @@
 
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
-use crate::operations::unary::group::hashtables::{KeyExtractor, MultiSlabTable, ValueExtractor};
+use crate::operations::unary::group::hashtables::{KeyExtractor, PartitionBuffers, ValueExtractor};
 use crate::operations::unary::group::{AggregationSlot, Group, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
@@ -36,8 +36,8 @@ pub struct GroupFactory<K: KeyExtractor, V: ValueExtractor> {
     injector: Arc<Injector<PartitionJob<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
 
-    sender: mpsc::Sender<Vec<MultiSlabTable<K, V>>>,
-    receiver: Option<mpsc::Receiver<Vec<MultiSlabTable<K, V>>>>,
+    sender: mpsc::Sender<PartitionBuffers<K, V>>,
+    receiver: Option<mpsc::Receiver<PartitionBuffers<K, V>>>,
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {

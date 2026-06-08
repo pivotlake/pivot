@@ -19,10 +19,10 @@ pub use crate::operations::unary::group::keys::KeyExtractor;
 pub use crate::operations::unary::group::values::ValueExtractor;
 
 mod hash_table;
-pub use hash_table::{BatchRowSource, Entry, LiveKey, PersistedKey, Value};
+pub use hash_table::{Entry, LiveKey, PersistedKey, Value};
 
 mod aggregated_table;
-pub use aggregated_table::AggregatedTable;
+pub use aggregated_table::{AggregatedTable, PartitionBuffers};
 
 /// Initial number of slots for a new per-worker hash table.
 pub const DEFAULT_CAPACITY: usize = 128;
