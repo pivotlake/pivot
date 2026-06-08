@@ -4,6 +4,10 @@ use std::sync::Arc;
 struct TTable;
 
 impl DuckDBTable for TTable {
+    fn clone_box(&self) -> Box<dyn DuckDBTable> {
+        Box::new(TTable)
+    }
+
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         vec![
             DuckDBColumn {

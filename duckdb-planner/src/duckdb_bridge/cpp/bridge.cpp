@@ -9,6 +9,7 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -47,6 +48,8 @@ using DynamicFilterDedup = std::unordered_map<duckdb::DynamicFilterData *, size_
 json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
                           DynamicFilterDedup &df_dedup);
 json build_expression(duckdb::Expression *expr);
+json build_late_materialization(duckdb::LogicalComparisonJoin &join,
+                                rust::Vec<rust::Box<OptionalTableWrapper>> &tables, DynamicFilterDedup &df_dedup);
 
 json build_bridge_error(const string &kind, const string &message, std::optional<string> position = std::nullopt) {
 	json error = {
@@ -91,7 +94,7 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
     : catalog(std::move(catalog)),
       db(nullptr, &this->config),
       con(db) {
-        con.Query("SET disabled_optimizers='compressed_materialization,late_materialization,empty_result_pullup'");
+        con.Query("SET disabled_optimizers='compressed_materialization,empty_result_pullup'");
 
 	// Set catalog context on the storage extension and attach the pivot catalog as default
 	auto ext = duckdb::StorageExtension::Find(
@@ -387,6 +390,8 @@ json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper
 	    {"table_id", table_id},
 	    {"columns", columns},
 	    {"dynamic_filters", std::move(dynamic_filters)},
+	    // Flipped to true by build_late_materialization on a late-mat narrow scan.
+	    {"emit_row_group_metadata", false},
 	};
 }
 
@@ -505,8 +510,157 @@ json build_create_table(duckdb::LogicalCreateTable *create_table) {
     };
 }
 
+// Remove DuckDB's row-id column from an already-built late-mat RHS subtree JSON.
+//
+// Late materialization threads a row-id column from the narrow scan up to the
+// (now-removed) join. pivot can't scan a virtual row-id and doesn't need it —
+// its materializer keys off row-group metadata instead. DuckDB appends the
+// row-id *last* at every level (the Get's column list and each Projection that
+// carries it up), so dropping it never shifts another column's position: we just
+// find it at the scan and drop the lone reference to it in each projection on the
+// way back up. Returns the output position that held the row-id in `node`, or
+// `nullopt` if this subtree has none.
+static std::optional<size_t> strip_trailing_rowid(json &node) {
+	auto type = node["operator"]["type"].get<uint8_t>();
+	auto &data = node["operator"]["data"];
+
+	if (type == static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_GET)) {
+		auto &cols = data["columns"];
+		for (size_t i = 0; i < cols.size(); i++) {
+			if (cols[i]["data"]["column_idx"].get<uint64_t>() == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+				cols.erase(cols.begin() + i);
+				return i;
+			}
+		}
+		return std::nullopt;
+	}
+
+	if (!node.contains("inputs") || node["inputs"].empty()) {
+		return std::nullopt;
+	}
+	auto child_rowid = strip_trailing_rowid(node["inputs"][0]);
+
+	// A projection that carried the row-id up references it positionally in its
+	// child's output; drop that one entry. Other operators (Filter, Top-N, and
+	// the synthetic PUSHDOWN_FILTER wrapper) pass columns through unchanged.
+	if (type == static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_PROJECTION) && child_rowid) {
+		auto &exprs = data["projections"];
+		for (size_t i = 0; i < exprs.size(); i++) {
+			auto &e = exprs[i];
+			if (e["type"].get<uint8_t>() == static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF) &&
+			    e["data"]["column_idx"].get<uint64_t>() == *child_rowid) {
+				exprs.erase(exprs.begin() + i);
+				return i;
+			}
+		}
+	}
+	return child_rowid;
+}
+
+// Walk a late-mat RHS subtree to its scan, flag it to emit row-group metadata
+// (so the materializer can fetch survivors), and return its table_id — which the
+// Materialize node reuses, so resolution clones the one resolved table for both.
+static int64_t prepare_narrow_scan(json &node) {
+	if (node["operator"]["type"].get<uint8_t>() ==
+	    static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_GET)) {
+		auto &data = node["operator"]["data"];
+		data["emit_row_group_metadata"] = true;
+		return data["table_id"].get<int64_t>();
+	}
+	if (!node.contains("inputs") || node["inputs"].empty()) {
+		return -1;
+	}
+	return prepare_narrow_scan(node["inputs"][0]);
+}
+
+// Collapse DuckDB's late-materialization SEMI join into a pivot Materialize node.
+//
+// DuckDB's plan is `... -> Projection -> SemiJoin(lhs.rowid = rhs.rowid)` where
+// the LHS is a full-column Get of the table and the RHS is the original narrow
+// `Top-N -> [Projection] -> [Filter] -> Get(+rowid)` pipeline. The SEMI join
+// keeps the LHS rows whose row-id survived the narrow Top-N. Pivot can't run a
+// join, so we emit `Materialize(<lhs columns>) -> <rhs pipeline>`: the narrow
+// pipeline runs as-is (its row-id column is dropped Rust-side, replaced by
+// pivot's row-group metadata), and the materializer re-reads the LHS columns for
+// the surviving rows. `columns` is the LHS Get's output column set (storage
+// indices, row-id excluded), in output order so the Projection kept above the
+// (former) join still lines up positionally.
+json build_late_materialization(duckdb::LogicalComparisonJoin &join,
+                                rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                                DynamicFilterDedup &df_dedup) {
+	auto &lhs_get = join.children[0]->Cast<duckdb::LogicalGet>();
+	auto &col_ids = lhs_get.GetColumnIds();
+	json mat_columns = json::array();
+	auto emit_col = [&](size_t pos) {
+		auto storage = col_ids[pos].GetPrimaryIndex();
+		if (storage == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+			return;
+		}
+		mat_columns.push_back(storage);
+	};
+	if (!lhs_get.projection_ids.empty()) {
+		for (auto pid : lhs_get.projection_ids) {
+			emit_col(pid);
+		}
+	} else {
+		for (size_t i = 0; i < col_ids.size(); i++) {
+			emit_col(i);
+		}
+	}
+
+	// The narrow pipeline is the RHS; translate it normally, then drop the row-id
+	// column DuckDB threaded through it for the join we're discarding.
+	json child = build_plan_node_json(join.children[1].get(), tables, df_dedup);
+	strip_trailing_rowid(child);
+	// Tag the narrow scan to emit row-group metadata, and reuse its table_id for
+	// the Materialize so both resolve to (a clone of) the same table.
+	int64_t table_id = prepare_narrow_scan(child);
+
+	json op = json::object();
+	op["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN);
+	op["data"] = json{{"table_id", table_id}, {"columns", std::move(mat_columns)}};
+
+	json node = json::object();
+	node["name"] = "Materialize";
+	node["inputs"] = json::array({std::move(child)});
+	node["operator"] = std::move(op);
+	return node;
+}
+
+// Whether a SEMI join is the one DuckDB's late_materialization optimizer
+// produces (vs a user `IN`/`EXISTS`). Late-mat keys the join on the row-id
+// virtual column, so its LHS is a bare LogicalGet carrying a column tagged with
+// COLUMN_IDENTIFIER_ROW_ID (added by GetOrInsertRowIds). A user semi-join's LHS
+// is an arbitrary subtree with no row-id, so it falls through to the normal
+// path (and is rejected as an unsupported operator, which is correct — pivot
+// can't execute a general join).
+static bool is_late_materialization_join(duckdb::LogicalComparisonJoin &join) {
+	if (join.children.empty() ||
+	    join.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+		return false;
+	}
+	auto &lhs_get = join.children[0]->Cast<duckdb::LogicalGet>();
+	for (auto &cid : lhs_get.GetColumnIds()) {
+		if (cid.GetPrimaryIndex() == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+			return true;
+		}
+	}
+	return false;
+}
+
 json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
                           DynamicFilterDedup &df_dedup) {
+	// DuckDB's late_materialization optimizer rewrites a wide Top-N/Limit scan
+	// into a row-id SEMI join. Collapse that into pivot's own Materialize node
+	// rather than executing a join — but only the late-mat shape, not a user
+	// IN/EXISTS semi-join (see is_late_materialization_join).
+	if (op->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+		auto &join = op->Cast<duckdb::LogicalComparisonJoin>();
+		if (join.join_type == duckdb::JoinType::SEMI && is_late_materialization_join(join)) {
+			return build_late_materialization(join, tables, df_dedup);
+		}
+	}
+
 	json new_node = json::object();
 	json new_operator = json::object();
 

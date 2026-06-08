@@ -6,6 +6,33 @@
 
 use arrow_schema::Schema;
 
+/// Field name of the global row-group column a scan appends when emitting
+/// row-group metadata for late materialization (a run-end-encoded group id).
+pub const ROW_GROUP_IDX_FIELD: &str = "row_group_idx";
+/// Field name of the per-row index column appended alongside [`ROW_GROUP_IDX_FIELD`].
+pub const ROW_IDX_FIELD: &str = "row_idx";
+
+/// Number of trailing row-group-metadata columns on a batch with this schema
+/// (`2` if it ends with the [`ROW_GROUP_IDX_FIELD`]/[`ROW_IDX_FIELD`] pair a
+/// metadata-emitting scan appends, else `0`).
+///
+/// Operators that drop or reorder columns between such a scan and the parquet
+/// materializer (notably projections) consult this so they can carry the
+/// metadata pair through untouched — the materializer reads it positionally
+/// from the end of the batch.
+pub fn trailing_metadata_columns(schema: &Schema) -> usize {
+    let fields = schema.fields();
+    let n = fields.len();
+    if n >= 2
+        && fields[n - 2].name() == ROW_GROUP_IDX_FIELD
+        && fields[n - 1].name() == ROW_IDX_FIELD
+    {
+        2
+    } else {
+        0
+    }
+}
+
 /// An ordered set of column indices that a scan should read.
 ///
 /// Can be built from explicit indices, from an Arrow [`Schema`], or by

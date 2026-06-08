@@ -39,12 +39,17 @@ impl Table for RecordingTable {
         _dispatcher: &DataFlowDispatcher,
         _projection: Projection,
         _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
+        _emit_row_group_metadata: bool,
     ) -> RecordBatchOperatorSpec {
         unreachable!("plan-only test should not reach compile")
     }
 
     fn columns(&self) -> Vec<Column> {
         self.columns.clone()
+    }
+
+    fn clone_box(&self) -> Box<dyn Table> {
+        Box::new(self.clone())
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> planner::catalog::Result<bool> {

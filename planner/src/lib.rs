@@ -41,10 +41,11 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>) -> RecordBatchOperatorSpec {
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool) -> RecordBatchOperatorSpec {
 //!         table_input(dispatcher, &self.parquet, projection, false)
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
+//!     fn clone_box(&self) -> Box<dyn Table> { Box::new(MyTable { parquet: self.parquet.clone(), columns: self.columns.clone() }) }
 //! }
 //!
 //! #[derive(Clone, Debug)]

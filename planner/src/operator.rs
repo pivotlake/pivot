@@ -37,6 +37,12 @@ pub struct Input {
     /// by a Top-N (or, in future, a hash join) elsewhere in the plan. Each
     /// prunes row groups against the producer's live boundary value.
     pub dynamic_filters: Vec<DynamicFilter>,
+    /// When `true`, the scan tags each emitted row with its global row-group ID
+    /// and per-row index (extra metadata columns appended after the data
+    /// columns). Set on the narrow scan of a late-materialized query so a
+    /// downstream [`Materialize`] can fetch the remaining columns for only the
+    /// surviving rows. Always `false` for ordinary scans.
+    pub emit_row_group_metadata: bool,
 }
 
 impl TryFrom<duckdb_operator::Input> for Input {
@@ -58,6 +64,23 @@ impl TryFrom<duckdb_operator::Input> for Input {
                 .into_iter()
                 .map(DynamicFilter::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            emit_row_group_metadata: s.emit_row_group_metadata,
+        })
+    }
+}
+
+impl TryFrom<duckdb_operator::Materialize> for Materialize {
+    type Error = Error;
+    fn try_from(m: duckdb_operator::Materialize) -> Result<Self, Self::Error> {
+        // Mirror `Input`: the resolved DuckDB table is a `DuckDBTableAdapter`
+        // wrapping the pivot `Table`; downcast and take it.
+        let any: Box<dyn Any> = m.table;
+        let wrapper: Box<DuckDBTableAdapter> = any
+            .downcast::<DuckDBTableAdapter>()
+            .expect("Materialize.table should be a DuckDBTableAdapter");
+        Ok(Materialize {
+            table: wrapper.table,
+            columns: m.columns,
         })
     }
 }
@@ -71,6 +94,35 @@ impl fmt::Display for Input {
             .collect::<Vec<_>>()
             .join(", ");
         write!(f, "Input([{cols}])")
+    }
+}
+
+/// Late-materialization fetch: re-reads `columns` from the table for the rows
+/// that survived the narrow pipeline below it.
+///
+/// The bridge synthesizes this by collapsing DuckDB's `late_materialization`
+/// row-id SEMI join (see the duckdb-planner `Materialize` operator). Its single
+/// input is the narrow pipeline whose scan is tagged with row-group metadata
+/// (see [`Input::emit_row_group_metadata`]); this node fetches the requested
+/// columns for only the surviving rows, emitting them in `columns` order — which
+/// matches the order DuckDB's full-column Get produced, so the projection kept
+/// above it lines up positionally without remapping.
+#[derive(Debug)]
+pub struct Materialize {
+    pub table: Box<dyn Table>,
+    /// Table-schema (storage) column indices to fetch, in output order.
+    pub columns: Vec<usize>,
+}
+
+impl fmt::Display for Materialize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cols = self
+            .columns
+            .iter()
+            .map(|c| format!("#{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(f, "Materialize([{cols}])")
     }
 }
 
@@ -408,6 +460,8 @@ pub enum Operator {
     TopN(TopN),
     CreateTable(CreateTable),
     DummyScan(DummyScan),
+    /// Late-materialization fetch (synthesized by the rewrite, see [`Materialize`]).
+    Materialize(Materialize),
 }
 
 impl TryFrom<duckdb_operator::Operator> for Operator {
@@ -423,8 +477,12 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
             duckdb_operator::Operator::TopN(t) => Operator::TopN(t.try_into()?),
             duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
             duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
+            duckdb_operator::Operator::Materialize(m) => Operator::Materialize(m.try_into()?),
             duckdb_operator::Operator::RawInput(_) => {
                 unreachable!("RawInput should be resolved to Input before reaching the planner")
+            }
+            duckdb_operator::Operator::RawMaterialize(_) => {
+                unreachable!("RawMaterialize should be resolved to Materialize before the planner")
             }
         })
     }
@@ -441,6 +499,7 @@ impl fmt::Display for Operator {
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
+            Operator::Materialize(m) => write!(f, "{m}"),
         }
     }
 }

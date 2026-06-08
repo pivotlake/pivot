@@ -10,7 +10,8 @@ use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use crate::operator::{
-    Aggregate, CreateTable, DummyScan, Filter, Input, OrderBy, OrderByDirection, Projection, TopN,
+    Aggregate, CreateTable, DummyScan, Filter, Input, Materialize, OrderBy, OrderByDirection,
+    Projection, TopN,
 };
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
@@ -42,7 +43,21 @@ impl Projection {
             let idxs = Arc::new(idxs);
             return Ok(input.project(move || {
                 let idxs = idxs.clone();
-                move |batch: RecordBatch| batch.project(&idxs).unwrap()
+                move |batch: RecordBatch| {
+                    // A late-materialized narrow scan appends row-group metadata
+                    // columns the downstream materializer reads positionally from
+                    // the end. A plain column projection would drop them, so carry
+                    // any such trailing pair through untouched.
+                    let meta = dispatch::trailing_metadata_columns(batch.schema_ref());
+                    if meta == 0 {
+                        batch.project(&idxs).unwrap()
+                    } else {
+                        let n = batch.num_columns();
+                        let mut cols: Vec<usize> = idxs.as_ref().clone();
+                        cols.extend((n - meta)..n);
+                        batch.project(&cols).unwrap()
+                    }
+                }
             }));
         }
 
@@ -339,7 +354,22 @@ impl Input {
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
-        Ok(self.table.compile(dispatcher, projection, dynamic_filters))
+        Ok(self.table.compile(
+            dispatcher,
+            projection,
+            dynamic_filters,
+            self.emit_row_group_metadata,
+        ))
+    }
+}
+
+impl Materialize {
+    pub(crate) fn compile(
+        &self,
+        input: RecordBatchOperatorSpec,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        let projection = DispatchProjection::columns(self.columns.iter().copied());
+        Ok(self.table.materialize(input, projection))
     }
 }
 
