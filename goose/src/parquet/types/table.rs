@@ -44,8 +44,9 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Where one data file lives. A [`ParquetSource`] is a list of these; the
-/// scan's first phase materializes each into [`RowGroupMetadata`] by reading its
+/// Where one data file lives. A [`ParquetSource`](crate::parquet::ParquetSource)
+/// is a list of these; the scan's first phase materializes each into
+/// [`RowGroupMetadata`] by reading its
 /// footer (across workers, in parallel).
 #[derive(Clone, Debug)]
 pub enum DataFileLocation {
