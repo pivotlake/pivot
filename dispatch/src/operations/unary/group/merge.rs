@@ -249,7 +249,7 @@ pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
     for wb in worker_buffers {
         wb.0[partition].for_each(|(hash, key, value)| {
             if target.undersized() {
-                cap *= 4;
+                cap *= 8;
                 let nb = allocator.create_multi_slab_buffer(cap, true);
                 target.resize_with(nb, cap);
             }
@@ -264,7 +264,7 @@ pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
         for entry in table.iter(0) {
             if (entry.hash() >> shift) as usize == partition {
                 if target.undersized() {
-                    cap *= 4;
+                    cap *= 8;
                     let nb = allocator.create_multi_slab_buffer(cap, true);
                     target.resize_with(nb, cap);
                 }
