@@ -24,7 +24,6 @@
 //!    exceeds [`RESIZE_COLLISION_RATIO`], which corresponds to ~70% effective
 //!    load (derived from Knuth's linear-probing analysis: ratio = α / 2(1-α)).
 
-#![allow(dead_code)] // old slot-range merge kept for reference; radix uses aggregate_partition
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
