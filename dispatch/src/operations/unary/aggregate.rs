@@ -133,10 +133,15 @@ fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, Arr
                 A::finalize(Arc::new(PrimitiveArray::<A::Arrow>::from_iter_values([value])));
             (Field::new("sum", array.data_type().clone(), false), array)
         }
-        AggregationKind::Count | AggregationKind::CountStar => (
-            Field::new("count", DataType::Int64, false),
-            Arc::new(Int64Array::from(vec![value.as_i64()])),
-        ),
+        // A count can't exceed the row count, so it always fits i64; the checked
+        // narrowing panics on the impossible overflow rather than truncating.
+        AggregationKind::Count | AggregationKind::CountStar => {
+            let count = i64::try_from(value.into()).expect("count exceeds i64::MAX");
+            (
+                Field::new("count", DataType::Int64, false),
+                Arc::new(Int64Array::from(vec![count])),
+            )
+        }
     }
 }
 

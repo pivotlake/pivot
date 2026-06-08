@@ -18,18 +18,16 @@ use std::sync::Arc;
 /// An aggregate slot's accumulator integer: `i64` (narrow) or `i128` (wide).
 ///
 /// A width is just an integer that combines by addition ([`AddAssign`]), is
-/// built from a per-row `i64` contribution ([`From<i64>`]), narrows back to
-/// `i64` ([`as_i64`](Accumulator::as_i64)), and maps to one Arrow output column
-/// type ([`Arrow`](Accumulator::Arrow)).
+/// built from a per-row `i64` contribution ([`From<i64>`]), widens losslessly to
+/// `i128` ([`Into<i128>`], for narrowing `COUNT` columns through a checked
+/// `i64::try_from`), is comparable ([`Ord`], for top-k sort keys), and maps to
+/// one Arrow output column type ([`Arrow`](Accumulator::Arrow)).
 pub trait Accumulator:
-    Copy + Default + Send + Sync + 'static + std::ops::AddAssign + From<i64>
+    Copy + Default + Send + Sync + 'static + std::ops::AddAssign + Ord + From<i64> + Into<i128>
 {
     /// The Arrow primitive backing this width's output column (`Int64Type` /
     /// `Decimal128Type`); its `Native` is the accumulator itself.
     type Arrow: ArrowPrimitiveType<Native = Self>;
-
-    /// Narrow to `i64` for top-k sort keys and `COUNT` columns (both always fit).
-    fn as_i64(self) -> i64;
 
     /// Finish a freshly built `Self::Arrow` column into its output array:
     /// identity for `Int64`, sets precision/scale `(38, 0)` for `Decimal128`
@@ -40,10 +38,6 @@ pub trait Accumulator:
 impl Accumulator for i64 {
     type Arrow = Int64Type;
     #[inline(always)]
-    fn as_i64(self) -> i64 {
-        self
-    }
-    #[inline(always)]
     fn finalize(array: ArrayRef) -> ArrayRef {
         array
     }
@@ -51,10 +45,6 @@ impl Accumulator for i64 {
 
 impl Accumulator for i128 {
     type Arrow = Decimal128Type;
-    #[inline(always)]
-    fn as_i64(self) -> i64 {
-        self as i64
-    }
     fn finalize(array: ArrayRef) -> ArrayRef {
         Arc::new(
             array

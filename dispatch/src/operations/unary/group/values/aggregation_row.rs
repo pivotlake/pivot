@@ -95,6 +95,7 @@ impl<const N: usize, A: Accumulator> ValueExtractor for AggregationRowValueExtra
     type Value = AggregationRow<N, A>;
     type Reader<'b> = AggregationRowReader<'b, N>;
     type Columns = AggregationRowColumns<N, A>;
+    type SortKey = A;
 
     fn make_reader<'b>(
         batch: &'b RecordBatch,
@@ -128,8 +129,8 @@ impl<const N: usize, A: Accumulator> ValueExtractor for AggregationRowValueExtra
     }
 
     #[inline(always)]
-    fn sort_key(value: &AggregationRow<N, A>, slot: usize) -> i64 {
-        value.0[slot].as_i64()
+    fn sort_key(value: &AggregationRow<N, A>, slot: usize) -> A {
+        value.0[slot]
     }
 }
 

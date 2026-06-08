@@ -58,6 +58,10 @@ pub trait ValueExtractor: Send + 'static {
     type Reader<'b>;
     /// Accumulates per-group values into the result's value column(s).
     type Columns: ValueColumns<Value = Self::Value>;
+    /// The scalar an `ORDER BY <slot> DESC LIMIT k` sorts on — the slot's own
+    /// accumulator type, so a wide (`i128`) sum is compared at full width with no
+    /// lossy narrowing.
+    type SortKey: Ord + Copy;
 
     /// Build a reader over `batch` for the configured aggregate `value_slots`.
     fn make_reader<'b>(batch: &'b RecordBatch, value_slots: &[AggregationSlot])
@@ -66,9 +70,9 @@ pub trait ValueExtractor: Send + 'static {
     /// Build the per-row aggregate value at row `idx`.
     fn value(reader: &Self::Reader<'_>, idx: usize) -> Self::Value;
 
-    /// The scalar that an `ORDER BY <slot> DESC LIMIT k` sorts on, pulled from an
+    /// The value an `ORDER BY <slot> DESC LIMIT k` sorts on, pulled from an
     /// otherwise-opaque [`Value`]. Used only when the group feeds a top-k.
-    fn sort_key(value: &Self::Value, slot: usize) -> i64;
+    fn sort_key(value: &Self::Value, slot: usize) -> Self::SortKey;
 }
 
 /// Builds the trailing value column(s) of a GROUP BY result, one group at a time.

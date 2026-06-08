@@ -40,6 +40,7 @@ macro_rules! impl_compiled {
             type Value = AggregationRow<$n, Acc>;
             type Reader<'b> = ($($Op::Reader<'b>,)+);
             type Columns = AggregationRowColumns<$n, Acc>;
+            type SortKey = Acc;
 
             #[inline(always)]
             fn make_reader<'b>(
@@ -56,8 +57,8 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
-            fn sort_key(value: &AggregationRow<$n, Acc>, slot: usize) -> i64 {
-                value.0[slot].as_i64()
+            fn sort_key(value: &AggregationRow<$n, Acc>, slot: usize) -> Acc {
+                value.0[slot]
             }
         }
     };
