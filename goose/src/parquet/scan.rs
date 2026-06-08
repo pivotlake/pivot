@@ -19,9 +19,8 @@ use dispatch::{
 
 use super::{
     CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, ParquetTable, RemoteRowGroupFetcherFactory, RowGroupBuffer,
-    RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
-    ScanOrder, TableMedium,
+    MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
+    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
 };
 
 /// Append the index → decompress → decode stages onto a source of
@@ -117,50 +116,26 @@ pub fn table_input_with_filter_and_eq_predicates(
     let n = dispatcher.worker_count();
     let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
     let siblings = Arc::new(AtomicUsize::new(n));
-    // Disk and HTTP get different fetchers (one row group at a time vs many in
-    // flight); a table is homogeneous so its medium selects which.
-    match table.medium() {
-        TableMedium::Local => {
-            let factories: Vec<_> = (0..n)
-                .map(|_| {
-                    RootUnaryOperatorFactory::new(
-                        RowGroupFetcherFactory::new(),
-                        injector.clone(),
-                        siblings.clone(),
-                    )
-                })
-                .collect();
-            let input = OperatorSpec::new(dispatcher.clone(), factories);
-            read_parquet(
-                input,
-                table,
-                projection,
-                RECORD_BATCH_SIZE,
-                add_row_group_metadata,
-                eq_predicates,
+    // One fetcher handles disk and HTTP row groups, bounding each medium's
+    // in-flight count separately.
+    let factories: Vec<_> = (0..n)
+        .map(|_| {
+            RootUnaryOperatorFactory::new(
+                RowGroupFetcherFactory::new(),
+                injector.clone(),
+                siblings.clone(),
             )
-        }
-        TableMedium::Remote => {
-            let factories: Vec<_> = (0..n)
-                .map(|_| {
-                    RootUnaryOperatorFactory::new(
-                        RemoteRowGroupFetcherFactory::new(),
-                        injector.clone(),
-                        siblings.clone(),
-                    )
-                })
-                .collect();
-            let input = OperatorSpec::new(dispatcher.clone(), factories);
-            read_parquet(
-                input,
-                table,
-                projection,
-                RECORD_BATCH_SIZE,
-                add_row_group_metadata,
-                eq_predicates,
-            )
-        }
-    }
+        })
+        .collect();
+    let input = OperatorSpec::new(dispatcher.clone(), factories);
+    read_parquet(
+        input,
+        table,
+        projection,
+        RECORD_BATCH_SIZE,
+        add_row_group_metadata,
+        eq_predicates,
+    )
 }
 
 /// Late materialization: take an existing `RecordBatch` spec (whose rows carry
@@ -177,63 +152,30 @@ pub fn materialize(
     let siblings_materializer = Arc::new(AtomicUsize::new(n));
     let siblings_fetcher = Arc::new(AtomicUsize::new(n));
 
-    // Mirror table_input's fetcher choice for the materialization re-read.
-    match table.medium() {
-        TableMedium::Local => {
-            let factories: Vec<_> = stealable::<RecordBatch>(n)
-                .into_iter()
-                .zip(stealable::<RowGroupRequest>(n))
-                .map(|(rb_ch, rq_ch)| {
-                    UnaryOperatorFactory::new(
-                        UnaryOperatorFactory::new(
-                            RecordBatchFactoryBridge::new(heads.pop_front().unwrap()),
-                            MaterializerFactory::new(projection.clone(), table.clone()),
-                            rb_ch,
-                            siblings_materializer.clone(),
-                        ),
-                        RowGroupFetcherFactory::new(),
-                        rq_ch,
-                        siblings_fetcher.clone(),
-                    )
-                })
-                .collect();
-            let input = OperatorSpec::new(dispatcher, factories);
-            read_parquet(
-                input,
-                &table,
-                projection,
-                RECORD_BATCH_SIZE,
-                false,
-                Arc::new(Vec::new()),
+    let factories: Vec<_> = stealable::<RecordBatch>(n)
+        .into_iter()
+        .zip(stealable::<RowGroupRequest>(n))
+        .map(|(rb_ch, rq_ch)| {
+            UnaryOperatorFactory::new(
+                UnaryOperatorFactory::new(
+                    RecordBatchFactoryBridge::new(heads.pop_front().unwrap()),
+                    MaterializerFactory::new(projection.clone(), table.clone()),
+                    rb_ch,
+                    siblings_materializer.clone(),
+                ),
+                RowGroupFetcherFactory::new(),
+                rq_ch,
+                siblings_fetcher.clone(),
             )
-        }
-        TableMedium::Remote => {
-            let factories: Vec<_> = stealable::<RecordBatch>(n)
-                .into_iter()
-                .zip(stealable::<RowGroupRequest>(n))
-                .map(|(rb_ch, rq_ch)| {
-                    UnaryOperatorFactory::new(
-                        UnaryOperatorFactory::new(
-                            RecordBatchFactoryBridge::new(heads.pop_front().unwrap()),
-                            MaterializerFactory::new(projection.clone(), table.clone()),
-                            rb_ch,
-                            siblings_materializer.clone(),
-                        ),
-                        RemoteRowGroupFetcherFactory::new(),
-                        rq_ch,
-                        siblings_fetcher.clone(),
-                    )
-                })
-                .collect();
-            let input = OperatorSpec::new(dispatcher, factories);
-            read_parquet(
-                input,
-                &table,
-                projection,
-                RECORD_BATCH_SIZE,
-                false,
-                Arc::new(Vec::new()),
-            )
-        }
-    }
+        })
+        .collect();
+    let input = OperatorSpec::new(dispatcher, factories);
+    read_parquet(
+        input,
+        &table,
+        projection,
+        RECORD_BATCH_SIZE,
+        false,
+        Arc::new(Vec::new()),
+    )
 }

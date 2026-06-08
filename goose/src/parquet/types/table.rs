@@ -42,16 +42,6 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// The storage medium a [`ParquetTable`]'s files live on. A table is
-/// homogeneous (all local or all remote) by construction — `from_files` yields
-/// `Local`, `from_remote_files` yields `Remote` — so this is derived from the
-/// row groups and is used to pick the fetcher (disk vs HTTP) at scan time.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TableMedium {
-    Local,
-    Remote,
-}
-
 /// A logical table backed by one or more Parquet files.
 ///
 /// Holds a flat, globally-indexed list of `RowGroupMetadata` entries spanning
@@ -186,15 +176,6 @@ impl ParquetTable {
             &EMPTY_SCHEMA
         } else {
             &self.row_groups[0].schema
-        }
-    }
-
-    /// The medium this table's files live on, which selects the fetcher used to
-    /// read them. An empty table reports `Local` (it issues no reads anyway).
-    pub fn medium(&self) -> TableMedium {
-        match self.row_groups.first().map(|rg| &rg.source) {
-            Some(FileSource::Remote(_)) => TableMedium::Remote,
-            _ => TableMedium::Local,
         }
     }
 }
