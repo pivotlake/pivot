@@ -1,6 +1,7 @@
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{MultiSlabBuffer, SlabAllocator};
 use crate::operations::unary::group::RADIX_PARTITIONS;
+use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
@@ -92,7 +93,7 @@ pub enum WorkerOutput<K: KeyExtractor, V: ValueExtractor> {
     InPlace(Vec<MultiSlabTable<K, V>>),
     /// Switched — the pre-switch stack has been folded into these per-partition
     /// scatter buffers, so the radix merge sees a single uniform source.
-    Radix(PartitionBuffers<K, V>),
+    Radix(PartitionBuffers<K, V>, Hll),
 }
 
 /// [`BatchRowSource`] adapter for [`BaseHashTable::merge_batch`] (in-place phase).
@@ -135,6 +136,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     tables: Vec<MultiSlabTable<K, V>>,
     /// Phase 2: per-partition scatter buffers (allocated on switch).
     buffers: Option<Vec<SlabList<RadixRow<K, V>>>>,
+    hll: Hll,
     switched: bool,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
     slots: Box<[usize; RECORD_BATCH_SIZE]>,
@@ -152,6 +154,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             allocator,
             tables: vec![table],
             buffers: None,
+            hll: Hll::new(),
             switched: false,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
@@ -289,12 +292,14 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             worker_arena,
             allocator,
             buffers,
+            hll,
             hashes,
             ..
         } = self;
         let buffers = buffers.as_mut().unwrap();
         for i in start..end {
             let hash = hashes[i];
+            hll.add(hash);
             let p = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, worker_arena).persist();
             let value = V::value(value_reader, i);
@@ -311,11 +316,13 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 tables,
                 buffers,
                 allocator,
+                hll,
                 ..
             } = &mut self;
             let buffers = buffers.as_mut().unwrap();
             for table in tables.iter() {
                 for entry in table.iter(0) {
+                    hll.add(entry.hash());
                     let p = (entry.hash() >> shift) as usize;
                     buffers[p].push(allocator, (entry.hash(), *entry.key(), *entry.value()));
                 }
@@ -325,7 +332,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         self.worker_arena.flush();
 
         if self.switched {
-            WorkerOutput::Radix(PartitionBuffers(self.buffers.take().unwrap()))
+            WorkerOutput::Radix(PartitionBuffers(self.buffers.take().unwrap()), self.hll)
         } else {
             WorkerOutput::InPlace(self.tables)
         }

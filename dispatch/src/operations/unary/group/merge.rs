@@ -235,21 +235,19 @@ pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
     partition: usize,
     worker_buffers: &[PartitionBuffers<K, V>],
     inplace_tables: &[MultiSlabTable<K, V>],
+    partition_capacity: usize,
     arena: &SharedArena,
 ) -> MultiSlabTable<K, V> {
     let pre_shift = RADIX_PARTITIONS.trailing_zeros();
     let shift = u64::BITS - RADIX_PARTITIONS.trailing_zeros();
-    let total_rows: usize = worker_buffers.iter().map(|b| b.0[partition].len()).sum();
     let mut allocator = SlabAllocator::new(true);
-    // ~4 rows per distinct key is a typical high-cardinality ratio; start there
-    // and grow if wrong, so the table tracks the real distinct count.
-    let mut cap = (total_rows / 4).next_power_of_two().max(DEFAULT_CAPACITY);
+    let mut cap = partition_capacity;
     let mut target: MultiSlabTable<K, V> =
         <MultiSlabTable<K, V>>::multi_slab(&mut allocator, cap, pre_shift);
     for wb in worker_buffers {
         wb.0[partition].for_each(|(hash, key, value)| {
             if target.undersized() {
-                cap *= 8;
+                cap *= 4;
                 let nb = allocator.create_multi_slab_buffer(cap, true);
                 target.resize_with(nb, cap);
             }
@@ -264,7 +262,7 @@ pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
         for entry in table.iter(0) {
             if (entry.hash() >> shift) as usize == partition {
                 if target.undersized() {
-                    cap *= 8;
+                    cap *= 4;
                     let nb = allocator.create_multi_slab_buffer(cap, true);
                     target.resize_with(nb, cap);
                 }

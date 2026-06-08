@@ -75,6 +75,8 @@
 //! - [`factory`] — [`GroupFactory`] for creating per-worker [`Group`] instances
 
 pub(crate) mod arena;
+mod hll;
+use hll::Hll;
 mod factory;
 mod keys;
 mod merge;
@@ -225,6 +227,7 @@ pub enum PartitionJob<K: KeyExtractor, V: ValueExtractor> {
         inplace: Arc<Vec<MultiSlabTable<K, V>>>,
         index: usize,
         arena: Arc<SharedArena>,
+        partition_capacity: usize,
         top_k: Option<(usize, usize)>,
     },
     /// Nobody switched (low-cardinality / strings): combine the in-place stacks
@@ -254,10 +257,16 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
                 inplace,
                 index,
                 arena,
+                partition_capacity,
                 top_k,
             } => {
-                let result_map =
-                    merge::aggregate_partition::<K, V>(index, &buffers, &inplace, &arena);
+                let result_map = merge::aggregate_partition::<K, V>(
+                    index,
+                    &buffers,
+                    &inplace,
+                    partition_capacity,
+                    &arena,
+                );
                 if result_map.len() == 0 {
                     return Ok(());
                 }
@@ -286,9 +295,13 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
         if let Some(rx) = self.receiver.take() {
             let mut radix_buffers = Vec::new();
             let mut inplace_tables = Vec::new();
+            let mut hll = Hll::new();
             for out in rx.into_iter() {
                 match out {
-                    WorkerOutput::Radix(b) => radix_buffers.push(b),
+                    WorkerOutput::Radix(b, h) => {
+                        radix_buffers.push(b);
+                        hll.merge(&h);
+                    }
                     WorkerOutput::InPlace(t) => inplace_tables.extend(t),
                 }
             }
@@ -314,12 +327,20 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                 // non-switched worker's stack is routed in via `inplace`.
                 let buffers = Arc::new(radix_buffers);
                 let inplace = Arc::new(inplace_tables);
+                // Size for ~0.7 load (×3/2 margin) so the partition holds its
+                // groups without crossing the resize threshold, then round to the
+                // power-of-two the table requires.
+                let est = hll.estimate();
+                let partition_capacity = (est * 3 / (2 * RADIX_PARTITIONS))
+                    .next_power_of_two()
+                    .max(DEFAULT_CAPACITY);
                 for i in 0..RADIX_PARTITIONS {
                     self.injector.push(PartitionJob::Radix {
                         buffers: buffers.clone(),
                         inplace: inplace.clone(),
                         index: i,
                         arena: self.shared_arena.clone(),
+                        partition_capacity,
                         top_k: self.top_k,
                     })
                 }
