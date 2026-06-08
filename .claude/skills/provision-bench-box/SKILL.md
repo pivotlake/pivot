@@ -95,7 +95,19 @@ cargo build --release --bin pivot-bench
 For a non-PGO pivot-vs-DuckDB table, run DuckDB separately: `./run-duckdb.sh --source ~/hits --query <ids> --iterations 3`. (`benchmark.sh` has no non-PGO mode — it always calls `just pgo-use`.)
 
 ## Warm the box before measuring (critical for cold numbers)
-A box launched from an AMI has a snapshot-restored root volume whose blocks **hydrate lazily from S3 on first access** (EBS lazy-init). The **first** full benchmark pass therefore inflates cold times — especially small queries (observed on c8g.metal-48xl: q42 cold 808 ms on the first pass, ~42–59 ms once warm; big I/O-bound queries look normal either way). **Always run the suite once and discard it**, then measure. Never trust the first snapshot-restored pass — it reads as a huge cold "regression" that isn't real. (To force hydration up front: `sudo fio --name=warm --filename=/dev/nvme0n1 --rw=read --bs=1M --iodepth=32 --direct=1 --runtime=60 --time_based` or `dd if=~/hits/hits.parquet of=/dev/null bs=8M`.)
+A box launched from an AMI has a snapshot-restored root volume whose blocks **hydrate lazily from S3 on first access** (EBS lazy-init). The **first** full benchmark pass therefore inflates cold times — especially small queries (observed on c8g.metal-48xl: q42 cold 808 ms on the first pass, ~42–59 ms once warm; big I/O-bound queries look normal either way). **Always run the suite once and discard it**, then measure. Never trust the first snapshot-restored pass — it reads as a huge cold "regression" that isn't real.
+
+**Force-hydrate the dataset up front — but do it in parallel.** S3 lazy-init is *latency*-bound, not throughput-bound: a single sequential `dd if=~/hits/hits.parquet of=/dev/null bs=8M` crawls at **~1 MB/s** (each block round-trips to S3 before the next is requested) → a 14 GB file would take *hours*. Issue many concurrent reads so the per-block S3 latency overlaps. Either:
+```bash
+# N-way parallel dd over byte ranges of the file (no extra tools, ~50× faster → ~55 MB/s):
+F=~/hits/hits.parquet; SZ=$(stat -c %s "$F"); N=32; CH=$((SZ/N))
+for i in $(seq 0 $((N-1))); do
+  dd if="$F" of=/dev/null bs=1M skip=$((i*CH)) count=$CH iflag=skip_bytes,count_bytes 2>/dev/null &
+done; wait
+# …or fio with deep queue depth over the device (warms whatever it touches):
+sudo fio --name=warm --filename=/dev/nvme0n1 --rw=read --bs=1M --iodepth=64 --direct=1 --runtime=120 --time_based
+```
+Sanity-check the rate while it runs (`a=$(awk '/ nvme0n1 /{print $6}' /proc/diskstats); sleep 2; b=$(awk '/ nvme0n1 /{print $6}' /proc/diskstats); echo "$(((b-a)*512/1024/1024/2)) MB/s"`) — if it's reading single-MB/s, you forgot the parallelism. Even parallel, gp2 lazy-init caps aggregate throughput (~55 MB/s observed), so 14 GB still takes ~4 min; budget for it.
 
 ## Reading the numbers
 - **Cold** = iteration 1 (page cache dropped). **Hot** = mean of the rest (steady state, the headline). `benchmark.sh` prints a per-query speedup + a ClickBench geomean score (lower = better, 1.00 = fastest on every query).
