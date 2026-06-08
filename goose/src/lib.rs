@@ -1,12 +1,14 @@
-//! A concrete [`planner::catalog::Catalog`] implementation backed by Parquet
-//! directories on disk.
+//! A concrete [`planner::catalog::Catalog`] implementation backed by Parquet.
 //!
 //! The catalog stores tables in a `RwLock<HashMap>` keyed by name, so multiple
 //! threads can resolve and create tables concurrently — many readers (lookups)
-//! coexist with infrequent writers (`CREATE TABLE`). The only kind of table
-//! supported today is a directory of Parquet files: a `CREATE TABLE` statement
-//! must carry a `WITH (path = '...')` option, and the catalog validates that
-//! the path points to a directory it can open as a [`ParquetTable`].
+//! coexist with infrequent writers (`CREATE TABLE`). A `CREATE TABLE` statement
+//! names its backing store with one of two `WITH` options:
+//! * `WITH (path = '<dir>')` — a local directory of Parquet files.
+//! * `WITH (url = '<s3://…/gs://…/local>')` — a goose object-store catalog: the
+//!   latest `_goose_log/` snapshot is resolved into a [`ParquetTable`] over its
+//!   data files (read locally or, for remote files, over the io_uring ring via
+//!   presigned URLs), or a new snapshot is CAS-committed if the catalog is empty.
 //!
 //! Each `Catalog::table` lookup hands back a fresh [`Box<dyn Table>`] cloned
 //! from the master entry, so per-binding filter pushdown can mutate the
@@ -132,11 +134,13 @@ impl ParquetCatalog {
     /// new snapshot defining this table (declared columns, no data files yet);
     /// ingest fills in data files via its own commits.
     ///
-    /// Remote (`s3://`/`gs://`) *data* files are not yet readable, so attaching
-    /// a catalog whose files live on object storage errors clearly; the catalog
-    /// metadata itself may still live on object storage.
+    /// Data files are resolved by location: local ones are read from disk;
+    /// remote (`s3://`/`gs://`) ones are presigned and range-read over the ring.
+    /// A table's files share the catalog root's store, so they're all local or
+    /// all remote — a mix is rejected.
     ///
-    /// Runs on a dispatch worker (it calls [`ParquetTable::from_files`]).
+    /// Runs on a dispatch worker (it calls [`ParquetTable::from_files`] /
+    /// [`ParquetTable::from_remote_files`]).
     fn create_lake_table(&self, request: CreateTableRequest) -> Result<()> {
         if request.if_not_exists {
             return Err(Error::IfNotExistsUnsupported);
