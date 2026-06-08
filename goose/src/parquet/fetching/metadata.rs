@@ -5,21 +5,25 @@
 //! [`RowGroupMetadata`]. Doing that serially (a loop over files) wastes the
 //! worker pool, especially for remote files where each footer is a network
 //! round trip. So this runs the footer reads as a small dispatch dataflow: a
-//! work-stealing source hands out files, a [`MetadataFetcher`] reads each one's
+//! work-stealing source hands out files, a [`FooterFetcher`] reads each one's
 //! footer on whatever worker steals it, and [`materialize_metadata`] collects every row
 //! group (a pipeline breaker) and assigns global indices in file order. The
 //! materialized [`ParquetTable`] then feeds the existing scan pipeline.
 
-use crate::parquet::types::metadata::RowGroupMetadata;
+use crate::parquet::types::metadata::{FileSource, RowGroupMetadata};
 use crate::parquet::types::table::{
-    DataFileLocation, Error, ParquetTable, Result, parse_file_metadatas,
+    DataFileLocation, Error, FOOTER_PROBE_BYTES, ParquetTable, Result, footer_len_from_tail,
+    parse_file_metadatas, row_groups_from_footer,
 };
 use crossbeam_deque::{Injector, Steal};
+use dispatch::io::{FileLocation, FsRequest, HttpRequest, IORequest, open_direct_read};
+use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{
     DataFlowDispatcher, DefaultUnaryFactory, OperatorSpec, Receiver, RootChannelFactory,
     RootUnaryOperatorFactory, Sender, Unary,
 };
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -100,7 +104,7 @@ pub fn materialize_metadata(
     let factories: Vec<_> = (0..n)
         .map(|_| {
             RootUnaryOperatorFactory::new(
-                DefaultUnaryFactory::<MetadataFetcher>::new(),
+                DefaultUnaryFactory::<FooterFetcher>::new(),
                 injector.clone(),
                 siblings.clone(),
             )
@@ -123,22 +127,197 @@ pub fn materialize_metadata(
     Ok(ParquetTable::new(row_groups))
 }
 
-/// Reads one file's footer per input, emitting each of its row groups tagged
-/// with the file index.
+/// Reads one file's footer per input — through the io_uring ring and the file
+/// cache, exactly like a column-chunk read — and emits the file's row groups.
+///
+/// One file at a time per worker (the work-stealing source already spreads files
+/// across workers): it fetches the file's tail probe window through the cache,
+/// parses the footer length, and — if the footer didn't fit the probe — does an
+/// exact second cache read, then parses the footer. The same file handle is
+/// carried into the emitted [`RowGroupMetadata`], so the later column-chunk
+/// reads hit the same cache entry.
+///
+/// Local files compute their footer offset from `stat`. Remote files need the
+/// size to address the cache; until the ring learns sizes via suffix ranges they
+/// fall back to a blocking suffix read here.
 #[derive(Default)]
-struct MetadataFetcher;
+struct FooterFetcher {
+    current: Option<InFlight>,
+}
 
-impl Unary<IndexedFile, IndexedRowGroup> for MetadataFetcher {
+/// The footer read in progress for one file.
+struct InFlight {
+    file_idx: usize,
+    location: FileLocation,
+    /// Keeps the file handle (fd / remote) alive and travels into the row groups.
+    source: FileSource,
+    size: usize,
+    /// Cache lookups pinning the region currently being read.
+    lookups: Vec<CacheLookup>,
+    pending_fs: Vec<FsRequest>,
+    pending_http: Vec<HttpRequest>,
+    /// Outstanding blocks for the current region.
+    remaining: usize,
+    /// `false` while reading the tail probe window; `true` once we know the
+    /// footer overflowed the probe and are reading it exactly.
+    reading_exact: bool,
+}
+
+impl InFlight {
+    /// Look up `[offset, offset+len)` in the cache and queue any missing blocks.
+    fn read_region(&mut self, offset: usize, len: usize) {
+        self.lookups = memory_ctx().file_cache().get(&self.location, offset, len);
+        self.remaining = 0;
+        for lookup in &self.lookups {
+            for block in lookup.missing() {
+                match &self.location {
+                    FileLocation::Local(fd) => self.pending_fs.push(FsRequest {
+                        fd: *fd,
+                        block: block.clone(),
+                    }),
+                    FileLocation::Remote(remote) => self.pending_http.push(HttpRequest {
+                        remote: remote.clone(),
+                        block: block.clone(),
+                    }),
+                }
+                self.remaining += 1;
+            }
+        }
+    }
+
+    /// The fetched region's bytes (concatenated), consuming the lookups.
+    fn region_bytes(&mut self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for lookup in std::mem::take(&mut self.lookups) {
+            out.extend_from_slice(&lookup.into_data());
+        }
+        out
+    }
+}
+
+impl FooterFetcher {
+    /// The current region's reads have all landed: parse it. Either emit the row
+    /// groups (footer in hand) or issue the exact-footer read.
+    fn on_region_complete<S: Sender<IndexedRowGroup>>(
+        &mut self,
+        sender: &mut S,
+    ) -> dispatch::UnaryResult<()> {
+        let mut inflight = self.current.take().unwrap();
+        let bytes = inflight.region_bytes();
+
+        let footer: &[u8] = if inflight.reading_exact {
+            // The region is exactly the footer.
+            &bytes
+        } else {
+            let footer_len = footer_len_from_tail(&bytes).map_err(crate::parquet::op_err)?;
+            if footer_len + 8 > bytes.len() {
+                // Footer overflowed the probe window — read it exactly, then retry.
+                let exact_offset = inflight.size - 8 - footer_len;
+                inflight.reading_exact = true;
+                inflight.read_region(exact_offset, footer_len);
+                let cached = inflight.remaining == 0;
+                self.current = Some(inflight);
+                if cached {
+                    return self.on_region_complete(sender);
+                }
+                return Ok(());
+            }
+            let start = bytes.len() - 8 - footer_len;
+            &bytes[start..bytes.len() - 8]
+        };
+
+        let row_groups =
+            row_groups_from_footer(footer, inflight.source).map_err(crate::parquet::op_err)?;
+        for rg in row_groups {
+            sender.send((inflight.file_idx, rg))?;
+        }
+        Ok(())
+    }
+}
+
+impl Unary<IndexedFile, IndexedRowGroup> for FooterFetcher {
     fn consume<S: Sender<IndexedRowGroup>>(
         &mut self,
         (file_idx, location): IndexedFile,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        let row_groups = parse_file_metadatas(&location).map_err(crate::parquet::op_err)?;
-        for rg in row_groups {
-            sender.send((file_idx, rg))?;
+        match location {
+            DataFileLocation::Local(path) => {
+                let file = open_direct_read(&path).map_err(crate::parquet::op_err)?;
+                let location = FileLocation::Local(file.as_raw_fd());
+                memory_ctx().file_cache().open_entry(location.clone());
+                let size = fs::metadata(&path).map_err(crate::parquet::op_err)?.len() as usize;
+                let mut inflight = InFlight {
+                    file_idx,
+                    location,
+                    source: FileSource::Local(Arc::new(file)),
+                    size,
+                    lookups: Vec::new(),
+                    pending_fs: Vec::new(),
+                    pending_http: Vec::new(),
+                    remaining: 0,
+                    reading_exact: false,
+                };
+                let probe = size.min(FOOTER_PROBE_BYTES);
+                inflight.read_region(size - probe, probe);
+                let cached = inflight.remaining == 0;
+                self.current = Some(inflight);
+                if cached {
+                    self.on_region_complete(sender)?;
+                }
+            }
+            remote @ DataFileLocation::Remote(_) => {
+                // Suffix-on-the-ring is the next step; for now read the remote
+                // footer with a blocking suffix range.
+                let row_groups = parse_file_metadatas(&remote).map_err(crate::parquet::op_err)?;
+                for rg in row_groups {
+                    sender.send((file_idx, rg))?;
+                }
+            }
         }
         Ok(())
+    }
+
+    fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
+        Ok(self
+            .current
+            .as_mut()
+            .map(|i| std::mem::take(&mut i.pending_fs))
+            .unwrap_or_default())
+    }
+
+    fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
+        Ok(self
+            .current
+            .as_mut()
+            .map(|i| std::mem::take(&mut i.pending_http))
+            .unwrap_or_default())
+    }
+
+    fn ready_for_more_work(&mut self) -> bool {
+        self.current.is_none()
+    }
+
+    fn process_io_response<S: Sender<IndexedRowGroup>>(
+        &mut self,
+        sender: &mut S,
+        _request: IORequest,
+    ) -> dispatch::UnaryResult<()> {
+        // Single file in flight, so every completion is for the current region.
+        if let Some(inflight) = self.current.as_mut() {
+            inflight.remaining -= 1;
+            if inflight.remaining == 0 {
+                self.on_region_complete(sender)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish<S: Sender<IndexedRowGroup>>(
+        &mut self,
+        _sender: &mut S,
+    ) -> dispatch::UnaryResult<bool> {
+        Ok(self.current.is_none())
     }
 }
 

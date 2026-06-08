@@ -40,6 +40,8 @@ pub enum Error {
     Remote { url: String, message: String },
     #[error("fetching row-group metadata: {0}")]
     Materialize(String),
+    #[error("invalid parquet footer: {0}")]
+    InvalidFooter(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -207,6 +209,32 @@ impl ParquetTable {
 
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
 
+/// How much of a file's tail to fetch when probing for the footer. Almost every
+/// footer fits, so it's a single read; a larger footer falls back to an exact
+/// second read.
+pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
+
+/// Parse the 4-byte footer length from a file's `tail` (whose final 8 bytes are
+/// `[footer_len][PAR1]`). Used by the on-ring footer reader, which fetches the
+/// tail through the cache rather than `seek`+`read`.
+pub(crate) fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
+    if tail.len() < 8 || tail[tail.len() - 4..] != PARQUET_MAGIC {
+        return Err(Error::InvalidFooter("missing PAR1 magic".to_string()));
+    }
+    let len = &tail[tail.len() - 8..tail.len() - 4];
+    Ok(u32::from_le_bytes(len.try_into().unwrap()) as usize)
+}
+
+/// Parse raw thrift footer bytes into this file's row groups (file-local
+/// indices), tying each to `source` for the column-chunk reads that follow.
+pub(crate) fn row_groups_from_footer(
+    footer: &[u8],
+    source: FileSource,
+) -> Result<Vec<RowGroupMetadata>> {
+    let file_meta = parse_footer_thrift(footer)?;
+    build_row_groups(0, file_meta, source)
+}
+
 /// Read the parquet footer bytes from a file. Returns the raw thrift-encoded metadata.
 fn read_parquet_footer(file: &mut File) -> std::io::Result<Vec<u8>> {
     // Read the last 8 bytes: 4-byte footer length + 4-byte magic
@@ -321,11 +349,6 @@ fn build_row_groups(
 
     Ok(row_groups)
 }
-
-/// How much of a remote file's tail to fetch on the first probe. Almost all
-/// Parquet footers fit well within this, so it's a single round trip; a larger
-/// footer falls back to an exact second fetch.
-const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 
 /// Fetch a remote Parquet file's footer via an HTTP suffix-range GET — no HEAD
 /// needed: read the last `FOOTER_PROBE_BYTES`, read the 4-byte footer length
