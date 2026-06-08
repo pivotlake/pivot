@@ -93,7 +93,9 @@ pub use values::{
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::group::hashtables::{AggregatedTable, PartitionBuffers};
+use crate::operations::unary::group::hashtables::{
+    AggregatedTable, DEFAULT_CAPACITY, MultiSlabTable, PartitionBuffers, WorkerOutput,
+};
 use crate::worker::worker_waker;
 use ahash::RandomState;
 use arena::SharedArena;
@@ -118,7 +120,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Number of hash partitions for the output merge phase.
 /// Each partition is merged independently, enabling parallel output.
-const PARTITIONS: usize = 1024;
+const PARTITIONS: usize = 64;
+
+/// Number of radix partitions for the scatter + merge of high-cardinality
+/// (switched) workers. Larger than [`PARTITIONS`] so each radix target stays
+/// cache-resident at high group counts.
+const RADIX_PARTITIONS: usize = 4096;
 
 /// Per-worker GROUP BY consumer.
 ///
@@ -131,7 +138,7 @@ pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     value_slots: Vec<AggregationSlot>,
 
     aggregated_table: AggregatedTable<K, V>,
-    sender: mpsc::Sender<PartitionBuffers<K, V>>,
+    sender: mpsc::Sender<WorkerOutput<K, V>>,
     outputter: GroupOutputter<K, V>,
 }
 
@@ -144,8 +151,8 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
-        sender: mpsc::Sender<PartitionBuffers<K, V>>,
-        receiver: Option<mpsc::Receiver<PartitionBuffers<K, V>>>,
+        sender: mpsc::Sender<WorkerOutput<K, V>>,
+        receiver: Option<mpsc::Receiver<WorkerOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -195,7 +202,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
 pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     shared_arena: Arc<SharedArena>,
     injector: Arc<Injector<PartitionJob<K, V>>>,
-    receiver: Option<mpsc::Receiver<PartitionBuffers<K, V>>>,
+    receiver: Option<mpsc::Receiver<WorkerOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     top_k: Option<(usize, usize)>,
     /// One allocator per worker for the output columns of every partition this
@@ -210,11 +217,25 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
 /// shared [`Injector`] for work-stealing execution. Each job merges all
 /// source tables for partition `index` into one result table and sends the
 /// output as a [`RecordBatch`].
-pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
-    tables: Arc<Vec<PartitionBuffers<K, V>>>,
-    index: usize,
-    arena: Arc<SharedArena>,
-    top_k: Option<(usize, usize)>,
+pub enum PartitionJob<K: KeyExtractor, V: ValueExtractor> {
+    /// Some worker switched to radix: aggregate this partition's scatter buffers
+    /// (plus any non-switched worker's routed stack) into one table.
+    Radix {
+        buffers: Arc<Vec<PartitionBuffers<K, V>>>,
+        inplace: Arc<Vec<MultiSlabTable<K, V>>>,
+        index: usize,
+        arena: Arc<SharedArena>,
+        top_k: Option<(usize, usize)>,
+    },
+    /// Nobody switched (low-cardinality / strings): combine the in-place stacks
+    /// for this partition with the original slot-range merge.
+    InPlace {
+        tables: Arc<Vec<MultiSlabTable<K, V>>>,
+        index: usize,
+        arena: Arc<SharedArena>,
+        partition_capacity: usize,
+        top_k: Option<(usize, usize)>,
+    },
 }
 
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
@@ -227,37 +248,81 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
         sender: &mut S,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
-        debug!("Merging maps for partition {:?}...", self.index);
-        let result_map = merge::aggregate_partition::<K, V>(self.index, &self.tables, &self.arena);
-
-        if result_map.len() == 0 {
-            return Ok(());
+        match self {
+            PartitionJob::Radix {
+                buffers,
+                inplace,
+                index,
+                arena,
+                top_k,
+            } => {
+                let result_map =
+                    merge::aggregate_partition::<K, V>(index, &buffers, &inplace, &arena);
+                if result_map.len() == 0 {
+                    return Ok(());
+                }
+                output::build_and_send::<K, V, _, _>(result_map, &arena, allocator, top_k, sender)
+            }
+            PartitionJob::InPlace {
+                tables,
+                index,
+                arena,
+                partition_capacity,
+                top_k,
+            } => {
+                let result_map =
+                    merge::merge_partition::<K, V>(index, &tables, &arena, partition_capacity);
+                if result_map.len() == 0 {
+                    return Ok(());
+                }
+                output::build_and_send::<K, V, _, _>(result_map, &arena, allocator, top_k, sender)
+            }
         }
-
-        debug!("Sending record batch {:?}", self.index);
-        output::build_and_send::<K, V, _, _>(result_map, &self.arena, allocator, self.top_k, sender)
     }
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputter<K, V> {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let tables: Vec<PartitionBuffers<K, V>> = rx.into_iter().collect::<Vec<_>>();
-            debug!("Outputting {:?} maps", tables.len());
-            // Estimate the merged entry count from actual occupancy (sum of
-            // lengths), not capacity — capacity over-counts by the table-stack's
-            // ~2x geometric slack. A tighter estimate keeps each partition's
-            // result table near a high load factor instead of 2.5x
-            // over-provisioned, which at very large group counts is gigabytes less memory
-            // to allocate and zero every query.
-            let tables = Arc::new(tables);
-            for i in 0..PARTITIONS {
-                self.injector.push(PartitionJob {
-                    tables: tables.clone(),
-                    index: i,
-                    arena: self.shared_arena.clone(),
-                    top_k: self.top_k,
-                })
+            let mut radix_buffers = Vec::new();
+            let mut inplace_tables = Vec::new();
+            for out in rx.into_iter() {
+                match out {
+                    WorkerOutput::Radix(b) => radix_buffers.push(b),
+                    WorkerOutput::InPlace(t) => inplace_tables.extend(t),
+                }
+            }
+
+            if radix_buffers.is_empty() {
+                // Nobody crossed the threshold: original slot-range merge over the
+                // in-place stacks, sized to actual occupancy (PARTITIONS jobs).
+                let tables = Arc::new(inplace_tables);
+                let total: usize = tables.iter().map(|t| t.len()).sum();
+                let partition_capacity =
+                    (total / PARTITIONS).next_power_of_two().max(DEFAULT_CAPACITY);
+                for i in 0..PARTITIONS {
+                    self.injector.push(PartitionJob::InPlace {
+                        tables: tables.clone(),
+                        index: i,
+                        arena: self.shared_arena.clone(),
+                        partition_capacity,
+                        top_k: self.top_k,
+                    })
+                }
+            } else {
+                // Some worker scattered: radix merge (RADIX_PARTITIONS jobs). Any
+                // non-switched worker's stack is routed in via `inplace`.
+                let buffers = Arc::new(radix_buffers);
+                let inplace = Arc::new(inplace_tables);
+                for i in 0..RADIX_PARTITIONS {
+                    self.injector.push(PartitionJob::Radix {
+                        buffers: buffers.clone(),
+                        inplace: inplace.clone(),
+                        index: i,
+                        arena: self.shared_arena.clone(),
+                        top_k: self.top_k,
+                    })
+                }
             }
             self.partition_jobs_injected.store(true, Ordering::Relaxed);
 

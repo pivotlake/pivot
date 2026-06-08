@@ -34,6 +34,7 @@ use crate::operations::unary::group::hashtables::{
 };
 
 use super::PARTITIONS;
+use super::RADIX_PARTITIONS;
 
 /// Collision-to-entry ratio at which we double the target table.
 ///
@@ -233,9 +234,11 @@ pub(super) fn merge_partition<K: KeyExtractor, V: ValueExtractor>(
 pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
     partition: usize,
     worker_buffers: &[PartitionBuffers<K, V>],
+    inplace_tables: &[MultiSlabTable<K, V>],
     arena: &SharedArena,
 ) -> MultiSlabTable<K, V> {
-    let pre_shift = PARTITIONS.trailing_zeros();
+    let pre_shift = RADIX_PARTITIONS.trailing_zeros();
+    let shift = u64::BITS - RADIX_PARTITIONS.trailing_zeros();
     let total_rows: usize = worker_buffers.iter().map(|b| b.0[partition].len()).sum();
     let mut allocator = SlabAllocator::new(true);
     // ~4 rows per distinct key is a typical high-cardinality ratio; start there
@@ -253,6 +256,22 @@ pub(super) fn aggregate_partition<K: KeyExtractor, V: ValueExtractor>(
             let live = K::resolve_persisted(arena, key);
             target.merge::<false, _>(hash, live, value);
         });
+    }
+    // Mixed case: any worker that never switched contributes its (small) in-place
+    // stack; route only the entries hashing into this partition. Empty (no cost)
+    // in the common all-switched case.
+    for table in inplace_tables {
+        for entry in table.iter(0) {
+            if (entry.hash() >> shift) as usize == partition {
+                if target.undersized() {
+                    cap *= 4;
+                    let nb = allocator.create_multi_slab_buffer(cap, true);
+                    target.resize_with(nb, cap);
+                }
+                let live = K::resolve_persisted(arena, *entry.key());
+                target.merge::<false, _>(entry.hash(), live, *entry.value());
+            }
+        }
     }
     target
 }

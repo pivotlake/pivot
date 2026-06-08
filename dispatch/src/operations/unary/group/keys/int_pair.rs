@@ -75,6 +75,7 @@ where
     A::Native: IntBits,
     B::Native: IntBits,
 {
+    const SUPPORTS_RADIX: bool = true;
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
     type PersistedLiveKey<'a> = u128;

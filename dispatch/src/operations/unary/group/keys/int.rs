@@ -38,6 +38,7 @@ impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for IntKeyExtractor<T>
 where
     T::Native: PersistedKey + Hash + Eq,
 {
+    const SUPPORTS_RADIX: bool = true;
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;
     type PersistedLiveKey<'a> = T::Native;

@@ -1,39 +1,40 @@
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{MultiSlabBuffer, SlabAllocator};
-use crate::operations::unary::group::PARTITIONS;
+use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::hashtables::{KeyExtractor, LiveKey, ValueExtractor};
+use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
+use crate::operations::unary::group::hashtables::{
+    BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
+};
 use crate::operations::unary::group::values::AggregationSlot;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
+/// Table-slot count at which a worker stops growing its in-place hash table and
+/// switches to radix scatter (for radix-eligible keys). Below this, a group-by
+/// stays in the cheap in-place path (no scatter overhead); above it, the table
+/// would spill cache, so radix's cache-resident per-partition aggregation wins.
+const SWITCH_THRESHOLD: usize = 4096;
+
+/// Elements per [`SlabList`] chunk (single slab, < 2MB for the row width).
+const CHUNK_CAP: usize = 1 << 11; // 2048
+
 /// One scattered row: `(hash, persisted key, per-row value contribution)`.
 pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value);
 
-/// Elements per chunk in a [`SlabList`]. ~`CHUNK_CAP * size_of::<RadixRow>()`
-/// bytes, kept under one 2MB slab so each chunk is a single slab.
-const CHUNK_CAP: usize = 1 << 11; // 2048
-
-/// A growable, **engine-backed** (slab-pool) buffer, as a list of fixed-size
-/// chunks. Appending never reallocates/copies the data (unlike `Vec`), and the
-/// rows live in the pre-faulted, accounted slab pool rather than the heap — only
-/// the small vector of chunk handles is on the heap. This is what lets the radix
-/// scatter use our memory system instead of `std::Vec`.
+/// A growable, engine-backed (slab-pool) append-only buffer, as a list of
+/// fixed-size chunks. Appends never reallocate; a cached base pointer makes the
+/// scatter writes and aggregate reads sequential (no per-element index math).
 pub struct SlabList<T: Copy> {
     chunks: Vec<MultiSlabBuffer<T>>,
-    /// Cached base pointer of the current (last) chunk. Each chunk is a single
-    /// slab (CHUNK_CAP * size_of::<T>() < 2MB), so its elements are contiguous
-    /// and we can write/read sequentially off the base — avoiding the per-element
-    /// `Index` (which pays a div/mod for the per-slab packing) on the hot path.
     cur_base: *mut T,
     last_len: usize,
 }
 
-// SAFETY: same as the hash table — for string keys the stored value embeds an
-// `ArenaKey` (raw pointer into the `Arc`'d arena, which outlives the merge), so
-// moving these to a merge worker is sound. `cur_base` points into a slab the
-// `chunks` keep alive.
+// SAFETY: for string keys the stored value embeds an `ArenaKey` (raw pointer into
+// the `Arc`'d arena, which outlives the merge); `cur_base` points into a slab the
+// `chunks` keep alive. (Strings never scatter today, but the bound is generic.)
 unsafe impl<T: Copy> Send for SlabList<T> {}
 
 impl<T: Copy> SlabList<T> {
@@ -64,8 +65,7 @@ impl<T: Copy> SlabList<T> {
         }
     }
 
-    /// Visit every element in insertion order — sequentially off each chunk's
-    /// base pointer (a contiguous single slab), so no per-element index math.
+    /// Visit every element in insertion order — sequentially off each chunk's base.
     #[inline(always)]
     pub fn for_each(&self, mut f: impl FnMut(T)) {
         let n = self.chunks.len();
@@ -80,40 +80,98 @@ impl<T: Copy> SlabList<T> {
     }
 }
 
-/// A worker's scatter output: one engine-backed buffer of raw (un-aggregated)
-/// rows per partition. Aggregated once, in the merge phase.
+/// A worker's scatter output: one engine-backed buffer of raw rows per partition.
 pub struct PartitionBuffers<K: KeyExtractor, V: ValueExtractor>(pub Vec<SlabList<RadixRow<K, V>>>);
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionBuffers<K, V> {}
 
-/// Per-worker consume state — **single-level radix** on engine buffers.
+/// What a worker hands the merge phase, depending on whether it crossed the
+/// radix threshold during consume.
+pub enum WorkerOutput<K: KeyExtractor, V: ValueExtractor> {
+    /// Never switched — the full result is in this stack of in-place tables
+    /// (low-cardinality, or any string group-by). Combined by the slot-range merge.
+    InPlace(Vec<MultiSlabTable<K, V>>),
+    /// Switched — the pre-switch stack has been folded into these per-partition
+    /// scatter buffers, so the radix merge sees a single uniform source.
+    Radix(PartitionBuffers<K, V>),
+}
+
+/// [`BatchRowSource`] adapter for [`BaseHashTable::merge_batch`] (in-place phase).
+struct RowSrc<'r, 'b, K: KeyExtractor, V: ValueExtractor> {
+    key_reader: &'r K::Reader<'b>,
+    value_reader: V::Reader<'b>,
+    arena: &'r mut WorkerArena,
+}
+
+impl<K: KeyExtractor, V: ValueExtractor> BatchRowSource<K::Persisted, V::Value>
+    for RowSrc<'_, '_, K, V>
+{
+    #[inline(always)]
+    fn persisted(&mut self, i: usize) -> K::Persisted {
+        K::live_key(self.key_reader, i, &mut *self.arena).persist()
+    }
+    #[inline(always)]
+    fn key_eq(&mut self, i: usize, persisted: &K::Persisted) -> bool {
+        K::live_key(self.key_reader, i, &mut *self.arena).eq_persisted(persisted)
+    }
+    #[inline(always)]
+    fn value(&mut self, i: usize) -> V::Value {
+        V::value(&self.value_reader, i)
+    }
+}
+
+/// Per-worker aggregation state — **adaptive in-place → radix**.
 ///
-/// The consume phase does *no* aggregation: it scatters each row into one of
-/// [`PARTITIONS`] per-partition [`SlabList`]s (slab-pool memory) by the top hash
-/// bits. Each partition's rows from all workers are then aggregated exactly once
-/// in a cache-resident table by the merge phase.
+/// Phase 1 aggregates into a growing stack of in-place hash tables (the original
+/// strategy). When the table would grow past [`SWITCH_THRESHOLD`] and the key is
+/// radix-eligible ([`KeyExtractor::SUPPORTS_RADIX`]), it switches to phase 2:
+/// scatter into per-partition buffers (cache-resident merge). String keys never
+/// switch. At [`flush`](Self::flush) a switched worker folds its small pre-switch
+/// stack into the buffers, so the merge sees one uniform source.
 pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     hash_state: RandomState,
     worker_arena: WorkerArena,
     allocator: SlabAllocator,
-    buffers: Vec<SlabList<RadixRow<K, V>>>,
+    /// Phase 1: stack of growing in-place tables.
+    tables: Vec<MultiSlabTable<K, V>>,
+    /// Phase 2: per-partition scatter buffers (allocated on switch).
+    buffers: Option<Vec<SlabList<RadixRow<K, V>>>>,
+    switched: bool,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    slots: Box<[usize; RECORD_BATCH_SIZE]>,
+    sel: Box<[u32; RECORD_BATCH_SIZE]>,
+    sel_next: Box<[u32; RECORD_BATCH_SIZE]>,
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     pub fn new(state: RandomState, shared_arena: Arc<SharedArena>) -> Self {
+        let mut allocator = SlabAllocator::new(true);
+        let table = BaseHashTable::multi_slab(&mut allocator, DEFAULT_CAPACITY, 0);
         Self {
             hash_state: state,
             worker_arena: WorkerArena::new(shared_arena),
-            allocator: SlabAllocator::new(false),
-            buffers: (0..PARTITIONS).map(|_| SlabList::new()).collect(),
+            allocator,
+            tables: vec![table],
+            buffers: None,
+            switched: false,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            slots: vec![0usize; RECORD_BATCH_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            sel: vec![0u32; RECORD_BATCH_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            sel_next: vec![0u32; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
         }
     }
 
-    /// Scatter every row of `batch` into its partition buffer.
     pub fn consume_batch(
         &mut self,
         batch: &RecordBatch,
@@ -124,33 +182,152 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 
-        // Destructure so the per-partition buffer and the shared allocator can be
-        // borrowed mutably at once (disjoint fields).
+        for i in 0..length {
+            self.hashes[i] = K::hash(&key_reader, i, &self.hash_state);
+        }
+
+        if self.switched {
+            self.scatter_range(0, length, &key_reader, &value_reader);
+            return;
+        }
+
+        // The active table can take the whole batch iff no probe overflows it
+        // mid-batch; only then is the batched path safe.
+        let free = {
+            let t = self.tables.last().unwrap();
+            t.capacity() - t.len()
+        };
+        if free > length {
+            self.consume_batched(length, &key_reader, value_reader);
+        } else {
+            self.consume_scalared(length, &key_reader, &value_reader);
+        }
+    }
+
+    /// Batched multi-pass probe over the active table (it has room for the whole
+    /// batch). The whole batch is consumed before any grow/switch is considered.
+    #[inline(always)]
+    fn consume_batched<'b>(
+        &mut self,
+        length: usize,
+        key_reader: &K::Reader<'b>,
+        value_reader: V::Reader<'b>,
+    ) {
+        let mut src = RowSrc::<K, V> {
+            key_reader,
+            value_reader,
+            arena: &mut self.worker_arena,
+        };
+        self.tables.last_mut().unwrap().merge_batch(
+            length,
+            &mut self.hashes[..],
+            &mut self.slots[..],
+            &mut self.sel[..],
+            &mut self.sel_next[..],
+            &mut src,
+        );
+        if self.tables.last().unwrap().undersized() {
+            self.grow_or_switch();
+        }
+    }
+
+    /// Row-by-row probe, switching tables (or to radix) when the active table
+    /// overflows mid-batch. On switch, the remaining rows are scattered.
+    #[inline(always)]
+    fn consume_scalared<'b>(
+        &mut self,
+        length: usize,
+        key_reader: &K::Reader<'b>,
+        value_reader: &V::Reader<'b>,
+    ) {
+        let mut i = 0;
+        while i < length {
+            let hash = self.hashes[i];
+            let key = K::live_key(key_reader, i, &mut self.worker_arena);
+            let value = V::value(value_reader, i);
+            self.tables
+                .last_mut()
+                .unwrap()
+                .merge::<false, _>(hash, key, value);
+
+            if self.tables.last().unwrap().undersized() && self.grow_or_switch() {
+                self.scatter_range(i + 1, length, key_reader, value_reader);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    /// Active table is full: either grow the stack (4x) or, for a radix-eligible
+    /// key that would grow past [`SWITCH_THRESHOLD`], switch to scatter. Returns
+    /// `true` if it switched.
+    #[inline(always)]
+    fn grow_or_switch(&mut self) -> bool {
+        let next_size = self.tables.last().unwrap().capacity() * 4;
+        if K::SUPPORTS_RADIX && next_size > SWITCH_THRESHOLD {
+            self.buffers = Some((0..RADIX_PARTITIONS).map(|_| SlabList::new()).collect());
+            self.switched = true;
+            true
+        } else {
+            self.tables
+                .push(BaseHashTable::multi_slab(&mut self.allocator, next_size, 0));
+            false
+        }
+    }
+
+    /// Scatter rows `[start, end)` into per-partition buffers (post-switch).
+    #[inline(always)]
+    fn scatter_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        key_reader: &K::Reader<'_>,
+        value_reader: &V::Reader<'_>,
+    ) {
+        let shift = u64::BITS - RADIX_PARTITIONS.trailing_zeros();
         let Self {
-            hash_state,
             worker_arena,
             allocator,
             buffers,
             hashes,
+            ..
         } = self;
-
-        for i in 0..length {
-            hashes[i] = K::hash(&key_reader, i, hash_state);
-        }
-
-        let shift = u64::BITS - PARTITIONS.trailing_zeros();
-        for i in 0..length {
+        let buffers = buffers.as_mut().unwrap();
+        for i in start..end {
             let hash = hashes[i];
             let p = (hash >> shift) as usize;
-            let key = K::live_key(&key_reader, i, worker_arena).persist();
-            let value = V::value(&value_reader, i);
+            let key = K::live_key(key_reader, i, worker_arena).persist();
+            let value = V::value(value_reader, i);
             buffers[p].push(allocator, (hash, key, value));
         }
     }
 
-    /// Hand the per-partition scatter buffers to the merge phase.
-    pub fn flush(self) -> PartitionBuffers<K, V> {
+    /// Finalize: a switched worker folds its small pre-switch stack into the
+    /// buffers (so the merge sees one source); otherwise it hands back the stack.
+    pub fn flush(mut self) -> WorkerOutput<K, V> {
+        if self.switched {
+            let shift = u64::BITS - RADIX_PARTITIONS.trailing_zeros();
+            let Self {
+                tables,
+                buffers,
+                allocator,
+                ..
+            } = &mut self;
+            let buffers = buffers.as_mut().unwrap();
+            for table in tables.iter() {
+                for entry in table.iter(0) {
+                    let p = (entry.hash() >> shift) as usize;
+                    buffers[p].push(allocator, (entry.hash(), *entry.key(), *entry.value()));
+                }
+            }
+        }
+
         self.worker_arena.flush();
-        PartitionBuffers(self.buffers)
+
+        if self.switched {
+            WorkerOutput::Radix(PartitionBuffers(self.buffers.take().unwrap()))
+        } else {
+            WorkerOutput::InPlace(self.tables)
+        }
     }
 }

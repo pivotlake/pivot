@@ -40,6 +40,11 @@ pub use string::{ArenaKey, StringKeyExtractor};
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
 pub trait KeyExtractor: Send + 'static {
+    /// Whether this key may switch from in-place aggregation to radix scatter at
+    /// high cardinality. Strings stay in-place (deferred dedup would store every
+    /// occurrence un-deduped); fixed-width integer keys switch.
+    const SUPPORTS_RADIX: bool = false;
+
     /// The `Copy` key representation stored inside hash table entries.
     type Persisted: PersistedKey;
     /// A transient key that borrows from the input batch and/or the worker arena.
