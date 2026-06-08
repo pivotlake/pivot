@@ -97,7 +97,7 @@ pub use operations::channels::{
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
-    AggKind, AggSpec, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled,
+    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled,
     Count, DynamicFilterSlot, IntKeyExtractor, IntPairKeyExtractor, Nullary, NullaryFactory,
     NullaryOperatorFactory, Operator, OrderBy, Result as OperatorResult, StringKeyExtractor, Sum,
     ValueExtractor,

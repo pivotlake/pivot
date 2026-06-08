@@ -99,12 +99,14 @@ impl Aggregate {
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
-        use dispatch::{AggKind, AggSpec};
+        use dispatch::{AggregationKind, AggregationSlot};
 
         // Global aggregates (no GROUP BY). A bare `COUNT(*)` keeps the
-        // dedicated row-counter; anything else (SUM/AVG/COUNT, possibly
-        // several) compiles to the multi-aggregate operator, one output
-        // column per expression.
+        // dedicated row-counter; anything else (SUM/COUNT, possibly several)
+        // compiles to the multi-aggregate operator, one output column per
+        // expression. `AVG` never appears here: DuckDB lowers it to a
+        // `sum`+`count` pair with a downstream divide (the same lowering the
+        // grouped path relies on), so only count/sum slots reach this point.
         if self.groups.is_empty() {
             if matches!(
                 self.expressions.as_slice(),
@@ -113,27 +115,25 @@ impl Aggregate {
                 return Ok(input.count());
             }
 
-            let specs = self
+            let slots = self
                 .expressions
                 .iter()
                 .map(|e| match e {
                     Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
-                        Ok(AggSpec::new(AggKind::Sum, a.column.column_idx))
+                        Ok(AggregationSlot::new(AggregationKind::Sum, a.column.column_idx))
                     }
-                    Expression::AggregateFunc(AggregateFunc::Count(a)) => {
-                        Ok(AggSpec::new(AggKind::Count, a.column.column_idx))
-                    }
-                    Expression::AggregateFunc(AggregateFunc::Avg(a)) => {
-                        Ok(AggSpec::new(AggKind::Avg, a.column.column_idx))
-                    }
+                    Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(AggregationSlot::new(
+                        AggregationKind::Count,
+                        a.column.column_idx,
+                    )),
                     // COUNT(*) ignores its column; the index is a placeholder.
                     Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {
-                        Ok(AggSpec::new(AggKind::CountStar, 0))
+                        Ok(AggregationSlot::new(AggregationKind::CountStar, 0))
                     }
                     expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            return Ok(input.aggregate(specs));
+            return Ok(input.aggregate(slots));
         }
 
         // Grouped. A single key with a lone COUNT(*) uses the dedicated count

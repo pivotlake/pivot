@@ -491,6 +491,54 @@ fn filter_then_count(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn global_avg_is_lowered_to_sum_and_count(mut testing_planner: TestingPlanner) {
+    // AVG never reaches the global aggregate operator as a dedicated kind:
+    // DuckDB lowers it to sum/count plus a divide projection. After the
+    // `AggKind::Avg` removal this must still compile (no
+    // `UnsupportedAggregateExpression`) and produce the right average through
+    // the sum + count slots. avg(a) over [1,2,3,4,5] = 3.0.
+    let results = testing_planner
+        .planner
+        .plan("SELECT AVG(a) FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    let avg = rows[0].as_object().unwrap().values().next().unwrap();
+    assert_eq!(avg.as_f64().unwrap(), 3.0);
+}
+
+#[rstest]
+fn global_sum_count_avg_together(mut testing_planner: TestingPlanner) {
+    // The multi-aggregate global path with a SUM, a COUNT(*) and an AVG mixed
+    // (q02's shape). Must compile and run end-to-end; count = 5 and avg(b) over
+    // [10,20,30,40,50] = 30.0 (sum(a) is a Decimal128, skipped by the f64 scan).
+    let results = testing_planner
+        .planner
+        .plan("SELECT SUM(a), COUNT(*), AVG(b) FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    let vals: Vec<f64> = rows[0]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|v| v.as_f64())
+        .collect();
+    assert!(vals.contains(&5.0), "expected count 5 in {vals:?}");
+    assert!(vals.contains(&30.0), "expected avg(b) 30.0 in {vals:?}");
+}
+
+#[rstest]
 fn filter_then_top_n(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .planner

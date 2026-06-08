@@ -72,7 +72,7 @@ mod count;
 pub use count::CountFactory;
 
 mod aggregate;
-pub use aggregate::{AggKind, AggSpec, AggregateFactory};
+pub use aggregate::AggregateFactory;
 
 mod filter;
 pub use filter::FilterFactory;
