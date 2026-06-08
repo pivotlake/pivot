@@ -131,8 +131,11 @@ fn constant_comparison(
     })))
 }
 
+// Row groups that survive the binding's pushed-down predicates (what `compile`
+// would scan). Pushdown is recorded, not applied in place, so this is where the
+// pruning becomes observable.
 fn row_group_count(table: &ParquetCatalogTable) -> usize {
-    table.parquet.row_groups().len()
+    table.pruned_parquet().row_groups().len()
 }
 
 #[test]
