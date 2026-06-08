@@ -353,18 +353,38 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
     }
 
     fn into_outputter(self) -> crate::operations::unary::Result<Option<Self::Outputter>> {
-        if let Some(local_top_k) = self.running_top_k {
+        let OrderByLimit {
+            running_top_k,
+            sender,
+            receiver,
+            order_by,
+            limit,
+            offset,
+            ..
+        } = self;
+
+        if let Some(local_top_k) = running_top_k {
             debug!("Sending on {:?}", local_top_k.num_rows());
-            self.sender.send(local_top_k).expect("Receiver dropped!");
-            worker_waker().notify();
+            sender.send(local_top_k).expect("Receiver dropped!");
         }
 
-        Ok(self.receiver.map(|rx| OrderByLimitOutputter {
+        // Drop our sender *before* notifying, and notify *unconditionally*. The
+        // receiver worker collects the per-worker top-ks with a non-blocking
+        // `try_recv` while parked on the shared waker, so it only observes the
+        // channel reaching `Disconnected` (all senders dropped) when something
+        // wakes it. A worker that consumed no rows has `running_top_k == None`
+        // and would otherwise drop its sender silently — if that drop is the
+        // one that disconnects the channel and the receiver is parked, it sleeps
+        // forever. Dropping first means the wake reflects the post-drop state.
+        drop(sender);
+        worker_waker().notify();
+
+        Ok(receiver.map(|rx| OrderByLimitOutputter {
             rx,
             batches: vec![],
-            order_by: self.order_by,
-            limit: self.limit,
-            offset: self.offset,
+            order_by,
+            limit,
+            offset,
         }))
     }
 }
@@ -591,5 +611,37 @@ mod tests {
 
         assert_eq!(sender.total_rows(), 4);
         assert_eq!(sender.i32_column(0), vec![1, 1, 2, 2]);
+    }
+
+    /// Regression: a worker that consumed no rows (`running_top_k == None`) must
+    /// still wake the waker when it finalizes. The receiver worker collects the
+    /// per-worker top-ks with a non-blocking `try_recv` while parked on the
+    /// waker, so the *drop* of this worker's sender (which may disconnect the
+    /// channel) has to be accompanied by a notify — otherwise a parked receiver
+    /// can sleep through the final disconnect and the query hangs forever.
+    #[test]
+    fn into_outputter_notifies_even_with_no_local_top_k() {
+        use crate::worker::{WorkerWaker, init_worker_waker};
+
+        let waker = Arc::new(WorkerWaker::new());
+        init_worker_waker(&waker);
+
+        let (tx, rx) = mpsc::channel::<RecordBatch>();
+        // Freshly built, nothing consumed -> `running_top_k` is None.
+        let obl = OrderByLimit::new(
+            vec![OrderBy::new(0, false, false)],
+            10,
+            0,
+            tx,
+            Some(rx),
+            None,
+        );
+
+        let before = waker.wake_count();
+        let _ = obl.into_outputter().unwrap();
+        assert!(
+            waker.wake_count() > before,
+            "into_outputter must notify the waker even when it has no local top-k",
+        );
     }
 }
