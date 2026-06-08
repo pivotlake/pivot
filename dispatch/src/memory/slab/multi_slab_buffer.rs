@@ -3,15 +3,17 @@ use crate::memory::slab::Slab;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
-const BUFFER_SHIFT: u32 = BUFFER_SIZE.trailing_zeros();
-const BUFFER_MASK: usize = BUFFER_SIZE - 1;
-
 /// Typed buffer backed by one or more [`Slab`]s, supporting allocations that span
 /// multiple 2MB `WriteBuffer`s.
 ///
-/// Created via [`super::SlabAllocator::create_multi_slab_buffer`]. Each slab is aligned to the
-/// start of a 2MB buffer, so element indexing works by computing a byte offset, then using
-/// bit-shift (`>> 21`) to find the slab and bit-mask (`& 0x1FFFFF`) for the offset within it.
+/// Created via [`super::SlabAllocator::create_multi_slab_buffer`]. The backing slabs are
+/// *separate* 2MB allocations, not one contiguous run of memory, so each slab holds a whole
+/// number of elements — `BUFFER_SIZE / size_of::<T>()` of them — with the few leftover bytes
+/// at each slab's tail unused. Element `i` therefore lives in slab `i / elems_per_slab` at
+/// offset `(i % elems_per_slab) * size_of::<T>()`. (Indexing the slabs as one contiguous byte
+/// run instead — `byte_offset >> 21` — would let any element whose size doesn't divide 2MB
+/// straddle a slab boundary and read past the slab into unrelated memory.) `elems_per_slab` is
+/// a constant for a given `T`, so the div/mod lower to a multiply+shift.
 ///
 /// Supports `Index<usize>` and `IndexMut<usize>` for typed element access. The buffer does
 /// not track its logical length — callers must track how many elements have been written. This
@@ -33,13 +35,15 @@ impl<T> MultiSlabBuffer<T> {
 
     /// Returns a raw pointer to the element at `index`.
     ///
-    /// Computes the byte offset, determines which slab it falls in via bit-shift, and
-    /// the offset within that slab via bit-mask.
+    /// Each slab holds `elems_per_slab = BUFFER_SIZE / size_of::<T>()` elements packed from its
+    /// start, so the element lives in slab `index / elems_per_slab` at byte offset
+    /// `(index % elems_per_slab) * size_of::<T>()` — never straddling a slab boundary even when
+    /// `size_of::<T>()` doesn't divide `BUFFER_SIZE`.
     pub fn ptr_at_index(&self, index: usize) -> *mut T {
-        let byte_offset = index * size_of::<T>();
-        let buffer_idx = byte_offset >> BUFFER_SHIFT;
-        let offset_in_buffer = byte_offset & BUFFER_MASK;
-        unsafe { self.slabs[buffer_idx].ptr.add(offset_in_buffer) as *mut T }
+        let elems_per_slab = BUFFER_SIZE / size_of::<T>();
+        let slab_idx = index / elems_per_slab;
+        let offset_in_slab = (index % elems_per_slab) * size_of::<T>();
+        unsafe { self.slabs[slab_idx].ptr.add(offset_in_slab) as *mut T }
     }
 }
 
@@ -100,5 +104,45 @@ mod tests {
 
         assert_eq!(buf[0], 1);
         assert_eq!(buf[elements - 1], 2);
+    }
+
+    /// An element whose size does NOT divide `BUFFER_SIZE` (e.g. a 24-byte hash-table
+    /// `Entry`) must not straddle a slab boundary: 2MB / 24 = 87381.33, so treating the
+    /// separate slabs as one contiguous byte run made element 87381 read past slab 0 into
+    /// unrelated memory, corrupting its tail (high-cardinality GROUP BY counts). Write a
+    /// distinct pattern to every element across the boundary and read it all back.
+    #[test]
+    fn non_divisor_element_size_does_not_straddle_slab_boundary() {
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        #[repr(C)]
+        struct Entry {
+            hash: u64,
+            key: u64,
+            value: u64,
+        }
+        assert_ne!(
+            BUFFER_SIZE % size_of::<Entry>(),
+            0,
+            "test needs a non-divisor size"
+        );
+
+        init_test_free_pool(8);
+        let mut alloc = SlabAllocator::new(true);
+        let elems_per_slab = BUFFER_SIZE / size_of::<Entry>();
+        // Span well past the first slab boundary, including the straddling index.
+        let n = elems_per_slab + 50;
+        let mut buf: MultiSlabBuffer<Entry> = alloc.create_multi_slab_buffer(n, true);
+
+        let pat = |i: usize| Entry {
+            hash: i as u64 + 1,
+            key: (i as u64) ^ 0xA5A5_5A5A,
+            value: i as u64 * 7,
+        };
+        for i in 0..n {
+            buf[i] = pat(i);
+        }
+        for i in 0..n {
+            assert_eq!(buf[i], pat(i), "corruption at index {i}");
+        }
     }
 }

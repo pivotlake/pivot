@@ -111,7 +111,16 @@ impl SlabAllocator {
     /// `MultiSlabBuffer`, but the extra addition was felt (~5% in some queries) since it appears
     /// in every single indexing operation.
     pub fn create_multi_slab_buffer<T>(&mut self, size: usize, zeroed: bool) -> MultiSlabBuffer<T> {
-        let bytes = size * size_of::<T>();
+        // `MultiSlabBuffer` packs `elems_per_slab` elements into each slab (it does NOT treat
+        // the slabs as one contiguous byte run — see its docs), so a single slab fits tightly
+        // but anything larger takes one full 2MB slab per `elems_per_slab` elements. Sizing by
+        // bytes alone would under-allocate by a slab once an element straddles the 2MB point.
+        let elems_per_slab = BUFFER_SIZE / size_of::<T>();
+        let bytes = if size <= elems_per_slab {
+            size * size_of::<T>()
+        } else {
+            size.div_ceil(elems_per_slab) * BUFFER_SIZE
+        };
         // For MultiSlabBuffer to work properly (with indexing), if the allocation doesn't fit
         // in the remaining space we must start a new buffer so each slab begins at offset 0.
         if self.remaining_in_buffer() < bytes {
