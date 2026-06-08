@@ -139,10 +139,9 @@ impl ParquetCatalog {
     /// Data files are resolved by location: local ones are read from disk;
     /// remote (`s3://`/`gs://`) ones are presigned and range-read over the ring.
     /// A table's files share the catalog root's store, so they're all local or
-    /// all remote — a mix is rejected.
-    ///
-    /// Runs on a dispatch worker (it calls [`ParquetTable::from_files`] /
-    /// [`ParquetTable::from_remote_files`]).
+    /// all remote — a mix is rejected. The result is a [`ParquetSource`] (file
+    /// locations only); footers are read at query time by
+    /// [`ParquetSource::materialize`].
     fn create_lake_table(&self, request: CreateTableRequest) -> Result<()> {
         if request.if_not_exists {
             return Err(Error::IfNotExistsUnsupported);
@@ -165,7 +164,11 @@ impl ParquetCatalog {
                 for file in &table.files {
                     match lake::resolve_data_file(url, &file.location) {
                         lake::Resolved::Local(p) => paths.push(p),
-                        lake::Resolved::Remote(uri) => urls.push(store::presign_get(&uri)?),
+                        // Carry the snapshot's recorded size so the footer offset
+                        // is known without probing the remote object.
+                        lake::Resolved::Remote(uri) => {
+                            urls.push((store::presign_get(&uri)?, file.size))
+                        }
                     }
                 }
                 match (paths.is_empty(), urls.is_empty()) {

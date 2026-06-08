@@ -304,7 +304,7 @@ mod tests {
                     }],
                     files: vec![DataFile {
                         location: "_goose_data/a.parquet".into(),
-                        size: Some(123),
+                        size: 123,
                         row_count: 1,
                     }],
                 }],

@@ -9,10 +9,10 @@
 //! goose-managed files are recorded by a path *relative* to the catalog root.
 //!
 //! The shape mirrors the reference `goose` extension's metadata, with two
-//! read-oriented additions on [`DataFile`]: an optional byte `size` (lets the
-//! reader skip a HEAD / suffix-range probe to locate a remote footer) and the
-//! existing best-effort `row_count`. Serialization is plain `serde_json` rather
-//! than a hand-rolled encoder.
+//! read-oriented additions on [`DataFile`]: the byte `size` (which lets the
+//! reader locate a remote footer directly — no HEAD or suffix-range probe) and
+//! the best-effort `row_count`. Serialization is plain `serde_json` rather than
+//! a hand-rolled encoder.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,11 +40,10 @@ pub struct Column {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataFile {
     pub location: String,
-    /// Total file size in bytes, if the writer knew it at commit time. When
-    /// present the reader can compute the footer offset directly; when `None`
-    /// it probes (suffix-range GET for remote, `stat` for local).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<u64>,
+    /// Total file size in bytes. The writer records it at commit time (it has
+    /// just written the file), so the reader can compute the footer offset
+    /// directly — no HEAD or suffix-range probe to locate a remote footer.
+    pub size: u64,
     /// Best-effort row count; `0` when unknown.
     #[serde(default)]
     pub row_count: i64,
@@ -161,12 +160,12 @@ mod tests {
                     files: vec![
                         DataFile {
                             location: "_goose_data/main/events/a.parquet".into(),
-                            size: Some(4096),
+                            size: 4096,
                             row_count: 3,
                         },
                         DataFile {
                             location: "s3://other/logs/b.parquet".into(),
-                            size: None,
+                            size: 8192,
                             row_count: 0,
                         },
                     ],
@@ -194,18 +193,18 @@ mod tests {
     }
 
     #[test]
-    fn size_is_omitted_when_absent_and_parsed_when_present() {
+    fn size_is_required_and_row_count_defaults() {
         let json = br#"{
             "format_version": 1, "version": 1,
             "schemas": [{"name":"main","tables":[{"name":"t","columns":[],
-              "files":[{"location":"a.parquet"},
+              "files":[{"location":"a.parquet","size":42},
                        {"location":"b.parquet","size":99,"row_count":7}]}]}]
         }"#;
         let snap = CatalogSnapshot::from_slice(json).unwrap();
         let files = &snap.table("main", "t").unwrap().files;
-        assert_eq!(files[0].size, None);
+        assert_eq!(files[0].size, 42);
         assert_eq!(files[0].row_count, 0); // serde default
-        assert_eq!(files[1].size, Some(99));
+        assert_eq!(files[1].size, 99);
         assert_eq!(files[1].row_count, 7);
     }
 

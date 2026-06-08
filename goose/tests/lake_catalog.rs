@@ -81,7 +81,9 @@ fn attach_existing_lake_table_and_scan_rows() {
     // by a path relative to the root.
     fs::create_dir_all(dir.path().join("_goose_data")).unwrap();
     let batch = strings_and_ints(&["a", "b", "c"], &[1, 2, 3]);
-    write_parquet(&dir.path().join("_goose_data/a.parquet"), &batch);
+    let data_path = dir.path().join("_goose_data/a.parquet");
+    write_parquet(&data_path, &batch);
+    let data_size = fs::metadata(&data_path).unwrap().len();
 
     let snapshot = CatalogSnapshot {
         format_version: FORMAT_VERSION,
@@ -102,7 +104,7 @@ fn attach_existing_lake_table_and_scan_rows() {
                 ],
                 files: vec![DataFile {
                     location: "_goose_data/a.parquet".to_string(),
-                    size: None,
+                    size: data_size,
                     row_count: 3,
                 }],
             }],

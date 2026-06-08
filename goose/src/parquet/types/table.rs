@@ -16,7 +16,7 @@ use arrow_array::{
     Int64Array, Scalar, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use dispatch::io::{FileLocation, RemoteFile, open_direct_read};
+use dispatch::io::{FileLocation, open_direct_read};
 use dispatch::memory::{has_memory_context, memory_ctx};
 use std::fmt::{Debug, Formatter};
 use std::fs::File;
@@ -36,8 +36,6 @@ pub enum Error {
     IO(#[from] std::io::Error),
     #[error("Column not found {0}")]
     ColumnNotFound(String),
-    #[error("reading remote parquet `{url}`: {message}")]
-    Remote { url: String, message: String },
     #[error("fetching row-group metadata: {0}")]
     Materialize(String),
     #[error("invalid parquet footer: {0}")]
@@ -52,21 +50,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// footer (across workers, in parallel).
 #[derive(Clone, Debug)]
 pub enum DataFileLocation {
-    /// A local file path.
+    /// A local file path. The size is read with `stat` when the footer is
+    /// fetched (no round trip to pay for, unlike a remote file).
     Local(PathBuf),
     /// A remote object addressed by a concrete fetchable URL (presigned for
-    /// S3/GCS, or plain `http(s)://`).
-    Remote(Url),
-}
-
-/// Read one data file's footer into its [`RowGroupMetadata`]s, with row-group
-/// indices local to the file (global indices are assigned after all files are
-/// collected). Must run on a dispatch worker (registers the file in the cache).
-pub fn parse_file_metadatas(location: &DataFileLocation) -> Result<Vec<RowGroupMetadata>> {
-    match location {
-        DataFileLocation::Local(path) => parse_row_group_metadatas(0, path),
-        DataFileLocation::Remote(url) => parse_row_group_metadatas_remote(0, url),
-    }
+    /// S3/GCS, or plain `http(s)://`), with its total size from the catalog
+    /// snapshot — so the footer offset is known without a HEAD or suffix probe.
+    Remote { url: Url, size: u64 },
 }
 
 /// A logical table backed by one or more Parquet files.
@@ -170,33 +160,6 @@ impl ParquetTable {
         Ok(Self::new(row_groups))
     }
 
-    /// Creates a table from an ordered list of **remote** Parquet files, named
-    /// by concrete fetchable URLs (presigned `https://…` for S3/GCS, or plain
-    /// `http(s)://…`). Each file's footer is fetched once here (suffix-range
-    /// GET); column chunks are read lazily at scan time over the io_uring ring.
-    /// Same worker-thread requirement as [`from_files`](Self::from_files).
-    pub fn from_remote_files(urls: &[Url]) -> Result<Self> {
-        assert!(
-            has_memory_context(),
-            "ParquetTable::from_remote_files must run on a dispatch worker thread: \
-             no MemoryContext is installed on the current thread. Off-worker \
-             callers must dispatch via DataFlowDispatcher::run_on_worker."
-        );
-        let mut start_offset = 0;
-        let row_groups: Vec<_> = urls
-            .iter()
-            .map(|url| {
-                parse_row_group_metadatas_remote(start_offset, url)
-                    .inspect(|v| start_offset += v.len())
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .map(Arc::new)
-            .collect();
-        Ok(Self::new(row_groups))
-    }
-
     /// Returns the Arrow schema (taken from the first row group).
     pub fn schema(&self) -> &SchemaRef {
         if self.row_groups.is_empty() {
@@ -277,28 +240,6 @@ fn parse_row_group_metadatas(
     build_row_groups(global_row_group_offset, file_meta, source)
 }
 
-/// Parse one remote Parquet file's footer (fetched over HTTP) into
-/// [`RowGroupMetadata`]s. `url` must already be a concrete, fetchable URL — a
-/// presigned `https://…` for S3/GCS, or a plain `http(s)://…` host. The bytes
-/// are read on demand at scan time via the io_uring ring; only the footer is
-/// fetched here (to learn the column-chunk layout).
-fn parse_row_group_metadatas_remote(
-    global_row_group_offset: usize,
-    url: &Url,
-) -> Result<Vec<RowGroupMetadata>> {
-    let footer = read_remote_footer(url)?;
-    let file_meta = parse_footer_thrift(&footer)?;
-    let remote = Arc::new(RemoteFile::open(url.clone())?);
-    memory_ctx()
-        .file_cache()
-        .open_entry(FileLocation::Remote(remote.clone()));
-    build_row_groups(
-        global_row_group_offset,
-        file_meta,
-        FileSource::Remote(remote),
-    )
-}
-
 /// Build the per-row-group metadata from a parsed footer and a (local or
 /// remote) byte source. Shared by the local and remote readers.
 fn build_row_groups(
@@ -348,47 +289,6 @@ fn build_row_groups(
         .collect();
 
     Ok(row_groups)
-}
-
-/// Fetch a remote Parquet file's footer via an HTTP suffix-range GET — no HEAD
-/// needed: read the last `FOOTER_PROBE_BYTES`, read the 4-byte footer length
-/// from the trailing `[len][PAR1]`, and return the footer (fetching exactly once
-/// more only if the footer is larger than the probe window).
-fn read_remote_footer(url: &Url) -> Result<Vec<u8>> {
-    let tail = http_get_suffix(url, FOOTER_PROBE_BYTES)?;
-    if tail.len() < 8 || tail[tail.len() - 4..] != PARQUET_MAGIC {
-        return Err(Error::Remote {
-            url: url.to_string(),
-            message: "not a parquet file (bad magic)".to_string(),
-        });
-    }
-    let len_bytes = &tail[tail.len() - 8..tail.len() - 4];
-    let footer_len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
-
-    if footer_len + 8 <= tail.len() {
-        let start = tail.len() - 8 - footer_len;
-        return Ok(tail[start..tail.len() - 8].to_vec());
-    }
-    // Footer didn't fit in the probe; fetch exactly the footer + trailer.
-    let exact = http_get_suffix(url, footer_len + 8)?;
-    Ok(exact[..footer_len].to_vec())
-}
-
-/// GET the last `n` bytes of `url` via an HTTP suffix range (`Range: bytes=-n`).
-fn http_get_suffix(url: &Url, n: usize) -> Result<Vec<u8>> {
-    let remote_err = |message: String| Error::Remote {
-        url: url.to_string(),
-        message,
-    };
-    let resp = ureq::get(url.as_str())
-        .set("Range", &format!("bytes=-{n}"))
-        .call()
-        .map_err(|e| remote_err(format!("suffix-range GET: {e}")))?;
-    let mut buf = Vec::new();
-    resp.into_reader()
-        .read_to_end(&mut buf)
-        .map_err(|e| remote_err(format!("reading body: {e}")))?;
-    Ok(buf)
 }
 
 /// Returns `true` when `encoding_stats` proves every *data* page in the chunk

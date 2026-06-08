@@ -1,9 +1,9 @@
 //! Remote-read end-to-end test: serve a Parquet file over a loopback HTTP server
 //! that honours byte-range requests, then read it through the goose pipeline —
-//! footer via a suffix-range GET, column chunks via the io_uring ring — and
-//! check the rows come back. Plain HTTP (not TLS) so the worker's default
-//! requester needs no injected trust; the S3/GCS auth layer (presigned URLs) is
-//! orthogonal and exercised against a live endpoint, not here.
+//! footer and column chunks both via the io_uring ring — and check the rows come
+//! back. Plain HTTP (not TLS) so the worker's default requester needs no injected
+//! trust; the S3/GCS auth layer (presigned URLs) is orthogonal and exercised
+//! against a live endpoint, not here.
 
 mod common;
 use common::*;
@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use url::Url;
 
 use dispatch::Projection;
-use goose::parquet::{ParquetTable, table_input};
+use goose::parquet::{ParquetSource, table_input};
 
 /// Serve `bytes` over loopback HTTP, answering `Range` requests with `206`.
 /// Returns the bound URL. The server thread is detached and lives for the
@@ -132,25 +132,24 @@ fn parquet_bytes(batch: &arrow_array::RecordBatch) -> Vec<u8> {
 }
 
 #[test]
-fn scans_a_remote_parquet_file_over_http() {
+fn materializes_a_remote_footer_over_the_ring() {
     let dispatch = dispatch(1);
 
     let batch = strings_and_ints(&["a", "b", "c", "d"], &[10, 20, 30, 40]);
-    let url = serve_with_ranges(parquet_bytes(&batch));
+    let bytes = parquet_bytes(&batch);
+    let size = bytes.len() as u64;
+    let url = serve_with_ranges(bytes);
 
-    // Build the table from the remote URL (footer over HTTP), on a worker.
-    let table = {
-        let url = url.clone();
-        dispatch
-            .run_on_worker(move || Arc::new(ParquetTable::from_remote_files(&[url]).unwrap()))
-            .expect("from_remote_files on a worker")
-    };
-    assert!(
-        !table.row_groups().is_empty(),
-        "footer parsed from the remote file"
-    );
+    // Materialize the footer through `ParquetSource` — the on-ring path: the
+    // catalog-recorded size locates the footer, so its tail window is fetched
+    // through the file cache exactly like a column chunk. No HEAD, no suffix
+    // probe.
+    let source = ParquetSource::from_remote_files(&[(url, size)]);
+    let table = Arc::new(source.materialize(&dispatch).expect("materialize footers"));
+    // Four rows, one row group each (writer set to one row per group).
+    assert_eq!(table.row_groups().len(), 4, "all row-group footers parsed");
 
-    // Scan it: the column chunks are fetched as HTTP range reads on the ring.
+    // And the materialized table scans back the rows over the ring.
     let results = table_input(&dispatch, &table, Projection::all(2), false)
         .collect()
         .unwrap();

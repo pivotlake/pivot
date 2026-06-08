@@ -13,10 +13,10 @@
 use crate::parquet::types::metadata::{FileSource, RowGroupMetadata};
 use crate::parquet::types::table::{
     DataFileLocation, Error, FOOTER_PROBE_BYTES, ParquetTable, Result, footer_len_from_tail,
-    parse_file_metadatas, row_groups_from_footer,
+    row_groups_from_footer,
 };
 use crossbeam_deque::{Injector, Steal};
-use dispatch::io::{FileLocation, FsRequest, HttpRequest, IORequest, open_direct_read};
+use dispatch::io::{FileLocation, FsRequest, HttpRequest, IORequest, RemoteFile, open_direct_read};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{
     DataFlowDispatcher, DefaultUnaryFactory, OperatorSpec, Receiver, RootChannelFactory,
@@ -60,10 +60,15 @@ impl ParquetSource {
         }
     }
 
-    /// An explicit list of remote files (concrete fetchable URLs).
-    pub fn from_remote_files(urls: &[Url]) -> Self {
+    /// An explicit list of remote files: concrete fetchable URLs paired with
+    /// their total size (from the catalog snapshot), which locates each footer.
+    pub fn from_remote_files(files: &[(Url, u64)]) -> Self {
         Self {
-            files: urls.iter().cloned().map(DataFileLocation::Remote).collect(),
+            files: files
+                .iter()
+                .cloned()
+                .map(|(url, size)| DataFileLocation::Remote { url, size })
+                .collect(),
         }
     }
 
@@ -137,9 +142,9 @@ pub fn materialize_metadata(
 /// carried into the emitted [`RowGroupMetadata`], so the later column-chunk
 /// reads hit the same cache entry.
 ///
-/// Local files compute their footer offset from `stat`. Remote files need the
-/// size to address the cache; until the ring learns sizes via suffix ranges they
-/// fall back to a blocking suffix read here.
+/// The file size is known up front — from `stat` for a local file, from the
+/// catalog snapshot for a remote one — so the footer's tail window is at a known
+/// offset and there's no HEAD or suffix probe to pay for.
 #[derive(Default)]
 struct FooterFetcher {
     current: Option<InFlight>,
@@ -151,6 +156,7 @@ struct InFlight {
     location: FileLocation,
     /// Keeps the file handle (fd / remote) alive and travels into the row groups.
     source: FileSource,
+    /// Total file size, known when the read starts.
     size: usize,
     /// Cache lookups pinning the region currently being read.
     lookups: Vec<CacheLookup>,
@@ -196,6 +202,41 @@ impl InFlight {
 }
 
 impl FooterFetcher {
+    /// Start reading one file's footer: register the file in the cache and issue
+    /// the tail probe window `[size - probe, size)`. `location`/`source` select
+    /// the transport (local fd or remote URL); `size` is already known by the
+    /// caller (`stat` or the catalog snapshot). If the window was already cached,
+    /// completes inline.
+    fn begin_footer_read<S: Sender<IndexedRowGroup>>(
+        &mut self,
+        file_idx: usize,
+        location: FileLocation,
+        source: FileSource,
+        size: usize,
+        sender: &mut S,
+    ) -> dispatch::UnaryResult<()> {
+        memory_ctx().file_cache().open_entry(location.clone());
+        let mut inflight = InFlight {
+            file_idx,
+            location,
+            source,
+            size,
+            lookups: Vec::new(),
+            pending_fs: Vec::new(),
+            pending_http: Vec::new(),
+            remaining: 0,
+            reading_exact: false,
+        };
+        let probe = size.min(FOOTER_PROBE_BYTES);
+        inflight.read_region(size - probe, probe);
+        let cached = inflight.remaining == 0;
+        self.current = Some(inflight);
+        if cached {
+            self.on_region_complete(sender)?;
+        }
+        Ok(())
+    }
+
     /// The current region's reads have all landed: parse it. Either emit the row
     /// groups (footer in hand) or issue the exact-footer read.
     fn on_region_complete<S: Sender<IndexedRowGroup>>(
@@ -241,41 +282,23 @@ impl Unary<IndexedFile, IndexedRowGroup> for FooterFetcher {
         (file_idx, location): IndexedFile,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        match location {
+        // Resolve the location to its transport, byte source, and size. Local
+        // files `stat` for the size; remote files carry it from the catalog
+        // snapshot — either way the footer offset is known with no probe.
+        let (location, source, size) = match location {
             DataFileLocation::Local(path) => {
                 let file = open_direct_read(&path).map_err(crate::parquet::op_err)?;
-                let location = FileLocation::Local(file.as_raw_fd());
-                memory_ctx().file_cache().open_entry(location.clone());
                 let size = fs::metadata(&path).map_err(crate::parquet::op_err)?.len() as usize;
-                let mut inflight = InFlight {
-                    file_idx,
-                    location,
-                    source: FileSource::Local(Arc::new(file)),
-                    size,
-                    lookups: Vec::new(),
-                    pending_fs: Vec::new(),
-                    pending_http: Vec::new(),
-                    remaining: 0,
-                    reading_exact: false,
-                };
-                let probe = size.min(FOOTER_PROBE_BYTES);
-                inflight.read_region(size - probe, probe);
-                let cached = inflight.remaining == 0;
-                self.current = Some(inflight);
-                if cached {
-                    self.on_region_complete(sender)?;
-                }
+                let location = FileLocation::Local(file.as_raw_fd());
+                (location, FileSource::Local(Arc::new(file)), size)
             }
-            remote @ DataFileLocation::Remote(_) => {
-                // Suffix-on-the-ring is the next step; for now read the remote
-                // footer with a blocking suffix range.
-                let row_groups = parse_file_metadatas(&remote).map_err(crate::parquet::op_err)?;
-                for rg in row_groups {
-                    sender.send((file_idx, rg))?;
-                }
+            DataFileLocation::Remote { url, size } => {
+                let remote = Arc::new(RemoteFile::open(url).map_err(crate::parquet::op_err)?);
+                let location = FileLocation::Remote(remote.clone());
+                (location, FileSource::Remote(remote), size as usize)
             }
-        }
-        Ok(())
+        };
+        self.begin_footer_read(file_idx, location, source, size, sender)
     }
 
     fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
