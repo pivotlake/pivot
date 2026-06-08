@@ -11,7 +11,7 @@
 //! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
 //! # let dispatch = Dispatch::spin_up(1, 32);
 //! # let dispatcher = dispatch.dispatcher();
-//! // SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'
+//! // SELECT COUNT(*) FROM events WHERE url LIKE '%google%'
 //! let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");

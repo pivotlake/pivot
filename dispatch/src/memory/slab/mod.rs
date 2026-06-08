@@ -34,6 +34,10 @@ mod multi_slab_buffer;
 
 pub use multi_slab_buffer::MultiSlabBuffer;
 
+mod slab_vec;
+
+pub use slab_vec::SlabVec;
+
 /// A contiguous byte region within a `WriteBuffer`.
 ///
 /// Keeps the parent buffer alive via `Arc<WriteBuffer>`. Multiple slabs can share the same
