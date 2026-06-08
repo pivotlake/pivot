@@ -363,6 +363,34 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
     );
 }
 
+// `SELECT *` over a filtered Top-N is exactly the late-materialization shape:
+// DuckDB scans only `a`/`name` for the predicate+sort, then materializes the
+// full row for the survivors. Exercises multi-column materialize + reordering
+// back to schema order, plus that metadata survives the narrow projection.
+#[rstest]
+fn select_star_filtered_top_n_late_materializes(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT * FROM example_table WHERE name <> 'bob' ORDER BY a ASC LIMIT 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"a": 1, "b": 10, "c": 100, "name": "alice"},
+            {"a": 3, "b": 30, "c": 300, "name": "charlie"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
 #[rstest]
 fn group_by_int_column(mut testing_planner: TestingPlanner) {
     let results = testing_planner

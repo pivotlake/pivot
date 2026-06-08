@@ -79,15 +79,44 @@ pub trait Table: Debug + Send + Sync {
     /// A backend may use them to skip data that can't match — e.g. Parquet
     /// row-group elimination — or ignore them; ignoring is always correct, just
     /// without the optimization.
+    ///
+    /// `emit_row_group_metadata` asks the scan to tag each emitted row with the
+    /// metadata a downstream [`materialize`](Table::materialize) needs (e.g. its
+    /// row-group ID and per-row index). Backends that don't materialize can
+    /// ignore it; the bridge only sets it on a late-materialized query's narrow
+    /// scan.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
+        emit_row_group_metadata: bool,
     ) -> RecordBatchOperatorSpec;
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
+
+    /// Clone this table into a fresh boxed trait object.
+    ///
+    /// A late-materialized query references one table from both its narrow scan
+    /// and its [`Materialize`](crate::operator::Materialize); `Box<dyn Table>`
+    /// isn't `Clone`, so backends expose cloning through this method.
+    fn clone_box(&self) -> Box<dyn Table>;
+
+    /// Fetch `projection` for the rows that survived `input` (whose scan was
+    /// tagged via `emit_row_group_metadata`), emitting them in `projection`
+    /// order.
+    ///
+    /// Only reached for a [`Materialize`](crate::operator::Materialize) node,
+    /// which the bridge only emits for tables that support it; the default
+    /// panics.
+    fn materialize(
+        &self,
+        _input: RecordBatchOperatorSpec,
+        _projection: Projection,
+    ) -> RecordBatchOperatorSpec {
+        unreachable!("materialize called on a table that does not support late materialization")
+    }
 
     /// Try to push a filter into the table. Returns `Ok(true)` if it was
     /// *FULLY* consumed (no upstream `Filter` operator required), `Ok(false)`
@@ -107,6 +136,12 @@ pub struct DuckDBTableAdapter {
 }
 
 impl DuckDBTable for DuckDBTableAdapter {
+    fn clone_box(&self) -> Box<dyn DuckDBTable> {
+        Box::new(DuckDBTableAdapter {
+            table: self.table.clone_box(),
+        })
+    }
+
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         self.table
             .columns()

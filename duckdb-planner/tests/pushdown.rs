@@ -20,6 +20,10 @@ struct UsersTable {
 }
 
 impl DuckDBTable for UsersTable {
+    fn clone_box(&self) -> Box<dyn DuckDBTable> {
+        Box::new(self.clone())
+    }
+
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         vec![
             DuckDBColumn {

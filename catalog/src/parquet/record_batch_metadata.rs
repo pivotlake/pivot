@@ -11,11 +11,11 @@ static GLOBAL_ROW_GROUP_FIELD: LazyLock<Arc<Field>> = LazyLock::new(|| {
     let run_ends = Field::new("run_ends", DataType::Int32, false);
     let values = Field::new("values", DataType::UInt32, true);
     let dt = DataType::RunEndEncoded(Arc::new(run_ends), Arc::new(values));
-    Arc::new(Field::new("row_group_idx", dt, false))
+    Arc::new(Field::new(dispatch::ROW_GROUP_IDX_FIELD, dt, false))
 });
 
 static ROW_IDX_FIELD: LazyLock<Arc<Field>> =
-    LazyLock::new(|| Arc::new(Field::new("row_idx", DataType::UInt32, false)));
+    LazyLock::new(|| Arc::new(Field::new(dispatch::ROW_IDX_FIELD, DataType::UInt32, false)));
 
 /// The global row group column for a particular RecordBatch. Note that the global row group column
 /// is NOT the row_group within a parquet file, but across

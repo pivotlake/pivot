@@ -48,43 +48,45 @@ impl PlanNode {
         Ok(())
     }
 
-    /// Walk the plan tree and upgrade each `RawInput` to a resolved
-    /// [`Input`](crate::operator::Input) by moving the `Box<dyn DuckDBTable>`
-    /// at index `table_id` out of `tables` (consumed exactly once).
+    /// Walk the plan tree and upgrade each `RawInput`/`RawMaterialize` to its
+    /// resolved form by attaching the `Box<dyn DuckDBTable>` at index `table_id`.
     ///
-    /// `Box<dyn DuckDBTable>` is not `Clone`, so each `table_id` must be
-    /// referenced by at most one `RawInput`. The walker enforces this by
-    /// wrapping each table with `Option` and taking it when accessed.
+    /// A `table_id` can be referenced more than once — a late-materialized query
+    /// shares one between its narrow scan and its `Materialize` — so each
+    /// reference gets a [`clone_box`](DuckDBTable::clone_box) of the resolved
+    /// table rather than the single bound instance.
     ///
     /// Dynamic-filter references are left as-is here — they carry only a
     /// `slot_id` and are bound to a shared slot later, at compile time.
     pub(crate) fn resolve_inputs(self, tables: Vec<Box<dyn DuckDBTable>>) -> Self {
-        let mut table_slots: Vec<Option<Box<dyn DuckDBTable>>> =
-            tables.into_iter().map(Some).collect();
-        self.resolve_inputs_walker(&mut table_slots)
+        self.resolve_inputs_walker(&tables)
     }
 
-    fn resolve_inputs_walker(mut self, tables: &mut [Option<Box<dyn DuckDBTable>>]) -> Self {
+    fn resolve_inputs_walker(mut self, tables: &[Box<dyn DuckDBTable>]) -> Self {
         self.inputs = self
             .inputs
             .into_iter()
             .map(|n| n.resolve_inputs_walker(tables))
             .collect();
 
-        let Operator::RawInput(raw) = self.operator else {
-            return self;
+        let operator = match self.operator {
+            Operator::RawInput(raw) => Operator::Input(crate::operator::Input {
+                table: tables[raw.table_id].clone_box(),
+                columns: raw.columns,
+                dynamic_filters: raw.dynamic_filters,
+                emit_row_group_metadata: raw.emit_row_group_metadata,
+            }),
+            Operator::RawMaterialize(raw) => Operator::Materialize(crate::operator::Materialize {
+                table: tables[raw.table_id].clone_box(),
+                columns: raw.columns,
+            }),
+            other => other,
         };
 
         PlanNode {
             name: self.name,
             inputs: self.inputs,
-            operator: Operator::Input(crate::operator::Input {
-                table: tables[raw.table_id]
-                    .take()
-                    .expect("table id already consumed by another Input"),
-                columns: raw.columns,
-                dynamic_filters: raw.dynamic_filters,
-            }),
+            operator,
         }
     }
 }

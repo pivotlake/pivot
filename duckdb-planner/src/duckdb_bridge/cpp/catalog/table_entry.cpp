@@ -90,6 +90,24 @@ static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &g
 	}
 }
 
+// Expose the table's virtual columns (notably the default `rowid`) so DuckDB's
+// late-materialization optimizer can reference a row-id when it rewrites a wide
+// Top-N/Limit scan into a row-id SEMI join.
+static virtual_column_map_t PivotScanGetVirtualColumns(ClientContext &context,
+                                                       optional_ptr<FunctionData> bind_data_p) {
+	auto &data = bind_data_p->Cast<PivotScanBindData>();
+	return data.catalog_entry.GetVirtualColumns();
+}
+
+// The row-id column(s) late materialization joins on — the standard single
+// `rowid` from TableCatalogEntry. Plan-time only; pivot never executes a
+// DuckDB scan, so no real row-id values are produced.
+static vector<column_t> PivotScanGetRowIdColumns(ClientContext &context,
+                                                 optional_ptr<FunctionData> bind_data_p) {
+	auto &data = bind_data_p->Cast<PivotScanBindData>();
+	return data.catalog_entry.GetRowIdColumns();
+}
+
 PivotTableCatalogEntry::PivotTableCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                                rust::Box<OptionalTableWrapper> table)
     : TableCatalogEntry(catalog, schema, info), table(std::move(table)) {
@@ -110,6 +128,17 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	// attached to the Input and its producing Top-N.
 	func.filter_pushdown = true;
 	func.projection_pushdown = true;
+	// Advertise row-id / late-materialization support so DuckDB's
+	// `late_materialization` optimizer fires for `SELECT <wide> ... ORDER BY ...
+	// LIMIT n` queries over this table: it rewrites them into a SEMI join on the
+	// row-id whose narrow side scans only the predicate/sort columns. The bridge
+	// recognizes that join and collapses it onto pivot's own materializer. We
+	// only PLAN with DuckDB (never execute its scan), so the row-id is purely a
+	// plan-time marker; the default `rowid` virtual column from TableCatalogEntry
+	// is enough.
+	func.late_materialization = true;
+	func.get_virtual_columns = PivotScanGetVirtualColumns;
+	func.get_row_id_columns = PivotScanGetRowIdColumns;
 	return func;
 }
 

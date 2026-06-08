@@ -74,18 +74,31 @@ impl Table for TestTable {
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
+        emit_row_group_metadata: bool,
     ) -> RecordBatchOperatorSpec {
         table_input_with_filter(
             dispatcher,
             &self.parquet_table,
             projection,
-            false,
+            emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
         )
     }
 
     fn columns(&self) -> Vec<Column> {
         self.columns.clone()
+    }
+
+    fn clone_box(&self) -> Box<dyn Table> {
+        Box::new(self.clone())
+    }
+
+    fn materialize(
+        &self,
+        input: RecordBatchOperatorSpec,
+        projection: Projection,
+    ) -> RecordBatchOperatorSpec {
+        catalog::parquet::materialize(input, self.parquet_table.clone(), projection)
     }
 }
 

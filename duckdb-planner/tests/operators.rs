@@ -83,10 +83,17 @@ fn top_n(mut planner: PlannerContext) {
         .plan("SELECT * FROM users ORDER BY age LIMIT 5")
         .unwrap()
         .to_string();
+    // DuckDB's late_materialization optimizer fires for `SELECT * ... ORDER BY
+    // ... LIMIT`: it scans only the sort column (`age` = #3) up front, then the
+    // bridge collapses its row-id SEMI join into a Materialize that re-reads the
+    // full row for the surviving rows.
     assert_snapshot!(plan, @"
-    TopN(limit: 5, offset: 0, order: #3:INTEGER ASC)
+    OrderBy(#3:INTEGER ASC)
       Projection(#0:INTEGER, #1:VARCHAR, #2:INTEGER, #3:INTEGER, #4:BOOLEAN)
-        Input([#0:INTEGER, #1:VARCHAR, #2:INTEGER, #3:INTEGER, #4:BOOLEAN])
+        Materialize([#0, #1, #2, #3, #4])
+          TopN(limit: 5, offset: 0, order: #0:INTEGER ASC)
+            Projection(#0:INTEGER)
+              Input([#3:INTEGER])
     ");
 }
 

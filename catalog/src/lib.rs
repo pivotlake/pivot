@@ -29,7 +29,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::parquet::{
-    ParquetTable, ParquetTableError, ScanEqualityPredicate, row_group_eliminated,
+    ParquetTable, ParquetTableError, ScanEqualityPredicate, materialize, row_group_eliminated,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
@@ -154,6 +154,7 @@ impl Table for ParquetCatalogTable {
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
+        emit_row_group_metadata: bool,
     ) -> RecordBatchOperatorSpec {
         let parquet = Arc::new(self.parquet.clone());
         // Order the scan by the Top-N's key so its boundary tightens after the
@@ -163,7 +164,7 @@ impl Table for ParquetCatalogTable {
             dispatcher,
             &parquet,
             projection,
-            false,
+            emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
             scan_order,
             Arc::new(self.eq_predicates.clone()),
@@ -172,6 +173,18 @@ impl Table for ParquetCatalogTable {
 
     fn columns(&self) -> Vec<Column> {
         self.columns.clone()
+    }
+
+    fn clone_box(&self) -> Box<dyn Table> {
+        Box::new(self.clone())
+    }
+
+    fn materialize(
+        &self,
+        input: RecordBatchOperatorSpec,
+        projection: Projection,
+    ) -> RecordBatchOperatorSpec {
+        materialize(input, Arc::new(self.parquet.clone()), projection)
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
