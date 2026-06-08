@@ -13,10 +13,13 @@ use arrow_array::RecordBatch;
 use std::sync::Arc;
 
 /// Table-slot count at which a worker stops growing its in-place hash table and
-/// switches to radix scatter (for radix-eligible keys). Below this, a group-by
-/// stays in the cheap in-place path (no scatter overhead); above it, the table
-/// would spill cache, so radix's cache-resident per-partition aggregation wins.
-const SWITCH_THRESHOLD: usize = 4096;
+/// switches to radix scatter (for radix-eligible keys). Set near the L2-resident
+/// boundary: an in-place table up to this size (~0.8–1.8 MB depending on entry
+/// width) stays in cache, so low- and medium-cardinality group-bys keep the cheap
+/// in-place path and pay no scatter/partition overhead — only once the table
+/// would spill cache does radix's cache-resident per-partition merge win. (Set
+/// too low this regresses e.g. q42's ~2880-group date_trunc into a 4096-way radix.)
+const SWITCH_THRESHOLD: usize = 32768;
 
 /// Elements per [`SlabList`] chunk (single slab, < 2MB for the row width).
 const CHUNK_CAP: usize = 1 << 11; // 2048
