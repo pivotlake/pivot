@@ -93,7 +93,7 @@ pub use values::{
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::group::hashtables::{AggregatedTable, MultiSlabTable};
+use crate::operations::unary::group::hashtables::{AggregatedTable, ExtractorEntry, MultiSlabTable};
 use crate::worker::worker_waker;
 use ahash::RandomState;
 use arena::SharedArena;
@@ -116,9 +116,43 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Number of hash partitions for the output merge phase.
-/// Each partition is merged independently, enabling parallel output.
-const PARTITIONS: usize = 64;
+/// Lower bound on output-merge partitions (also the count for small group-bys,
+/// preserving prior behaviour there).
+const MIN_PARTITIONS: usize = 64;
+/// Upper bound, to cap per-partition fixed overhead (job + per-partition output).
+const MAX_PARTITIONS: usize = 16384;
+
+/// Choose the number of output-merge partitions, **scaled to the merge's data
+/// volume** (`total_entries × entry_size`).
+///
+/// The merge re-inserts every source entry into a per-partition target with
+/// random, hash-distributed probes. When a target is larger than L3 those probes
+/// hit DRAM — the dominant cost for wide-entry, high-cardinality group-bys (e.g.
+/// q32) on a bandwidth-limited box. Sizing partitions so the ~one-per-worker
+/// targets being built concurrently stay within L3 keeps those probes
+/// cache-resident. Scaling by *bytes* (not just group count) means narrow-entry
+/// group-bys (e.g. `GROUP BY url COUNT(*)`), whose merge isn't bandwidth-bound,
+/// keep a small partition count and don't pay the per-partition output overhead.
+fn num_partitions_for(total_entries: usize, entry_size: usize) -> usize {
+    // Cache-blocking only pays off when the merge is memory-bandwidth-bound,
+    // which it is for *wide* entries (multi-key / multi-value aggregates). For
+    // narrow entries (e.g. single int/string key + a `COUNT`) the merge isn't
+    // the bottleneck, so extra partitions would only add per-partition output
+    // overhead (each emits up to `limit` rows for a top-k) — keep those at the
+    // minimum. The 48-byte gate sits between a single-key+count entry (~32 B)
+    // and a two-key, multi-aggregate one (~56 B).
+    if entry_size < 48 {
+        return MIN_PARTITIONS;
+    }
+    // ~700 KB of entries per partition ≈ L3 / concurrent builders, so the
+    // ~one-per-worker targets built concurrently stay cache-resident.
+    const TARGET_BYTES_PER_PARTITION: usize = 700_000;
+    let bytes = total_entries.saturating_mul(entry_size);
+    let raw = (bytes / TARGET_BYTES_PER_PARTITION)
+        .max(1)
+        .next_power_of_two();
+    raw.clamp(MIN_PARTITIONS, MAX_PARTITIONS)
+}
 
 /// Per-worker GROUP BY consumer.
 ///
@@ -215,6 +249,7 @@ pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
     index: usize,
     arena: Arc<SharedArena>,
     partition_capacity: usize,
+    num_partitions: usize,
     top_k: Option<(usize, usize)>,
 }
 
@@ -231,6 +266,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
         debug!("Merging maps for partition {:?}...", self.index);
         let result_map = merge::merge_partition::<K, V>(
             self.index,
+            self.num_partitions,
             &self.tables,
             &self.arena,
             self.partition_capacity,
@@ -257,15 +293,18 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
             // over-provisioned, which at very large group counts is gigabytes less memory
             // to allocate and zero every query.
             let total_entries: usize = tables.iter().map(|m| m.len()).sum::<usize>();
-            let partition_capacity = (total_entries / PARTITIONS).next_power_of_two();
-            info!("Partition capacity {:?}", partition_capacity);
+            let entry_size = std::mem::size_of::<ExtractorEntry<K, V>>();
+            let num_partitions = num_partitions_for(total_entries, entry_size);
+            let partition_capacity = (total_entries / num_partitions).next_power_of_two();
+            info!("Partitions {num_partitions}, capacity {partition_capacity:?}");
             let tables = Arc::new(tables);
-            for i in 0..PARTITIONS {
+            for i in 0..num_partitions {
                 self.injector.push(PartitionJob {
                     tables: tables.clone(),
                     index: i,
                     arena: self.shared_arena.clone(),
                     partition_capacity,
+                    num_partitions,
                     top_k: self.top_k,
                 })
             }

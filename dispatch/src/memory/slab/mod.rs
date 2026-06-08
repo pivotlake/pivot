@@ -43,6 +43,11 @@ pub struct Slab {
     pub(crate) ptr: *mut u8,
     /// Size of this slab in bytes.
     pub(crate) size: usize,
+    /// Whether this slab's bytes are currently all zero (either the parent buffer
+    /// came pre-zeroed from the pool, or the slab was explicitly `zero_out`). Lets
+    /// callers (e.g. the hash table) decide at allocation time whether they got
+    /// zeroed memory for free or must fall back to an occupancy bitmap.
+    pub(crate) zeroed: bool,
     /// Shared ownership of the parent buffer. Dropping the last `Arc` returns the buffer
     /// to the free pool.
     _buffer: Arc<WriteBuffer>,

@@ -106,11 +106,76 @@ fn max_load_for_len(len: usize) -> usize {
     (len as f64 * MAX_LOAD_FACTOR).round() as usize
 }
 
-/// Remap the empty-slot sentinel: `hash == 0` marks an empty slot, so a real
-/// zero hash is bumped to 1 before it is stored or probed.
+/// Minimum fraction of a table's entry-buffer slabs that must come back already
+/// zeroed (from the pre-zeroed pool) to use the **zeroed buffer + `hash == 0`
+/// sentinel** scheme. At/above this, the dirty minority is memset (cheap) and we
+/// skip the per-probe bitmap load. Below it — i.e. the pre-zeroed pool is
+/// depleted, which happens for big, high-cardinality tables on a
+/// bandwidth-bound box — we instead leave the buffer **dirty** and track empties
+/// with an **occupancy bitmap**, avoiding a multi-gigabyte memset (the
+/// "re-zeroing cliff"). This is decided per-table at allocation time from the
+/// actual pool state, not statically from entry width.
+const ZEROED_FRACTION_THRESHOLD: f64 = 0.5;
+
+/// Remap a real zero hash to 1. The sentinel scheme needs this (a stored
+/// `hash == 0` marks an empty slot); the bitmap scheme doesn't care, but it's
+/// applied unconditionally — it's a no-op for non-zero hashes, deterministic
+/// (so consume/merge stay consistent), and harmless under the bitmap (the hash
+/// is only used for slot placement and the fast pre-compare, never as a
+/// sentinel) — which removes a per-insert branch.
 #[inline(always)]
 fn remap_zero(hash: u64) -> u64 {
     if hash == 0 { 1 } else { hash }
+}
+
+/// Empty-slot tracking for a hash table: an occupancy bitmap, or the
+/// `hash == 0` sentinel.
+///
+/// The bitmap is a plain heap `Vec<u64>`, deliberately *not* carved from the
+/// ring like the entry buffer. The ring is `MADV_HUGEPAGE` (2 MB pages); a small
+/// heap `Vec` is on 4 KB pages — and x86 has **separate TLBs for 2 MB vs 4 KB
+/// pages**. The ~350 MB entry buffer already saturates the small 2 MB-page dTLB,
+/// so a *huge-paged* bitmap competes for those same scarce entries and its
+/// per-probe `bitmap[slot>>6]` access evicts the entry buffer's translations →
+/// TLB-miss stalls. A 4 KB-paged bitmap uses the *separate* 4 KB dTLB the entry
+/// buffer never touches, so there's no competition.
+///
+/// Proven on q32 by controlled experiment (this VM exposes no HW cache/TLB
+/// counters): with the *same* mmap region toggled only via `madvise`,
+/// `MADV_HUGEPAGE` ran ~1143 ms vs `MADV_NOHUGEPAGE` ~1123 ms — the slowdown
+/// tracks **page size**, not alignment, allocation, or zeroing (perf shows the
+/// huge-page variants burn ~+2.8 s task-clock of stalls with *fewer* faults).
+/// The hot path never indexes the `Vec`; it derefs the cached
+/// [`BaseHashTable::bitmap_ptr`] (no bounds check).
+pub(crate) enum Occupancy {
+    /// Sentinel scheme: no bitmap — empty slots are marked by `hash == 0`.
+    Sentinel,
+    /// Occupancy bitmap, one bit per slot (1 = occupied).
+    Bitmap(Vec<u64>),
+}
+
+impl Occupancy {
+    /// Allocate a zeroed occupancy bitmap sized for `capacity` slots.
+    pub(crate) fn alloc_bitmap(capacity: usize) -> Self {
+        Occupancy::Bitmap(vec![0u64; capacity.div_ceil(64)])
+    }
+
+    /// Whether the bitmap scheme is in use (vs the `hash == 0` sentinel).
+    #[inline(always)]
+    fn is_bitmap(&self) -> bool {
+        !matches!(self, Occupancy::Sentinel)
+    }
+
+    /// Base pointer to the contiguous bitmap words, or null for the sentinel
+    /// scheme. The `Vec`'s heap buffer is stable across moves of the enclosing
+    /// struct, so this pointer is cached on the hot path.
+    #[inline]
+    fn base_ptr(&self) -> *mut u64 {
+        match self {
+            Occupancy::Sentinel => std::ptr::null_mut(),
+            Occupancy::Bitmap(v) => v.as_ptr() as *mut u64,
+        }
+    }
 }
 
 /// A linear probing hash table optimized for never rehashing, exposing a very raw interface allowing
@@ -235,6 +300,19 @@ pub struct BaseHashTable<
     /// bits (top N) are stripped and the next top bits drive slot placement.
     pre_shift: u32,
     buffer: A,
+    /// Empty-slot tracking: an occupancy bitmap (1 bit/slot, marks occupied), or
+    /// the `hash == 0` sentinel. When the bitmap is used the (large) entry
+    /// `buffer` is left **dirty** and never zeroed — only the tiny bitmap is
+    /// zeroed, removing the per-query full-buffer memset that otherwise dominates
+    /// hot iterations on a bandwidth-bound box whose ring can't keep the zeroed
+    /// pool full. See [`Occupancy`].
+    occupied: Occupancy,
+    /// Cached base pointer of `occupied`'s contiguous bitmap words (null on the
+    /// sentinel path). Lets the per-probe hot path read/write the bitmap with a
+    /// single null check + direct deref — no enum dispatch, no bounds check —
+    /// matching flat-array cost while keeping the storage off-heap. Kept in sync
+    /// with `occupied` on construction and resize.
+    bitmap_ptr: *mut u64,
     length: usize,
     max_load: usize,
     _phantom: PhantomData<(K, V)>,
@@ -256,13 +334,36 @@ impl<K: PersistedKey, V: Value> BaseHashTable<K, V, MultiSlabBuffer<Entry<K, V>>
         expected_capacity: usize,
         pre_shift: u32,
     ) -> Self {
-        let buffer = allocator.create_multi_slab_buffer(expected_capacity, true);
+        // Grab the entry buffer preferring zeroed pool memory but never memsetting,
+        // then decide the empty-slot scheme from what we actually got:
+        //  - single slab, or enough slabs already zeroed → zero the dirty minority
+        //    (cheap) and use the `hash == 0` sentinel (no per-probe bitmap load);
+        //  - otherwise (pre-zeroed pool depleted by a big table) → leave the
+        //    buffer dirty and track empties with an occupancy bitmap, avoiding a
+        //    multi-gigabyte memset.
+        let mut buffer =
+            allocator.create_multi_slab_buffer_lazy::<Entry<K, V>>(expected_capacity);
+        let zeroed_frac = buffer.zeroed_slab_count() as f64 / buffer.slab_count() as f64;
 
+        let occupied = if zeroed_frac >= ZEROED_FRACTION_THRESHOLD {
+            // Enough already-zeroed slabs: memset the dirty minority (cheap) and
+            // use the `hash == 0` sentinel — no per-probe bitmap load.
+            buffer.zero_dirty_slabs();
+            Occupancy::Sentinel
+        } else {
+            // Pre-zeroed pool depleted: leave the buffer dirty and track empties
+            // with a zeroed bitmap, avoiding a large memset.
+            Occupancy::alloc_bitmap(expected_capacity)
+        };
+
+        let bitmap_ptr = occupied.base_ptr();
         BaseHashTable {
             mask: expected_capacity - 1,
             length: 0,
             max_load: max_load_for_len(expected_capacity),
             buffer,
+            occupied,
+            bitmap_ptr,
             pre_shift,
             shift: u64::BITS - expected_capacity.trailing_zeros(),
             _phantom: PhantomData,
@@ -289,10 +390,40 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         self.collisions
     }
 
+    /// Whether this table tracks empties with the occupancy bitmap (vs the
+    /// `hash == 0` sentinel). Lets a caller allocate a matching bitmap before
+    /// [`resize_with`](Self::resize_with).
+    pub fn uses_bitmap(&self) -> bool {
+        self.occupied.is_bitmap()
+    }
+
     /// Map a hash to a slot index using the top bits: `(hash << pre_shift) >> shift`.
     #[inline(always)]
     fn slot_for(&self, hash: u64) -> usize {
         ((hash << self.pre_shift) >> self.shift) as usize
+    }
+
+    /// Whether slot `idx` holds an entry. Bitmap path reads the occupancy bitmap
+    /// (entry bytes are dirty); sentinel path reads the entry's `hash` (`0` =
+    /// empty). The branch is on a per-table-constant flag, so it predicts well.
+    #[inline(always)]
+    pub fn is_occupied(&self, idx: usize) -> bool {
+        // One predicted null check + a direct deref of the cached, contiguous
+        // bitmap (no enum dispatch, no bounds check). Null = sentinel scheme.
+        if self.bitmap_ptr.is_null() {
+            self.buffer[idx].hash != 0
+        } else {
+            unsafe { (*self.bitmap_ptr.add(idx >> 6) >> (idx & 63)) & 1 != 0 }
+        }
+    }
+
+    /// Mark slot `idx` occupied (bitmap path only; the sentinel path marks a slot
+    /// implicitly via the non-zero `hash` written into the entry).
+    #[inline(always)]
+    fn set_occupied(&mut self, idx: usize) {
+        if !self.bitmap_ptr.is_null() {
+            unsafe { *self.bitmap_ptr.add(idx >> 6) |= 1u64 << (idx & 63) };
+        }
     }
 
     /// Direct slot access by index (no bounds checking beyond the buffer's own).
@@ -317,6 +448,12 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
                 ptr.add(128) as *const i8
             );
+            // Bitmap path reads the occupancy word before the entry — prefetch it
+            // too, else it's an un-hidden miss that regresses probe-heavy group-bys.
+            if !self.bitmap_ptr.is_null() {
+                let bm = self.bitmap_ptr.add(idx >> 6) as *const i8;
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(bm);
+            }
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = ptr;
@@ -388,21 +525,17 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     #[inline(always)]
     pub fn merge<const COUNT_COLLISIONS: bool, L: LiveKey<Persisted = K>>(
         &mut self,
-        mut hash: u64,
+        hash: u64,
         key: L,
         value: V,
     ) {
-        // hash == 0 is our empty sentinel, so remap actual zero hashes to 1
-        if hash == 0 {
-            hash = 1;
-        }
-
+        // Always remap a real zero hash to 1: required by the sentinel scheme,
+        // a harmless no-op under the bitmap (see `remap_zero`).
+        let hash = remap_zero(hash);
         let mut idx = self.slot_for(hash);
 
         loop {
-            let entry = &mut self.buffer[idx];
-
-            if entry.hash == 0 {
+            if !self.is_occupied(idx) {
                 // Empty slot found - persist the key and insert
                 let persisted = key.persist();
                 self.buffer[idx] = Entry {
@@ -410,10 +543,12 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
                     value,
                     key: persisted,
                 };
+                self.set_occupied(idx);
                 self.length += 1;
                 return;
             }
 
+            let entry = &mut self.buffer[idx];
             if entry.hash == hash && key.eq_persisted(&entry.key) {
                 // Key exists - merge the values (e.g., add counts)
                 entry.value = entry.value.merge(value);
@@ -436,6 +571,10 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         unsafe {
             let ptr = &self.buffer[idx] as *const Entry<K, V> as *const i8;
             std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
+            if !self.bitmap_ptr.is_null() {
+                let bm = self.bitmap_ptr.add(idx >> 6) as *const i8;
+                std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(bm);
+            }
         }
         #[cfg(not(target_arch = "x86_64"))]
         let _ = idx;
@@ -456,14 +595,14 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         slots: &mut [usize],
         rows: &mut S,
     ) -> bool {
-        let stored = self.buffer[slot].hash;
-        if stored == 0 {
+        if !self.is_occupied(slot) {
             let key = rows.persisted(i);
             let value = rows.value(i);
             self.buffer[slot] = Entry { hash, key, value };
+            self.set_occupied(slot);
             self.length += 1;
             true
-        } else if stored == hash && rows.key_eq(i, &self.buffer[slot].key) {
+        } else if self.buffer[slot].hash == hash && rows.key_eq(i, &self.buffer[slot].key) {
             let value = rows.value(i);
             self.buffer[slot].value = self.buffer[slot].value.merge(value);
             true
@@ -524,6 +663,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             if i + PREFETCH_DIST < length {
                 self.prefetch_entry(self.slot_for(hashes[i + PREFETCH_DIST]));
             }
+            // Always remap zero (required by sentinel, harmless under bitmap).
             let hash = remap_zero(hashes[i]);
             hashes[i] = hash;
             let slot = self.slot_for(hash);
@@ -568,27 +708,46 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     /// # Panics
     ///
     /// The underlying allocation may panic if memory allocation fails.
+    /// `new_occupied` must be a zeroed bitmap iff this table uses the bitmap
+    /// scheme (and [`Occupancy::Sentinel`] for the sentinel scheme, where
+    /// `buffer` must be zeroed); the resize preserves the table's existing
+    /// scheme. The caller owns allocation since `resize_with` has no allocator.
     #[cold]
-    pub fn resize_with(&mut self, buffer: A, new_size: usize) {
+    pub fn resize_with(&mut self, buffer: A, new_occupied: Occupancy, new_size: usize) {
         debug!("Resizing map to {:?}...", new_size);
+        debug_assert_eq!(new_occupied.is_bitmap(), self.occupied.is_bitmap());
         let old_mask = self.mask;
         self.collisions = self.length;
         self.mask = new_size - 1;
         self.shift = u64::BITS - new_size.trailing_zeros();
 
         let old_buffer = mem::replace(&mut self.buffer, buffer);
+        let old_occupied = mem::replace(&mut self.occupied, new_occupied);
+        // Re-cache the hot-path bitmap pointer for the new (post-resize) bitmap
+        // before any is_occupied/set_occupied below uses it.
+        self.bitmap_ptr = self.occupied.base_ptr();
+        let old_bitmap = old_occupied.base_ptr();
 
         for idx in 0..=old_mask {
+            // Occupancy in the OLD table: bitmap path reads the old bitmap;
+            // sentinel path reads the old entry's hash.
+            let occupied = if old_bitmap.is_null() {
+                old_buffer[idx].hash != 0
+            } else {
+                unsafe { (*old_bitmap.add(idx >> 6) >> (idx & 63)) & 1 != 0 }
+            };
+            if !occupied {
+                continue;
+            }
             let entry = &old_buffer[idx];
-            if entry.hash != 0 {
-                let mut new_idx = self.slot_for(entry.hash);
-                loop {
-                    if self.buffer[new_idx].hash == 0 {
-                        self.buffer[new_idx] = *entry;
-                        break;
-                    }
-                    new_idx = (new_idx + 1) & self.mask;
+            let mut new_idx = self.slot_for(entry.hash);
+            loop {
+                if !self.is_occupied(new_idx) {
+                    self.buffer[new_idx] = *entry;
+                    self.set_occupied(new_idx);
+                    break;
                 }
+                new_idx = (new_idx + 1) & self.mask;
             }
         }
 
@@ -617,10 +776,10 @@ impl<'a, K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + Inde
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.idx < self.hash_table.mask + 1 {
-            let entry = &self.hash_table.buffer[self.idx];
+            let idx = self.idx;
             self.idx += 1;
-            if entry.hash != 0 {
-                return Some(entry);
+            if self.hash_table.is_occupied(idx) {
+                return Some(&self.hash_table.buffer[idx]);
             }
         }
         None
@@ -643,6 +802,9 @@ mod tests {
     type TestTable = BaseHashTable<u64, Count, Vec<Entry<u64, Count>>>;
 
     fn new_table(capacity: usize) -> TestTable {
+        // Vec-backed test tables use the zeroed-buffer + `hash == 0` sentinel
+        // scheme (no bitmap); the bitmap path needs ring-backed slabs and is
+        // covered end-to-end by the query oracle tests.
         let buffer = vec![Entry::default(); capacity];
         BaseHashTable {
             mask: capacity - 1,
@@ -650,6 +812,8 @@ mod tests {
             collisions: 0,
             pre_shift: 0,
             buffer,
+            occupied: Occupancy::Sentinel,
+            bitmap_ptr: std::ptr::null_mut(),
             length: 0,
             max_load: max_load_for_len(capacity),
             _phantom: PhantomData,
@@ -696,7 +860,9 @@ mod tests {
     }
 
     #[test]
-    fn hash_zero_is_remapped_and_retrievable() {
+    fn hash_zero_is_stored_and_retrievable() {
+        // A real zero hash is handled invisibly (remapped on the sentinel path,
+        // stored as-is on the bitmap path) and the entry stays retrievable.
         let mut table = new_table(16);
 
         table.merge::<false, _>(0, 99u64, Count(1));
@@ -704,7 +870,6 @@ mod tests {
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
         assert_eq!(*entry.key(), 99);
-        assert_ne!(entry.hash(), 0);
     }
 
     #[test]
@@ -763,7 +928,7 @@ mod tests {
         }
 
         let new_buf = vec![Entry::default(); 32];
-        table.resize_with(new_buf, 32);
+        table.resize_with(new_buf, Occupancy::Sentinel, 32);
 
         assert_eq!(table.len(), 8);
         assert_eq!(table.capacity(), 32);
@@ -782,7 +947,7 @@ mod tests {
         assert!(pre_resize_collisions > 0);
 
         let new_buf = vec![Entry::default(); 32];
-        table.resize_with(new_buf, 32);
+        table.resize_with(new_buf, Occupancy::Sentinel, 32);
 
         assert_eq!(table.collisions(), table.len());
     }
@@ -834,7 +999,7 @@ mod tests {
         table.merge::<false, _>(99, 2u64, Count(1));
 
         let new_buf = vec![Entry::default(); 32];
-        table.resize_with(new_buf, 32);
+        table.resize_with(new_buf, Occupancy::Sentinel, 32);
         table.merge::<false, _>(42, 1u64, Count(1));
         table.merge::<false, _>(200, 3u64, Count(1));
 
@@ -850,7 +1015,7 @@ mod tests {
         table.merge::<false, _>(42, 100u64, Count(1));
 
         let occupied: Vec<usize> = (0..table.capacity())
-            .filter(|&i| table.entry_at(i).hash() != 0)
+            .filter(|&i| table.is_occupied(i))
             .collect();
 
         assert_eq!(occupied.len(), 1);

@@ -41,6 +41,28 @@ impl<T> MultiSlabBuffer<T> {
         let offset_in_buffer = byte_offset & BUFFER_MASK;
         unsafe { self.slabs[buffer_idx].ptr.add(offset_in_buffer) as *mut T }
     }
+
+    /// Total number of backing slabs.
+    pub fn slab_count(&self) -> usize {
+        self.slabs.len()
+    }
+
+    /// Number of backing slabs that came back already zeroed (no memset needed).
+    pub fn zeroed_slab_count(&self) -> usize {
+        self.slabs.iter().filter(|s| s.zeroed).count()
+    }
+
+    /// Zero only the slabs that aren't already zeroed. Used when the caller has
+    /// decided to treat a lazily-allocated buffer as zeroed (sentinel path): the
+    /// already-zeroed majority costs nothing, only the dirty minority is memset.
+    pub fn zero_dirty_slabs(&mut self) {
+        for slab in &mut self.slabs {
+            if !slab.zeroed {
+                slab.zero_out();
+                slab.zeroed = true;
+            }
+        }
+    }
 }
 
 impl<T> Index<usize> for MultiSlabBuffer<T> {

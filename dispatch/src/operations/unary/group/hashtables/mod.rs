@@ -20,6 +20,7 @@ pub use crate::operations::unary::group::values::ValueExtractor;
 
 mod hash_table;
 pub use hash_table::{BatchRowSource, Entry, LiveKey, PersistedKey, Value};
+pub(crate) use hash_table::Occupancy;
 
 mod aggregated_table;
 pub use aggregated_table::AggregatedTable;

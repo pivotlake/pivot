@@ -43,10 +43,13 @@ impl SlabAllocator {
         let mut slab = Slab {
             ptr: unsafe { self.working_buffer.ptr.add(self.offset) },
             size,
+            // Carving doesn't write, so a slab from a pre-zeroed buffer is zeroed.
+            zeroed: self.working_buffer.zeroed,
             _buffer: self.working_buffer.clone(),
         };
         if zeroed && !self.working_buffer.zeroed {
             slab.zero_out();
+            slab.zeroed = true;
         }
 
         self.offset += size;
@@ -119,6 +122,34 @@ impl SlabAllocator {
         }
         self.align_offset::<T>();
         MultiSlabBuffer::new(self.get_slabs_of_size(bytes, zeroed))
+    }
+
+    /// Like [`create_multi_slab_buffer`](Self::create_multi_slab_buffer) but
+    /// **prefers** zeroed pool buffers and **never memsets** — each slab's
+    /// [`Slab::zeroed`] flag reflects whether it came back already zeroed. The
+    /// caller inspects the result (via [`MultiSlabBuffer::zeroed_slab_count`])
+    /// and decides whether to treat it as zeroed (memsetting the dirty minority)
+    /// or to track occupancy with a bitmap and leave it dirty. This avoids
+    /// eagerly memsetting a multi-gigabyte buffer (the "re-zeroing cliff") when
+    /// the pre-zeroed pool is depleted.
+    pub fn create_multi_slab_buffer_lazy<T>(&mut self, size: usize) -> MultiSlabBuffer<T> {
+        let bytes = size * size_of::<T>();
+        if self.remaining_in_buffer() < bytes {
+            self.advance_to_new_buffer(true); // prefer zeroed
+        }
+        self.align_offset::<T>();
+        let mut slabs = vec![];
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let slab_size = std::cmp::min(remaining, self.remaining_in_buffer());
+            // `false`: never memset — keep whatever zeroed-ness the pool gave us.
+            slabs.push(self.get_slab_from_current_buffer(slab_size, false));
+            remaining -= slab_size;
+            if self.remaining_in_buffer() == 0 {
+                self.advance_to_new_buffer(true); // prefer zeroed
+            }
+        }
+        MultiSlabBuffer::new(slabs)
     }
 
     /// Allocates a [`SlabBuffer<T>`] that can hold `size` elements of type `T`.
