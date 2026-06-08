@@ -12,61 +12,46 @@
 //!
 //! The aggregate *kind* and per-row contribution are the group module's
 //! [`AggregationSlot`] / [`Aggregate`](RowAggregate) ops — the single source of
-//! truth shared with GROUP BY — so this operator only adds the global concerns:
-//! null skipping, an `i128` batch accumulator (a full billion-row scan of a
-//! 16/32/64-bit integer column never overflows it), and the single-row output.
-//! `Sum` emits its full `i128` as a `Decimal128(38, 0)` cell (matching DuckDB's
-//! `HUGEINT` result type) so large sums over a 64-bit column are exact; `Count`
-//! emits `Int64`. There is no `Avg` kind: DuckDB lowers `AVG(x)` to
-//! `sum(x) / count(x)` over two aggregates plus a divide projection (the divide
-//! casts both operands to `f64`, so the full-precision `Decimal128` sum yields a
-//! correct average), so an average reaches this operator as a `Sum` slot and a
-//! `Count` slot, never as a dedicated kind.
+//! truth shared with GROUP BY — and so is the accumulator width [`A`](Accumulator):
+//! the operator is generic over `i64`/`i128`, chosen by the same column-width rule
+//! as the grouped path (`i128` only when a sum reads a 64-bit column, e.g.
+//! `SUM(UserID)`). `Sum` emits `Int64` or `Decimal128(38, 0)` accordingly (the
+//! latter matching DuckDB's `HUGEINT`); `Count` always emits `Int64`. There is no
+//! `Avg` kind: DuckDB lowers `AVG(x)` to `sum(x) / count(x)` over two aggregates
+//! plus a divide projection, so an average reaches this operator as a `Sum` slot
+//! and a `Count` slot.
 
 use crate::operations::channels::Sender;
-use crate::operations::unary::group::{Aggregate as RowAggregate, AggregationKind, AggregationSlot, Sum};
+use crate::operations::unary::group::{
+    Accumulator, Aggregate as RowAggregate, AggregationKind, AggregationSlot, Sum,
+};
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, Decimal128Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::sync::mpsc;
-
-/// One partial accumulator: running `i128` sum and non-null count. A `Sum` slot
-/// uses `sum`; a `Count`/`CountStar` slot uses `count`.
-#[derive(Default, Clone, Copy)]
-struct Acc {
-    sum: i128,
-    count: u64,
-}
-
-impl Acc {
-    fn merge(&mut self, other: &Acc) {
-        self.sum += other.sum;
-        self.count += other.count;
-    }
-}
 
 /// Factory for the aggregate operator. All workers share one mpsc channel; the
 /// first factory gets the receiver, the rest get `None`, so per-worker partials
 /// flow to a single collector (the same wiring as [`OrderByLimitFactory`]).
 ///
 /// [`OrderByLimitFactory`]: super::order_by_limit
-pub struct AggregateFactory {
+pub struct AggregateFactory<A: Accumulator> {
     slots: Arc<Vec<AggregationSlot>>,
-    sender: mpsc::Sender<Vec<Acc>>,
-    receiver: Option<mpsc::Receiver<Vec<Acc>>>,
+    sender: mpsc::Sender<Vec<A>>,
+    receiver: Option<mpsc::Receiver<Vec<A>>>,
 }
 
-impl AggregateFactory {
+impl<A: Accumulator> AggregateFactory<A> {
     /// Create one factory per worker, all sharing the same partials channel.
     pub fn create_for_workers(
         slots: Vec<AggregationSlot>,
         worker_count: usize,
-    ) -> impl IntoIterator<Item = AggregateFactory> {
+    ) -> impl IntoIterator<Item = AggregateFactory<A>> {
         let slots = Arc::new(slots);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
@@ -79,8 +64,8 @@ impl AggregateFactory {
     }
 }
 
-impl UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory {
-    type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate>;
+impl<A: Accumulator> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
+    type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate<A>>;
 
     fn build_unary(mut self) -> Self::Unary {
         PipelineBreaker::Consuming(Aggregate::new(self.slots, self.sender, self.receiver.take()))
@@ -89,20 +74,20 @@ impl UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory {
 
 /// Per-worker aggregate consumer. Accumulates local partials, then sends them
 /// down the shared channel on finalization.
-pub struct Aggregate {
+pub struct Aggregate<A: Accumulator> {
     slots: Arc<Vec<AggregationSlot>>,
-    local: Vec<Acc>,
-    sender: mpsc::Sender<Vec<Acc>>,
-    receiver: Option<mpsc::Receiver<Vec<Acc>>>,
+    local: Vec<A>,
+    sender: mpsc::Sender<Vec<A>>,
+    receiver: Option<mpsc::Receiver<Vec<A>>>,
 }
 
-impl Aggregate {
+impl<A: Accumulator> Aggregate<A> {
     fn new(
         slots: Arc<Vec<AggregationSlot>>,
-        sender: mpsc::Sender<Vec<Acc>>,
-        receiver: Option<mpsc::Receiver<Vec<Acc>>>,
+        sender: mpsc::Sender<Vec<A>>,
+        receiver: Option<mpsc::Receiver<Vec<A>>>,
     ) -> Self {
-        let local = vec![Acc::default(); slots.len()];
+        let local = vec![A::default(); slots.len()];
         Aggregate {
             slots,
             local,
@@ -112,65 +97,51 @@ impl Aggregate {
     }
 }
 
-/// Sum the non-null values of an integer primitive column as `i128`, returning
-/// `(sum, non_null_count)`.
+/// Sum an integer primitive column into the accumulator `A`.
 ///
 /// The per-row value read (downcast + widen to `i64`) is delegated to the GROUP
 /// BY [`Sum`] op — the single source of truth for what `SUM` contributes per
-/// row — so this path only layers on the two concerns that op leaves out: null
-/// skipping, and an accumulator wide enough for a whole batch.
-///
-/// `$acc` is the per-batch accumulator type. For 16/32-bit columns an `i64`
-/// batch fold is safe (a single batch can't overflow it) and fast. For 64-bit
-/// columns the values themselves can approach `i64::MAX`, so a
-/// batch sum must accumulate in `i128` or it overflows within one batch.
-fn sum_column(arr: &dyn Array) -> (i128, u64) {
+/// row. The fold accumulates into `A`: `i64` for 16/32-bit columns (a full scan
+/// can't overflow it) and `i128` for a 64-bit column (whose values can approach
+/// `i64::MAX`), the width the planner picks.
+fn sum_column<A: Accumulator>(arr: &dyn Array) -> A {
     macro_rules! sum_primitive {
-        ($ty:ty, $acc:ty) => {{
+        ($ty:ty) => {{
             let a = arr.as_primitive::<$ty>();
-            let non_null = (a.len() - a.null_count()) as u64;
-            let contribution = |i: usize| Sum::<$ty>::contribution(&a, i) as $acc;
-            let batch_sum: $acc = if a.null_count() == 0 {
-                (0..a.len()).map(contribution).sum()
-            } else {
-                (0..a.len()).filter(|&i| a.is_valid(i)).map(contribution).sum()
-            };
-            (batch_sum as i128, non_null)
+            let mut acc = A::default();
+            for i in 0..a.len() {
+                acc += A::from_i64(Sum::<$ty>::contribution(&a, i));
+            }
+            acc
         }};
     }
 
     match arr.data_type() {
-        DataType::Int16 => sum_primitive!(Int16Type, i64),
-        DataType::Int32 => sum_primitive!(Int32Type, i64),
-        DataType::Int64 => sum_primitive!(Int64Type, i128),
+        DataType::Int16 => sum_primitive!(Int16Type),
+        DataType::Int32 => sum_primitive!(Int32Type),
+        DataType::Int64 => sum_primitive!(Int64Type),
         other => panic!("aggregate: unsupported column type {other:?}"),
     }
 }
 
 /// Build the single output column for one aggregate slot from its accumulator.
-fn result_column(kind: AggregationKind, acc: Acc) -> (Field, ArrayRef) {
+fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, ArrayRef) {
     match kind {
-        // Emit the full i128 sum as Decimal128(38, 0) (scale 0 = a plain
-        // integer) so large sums survive without the i64 truncation that an
-        // Int64 output column would force. Precision 38 is the max Decimal128
-        // holds and comfortably covers any i128 a real scan produces.
+        // `Int64` or `Decimal128(38, 0)` per the accumulator width — see
+        // [`Accumulator::sum_datatype`].
         AggregationKind::Sum => (
-            Field::new("sum", DataType::Decimal128(38, 0), false),
-            Arc::new(
-                Decimal128Array::from(vec![acc.sum])
-                    .with_precision_and_scale(38, 0)
-                    .unwrap(),
-            ),
+            Field::new("sum", A::sum_datatype(), false),
+            A::one_sum_array(value),
         ),
         AggregationKind::Count | AggregationKind::CountStar => (
             Field::new("count", DataType::Int64, false),
-            Arc::new(Int64Array::from(vec![acc.count as i64])),
+            Arc::new(Int64Array::from(vec![value.as_i64()])),
         ),
     }
 }
 
-impl Consumer<RecordBatch, RecordBatch> for Aggregate {
-    type Outputter = AggregateOutputter;
+impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
+    type Outputter = AggregateOutputter<A>;
 
     fn consume<OP: Sender<RecordBatch>>(
         &mut self,
@@ -178,21 +149,17 @@ impl Consumer<RecordBatch, RecordBatch> for Aggregate {
         _output: &mut OP,
     ) -> unary::Result<()> {
         for (i, slot) in self.slots.iter().enumerate() {
-            match slot.kind {
+            self.local[i] += match slot.kind {
                 // COUNT(*) counts every row and never reads a column.
-                AggregationKind::CountStar => self.local[i].count += batch.num_rows() as u64,
+                AggregationKind::CountStar => A::from_i64(batch.num_rows() as i64),
                 // COUNT(c) needs only the non-null count, not the values — read
                 // it straight off the null bitmap instead of summing the column.
                 AggregationKind::Count => {
                     let col = batch.column(slot.column);
-                    self.local[i].count += (col.len() - col.null_count()) as u64;
+                    A::from_i64((col.len() - col.null_count()) as i64)
                 }
-                AggregationKind::Sum => {
-                    let (sum, count) = sum_column(batch.column(slot.column));
-                    self.local[i].sum += sum;
-                    self.local[i].count += count;
-                }
-            }
+                AggregationKind::Sum => sum_column::<A>(batch.column(slot.column)),
+            };
         }
         Ok(())
     }
@@ -205,7 +172,7 @@ impl Consumer<RecordBatch, RecordBatch> for Aggregate {
         self.sender.send(self.local).expect("aggregate collector dropped");
         worker_waker().notify();
 
-        let totals = vec![Acc::default(); self.slots.len()];
+        let totals = vec![A::default(); self.slots.len()];
         Ok(self.receiver.map(|rx| AggregateOutputter {
             rx,
             slots: self.slots,
@@ -216,19 +183,19 @@ impl Consumer<RecordBatch, RecordBatch> for Aggregate {
 
 /// Output phase (one worker only): drains every sibling's partials from the
 /// channel, sums them, then emits the single-row result.
-pub struct AggregateOutputter {
-    rx: mpsc::Receiver<Vec<Acc>>,
+pub struct AggregateOutputter<A: Accumulator> {
+    rx: mpsc::Receiver<Vec<A>>,
     slots: Arc<Vec<AggregationSlot>>,
-    totals: Vec<Acc>,
+    totals: Vec<A>,
 }
 
-impl Outputter<RecordBatch> for AggregateOutputter {
+impl<A: Accumulator> Outputter<RecordBatch> for AggregateOutputter<A> {
     fn output<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
         loop {
             match self.rx.try_recv() {
                 Ok(partial) => {
                     for (total, p) in self.totals.iter_mut().zip(&partial) {
-                        total.merge(p);
+                        *total += *p;
                     }
                 }
                 // Some siblings haven't finished yet; resume when re-driven.
@@ -239,7 +206,7 @@ impl Outputter<RecordBatch> for AggregateOutputter {
                         .slots
                         .iter()
                         .zip(&self.totals)
-                        .map(|(slot, acc)| result_column(slot.kind, *acc))
+                        .map(|(slot, total)| result_column(slot.kind, *total))
                         .unzip();
                     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
                     output.send(batch)?;
@@ -254,7 +221,7 @@ impl Outputter<RecordBatch> for AggregateOutputter {
 mod tests {
     use super::*;
     use crate::operations::unary::test_utils::run_consumers;
-    use arrow_array::Int32Array;
+    use arrow_array::{Decimal128Array, Int32Array};
 
     fn make_batch(values: &[i32]) -> RecordBatch {
         let array = Int32Array::from(values.to_vec());
@@ -267,7 +234,7 @@ mod tests {
 
     /// Build `n` channel-wired aggregate consumers sharing one partials channel
     /// (the first holds the receiver), mirroring the factory's wiring.
-    fn build(n: usize, slots: Vec<AggregationSlot>) -> Vec<Aggregate> {
+    fn build<A: Accumulator>(n: usize, slots: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
         let slots = Arc::new(slots);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
@@ -294,15 +261,16 @@ mod tests {
 
     #[test]
     fn single_worker_sum() {
-        let ops = build(1, vec![slot(AggregationKind::Sum, 0)]);
+        // Int32 column → i64 accumulator → Int64 output.
+        let ops = build::<i64>(1, vec![slot(AggregationKind::Sum, 0)]);
         let out = run_consumers(ops, vec![vec![make_batch(&[1, 2, 3]), make_batch(&[4, 5])]]);
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i128(&out.items[0], 0), 15);
+        assert_eq!(col_i64(&out.items[0], 0), 15);
     }
 
     #[test]
     fn sum_and_count_together() {
-        let ops = build(
+        let ops = build::<i64>(
             1,
             vec![
                 slot(AggregationKind::Sum, 0),
@@ -311,13 +279,13 @@ mod tests {
         );
         let out = run_consumers(ops, vec![vec![make_batch(&[2, 4, 6, 8])]]);
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i128(&out.items[0], 0), 20); // sum
+        assert_eq!(col_i64(&out.items[0], 0), 20); // sum
         assert_eq!(col_i64(&out.items[0], 1), 4); // count
     }
 
     #[test]
     fn multiple_workers_sum_merge() {
-        let ops = build(3, vec![slot(AggregationKind::Sum, 0)]);
+        let ops = build::<i64>(3, vec![slot(AggregationKind::Sum, 0)]);
         let out = run_consumers(
             ops,
             vec![
@@ -327,13 +295,13 @@ mod tests {
             ],
         );
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i128(&out.items[0], 0), 36);
+        assert_eq!(col_i64(&out.items[0], 0), 36);
     }
 
     #[test]
     fn large_i64_sum_is_exact() {
-        // Three i64::MAX values sum past i64::MAX; the Decimal128 output must
-        // keep the full i128 instead of truncating to i64.
+        // Three i64::MAX values sum past i64::MAX; an i128 accumulator over an
+        // Int64 column must keep the full value and emit it as Decimal128.
         let schema = Arc::new(Schema::new(vec![Field::new("u", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
             schema,
@@ -344,23 +312,23 @@ mod tests {
             ]))],
         )
         .unwrap();
-        let ops = build(1, vec![slot(AggregationKind::Sum, 0)]);
+        let ops = build::<i128>(1, vec![slot(AggregationKind::Sum, 0)]);
         let out = run_consumers(ops, vec![vec![batch]]);
         assert_eq!(col_i128(&out.items[0], 0), 3 * i64::MAX as i128);
     }
 
     #[test]
     fn count_star_counts_all_rows() {
-        let ops = build(1, vec![slot(AggregationKind::CountStar, 0)]);
+        let ops = build::<i64>(1, vec![slot(AggregationKind::CountStar, 0)]);
         let out = run_consumers(ops, vec![vec![make_batch(&[5, 6, 7]), make_batch(&[8])]]);
         assert_eq!(col_i64(&out.items[0], 0), 4);
     }
 
     #[test]
     fn empty_input_sum_is_zero() {
-        let ops = build(1, vec![slot(AggregationKind::Sum, 0)]);
+        let ops = build::<i64>(1, vec![slot(AggregationKind::Sum, 0)]);
         let out = run_consumers(ops, vec![vec![]]);
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i128(&out.items[0], 0), 0);
+        assert_eq!(col_i64(&out.items[0], 0), 0);
     }
 }

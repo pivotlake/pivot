@@ -12,10 +12,12 @@ use crate::operations::unary::group::hashtables::Value;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 
+mod accumulator;
 mod aggregate;
 mod aggregation_row;
 mod compiled;
 
+pub use accumulator::Accumulator;
 pub use aggregate::{Aggregate, Count, Sum};
 pub use aggregation_row::AggregationRowValueExtractor;
 pub use compiled::Compiled;

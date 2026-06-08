@@ -57,7 +57,7 @@ use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::{
-    AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory, Count,
+    Accumulator, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory, Count,
     CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
     NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory,
     UnaryOperator, UnaryOperatorFactory, ValueExtractor,
@@ -473,9 +473,9 @@ impl RecordBatchOperatorSpec {
     /// columns, computed in a single pass. Emits one single-row output column
     /// per slot (`Decimal128(38, 0)` for SUM, `Int64` for COUNT). `AVG` arrives
     /// pre-lowered to a SUM slot + a COUNT slot with a downstream divide.
-    pub fn aggregate(self, slots: Vec<AggregationSlot>) -> Self {
+    pub fn aggregate<A: Accumulator>(self, slots: Vec<AggregationSlot>) -> Self {
         let worker_count = self.worker_count();
-        self.unary(AggregateFactory::create_for_workers(slots, worker_count))
+        self.unary(AggregateFactory::<A>::create_for_workers(slots, worker_count))
     }
 
     /// Sort by the given columns and keep only the first `limit` rows.

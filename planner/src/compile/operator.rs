@@ -93,6 +93,19 @@ impl Projection {
     }
 }
 
+/// Pick the aggregate accumulator width by column type — the single rule shared
+/// by the global and grouped paths: `i128` only when a `SUM` reads a 64-bit
+/// column (whose total can overflow `i64`, e.g. `SUM(UserID)`), else `i64`.
+fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
+    use crate::expression::AggregateFunc;
+    exprs.iter().any(|e| {
+        matches!(
+            e,
+            Expression::AggregateFunc(AggregateFunc::Sum(a)) if a.column.return_type == Type::Int64
+        )
+    })
+}
+
 impl Aggregate {
     pub fn compile(
         &self,
@@ -133,7 +146,14 @@ impl Aggregate {
                     expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            return Ok(input.aggregate(slots));
+            // Pick the accumulator width by column type, the same rule the
+            // grouped path uses: i128 only when a SUM reads a 64-bit column
+            // (whose total can overflow i64, e.g. SUM(UserID)), else i64.
+            return Ok(if sum_reads_wide_column(&self.expressions) {
+                input.aggregate::<i128>(slots)
+            } else {
+                input.aggregate::<i64>(slots)
+            });
         }
 
         // Grouped. A single key with a lone COUNT(*) uses the dedicated count
@@ -273,9 +293,18 @@ impl Aggregate {
 
         let top_k = self.top_k;
 
-        // Monomorphise over the two key types and the slot arity (N).
+        // Accumulator width, by the same column-type rule as the global path:
+        // i128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
+        // No ClickBench grouped query sums a 64-bit column, so this is i64 in
+        // practice; the i128 arm keeps a wide grouped sum correct rather than
+        // silently overflowing the slot.
+        let wide = sum_reads_wide_column(&self.expressions);
+
+        // Monomorphise over the two key types, the slot arity (N), and the
+        // accumulator width ($acc). The compiled q32 shape is i16-only (never
+        // wide), so only the generic fallback needs the width parameter.
         macro_rules! by_arity {
-            ($a:ty, $b:ty) => {{
+            ($a:ty, $b:ty, $acc:ty) => {{
                 type Key = IntPairKeyExtractor<$a, $b>;
                 match sig.as_slice() {
                     // COUNT(*), SUM(i16), SUM(i16), COUNT — compiled to straight-line
@@ -293,27 +322,27 @@ impl Aggregate {
                     _ => {
                         match slots.len() {
                             1 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<1>>(
+                                .group_by_aggregate::<Key, AggregationRowValueExtractor<1, $acc>>(
                                     key_cols, slots, top_k,
                                 )),
                             2 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<2>>(
+                                .group_by_aggregate::<Key, AggregationRowValueExtractor<2, $acc>>(
                                     key_cols, slots, top_k,
                                 )),
                             3 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<3>>(
+                                .group_by_aggregate::<Key, AggregationRowValueExtractor<3, $acc>>(
                                     key_cols, slots, top_k,
                                 )),
                             4 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<4>>(
+                                .group_by_aggregate::<Key, AggregationRowValueExtractor<4, $acc>>(
                                     key_cols, slots, top_k,
                                 )),
                             5 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<5>>(
+                                .group_by_aggregate::<Key, AggregationRowValueExtractor<5, $acc>>(
                                     key_cols, slots, top_k,
                                 )),
                             6 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<6>>(
+                                .group_by_aggregate::<Key, AggregationRowValueExtractor<6, $acc>>(
                                     key_cols, slots, top_k,
                                 )),
                             n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
@@ -323,13 +352,24 @@ impl Aggregate {
             }};
         }
 
+        // Pick the accumulator width once, then dispatch on the key types.
+        macro_rules! by_keys {
+            ($a:ty, $b:ty) => {
+                if wide {
+                    by_arity!($a, $b, i128)
+                } else {
+                    by_arity!($a, $b, i64)
+                }
+            };
+        }
+
         match (&key_refs[0].return_type, &key_refs[1].return_type) {
-            (Type::Int64, Type::Int32) => by_arity!(Int64Type, Int32Type),
-            (Type::Int32, Type::Int32) => by_arity!(Int32Type, Int32Type),
-            (Type::Int16, Type::Int32) => by_arity!(Int16Type, Int32Type),
-            (Type::Int16, Type::Int16) => by_arity!(Int16Type, Int16Type),
-            (Type::Int64, Type::Int64) => by_arity!(Int64Type, Int64Type),
-            (Type::Int32, Type::Int64) => by_arity!(Int32Type, Int64Type),
+            (Type::Int64, Type::Int32) => by_keys!(Int64Type, Int32Type),
+            (Type::Int32, Type::Int32) => by_keys!(Int32Type, Int32Type),
+            (Type::Int16, Type::Int32) => by_keys!(Int16Type, Int32Type),
+            (Type::Int16, Type::Int16) => by_keys!(Int16Type, Int16Type),
+            (Type::Int64, Type::Int64) => by_keys!(Int64Type, Int64Type),
+            (Type::Int32, Type::Int64) => by_keys!(Int32Type, Int64Type),
             (a, _) => Err(Error::DataTypeNotSupportedForGroupBy(a.clone())),
         }
     }
