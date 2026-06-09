@@ -80,7 +80,7 @@ use crate::worker::{Worker, WorkerWaker};
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
-pub use io::{FsRequest, HttpRequest, IORequest};
+pub use io::{FsRequest, HttpRequest};
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};

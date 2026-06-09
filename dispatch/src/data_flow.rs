@@ -15,12 +15,13 @@
 //! - [`get_next_fs_request`](DataFlow::get_next_fs_request) /
 //!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending IO
 //!   requests from operators (e.g. parquet page reads, or HTTP range reads).
-//! - [`process_io`](DataFlow::process_io) — deliver a completed IO buffer to the
+//! - [`process_fs`](DataFlow::process_fs) / [`process_http`](DataFlow::process_http)
+//!   — deliver a completed read to the
 //!   operator that requested it.
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
-use crate::io::{DataFlowRequest, FsRequest, HttpRequest, IORequest};
+use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
 use crate::operations::Operator;
 use crate::worker::worker_waker;
 use ahash::HashMap;
@@ -265,13 +266,24 @@ impl DataFlow {
         })
     }
 
-    /// Notify the operator that requested it that one of its reads has landed
-    /// (already committed into the cache slot by the requester).
-    pub fn process_io(&mut self, node_id: Identifier, request: IORequest) {
+    /// Notify the operator that requested it that one of its filesystem reads
+    /// has landed (already committed into the cache slot by the requester).
+    pub fn process_fs(&mut self, node_id: Identifier, request: FsRequest) {
         self.try_run(|d| {
             d.graph.operators[node_id]
                 .operator
-                .process_io_response(request)?;
+                .process_fs_response(request)?;
+            Ok(())
+        });
+    }
+
+    /// Notify the operator that requested it that one of its HTTP reads has
+    /// landed (already committed into the cache slot by the requester).
+    pub fn process_http(&mut self, node_id: Identifier, request: HttpRequest) {
+        self.try_run(|d| {
+            d.graph.operators[node_id]
+                .operator
+                .process_http_response(request)?;
             Ok(())
         });
     }

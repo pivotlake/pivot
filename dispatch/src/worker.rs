@@ -25,7 +25,7 @@
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
-use crate::io::{DataFlowRequest, IORequest, IORequester};
+use crate::io::{Completion, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use core_affinity::CoreId;
 use std::cell::Cell;
@@ -340,15 +340,21 @@ impl Worker {
         }
     }
 
-    /// Deliver completed reads (disk and HTTP) back to the operators that
-    /// requested them; by the time we're here each block's bytes are already
-    /// committed to its cache slot. The transport-typed completions erase into
-    /// the operator-facing [`IORequest`] form here.
+    /// Deliver completed reads back to the operators that requested them, each
+    /// transport to its own handler; by the time we're here each block's bytes
+    /// are already committed to its cache slot.
     fn process_io_completions(&mut self) -> Result<()> {
         for completion in self.io.completions()? {
-            let request: DataFlowRequest<IORequest> = completion.into();
-            let data_flow = self.data_flows.get_mut(&request.data_flow_id).unwrap();
-            data_flow.process_io(request.operator_idx, request.request);
+            match completion {
+                Completion::Fs(r) => {
+                    let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
+                    data_flow.process_fs(r.operator_idx, r.request);
+                }
+                Completion::Http(r) => {
+                    let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
+                    data_flow.process_http(r.operator_idx, r.request);
+                }
+            }
         }
         Ok(())
     }

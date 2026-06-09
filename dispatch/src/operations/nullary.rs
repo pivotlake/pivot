@@ -7,7 +7,7 @@
 use super::Operator;
 use crate::api::{Chain, OperatorFactory};
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest, IORequest};
+use crate::io::{FsRequest, HttpRequest};
 use crate::operations::channels::Sender;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -44,12 +44,22 @@ pub trait Nullary<O> {
         Ok(vec![])
     }
 
-    /// Handle a completed read (disk or HTTP); its bytes are already committed to
+    /// Handle a completed filesystem read; its bytes are already committed to
     /// the cache slot.
-    fn process_io_response<S: Sender<O>>(
+    fn process_fs_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _request: IORequest,
+        _request: FsRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed HTTP read; its bytes are already committed to the
+    /// cache slot.
+    fn process_http_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: HttpRequest,
     ) -> Result<()> {
         unreachable!()
     }
@@ -90,10 +100,16 @@ impl<O, N: Nullary<O>, S: Sender<O>> Operator for NullaryOperator<O, N, S> {
         Ok(self.nullary.next_http_requests()?)
     }
 
-    fn process_io_response(&mut self, request: IORequest) -> super::Result<()> {
+    fn process_fs_response(&mut self, request: FsRequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_io_response(&mut self.sender, request)?)
+            .process_fs_response(&mut self.sender, request)?)
+    }
+
+    fn process_http_response(&mut self, request: HttpRequest) -> super::Result<()> {
+        Ok(self
+            .nullary
+            .process_http_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {

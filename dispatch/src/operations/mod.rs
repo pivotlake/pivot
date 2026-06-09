@@ -33,7 +33,8 @@
 //!    [`next_http_requests`](Operator::next_http_requests) — return any pending IO requests
 //!    (e.g. read a parquet page from disk, or a byte range over HTTP). The worker submits
 //!    these asynchronously and delivers completions via
-//!    [`process_io_response`](Operator::process_io_response).
+//!    [`process_fs_response`](Operator::process_fs_response) /
+//!    [`process_http_response`](Operator::process_http_response).
 //!
 //! 3. [`try_finish`](Operator::try_finish) — called when the input channel is drained
 //!    and all sibling operators (across workers) have also drained. The operator does
@@ -43,7 +44,7 @@
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest, IORequest};
+use crate::io::{FsRequest, HttpRequest};
 use thiserror::Error;
 
 pub mod channels;
@@ -85,22 +86,26 @@ pub trait Operator {
 
     /// Return any pending filesystem read requests (e.g. parquet page reads from
     /// a local file). The worker submits them and later calls
-    /// [`process_io_response`](Self::process_io_response).
+    /// [`process_fs_response`](Self::process_fs_response).
     fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>>;
 
     /// Return any pending HTTP requests (reads of [`Remote`](crate::io::FileLocation::Remote)
     /// regions). The worker submits these on the same per-core io_uring and
-    /// delivers completions via the same
-    /// [`process_io_response`](Self::process_io_response) — by the time it is
-    /// called the bytes are already committed to the cache slot, identical to a
-    /// disk read.
+    /// delivers completions via
+    /// [`process_http_response`](Self::process_http_response) — by the time it
+    /// is called the bytes are already committed to the cache slot, identical to
+    /// a disk read.
     fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
         Ok(vec![])
     }
 
-    /// Handle a completed read (disk or HTTP); its bytes are already committed to
-    /// the cache. Called by the worker when IO finishes.
-    fn process_io_response(&mut self, request: IORequest) -> Result<()>;
+    /// Handle a completed filesystem read; its bytes are already committed to
+    /// the cache. Called by the worker when the read finishes.
+    fn process_fs_response(&mut self, request: FsRequest) -> Result<()>;
+
+    /// Handle a completed HTTP read; its bytes are already committed to the
+    /// cache. Called by the worker when the read finishes.
+    fn process_http_response(&mut self, request: HttpRequest) -> Result<()>;
 
     /// Attempt to finish, return whether the operator is ready to finish. Regardless of whether it
     /// is, this function may be called many times.

@@ -55,16 +55,6 @@ pub enum FileLocation {
     Remote(Arc<RemoteFile>),
 }
 
-impl FileLocation {
-    /// The local fd, or `None` for a remote location.
-    pub fn as_raw_fd(&self) -> Option<RawFd> {
-        match self {
-            FileLocation::Local(fd) => Some(*fd),
-            FileLocation::Remote(_) => None,
-        }
-    }
-}
-
 impl PartialEq for FileLocation {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -218,71 +208,34 @@ impl Hash for RemoteFile {
     }
 }
 
-/// A filesystem read request: read `block` from local descriptor `fd`. This is
-/// what an operator's [`next_fs_requests`](crate::operations::Operator::next_fs_requests)
-/// yields — by construction it can only describe a local read, never a remote
-/// one — and what the requester submits and completes; the transport stays a
-/// type-level fact the whole way.
+/// A filesystem read request: read `block` from local descriptor `fd` into its
+/// pinned cache slot. This is what an operator's
+/// [`next_fs_requests`](crate::operations::Operator::next_fs_requests) yields —
+/// by construction it can only describe a local read, never a remote one — what
+/// the requester submits and completes, and what comes back to the operator's
+/// [`process_fs_response`](crate::operations::Operator::process_fs_response);
+/// the transport stays a type-level fact the whole way.
 pub struct FsRequest {
     pub fd: RawFd,
     pub block: MissingBlock,
 }
 
-/// An HTTP(S) read request: read `block` (a byte range) from `remote`. This is
-/// what an operator's [`next_http_requests`](crate::operations::Operator::next_http_requests)
+/// An HTTP(S) read request: read `block` (a byte range) from `remote` into its
+/// pinned cache slot. This is what an operator's
+/// [`next_http_requests`](crate::operations::Operator::next_http_requests)
 /// yields — by construction it can only describe a remote read, never a local
-/// one — and what the requester submits and completes; the transport stays a
-/// type-level fact the whole way.
+/// one — what the requester submits and completes, and what comes back to the
+/// operator's
+/// [`process_http_response`](crate::operations::Operator::process_http_response);
+/// the transport stays a type-level fact the whole way.
 pub struct HttpRequest {
     pub remote: Arc<RemoteFile>,
     pub block: MissingBlock,
 }
 
-/// A completed read for one `MissingBlock`: `block.len` bytes at
-/// `block.file_offset` from `location`, already landed in the block's pinned
-/// cache slot. `location` records which transport served it (a local fd read or
-/// an HTTP range request, both on the per-core uring).
-///
-/// This is the *operator-facing* form: a [`Completion`]'s kind-specific
-/// [`FsRequest`] / [`HttpRequest`] converts here (via `From`) when the worker
-/// delivers it to [`process_io_response`](crate::operations::Operator::process_io_response).
-pub struct IORequest {
-    pub location: FileLocation,
-    pub block: MissingBlock,
-}
-
-impl From<FsRequest> for IORequest {
-    fn from(r: FsRequest) -> Self {
-        IORequest {
-            location: FileLocation::Local(r.fd),
-            block: r.block,
-        }
-    }
-}
-
-impl From<HttpRequest> for IORequest {
-    fn from(r: HttpRequest) -> Self {
-        IORequest {
-            location: FileLocation::Remote(r.remote),
-            block: r.block,
-        }
-    }
-}
-
-impl Debug for IORequest {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IORequest")
-            .field("location", &self.location)
-            .field("file_offset", &self.block.file_offset())
-            .field("len", &self.block.len())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Associates a read request with the dataflow and operator that issued it, so
-/// the completed read can be routed back to the correct operator. Generic over
-/// the request kind: [`FsRequest`] or [`HttpRequest`] through the requester
-/// (keeping the transport in the type), [`IORequest`] at the operator boundary.
+/// Associates a read request ([`FsRequest`] or [`HttpRequest`]) with the
+/// dataflow and operator that issued it, so the completed read can be routed
+/// back to the correct operator.
 pub struct DataFlowRequest<R> {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
@@ -297,15 +250,6 @@ impl<R> DataFlowRequest<R> {
             request,
         }
     }
-
-    /// The same dataflow/operator addressing around a converted request.
-    fn map<T>(self, f: impl FnOnce(R) -> T) -> DataFlowRequest<T> {
-        DataFlowRequest {
-            data_flow_id: self.data_flow_id,
-            operator_idx: self.operator_idx,
-            request: f(self.request),
-        }
-    }
 }
 
 /// One completed read drained from [`IORequester::completions`]: either a
@@ -314,16 +258,6 @@ impl<R> DataFlowRequest<R> {
 pub enum Completion {
     Fs(DataFlowRequest<FsRequest>),
     Http(DataFlowRequest<HttpRequest>),
-}
-
-/// Erase the transport kind into the operator-facing [`IORequest`] for delivery.
-impl From<Completion> for DataFlowRequest<IORequest> {
-    fn from(completion: Completion) -> Self {
-        match completion {
-            Completion::Fs(request) => request.map(IORequest::from),
-            Completion::Http(request) => request.map(IORequest::from),
-        }
-    }
 }
 
 /// Opens a file for direct (uncached) reads.

@@ -57,7 +57,7 @@ impl ColumnRequest {
 /// Tracks the IO state for an entire row group read.
 ///
 /// Created by `from()`, which looks up every projected column in the file cache
-/// and queues `IORequest`s for any missing sub-blocks. As completions arrive the
+/// and queues read requests for any missing sub-blocks. As completions arrive the
 /// requester fills the blocks directly into their cache slots and the fetcher
 /// counts down via [`complete_one`](Self::complete_one) until
 /// [`complete`](Self::complete) holds.

@@ -54,7 +54,7 @@ mod factory;
 pub use factory::*;
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest, IORequest};
+use crate::io::{FsRequest, HttpRequest};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -134,12 +134,22 @@ pub trait Unary<I, O> {
         true
     }
 
-    /// Handle a completed read (disk or HTTP); its bytes are already committed to
+    /// Handle a completed filesystem read; its bytes are already committed to
     /// the cache slot.
-    fn process_io_response<S: Sender<O>>(
+    fn process_fs_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _request: IORequest,
+        _request: FsRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed HTTP read; its bytes are already committed to the
+    /// cache slot.
+    fn process_http_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: HttpRequest,
     ) -> Result<()> {
         unreachable!()
     }
@@ -213,8 +223,14 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(self.unary.next_http_requests()?)
     }
 
-    fn process_io_response(&mut self, context: IORequest) -> super::Result<()> {
-        Ok(self.unary.process_io_response(&mut self.sender, context)?)
+    fn process_fs_response(&mut self, request: FsRequest) -> super::Result<()> {
+        Ok(self.unary.process_fs_response(&mut self.sender, request)?)
+    }
+
+    fn process_http_response(&mut self, request: HttpRequest) -> super::Result<()> {
+        Ok(self
+            .unary
+            .process_http_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {

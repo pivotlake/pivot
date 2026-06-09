@@ -8,7 +8,7 @@ use super::{IndexedFile, IndexedRowGroup};
 use crate::parquet::types::metadata::{FileSource, RowGroupMetadata};
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
 use crate::store::DataFileLocation;
-use dispatch::io::{FileLocation, FsRequest, HttpRequest, IORequest, RemoteFile, open_direct_read};
+use dispatch::io::{FileLocation, FsRequest, HttpRequest, RemoteFile, open_direct_read};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
 use std::collections::{HashMap, VecDeque};
@@ -101,6 +101,30 @@ impl RowGroupMetadataFetcher {
     /// Called from `consume` (after issuing the probe) and `process_io_response`
     /// (after a block lands) — both just "make a read happen, then advance" — so
     /// the pending-vs-already-cached decision lives only here.
+    /// A completed read (fs or http): the requester already committed its bytes;
+    /// route it to the owning request and count it off its current region.
+    fn process_completion<S: Sender<IndexedRowGroup>>(
+        &mut self,
+        key: (FileLocation, usize),
+        sender: &mut S,
+    ) -> dispatch::UnaryResult<()> {
+        let slot = match self.routing.get_mut(&key) {
+            Some(waiters) => {
+                let slot = waiters.pop_front();
+                if waiters.is_empty() {
+                    self.routing.remove(&key);
+                }
+                slot
+            }
+            None => None,
+        };
+        if let Some(slot) = slot {
+            self.in_flight[slot].as_mut().unwrap().record_block();
+            self.advance(slot, sender)?;
+        }
+        Ok(())
+    }
+
     fn advance<S: Sender<IndexedRowGroup>>(
         &mut self,
         slot: usize,
@@ -186,29 +210,25 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
         self.disk_in_flight < MAX_DISK_IN_FLIGHT && self.http_in_flight < MAX_HTTP_IN_FLIGHT
     }
 
-    fn process_io_response<S: Sender<IndexedRowGroup>>(
+    fn process_fs_response<S: Sender<IndexedRowGroup>>(
         &mut self,
         sender: &mut S,
-        request: IORequest,
+        request: FsRequest,
     ) -> dispatch::UnaryResult<()> {
-        // The requester already committed this block's bytes; route the
-        // completion to the owning request and count it off its current region.
-        let key = (request.location, request.block.file_offset());
-        let slot = match self.routing.get_mut(&key) {
-            Some(waiters) => {
-                let slot = waiters.pop_front();
-                if waiters.is_empty() {
-                    self.routing.remove(&key);
-                }
-                slot
-            }
-            None => None,
-        };
-        if let Some(slot) = slot {
-            self.in_flight[slot].as_mut().unwrap().record_block();
-            self.advance(slot, sender)?;
-        }
-        Ok(())
+        let key = (FileLocation::Local(request.fd), request.block.file_offset());
+        self.process_completion(key, sender)
+    }
+
+    fn process_http_response<S: Sender<IndexedRowGroup>>(
+        &mut self,
+        sender: &mut S,
+        request: HttpRequest,
+    ) -> dispatch::UnaryResult<()> {
+        let key = (
+            FileLocation::Remote(request.remote),
+            request.block.file_offset(),
+        );
+        self.process_completion(key, sender)
     }
 
     fn finish<S: Sender<IndexedRowGroup>>(

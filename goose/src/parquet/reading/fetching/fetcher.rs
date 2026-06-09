@@ -24,7 +24,7 @@
 use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::io::{FileLocation, FsRequest, HttpRequest, IORequest};
+use dispatch::io::{FileLocation, FsRequest, HttpRequest};
 use std::collections::HashMap;
 use std::collections::VecDeque;
 
@@ -84,6 +84,29 @@ impl RowGroupFetcher {
         }
         Ok(())
     }
+
+    /// A completed read (fs or http): the requester already committed its bytes
+    /// into the cache slot, so route it to the owning row group and count it off.
+    fn process_completion<S: Sender<RowGroupBuffer>>(
+        &mut self,
+        key: (FileLocation, usize),
+        sender: &mut S,
+    ) -> dispatch::UnaryResult<()> {
+        let (slot, drained) = match self.routing.get_mut(&key) {
+            Some(waiters) => (waiters.pop_front(), waiters.is_empty()),
+            None => (None, false),
+        };
+        if drained {
+            self.routing.remove(&key);
+        }
+        if let Some(slot) = slot {
+            if let Some(rg) = self.in_flight[slot].as_mut() {
+                rg.complete_one();
+            }
+            self.emit_if_complete(slot, sender)?;
+        }
+        Ok(())
+    }
 }
 
 impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
@@ -139,28 +162,25 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         self.disk_in_flight < MAX_DISK_IN_FLIGHT && self.http_in_flight < MAX_HTTP_IN_FLIGHT
     }
 
-    fn process_io_response<S: Sender<RowGroupBuffer>>(
+    fn process_fs_response<S: Sender<RowGroupBuffer>>(
         &mut self,
         sender: &mut S,
-        request: IORequest,
+        request: FsRequest,
     ) -> dispatch::UnaryResult<()> {
-        // The requester already committed this block's bytes into its cache
-        // slot; route the completion to the owning row group and count it off.
-        let key = (request.location, request.block.file_offset());
-        let (slot, drained) = match self.routing.get_mut(&key) {
-            Some(waiters) => (waiters.pop_front(), waiters.is_empty()),
-            None => (None, false),
-        };
-        if drained {
-            self.routing.remove(&key);
-        }
-        if let Some(slot) = slot {
-            if let Some(rg) = self.in_flight[slot].as_mut() {
-                rg.complete_one();
-            }
-            self.emit_if_complete(slot, sender)?;
-        }
-        Ok(())
+        let key = (FileLocation::Local(request.fd), request.block.file_offset());
+        self.process_completion(key, sender)
+    }
+
+    fn process_http_response<S: Sender<RowGroupBuffer>>(
+        &mut self,
+        sender: &mut S,
+        request: HttpRequest,
+    ) -> dispatch::UnaryResult<()> {
+        let key = (
+            FileLocation::Remote(request.remote),
+            request.block.file_offset(),
+        );
+        self.process_completion(key, sender)
     }
 
     fn finish<S: Sender<RowGroupBuffer>>(
