@@ -43,13 +43,6 @@ use std::sync::Arc;
 /// too low and a few-thousand-group aggregation regresses into a 4096-way radix.)
 const SWITCH_THRESHOLD: usize = 32768;
 
-/// Elements per [`SlabList`] chunk. Each chunk is one sub-2MB slab (a contiguous
-/// [`SlabBuffer`]). Deliberately small — *not* a full 2MB slab: with thousands of
-/// radix partitions a full-slab chunk apiece would pin gigabytes for near-empty
-/// partitions, whereas small chunks bump-pack into the shared 2MB ring buffers so
-/// memory tracks the data scattered, not the partition count.
-const CHUNK_CAP: usize = 1 << 11; // 2048
-
 /// Tunable thresholds for the in-place→radix switch. Production uses
 /// [`DEFAULT`](RadixConfig::DEFAULT); tests build small configs so the radix path
 /// (scatter buffers + an N-way merge) fits the test slab pool.
@@ -90,6 +83,18 @@ pub struct SlabList<T: Copy> {
 unsafe impl<T: Copy> Send for SlabList<T> {}
 
 impl<T: Copy> SlabList<T> {
+    /// Elements per chunk: a ~64 KB target of `T`. Derived from `size_of::<T>()`
+    /// rather than a fixed element count so a wide row (e.g. a group-by with many
+    /// aggregates) can't overflow a single slab — which `create_slab_buffer`
+    /// asserts against — and kept far below a full 2 MB slab so chunks bump-pack
+    /// into the shared ring buffers: with thousands of radix partitions a
+    /// full-slab chunk apiece would pin gigabytes for near-empty partitions, while
+    /// small chunks make memory track the data scattered, not the partition count.
+    const CHUNK_CAP: usize = {
+        let cap = (64 * 1024) / size_of::<T>();
+        if cap == 0 { 1 } else { cap }
+    };
+
     fn new() -> Self {
         Self {
             chunks: Vec::new(),
@@ -100,8 +105,8 @@ impl<T: Copy> SlabList<T> {
 
     #[inline(always)]
     fn push(&mut self, allocator: &mut SlabAllocator, val: T) {
-        if self.chunks.is_empty() || self.last_len == CHUNK_CAP {
-            let chunk = allocator.create_slab_buffer(CHUNK_CAP, false);
+        if self.chunks.is_empty() || self.last_len == Self::CHUNK_CAP {
+            let chunk = allocator.create_slab_buffer(Self::CHUNK_CAP, false);
             self.cur_base = chunk.ptr_at_index(0);
             self.chunks.push(chunk);
             self.last_len = 0;
@@ -118,7 +123,7 @@ impl<T: Copy> SlabList<T> {
             let len = if ci + 1 == n {
                 self.last_len
             } else {
-                CHUNK_CAP
+                Self::CHUNK_CAP
             };
             let base = chunk.ptr_at_index(0) as *const T;
             let slice = unsafe { std::slice::from_raw_parts(base, len) };
