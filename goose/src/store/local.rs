@@ -64,6 +64,27 @@ impl ObjectStore for LocalStore {
         }
     }
 
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        let path = self.path_for(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                key: key.to_string(),
+                source,
+            })?;
+        }
+        // Write a sibling temp file and rename over the target, so a concurrent
+        // reader sees the old or new file whole — never a half-written one.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, data).map_err(|source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        })
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {

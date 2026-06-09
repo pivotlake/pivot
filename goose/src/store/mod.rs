@@ -64,6 +64,13 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// [`PutOutcome::AlreadyExists`] without overwriting.
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<PutOutcome>;
 
+    /// Atomically replace `key` with `data` (overwriting any existing object).
+    /// Backs a small, rarely-written mutable control file like the table
+    /// manifest; reads see either the old or the new object whole, never a torn
+    /// write. (Concurrent writers are last-writer-wins — fine for the manifest,
+    /// which a single server writes on the occasional `CREATE TABLE`.)
+    fn put(&self, key: &str, data: &[u8]) -> Result<()>;
+
     /// List object keys directly under `prefix` (one level, not recursive),
     /// returned as full keys relative to the root.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;

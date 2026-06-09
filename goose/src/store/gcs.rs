@@ -192,6 +192,25 @@ impl ObjectStore for GcsStore {
         }
     }
 
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        let token = self.bearer()?;
+        let url = format!(
+            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            self.bucket,
+            self.object_path(key)
+        );
+        match self
+            .agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(data)
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(StoreError::Http(format!("GCS PUT {key}: {e}"))),
+        }
+    }
+
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<PutOutcome> {
         let token = self.bearer()?;
         // ifGenerationMatch=0 => create only if the object does not exist: the

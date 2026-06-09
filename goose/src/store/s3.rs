@@ -169,6 +169,17 @@ impl ObjectStore for S3Store {
         }
     }
 
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        let object = join_prefix(&self.prefix, key);
+        let url = self.url_for(&object);
+        let signed = self.sign("PUT", &url, &[], data)?;
+        let req = Self::apply(self.agent.put(&url), &signed);
+        match req.send_bytes(data) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(StoreError::Http(format!("PUT {object}: {e}"))),
+        }
+    }
+
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<PutOutcome> {
         let object = join_prefix(&self.prefix, key);
         let url = self.url_for(&object);

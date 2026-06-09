@@ -31,7 +31,7 @@ pub mod parquet;
 pub mod store;
 pub mod table_store;
 
-pub use manifest::{InMemoryTableManifest, ManifestEntry, TableManifest};
+pub use manifest::{InMemoryTableManifest, ManifestEntry, ObjectStoreManifest, TableManifest};
 pub use table_store::TableObjectStore;
 
 use std::collections::HashMap;
