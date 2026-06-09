@@ -273,8 +273,8 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
             }
 
             // Pick the partition count: nobody switched -> the cheap PARTITIONS-way
-            // slot-range merge (don't blow a small group-by like q42 into a
-            // 4096-way merge); any switch -> RADIX_PARTITIONS so each radix target
+            // slot-range merge (don't blow a small group-by into a 4096-way
+            // merge); any switch -> RADIX_PARTITIONS so each radix target
             // stays cache-resident. Either way, one merge_combined job per partition
             // combines that partition's scatter buffers and in-place stacks.
             let (num_partitions, partition_capacity) = if all_buffers.is_empty() {

@@ -7,10 +7,10 @@
 //! accumulator; the last worker to finish emits the single-row result with one
 //! output column per aggregate.
 //!
-//! The sum is accumulated in `i128` so a full ClickBench-scale scan of a
+//! The sum is accumulated in `i128` so a full billion-row scan of a
 //! 16/32/64-bit integer column never overflows. `Sum` emits that full `i128`
 //! as a `Decimal128(38, 0)` cell (matching DuckDB's `HUGEINT` result type) so
-//! large sums like `SUM(UserID)` are exact; `Count` emits `Int64` and `Avg` a
+//! large sums over a 64-bit column are exact; `Count` emits `Int64` and `Avg` a
 //! `Float64`. (DuckDB lowers `AVG(x)` to `sum(x) / count(x)` over two
 //! aggregates plus a divide projection; that divide casts both operands to
 //! `f64`, so the full-precision `Decimal128` sum yields a correct average and
@@ -110,7 +110,7 @@ pub struct Aggregate {
 ///
 /// `$acc` is the per-batch accumulator type. For 16/32-bit columns an `i64`
 /// batch fold is safe (a single batch can't overflow it) and fast. For 64-bit
-/// columns the values themselves can approach `i64::MAX` (e.g. `UserID`), so a
+/// columns the values themselves can approach `i64::MAX`, so a
 /// batch sum must accumulate in `i128` or it overflows within one batch.
 fn sum_column(arr: &dyn Array) -> (i128, u64) {
     macro_rules! sum_primitive {
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn large_i64_sum_does_not_overflow() {
-        // A batch of large BIGINTs (e.g. UserID) overflows an i64 accumulator
+        // A batch of large BIGINTs overflows an i64 accumulator
         // within a single batch; the i128 fold must keep it exact.
         let schema = Arc::new(Schema::new(vec![Field::new("u", DataType::Int64, false)]));
         let vals = vec![i64::MAX, i64::MAX, i64::MAX];

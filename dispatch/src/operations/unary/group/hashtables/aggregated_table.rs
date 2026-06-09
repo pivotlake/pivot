@@ -40,7 +40,7 @@ use std::sync::Arc;
 /// width) stays in cache, so low- and medium-cardinality group-bys keep the cheap
 /// in-place path and pay no scatter/partition overhead — only once the table
 /// would spill cache does radix's cache-resident per-partition merge win. (Set
-/// too low this regresses e.g. q42's ~2880-group date_trunc into a 4096-way radix.)
+/// too low and a few-thousand-group aggregation regresses into a 4096-way radix.)
 const SWITCH_THRESHOLD: usize = 32768;
 
 /// Elements per [`SlabList`] chunk. Each chunk is one sub-2MB slab (a contiguous
