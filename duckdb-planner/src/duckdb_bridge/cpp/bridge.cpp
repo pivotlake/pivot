@@ -165,6 +165,7 @@ json build_aggregate_expression(duckdb::BoundAggregateExpression *aggregate) {
     return {
         {"aggregate_function", aggregate->function.name},
         {"params", params},
+        {"distinct", aggregate->IsDistinct()},
         {"return_type", aggregate->return_type.id()}
     };
 }

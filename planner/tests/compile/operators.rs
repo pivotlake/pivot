@@ -434,6 +434,119 @@ fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
     assert_eq!(bob["v0"], 1);
 }
 
+#[rstest]
+fn group_by_count_distinct(mut testing_planner: TestingPlanner) {
+    // g: 1,1,1,2,2,3   x: 10,10,20,30,30,40
+    // distinct x per g: g=1 -> {10,20}=2, g=2 -> {30}=1, g=3 -> {40}=1
+    testing_planner.add_table(
+        "gx",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 1, 2, 2, 3])),
+            ("x", Type::Int32, int_col(vec![10, 10, 20, 30, 30, 40])),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, COUNT(DISTINCT x) FROM gx GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["key"], 1);
+    assert_eq!(rows[0]["v0"], 2);
+    assert_eq!(rows[1]["key"], 2);
+    assert_eq!(rows[1]["v0"], 1);
+    assert_eq!(rows[2]["key"], 3);
+    assert_eq!(rows[2]["v0"], 1);
+}
+
+#[rstest]
+fn global_count_distinct_string(mut testing_planner: TestingPlanner) {
+    // example_table.name = alice, bob, charlie, dave, alice -> 4 distinct.
+    let results = testing_planner
+        .planner
+        .plan("SELECT COUNT(DISTINCT name) FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    let only_value = rows[0].as_object().unwrap().values().next().unwrap();
+    assert_eq!(only_value, 4);
+}
+
+#[rstest]
+fn global_count_distinct_int(mut testing_planner: TestingPlanner) {
+    // distinct {7, 8, 9, 0} = 4 (includes 0, exercising the HashOnly extractor's
+    // mix64(0)==0 / empty-sentinel edge through the keys-only count path).
+    testing_planner.add_table(
+        "ints",
+        &[("v", Type::Int32, int_col(vec![7, 7, 7, 8, 9, 9, 0, 0]))],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT COUNT(DISTINCT v) FROM ints")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    let only_value = rows[0].as_object().unwrap().values().next().unwrap();
+    assert_eq!(only_value, 4);
+}
+
+#[rstest]
+fn group_by_mixed_distinct(mut testing_planner: TestingPlanner) {
+    // g: 1,1,2  x: 10,10,20  v: 5,5,7
+    // per g: SUM(v), COUNT(*), COUNT(DISTINCT x)
+    //   g=1 -> sum=10, count=2, distinct=1 ; g=2 -> sum=7, count=1, distinct=1
+    testing_planner.add_table(
+        "mixed",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2])),
+            ("x", Type::Int32, int_col(vec![10, 10, 20])),
+            ("v", Type::Int32, int_col(vec![5, 5, 7])),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, SUM(v), COUNT(*), COUNT(DISTINCT x) FROM mixed GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    assert_eq!(rows.len(), 2);
+    // Value columns are v0/v1/v2 in DuckDB's expression order; assert the
+    // multiset so the test is robust to that order (all three values differ).
+    let vals = |r: &serde_json::Value| -> Vec<i64> {
+        ["v0", "v1", "v2"]
+            .iter()
+            .map(|c| r[*c].as_i64().unwrap())
+            .collect()
+    };
+    assert_eq!(rows[0]["key"], 1);
+    let v1 = vals(&rows[0]);
+    assert!(v1.contains(&10) && v1.contains(&2) && v1.contains(&1), "g=1 {v1:?}");
+    assert_eq!(rows[1]["key"], 2);
+    let v2 = vals(&rows[1]);
+    assert!(v2.contains(&7) && v2.contains(&1), "g=2 {v2:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Combined operator tests
 // ---------------------------------------------------------------------------

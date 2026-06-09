@@ -16,11 +16,13 @@ mod accumulator;
 mod aggregate;
 mod aggregation_row;
 mod compiled;
+mod distinct;
 
 pub use accumulator::Accumulator;
 pub use aggregate::{Aggregate, Count, Sum};
 pub use aggregation_row::AggregationRowValueExtractor;
 pub use compiled::Compiled;
+pub use distinct::DistinctValueExtractor;
 
 /// Which per-group aggregate a value slot accumulates during the consume phase.
 ///

@@ -84,6 +84,9 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
     pub buffers: Option<PartitionBuffers<K, V>>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
+    /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
+    /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
+    pub zero_hash_seen: bool,
 }
 
 /// [`BatchRowSource`] adapter for [`BaseHashTable::merge_batch`] (in-place phase).
@@ -136,6 +139,11 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     /// Another scratch buffer for unresolved slots (slots that collided)- this is used in tangent
     /// with the original `unresolved_slots` as a sort of ping-pong (see merge_batch)
     next_unresolved_slots: Box<[u32; RECORD_BATCH_SIZE]>,
+    /// `K::DEDUP_BY_HASH` only: a key whose bijective hash is exactly 0 collides
+    /// with the empty-slot sentinel, so it is excluded from the table and recorded
+    /// here. There is at most one such key (the hash is a bijection), so this
+    /// boolean adds 0 or 1 to the distinct count at output.
+    zero_hash_seen: bool,
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
@@ -167,10 +175,36 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
+            zero_hash_seen: false,
         }
     }
 
+    /// Merge all rows of `batch`. The per-batch scratch is sized to
+    /// [`RECORD_BATCH_SIZE`], so an input wider than that — which happens when a
+    /// GROUP BY feeds another GROUP BY (the output path emits up to
+    /// `OUTPUT_CHUNK_ROWS` ≫ `RECORD_BATCH_SIZE` rows per batch) — is consumed in
+    /// `RECORD_BATCH_SIZE`-row windows via zero-copy slices. Scan/filter output
+    /// (already ≤ `RECORD_BATCH_SIZE`) skips slicing.
     pub fn consume_batch(
+        &mut self,
+        batch: &RecordBatch,
+        key_cols: &[usize],
+        value_slots: &[AggregationSlot],
+    ) {
+        let total = batch.num_rows();
+        if total <= RECORD_BATCH_SIZE {
+            self.consume_window(batch, key_cols, value_slots);
+            return;
+        }
+        let mut start = 0;
+        while start < total {
+            let len = (total - start).min(RECORD_BATCH_SIZE);
+            self.consume_window(&batch.slice(start, len), key_cols, value_slots);
+            start += len;
+        }
+    }
+
+    fn consume_window(
         &mut self,
         batch: &RecordBatch,
         key_cols: &[usize],
@@ -180,8 +214,26 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 
+        // Keys-only exact COUNT(DISTINCT): the bijective hash makes hash-equality
+        // exactly key-equality, but a hash of 0 is the table's empty sentinel.
+        // Rather than remap it (which would alias another key), exclude any
+        // 0-hash row and record the flag — at most one key hashes to 0, so it
+        // contributes 1 to the count, added at output. The 0-check folds into the
+        // hash loop (no extra pass) and is gated by a const, so non-distinct
+        // group-bys pay nothing.
+        let mut any_zero = false;
         for i in 0..length {
-            self.hashes[i] = K::hash(&key_reader, i, &self.hash_state);
+            let h = K::hash(&key_reader, i, &self.hash_state);
+            self.hashes[i] = h;
+            if K::DEDUP_BY_HASH {
+                any_zero |= h == 0;
+            }
+        }
+        if K::DEDUP_BY_HASH && any_zero {
+            debug_assert!(!K::SUPPORTS_RADIX, "DEDUP_BY_HASH implies !SUPPORTS_RADIX");
+            self.zero_hash_seen = true;
+            self.consume_scalared_skip_zero(length, &key_reader, &value_reader);
+            return;
         }
 
         if self.switched_to_radix {
@@ -266,6 +318,32 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         }
     }
 
+    /// Scalar insert that skips 0-hash rows — the rare path for `DEDUP_BY_HASH`
+    /// when a batch contains the (single) key whose bijective hash is 0. That key
+    /// is counted via `zero_hash_seen`, not stored, so `merge` never sees a 0 hash
+    /// and never remaps-and-aliases it. `DEDUP_BY_HASH` implies `!SUPPORTS_RADIX`,
+    /// so the table only ever grows here (no mid-batch switch to scatter).
+    fn consume_scalared_skip_zero<'b>(
+        &mut self,
+        length: usize,
+        key_reader: &K::Reader<'b>,
+        value_reader: &V::Reader<'b>,
+    ) {
+        for i in 0..length {
+            let hash = self.hashes[i];
+            if hash == 0 {
+                continue;
+            }
+            let table = self.tables.last_mut().unwrap();
+            let key = K::live_key(key_reader, i, &mut self.worker_arena);
+            let value = V::value(value_reader, i);
+            table.merge::<false, _>(hash, key, value);
+            if table.undersized() {
+                self.grow_or_switch();
+            }
+        }
+    }
+
     /// Active table is full: either grow the stack (4x) or, for a radix-eligible
     /// key that would grow past [`SWITCH_THRESHOLD`], switch to scatter. Returns
     /// `true` if it switched.
@@ -334,6 +412,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             tables: self.tables,
             buffers: self.buffers.map(PartitionBuffers),
             hll: self.hll,
+            zero_hash_seen: self.zero_hash_seen,
         }
     }
 }

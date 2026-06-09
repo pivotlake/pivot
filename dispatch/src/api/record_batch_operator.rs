@@ -57,8 +57,8 @@ use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::{
-    Accumulator, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory, Count,
-    CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
+    Accumulator, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory,
+    Count, CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
     NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory,
     UnaryOperator, UnaryOperatorFactory, ValueExtractor,
 };
@@ -475,7 +475,10 @@ impl RecordBatchOperatorSpec {
     /// pre-lowered to a SUM slot + a COUNT slot with a downstream divide.
     pub fn aggregate<A: Accumulator>(self, slots: Vec<AggregationSlot>) -> Self {
         let worker_count = self.worker_count();
-        self.unary(AggregateFactory::<A>::create_for_workers(slots, worker_count))
+        self.unary(AggregateFactory::<A>::create_for_workers(
+            slots,
+            worker_count,
+        ))
     }
 
     /// Sort by the given columns and keep only the first `limit` rows.
@@ -551,6 +554,39 @@ impl RecordBatchOperatorSpec {
         )
     }
 
+    /// GROUP BY one or more key columns with no aggregate — emits one row per
+    /// distinct key (the key column(s) only, no value column). Backs the dedup
+    /// stage of `COUNT(DISTINCT x)`: the per-entry value is zero-sized, so the
+    /// hash-table entry is just hash + key.
+    pub fn group_by_distinct<K: KeyExtractor>(self, key_cols: Vec<usize>) -> Self {
+        self.group_by_aggregate::<K, crate::operations::DistinctValueExtractor>(
+            key_cols,
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Global `COUNT(DISTINCT x)`: GROUP BY `key_cols` with no aggregate, emitting
+    /// only each hash partition's distinct-key count (one `Int64` row) rather than
+    /// the keys. Partitions are hash-disjoint, so a downstream global `SUM` over
+    /// those rows yields the total — without materialising the (potentially huge)
+    /// key column. Pair with a keys-only extractor (e.g. `HashOnlyIntKeyExtractor`)
+    /// for an 8-byte entry.
+    pub fn group_by_distinct_count<K: KeyExtractor>(self, key_cols: Vec<usize>) -> Self {
+        let worker_count = self.worker_count();
+        let buffers = self.dispatcher.buffers;
+        self.unary(
+            GroupFactory::<K, crate::operations::DistinctValueExtractor>::create_for_workers(
+                key_cols,
+                Vec::new(),
+                None,
+                true,
+                worker_count,
+                buffers,
+            ),
+        )
+    }
+
     /// GROUP BY one or more key columns computing one or more aggregate value
     /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key
     /// shape, `V` the aggregate shape (e.g. its arity).
@@ -566,6 +602,7 @@ impl RecordBatchOperatorSpec {
             key_cols,
             value_slots,
             top_k,
+            false,
             worker_count,
             buffers,
         ))
