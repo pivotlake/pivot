@@ -10,9 +10,11 @@
 const P: u32 = 12;
 const M: usize = 1 << P;
 
-/// HyperLogLog's bias-correction constant α_m. For m ≥ 128 registers the paper
-/// gives `α_m = 0.7213 / (1 + 1.079/m)`; `0.7213` and `1.079` are its
-/// empirically-fitted values, not tunables.
+/// HyperLogLog's bias-correction constant α_m, from the HyperLogLog paper
+/// (Flajolet, Fusy, Gandouet & Meunier, 2007 — cited above): for m ≥ 128
+/// registers, `α_m = 0.7213 / (1 + 1.079/m)`. `0.7213` and `1.079` are that
+/// paper's empirically-fitted constants — standard across HLL implementations,
+/// not tunables.
 const ALPHA: f64 = 0.7213 / (1.0 + 1.079 / M as f64);
 
 /// Raw-estimate cutoff, in units of m: below `E = 5/2·m` the harmonic-mean

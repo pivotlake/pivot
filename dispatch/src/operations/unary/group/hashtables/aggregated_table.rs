@@ -1,3 +1,25 @@
+//! Per-worker GROUP BY consume state, with an **adaptive in-place → radix**
+//! strategy that needs no up-front cardinality estimate.
+//!
+//! A worker starts aggregating *in place* — a growing stack of hash tables. This
+//! is the cheap path: no scatter, and the whole result stays in a few
+//! cache-resident tables. It wins while the distinct count is small (low
+//! cardinality, and every string group-by).
+//!
+//! Once that table would grow past [`SWITCH_THRESHOLD`] (≈ where it stops fitting
+//! L2) *and* the key is radix-eligible ([`KeyExtractor::SUPPORTS_RADIX`] — ints
+//! yes, strings never), the worker **drops off to radix**: it stops aggregating
+//! and instead *scatters* every remaining row into one of [`RADIX_PARTITIONS`]
+//! per-partition buffers by the top hash bits — no probing on the hot path. The
+//! aggregation moves to the merge phase, where each partition is small enough to
+//! stay cache-resident. That's the whole point at high cardinality, where a
+//! single in-place table would spill to DRAM and every probe would miss cache.
+//!
+//! The choice is per-worker and just falls out of how fast the table fills, so a
+//! low-cardinality column never switches. At [`flush`](AggregatedTable::flush) a
+//! switched worker folds its small pre-switch stack into the scatter buffers, so
+//! the merge sees one uniform source per partition (a [`WorkerOutput::Radix`]).
+
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{MultiSlabBuffer, SlabAllocator};
 use crate::operations::unary::group::RADIX_PARTITIONS;
@@ -116,14 +138,9 @@ impl<K: KeyExtractor, V: ValueExtractor> BatchRowSource<K::Persisted, V::Value>
     }
 }
 
-/// Per-worker aggregation state — **adaptive in-place → radix**.
-///
-/// Phase 1 aggregates into a growing stack of in-place hash tables (the original
-/// strategy). When the table would grow past [`SWITCH_THRESHOLD`] and the key is
-/// radix-eligible ([`KeyExtractor::SUPPORTS_RADIX`]), it switches to phase 2:
-/// scatter into per-partition buffers (cache-resident merge). String keys never
-/// switch. At [`flush`](Self::flush) a switched worker folds its small pre-switch
-/// stack into the buffers, so the merge sees one uniform source.
+/// Per-worker aggregation state for the adaptive in-place → radix consume
+/// strategy (see the module docs). Holds the in-place table stack and, after a
+/// switch, the per-partition scatter buffers plus a distinct-count sketch.
 pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     hash_state: RandomState,
     worker_arena: WorkerArena,
