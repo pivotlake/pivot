@@ -541,7 +541,10 @@ fn group_by_mixed_distinct(mut testing_planner: TestingPlanner) {
     };
     assert_eq!(rows[0]["key"], 1);
     let v1 = vals(&rows[0]);
-    assert!(v1.contains(&10) && v1.contains(&2) && v1.contains(&1), "g=1 {v1:?}");
+    assert!(
+        v1.contains(&10) && v1.contains(&2) && v1.contains(&1),
+        "g=1 {v1:?}"
+    );
     assert_eq!(rows[1]["key"], 2);
     let v2 = vals(&rows[1]);
     assert!(v2.contains(&7) && v2.contains(&1), "g=2 {v2:?}");
