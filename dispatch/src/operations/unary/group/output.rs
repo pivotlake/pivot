@@ -36,24 +36,24 @@ const OUTPUT_CHUNK_ROWS: usize = BUFFER_SIZE / 16;
 /// A heap entry for top-k selection, ordered solely by the aggregate `sort`
 /// scalar. Ties compare equal, which is fine: an `ORDER BY <slot> DESC LIMIT k`
 /// is indifferent to the order within a tied group.
-struct TopK<P, Val> {
-    sort: i64,
+struct TopK<P, Val, S: Ord> {
+    sort: S,
     key: P,
     value: Val,
 }
 
-impl<P, Val> PartialEq for TopK<P, Val> {
+impl<P, Val, S: Ord> PartialEq for TopK<P, Val, S> {
     fn eq(&self, other: &Self) -> bool {
         self.sort == other.sort
     }
 }
-impl<P, Val> Eq for TopK<P, Val> {}
-impl<P, Val> PartialOrd for TopK<P, Val> {
+impl<P, Val, S: Ord> Eq for TopK<P, Val, S> {}
+impl<P, Val, S: Ord> PartialOrd for TopK<P, Val, S> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl<P, Val> Ord for TopK<P, Val> {
+impl<P, Val, S: Ord> Ord for TopK<P, Val, S> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.sort.cmp(&other.sort)
     }
@@ -77,7 +77,7 @@ where
 {
     // Size-`limit` min-heap (via `Reverse`) keyed by the sort scalar; keeps the
     // `limit` largest entries seen.
-    let mut heap: BinaryHeap<Reverse<TopK<K::Persisted, V::Value>>> =
+    let mut heap: BinaryHeap<Reverse<TopK<K::Persisted, V::Value, V::SortKey>>> =
         BinaryHeap::with_capacity(limit + 1);
     for entry in table.iter(0) {
         let sort = V::sort_key(entry.value(), slot);

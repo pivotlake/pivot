@@ -4,8 +4,8 @@
 //! through a runtime enum (`SlotValueReader`) on every row. These specialise a
 //! *fixed* aggregate signature into straight-line code instead: each output slot
 //! is a zero-sized [`Aggregate`] op, and the value extractor is monomorphised
-//! over a tuple of them, so `value()` is just typed column reads with no per-row
-//! branch.
+//! over a tuple of them (and the accumulator width `A`), so `value()` is just
+//! typed column reads with no per-row branch.
 //!
 //! Adding capability is cheap:
 //! - a new aggregate function (e.g. `MIN`) is one `impl Aggregate`;
@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 
 use arrow_array::RecordBatch;
 
+use crate::operations::unary::group::values::accumulator::Accumulator;
 use crate::operations::unary::group::values::aggregate::Aggregate;
 use crate::operations::unary::group::values::aggregation_row::{
     AggregationRow, AggregationRowColumns,
@@ -27,17 +28,19 @@ use crate::operations::unary::group::values::aggregation_row::{
 use crate::operations::unary::group::values::{AggregationSlot, ValueExtractor};
 
 /// A [`ValueExtractor`] monomorphised over a tuple of [`Aggregate`] ops — one per
-/// output slot. `value()` is straight-line typed reads with no per-row dispatch.
-pub struct Compiled<Ops>(PhantomData<Ops>);
+/// output slot — and the accumulator width `A`. `value()` is straight-line typed
+/// reads with no per-row dispatch.
+pub struct Compiled<Ops, A: Accumulator = i64>(PhantomData<(Ops, A)>);
 
-/// Implements [`ValueExtractor`] for a `Compiled<(Op0, Op1, …)>` tuple of a given
-/// arity. `$idx` are the tuple field indices, which also index `value_slots`.
+/// Implements [`ValueExtractor`] for a `Compiled<(Op0, Op1, …), A>` tuple of a
+/// given arity. `$idx` are the tuple field indices, which also index `value_slots`.
 macro_rules! impl_compiled {
     ($n:literal; $($Op:ident $idx:tt),+) => {
-        impl<$($Op: Aggregate + Send + 'static),+> ValueExtractor for Compiled<($($Op,)+)> {
-            type Value = AggregationRow<$n>;
+        impl<Acc: Accumulator, $($Op: Aggregate + Send + 'static),+> ValueExtractor for Compiled<($($Op,)+), Acc> {
+            type Value = AggregationRow<$n, Acc>;
             type Reader<'b> = ($($Op::Reader<'b>,)+);
-            type Columns = AggregationRowColumns<$n>;
+            type Columns = AggregationRowColumns<$n, Acc>;
+            type SortKey = Acc;
 
             #[inline(always)]
             fn make_reader<'b>(
@@ -49,12 +52,12 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
-            fn value(reader: &Self::Reader<'_>, idx: usize) -> AggregationRow<$n> {
-                AggregationRow([$( $Op::contribution(&reader.$idx, idx), )+])
+            fn value(reader: &Self::Reader<'_>, idx: usize) -> AggregationRow<$n, Acc> {
+                AggregationRow([$( Acc::from($Op::contribution(&reader.$idx, idx)), )+])
             }
 
             #[inline(always)]
-            fn sort_key(value: &AggregationRow<$n>, slot: usize) -> i64 {
+            fn sort_key(value: &AggregationRow<$n, Acc>, slot: usize) -> Acc {
                 value.0[slot]
             }
         }
