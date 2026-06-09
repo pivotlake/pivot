@@ -21,7 +21,7 @@
 //! the merge sees one uniform source per partition (a [`WorkerOutput::Radix`]).
 
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use crate::memory::{SlabAllocator, SlabBuffer};
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
@@ -43,7 +43,11 @@ use std::sync::Arc;
 /// too low this regresses e.g. q42's ~2880-group date_trunc into a 4096-way radix.)
 const SWITCH_THRESHOLD: usize = 32768;
 
-/// Elements per [`SlabList`] chunk (single slab, < 2MB for the row width).
+/// Elements per [`SlabList`] chunk. Each chunk is one sub-2MB slab (a contiguous
+/// [`SlabBuffer`]). Deliberately small — *not* a full 2MB slab: with thousands of
+/// radix partitions a full-slab chunk apiece would pin gigabytes for near-empty
+/// partitions, whereas small chunks bump-pack into the shared 2MB ring buffers so
+/// memory tracks the data scattered, not the partition count.
 const CHUNK_CAP: usize = 1 << 11; // 2048
 
 /// One scattered row: `(hash, persisted key, per-row value contribution)`.
@@ -53,7 +57,7 @@ pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, <V as ValueExtra
 /// fixed-size chunks. Appends never reallocate; a cached base pointer makes the
 /// scatter writes and aggregate reads sequential (no per-element index math).
 pub struct SlabList<T: Copy> {
-    chunks: Vec<MultiSlabBuffer<T>>,
+    chunks: Vec<SlabBuffer<T>>,
     cur_base: *mut T,
     last_len: usize,
 }
@@ -75,7 +79,7 @@ impl<T: Copy> SlabList<T> {
     #[inline(always)]
     fn push(&mut self, allocator: &mut SlabAllocator, val: T) {
         if self.chunks.is_empty() || self.last_len == CHUNK_CAP {
-            let chunk = allocator.create_multi_slab_buffer(CHUNK_CAP, false);
+            let chunk = allocator.create_slab_buffer(CHUNK_CAP, false);
             self.cur_base = chunk.ptr_at_index(0);
             self.chunks.push(chunk);
             self.last_len = 0;
@@ -149,6 +153,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     tables: Vec<MultiSlabTable<K, V>>,
     /// Phase 2: per-partition scatter buffers (allocated on switch).
     buffers: Option<Vec<SlabList<RadixRow<K, V>>>>,
+    /// Distinct-count sketch over scattered (post-switch) hashes, for sizing.
     hll: Hll,
     switched: bool,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
