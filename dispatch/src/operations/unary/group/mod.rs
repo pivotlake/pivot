@@ -107,7 +107,8 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTable, DEFAULT_CAPACITY, MultiSlabTable, PartitionBuffers, RadixConfig, WorkerOutput,
+    AggregatedTable, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable, PartitionBuffers,
+    RadixConfig, WorkerOutput,
 };
 use crate::worker::worker_waker;
 use ahash::RandomState;
@@ -299,15 +300,15 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
             } else {
                 // Every switched worker scattered into the same partition count
                 // (their RadixConfig); read it back off the buffers. Size each
-                // radix target for ~0.7 load (x3/2 margin) from the distinct estimate.
+                // radix target so its distinct-per-partition groups sit at
+                // MAX_LOAD_FACTOR — the merge's resize threshold — so it fills
+                // without ever resizing.
                 let parts = all_buffers[0].0.len();
-                let est = hll.estimate();
-                (
-                    parts,
-                    (est * 3 / (2 * parts))
-                        .next_power_of_two()
-                        .max(DEFAULT_CAPACITY),
-                )
+                let per_partition = hll.estimate() as f64 / parts as f64;
+                let capacity = ((per_partition / MAX_LOAD_FACTOR).ceil() as usize)
+                    .next_power_of_two()
+                    .max(DEFAULT_CAPACITY);
+                (parts, capacity)
             };
 
             let buffers = Arc::new(all_buffers);
