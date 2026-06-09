@@ -19,6 +19,8 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -182,6 +184,33 @@ json build_function_expression(duckdb::BoundFunctionExpression *function) {
     };
 }
 
+// `a AND b AND ...` / `a OR b OR ...`. The optimizer rewrites a small
+// `x IN (a, b)` into `x = a OR x = b`, so this is the usual shape a pushed-down
+// IN membership test reaches us in. `conjunction_type` preserves AND vs OR.
+json build_conjunction_expression(duckdb::BoundConjunctionExpression *conj) {
+	json children = json::array();
+	for (auto &child : conj->children) {
+		children.push_back(build_expression(child.get()));
+	}
+	return {
+		{"conjunction_type", static_cast<uint8_t>(conj->type)},
+		{"children", std::move(children)},
+	};
+}
+
+// `x IN (a, b, ...)` is a BoundOperatorExpression whose first child is the
+// tested expression and whose remaining children are the list values.
+json build_in_expression(duckdb::BoundOperatorExpression *op) {
+	json values = json::array();
+	for (size_t i = 1; i < op->children.size(); i++) {
+		values.push_back(build_expression(op->children[i].get()));
+	}
+	return {
+		{"input", build_expression(op->children[0].get())},
+		{"values", std::move(values)},
+	};
+}
+
 json build_expression(duckdb::Expression *expr) {
 	json new_expression;
 	new_expression["type"] = expr->type;
@@ -219,6 +248,15 @@ json build_expression(duckdb::Expression *expr) {
 	}
 	case duckdb::ExpressionType::BOUND_FUNCTION: {
 		new_expression["data"] = build_function_expression(&expr->Cast<duckdb::BoundFunctionExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::COMPARE_IN: {
+		new_expression["data"] = build_in_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::CONJUNCTION_AND:
+	case duckdb::ExpressionType::CONJUNCTION_OR: {
+		new_expression["data"] = build_conjunction_expression(&expr->Cast<duckdb::BoundConjunctionExpression>());
 		break;
 	}
 	case duckdb::ExpressionType::OPERATOR_CAST: {

@@ -5,10 +5,11 @@
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::expression::{
-    Between, Compare, CompareType, Contains, DateTrunc, Divide, Expression, Function, Ref,
+    Between, Compare, CompareType, Conjunction, ConjunctionOp, Contains, DateTrunc, Divide,
+    Expression, Function, InList, Ref,
 };
 use crate::types::Type;
-use arrow::compute::kernels::boolean::and;
+use arrow::compute::kernels::boolean::{and, or};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, BooleanArray, Datum, Int64Array, RecordBatch, Scalar};
@@ -149,6 +150,72 @@ impl Contains {
     }
 }
 
+impl InList {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // `x IN (a, b, …)` is the disjunction `x = a OR x = b OR …`. We compile
+        // the tested expression and every list value once, then per batch
+        // OR-reduce the equality masks. `compare_coerced` aligns differing
+        // physical types (e.g. an Int16 column against Int32 literals) the same
+        // way `Compare` does, so an IN over any integer/string column works.
+        let input_builder = self.input.compile()?;
+        let value_builders = self
+            .values
+            .iter()
+            .map(|v| v.compile())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            let mut value_exprs: Vec<ExprEvalFn> = value_builders.iter().map(|b| b()).collect();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let mask = value_exprs
+                    .iter_mut()
+                    .map(|v| {
+                        let value = v(batch);
+                        compare_coerced(input.as_datum(), value.as_datum(), eq)
+                    })
+                    .reduce(|left, right| or(&left, &right).unwrap())
+                    // An empty list (`IN ()`) matches nothing; DuckDB folds this
+                    // away before planning, so this is only a defensive fallback.
+                    .unwrap_or_else(|| BooleanArray::from(vec![false; batch.num_rows()]));
+                ExprResult::Array(Arc::new(mask) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Conjunction {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Compile each child predicate once, then per batch reduce their boolean
+        // masks with the conjunction's kernel (`AND`/`OR`).
+        type BoolKernel = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
+        let kernel: BoolKernel = match self.op {
+            ConjunctionOp::And => and,
+            ConjunctionOp::Or => or,
+        };
+        let child_builders = self
+            .children
+            .iter()
+            .map(|c| c.compile())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Box::new(move || {
+            let mut child_exprs: Vec<ExprEvalFn> = child_builders.iter().map(|b| b()).collect();
+            Box::new(move |batch: &RecordBatch| {
+                let mask = child_exprs
+                    .iter_mut()
+                    .map(|c| {
+                        let result = c(batch);
+                        let (arr, _) = result.as_datum().get();
+                        arr.as_any().downcast_ref::<BooleanArray>().unwrap().clone()
+                    })
+                    .reduce(|left, right| kernel(&left, &right).unwrap())
+                    .expect("conjunction always has at least two children");
+                ExprResult::Array(Arc::new(mask) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Divide {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         let left_builder = self.left.compile()?;
@@ -238,6 +305,8 @@ impl Expression {
             }
             Expression::Function(f) => f.compile(),
             Expression::Between(b) => b.compile(),
+            Expression::InList(i) => i.compile(),
+            Expression::Conjunction(c) => c.compile(),
             _ => Err(Error::UnsupportedExpression(self.clone())),
         }
     }
