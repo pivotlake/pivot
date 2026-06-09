@@ -116,7 +116,12 @@ fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
 
     // Minutes 0 and 2 occur once; minute 1 occurs twice.
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows.iter().map(|r| r["key"].as_i64().unwrap()).collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["key"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
     let minute_one = rows.iter().find(|r| r["key"] == 1).unwrap();
     assert_eq!(minute_one["v0"], 2);
 }
@@ -143,7 +148,10 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
 
     // (part, [expected for t0, t1, t2, t3]).
     let cases: &[(&str, [i64; 4])] = &[
-        ("epoch", [1_704_067_200, 1_700_000_000, 1_262_304_000, -100_000]),
+        (
+            "epoch",
+            [1_704_067_200, 1_700_000_000, 1_262_304_000, -100_000],
+        ),
         ("second", [0, 20, 0, 20]),
         ("millisecond", [0, 20_000, 0, 20_000]),
         ("microsecond", [0, 20_000_000, 0, 20_000_000]),
@@ -207,7 +215,9 @@ fn filter_in_list_int(mut testing_planner: TestingPlanner) {
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["a"].as_i64().unwrap());
     assert_eq!(
-        rows.iter().map(|r| r["a"].as_i64().unwrap()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|r| r["a"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
         vec![2, 4]
     );
 }
@@ -244,9 +254,8 @@ fn in_list_compare_in_compiles_to_membership_mask() {
     use arrow_schema::{DataType, Field, Schema};
     use planner::expression::{Expression, InList, Ref};
 
-    let constant = |v: i16| {
-        Expression::Constant(Scalar::new(Arc::new(Int16Array::from(vec![v])) as ArrayRef))
-    };
+    let constant =
+        |v: i16| Expression::Constant(Scalar::new(Arc::new(Int16Array::from(vec![v])) as ArrayRef));
     let in_list = InList {
         input: Box::new(Expression::Ref(Ref {
             column_idx: 0,
@@ -268,6 +277,65 @@ fn in_list_compare_in_compiles_to_membership_mask() {
     assert_eq!(
         (0..mask.len()).map(|i| mask.value(i)).collect::<Vec<_>>(),
         vec![true, true, false, true]
+    );
+}
+
+#[rstest]
+fn case_expression_in_projection(mut testing_planner: TestingPlanner) {
+    // a = [1,2,3,4,5]; a < 3 -> 'low' (a=1,2), else 'high' (a=3,4,5).
+    let results = testing_planner
+        .planner
+        .plan("SELECT CASE WHEN a < 3 THEN 'low' ELSE 'high' END AS c FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut labels = batches_to_json(&results)
+        .iter()
+        .map(|r| r["col0"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    labels.sort();
+    assert_eq!(labels, vec!["high", "high", "high", "low", "low"]);
+}
+
+#[rstest]
+fn case_expression_multi_arm_group_key(mut testing_planner: TestingPlanner) {
+    // Three-arm CASE bucketing a into lo/mid/hi, grouped and counted:
+    //   a=1     -> "lo"  (1 row)
+    //   a=2,3   -> "mid" (2 rows)
+    //   a=4,5   -> "hi"  (2 rows)
+    let results = testing_planner
+        .planner
+        .plan(
+            "SELECT CASE WHEN a < 2 THEN 'lo' WHEN a < 4 THEN 'mid' ELSE 'hi' END AS c, COUNT(*) \
+             FROM example_table GROUP BY 1",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
+    let counts: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        vec![
+            ("hi".to_string(), 2),
+            ("lo".to_string(), 1),
+            ("mid".to_string(), 2),
+        ]
     );
 }
 

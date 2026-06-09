@@ -99,6 +99,22 @@ pub struct Conjunction {
     pub children: Vec<Expression>,
 }
 
+/// One `WHEN when THEN then` arm of a [`Case`].
+#[derive(CustomDeserializer, Debug)]
+pub struct CaseCheck {
+    pub when: Box<Expression>,
+    pub then: Box<Expression>,
+}
+
+/// A `CASE WHEN … THEN … [WHEN …] ELSE … END` expression
+/// (`BoundCaseExpression`). DuckDB always materializes an `else_expr` —
+/// a `CASE` without an explicit `ELSE` carries a `NULL` constant there.
+#[derive(CustomDeserializer, Debug)]
+pub struct Case {
+    pub checks: Vec<CaseCheck>,
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
 #[derive(CustomDeserializer, Debug)]
 pub enum Expression {
@@ -124,6 +140,8 @@ pub enum Expression {
     #[type_tag(ExpressionType::CONJUNCTION_AND)]
     #[type_tag(ExpressionType::CONJUNCTION_OR)]
     Conjunction(Conjunction),
+    #[type_tag(ExpressionType::CASE_EXPR)]
+    Case(Case),
 }
 
 /// A constant comparison against a single column (e.g. `col <> 42`).
@@ -251,6 +269,13 @@ impl fmt::Display for Expression {
                 };
                 let parts: Vec<String> = conj.children.iter().map(|c| c.to_string()).collect();
                 write!(f, "({})", parts.join(&format!(" {op} ")))
+            }
+            Expression::Case(case) => {
+                write!(f, "CASE")?;
+                for check in &case.checks {
+                    write!(f, " WHEN {} THEN {}", check.when, check.then)?;
+                }
+                write!(f, " ELSE {} END", case.else_expr)
             }
         }
     }
