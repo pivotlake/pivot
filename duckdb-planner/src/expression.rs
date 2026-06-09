@@ -65,6 +65,9 @@ pub struct Between {
 pub struct AggregateFunc {
     pub aggregate_function: String,
     pub params: Vec<Expression>,
+    /// `true` when the call is `COUNT(DISTINCT …)` / `SUM(DISTINCT …)` etc.
+    /// (DuckDB's `AggregateType::DISTINCT`).
+    pub distinct: bool,
     pub return_type: LogicalTypeId,
 }
 

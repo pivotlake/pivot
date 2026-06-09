@@ -177,15 +177,28 @@ pub enum AggregateFunc {
     /// `COUNT(col)` — counts non-null values. DuckDB lowers `AVG(col)` to
     /// `sum(col) / count(col)`, so this shows up in average plans.
     Count(NumericAggregate),
+    /// `COUNT(DISTINCT col)` — counts the distinct non-null values of `col`.
+    /// Lowered in compilation to a two-level GROUP BY (dedup on the group keys
+    /// plus `col`, then count rows per group); see [`crate::compile`].
+    CountDistinct(NumericAggregate),
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
     type Error = Error;
     fn try_from(a: duckdb_expression::AggregateFunc) -> Result<Self, Self::Error> {
+        // DISTINCT is only supported for `COUNT` so far; reject `SUM(DISTINCT)`
+        // etc. rather than silently computing the non-distinct aggregate.
+        if a.distinct && a.aggregate_function != "count" {
+            return Err(Error::UnsupportedAggregateFunction(format!(
+                "DISTINCT {}",
+                a.aggregate_function
+            )));
+        }
         match a.aggregate_function.as_str() {
             "count_star" => Ok(AggregateFunc::CountStar(a.try_into()?)),
             "sum" => Ok(AggregateFunc::Sum(a.try_into()?)),
             "avg" => Ok(AggregateFunc::Avg(a.try_into()?)),
+            "count" if a.distinct => Ok(AggregateFunc::CountDistinct(a.try_into()?)),
             "count" => Ok(AggregateFunc::Count(a.try_into()?)),
             _ => Err(Error::UnsupportedAggregateFunction(a.aggregate_function)),
         }
@@ -375,6 +388,9 @@ impl Display for Expression {
             }
             Expression::AggregateFunc(AggregateFunc::Count(a)) => {
                 write!(f, "count(#{})", a.column.column_idx)
+            }
+            Expression::AggregateFunc(AggregateFunc::CountDistinct(a)) => {
+                write!(f, "count(distinct #{})", a.column.column_idx)
             }
             Expression::Function(Function::Contains(c)) => {
                 write!(f, "contains({}, {})", c.haystack, c.needle)

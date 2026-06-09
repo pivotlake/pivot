@@ -14,8 +14,8 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field as ArrowField, Schema};
 
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
 use crate::operations::channels::Sender;
@@ -164,6 +164,7 @@ pub(crate) fn build_and_send<K, V, S, Snd>(
     arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     top_k: Option<(usize, usize)>,
+    count_only: bool,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -172,6 +173,20 @@ where
     S: TableStorage<K, V>,
     Snd: Sender<RecordBatch>,
 {
+    // Global `COUNT(DISTINCT)`: the caller only needs the *number* of distinct
+    // keys, not the keys. Emit this partition's distinct-key count as a single
+    // `Int64` row instead of materialising every key column (hundreds of MB of
+    // pure waste at high cardinality); a downstream `SUM` over the per-partition
+    // counts gives the total (partitions are hash-disjoint). `table.len() == 0`
+    // partitions are filtered out before this call, so every count is non-zero.
+    if count_only {
+        let arr = Arc::new(Int64Array::from(vec![table.len() as i64]));
+        let field = ArrowField::new("v0", DataType::Int64, false);
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr])?;
+        sender.send(batch)?;
+        return Ok(());
+    }
+
     match top_k {
         Some((slot, limit)) if limit < table.len() => {
             let rows = top_k_rows::<K, V, S>(&table, slot, limit);

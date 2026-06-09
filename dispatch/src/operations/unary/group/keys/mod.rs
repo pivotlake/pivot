@@ -34,6 +34,9 @@ pub use int::IntKeyExtractor;
 mod int_pair;
 pub use int_pair::IntPairKeyExtractor;
 
+mod hash_only_int;
+pub use hash_only_int::HashOnlyIntKeyExtractor;
+
 mod string;
 pub use string::{ArenaKey, StringKeyExtractor};
 
@@ -44,6 +47,14 @@ pub trait KeyExtractor: Send + 'static {
     /// high cardinality. Strings stay in-place (deferred dedup would store every
     /// occurrence un-deduped); fixed-width integer keys switch.
     const SUPPORTS_RADIX: bool = false;
+
+    /// When `true`, the persisted key is a zero-sized `()` and dedup is purely by
+    /// the (bijective) hash, so a hash of 0 — which the table reserves as its
+    /// empty-slot sentinel — cannot be remapped without aliasing a real key.
+    /// [`AggregatedTable`](super::hashtables::AggregatedTable) instead counts the
+    /// single 0-hash key out of band (it never reaches the table). Implies
+    /// `!SUPPORTS_RADIX` (the radix scatter path has no such out-of-band count).
+    const DEDUP_BY_HASH: bool = false;
 
     /// The `Copy` key representation stored inside hash table entries.
     type Persisted: PersistedKey;

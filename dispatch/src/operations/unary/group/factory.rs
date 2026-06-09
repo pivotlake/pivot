@@ -35,6 +35,7 @@ pub struct GroupFactory<K: KeyExtractor, V: ValueExtractor> {
     key_cols: Vec<usize>,
     value_slots: Vec<AggregationSlot>,
     top_k: Option<(usize, usize)>,
+    count_only: bool,
     hash_state: RandomState,
     injector: Arc<Injector<PartitionJob<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
@@ -47,10 +48,12 @@ impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {
     /// Create `worker_count` factories that share the same arena, hash state,
     /// and synchronization primitives. `key_cols` are the GROUP BY column
     /// indices; `value_slots` configure the per-group aggregates.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_for_workers(
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
+        count_only: bool,
         worker_count: usize,
         buffers: usize,
     ) -> impl IntoIterator<Item = GroupFactory<K, V>> {
@@ -66,6 +69,7 @@ impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {
             key_cols: key_cols.clone(),
             value_slots: value_slots.clone(),
             top_k,
+            count_only,
             hash_state: hash_state.clone(),
             injector: injector.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
@@ -88,6 +92,7 @@ impl<K: KeyExtractor, V: ValueExtractor> UnaryFactory<RecordBatch, RecordBatch>
             self.key_cols,
             self.value_slots,
             self.top_k,
+            self.count_only,
             self.sender,
             self.receiver.take(),
             self.partition_jobs_injected,

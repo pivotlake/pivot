@@ -1,0 +1,107 @@
+//! Keys-only integer GROUP BY for exact global `COUNT(DISTINCT int)`.
+//!
+//! For a global distinct count we never read the keys back — we only need the
+//! number of distinct values. So instead of storing the integer key alongside
+//! its hash (a 16-byte `Entry` for an `i64`), this extractor stores **only** a
+//! *bijective* 64-bit hash of the key and uses `()` as the persisted key, giving
+//! an 8-byte `Entry { hash: u64, key: (), value: ZST }`. Dedup is by hash
+//! equality, which — because the mix below is a bijection on `u64` — is exactly
+//! key equality. Half the bytes per entry means roughly twice the entries per
+//! cache line, which is the dominant cost for this latency-bound, high-cardinality
+//! build (the probe is bound by cache-miss latency, so denser entries win).
+//!
+//! This is paired with the count-only group output, so the no-op
+//! [`KeyColumns`] below is never materialised (the group emits per-partition
+//! counts, not keys). It must therefore only be used via `group_by_distinct_count`.
+
+use super::int_pair::IntBits;
+use crate::memory::SlabAllocator;
+use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
+use crate::operations::unary::group::hashtables::PersistedKey;
+use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
+use ahash::RandomState;
+use arrow_array::cast::AsArray;
+use arrow_array::types::ArrowPrimitiveType;
+use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch};
+use arrow_schema::Field;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+/// `()` is a valid persisted key: zero-sized, so an entry that stores only the
+/// (bijective) hash carries no separate key bytes.
+impl PersistedKey for () {}
+
+/// SplitMix64 finalizer — a *bijection* on `u64` (each step is invertible: an
+/// xor-shift-right and a multiply by an odd constant). Distinct inputs therefore
+/// map to distinct outputs, so deduping by this value is exact, and its strong
+/// avalanche gives uniform top bits for slot/partition placement.
+#[inline(always)]
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// A keys-only [`KeyExtractor`] over a single integer column: stores a bijective
+/// hash and a `()` key (8-byte entries). For exact global `COUNT(DISTINCT col)`.
+pub struct HashOnlyIntKeyExtractor<T: ArrowPrimitiveType>(PhantomData<T>)
+where
+    T::Native: IntBits;
+
+unsafe impl<T: ArrowPrimitiveType> Send for HashOnlyIntKeyExtractor<T> where T::Native: IntBits {}
+
+impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for HashOnlyIntKeyExtractor<T>
+where
+    T::Native: IntBits,
+{
+    // Dedup is purely by the bijective hash (the key is `()`), so the table
+    // counts the single 0-hash key out of band instead of remapping it. Stays
+    // in-place (no radix) — the out-of-band count lives on the in-place table.
+    const DEDUP_BY_HASH: bool = true;
+
+    type Persisted = ();
+    type LiveKey<'a, 'b> = ();
+    type PersistedLiveKey<'a> = ();
+    type Reader<'b> = &'b PrimitiveArray<T>;
+    type Columns = NoKeyColumns;
+
+    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
+        batch.column(key_cols[0]).as_primitive::<T>()
+    }
+
+    #[inline(always)]
+    fn hash(reader: &Self::Reader<'_>, idx: usize, _state: &RandomState) -> u64 {
+        // Fixed bijective mix (not the keyed RandomState): consistency across
+        // workers and exact dedup both require the same 1:1 function everywhere.
+        mix64(unsafe { reader.value_unchecked(idx) }.to_u64())
+    }
+
+    #[inline(always)]
+    fn live_key<'a, 'b>(
+        _reader: &Self::Reader<'b>,
+        _idx: usize,
+        _arena: &'a mut WorkerArena,
+    ) -> Self::LiveKey<'a, 'b> {
+    }
+
+    fn resolve_persisted(_arena: &SharedArena, _persisted: ()) {}
+}
+
+/// No-op key columns: a keys-only group is only ever used count-only, so this is
+/// never materialised.
+pub struct NoKeyColumns;
+
+impl KeyColumns for NoKeyColumns {
+    type Key = ();
+
+    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+        NoKeyColumns
+    }
+
+    #[inline(always)]
+    fn push(&mut self, _key: &()) {}
+
+    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+        (Vec::new(), Vec::new())
+    }
+}

@@ -97,10 +97,13 @@ mod values;
 pub use factory::GroupFactory;
 mod hashtables;
 
-pub use keys::{ArenaKey, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
+pub use keys::{
+    ArenaKey, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor,
+    StringKeyExtractor,
+};
 pub use values::{
     Accumulator, Aggregate, AggregationKind, AggregationRowValueExtractor, AggregationSlot,
-    Compiled, Count, Sum, ValueExtractor,
+    Compiled, Count, DistinctValueExtractor, Sum, ValueExtractor,
 };
 
 use crate::memory::SlabAllocator;
@@ -164,6 +167,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
+        count_only: bool,
         sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
         receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
@@ -178,6 +182,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 receiver,
                 partition_jobs_injected,
                 top_k,
+                count_only,
                 output_allocator: None,
             },
             sender,
@@ -219,6 +224,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     top_k: Option<(usize, usize)>,
+    /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
+    /// of its keys (a downstream `SUM` totals them).
+    count_only: bool,
     /// One allocator per worker for the output columns of every partition this
     /// worker handles, so small per-partition outputs pack into shared buffers
     /// instead of each grabbing a fresh 2MB one. Created lazily on the first job.
@@ -243,6 +251,7 @@ pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
     top_k: Option<(usize, usize)>,
+    count_only: bool,
 }
 
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
@@ -266,7 +275,14 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
         if result_map.len() == 0 {
             return Ok(());
         }
-        output::build_and_send::<K, V, _, _>(result_map, &self.arena, allocator, self.top_k, sender)
+        output::build_and_send::<K, V, _, _>(
+            result_map,
+            &self.arena,
+            allocator,
+            self.top_k,
+            self.count_only,
+            sender,
+        )
     }
 }
 
@@ -276,12 +292,14 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
             let mut all_tables = Vec::new();
             let mut all_buffers = Vec::new();
             let mut hll = Hll::new();
+            let mut zero_hash_seen = false;
             for out in rx.into_iter() {
                 all_tables.extend(out.tables);
                 if let Some(b) = out.buffers {
                     all_buffers.push(b);
                 }
                 hll.merge(&out.hll);
+                zero_hash_seen |= out.zero_hash_seen;
             }
 
             // Pick the partition count: nobody switched -> the cheap PARTITIONS-way
@@ -322,10 +340,28 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                     partition_capacity,
                     num_partitions,
                     top_k: self.top_k,
+                    count_only: self.count_only,
                 });
             }
 
             self.partition_jobs_injected.store(true, Ordering::Relaxed);
+
+            // Exact COUNT(DISTINCT): the keys-only consume excluded the single
+            // key whose bijective hash is 0 (it collides with the empty sentinel)
+            // and flagged it instead. Emit it now as one extra count row so the
+            // downstream SUM includes it. Only one worker drains the channel, so
+            // this fires exactly once.
+            if self.count_only && zero_hash_seen {
+                use arrow_array::Int64Array;
+                use arrow_schema::{DataType, Field, Schema};
+                let arr = Arc::new(Int64Array::from(vec![1i64]));
+                let field = Field::new("v0", DataType::Int64, false);
+                let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr])
+                    .map_err(|e| unary::Error::from(Error::from(e)))?;
+                sender
+                    .send(batch)
+                    .map_err(|e| unary::Error::from(Error::from(e)))?;
+            }
 
             // Wake up all workers so that they can start working on partitions
             worker_waker().notify();
@@ -411,6 +447,17 @@ mod tests {
         )
     }
 
+    #[test]
+    fn batch_wider_than_record_batch_size() {
+        // A single input batch wider than RECORD_BATCH_SIZE (8192) must be
+        // consumed via windowing rather than overflowing the per-batch scratch.
+        // This is the shape a GROUP BY feeding another GROUP BY produces.
+        let values: Vec<i32> = (0..20_000).map(|i| i % 5_000).collect();
+        let sender = run_group(vec![vec![batch_with_column(&values)]]);
+        // 5_000 distinct keys, each appearing 4 times.
+        assert_eq!(sender.total_rows(), 5_000);
+    }
+
     /// Common case with a chosen [`RadixConfig`] — a small one forces the radix
     /// switch + scatter merge to run within the test slab pool.
     fn run_group_with_radix(
@@ -454,6 +501,7 @@ mod tests {
                     key_cols.clone(),
                     value_slots.clone(),
                     top_k,
+                    false,
                     tx.clone(),
                     rx_opt.take(),
                     partition_jobs_injected.clone(),
