@@ -36,7 +36,7 @@ pub use table_store::TableObjectStore;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::parquet::{
@@ -57,18 +57,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 const PATH_OPTION: &str = "path";
-const URL_OPTION: &str = "url";
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(
-        "CREATE TABLE needs a `{PATH_OPTION}` (local directory) or `{URL_OPTION}` (goose catalog) option"
+        "CREATE TABLE needs a `{PATH_OPTION}` option, or a server started with a database directory"
     )]
     MissingPath,
     #[error("path `{0}` does not exist")]
     PathNotFound(String),
     #[error("path `{0}` is not a directory")]
     PathNotDirectory(String),
+    #[error(
+        "table path `{0}` must be a local path: a local database cannot hold an object-store table"
+    )]
+    RemoteTablePath(String),
     #[error("`IF NOT EXISTS` is not supported")]
     IfNotExistsUnsupported,
     #[error(transparent)]
@@ -79,6 +82,10 @@ pub enum Error {
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
     Store(#[from] store::StoreError),
+    #[error(transparent)]
+    Manifest(#[from] manifest::ManifestError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -96,9 +103,27 @@ impl From<Error> for CatalogError {
 /// [`ParquetTable`] (row groups + open file handles) that every later query
 /// reuses. The table map is shared (`Arc`) with the write operator the
 /// `CREATE TABLE` plan compiles to, so that plan can commit the built table.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ParquetCatalog {
     tables: Arc<RwLock<HashMap<String, ParquetCatalogTable>>>,
+    /// Durable record of which tables exist. In-memory by default (ephemeral);
+    /// for a database opened with [`open`](Self::open) it persists to the
+    /// database's object store and is reloaded into `tables` at startup.
+    manifest: Arc<dyn TableManifest>,
+    /// The database root directory (a persisted local database). A `CREATE TABLE`
+    /// with no explicit `path` puts the new table under `<root>/<name>`; `None`
+    /// for an in-memory database, where every table must name its own `path`.
+    root: Option<PathBuf>,
+}
+
+impl Default for ParquetCatalog {
+    fn default() -> Self {
+        Self {
+            tables: Arc::new(RwLock::new(HashMap::new())),
+            manifest: Arc::new(InMemoryTableManifest),
+            root: None,
+        }
+    }
 }
 
 impl ParquetCatalog {
@@ -117,7 +142,43 @@ impl ParquetCatalog {
         self.tables.read().unwrap().get(name).cloned()
     }
 
-    fn create_parquet_table(
+    /// Open a persisted database rooted at `uri` (a local directory, or — with an
+    /// object-store manifest — `s3://…`/`gs://…`), reloading every table the
+    /// manifest records. Each is re-materialized from its data directory, so a
+    /// restart restores the same catalog.
+    pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
+        let manifest: Arc<dyn TableManifest> =
+            Arc::new(ObjectStoreManifest::new(store::open_store(uri)?));
+        let catalog = Self {
+            tables: Arc::new(RwLock::new(HashMap::new())),
+            manifest,
+            root: local_root(uri),
+        };
+        for entry in catalog.manifest.load()? {
+            let location = catalog.resolve(&entry.location);
+            let parquet = Arc::new(materialize(dispatcher, &location)?);
+            catalog.tables.write().unwrap().insert(
+                entry.name,
+                ParquetCatalogTable {
+                    columns: entry.columns,
+                    location,
+                    parquet,
+                    predicates: Vec::new(),
+                },
+            );
+        }
+        Ok(catalog)
+    }
+
+    /// Create a table and register it in the manifest.
+    ///
+    /// The data lives in a directory: an explicit `WITH (path = '…')` — a local
+    /// path, inside or outside the database root, never an object-store URL — or
+    /// `<database-root>/<name>` when none is given. `CREATE TABLE x (…)` with no
+    /// path on an in-memory database has nowhere to put data and is rejected.
+    /// Every footer under the directory is read (in parallel) into the reusable
+    /// row groups; an empty directory yields an empty table.
+    fn create(
         &self,
         request: CreateTableRequest,
         dispatcher: &DataFlowDispatcher,
@@ -125,91 +186,63 @@ impl ParquetCatalog {
         if request.if_not_exists {
             return Err(Error::IfNotExistsUnsupported);
         }
-        // Validate inputs (path option, filesystem) before reading any footers.
-        let path = request.options.get(PATH_OPTION).ok_or(Error::MissingPath)?;
-        let path_buf = Path::new(path);
-        if !path_buf.exists() {
-            return Err(Error::PathNotFound(path.clone()));
+        // Reject a duplicate before persisting it; the write operator re-checks
+        // under the lock as a race backstop.
+        if self.tables.read().unwrap().contains_key(&request.name) {
+            return Err(Error::TableExists(request.name));
         }
-        if !path_buf.is_dir() {
-            return Err(Error::PathNotDirectory(path.clone()));
-        }
-        // Read every footer in parallel into the reusable row-group metadata.
-        let parquet = Arc::new(ParquetTable::from_directory(dispatcher, path_buf)?);
+
+        let stored = self.locate(&request)?;
+        let location = self.resolve(&stored);
+        let parquet = Arc::new(materialize(dispatcher, &location)?);
+
+        self.manifest.insert(&ManifestEntry {
+            name: request.name.clone(),
+            columns: request.columns.clone(),
+            location: stored,
+        })?;
 
         let table = ParquetCatalogTable {
             columns: request.columns,
+            location,
             parquet,
             predicates: Vec::new(),
         };
         Ok(self.write_table_spec(dispatcher, request.name, table))
     }
 
-    /// Create a table from a goose catalog snapshot (`WITH (url = '…')`).
-    ///
-    /// The URL names one catalog root (one table). If the latest snapshot
-    /// already defines a table, we attach to it — building a [`ParquetTable`]
-    /// over its recorded data files. If the catalog is empty, we CAS-commit a
-    /// new snapshot defining this table (declared columns, no data files yet);
-    /// ingest fills in data files via its own commits.
-    ///
-    /// Data files are resolved by location: local ones are read from disk;
-    /// remote (`s3://`/`gs://`) ones are presigned and range-read over the ring.
-    /// A table's files share the catalog root's store, so they're all local or
-    /// all remote — a mix is rejected. Every footer is read (in parallel) here,
-    /// producing the reusable [`ParquetTable`] row groups.
-    fn create_lake_table(
-        &self,
-        request: CreateTableRequest,
-        dispatcher: &DataFlowDispatcher,
-    ) -> Result<RecordBatchOperatorSpec> {
-        if request.if_not_exists {
-            return Err(Error::IfNotExistsUnsupported);
+    /// The data directory for a new table, in the form stored in the manifest: an
+    /// explicit local `path` (kept as given), or the table name relative to the
+    /// database root. For the latter it creates `<root>/<name>` so an empty table
+    /// has somewhere to hold data.
+    fn locate(&self, request: &CreateTableRequest) -> Result<PathBuf> {
+        if let Some(path) = request.options.get(PATH_OPTION) {
+            if has_object_store_scheme(path) {
+                return Err(Error::RemoteTablePath(path.clone()));
+            }
+            let dir = PathBuf::from(path);
+            if !dir.exists() {
+                return Err(Error::PathNotFound(path.clone()));
+            }
+            if !dir.is_dir() {
+                return Err(Error::PathNotDirectory(path.clone()));
+            }
+            Ok(dir)
+        } else if let Some(root) = &self.root {
+            std::fs::create_dir_all(root.join(&request.name))?;
+            Ok(PathBuf::from(&request.name))
+        } else {
+            Err(Error::MissingPath)
         }
-        let url = request.options.get(URL_OPTION).ok_or(Error::MissingPath)?;
-        let store = TableObjectStore::open(url)?;
-        let snapshot = store.latest_snapshot()?;
+    }
 
-        // The URL identifies a single table, so take the sole table the snapshot
-        // describes (if any).
-        let existing = snapshot.schemas.iter().flat_map(|s| &s.tables).next();
-
-        let parquet = match existing {
-            // Attach: resolve the recorded data files (local or presigned remote,
-            // freely mixed) and read their footers in parallel.
-            Some(table) => {
-                ParquetTable::from_locations(dispatcher, store.resolve_data_files(table)?)?
-            }
-            None => {
-                // New catalog: commit an initial snapshot defining this table.
-                let columns: Vec<metadata::Column> = request
-                    .columns
-                    .iter()
-                    .map(|c| metadata::Column {
-                        name: c.name.clone(),
-                        type_sql: lake::pivot_type_to_sql(&c.col_type).to_string(),
-                    })
-                    .collect();
-                let name = request.name.clone();
-                store.commit(|snap| {
-                    let schema = ensure_main_schema(snap);
-                    schema.tables.push(metadata::Table {
-                        name: name.clone(),
-                        columns: columns.clone(),
-                        files: Vec::new(),
-                    });
-                    Ok(())
-                })?;
-                ParquetTable::new(Vec::new())
-            }
-        };
-
-        let table = ParquetCatalogTable {
-            columns: request.columns,
-            parquet: Arc::new(parquet),
-            predicates: Vec::new(),
-        };
-        Ok(self.write_table_spec(dispatcher, request.name, table))
+    /// Resolve a manifest-stored location to an absolute path: a relative one is
+    /// taken against the database root, an absolute one used as-is.
+    fn resolve(&self, location: &Path) -> PathBuf {
+        match &self.root {
+            Some(root) if location.is_relative() => root.join(location),
+            _ => location.to_path_buf(),
+        }
     }
 
     /// Build the dataflow that commits an already-materialized table into the
@@ -233,31 +266,36 @@ impl ParquetCatalog {
             }),
         )
     }
+}
 
-    /// Route a `CREATE TABLE` to the local-directory or goose-catalog backend
-    /// based on which option it carries.
-    fn create_any(
-        &self,
-        request: CreateTableRequest,
-        dispatcher: &DataFlowDispatcher,
-    ) -> Result<RecordBatchOperatorSpec> {
-        if request.options.contains_key(URL_OPTION) {
-            self.create_lake_table(request, dispatcher)
-        } else {
-            self.create_parquet_table(request, dispatcher)
-        }
+/// Read every Parquet footer under `dir` into a table's row groups. A missing or
+/// empty directory yields an empty table — a freshly-created, data-less table.
+fn materialize(dispatcher: &DataFlowDispatcher, dir: &Path) -> Result<ParquetTable> {
+    if !dir.exists() {
+        return Ok(ParquetTable::new(Vec::new()));
+    }
+    Ok(ParquetTable::from_directory(dispatcher, dir)?)
+}
+
+/// The local root directory for a database `uri`, or `None` if it names a remote
+/// object store (whose tables aren't local paths). `file://` is local.
+fn local_root(uri: &str) -> Option<PathBuf> {
+    if is_remote_uri(uri) {
+        None
+    } else {
+        Some(PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri)))
     }
 }
 
-/// Get the `main` schema, creating it if a snapshot somehow lacks one.
-fn ensure_main_schema(snap: &mut metadata::CatalogSnapshot) -> &mut metadata::Schema {
-    if !snap.schemas.iter().any(|s| s.name == "main") {
-        snap.schemas.push(metadata::Schema {
-            name: "main".to_string(),
-            tables: Vec::new(),
-        });
-    }
-    snap.schemas.iter_mut().find(|s| s.name == "main").unwrap()
+/// Whether a database URI names a remote object store (matching `open_store`).
+fn is_remote_uri(uri: &str) -> bool {
+    uri.starts_with("s3://") || uri.starts_with("s3a://") || uri.starts_with("gs://")
+}
+
+/// Whether a table `path` carries any object-store / URL scheme, which a table
+/// location never may — it must be a bare local path.
+fn has_object_store_scheme(path: &str) -> bool {
+    is_remote_uri(path) || path.starts_with("gcs://") || path.starts_with("file://")
 }
 
 impl Catalog for ParquetCatalog {
@@ -274,7 +312,7 @@ impl Catalog for ParquetCatalog {
         request: CreateTableRequest,
         dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        Ok(self.create_any(request, dispatcher)?)
+        Ok(self.create(request, dispatcher)?)
     }
 }
 
@@ -358,6 +396,9 @@ struct PushedPredicate {
 #[derive(Clone, Debug)]
 pub struct ParquetCatalogTable {
     pub columns: Vec<Column>,
+    /// The absolute directory holding this table's Parquet data. Kept so a future
+    /// `refresh()` can re-read the latest files without consulting the manifest.
+    pub location: PathBuf,
     /// The table's row-group metadata, read once when the table was defined and
     /// shared across every binding/query (cheap `Arc` clone). Pruning a binding's
     /// predicates clones the row-group `Vec` and filters it — no footer re-read.
