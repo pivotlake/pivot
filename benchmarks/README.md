@@ -11,37 +11,41 @@ saved baseline.
 # from the workspace root
 cd benchmarks
 
-# run the full clickbench suite
-cargo run --release -- --source ~/hits
+# download/use ~/hits/hits.parquet, then run the full clickbench suite
+./benchmark.sh
 
 # run just q07 and q20, three iterations each, sleeping 500ms between
-cargo run --release -- --source ~/hits --query 7,20 --iterations 3 --sleep 500
+cargo run --release --bin pivot-bench -- --source ~/hits --query 7,20 --iterations 3 --sleep 500
+
+# generate/use ~/tpch-flat/tpch_flat.parquet, then compare pivot vs DuckDB
+./benchmark.sh --suite tpch-flat --iterations 3
 
 # regenerate expected output (use after a deliberate semantic change, or
 # when running against a smaller/different dataset)
-cargo run --release -- --source ~/hits --update-results
+cargo run --release --bin pivot-bench -- --source ~/hits --update-results
 
 # compare against the baseline; overwrite it (appending a timestamped history
 # row) if *either* the cold or the hot suite total beats it by more than the
 # regression threshold
-cargo run --release -- --source ~/hits --iterations 5 --save-if-better
+cargo run --release --bin pivot-bench -- --source ~/hits --iterations 5 --save-if-better
 
 # compare against a baseline stored in GCS
-cargo run --release -- --source ~/hits --baseline gs://my-bucket/clickbench.json
+cargo run --release --bin pivot-bench -- --source ~/hits --baseline gs://my-bucket/clickbench.json
 
 # show the recorded results without running anything
-cargo run -- --show
-cargo run -- --show --baseline gs://my-bucket/clickbench.json
+cargo run --bin pivot-bench -- --show
+cargo run --bin pivot-bench -- --show --baseline gs://my-bucket/clickbench.json
 ```
 
 ## Suite layout
 
-A suite is a directory under `benchmarks/<name>/`. Today only `clickbench`
-ships, `tpch` will sit alongside.
+A suite is a directory under `benchmarks/<name>/`.
 
 ```
 benchmarks/clickbench/
+├── load.sh            # optional data loader; prints the resolved source path
 ├── setup.sql          # CREATE TABLE etc. {source} is substituted with --source
+├── duckdb-setup.sql   # DuckDB setup template used by run-duckdb.sh
 ├── q07.sql            # one query per file; stem is the query ID
 ├── q07.tsv            # expected pgwire output (TSV, tab-separated rows)
 ├── q20.sql
@@ -61,7 +65,25 @@ a few columns — chiefly `EventDate` → a real `DATE` — so for `SELECT *`/da
 queries that path won't match; fall back to `--update-results` and eyeball.)
 
 Adding a suite: `mkdir benchmarks/<name>`, fill in `setup.sql` and the
-queries, then run with `--suite <name>`.
+queries, then run with `--suite <name>`. Add `load.sh` when the suite can
+provision or transform its own data. `benchmark.sh` calls it before running and
+uses the path it prints as `--source`.
+
+`clickbench/load.sh` downloads the canonical `hits.parquet` into `~/hits` by
+default when no parquet files are present. Override with `HITS_SOURCE`,
+`CLICKBENCH_PARQUET_URL`, or `./benchmark.sh --source <path>`.
+
+`tpch-flat/load.sh` uses `tpchgen-cli` to generate the normalized TPCH tables,
+then materializes one wide `tpch_flat.parquet` row per `lineitem` by joining in
+orders, customer, part, supplier, partsupp, nation, and region fields. The wide
+file is written with Snappy on every column and large row groups by default
+(`TPCH_FLAT_ROW_GROUP_ROWS=1048576`). If `tpchgen-cli` is missing, the loader
+installs it with `cargo install tpchgen-cli`; set `TPCHGEN_INSTALL=0` to require
+a preinstalled binary. Override the scale with `TPCH_SCALE_FACTOR=<sf>`, the
+flat output with `TPCH_FLAT_SOURCE`, the generated source cache with
+`TPCHGEN_SOURCE`, the row-group size with `TPCH_FLAT_ROW_GROUP_ROWS`, the
+transform batch size with `TPCH_FLAT_BATCH_ROWS`, or the command line path with
+`./benchmark.sh --suite tpch-flat --source <dir>`.
 
 ## Output verification
 

@@ -21,6 +21,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 core_affinity = "0.8.3"
 sysinfo = "0.38.0"
+arrow-array = "58.2.0"
+arrow-schema = "58.2.0"
+parquet = { version = "58.2.0", features = ["arrow", "snap"] }
 
 [[bin]]
 name = "pivot-bench"

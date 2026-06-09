@@ -14,9 +14,9 @@
 //! - `qXX.tsv`: the expected TSV output for the matching `qXX.sql`. Compared
 //!   for accuracy on every run; populated/refreshed with `--update-results`.
 //!
-//! Today the only suite is `clickbench`; future suites (e.g. `tpch`) just need
-//! to be a sibling directory — the harness discovers queries by listing
-//! `qXX.sql` files, so adding a query is "drop in two files".
+//! The shipped suites (`clickbench`, `tpch-flat`) are sibling directories —
+//! the harness discovers queries by listing `qXX.sql` files, so adding a query
+//! is "drop in two files".
 //!
 //! # Baselines
 //!

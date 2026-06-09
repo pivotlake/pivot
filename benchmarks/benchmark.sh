@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# benchmark.sh — run the same ClickBench queries through DuckDB and through
-# pivotdb, and print a side-by-side table of cold and hot timings plus the
-# speedup (how many times faster pivot is) per query.
+# benchmark.sh — run the same benchmark suite queries through DuckDB and
+# through pivotdb, and print a side-by-side table of cold and hot timings plus
+# the speedup (how many times faster pivot is) per query.
 #
 # DuckDB is driven by run-duckdb.sh; pivot is driven by
-# `just pgo-use run --release -- ...` (so it runs the PGO-optimised build —
+# `just pgo-use run --release --bin pivot-bench -- ...` (so it runs the PGO-optimised build —
 # generate the profile first with `just pgo-gen ...`).
 #
 # All pivot queries run first, then all DuckDB queries.
@@ -24,13 +24,15 @@
 # red when it is slower.
 #
 # Usage:
-#   ./benchmark.sh --source ~/hits                     # all queries, one session
+#   ./benchmark.sh --source ~/hits                     # clickbench, one session
+#   ./benchmark.sh --suite tpch-flat                   # load/use suite default data
 #   ./benchmark.sh --hits ~/hits --query 7,20          # subset; --hits == --source
 #   ./benchmark.sh --source ~/hits --iterations 5      # 1 cold + 4 hot runs
 #   ./benchmark.sh --source ~/hits --sleep 500         # 500ms between iterations
 #   ./benchmark.sh --source ~/hits --restart-server    # isolate each query
 #   ./benchmark.sh --source ~/hits --skip-check        # don't verify pivot output
 #   ./benchmark.sh --source ~/hits --no-drop-caches    # skip the cache drop
+#   ./benchmark.sh --source ~/hits --no-load           # don't run suite load.sh
 #
 # --source/--hits accepts a directory (globbed for *.parquet), a single
 # .parquet file, or an explicit glob.
@@ -38,8 +40,9 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-suite_dir="$here/clickbench"
 
+suite="clickbench"
+suite_dir_arg=""
 source_path=""
 queries=""
 iterations=3
@@ -47,19 +50,23 @@ drop_caches=1
 restart_server=0
 sleep_ms=0
 skip_check=0
+load_data=1
 
 usage() {
-    sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    awk 'NR > 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
     exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --suite)          suite="$2"; shift 2 ;;
+        --suite-dir)      suite_dir_arg="$2"; shift 2 ;;
         --source|--hits)  source_path="$2"; shift 2 ;;
         --query)          queries="$2"; shift 2 ;;
         --iterations)     iterations="$2"; shift 2 ;;
         --sleep)          sleep_ms="$2"; shift 2 ;;
         --skip-check)     skip_check=1; shift ;;
+        --no-load)        load_data=0; shift ;;
         --restart-server) restart_server=1; shift ;;
         --no-drop-caches) drop_caches=0; shift ;;
         -h|--help)        usage 0 ;;
@@ -67,14 +74,24 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$source_path" ]]; then
-    echo "error: --source/--hits is required" >&2
+suite_dir="${suite_dir_arg:-$here/$suite}"
+if [[ ! -d "$suite_dir" ]]; then
+    echo "error: suite directory not found: $suite_dir" >&2
     usage 1
 fi
 
-# pivot-bench flag: skip its output-vs-expected check (DuckDB doesn't verify).
-skip_flag=""
-[[ $skip_check -eq 1 ]] && skip_flag="--skip-check"
+if [[ $load_data -eq 1 && -x "$suite_dir/load.sh" ]]; then
+    if [[ -n "$source_path" ]]; then
+        source_path="$("$suite_dir/load.sh" "$source_path")"
+    else
+        source_path="$("$suite_dir/load.sh")"
+    fi
+fi
+
+if [[ -z "$source_path" ]]; then
+    echo "error: --source/--hits is required when the suite has no default load path" >&2
+    usage 1
+fi
 
 # Build the list of query IDs to run (stems like "q07"), accepting "7", "q07",
 # or nothing (= every qNN.sql in the suite).
@@ -93,6 +110,21 @@ else
         ids+=("$(basename "$f" .sql)")
     done
 fi
+
+if [[ $skip_check -eq 0 ]]; then
+    declare -a missing_expected=()
+    for id in "${ids[@]}"; do
+        [[ -f "$suite_dir/$id.tsv" ]] || missing_expected+=("$id")
+    done
+    if (( ${#missing_expected[@]} > 0 )); then
+        echo "warning: missing expected TSV for ${missing_expected[*]}; pivot result checks disabled" >&2
+        skip_check=1
+    fi
+fi
+
+# pivot-bench flag: skip its output-vs-expected check (DuckDB doesn't verify).
+skip_flag=""
+[[ $skip_check -eq 1 ]] && skip_flag="--skip-check"
 
 # Flush the Linux page cache so the next run reads cold from disk, the way
 # ClickBench measures. Needs root, so it goes through sudo.
@@ -113,7 +145,8 @@ pivot_invoke() {
     # a true cold read within the one warm server session (no restart needed).
     local cold_flag=""
     [[ $drop_caches -eq 1 ]] && cold_flag="--drop-caches"
-    ( cd "$here" && just pgo-use run --release -- \
+    ( cd "$here" && just pgo-use run --release --bin pivot-bench -- \
+        --suite "$suite" --suite-dir "$suite_dir" \
         --source "$source_path" --query "$*" --iterations "$iterations" \
         --sleep "$sleep_ms" $skip_flag $cold_flag ) 2>&1
 }
@@ -126,7 +159,8 @@ duck_invoke() {
     local IFS=,
     local duck_cache_flag="--no-drop-caches"
     [[ $drop_caches -eq 1 ]] && duck_cache_flag=""
-    "$here/run-duckdb.sh" --source "$source_path" --query "$*" \
+    "$here/run-duckdb.sh" --suite "$suite" --suite-dir "$suite_dir" \
+        --source "$source_path" --query "$*" \
         --iterations "$iterations" --sleep "$sleep_ms" $duck_cache_flag 2>&1
 }
 
@@ -283,6 +317,7 @@ collect() {
 }
 
 mode=$([[ $restart_server -eq 1 ]] && echo "restart per query" || echo "one session")
+echo "suite: $suite"
 echo "queries: ${#ids[@]}, iterations: $iterations, mode: $mode, drop_caches: $drop_caches"
 echo "source: $source_path"
 echo
@@ -368,7 +403,7 @@ BEGIN { grn = color ? "\033[32m" : ""; rst = color ? "\033[0m" : "" }
 }
 END {
     print ""
-    print "ClickBench score — geomean of (t+10ms)/(best+10ms) per query, lower is better"
+    print "ClickBench-style score — geomean of (t+10ms)/(best+10ms) per query, lower is better"
     print "(1.00 = fastest on every scored query):"
     printf "  %-7s %8s %8s\n", "", "cold", "hot"
     printf "  %-7s %s %s\n", "pivot",  cell(gm(lpc,nc), gm(ldc,nc), nc), cell(gm(lph,nh), gm(ldh,nh), nh)

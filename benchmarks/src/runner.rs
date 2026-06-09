@@ -56,10 +56,9 @@ pub struct Suite {
     pub queries: Vec<Query>,
 }
 
-/// Discover queries by listing `.sql` files in `suite_dir`. Every `*.sql`
-/// other than `setup.sql` is treated as a query whose ID is the file stem
-/// (e.g. `q07`); each one is paired with `<stem>.tsv` for the expected
-/// output. Sort by ID so the run order is deterministic.
+/// Discover queries by listing `q*.sql` files in `suite_dir`. Each one is
+/// paired with `<stem>.tsv` for the expected output. Sort by ID so the run
+/// order is deterministic.
 ///
 /// This is what makes a suite "just a directory": adding a query is dropping
 /// in `qNN.sql` + `qNN.tsv`, no code change needed.
@@ -81,7 +80,7 @@ pub fn discover_suite(name: &str, suite_dir: &Path) -> Result<Suite> {
             continue;
         }
         let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) if s != "setup" => s.to_string(),
+            Some(s) if s.starts_with('q') => s.to_string(),
             _ => continue,
         };
         queries.push(Query {

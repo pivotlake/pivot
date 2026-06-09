@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# run-duckdb.sh — run ClickBench queries through DuckDB for a side-by-side
+# run-duckdb.sh — run benchmark suite queries through DuckDB for a side-by-side
 # comparison with pivot-bench.
 #
-# The query files (qNN.sql) and schema live in benchmarks/clickbench/. DuckDB
-# reads the same parquet data pivot-bench points at via --source, exposed as a
-# `hits` view so the unmodified qNN.sql files run as-is.
+# Query files (qNN.sql) and the DuckDB setup template live in the suite
+# directory. DuckDB reads the same parquet data pivot-bench points at via
+# --source.
 #
 # Usage:
-#   ./run-duckdb.sh --source ~/hits                       # all queries, 1 run
+#   ./run-duckdb.sh --source ~/hits                       # clickbench, 1 run
+#   ./run-duckdb.sh --suite tpch-flat --source ~/tpch-flat
 #   ./run-duckdb.sh --source ~/hits --query 7,20          # just q07 and q20
 #   ./run-duckdb.sh --source ~/hits --iterations 3        # 3 timed runs each
 #   ./run-duckdb.sh --source ~/hits --iterations 3 --sleep 500   # 500ms between runs
@@ -33,8 +34,10 @@
 
 set -euo pipefail
 
-suite_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/clickbench"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+suite="clickbench"
+suite_dir_arg=""
 source_path=""
 queries=""
 iterations=1
@@ -43,12 +46,14 @@ write_expected=0
 sleep_ms=0
 
 usage() {
-    sed -n '3,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    awk 'NR > 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
     exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --suite)     suite="$2"; shift 2 ;;
+        --suite-dir) suite_dir_arg="$2"; shift 2 ;;
         --source)     source_path="$2"; shift 2 ;;
         --query)      queries="$2"; shift 2 ;;
         --iterations) iterations="$2"; shift 2 ;;
@@ -63,6 +68,18 @@ done
 if [[ -z "$source_path" ]]; then
     echo "error: --source is required" >&2
     usage 1
+fi
+
+suite_dir="${suite_dir_arg:-$here/$suite}"
+if [[ ! -d "$suite_dir" ]]; then
+    echo "error: suite directory not found: $suite_dir" >&2
+    exit 1
+fi
+
+duckdb_setup="$suite_dir/duckdb-setup.sql"
+if [[ ! -f "$duckdb_setup" ]]; then
+    echo "error: no DuckDB setup template at $duckdb_setup" >&2
+    exit 1
 fi
 
 command -v duckdb >/dev/null 2>&1 || {
@@ -105,6 +122,7 @@ else
 fi
 
 echo "duckdb $(duckdb --version)"
+echo "suite: $suite"
 echo "source: $parquet_glob"
 if [[ "$write_expected" == "1" ]]; then
     echo "queries: ${#query_files[@]}, writing expected .tsv (no timing)"
@@ -113,23 +131,8 @@ else
 fi
 echo
 
-# ClickBench's upstream DuckDB setup. `binary_as_string=True` decodes the parquet
-# string columns (stored as BLOB) as VARCHAR so `URL LIKE ...` binds, and
-# `make_date(EventDate)` turns EventDate (days since epoch) into a real DATE.
-#
-# EventTime is left as its raw packed-seconds integer — matching ClickBench's
-# upstream setup and pivot (whose planner also treats EventTime as an integer).
-# So `ORDER BY EventTime` (q24/q26) sorts the raw integer rather than converting
-# all ~100M rows per query. The one query that needs it as a timestamp — Q42's
-# `date_trunc` — converts it inline via the `toDateTime` macro in q42-duckdb.sql
-# (the same trick ClickBench uses), applied only to the rows surviving Q42's
-# filter. `epoch_ms` (not `to_timestamp`) avoids TIMESTAMP WITH TIME ZONE, whose
-# tz/ICU handling is ~3x slower.
-setup="CREATE VIEW hits AS
-SELECT *
-    REPLACE (make_date(EventDate) AS EventDate)
-FROM read_parquet('${parquet_glob}', binary_as_string=True);
-CREATE MACRO toDateTime(t) AS epoch_ms(t * 1000);"
+setup_template="$(<"$duckdb_setup")"
+setup="${setup_template//\{source\}/$parquet_glob}"
 
 for f in "${query_files[@]}"; do
     stem="$(basename "$f" .sql)"
