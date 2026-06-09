@@ -25,11 +25,13 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 pub mod lake;
+pub mod manifest;
 pub mod metadata;
 pub mod parquet;
 pub mod store;
 pub mod table_store;
 
+pub use manifest::{InMemoryTableManifest, ManifestEntry, TableManifest};
 pub use table_store::TableObjectStore;
 
 use std::collections::HashMap;
