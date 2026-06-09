@@ -96,8 +96,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTable, DEFAULT_CAPACITY, MultiSlabTable, PartitionBuffers, RadixConfig,
-    WorkerOutput,
+    AggregatedTable, DEFAULT_CAPACITY, MultiSlabTable, PartitionBuffers, RadixConfig, WorkerOutput,
 };
 use crate::worker::worker_waker;
 use ahash::RandomState;
@@ -282,7 +281,9 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                 let total: usize = all_tables.iter().map(|t| t.len()).sum();
                 (
                     PARTITIONS,
-                    (total / PARTITIONS).next_power_of_two().max(DEFAULT_CAPACITY),
+                    (total / PARTITIONS)
+                        .next_power_of_two()
+                        .max(DEFAULT_CAPACITY),
                 )
             } else {
                 // Every switched worker scattered into the same partition count
@@ -312,7 +313,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                 });
             }
 
-                        self.partition_jobs_injected.store(true, Ordering::Relaxed);
+            self.partition_jobs_injected.store(true, Ordering::Relaxed);
 
             // Wake up all workers so that they can start working on partitions
             worker_waker().notify();
@@ -515,24 +516,36 @@ mod tests {
         // A small config makes a radix-eligible (integer) worker switch to scatter
         // after ~a couple hundred keys and scatter into 16 partitions, exercising
         // the whole radix path within the test pool.
-        let radix = RadixConfig { switch_threshold: 256, partitions: 16 };
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
         let mut values: Vec<i32> = (0..500).collect();
         values.extend(0..500);
 
         let sender = run_group_with_radix(vec![vec![batch_with_column(&values)]], radix);
 
-        assert_eq!(group_counts(&sender), (0..500).map(|k| (k, 2)).collect::<Vec<_>>());
+        assert_eq!(
+            group_counts(&sender),
+            (0..500).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn radix_switch_merges_across_workers() {
         // Two workers each switch to scatter; the radix merge has to combine both
         // workers' per-partition buffers and pre-switch stacks for every key.
-        let radix = RadixConfig { switch_threshold: 256, partitions: 16 };
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
         let worker = || vec![batch_with_column(&(0..500).collect::<Vec<_>>())];
 
         let sender = run_group_with_radix(vec![worker(), worker()], radix);
 
-        assert_eq!(group_counts(&sender), (0..500).map(|k| (k, 2)).collect::<Vec<_>>());
+        assert_eq!(
+            group_counts(&sender),
+            (0..500).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
     }
 }

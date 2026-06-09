@@ -17,18 +17,18 @@
 //!
 //! The choice is per-worker and just falls out of how fast the table fills, so a
 //! low-cardinality column never switches. At [`flush`](AggregatedTable::flush) a
-//! switched worker folds its small pre-switch stack into the scatter buffers, so
-//! the merge sees one uniform source per partition (a [`WorkerOutput::Radix`]).
+//! worker hands back its in-place stack and, if it switched, its scatter buffers;
+//! the merge slot-range-combines both by the same top bits, with no pre-fold.
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{SlabAllocator, SlabBuffer};
 use crate::operations::unary::group::RADIX_PARTITIONS;
-use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
     BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
 };
+use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::values::AggregationSlot;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
@@ -69,7 +69,11 @@ impl RadixConfig {
 }
 
 /// One scattered row: `(hash, persisted key, per-row value contribution)`.
-pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value);
+pub type RadixRow<K, V> = (
+    u64,
+    <K as KeyExtractor>::Persisted,
+    <V as ValueExtractor>::Value,
+);
 
 /// A growable, engine-backed (slab-pool) append-only buffer, as a list of
 /// fixed-size chunks. Appends never reallocate; a cached base pointer makes the
@@ -111,7 +115,11 @@ impl<T: Copy> SlabList<T> {
     pub fn for_each(&self, mut f: impl FnMut(T)) {
         let n = self.chunks.len();
         for (ci, chunk) in self.chunks.iter().enumerate() {
-            let len = if ci + 1 == n { self.last_len } else { CHUNK_CAP };
+            let len = if ci + 1 == n {
+                self.last_len
+            } else {
+                CHUNK_CAP
+            };
             let base = chunk.ptr_at_index(0) as *const T;
             let slice = unsafe { std::slice::from_raw_parts(base, len) };
             for &val in slice {
@@ -319,8 +327,11 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     fn grow_or_switch(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
         if K::SUPPORTS_RADIX && next_size > self.radix.switch_threshold {
-            self.buffers =
-                Some((0..self.radix.partitions).map(|_| SlabList::new()).collect());
+            self.buffers = Some(
+                (0..self.radix.partitions)
+                    .map(|_| SlabList::new())
+                    .collect(),
+            );
             self.switched = true;
             true
         } else {

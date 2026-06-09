@@ -26,10 +26,9 @@
 //!    exceeds [`RESIZE_COLLISION_RATIO`], which corresponds to ~70% effective
 //!    load (derived from Knuth's linear-probing analysis: ratio = α / 2(1-α)).
 //!
-//! The partition count (`num_partitions`) is [`PARTITIONS`] when nobody switched
-//! and [`RADIX_PARTITIONS`] otherwise; the in-place tables slot on the same top
-//! bits the scatter partitions on, so both sources land in the same partition.
-
+//! The partition count (`num_partitions`) is the in-place `PARTITIONS` when nobody
+//! switched and `RADIX_PARTITIONS` otherwise; the in-place tables slot on the same
+//! top bits the scatter partitions on, so both sources land in the same partition.
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
@@ -37,7 +36,6 @@ use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
     DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage, ValueExtractor,
 };
-
 
 /// Collision-to-entry ratio at which we double the target table.
 ///
@@ -178,10 +176,22 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
     partition_bits: u32,
 ) {
     merge_within_partition_bounds::<K, V, S>(
-        allocator, arena, partition, slot_count, &tables, target, partition_bits,
+        allocator,
+        arena,
+        partition,
+        slot_count,
+        &tables,
+        target,
+        partition_bits,
     );
     merge_past_partition_bounds::<K, V, S>(
-        allocator, arena, partition, slot_count, &tables, target, partition_bits,
+        allocator,
+        arena,
+        partition,
+        slot_count,
+        &tables,
+        target,
+        partition_bits,
     );
 }
 
@@ -264,8 +274,8 @@ fn grow_if_full<K: KeyExtractor, V: ValueExtractor>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::PARTITIONS;
+    use super::*;
     use crate::RECORD_BATCH_SIZE;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::arena::SharedArena;
@@ -288,8 +298,11 @@ mod tests {
         arena: &Arc<SharedArena>,
         values: &[i32],
     ) -> Vec<MultiSlabTable<IntExtractor, CountValue>> {
-        let mut agg =
-            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone(), RadixConfig::DEFAULT);
+        let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
+            state.clone(),
+            arena.clone(),
+            RadixConfig::DEFAULT,
+        );
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
@@ -314,8 +327,14 @@ mod tests {
 
         let mut all_entries = vec![];
         for p in 0..PARTITIONS {
-            let result =
-                merge_combined::<IntExtractor, CountValue>(p, &[], tables, partition_cap, PARTITIONS, arena);
+            let result = merge_combined::<IntExtractor, CountValue>(
+                p,
+                &[],
+                tables,
+                partition_cap,
+                PARTITIONS,
+                arena,
+            );
             for entry in result.iter(0) {
                 all_entries.push((*entry.key(), entry.value().0[0] as usize));
             }
@@ -412,8 +431,14 @@ mod tests {
         let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
         let mut total = 0;
         for p in 0..PARTITIONS {
-            let result =
-                merge_combined::<IntExtractor, CountValue>(p, &[], &tables, partition_cap, PARTITIONS, &arena);
+            let result = merge_combined::<IntExtractor, CountValue>(
+                p,
+                &[],
+                &tables,
+                partition_cap,
+                PARTITIONS,
+                &arena,
+            );
             total += result.iter(0).count();
         }
 
@@ -460,8 +485,11 @@ mod tests {
         arena: &Arc<SharedArena>,
         values: &[i32],
     ) -> WorkerOutput<IntExtractor, CountValue> {
-        let mut agg =
-            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone(), RadixConfig::DEFAULT);
+        let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
+            state.clone(),
+            arena.clone(),
+            RadixConfig::DEFAULT,
+        );
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         // One batch at a time — consume_batch's scratch is sized for RECORD_BATCH_SIZE.
         for chunk in values.chunks(RECORD_BATCH_SIZE) {
@@ -516,7 +544,10 @@ mod tests {
         }
 
         for k in 0..n as usize {
-            assert_eq!(occurrences[k], 1, "key {k} must be in exactly one partition");
+            assert_eq!(
+                occurrences[k], 1,
+                "key {k} must be in exactly one partition"
+            );
             assert_eq!(counts[k], 2, "key {k} has the wrong count");
         }
     }
