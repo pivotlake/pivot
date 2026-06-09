@@ -129,7 +129,12 @@ impl Aggregate {
         let n_distinct = self
             .expressions
             .iter()
-            .filter(|e| matches!(e, Expression::AggregateFunc(AggregateFunc::CountDistinct(_))))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Expression::AggregateFunc(AggregateFunc::CountDistinct(_))
+                )
+            })
             .count();
         if !self.groups.is_empty() && n_distinct == 1 {
             return self.compile_grouped_mixed_distinct(input);
@@ -149,24 +154,23 @@ impl Aggregate {
                 return Ok(input.count());
             }
 
-            let slots = self
-                .expressions
-                .iter()
-                .map(|e| match e {
-                    Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
-                        Ok(AggregationSlot::new(AggregationKind::Sum, a.column.column_idx))
-                    }
-                    Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(AggregationSlot::new(
-                        AggregationKind::Count,
-                        a.column.column_idx,
-                    )),
-                    // COUNT(*) ignores its column; the index is a placeholder.
-                    Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {
-                        Ok(AggregationSlot::new(AggregationKind::CountStar, 0))
-                    }
-                    expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let slots =
+                self.expressions
+                    .iter()
+                    .map(|e| match e {
+                        Expression::AggregateFunc(AggregateFunc::Sum(a)) => Ok(
+                            AggregationSlot::new(AggregationKind::Sum, a.column.column_idx),
+                        ),
+                        Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(
+                            AggregationSlot::new(AggregationKind::Count, a.column.column_idx),
+                        ),
+                        // COUNT(*) ignores its column; the index is a placeholder.
+                        Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {
+                            Ok(AggregationSlot::new(AggregationKind::CountStar, 0))
+                        }
+                        expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
             // Pick the accumulator width by column type, the same rule the
             // grouped path uses: i128 only when a SUM reads a 64-bit column
             // (whose total can overflow i64), else i64.
@@ -219,9 +223,11 @@ impl Aggregate {
                     }
                 }
                 // Computed group key (e.g. `GROUP BY date_trunc('minute',
-                // EventTime)`). Materialise the key into a single Int64 column
-                // with a projection, then group on that column. date_trunc and
-                // the other supported scalar key expressions all yield Int64.
+                // EventTime)` or `GROUP BY CASE …`). Materialise the key into a
+                // single column with a projection, then group on it, picking the
+                // key extractor from the expression's static result type. Numeric
+                // keys (date_trunc/minute yield Int64) use the Int64 extractor;
+                // a string-valued CASE uses the string extractor.
                 computed => {
                     let key_fn = computed.compile()?;
                     let keyed = input.project(move || {
@@ -236,7 +242,11 @@ impl Aggregate {
                                 .unwrap()
                         }
                     });
-                    Ok(keyed.group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(0))
+                    match computed.result_type() {
+                        Some(Type::Utf8) => Ok(keyed.group_by_count::<StringKeyExtractor>(0)),
+                        _ => Ok(keyed
+                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(0)),
+                    }
                 }
             },
             n => Err(Error::UnsupportedAggregateGroupAmount(n)),
@@ -278,28 +288,22 @@ impl Aggregate {
         // is the dominant cost for this latency-bound build. Strings keep the
         // arena-backed StringKeyExtractor (no exact 64-bit bijection for them).
         if self.groups.is_empty() {
-            let counts = match &x.return_type {
-                Type::Int8 => {
-                    input.group_by_distinct_count::<HashOnlyIntKeyExtractor<Int8Type>>(vec![x_col])
-                }
-                Type::Int16 => {
-                    input.group_by_distinct_count::<HashOnlyIntKeyExtractor<Int16Type>>(vec![x_col])
-                }
-                Type::Int32 => {
-                    input.group_by_distinct_count::<HashOnlyIntKeyExtractor<Int32Type>>(vec![x_col])
-                }
-                Type::Int64 => {
-                    input.group_by_distinct_count::<HashOnlyIntKeyExtractor<Int64Type>>(vec![x_col])
-                }
-                Type::Utf8 => input.group_by_distinct_count::<StringKeyExtractor>(vec![x_col]),
-                dt => return Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
-            };
+            let counts =
+                match &x.return_type {
+                    Type::Int8 => input
+                        .group_by_distinct_count::<HashOnlyIntKeyExtractor<Int8Type>>(vec![x_col]),
+                    Type::Int16 => input
+                        .group_by_distinct_count::<HashOnlyIntKeyExtractor<Int16Type>>(vec![x_col]),
+                    Type::Int32 => input
+                        .group_by_distinct_count::<HashOnlyIntKeyExtractor<Int32Type>>(vec![x_col]),
+                    Type::Int64 => input
+                        .group_by_distinct_count::<HashOnlyIntKeyExtractor<Int64Type>>(vec![x_col]),
+                    Type::Utf8 => input.group_by_distinct_count::<StringKeyExtractor>(vec![x_col]),
+                    dt => return Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
+                };
             // Per-partition distinct counts are i64; their total can't exceed the
             // row count, so the narrow accumulator suffices.
-            return Ok(counts.aggregate::<i64>(vec![AggregationSlot::new(
-                AggregationKind::Sum,
-                0,
-            )]));
+            return Ok(counts.aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::Sum, 0)]));
         }
 
         if self.groups.len() != 1 {
@@ -457,18 +461,24 @@ impl Aggregate {
             ($spec:expr, $K:ty, $cols:expr, $slots:expr) => {{
                 let slots = $slots;
                 match slots.len() {
-                    1 => $spec
-                        .group_by_aggregate::<$K, AggregationRowValueExtractor<1>>($cols, slots, None),
-                    2 => $spec
-                        .group_by_aggregate::<$K, AggregationRowValueExtractor<2>>($cols, slots, None),
-                    3 => $spec
-                        .group_by_aggregate::<$K, AggregationRowValueExtractor<3>>($cols, slots, None),
-                    4 => $spec
-                        .group_by_aggregate::<$K, AggregationRowValueExtractor<4>>($cols, slots, None),
-                    5 => $spec
-                        .group_by_aggregate::<$K, AggregationRowValueExtractor<5>>($cols, slots, None),
-                    6 => $spec
-                        .group_by_aggregate::<$K, AggregationRowValueExtractor<6>>($cols, slots, None),
+                    1 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<1>>(
+                        $cols, slots, None,
+                    ),
+                    2 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<2>>(
+                        $cols, slots, None,
+                    ),
+                    3 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<3>>(
+                        $cols, slots, None,
+                    ),
+                    4 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<4>>(
+                        $cols, slots, None,
+                    ),
+                    5 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<5>>(
+                        $cols, slots, None,
+                    ),
+                    6 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<6>>(
+                        $cols, slots, None,
+                    ),
                     n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             }};
@@ -601,35 +611,33 @@ impl Aggregate {
                         Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
                     }
                     // Fallback: the generic enum extractor, monomorphised by arity.
-                    _ => {
-                        match slots.len() {
-                            1 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<1, $acc>>(
-                                    key_cols, slots, top_k,
-                                )),
-                            2 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<2, $acc>>(
-                                    key_cols, slots, top_k,
-                                )),
-                            3 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<3, $acc>>(
-                                    key_cols, slots, top_k,
-                                )),
-                            4 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<4, $acc>>(
-                                    key_cols, slots, top_k,
-                                )),
-                            5 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<5, $acc>>(
-                                    key_cols, slots, top_k,
-                                )),
-                            6 => Ok(input
-                                .group_by_aggregate::<Key, AggregationRowValueExtractor<6, $acc>>(
-                                    key_cols, slots, top_k,
-                                )),
-                            n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
-                        }
-                    }
+                    _ => match slots.len() {
+                        1 => Ok(input
+                            .group_by_aggregate::<Key, AggregationRowValueExtractor<1, $acc>>(
+                                key_cols, slots, top_k,
+                            )),
+                        2 => Ok(input
+                            .group_by_aggregate::<Key, AggregationRowValueExtractor<2, $acc>>(
+                                key_cols, slots, top_k,
+                            )),
+                        3 => Ok(input
+                            .group_by_aggregate::<Key, AggregationRowValueExtractor<3, $acc>>(
+                                key_cols, slots, top_k,
+                            )),
+                        4 => Ok(input
+                            .group_by_aggregate::<Key, AggregationRowValueExtractor<4, $acc>>(
+                                key_cols, slots, top_k,
+                            )),
+                        5 => Ok(input
+                            .group_by_aggregate::<Key, AggregationRowValueExtractor<5, $acc>>(
+                                key_cols, slots, top_k,
+                            )),
+                        6 => Ok(input
+                            .group_by_aggregate::<Key, AggregationRowValueExtractor<6, $acc>>(
+                                key_cols, slots, top_k,
+                            )),
+                        n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                    },
                 }
             }};
         }

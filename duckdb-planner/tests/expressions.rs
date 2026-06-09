@@ -151,6 +151,25 @@ fn explicit_or_and_conjunction(mut planner: PlannerContext) {
     ");
 }
 
+// ---- CASE expressions ----
+
+/// `CASE WHEN … THEN … ELSE … END` deserializes as `Expression::Case` and
+/// renders each arm. A two-arm CASE here exercises both checks and the ELSE.
+#[rstest]
+fn case_expression_structure(mut planner: PlannerContext) {
+    let plan = planner
+        .plan(
+            "SELECT CASE WHEN score < 10 THEN 'lo' WHEN score < 20 THEN 'mid' ELSE 'hi' END \
+             FROM users",
+        )
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(CASE WHEN #0:INTEGER < 10:INTEGER -> BOOLEAN THEN lo:VARCHAR WHEN #0:INTEGER < 20:INTEGER -> BOOLEAN THEN mid:VARCHAR ELSE hi:VARCHAR END)
+      Input([#2:INTEGER])
+    ");
+}
+
 // ---- Aggregate function expressions ----
 
 #[rstest]

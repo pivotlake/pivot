@@ -518,6 +518,43 @@ impl TryFrom<duckdb_expression::Conjunction> for Conjunction {
     }
 }
 
+/// One `WHEN when THEN then` arm of a [`Case`].
+#[derive(Debug, Clone)]
+pub struct CaseCheck {
+    pub when: Box<Expression>,
+    pub then: Box<Expression>,
+}
+
+/// A `CASE WHEN … THEN … [WHEN …] ELSE … END` expression. Evaluates each
+/// `when` predicate in order and yields the first matching `then`, falling back
+/// to `else_expr`; see its compile impl, which folds the arms with arrow's
+/// `zip` kernel.
+#[derive(Debug, Clone)]
+pub struct Case {
+    pub checks: Vec<CaseCheck>,
+    pub else_expr: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Case> for Case {
+    type Error = Error;
+    fn try_from(c: duckdb_expression::Case) -> Result<Self, Self::Error> {
+        let checks = c
+            .checks
+            .into_iter()
+            .map(|check| {
+                Ok(CaseCheck {
+                    when: Box::<Expression>::try_from(check.when)?,
+                    then: Box::<Expression>::try_from(check.then)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Case {
+            checks,
+            else_expr: Box::<Expression>::try_from(c.else_expr)?,
+        })
+    }
+}
+
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
 #[derive(Debug, Clone)]
 pub enum Expression {
@@ -529,6 +566,34 @@ pub enum Expression {
     Function(Function),
     InList(InList),
     Conjunction(Conjunction),
+    Case(Case),
+}
+
+impl Expression {
+    /// Best-effort static result type of a computed expression, used to pick a
+    /// group-key extractor when grouping on it (e.g. `GROUP BY CASE …`). Returns
+    /// `None` when the type can't be determined cheaply, in which case callers
+    /// fall back to their default.
+    pub fn result_type(&self) -> Option<Type> {
+        match self {
+            Expression::Ref(r) => Some(r.return_type.clone()),
+            Expression::Constant(s) => match s.get().0.data_type() {
+                arrow_schema::DataType::Utf8
+                | arrow_schema::DataType::LargeUtf8
+                | arrow_schema::DataType::Utf8View => Some(Type::Utf8),
+                arrow_schema::DataType::Int8 => Some(Type::Int8),
+                arrow_schema::DataType::Int16 => Some(Type::Int16),
+                arrow_schema::DataType::Int32 => Some(Type::Int32),
+                arrow_schema::DataType::Int64 => Some(Type::Int64),
+                _ => None,
+            },
+            // A CASE's branches are unified to one type by DuckDB, so the ELSE
+            // branch's type is the whole expression's type.
+            Expression::Case(c) => c.else_expr.result_type(),
+            Expression::Function(Function::DateTrunc(_)) => Some(Type::Timestamp),
+            _ => None,
+        }
+    }
 }
 
 impl Display for CompareType {
@@ -605,6 +670,13 @@ impl Display for Expression {
                 let parts: Vec<String> = c.children.iter().map(|p| p.to_string()).collect();
                 write!(f, "({})", parts.join(&format!(" {op} ")))
             }
+            Expression::Case(c) => {
+                write!(f, "CASE")?;
+                for check in &c.checks {
+                    write!(f, " WHEN {} THEN {}", check.when, check.then)?;
+                }
+                write!(f, " ELSE {} END", c.else_expr)
+            }
         }
     }
 }
@@ -625,6 +697,7 @@ impl TryFrom<duckdb_expression::Expression> for Expression {
             duckdb_expression::Expression::Function(f) => Expression::Function(f.try_into()?),
             duckdb_expression::Expression::InList(i) => Expression::InList(i.try_into()?),
             duckdb_expression::Expression::Conjunction(c) => Expression::Conjunction(c.try_into()?),
+            duckdb_expression::Expression::Case(c) => Expression::Case(c.try_into()?),
         })
     }
 }
