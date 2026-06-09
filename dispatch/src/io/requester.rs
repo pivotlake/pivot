@@ -1,7 +1,7 @@
 use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
-use crate::io::{DataFlowRequest, FileLocation};
+use crate::io::{Completion, DataFlowRequest, FsRequest, HttpRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -36,13 +36,13 @@ const RING_SIZE: u32 = 64;
 pub struct IORequester {
     backend: IOBackend,
     /// In-flight disk reads, keyed by their `user_data` id.
-    pending_io_requests: HashMap<Identifier, DataFlowRequest>,
+    pending_io_requests: HashMap<Identifier, DataFlowRequest<FsRequest>>,
     next_id: Identifier,
 
     /// HTTP transport (shares `backend`'s ring on Linux).
     http: HttpEngine,
     /// In-flight HTTP reads, keyed by their engine request id.
-    http_pending: HashMap<Identifier, DataFlowRequest>,
+    http_pending: HashMap<Identifier, DataFlowRequest<HttpRequest>>,
     next_http_id: Identifier,
 }
 
@@ -74,13 +74,9 @@ impl IORequester {
     /// flushes immediately. No intermediate buffer: the slot region is the read
     /// target. The block holds an `Arc` on the slot pin, so it stays alive for
     /// the read even if the issuing query is cancelled meanwhile.
-    pub fn request(&mut self, request: DataFlowRequest) -> Result<()> {
-        let fd =
-            request.request.location.as_raw_fd().expect(
-                "IORequester::request only handles Local files; remote ones use request_http",
-            );
+    pub fn request(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
         self.backend.submit_read(
-            fd,
+            request.request.fd,
             request.request.block.file_offset() as u64,
             request.request.block.dest(),
             request.request.block.len(),
@@ -93,12 +89,18 @@ impl IORequester {
         Ok(())
     }
 
-    /// Submit an HTTP(S) range read for a [`Remote`](FileLocation::Remote) region.
-    /// The engine drives connect/handshake/request/response on the shared ring
-    /// (Linux) or synchronously (other platforms); the body lands in the block's
-    /// pinned cache slot just like a disk read.
-    pub fn request_http(&mut self, request: DataFlowRequest) -> Result<()> {
-        let read = remote_read(&request);
+    /// Submit an HTTP(S) range read for a remote region. The engine drives
+    /// connect/handshake/request/response on the shared ring (Linux) or
+    /// synchronously (other platforms); the body lands in the block's pinned
+    /// cache slot just like a disk read.
+    pub fn request_http(&mut self, request: DataFlowRequest<HttpRequest>) -> Result<()> {
+        let block = &request.request.block;
+        let read = RemoteRead {
+            remote: request.request.remote.clone(),
+            offset: block.file_offset() as u64,
+            len: block.len(),
+            dest: block.dest(),
+        };
         let id = self.next_http_id;
         #[cfg(target_os = "linux")]
         self.http.start(&mut self.backend.ring, id, read)?;
@@ -126,10 +128,11 @@ impl IORequester {
 
     /// Drain completed reads. Each block's bytes have already landed in its cache
     /// slot, so we [`commit`](crate::memory::file_cache::MissingBlock::commit) it
-    /// and yield the originating request. Disk completions come straight off the
+    /// and yield the originating request as a [`Completion`] — the transport kind
+    /// (fs or http) preserved in the type. Disk completions come straight off the
     /// ring; HTTP completions are routed through the [`HttpEngine`] (which may
     /// submit follow-up SQEs) before the finished ones are harvested.
-    pub fn completions(&mut self) -> Result<impl Iterator<Item = DataFlowRequest> + '_> {
+    pub fn completions(&mut self) -> Result<impl Iterator<Item = Completion> + '_> {
         let raw = self.backend.completions()?;
 
         // HTTP CQEs drive the engine (and may submit follow-up SQEs) — route them
@@ -144,23 +147,25 @@ impl IORequester {
         let http_ids = self.http.take_completed();
 
         // Yield each finished request lazily, committing its cache block as it
-        // goes: disk reads (the non-HTTP CQEs, already routed above are dropped)
-        // then the HTTP reads the engine just finished. A single `map` holds the
-        // one `&mut self`; `false`/`true` selects which pending map to drain.
-        Ok(raw
+        // goes: disk reads (the non-HTTP CQEs; the routed HTTP CQEs are dropped)
+        // then the HTTP reads the engine just finished. Each arm drains its own
+        // pending map (disjoint field borrows).
+        let fs_pending = &mut self.pending_io_requests;
+        let http_pending = &mut self.http_pending;
+        let fs = raw
             .into_iter()
-            .filter_map(|(_size, ud)| disk_completion(ud).then_some((false, ud)))
-            .chain(http_ids.into_iter().map(|id| (true, id)))
-            .map(move |(is_http, id)| {
-                let pending = if is_http {
-                    &mut self.http_pending
-                } else {
-                    &mut self.pending_io_requests
-                };
-                let request = pending.remove(&id).unwrap();
+            .filter_map(|(_size, ud)| disk_completion(ud).then_some(ud))
+            .map(move |id| {
+                let request = fs_pending.remove(&id).unwrap();
                 request.request.block.commit();
-                request
-            }))
+                Completion::Fs(request)
+            });
+        let http = http_ids.into_iter().map(move |id| {
+            let request = http_pending.remove(&id).unwrap();
+            request.request.block.commit();
+            Completion::Http(request)
+        });
+        Ok(fs.chain(http))
     }
 
     /// Blocks until at least one pending read (disk or HTTP) makes progress.
@@ -182,23 +187,6 @@ fn disk_completion(_ud: Identifier) -> bool {
     true
 }
 
-/// Extract a [`RemoteRead`] descriptor from a remote request.
-fn remote_read(request: &DataFlowRequest) -> RemoteRead {
-    let remote = match &request.request.location {
-        FileLocation::Remote(remote) => remote.clone(),
-        FileLocation::Local(_) => {
-            panic!("request_http only handles Remote files; local ones use request")
-        }
-    };
-    let block = &request.request.block;
-    RemoteRead {
-        remote,
-        offset: block.file_offset() as u64,
-        len: block.len(),
-        dest: block.dest(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! End-to-end HTTPS plumbing test: a loopback TLS server serves `206` range
@@ -210,7 +198,7 @@ mod tests {
     //! issuing a second read for a different region of the same object.
 
     use super::*;
-    use crate::io::{IORequest, RemoteFile};
+    use crate::io::{FileLocation, RemoteFile};
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -360,12 +348,15 @@ mod tests {
     /// Fetch `[offset, offset + len)` of `loc` via the requester and block until
     /// it completes.
     fn fetch(requester: &mut IORequester, loc: &FileLocation, offset: usize, len: usize) {
+        let FileLocation::Remote(remote) = loc else {
+            panic!("test fetches over http")
+        };
         let lookups = memory_ctx().file_cache().get(loc, offset, len);
         let mut submitted = 0;
         for lookup in &lookups {
             for block in lookup.missing() {
-                let req = IORequest {
-                    location: loc.clone(),
+                let req = HttpRequest {
+                    remote: remote.clone(),
                     block: block.clone(),
                 };
                 requester

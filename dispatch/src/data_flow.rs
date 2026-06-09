@@ -20,7 +20,7 @@
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
-use crate::io::{DataFlowRequest, IORequest};
+use crate::io::{DataFlowRequest, FsRequest, HttpRequest, IORequest};
 use crate::operations::Operator;
 use crate::worker::worker_waker;
 use ahash::HashMap;
@@ -310,9 +310,7 @@ impl DataFlow {
 
     /// Collect pending filesystem read requests from operators (leaf-to-root).
     /// Returns the first batch found, or `None` if no operator needs disk IO.
-    /// The kind-specific [`FsRequest`](crate::io::FsRequest)s convert into the
-    /// transport-tagged [`IORequest`] here.
-    pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest>> {
+    pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
         self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
@@ -321,7 +319,7 @@ impl DataFlow {
                         Ok(ControlFlow::Break(
                             requests
                                 .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, op.id, r.into()))
+                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
                                 .collect(),
                         ))
                     } else {
@@ -333,9 +331,8 @@ impl DataFlow {
     }
 
     /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
-    /// [`get_next_fs_request`](Self::get_next_fs_request); the kind-specific
-    /// [`HttpRequest`](crate::io::HttpRequest)s convert into [`IORequest`] here.
-    pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest>> {
+    /// [`get_next_fs_request`](Self::get_next_fs_request).
+    pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
         self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
@@ -344,7 +341,7 @@ impl DataFlow {
                         Ok(ControlFlow::Break(
                             requests
                                 .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, op.id, r.into()))
+                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
                                 .collect(),
                         ))
                     } else {
