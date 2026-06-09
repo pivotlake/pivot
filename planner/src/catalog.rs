@@ -91,7 +91,7 @@ pub trait Table: Debug + Send + Sync {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-    ) -> RecordBatchOperatorSpec;
+    ) -> Result<RecordBatchOperatorSpec>;
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
@@ -169,8 +169,10 @@ impl DuckDBTable for DuckDBTableAdapter {
 /// translation layer will call it when wiring [`Operator::Input`](crate::operator::Operator::Input)
 /// nodes to concrete [`Table`]s.
 ///
-/// `create_table` is invoked at execution time (not at plan time) by the
-/// nullary operator that compiles a `CREATE TABLE` statement.
+/// `create_table` compiles a `CREATE TABLE` statement: it does the up-front work
+/// (e.g. reading every data file's footer, in parallel, into a materialized
+/// table) on the coordinator and returns the dataflow plan that *writes* the
+/// result into the catalog when executed.
 pub trait Catalog: Debug + Send + Sync {
     /// Resolve a table name to a fresh, independently-mutable [`Table`], or
     /// `None` if no such table exists. Each call returns a unique `Box`, so
@@ -178,11 +180,19 @@ pub trait Catalog: Debug + Send + Sync {
     /// concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>>;
 
-    /// Create a new table from a [`CreateTableRequest`]. Invoked at execution
-    /// time by the nullary operator compiled from a `CREATE TABLE` statement,
-    /// not during planning. Errors are surfaced to the caller as
-    /// [`catalog::Error`](enum@Error).
-    fn create_table(&self, request: CreateTableRequest) -> Result<()>;
+    /// Compile a `CREATE TABLE` statement into the dataflow that writes the new
+    /// table into the catalog.
+    ///
+    /// Called on the **coordinator** at plan-compile time, so the backend may
+    /// run a dataflow here to build the table (e.g. fetch every Parquet footer
+    /// in parallel over the dispatch worker pool) before returning the plan that
+    /// commits it. The returned spec, when executed, performs the catalog write
+    /// and yields no rows. Errors surface as [`catalog::Error`](enum@Error).
+    fn create_table(
+        &self,
+        request: CreateTableRequest,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Result<RecordBatchOperatorSpec>;
 }
 
 /// Adapts a Pivot [`Catalog`] to DuckDB's [`DuckDBBind`] trait so DuckDB can

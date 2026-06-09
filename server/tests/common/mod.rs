@@ -11,8 +11,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
 use dispatch::Dispatch;
+use goose::ParquetCatalog;
 use rstest::fixture;
 use server::Server;
 use tokio_postgres::{Client, NoTls};
@@ -50,11 +50,11 @@ pub fn server_port() -> u16 {
     *PORT.get_or_init(|| {
         let port = pick_free_port();
         let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
-        let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
         let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         thread::spawn(move || {
             let dispatch = Dispatch::spin_up(workers, 32);
+            let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
