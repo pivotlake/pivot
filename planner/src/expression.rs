@@ -281,12 +281,40 @@ impl TryFrom<duckdb_expression::Function> for DateTrunc {
     }
 }
 
+/// SQL `minute(source)` — the minute-of-hour (0–59) of a timestamp. DuckDB
+/// lowers `extract(minute FROM EventTime)` to a call to this scalar function.
+/// `EventTime` is stored as Int64 epoch *seconds* (see [`Type::Timestamp`]), so
+/// the minute field is a pure integer computation; see its compile impl.
+///
+/// [`Type::Timestamp`]: crate::types::Type::Timestamp
+#[derive(Debug, Clone)]
+pub struct Minute {
+    pub source: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Function> for Minute {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        if f.params.len() != 1 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 1,
+                actual,
+            });
+        }
+        let source = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(Minute { source })
+    }
+}
+
 /// A scalar function call (e.g. `year`, `substring`).
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
     Divide(Divide),
     DateTrunc(DateTrunc),
+    Minute(Minute),
     /// `drop_cache()` — evict pivot's file cache, returning the regions dropped.
     /// A side-effecting admin function; evaluated once over the [`DummyScan`]
     /// row of a `FROM`-less `SELECT`. See its compile impl.
@@ -302,6 +330,7 @@ impl TryFrom<duckdb_expression::Function> for Function {
             "contains" => Ok(Function::Contains(f.try_into()?)),
             "/" => Ok(Function::Divide(f.try_into()?)),
             "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),
+            "minute" => Ok(Function::Minute(f.try_into()?)),
             "drop_cache" => {
                 if !f.params.is_empty() {
                     return Err(Error::InvalidParameterCount {
@@ -383,6 +412,7 @@ impl Display for Expression {
             Expression::Function(Function::DateTrunc(dt)) => {
                 write!(f, "date_trunc('{}', {})", dt.unit, dt.source)
             }
+            Expression::Function(Function::Minute(m)) => write!(f, "minute({})", m.source),
             Expression::Function(Function::DropCache) => write!(f, "drop_cache()"),
         }
     }
