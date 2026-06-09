@@ -5,11 +5,12 @@
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::expression::{
-    Between, Compare, CompareType, Conjunction, ConjunctionOp, Contains, DatePart, DateTrunc,
+    Between, Case, Compare, CompareType, Conjunction, ConjunctionOp, Contains, DatePart, DateTrunc,
     Divide, Expression, Function, InList, Ref,
 };
 use crate::types::Type;
 use arrow::compute::kernels::boolean::{and, or};
+use arrow::compute::kernels::zip::zip;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, BooleanArray, Datum, Int64Array, RecordBatch, Scalar};
@@ -211,6 +212,44 @@ impl Conjunction {
                     .reduce(|left, right| kernel(&left, &right).unwrap())
                     .expect("conjunction always has at least two children");
                 ExprResult::Array(Arc::new(mask) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Case {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Compile the ELSE branch and each (WHEN, THEN) arm once. Per batch we
+        // start from the ELSE value and fold the arms back-to-front with arrow's
+        // `zip` (selecting `then` where the WHEN mask is true, else the running
+        // result). Applying the *first* arm last makes it win on overlap, giving
+        // SQL's first-match-wins CASE semantics. A NULL WHEN reads as false.
+        //
+        // `zip` requires `then` and the running result share a data type; DuckDB
+        // unifies all branch types when binding the CASE, so they always do.
+        let else_builder = self.else_expr.compile()?;
+        let arm_builders = self
+            .checks
+            .iter()
+            .map(|c| Ok((c.when.compile()?, c.then.compile()?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Box::new(move || {
+            let mut else_eval = else_builder();
+            let mut arm_evals: Vec<(ExprEvalFn, ExprEvalFn)> = arm_builders
+                .iter()
+                .map(|(when, then)| (when(), then()))
+                .collect();
+            Box::new(move |batch: &RecordBatch| {
+                let mut result = else_eval(batch);
+                for (when_eval, then_eval) in arm_evals.iter_mut().rev() {
+                    let when = when_eval(batch);
+                    let (when_arr, _) = when.as_datum().get();
+                    let mask = when_arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let then = then_eval(batch);
+                    let zipped = zip(mask, then.as_datum(), result.as_datum()).unwrap();
+                    result = ExprResult::Array(zipped);
+                }
+                result
             }) as ExprEvalFn
         }))
     }
@@ -427,6 +466,7 @@ impl Expression {
             Expression::Between(b) => b.compile(),
             Expression::InList(i) => i.compile(),
             Expression::Conjunction(c) => c.compile(),
+            Expression::Case(c) => c.compile(),
             _ => Err(Error::UnsupportedExpression(self.clone())),
         }
     }
