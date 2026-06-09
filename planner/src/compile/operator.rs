@@ -178,9 +178,11 @@ impl Aggregate {
                     }
                 }
                 // Computed group key (e.g. `GROUP BY date_trunc('minute',
-                // EventTime)`). Materialise the key into a single Int64 column
-                // with a projection, then group on that column. date_trunc and
-                // the other supported scalar key expressions all yield Int64.
+                // EventTime)` or `GROUP BY CASE …`). Materialise the key into a
+                // single column with a projection, then group on it, picking the
+                // key extractor from the expression's static result type. Numeric
+                // keys (date_trunc/minute yield Int64) use the Int64 extractor;
+                // a string-valued CASE uses the string extractor.
                 computed => {
                     let key_fn = computed.compile()?;
                     let keyed = input.project(move || {
@@ -195,7 +197,11 @@ impl Aggregate {
                                 .unwrap()
                         }
                     });
-                    Ok(keyed.group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(0))
+                    match computed.result_type() {
+                        Some(Type::Utf8) => Ok(keyed.group_by_count::<StringKeyExtractor>(0)),
+                        _ => Ok(keyed
+                            .group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(0)),
+                    }
                 }
             },
             n => Err(Error::UnsupportedAggregateGroupAmount(n)),

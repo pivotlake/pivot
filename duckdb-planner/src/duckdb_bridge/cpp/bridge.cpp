@@ -19,6 +19,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -182,6 +183,22 @@ json build_function_expression(duckdb::BoundFunctionExpression *function) {
     };
 }
 
+// `CASE WHEN c0 THEN r0 WHEN c1 THEN r1 ... ELSE e END`. Each `(when, then)`
+// pair becomes a check; a CASE without an explicit ELSE has a NULL else_expr.
+json build_case_expression(duckdb::BoundCaseExpression *case_expr) {
+	json checks = json::array();
+	for (auto &check : case_expr->case_checks) {
+		checks.push_back({
+			{"when", build_expression(check.when_expr.get())},
+			{"then", build_expression(check.then_expr.get())},
+		});
+	}
+	return {
+		{"checks", std::move(checks)},
+		{"else_expr", build_expression(case_expr->else_expr.get())},
+	};
+}
+
 json build_expression(duckdb::Expression *expr) {
 	json new_expression;
 	new_expression["type"] = expr->type;
@@ -219,6 +236,10 @@ json build_expression(duckdb::Expression *expr) {
 	}
 	case duckdb::ExpressionType::BOUND_FUNCTION: {
 		new_expression["data"] = build_function_expression(&expr->Cast<duckdb::BoundFunctionExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::CASE_EXPR: {
+		new_expression["data"] = build_case_expression(&expr->Cast<duckdb::BoundCaseExpression>());
 		break;
 	}
 	case duckdb::ExpressionType::OPERATOR_CAST: {

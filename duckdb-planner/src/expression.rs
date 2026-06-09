@@ -76,6 +76,22 @@ pub struct Function {
     pub return_type: LogicalTypeId,
 }
 
+/// One `WHEN when THEN then` arm of a [`Case`].
+#[derive(CustomDeserializer, Debug)]
+pub struct CaseCheck {
+    pub when: Box<Expression>,
+    pub then: Box<Expression>,
+}
+
+/// A `CASE WHEN … THEN … [WHEN …] ELSE … END` expression
+/// (`BoundCaseExpression`). DuckDB always materializes an `else_expr` —
+/// a `CASE` without an explicit `ELSE` carries a `NULL` constant there.
+#[derive(CustomDeserializer, Debug)]
+pub struct Case {
+    pub checks: Vec<CaseCheck>,
+    pub else_expr: Box<Expression>,
+}
+
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
 #[derive(CustomDeserializer, Debug)]
 pub enum Expression {
@@ -96,6 +112,8 @@ pub enum Expression {
     AggregateFunc(AggregateFunc),
     #[type_tag(ExpressionType::BOUND_FUNCTION)]
     Function(Function),
+    #[type_tag(ExpressionType::CASE_EXPR)]
+    Case(Case),
 }
 
 /// A constant comparison against a single column (e.g. `col <> 42`).
@@ -208,6 +226,13 @@ impl fmt::Display for Expression {
                     params.join(", "),
                     type_name(&func.return_type)
                 )
+            }
+            Expression::Case(case) => {
+                write!(f, "CASE")?;
+                for check in &case.checks {
+                    write!(f, " WHEN {} THEN {}", check.when, check.then)?;
+                }
+                write!(f, " ELSE {} END", case.else_expr)
             }
         }
     }
