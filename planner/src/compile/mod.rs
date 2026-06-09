@@ -15,12 +15,8 @@
 //!   per [`Operator`](crate::operator::Operator) variant).
 //! - `expression` (private) — per-expression `compile` impls, producing
 //!   [`ExprFn`]s.
-//! - `create_table` (private) — the custom dispatch [`dispatch::Nullary`]
-//!   operator and factory backing
-//!   [`CreateTable::compile`](crate::operator::CreateTable).
 //!
 
-mod create_table;
 mod dummy_scan;
 mod expression;
 mod operator;
@@ -84,6 +80,10 @@ pub enum Error {
     UnsupportedCreateTableConstraints(usize),
     #[error("CREATE TABLE nodes should not have input operators")]
     UnexpectedCreateTableInputs,
+    #[error("compiling table scan: {0}")]
+    TableScan(#[source] crate::catalog::Error),
+    #[error("creating table: {0}")]
+    CreateTable(#[source] crate::catalog::Error),
 }
 
 impl Plan {

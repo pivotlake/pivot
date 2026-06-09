@@ -11,8 +11,8 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
+use goose::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use planner::Planner;
 use planner::catalog::{Catalog, Column, DynamicScanPredicate, Table};
 use planner::types::Type;
@@ -45,13 +45,12 @@ impl TestTable {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        // `ParquetTable::from_directory` touches `memory_ctx()` (file cache),
-        // so it has to run on a worker.
-        let dir_path = dir.path().to_owned();
-        let parquet_table = dispatch
-            .dispatcher()
-            .run_on_worker(move || Arc::new(ParquetTable::from_directory(&dir_path).unwrap()))
-            .expect("ParquetTable::from_directory failed");
+        // Read the footers once, over the dispatch worker pool. This drives a
+        // dataflow, so it runs on the coordinator (here), not via run_on_worker.
+        let parquet_table = Arc::new(
+            ParquetTable::from_directory(dispatch.dispatcher(), dir.path())
+                .expect("ParquetTable::from_directory failed"),
+        );
         let cols = columns
             .iter()
             .map(|(name, col_type, _)| Column {
@@ -75,14 +74,14 @@ impl Table for TestTable {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-    ) -> RecordBatchOperatorSpec {
-        table_input_with_filter(
+    ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
+        Ok(table_input_with_filter(
             dispatcher,
             &self.parquet_table,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
-        )
+        ))
     }
 
     fn columns(&self) -> Vec<Column> {
@@ -98,7 +97,7 @@ impl Table for TestTable {
         input: RecordBatchOperatorSpec,
         projection: Projection,
     ) -> RecordBatchOperatorSpec {
-        catalog::parquet::materialize(input, self.parquet_table.clone(), projection)
+        goose::parquet::materialize(input, self.parquet_table.clone(), projection)
     }
 }
 
@@ -142,7 +141,8 @@ impl Catalog for TestCatalog {
     fn create_table(
         &self,
         _request: ::planner::catalog::CreateTableRequest,
-    ) -> ::planner::catalog::Result<()> {
+        _dispatcher: &::dispatch::DataFlowDispatcher,
+    ) -> ::planner::catalog::Result<::dispatch::RecordBatchOperatorSpec> {
         unreachable!("test helper catalog does not support CREATE TABLE")
     }
 }

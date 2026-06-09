@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 dispatch = { path = "../dispatch" }
 planner = { path = "../planner" }
-catalog = { path = "../catalog" }
+goose = { path = "../goose" }
 ingest = { path = "../ingest" }
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }

@@ -4,7 +4,6 @@
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
 use crate::catalog::{Catalog, DynamicScanPredicate};
-use crate::compile::create_table::CreateTableNullaryFactory;
 use crate::compile::dummy_scan::DummyScanNullaryFactory;
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
@@ -394,12 +393,14 @@ impl Input {
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
-        Ok(self.table.compile(
-            dispatcher,
-            projection,
-            dynamic_filters,
-            self.emit_row_group_metadata,
-        ))
+        self.table
+            .compile(
+                dispatcher,
+                projection,
+                dynamic_filters,
+                self.emit_row_group_metadata,
+            )
+            .map_err(Error::TableScan)
     }
 }
 
@@ -546,18 +547,14 @@ impl CreateTable {
             ));
         }
 
-        let already_created = Arc::new(AtomicBool::new(false));
-
-        Ok(RecordBatchOperatorSpec::from_nullary(
-            dispatcher,
-            (0..dispatcher.worker_count()).map(|_| {
-                CreateTableNullaryFactory::new(
-                    catalog.clone(),
-                    self.request.clone(),
-                    already_created.clone(),
-                )
-            }),
-        ))
+        // The catalog does the up-front work — fetching every data file's footer
+        // in parallel over the worker pool, here on the coordinator — and returns
+        // the plan that writes the materialized table into the catalog. (Running
+        // that fetch dataflow from a per-worker nullary would nest a dataflow
+        // inside a worker and deadlock the pool.)
+        catalog
+            .create_table(self.request.clone(), dispatcher)
+            .map_err(Error::CreateTable)
     }
 }
 

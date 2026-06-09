@@ -210,8 +210,12 @@ mod tests {
         fn table(&self, _name: &str) -> Option<Box<dyn Table>> {
             None
         }
-        fn create_table(&self, _request: CreateTableRequest) -> CatalogResult<()> {
-            Ok(())
+        fn create_table(
+            &self,
+            _request: CreateTableRequest,
+            _dispatcher: &dispatch::DataFlowDispatcher,
+        ) -> CatalogResult<dispatch::RecordBatchOperatorSpec> {
+            unreachable!("Server::serve never compiles a CREATE TABLE")
         }
     }
 
