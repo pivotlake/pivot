@@ -97,7 +97,7 @@ impl Debug for FileLocation {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             FileLocation::Local(fd) => write!(f, "Local({fd})"),
-            FileLocation::Remote(r) => write!(f, "Remote({})", r.url()),
+            FileLocation::Remote(r) => write!(f, "Remote({})", r.display_url()),
         }
     }
 }
@@ -108,16 +108,18 @@ static NEXT_REMOTE_FILE_ID: AtomicU32 = AtomicU32::new(0);
 /// against it.
 ///
 /// `Hash`/`Eq` delegate solely to the interned `id`, so using a `RemoteFile` as
-/// (part of) a cache key is as cheap as comparing a `u32` — the URL/host/addr
-/// are only read by the HTTP transport when actually issuing a request.
+/// (part of) a cache key is as cheap as comparing a `u32` — the host/addr are
+/// only read by the HTTP transport when actually issuing a request.
+///
+/// The fields are pre-parsed from the URL at [`open`](Self::open) so the request
+/// hot path never re-parses it; the `Url` itself isn't kept.
 pub struct RemoteFile {
     /// Process-unique id; the only thing `Hash`/`Eq` look at.
     id: u32,
-    url: Url,
-    host: String,
-    port: u16,
-    /// `host:port` resolved at construction time.
+    /// `IP:port`, resolved once at construction (the port lives here too).
     addr: SocketAddr,
+    /// Host for the `Host:` header and TLS SNI — `addr` only carries the IP.
+    host: String,
     /// Origin-form request target (path + query) for the HTTP request line.
     request_target: String,
     is_https: bool,
@@ -165,23 +167,18 @@ impl RemoteFile {
 
         Ok(Self {
             id: NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed),
-            url,
-            host,
-            port,
             addr,
+            host,
             request_target,
             is_https,
         })
     }
 
-    pub fn url(&self) -> &Url {
-        &self.url
-    }
     pub fn host(&self) -> &str {
         &self.host
     }
     pub fn port(&self) -> u16 {
-        self.port
+        self.addr.port()
     }
     pub fn addr(&self) -> SocketAddr {
         self.addr
@@ -191,6 +188,19 @@ impl RemoteFile {
     }
     pub fn is_https(&self) -> bool {
         self.is_https
+    }
+
+    /// The origin URL, reconstructed for display (the parsed `Url` isn't kept).
+    /// The port is shown only when non-default.
+    fn display_url(&self) -> String {
+        let scheme = if self.is_https { "https" } else { "http" };
+        let default_port = if self.is_https { 443 } else { 80 };
+        let port = self.addr.port();
+        if port == default_port {
+            format!("{scheme}://{}{}", self.host, self.request_target)
+        } else {
+            format!("{scheme}://{}:{port}{}", self.host, self.request_target)
+        }
     }
 }
 
