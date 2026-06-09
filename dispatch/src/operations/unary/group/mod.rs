@@ -343,14 +343,16 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::group::keys::IntKeyExtractor;
+    use crate::operations::unary::group::keys::{IntKeyExtractor, StringKeyExtractor};
+    use crate::operations::unary::group::values::Sum;
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
     type CountValue = Compiled<(Count,)>;
+    type SumValue = Compiled<(Sum<Int32Type>,)>;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -358,14 +360,68 @@ mod tests {
         RecordBatch::try_new(schema, vec![col]).unwrap()
     }
 
-    fn run_group(worker_batches: Vec<Vec<RecordBatch>>) -> CollectSender {
-        run_group_with_radix(worker_batches, RadixConfig::DEFAULT)
+    /// An `Int32` key column (0) plus an `Int32` value column (1), for `SUM`.
+    fn keyed_i32_batch(keys: &[i32], vals: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(keys.to_vec())),
+            Arc::new(Int32Array::from(vals.to_vec())),
+        ];
+        RecordBatch::try_new(schema, cols).unwrap()
     }
 
-    /// Like [`run_group`] but with a chosen [`RadixConfig`] — a small one forces
-    /// the radix switch + scatter merge to run within the test slab pool.
+    /// A single `Utf8View` key column.
+    fn string_key_batch(values: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "key",
+            DataType::Utf8View,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(StringViewArray::from(values.to_vec()));
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    fn count_slots() -> Vec<AggregationSlot> {
+        vec![AggregationSlot::new(AggregationKind::CountStar, 0)]
+    }
+
+    /// Common case: `Int32` keys, `COUNT(*)`, key column 0, no LIMIT, default radix.
+    fn run_group(worker_batches: Vec<Vec<RecordBatch>>) -> CollectSender {
+        run_group_full::<IntExtractor, CountValue>(
+            worker_batches,
+            vec![0],
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        )
+    }
+
+    /// Common case with a chosen [`RadixConfig`] — a small one forces the radix
+    /// switch + scatter merge to run within the test slab pool.
     fn run_group_with_radix(
         worker_batches: Vec<Vec<RecordBatch>>,
+        radix: RadixConfig,
+    ) -> CollectSender {
+        run_group_full::<IntExtractor, CountValue>(
+            worker_batches,
+            vec![0],
+            count_slots(),
+            None,
+            radix,
+        )
+    }
+
+    /// General harness: choose the key/value extractors, key columns, aggregates,
+    /// LIMIT pushdown, and radix config. The common-case wrappers above cover
+    /// `Int32` keys + `COUNT(*)`.
+    fn run_group_full<K: KeyExtractor, V: ValueExtractor>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        top_k: Option<(usize, usize)>,
         radix: RadixConfig,
     ) -> CollectSender {
         init_test_free_pool(64);
@@ -379,13 +435,13 @@ mod tests {
 
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
-                Group::<IntExtractor, CountValue>::new(
+                Group::<K, V>::new(
                     arena.clone(),
                     state.clone(),
                     injector.clone(),
-                    vec![0],
-                    vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
-                    None,
+                    key_cols.clone(),
+                    value_slots.clone(),
+                    top_k,
                     tx.clone(),
                     rx_opt.take(),
                     partition_jobs_injected.clone(),
@@ -546,6 +602,81 @@ mod tests {
         assert_eq!(
             group_counts(&sender),
             (0..500).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
+    }
+
+    /// (string key, count) pairs from a finished string group-by, sorted by key.
+    fn string_group_pairs(sender: &CollectSender) -> Vec<(String, i64)> {
+        let mut pairs: Vec<_> = sender
+            .string_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn string_keys_dedup_and_count() {
+        let batches = vec![vec![string_key_batch(&["a", "b", "a", "c", "b", "a"])]];
+
+        let sender = run_group_full::<StringKeyExtractor, CountValue>(
+            batches,
+            vec![0],
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        assert_eq!(
+            string_group_pairs(&sender),
+            vec![
+                ("a".to_string(), 3),
+                ("b".to_string(), 2),
+                ("c".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn sum_aggregates_value_per_group() {
+        // key 1 -> 10+30, key 2 -> 20, key 3 -> 5+5.
+        let batch = keyed_i32_batch(&[1, 2, 1, 3, 3], &[10, 20, 30, 5, 5]);
+        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 1)];
+
+        let sender = run_group_full::<IntExtractor, SumValue>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        assert_eq!(group_counts(&sender), vec![(1, 40), (2, 20), (3, 10)]);
+    }
+
+    #[test]
+    fn top_k_limits_output_keeping_partition_maxima() {
+        // key 0 dominates (count 100); keys 1..1000 appear once. ORDER BY count
+        // LIMIT 1 is applied per partition, collapsing ~1000 groups to at most one
+        // row per partition — always the partition's largest, so key 0 survives.
+        let mut values: Vec<i32> = vec![0; 100];
+        values.extend(1..1000);
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            vec![vec![batch_with_column(&values)]],
+            vec![0],
+            count_slots(),
+            Some((0, 1)),
+            RadixConfig::DEFAULT,
+        );
+
+        let pairs = group_counts(&sender);
+        assert!(pairs.contains(&(0, 100)), "dominant group kept");
+        assert!(pairs.len() <= PARTITIONS, "at most one row per partition");
+        assert!(
+            pairs.iter().all(|&(k, c)| k == 0 || c == 1),
+            "every survivor is its partition's max"
         );
     }
 }
