@@ -2,13 +2,17 @@
 //!
 //! The catalog stores tables in a `RwLock<HashMap>` keyed by name, so multiple
 //! threads can resolve and create tables concurrently — many readers (lookups)
-//! coexist with infrequent writers (`CREATE TABLE`). A `CREATE TABLE` statement
-//! names its backing store with one of two `WITH` options:
-//! * `WITH (path = '<dir>')` — a local directory of Parquet files.
-//! * `WITH (url = '<s3://…/gs://…/local>')` — a goose object-store catalog: the
-//!   latest `_goose_log/` snapshot is resolved into a [`ParquetTable`] over its
-//!   data files (read locally or, for remote files, over the io_uring ring via
-//!   presigned URLs), or a new snapshot is CAS-committed if the catalog is empty.
+//! coexist with infrequent writers (`CREATE TABLE`). Behind the map is a
+//! [`TableManifest`]: in-memory by default ([`ParquetCatalog::new`], ephemeral),
+//! or — for a database opened on a directory with [`ParquetCatalog::open`] — a
+//! durable [`ObjectStoreManifest`] that records every table so a restart reloads
+//! them.
+//!
+//! Each table's data is a directory of Parquet files: `<database-root>/<name>` by
+//! default, or an explicit `WITH (path = '<dir>')` — always a local path, never
+//! an object-store URL. `CREATE TABLE` reads every footer under that directory
+//! (in parallel over the dispatch pool) into the reusable [`ParquetTable`] row
+//! groups, then records the table in the manifest.
 //!
 //! Each `Catalog::table` lookup hands back a fresh [`Box<dyn Table>`] cloned
 //! from the master entry, so per-binding filter pushdown accumulates on that
@@ -26,13 +30,10 @@
 
 pub mod lake;
 pub mod manifest;
-pub mod metadata;
 pub mod parquet;
 pub mod store;
-pub mod table_store;
 
 pub use manifest::{InMemoryTableManifest, ManifestEntry, ObjectStoreManifest, TableManifest};
-pub use table_store::TableObjectStore;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;

@@ -11,7 +11,6 @@
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
-use crate::metadata::MetadataError;
 use std::fmt::Debug;
 
 mod gcs;
@@ -35,10 +34,6 @@ pub enum StoreError {
     UnsupportedUri(String),
     #[error("missing credential/config: {0}")]
     Config(String),
-    #[error(transparent)]
-    Metadata(#[from] MetadataError),
-    #[error("catalog commit lost too many races (>{0} retries)")]
-    TooMuchContention(u32),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

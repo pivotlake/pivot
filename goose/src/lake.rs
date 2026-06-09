@@ -1,18 +1,8 @@
-//! Lake tables: catalog tables whose schema and data-file list come from a
-//! goose object-store snapshot (`_goose_log/`) instead of a raw local directory.
-//!
-//! The catalog-root URL passed to `CREATE TABLE ... WITH (url = '…')` identifies
-//! a single table. Resolving it loads the latest snapshot, reads that table's
-//! recorded columns and data files, and builds a [`ParquetTable`] over them.
-//!
-//! This module holds the pure pieces — the SQL-type ↔ Pivot-type mapping (the
-//! snapshot's type contract) and data-file location resolution; the catalog
-//! wiring that uses them lives in `lib.rs`.
-//!
-//! [`ParquetTable`]: crate::parquet::ParquetTable
+//! The SQL-type ↔ Pivot-type mapping used when a table's declared schema is
+//! written to (and read back from) the table manifest. The spellings follow
+//! DuckDB's, so they round-trip a column's type through the manifest as text.
 
 use planner::types::Type;
-use std::path::PathBuf;
 
 /// Map a SQL type spelling (as recorded in a snapshot column's `type`) to a
 /// Pivot [`Type`]. Case-insensitive; precision/scale suffixes (`DECIMAL(18,2)`)
@@ -61,62 +51,6 @@ pub fn pivot_type_to_sql(ty: &Type) -> &'static str {
     }
 }
 
-/// Whether a snapshot data-file location lives on remote object storage.
-pub fn is_remote_location(loc: &str) -> bool {
-    loc.starts_with("s3://") || loc.starts_with("s3a://") || loc.starts_with("gs://")
-}
-
-/// A data-file location resolved to how it should be read.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Resolved {
-    /// A local filesystem path.
-    Local(PathBuf),
-    /// An absolute object-store URI (`s3://…`/`gs://…`) to be presigned and
-    /// range-read over HTTP.
-    Remote(String),
-}
-
-/// Resolve a snapshot data-file `loc` (under catalog `root`) to a local path or
-/// an absolute remote URI. A relative location is interpreted against the root:
-/// local root → local path; remote root → an absolute object URI in the same
-/// bucket.
-pub fn resolve_data_file(root: &str, loc: &str) -> Resolved {
-    if let Some(path) = local_path(root, loc) {
-        return Resolved::Local(path);
-    }
-    if is_remote_location(loc) {
-        Resolved::Remote(loc.to_string())
-    } else {
-        // Relative location under a remote root: join onto the root URI.
-        Resolved::Remote(format!(
-            "{}/{}",
-            root.trim_end_matches('/'),
-            loc.trim_start_matches('/')
-        ))
-    }
-}
-
-/// The local filesystem path for a data-file location, or `None` if it
-/// resolves to remote object storage. An absolute location (`/…`, `file://…`)
-/// is used directly; an absolute remote one (`s3://`/`gs://`) is `None`; a
-/// *relative* location is resolved against `root` — and is only local when the
-/// root itself is local (a relative file under an `s3://` root lives in the
-/// bucket, so it's remote too).
-pub fn local_path(root: &str, loc: &str) -> Option<PathBuf> {
-    if is_remote_location(loc) {
-        return None;
-    }
-    let stripped = loc.strip_prefix("file://").unwrap_or(loc);
-    if stripped.starts_with('/') {
-        return Some(PathBuf::from(stripped));
-    }
-    if is_remote_location(root) {
-        return None;
-    }
-    let root = root.strip_prefix("file://").unwrap_or(root);
-    Some(PathBuf::from(root).join(stripped))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,26 +79,5 @@ mod tests {
         // DuckDB byte-width aliases, easy to get backwards.
         assert_eq!(sql_type_to_pivot("INT8"), Some(Type::Int64));
         assert_eq!(sql_type_to_pivot("INT16"), Some(Type::Int128));
-    }
-
-    #[test]
-    fn location_resolution() {
-        assert!(is_remote_location("s3://b/k.parquet"));
-        assert!(is_remote_location("gs://b/k.parquet"));
-        assert!(!is_remote_location("/data/k.parquet"));
-
-        assert_eq!(local_path("s3://b/x", "data/f.parquet"), None);
-        assert_eq!(
-            local_path("/lake", "_goose_data/f.parquet"),
-            Some(PathBuf::from("/lake/_goose_data/f.parquet"))
-        );
-        assert_eq!(
-            local_path("/lake", "/abs/f.parquet"),
-            Some(PathBuf::from("/abs/f.parquet"))
-        );
-        assert_eq!(
-            local_path("file:///lake", "f.parquet"),
-            Some(PathBuf::from("/lake/f.parquet"))
-        );
     }
 }
