@@ -45,6 +45,11 @@
 //!    [`output`] combinator — key columns from the [`KeyExtractor`], value
 //!    columns from the [`ValueExtractor`] — and sends it downstream.
 //!
+//! When any worker switched to radix, the same machinery runs at
+//! [`RADIX_PARTITIONS`] granularity, and each job additionally aggregates its
+//! partition's scatter buffers (where most of phase 1's aggregation was deferred)
+//! alongside the in-place stacks.
+//!
 //! ## Why partitioned merging works across different table sizes
 //!
 //! The hash table uses **top-bit slot placement**: `slot = hash >> (64 - log2(capacity))`.
