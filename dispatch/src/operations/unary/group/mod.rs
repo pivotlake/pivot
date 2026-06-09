@@ -19,8 +19,14 @@
 //!    created and subsequent rows go there. The old table is kept — its
 //!    entries will be merged in phase 2.  See [Why partitioned merging works](#why-partitioned-merging-works-across-different-table-sizes).
 //!
-//! When consumption finishes, each worker sends its `Vec<MultiSlabTable>` to a
-//! shared mpsc channel and transitions into a [`GroupOutputter`].
+//! For high-cardinality integer keys a worker instead **switches to radix**
+//! partway through: rather than growing its in-place table further it scatters
+//! later rows into [`RADIX_PARTITIONS`] per-partition buffers (no probing),
+//! deferring their aggregation to a finer-grained, cache-resident phase-2 merge.
+//! Strings and low-cardinality keys never switch and stay fully in-place.
+//!
+//! When consumption finishes, each worker sends its tables (plus any radix
+//! buffers) to a shared mpsc channel and transitions into a [`GroupOutputter`].
 //!
 //! ## Phase 2: Output / Merge (parallel via work-stealing)
 //!
