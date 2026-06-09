@@ -43,8 +43,9 @@
 
 mod group;
 pub use group::{
-    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count, GroupFactory,
-    IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor, Sum, ValueExtractor,
+    Accumulator, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
+    GroupFactory, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor, Sum,
+    ValueExtractor,
 };
 
 #[cfg(any(test, feature = "test-util"))]
@@ -72,7 +73,7 @@ mod count;
 pub use count::CountFactory;
 
 mod aggregate;
-pub use aggregate::{AggKind, AggSpec, AggregateFactory};
+pub use aggregate::AggregateFactory;
 
 mod filter;
 pub use filter::FilterFactory;

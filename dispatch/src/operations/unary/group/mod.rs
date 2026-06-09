@@ -99,8 +99,8 @@ mod hashtables;
 
 pub use keys::{ArenaKey, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor, StringKeyExtractor};
 pub use values::{
-    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count, Sum,
-    ValueExtractor,
+    Accumulator, Aggregate, AggregationKind, AggregationRowValueExtractor, AggregationSlot,
+    Compiled, Count, Sum, ValueExtractor,
 };
 
 use crate::memory::SlabAllocator;
