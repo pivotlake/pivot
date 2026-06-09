@@ -95,7 +95,7 @@ impl Projection {
 
 /// Pick the aggregate accumulator width by column type — the single rule shared
 /// by the global and grouped paths: `i128` only when a `SUM` reads a 64-bit
-/// column (whose total can overflow `i64`, e.g. `SUM(UserID)`), else `i64`.
+/// column (whose total can overflow `i64`), else `i64`.
 fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
     use crate::expression::AggregateFunc;
     exprs.iter().any(|e| {
@@ -148,7 +148,7 @@ impl Aggregate {
                 .collect::<Result<Vec<_>, _>>()?;
             // Pick the accumulator width by column type, the same rule the
             // grouped path uses: i128 only when a SUM reads a 64-bit column
-            // (whose total can overflow i64, e.g. SUM(UserID)), else i64.
+            // (whose total can overflow i64), else i64.
             return Ok(if sum_reads_wide_column(&self.expressions) {
                 input.aggregate::<i128>(slots)
             } else {
@@ -295,9 +295,9 @@ impl Aggregate {
 
         // Accumulator width, by the same column-type rule as the global path:
         // i128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
-        // No ClickBench grouped query sums a 64-bit column, so this is i64 in
-        // practice; the i128 arm keeps a wide grouped sum correct rather than
-        // silently overflowing the slot.
+        // Grouped sums are almost always over narrow columns, so this is i64
+        // in practice; the i128 arm keeps a wide grouped sum correct rather
+        // than silently overflowing the slot.
         let wide = sum_reads_wide_column(&self.expressions);
 
         // Monomorphise over the two key types, the slot arity (N), and the

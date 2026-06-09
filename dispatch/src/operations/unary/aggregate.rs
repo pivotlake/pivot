@@ -14,8 +14,8 @@
 //! [`AggregationSlot`] / [`Aggregate`](RowAggregate) ops — the single source of
 //! truth shared with GROUP BY — and so is the accumulator width [`A`](Accumulator):
 //! the operator is generic over `i64`/`i128`, chosen by the same column-width rule
-//! as the grouped path (`i128` only when a sum reads a 64-bit column, e.g.
-//! `SUM(UserID)`). `Sum` emits `Int64` or `Decimal128(38, 0)` accordingly (the
+//! as the grouped path (`i128` only when a sum reads a 64-bit column).
+//! `Sum` emits `Int64` or `Decimal128(38, 0)` accordingly (the
 //! latter matching DuckDB's `HUGEINT`); `Count` always emits `Int64`. There is no
 //! `Avg` kind: DuckDB lowers `AVG(x)` to `sum(x) / count(x)` over two aggregates
 //! plus a divide projection, so an average reaches this operator as a `Sum` slot

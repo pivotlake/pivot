@@ -6,8 +6,8 @@
 //! addition, so a slot is just a running integer. The only question is its
 //! width, decided the same way in both paths from the summed column's type:
 //! `i64` is enough for counts and for sums over 16/32-bit columns (a whole-table
-//! scan can't overflow it), but a sum over a 64-bit column (e.g. `SUM(UserID)` =
-//! ~2.5e26) needs `i128`. `i64` is the default because it keeps a grouped hash
+//! scan can't overflow it), but a sum over a 64-bit column whose total can far
+//! exceed `i64::MAX` needs `i128`. `i64` is the default because it keeps a grouped hash
 //! table entry half as wide; `i128` is opt-in for the wide-sum case.
 
 use arrow_array::cast::AsArray;
