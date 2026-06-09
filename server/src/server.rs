@@ -213,9 +213,9 @@ mod tests {
         fn create_table(
             &self,
             _request: CreateTableRequest,
-            dispatcher: &dispatch::DataFlowDispatcher,
+            _dispatcher: &dispatch::DataFlowDispatcher,
         ) -> CatalogResult<dispatch::RecordBatchOperatorSpec> {
-            Ok(dispatch::RecordBatchOperatorSpec::empty(dispatcher))
+            unreachable!("Server::serve never compiles a CREATE TABLE")
         }
     }
 
