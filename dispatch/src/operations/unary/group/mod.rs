@@ -459,4 +459,40 @@ mod tests {
 
         assert_eq!(sender.total_rows(), 1);
     }
+
+    /// (key, count) pairs from a finished `COUNT(*)` group-by, sorted by key.
+    fn group_counts(sender: &CollectSender) -> Vec<(i32, i64)> {
+        let mut pairs: Vec<_> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn counts_aggregate_within_and_across_workers() {
+        let batches = vec![
+            vec![batch_with_column(&[1, 2, 3])],
+            vec![batch_with_column(&[2, 2, 3, 4])],
+        ];
+
+        let sender = run_group(batches);
+
+        assert_eq!(group_counts(&sender), vec![(1, 1), (2, 3), (3, 2), (4, 1)]);
+    }
+
+    #[test]
+    fn counts_survive_in_place_stack_growth() {
+        let mut values: Vec<i32> = (0..3000).collect();
+        values.extend(0..3000);
+
+        let sender = run_group(vec![vec![batch_with_column(&values)]]);
+
+        assert_eq!(
+            group_counts(&sender),
+            (0..3000).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
+    }
 }

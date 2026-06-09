@@ -4,7 +4,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
 use crate::worker::install_test_worker_waker;
-use arrow_array::{Int32Array, RecordBatch};
+use arrow_array::{Int32Array, Int64Array, RecordBatch};
 
 /// A [`Sender`] that collects all sent items for later inspection.
 pub struct CollectSender<T = RecordBatch> {
@@ -44,6 +44,23 @@ impl CollectSender<RecordBatch> {
                 b.column(col)
                     .as_any()
                     .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// All values from column `col` as i64s, preserving order (e.g. aggregate
+    /// outputs like `COUNT(*)`, which are `Int64`).
+    pub fn i64_column(&self, col: usize) -> Vec<i64> {
+        self.items
+            .iter()
+            .flat_map(|b| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
                     .unwrap()
                     .values()
                     .iter()
