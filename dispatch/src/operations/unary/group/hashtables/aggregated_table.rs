@@ -107,15 +107,18 @@ impl<T: Copy> SlabList<T> {
 pub struct PartitionBuffers<K: KeyExtractor, V: ValueExtractor>(pub Vec<SlabList<RadixRow<K, V>>>);
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionBuffers<K, V> {}
 
-/// What a worker hands the merge phase, depending on whether it crossed the
-/// radix threshold during consume.
-pub enum WorkerOutput<K: KeyExtractor, V: ValueExtractor> {
-    /// Never switched — the full result is in this stack of in-place tables
-    /// (low-cardinality, or any string group-by). Combined by the slot-range merge.
-    InPlace(Vec<MultiSlabTable<K, V>>),
-    /// Switched — the pre-switch stack has been folded into these per-partition
-    /// scatter buffers, so the radix merge sees a single uniform source.
-    Radix(PartitionBuffers<K, V>, Hll),
+/// What a worker hands the merge phase: its in-place stack (always), the radix
+/// scatter buffers (only if it switched), and its distinct-count sketch. The
+/// merge slot-range-combines the stack and the buffers by the same top hash bits,
+/// so a switched worker's pre-switch stack needs no pre-fold into the buffers.
+pub struct WorkerOutput<K: KeyExtractor, V: ValueExtractor> {
+    /// In-place table stack: the full result if the worker never switched,
+    /// otherwise its pre-switch tables.
+    pub tables: Vec<MultiSlabTable<K, V>>,
+    /// Per-partition scatter buffers — `Some` iff the worker switched to radix.
+    pub buffers: Option<PartitionBuffers<K, V>>,
+    /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
+    pub hll: Hll,
 }
 
 /// [`BatchRowSource`] adapter for [`BaseHashTable::merge_batch`] (in-place phase).
@@ -335,34 +338,24 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         }
     }
 
-    /// Finalize: a switched worker folds its small pre-switch stack into the
-    /// buffers (so the merge sees one source); otherwise it hands back the stack.
+    /// Finalize: hand back this worker's in-place stack plus, if it switched, its
+    /// scatter buffers. The merge slot-range-combines both by the same top bits,
+    /// so there's no pre-fold of the stack into the buffers.
     pub fn flush(mut self) -> WorkerOutput<K, V> {
         if self.switched {
-            let shift = u64::BITS - RADIX_PARTITIONS.trailing_zeros();
-            let Self {
-                tables,
-                buffers,
-                allocator,
-                hll,
-                ..
-            } = &mut self;
-            let buffers = buffers.as_mut().unwrap();
-            for table in tables.iter() {
+            // The scatter counted post-switch rows into the sketch; add the
+            // pre-switch stack's distinct so the merge sizing sees the total.
+            for table in &self.tables {
                 for entry in table.iter(0) {
-                    hll.add(entry.hash());
-                    let p = (entry.hash() >> shift) as usize;
-                    buffers[p].push(allocator, (entry.hash(), *entry.key(), *entry.value()));
+                    self.hll.add(entry.hash());
                 }
             }
         }
-
         self.worker_arena.flush();
-
-        if self.switched {
-            WorkerOutput::Radix(PartitionBuffers(self.buffers.take().unwrap()), self.hll)
-        } else {
-            WorkerOutput::InPlace(self.tables)
+        WorkerOutput {
+            tables: self.tables,
+            buffers: self.buffers.map(PartitionBuffers),
+            hll: self.hll,
         }
     }
 }

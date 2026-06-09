@@ -218,133 +218,97 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
 /// shared [`Injector`] for work-stealing execution. Each job merges all
 /// source tables for partition `index` into one result table and sends the
 /// output as a [`RecordBatch`].
-pub enum PartitionJob<K: KeyExtractor, V: ValueExtractor> {
-    /// Some worker switched to radix: aggregate this partition's scatter buffers
-    /// (plus any non-switched worker's routed stack) into one table.
-    Radix {
-        buffers: Arc<Vec<PartitionBuffers<K, V>>>,
-        inplace: Arc<Vec<MultiSlabTable<K, V>>>,
-        index: usize,
-        arena: Arc<SharedArena>,
-        partition_capacity: usize,
-        top_k: Option<(usize, usize)>,
-    },
-    /// Nobody switched (low-cardinality / strings): combine the in-place stacks
-    /// for this partition with the original slot-range merge.
-    InPlace {
-        tables: Arc<Vec<MultiSlabTable<K, V>>>,
-        index: usize,
-        arena: Arc<SharedArena>,
-        partition_capacity: usize,
-        top_k: Option<(usize, usize)>,
-    },
+pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
+    /// Switched workers' scatter buffers (empty Vec in the all-in-place case).
+    buffers: Arc<Vec<PartitionBuffers<K, V>>>,
+    /// Every worker's in-place stack: switched workers' pre-switch tables and
+    /// non-switched workers' full stacks. Slot-range-merged at `num_partitions`.
+    tables: Arc<Vec<MultiSlabTable<K, V>>>,
+    index: usize,
+    arena: Arc<SharedArena>,
+    partition_capacity: usize,
+    /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
+    num_partitions: usize,
+    top_k: Option<(usize, usize)>,
 }
 
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
 
 impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
-    /// Merge all source tables for this partition and send the result batches,
-    /// building output columns into `allocator`'s slab memory.
+    /// Merge this partition's scatter buffers and in-place stacks into one result
+    /// table and send the output batches, building columns into `allocator`.
     pub fn run<S: Sender<RecordBatch>>(
         self,
         sender: &mut S,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
-        match self {
-            PartitionJob::Radix {
-                buffers,
-                inplace,
-                index,
-                arena,
-                partition_capacity,
-                top_k,
-            } => {
-                let result_map = merge::aggregate_partition::<K, V>(
-                    index,
-                    &buffers,
-                    &inplace,
-                    partition_capacity,
-                    &arena,
-                );
-                if result_map.len() == 0 {
-                    return Ok(());
-                }
-                output::build_and_send::<K, V, _, _>(result_map, &arena, allocator, top_k, sender)
-            }
-            PartitionJob::InPlace {
-                tables,
-                index,
-                arena,
-                partition_capacity,
-                top_k,
-            } => {
-                let result_map =
-                    merge::merge_partition::<K, V>(index, &tables, &arena, partition_capacity);
-                if result_map.len() == 0 {
-                    return Ok(());
-                }
-                output::build_and_send::<K, V, _, _>(result_map, &arena, allocator, top_k, sender)
-            }
+        let result_map = merge::merge_combined::<K, V>(
+            self.index,
+            &self.buffers,
+            &self.tables,
+            self.partition_capacity,
+            self.num_partitions,
+            &self.arena,
+        );
+        if result_map.len() == 0 {
+            return Ok(());
         }
+        output::build_and_send::<K, V, _, _>(result_map, &self.arena, allocator, self.top_k, sender)
     }
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputter<K, V> {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let mut radix_buffers = Vec::new();
-            let mut inplace_tables = Vec::new();
+            let mut all_tables = Vec::new();
+            let mut all_buffers = Vec::new();
             let mut hll = Hll::new();
             for out in rx.into_iter() {
-                match out {
-                    WorkerOutput::Radix(b, h) => {
-                        radix_buffers.push(b);
-                        hll.merge(&h);
-                    }
-                    WorkerOutput::InPlace(t) => inplace_tables.extend(t),
+                all_tables.extend(out.tables);
+                if let Some(b) = out.buffers {
+                    all_buffers.push(b);
                 }
+                hll.merge(&out.hll);
             }
 
-            if radix_buffers.is_empty() {
-                // Nobody crossed the threshold: original slot-range merge over the
-                // in-place stacks, sized to actual occupancy (PARTITIONS jobs).
-                let tables = Arc::new(inplace_tables);
-                let total: usize = tables.iter().map(|t| t.len()).sum();
-                let partition_capacity =
-                    (total / PARTITIONS).next_power_of_two().max(DEFAULT_CAPACITY);
-                for i in 0..PARTITIONS {
-                    self.injector.push(PartitionJob::InPlace {
-                        tables: tables.clone(),
-                        index: i,
-                        arena: self.shared_arena.clone(),
-                        partition_capacity,
-                        top_k: self.top_k,
-                    })
-                }
+            // Pick the partition count: nobody switched -> the cheap PARTITIONS-way
+            // slot-range merge (don't blow a small group-by like q42 into a
+            // 4096-way merge); any switch -> RADIX_PARTITIONS so each radix target
+            // stays cache-resident. Either way, one merge_combined job per partition
+            // combines that partition's scatter buffers and in-place stacks.
+            let (num_partitions, partition_capacity) = if all_buffers.is_empty() {
+                let total: usize = all_tables.iter().map(|t| t.len()).sum();
+                (
+                    PARTITIONS,
+                    (total / PARTITIONS).next_power_of_two().max(DEFAULT_CAPACITY),
+                )
             } else {
-                // Some worker scattered: radix merge (RADIX_PARTITIONS jobs). Any
-                // non-switched worker's stack is routed in via `inplace`.
-                let buffers = Arc::new(radix_buffers);
-                let inplace = Arc::new(inplace_tables);
-                // Size for ~0.7 load (×3/2 margin) so the partition holds its
-                // groups without crossing the resize threshold, then round to the
-                // power-of-two the table requires.
+                // Size each radix target for ~0.7 load (x3/2 margin) from the
+                // distinct estimate, rounded to the power-of-two the table needs.
                 let est = hll.estimate();
-                let partition_capacity = (est * 3 / (2 * RADIX_PARTITIONS))
-                    .next_power_of_two()
-                    .max(DEFAULT_CAPACITY);
-                for i in 0..RADIX_PARTITIONS {
-                    self.injector.push(PartitionJob::Radix {
-                        buffers: buffers.clone(),
-                        inplace: inplace.clone(),
-                        index: i,
-                        arena: self.shared_arena.clone(),
-                        partition_capacity,
-                        top_k: self.top_k,
-                    })
-                }
+                (
+                    RADIX_PARTITIONS,
+                    (est * 3 / (2 * RADIX_PARTITIONS))
+                        .next_power_of_two()
+                        .max(DEFAULT_CAPACITY),
+                )
+            };
+
+            let buffers = Arc::new(all_buffers);
+            let tables = Arc::new(all_tables);
+            for i in 0..num_partitions {
+                self.injector.push(PartitionJob {
+                    buffers: buffers.clone(),
+                    tables: tables.clone(),
+                    index: i,
+                    arena: self.shared_arena.clone(),
+                    partition_capacity,
+                    num_partitions,
+                    top_k: self.top_k,
+                });
             }
-            self.partition_jobs_injected.store(true, Ordering::Relaxed);
+
+                        self.partition_jobs_injected.store(true, Ordering::Relaxed);
 
             // Wake up all workers so that they can start working on partitions
             worker_waker().notify();
