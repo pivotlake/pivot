@@ -461,6 +461,63 @@ impl TryFrom<duckdb_expression::Function> for Function {
     }
 }
 
+/// An `input IN (v0, v1, …)` membership test. Evaluates to a boolean column;
+/// see its compile impl, which expands it to an OR of per-value equalities.
+#[derive(Debug, Clone)]
+pub struct InList {
+    pub input: Box<Expression>,
+    pub values: Vec<Expression>,
+}
+
+impl TryFrom<duckdb_expression::InList> for InList {
+    type Error = Error;
+    fn try_from(i: duckdb_expression::InList) -> Result<Self, Self::Error> {
+        Ok(InList {
+            input: Box::<Expression>::try_from(i.input)?,
+            values: i
+                .values
+                .into_iter()
+                .map(Expression::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+/// Whether a [`Conjunction`] combines its children with boolean `AND` or `OR`.
+#[derive(Debug, Clone, Copy)]
+pub enum ConjunctionOp {
+    And,
+    Or,
+}
+
+/// A boolean `AND`/`OR` over two or more child predicates. DuckDB rewrites a
+/// small `x IN (a, b)` into the `OR` form, so this is how most membership tests
+/// reach the executor; it also covers any explicit `AND`/`OR` in a `WHERE`.
+#[derive(Debug, Clone)]
+pub struct Conjunction {
+    pub op: ConjunctionOp,
+    pub children: Vec<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Conjunction> for Conjunction {
+    type Error = Error;
+    fn try_from(c: duckdb_expression::Conjunction) -> Result<Self, Self::Error> {
+        let op = if c.conjunction_type.clone() as u8 == ExpressionType::CONJUNCTION_OR as u8 {
+            ConjunctionOp::Or
+        } else {
+            ConjunctionOp::And
+        };
+        Ok(Conjunction {
+            op,
+            children: c
+                .children
+                .into_iter()
+                .map(Expression::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
 #[derive(Debug, Clone)]
 pub enum Expression {
@@ -470,6 +527,8 @@ pub enum Expression {
     Constant(Scalar<ArrayRef>),
     AggregateFunc(AggregateFunc),
     Function(Function),
+    InList(InList),
+    Conjunction(Conjunction),
 }
 
 impl Display for CompareType {
@@ -534,6 +593,18 @@ impl Display for Expression {
                 write!(f, "{}({})", d.kind.name(), d.source)
             }
             Expression::Function(Function::DropCache) => write!(f, "drop_cache()"),
+            Expression::InList(i) => {
+                let values: Vec<String> = i.values.iter().map(|v| v.to_string()).collect();
+                write!(f, "{} IN ({})", i.input, values.join(", "))
+            }
+            Expression::Conjunction(c) => {
+                let op = match c.op {
+                    ConjunctionOp::And => "AND",
+                    ConjunctionOp::Or => "OR",
+                };
+                let parts: Vec<String> = c.children.iter().map(|p| p.to_string()).collect();
+                write!(f, "({})", parts.join(&format!(" {op} ")))
+            }
         }
     }
 }
@@ -552,6 +623,8 @@ impl TryFrom<duckdb_expression::Expression> for Expression {
                 Expression::AggregateFunc(a.try_into()?)
             }
             duckdb_expression::Expression::Function(f) => Expression::Function(f.try_into()?),
+            duckdb_expression::Expression::InList(i) => Expression::InList(i.try_into()?),
+            duckdb_expression::Expression::Conjunction(c) => Expression::Conjunction(c.try_into()?),
         })
     }
 }
