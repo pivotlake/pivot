@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Int32Array};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch};
 use dispatch::Dispatch;
 
 use crate::common::*;
@@ -517,9 +517,52 @@ impl Catalog for RecordingCatalog {
         None
     }
 
-    fn create_table(&self, request: CreateTableRequest) -> planner::catalog::Result<()> {
+    fn create_table(
+        &self,
+        request: CreateTableRequest,
+        dispatcher: &dispatch::DataFlowDispatcher,
+    ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
         self.created_tables.lock().unwrap().push(request);
-        Ok(())
+        // CREATE TABLE yields no rows; a real catalog would commit the table here.
+        Ok(dispatch::RecordBatchOperatorSpec::from_nullary(
+            dispatcher,
+            (0..dispatcher.worker_count()).map(|_| NoRowsNullary::default()),
+        ))
+    }
+}
+
+/// A nullary that emits nothing and finishes immediately — backs the empty
+/// result of this test's `CREATE TABLE`.
+#[derive(Default)]
+struct NoRowsNullary {
+    ran: bool,
+}
+
+impl dispatch::NullaryFactory<RecordBatch> for NoRowsNullary {
+    type Nullary = NoRowsNullary;
+
+    fn build_nullary(self) -> NoRowsNullary {
+        self
+    }
+}
+
+impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
+    fn run<S: dispatch::Sender<RecordBatch>>(
+        &mut self,
+        _sender: &mut S,
+    ) -> dispatch::NullaryResult<dispatch::WorkStatus> {
+        if self.ran {
+            return Ok(dispatch::WorkStatus::Pending);
+        }
+        self.ran = true;
+        Ok(dispatch::WorkStatus::Ran)
+    }
+
+    fn finish<S: dispatch::Sender<RecordBatch>>(
+        &mut self,
+        _sender: &mut S,
+    ) -> dispatch::NullaryResult<bool> {
+        Ok(self.ran)
     }
 }
 

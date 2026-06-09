@@ -7,7 +7,7 @@
 use super::Operator;
 use crate::api::{Chain, OperatorFactory};
 use crate::data_flow::WorkStatus;
-use crate::io::IORequest;
+use crate::io::{FsRequest, HttpRequest, IORequest};
 use crate::operations::channels::Sender;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -33,13 +33,20 @@ pub trait Nullary<O> {
     /// Run one unit of work, possibly sending output.
     fn run<S: Sender<O>>(&mut self, sender: &mut S) -> Result<WorkStatus>;
 
-    /// Return any pending IO requests.
-    fn next_io_requests(&mut self) -> Result<Vec<IORequest>> {
+    /// Return any pending filesystem read requests.
+    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
         Ok(vec![])
     }
 
-    /// Handle a completed disk read.
-    fn process_disk_response<S: Sender<O>>(
+    /// Return any pending HTTP requests (reads of remote regions). See
+    /// [`Operator::next_http_requests`].
+    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
+        Ok(vec![])
+    }
+
+    /// Handle a completed read (disk or HTTP); its bytes are already committed to
+    /// the cache slot.
+    fn process_io_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
         _request: IORequest,
@@ -75,14 +82,18 @@ impl<O, N: Nullary<O>, S: Sender<O>> Operator for NullaryOperator<O, N, S> {
         Ok(self.nullary.run(&mut self.sender)?)
     }
 
-    fn next_io_requests(&mut self) -> super::Result<Vec<IORequest>> {
-        Ok(self.nullary.next_io_requests()?)
+    fn next_fs_requests(&mut self) -> super::Result<Vec<FsRequest>> {
+        Ok(self.nullary.next_fs_requests()?)
     }
 
-    fn process_disk_response(&mut self, request: IORequest) -> super::Result<()> {
+    fn next_http_requests(&mut self) -> super::Result<Vec<HttpRequest>> {
+        Ok(self.nullary.next_http_requests()?)
+    }
+
+    fn process_io_response(&mut self, request: IORequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_disk_response(&mut self.sender, request)?)
+            .process_io_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {

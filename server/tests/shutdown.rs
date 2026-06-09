@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
 use common::{pick_free_port, wait_until_listening};
 use dispatch::Dispatch;
+use goose::ParquetCatalog;
 use server::Server;
 use tokio::sync::oneshot;
 
@@ -24,11 +24,11 @@ use tokio::sync::oneshot;
 fn shutdown_signal_drains_all_worker_threads() {
     let workers = 2;
     let bind: SocketAddr = format!("127.0.0.1:{}", pick_free_port()).parse().unwrap();
-    let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server_thread = thread::spawn(move || {
         let dispatch = Dispatch::spin_up(workers, 32);
+        let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
         assert_eq!(
             dispatch.workers(),
             workers,

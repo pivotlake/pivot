@@ -40,7 +40,7 @@ impl Table for RecordingTable {
         _projection: Projection,
         _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
-    ) -> RecordBatchOperatorSpec {
+    ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("plan-only test should not reach compile")
     }
 
@@ -71,7 +71,11 @@ impl Catalog for SingleTableCatalog {
         (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn Table>)
     }
 
-    fn create_table(&self, _request: CreateTableRequest) -> planner::catalog::Result<()> {
+    fn create_table(
+        &self,
+        _request: CreateTableRequest,
+        _dispatcher: &dispatch::DataFlowDispatcher,
+    ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
         unreachable!("test catalog does not support CREATE TABLE")
     }
 }

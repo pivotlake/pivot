@@ -4,15 +4,16 @@
 //! planner) with the `ParquetCatalog` and runs queries on `dispatch`
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use catalog::ParquetCatalog;
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch};
+use goose::ParquetCatalog;
 use ingest::{IngestConfig, OtelConfig, Signal, SinkDestination};
 use server::{Error, Server};
-use tracing::info;
+use tracing::{error, info};
 
 /// Postgres-wire-compatible server in front of pivotdb's dispatch engine.
 #[derive(Parser, Debug)]
@@ -25,6 +26,12 @@ struct Args {
     /// Number of dispatch worker threads. Defaults to the number of cores.
     #[arg(long)]
     workers: Option<usize>,
+
+    /// Database directory. Tables created with `CREATE TABLE` (without their own
+    /// `path`) live under here, and are reloaded on restart. Omit for an
+    /// in-memory catalog — tables vanish on restart and must each name a `path`.
+    #[arg(long)]
+    path: Option<PathBuf>,
 
     /// Start an OTLP/gRPC ingest receiver with the built-in default column
     /// layout. Repeatable — pass `--otel` once per receiver (each needs a
@@ -177,8 +184,23 @@ fn main() -> Result<(), Error> {
         .enable_all()
         .build()?;
 
+    // Build the catalog on this (coordinator) thread, before the workers are
+    // handed off: opening a persisted database reloads its tables, which reads
+    // Parquet footers over the dispatch pool.
+    let catalog = match args.path.as_deref() {
+        Some(dir) => {
+            let dir = dir.to_str().expect("database path must be valid UTF-8");
+            Arc::new(
+                ParquetCatalog::open(dir, dispatch.dispatcher()).unwrap_or_else(|e| {
+                    error!("failed to open database `{dir}`: {e}");
+                    std::process::exit(1);
+                }),
+            )
+        }
+        None => Arc::new(ParquetCatalog::new()),
+    };
+
     rt.block_on(async move {
-        let catalog = Arc::new(ParquetCatalog::new());
         let server = Server::new(args.bind, dispatch, catalog, ingests);
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;
