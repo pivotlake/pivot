@@ -121,6 +121,77 @@ fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
     assert_eq!(minute_one["v0"], 2);
 }
 
+/// Every `extract(<part> FROM ts)` part, validated against values produced by
+/// the DuckDB CLI at four timestamps (incl. a pre-epoch negative one and dates
+/// that exercise the ISO-week year-boundary rollover):
+///   t0 = 1704067200  2024-01-01 00:00:00 (Mon)
+///   t1 = 1700000000  2023-11-14 22:13:20 (Tue)
+///   t2 = 1262304000  2010-01-01 00:00:00 (Fri, ISO week 53 of 2009)
+///   t3 =     -100000  1969-12-30 20:13:20 (Tue, ISO week 1 of 1970)
+#[rstest]
+fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
+    use arrow_array::Int64Array;
+    let timestamps = [1_704_067_200i64, 1_700_000_000, 1_262_304_000, -100_000];
+    testing_planner.add_table(
+        "ts",
+        &[(
+            "EventTime",
+            Type::Timestamp,
+            Arc::new(Int64Array::from(timestamps.to_vec())) as ArrayRef,
+        )],
+    );
+
+    // (part, [expected for t0, t1, t2, t3]).
+    let cases: &[(&str, [i64; 4])] = &[
+        ("epoch", [1_704_067_200, 1_700_000_000, 1_262_304_000, -100_000]),
+        ("second", [0, 20, 0, 20]),
+        ("millisecond", [0, 20_000, 0, 20_000]),
+        ("microsecond", [0, 20_000_000, 0, 20_000_000]),
+        ("minute", [0, 13, 0, 13]),
+        ("hour", [0, 22, 0, 20]),
+        ("day", [1, 14, 1, 30]),
+        ("month", [1, 11, 1, 12]),
+        ("quarter", [1, 4, 1, 4]),
+        ("year", [2024, 2023, 2010, 1969]),
+        ("decade", [202, 202, 201, 196]),
+        ("century", [21, 21, 21, 20]),
+        ("millennium", [3, 3, 3, 2]),
+        ("dayofweek", [1, 2, 5, 2]),
+        ("isodow", [1, 2, 5, 2]),
+        ("dayofyear", [1, 318, 1, 364]),
+        ("week", [1, 46, 53, 1]),
+    ];
+
+    for (part, expected) in cases {
+        let results = testing_planner
+            .planner
+            .plan(&format!(
+                "SELECT extract({part} FROM EventTime) AS v, EventTime AS t FROM ts"
+            ))
+            .unwrap()
+            .compile(testing_planner.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap();
+
+        // The computed projection names its columns col0 (the extracted value)
+        // and col1 (the source EventTime). Map each row's timestamp to its
+        // value, then compare against the expectation (row order isn't fixed).
+        let rows = batches_to_json(&results);
+        for (i, &t) in timestamps.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|r| r["col1"].as_i64().unwrap() == t)
+                .unwrap_or_else(|| panic!("{part}: no row for ts {t}"));
+            assert_eq!(
+                row["col0"].as_i64().unwrap(),
+                expected[i],
+                "extract({part} FROM {t})"
+            );
+        }
+    }
+}
+
 #[rstest]
 fn unsupported_scalar_function_returns_error(mut testing_planner: TestingPlanner) {
     let result = testing_planner
