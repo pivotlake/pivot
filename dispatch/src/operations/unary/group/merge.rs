@@ -281,3 +281,194 @@ fn grow_if_full<K: KeyExtractor, V: ValueExtractor>(
         target.resize_with(nb, *cap);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::arena::SharedArena;
+    use crate::operations::unary::group::hashtables::{AggregatedTable, WorkerOutput};
+    use crate::operations::unary::group::keys::IntKeyExtractor;
+    use crate::operations::unary::group::values::{
+        AggregationKind, AggregationSlot, Compiled, Count,
+    };
+    use ahash::RandomState;
+    use arrow_array::types::Int32Type;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    type IntExtractor = IntKeyExtractor<Int32Type>;
+    type CountValue = Compiled<(Count,)>;
+
+    fn make_worker_tables(
+        state: &RandomState,
+        arena: &Arc<SharedArena>,
+        values: &[i32],
+    ) -> Vec<MultiSlabTable<IntExtractor, CountValue>> {
+        let mut agg =
+            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone());
+        let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+        agg.consume_batch(
+            &batch,
+            &[0],
+            &[AggregationSlot::new(AggregationKind::CountStar, 0)],
+        );
+        match agg.flush() {
+            WorkerOutput::InPlace(tables) => tables,
+            // The test data is low-cardinality, so the worker never crosses the
+            // radix threshold and always hands back an in-place stack.
+            WorkerOutput::Radix(..) => unreachable!("low-cardinality test stays in-place"),
+        }
+    }
+
+    fn merge_all_partitions(
+        tables: &[MultiSlabTable<IntExtractor, CountValue>],
+        arena: &SharedArena,
+    ) -> Vec<(i32, usize)> {
+        let total_cap: usize = tables.iter().map(|t| t.capacity()).sum::<usize>() / 2;
+        let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
+
+        let mut all_entries = vec![];
+        for p in 0..PARTITIONS {
+            let result =
+                merge_partition::<IntExtractor, CountValue>(p, tables, arena, partition_cap);
+            for entry in result.iter(0) {
+                all_entries.push((*entry.key(), entry.value().0[0] as usize));
+            }
+        }
+        all_entries.sort_by_key(|(k, _)| *k);
+        all_entries
+    }
+
+    #[test]
+    fn single_worker_all_entries_preserved() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let tables = make_worker_tables(&state, &arena, &[1, 2, 3, 4, 5]);
+
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 5);
+        for (key, count) in &entries {
+            assert_eq!(*count, 1, "key {} should have count 1", key);
+        }
+    }
+
+    #[test]
+    fn two_workers_disjoint_keys() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let mut tables = make_worker_tables(&state, &arena, &[1, 2, 3]);
+        tables.extend(make_worker_tables(&state, &arena, &[4, 5, 6]));
+
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 6);
+    }
+
+    #[test]
+    fn two_workers_overlapping_keys_merged() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let mut tables = make_worker_tables(&state, &arena, &[1, 2, 3]);
+        tables.extend(make_worker_tables(&state, &arena, &[2, 3, 4]));
+
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 4);
+        let count_for = |k: i32| entries.iter().find(|(key, _)| *key == k).unwrap().1;
+        assert_eq!(count_for(1), 1);
+        assert_eq!(count_for(2), 2);
+        assert_eq!(count_for(3), 2);
+        assert_eq!(count_for(4), 1);
+    }
+
+    #[test]
+    fn empty_tables_produce_no_entries() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let tables = make_worker_tables(&state, &arena, &[]);
+
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn many_workers_large_overlap() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let mut tables = vec![];
+        for _ in 0..8 {
+            tables.extend(make_worker_tables(&state, &arena, &[10, 20, 30]));
+        }
+
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 3);
+        for (_, count) in &entries {
+            assert_eq!(*count, 8);
+        }
+    }
+
+    #[test]
+    fn partitions_are_disjoint() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let values: Vec<i32> = (0..200).collect();
+        let tables = make_worker_tables(&state, &arena, &values);
+
+        let total_cap: usize = tables.iter().map(|t| t.capacity()).sum::<usize>() / 2;
+        let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
+        let mut total = 0;
+        for p in 0..PARTITIONS {
+            let result =
+                merge_partition::<IntExtractor, CountValue>(p, &tables, &arena, partition_cap);
+            total += result.iter(0).count();
+        }
+
+        assert_eq!(total, 200);
+    }
+
+    #[test]
+    fn mixed_size_tables_merge_correctly() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let small = make_worker_tables(&state, &arena, &[1, 2]);
+        let big_values: Vec<i32> = (0..500).collect();
+        let big = make_worker_tables(&state, &arena, &big_values);
+        let mut tables = small;
+        tables.extend(big);
+
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 500);
+        let count_for = |k: i32| entries.iter().find(|(key, _)| *key == k).unwrap().1;
+        assert_eq!(count_for(1), 2);
+        assert_eq!(count_for(2), 2);
+        assert_eq!(count_for(499), 1);
+    }
+
+    #[test]
+    fn duplicates_within_single_worker_carry_through_merge() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let tables = make_worker_tables(&state, &arena, &[5, 5, 5, 5, 5]);
+
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], (5, 5));
+    }
+}
