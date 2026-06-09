@@ -125,10 +125,19 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     hll: Hll,
     switched: bool,
     radix: RadixConfig,
+    // Scratch for the batched multi-pass probe (`merge_batch`), allocated once at
+    // RECORD_BATCH_SIZE and reused for every batch.
+    /// Each row's hash for the current batch. A zero hash — the empty-slot marker
+    /// — is remapped to a fixed non-zero value in place on the first probe.
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    /// Each row's current probe slot, advanced one slot per pass; only meaningful
+    /// while the row is still on the unresolved worklist.
     slots: Box<[usize; RECORD_BATCH_SIZE]>,
-    sel: Box<[u32; RECORD_BATCH_SIZE]>,
-    sel_next: Box<[u32; RECORD_BATCH_SIZE]>,
+    /// Worklist of indices of rows that collided and need another pass, and the
+    /// buffer it ping-pongs into: each pass walks `unresolved`, writes the rows
+    /// that collide again into `unresolved_scratch`, then swaps the two.
+    unresolved: Box<[u32; RECORD_BATCH_SIZE]>,
+    unresolved_scratch: Box<[u32; RECORD_BATCH_SIZE]>,
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
@@ -152,11 +161,11 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
-            sel: vec![0u32; RECORD_BATCH_SIZE]
+            unresolved: vec![0u32; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
-            sel_next: vec![0u32; RECORD_BATCH_SIZE]
+            unresolved_scratch: vec![0u32; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
@@ -213,8 +222,8 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             length,
             &mut self.hashes[..],
             &mut self.slots[..],
-            &mut self.sel[..],
-            &mut self.sel_next[..],
+            &mut self.unresolved[..],
+            &mut self.unresolved_scratch[..],
             &mut src,
         );
         if self.tables.last().unwrap().undersized() {
