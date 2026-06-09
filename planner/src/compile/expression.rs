@@ -245,6 +245,23 @@ fn iso_weeks_in_year(y: i64) -> i64 {
     if p(y) == 4 || p(y - 1) == 3 { 53 } else { 52 }
 }
 
+/// ISO 8601 week-of-year (1–53) for an epoch-relative day count. Week 1 is the
+/// week containing the year's first Thursday; days before it belong to the
+/// prior year's last week, and the year's tail can roll into week 1.
+fn iso_week(days: i64) -> i64 {
+    let (y, ..) = civil_from_days(days);
+    let ordinal = days - days_from_civil(y, 1, 1) + 1;
+    let iso_dow = (days + 3).rem_euclid(7) + 1;
+    let week = (ordinal - iso_dow + 10).div_euclid(7);
+    if week < 1 {
+        iso_weeks_in_year(y - 1)
+    } else if week > iso_weeks_in_year(y) {
+        1
+    } else {
+        week
+    }
+}
+
 impl DatePart {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         // EventTime is stored as Int64 epoch *seconds* (UTC), so every part is a
@@ -252,54 +269,6 @@ impl DatePart {
         // calendar fields well-defined for pre-epoch (negative) timestamps,
         // matching DuckDB's `extract(<part> FROM ...)`.
         let kind = self.kind;
-        let part = move |t: i64| -> i64 {
-            use crate::expression::DatePartKind::*;
-            match kind {
-                Epoch => t,
-                Second => t.rem_euclid(60),
-                Millisecond => t.rem_euclid(60) * 1_000,
-                Microsecond => t.rem_euclid(60) * 1_000_000,
-                Minute => t.div_euclid(60).rem_euclid(60),
-                Hour => t.div_euclid(SECS_PER_HOUR).rem_euclid(24),
-                // 0 = Sunday … 6 = Saturday. The epoch day (1970-01-01) was a
-                // Thursday (4), so `(days + 4) mod 7` rebases to Sunday = 0.
-                DayOfWeek => (t.div_euclid(SECS_PER_DAY) + 4).rem_euclid(7),
-                // 1 = Monday … 7 = Sunday.
-                IsoDayOfWeek => (t.div_euclid(SECS_PER_DAY) + 3).rem_euclid(7) + 1,
-                _ => {
-                    // Calendar parts share one civil-date conversion.
-                    let days = t.div_euclid(SECS_PER_DAY);
-                    let (y, m, d) = civil_from_days(days);
-                    match kind {
-                        Day => d,
-                        Month => m,
-                        Quarter => (m - 1) / 3 + 1,
-                        Year => y,
-                        Decade => y.div_euclid(10),
-                        Century => (y - 1).div_euclid(100) + 1,
-                        Millennium => (y - 1).div_euclid(1000) + 1,
-                        DayOfYear => days - days_from_civil(y, 1, 1) + 1,
-                        Week => {
-                            // ISO 8601: week 1 is the one containing the year's
-                            // first Thursday; days before it belong to the prior
-                            // year's last week, and the tail can roll into week 1.
-                            let ordinal = days - days_from_civil(y, 1, 1) + 1;
-                            let iso_dow = (days + 3).rem_euclid(7) + 1;
-                            let week = (ordinal - iso_dow + 10).div_euclid(7);
-                            if week < 1 {
-                                iso_weeks_in_year(y - 1)
-                            } else if week > iso_weeks_in_year(y) {
-                                1
-                            } else {
-                                week
-                            }
-                        }
-                        // Epoch/Second/Minute/Hour/DayOfWeek/IsoDayOfWeek handled above.
-                        _ => unreachable!("non-calendar part in calendar branch"),
-                    }
-                }
-            }
-        };
         let source_builder = self.source.compile()?;
         Ok(Box::new(move || {
             let mut source_expr = source_builder();
@@ -308,7 +277,46 @@ impl DatePart {
                 let (arr, _) = src.as_datum().get();
                 let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
                 let vals = i64arr.as_primitive::<Int64Type>();
-                let out: Int64Array = vals.iter().map(|v| v.map(part)).collect();
+                // Dispatch on the part ONCE per batch, then run a single
+                // monomorphic, branch-free row loop per arm — so e.g. `minute`
+                // compiles to exactly its two-op loop with no per-row `kind`
+                // test (no reliance on the optimizer hoisting a loop-invariant
+                // branch). The civil-date parts share `civil_from_days`.
+                use crate::expression::DatePartKind::*;
+                macro_rules! map_part {
+                    ($f:expr) => {{
+                        let out: Int64Array = vals.iter().map(|v| v.map($f)).collect();
+                        out
+                    }};
+                }
+                let day = |t: i64| t.div_euclid(SECS_PER_DAY);
+                let out = match kind {
+                    Epoch => map_part!(|t: i64| t),
+                    Second => map_part!(|t: i64| t.rem_euclid(60)),
+                    Millisecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000),
+                    Microsecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000_000),
+                    Minute => map_part!(|t: i64| t.div_euclid(60).rem_euclid(60)),
+                    Hour => map_part!(|t: i64| t.div_euclid(SECS_PER_HOUR).rem_euclid(24)),
+                    // 0 = Sunday … 6 = Saturday. The epoch day (1970-01-01) was a
+                    // Thursday (4), so `(days + 4) mod 7` rebases to Sunday = 0.
+                    DayOfWeek => map_part!(|t: i64| (day(t) + 4).rem_euclid(7)),
+                    // 1 = Monday … 7 = Sunday.
+                    IsoDayOfWeek => map_part!(|t: i64| (day(t) + 3).rem_euclid(7) + 1),
+                    Day => map_part!(|t: i64| civil_from_days(day(t)).2),
+                    Month => map_part!(|t: i64| civil_from_days(day(t)).1),
+                    Quarter => map_part!(|t: i64| (civil_from_days(day(t)).1 - 1) / 3 + 1),
+                    Year => map_part!(|t: i64| civil_from_days(day(t)).0),
+                    Decade => map_part!(|t: i64| civil_from_days(day(t)).0.div_euclid(10)),
+                    Century => map_part!(|t: i64| (civil_from_days(day(t)).0 - 1).div_euclid(100) + 1),
+                    Millennium => {
+                        map_part!(|t: i64| (civil_from_days(day(t)).0 - 1).div_euclid(1000) + 1)
+                    }
+                    DayOfYear => map_part!(|t: i64| {
+                        let d = day(t);
+                        d - days_from_civil(civil_from_days(d).0, 1, 1) + 1
+                    }),
+                    Week => map_part!(|t: i64| iso_week(day(t))),
+                };
                 ExprResult::Array(Arc::new(out) as ArrayRef)
             }) as ExprEvalFn
         }))
