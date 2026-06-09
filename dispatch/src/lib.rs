@@ -75,12 +75,10 @@ mod functions;
 mod operations;
 mod scan;
 
-use crate::operations::nullary::OneShotNullaryFactory;
 use crate::worker::{Worker, WorkerWaker};
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
-pub use io::{FsRequest, HttpRequest};
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
@@ -169,27 +167,6 @@ impl DataFlowDispatcher {
 
     pub fn worker_count(&self) -> usize {
         self.senders.len()
-    }
-
-    /// Ship a `FnOnce() -> T` to worker 0 and return its result.
-    ///
-    /// Useful for one-shot setup work that needs a `MemoryContext` to run
-    /// (e.g. `ParquetTable::from_directory`, which touches the file cache)
-    /// from a thread that doesn't have one. Builds a single-element
-    /// `OperatorSpec` whose nullary fires once, sends one item, and finishes.
-    pub fn run_on_worker<T, F>(&self, f: F) -> crate::data_flow::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> T + Send + 'static,
-    {
-        let spec = OperatorSpec::new(
-            self.clone(),
-            std::iter::once(NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))),
-        );
-        let mut results = spec.collect()?;
-        Ok(results
-            .pop()
-            .expect("OneShotNullary should have produced exactly one result"))
     }
 }
 

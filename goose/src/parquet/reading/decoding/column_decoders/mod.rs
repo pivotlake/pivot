@@ -39,8 +39,6 @@ use thiserror::Error;
 pub enum Error {
     #[error("No pages are ready")]
     NoPagesReady,
-    #[error("Dict page empty")]
-    DictPageEmpty,
     #[error("Unsupported encoding: {0}")]
     UnsupportedEncoding(Encoding),
     #[error("Nullable columns are not yet supported (encountered nulls in data page)")]

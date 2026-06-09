@@ -18,10 +18,10 @@ mod indexer;
 pub use indexer::IndexerFactory;
 
 mod decompressor;
-pub use decompressor::{DecompressorFactory, Error as DecompressorError};
+pub use decompressor::DecompressorFactory;
 
 mod decoding;
-pub use decoding::{DecoderFactory, RowGroupDecoderError, ScanEqualityPredicate};
+pub use decoding::{DecoderFactory, ScanEqualityPredicate};
 
 mod materializer;
 pub use materializer::MaterializerFactory;

@@ -75,8 +75,6 @@ pub enum Error {
     #[error("table `{0}` already exists")]
     TableExists(String),
     #[error(transparent)]
-    Arrow(#[from] arrow_schema::ArrowError),
-    #[error(transparent)]
     Store(#[from] store::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::ManifestError),

@@ -19,9 +19,9 @@ pub(crate) fn op_err(e: impl std::error::Error + Send + Sync + 'static) -> dispa
 
 mod reading;
 pub use reading::{
-    DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory, MaterializerFactory,
-    RowGroupDecoderError, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    DecoderFactory, DecompressorFactory, IndexerFactory, MaterializerFactory,
+    RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate, materialize,
+    table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
 };
 
 mod metadata;
