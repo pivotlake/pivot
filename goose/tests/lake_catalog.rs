@@ -173,8 +173,8 @@ fn create_new_lake_table_cas_commits_a_snapshot() {
 
     // The committed snapshot records the table and its declared columns,
     // round-tripped to SQL type spellings.
-    let store = goose::store::open_store(dir.path().to_str().unwrap()).unwrap();
-    let snap = goose::store::latest_snapshot(store.as_ref()).unwrap();
+    let store = goose::TableObjectStore::open(dir.path().to_str().unwrap()).unwrap();
+    let snap = store.latest_snapshot().unwrap();
     assert_eq!(snap.version, 1);
     let committed = snap.table("main", "t").expect("table is in the snapshot");
     assert_eq!(committed.columns.len(), 2);

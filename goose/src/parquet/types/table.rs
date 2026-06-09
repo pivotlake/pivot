@@ -144,8 +144,10 @@ impl ParquetTable {
     }
 
     /// Read every file's footer in parallel (the metadata-fetch dataflow) and
-    /// assemble the row groups.
-    fn from_locations(
+    /// assemble the row groups. The locations may freely mix local and remote
+    /// files. Same coordinator requirement as
+    /// [`from_directory`](Self::from_directory).
+    pub fn from_locations(
         dispatcher: &DataFlowDispatcher,
         files: Vec<DataFileLocation>,
     ) -> Result<Self> {

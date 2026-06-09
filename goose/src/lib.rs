@@ -28,6 +28,9 @@ pub mod lake;
 pub mod metadata;
 pub mod parquet;
 pub mod store;
+pub mod table_store;
+
+pub use table_store::TableObjectStore;
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -74,8 +77,6 @@ pub enum Error {
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
     Store(#[from] store::StoreError),
-    #[error("table mixes local and remote data files, which is not supported")]
-    MixedDataFiles,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -164,37 +165,18 @@ impl ParquetCatalog {
             return Err(Error::IfNotExistsUnsupported);
         }
         let url = request.options.get(URL_OPTION).ok_or(Error::MissingPath)?;
-        let store = store::open_store(url)?;
-        let snapshot = store::latest_snapshot(store.as_ref())?;
+        let store = TableObjectStore::open(url)?;
+        let snapshot = store.latest_snapshot()?;
 
         // The URL identifies a single table, so take the sole table the snapshot
         // describes (if any).
         let existing = snapshot.schemas.iter().flat_map(|s| &s.tables).next();
 
         let parquet = match existing {
+            // Attach: resolve the recorded data files (local or presigned remote,
+            // freely mixed) and read their footers in parallel.
             Some(table) => {
-                // Resolve each data file to a local path or a presigned remote
-                // URL. A table's files share the root's store, so they're either
-                // all local or all remote.
-                let mut paths = Vec::new();
-                let mut urls = Vec::new();
-                for file in &table.files {
-                    match lake::resolve_data_file(url, &file.location) {
-                        lake::Resolved::Local(p) => paths.push(p),
-                        // Carry the snapshot's recorded size so the footer offset
-                        // is known without probing the remote object.
-                        lake::Resolved::Remote(uri) => {
-                            urls.push((store::presign_get(&uri)?, file.size))
-                        }
-                    }
-                }
-                match (paths.is_empty(), urls.is_empty()) {
-                    (_, true) => ParquetTable::from_files(dispatcher, &paths)?,
-                    (true, false) => ParquetTable::from_remote_files(dispatcher, &urls)?,
-                    (false, false) => {
-                        return Err(Error::MixedDataFiles);
-                    }
-                }
+                ParquetTable::from_locations(dispatcher, store.resolve_data_files(table)?)?
             }
             None => {
                 // New catalog: commit an initial snapshot defining this table.
@@ -207,7 +189,7 @@ impl ParquetCatalog {
                     })
                     .collect();
                 let name = request.name.clone();
-                store::commit(store.as_ref(), |snap| {
+                store.commit(|snap| {
                     let schema = ensure_main_schema(snap);
                     schema.tables.push(metadata::Table {
                         name: name.clone(),
