@@ -5,7 +5,7 @@
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::expression::{
-    Between, Compare, CompareType, Contains, DateTrunc, Divide, Expression, Function, Ref,
+    Between, Compare, CompareType, Contains, DateTrunc, Divide, Expression, Function, Minute, Ref,
 };
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
@@ -206,12 +206,37 @@ impl DateTrunc {
     }
 }
 
+impl Minute {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // EventTime is stored as Int64 epoch *seconds*, so the minute-of-hour is
+        // the seconds-into-the-hour divided by 60: `(t mod 3600) / 60`. Euclidean
+        // division keeps the result in 0..=59 even for pre-epoch (negative)
+        // timestamps, matching DuckDB's `extract(minute FROM ...)`.
+        let source_builder = self.source.compile()?;
+        Ok(Box::new(move || {
+            let mut source_expr = source_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let src = source_expr(batch);
+                let (arr, _) = src.as_datum().get();
+                let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
+                let vals = i64arr.as_primitive::<Int64Type>();
+                let minutes: Int64Array = vals
+                    .iter()
+                    .map(|v| v.map(|t| t.rem_euclid(3600).div_euclid(60)))
+                    .collect();
+                ExprResult::Array(Arc::new(minutes) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Function {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
             Function::Contains(c) => c.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
+            Function::Minute(m) => m.compile(),
             // `drop_cache()` evicts pivot's file cache as a side effect, then
             // returns the regions dropped. Evaluated over the single `DummyScan`
             // row on a worker thread (where `memory_ctx` is valid), so the
