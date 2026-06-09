@@ -269,7 +269,7 @@ mod tests {
     use crate::RECORD_BATCH_SIZE;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::arena::SharedArena;
-    use crate::operations::unary::group::hashtables::{AggregatedTable, WorkerOutput};
+    use crate::operations::unary::group::hashtables::{AggregatedTable, RadixConfig, WorkerOutput};
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
         AggregationKind, AggregationSlot, Compiled, Count,
@@ -289,7 +289,7 @@ mod tests {
         values: &[i32],
     ) -> Vec<MultiSlabTable<IntExtractor, CountValue>> {
         let mut agg =
-            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone());
+            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone(), RadixConfig::DEFAULT);
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
@@ -461,7 +461,7 @@ mod tests {
         values: &[i32],
     ) -> WorkerOutput<IntExtractor, CountValue> {
         let mut agg =
-            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone());
+            AggregatedTable::<IntExtractor, CountValue>::new(state.clone(), arena.clone(), RadixConfig::DEFAULT);
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         // One batch at a time — consume_batch's scratch is sized for RECORD_BATCH_SIZE.
         for chunk in values.chunks(RECORD_BATCH_SIZE) {

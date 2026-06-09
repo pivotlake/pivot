@@ -50,6 +50,24 @@ const SWITCH_THRESHOLD: usize = 32768;
 /// memory tracks the data scattered, not the partition count.
 const CHUNK_CAP: usize = 1 << 11; // 2048
 
+/// Tunable thresholds for the in-place→radix switch. Production uses
+/// [`DEFAULT`](RadixConfig::DEFAULT); tests build small configs so the radix path
+/// (scatter buffers + an N-way merge) fits the test slab pool.
+#[derive(Copy, Clone)]
+pub struct RadixConfig {
+    /// Table-slot count past which a radix-eligible worker switches to scatter.
+    pub switch_threshold: usize,
+    /// Number of scatter partitions (a power of two).
+    pub partitions: usize,
+}
+
+impl RadixConfig {
+    pub const DEFAULT: Self = Self {
+        switch_threshold: SWITCH_THRESHOLD,
+        partitions: RADIX_PARTITIONS,
+    };
+}
+
 /// One scattered row: `(hash, persisted key, per-row value contribution)`.
 pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value);
 
@@ -159,6 +177,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     /// Distinct-count sketch over scattered (post-switch) hashes, for sizing.
     hll: Hll,
     switched: bool,
+    radix: RadixConfig,
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
     slots: Box<[usize; RECORD_BATCH_SIZE]>,
     sel: Box<[u32; RECORD_BATCH_SIZE]>,
@@ -166,7 +185,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
 }
 
 impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
-    pub fn new(state: RandomState, shared_arena: Arc<SharedArena>) -> Self {
+    pub fn new(state: RandomState, shared_arena: Arc<SharedArena>, radix: RadixConfig) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::multi_slab(&mut allocator, DEFAULT_CAPACITY, 0);
         Self {
@@ -177,6 +196,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             buffers: None,
             hll: Hll::new(),
             switched: false,
+            radix,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
@@ -298,8 +318,9 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     #[inline(always)]
     fn grow_or_switch(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
-        if K::SUPPORTS_RADIX && next_size > SWITCH_THRESHOLD {
-            self.buffers = Some((0..RADIX_PARTITIONS).map(|_| SlabList::new()).collect());
+        if K::SUPPORTS_RADIX && next_size > self.radix.switch_threshold {
+            self.buffers =
+                Some((0..self.radix.partitions).map(|_| SlabList::new()).collect());
             self.switched = true;
             true
         } else {
@@ -318,7 +339,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         key_reader: &K::Reader<'_>,
         value_reader: &V::Reader<'_>,
     ) {
-        let shift = u64::BITS - RADIX_PARTITIONS.trailing_zeros();
+        let shift = u64::BITS - self.radix.partitions.trailing_zeros();
         let Self {
             worker_arena,
             allocator,

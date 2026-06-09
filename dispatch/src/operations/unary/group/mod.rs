@@ -96,7 +96,8 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTable, DEFAULT_CAPACITY, MultiSlabTable, PartitionBuffers, WorkerOutput,
+    AggregatedTable, DEFAULT_CAPACITY, MultiSlabTable, PartitionBuffers, RadixConfig,
+    WorkerOutput,
 };
 use crate::worker::worker_waker;
 use ahash::RandomState;
@@ -155,6 +156,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         sender: mpsc::Sender<WorkerOutput<K, V>>,
         receiver: Option<mpsc::Receiver<WorkerOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
+        radix: RadixConfig,
     ) -> Self {
         Self {
             key_cols,
@@ -168,7 +170,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 output_allocator: None,
             },
             sender,
-            aggregated_table: AggregatedTable::new(state, shared_arena),
+            aggregated_table: AggregatedTable::new(state, shared_arena, radix),
         }
     }
 }
@@ -283,12 +285,14 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                     (total / PARTITIONS).next_power_of_two().max(DEFAULT_CAPACITY),
                 )
             } else {
-                // Size each radix target for ~0.7 load (x3/2 margin) from the
-                // distinct estimate, rounded to the power-of-two the table needs.
+                // Every switched worker scattered into the same partition count
+                // (their RadixConfig); read it back off the buffers. Size each
+                // radix target for ~0.7 load (x3/2 margin) from the distinct estimate.
+                let parts = all_buffers[0].0.len();
                 let est = hll.estimate();
                 (
-                    RADIX_PARTITIONS,
-                    (est * 3 / (2 * RADIX_PARTITIONS))
+                    parts,
+                    (est * 3 / (2 * parts))
                         .next_power_of_two()
                         .max(DEFAULT_CAPACITY),
                 )
@@ -354,6 +358,15 @@ mod tests {
     }
 
     fn run_group(worker_batches: Vec<Vec<RecordBatch>>) -> CollectSender {
+        run_group_with_radix(worker_batches, RadixConfig::DEFAULT)
+    }
+
+    /// Like [`run_group`] but with a chosen [`RadixConfig`] — a small one forces
+    /// the radix switch + scatter merge to run within the test slab pool.
+    fn run_group_with_radix(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        radix: RadixConfig,
+    ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
         let arena = SharedArena::new(64);
@@ -375,6 +388,7 @@ mod tests {
                     tx.clone(),
                     rx_opt.take(),
                     partition_jobs_injected.clone(),
+                    radix,
                 )
             })
             .collect();
@@ -494,5 +508,31 @@ mod tests {
             group_counts(&sender),
             (0..3000).map(|k| (k, 2)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn radix_switch_single_worker_aggregates_counts() {
+        // A small config makes a radix-eligible (integer) worker switch to scatter
+        // after ~a couple hundred keys and scatter into 16 partitions, exercising
+        // the whole radix path within the test pool.
+        let radix = RadixConfig { switch_threshold: 256, partitions: 16 };
+        let mut values: Vec<i32> = (0..500).collect();
+        values.extend(0..500);
+
+        let sender = run_group_with_radix(vec![vec![batch_with_column(&values)]], radix);
+
+        assert_eq!(group_counts(&sender), (0..500).map(|k| (k, 2)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn radix_switch_merges_across_workers() {
+        // Two workers each switch to scatter; the radix merge has to combine both
+        // workers' per-partition buffers and pre-switch stacks for every key.
+        let radix = RadixConfig { switch_threshold: 256, partitions: 16 };
+        let worker = || vec![batch_with_column(&(0..500).collect::<Vec<_>>())];
+
+        let sender = run_group_with_radix(vec![worker(), worker()], radix);
+
+        assert_eq!(group_counts(&sender), (0..500).map(|k| (k, 2)).collect::<Vec<_>>());
     }
 }

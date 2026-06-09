@@ -22,7 +22,7 @@ mod hash_table;
 pub use hash_table::{BatchRowSource, Entry, LiveKey, PersistedKey, Value};
 
 mod aggregated_table;
-pub use aggregated_table::{AggregatedTable, PartitionBuffers, WorkerOutput};
+pub use aggregated_table::{AggregatedTable, PartitionBuffers, RadixConfig, WorkerOutput};
 
 /// Initial number of slots for a new per-worker hash table.
 pub const DEFAULT_CAPACITY: usize = 128;
