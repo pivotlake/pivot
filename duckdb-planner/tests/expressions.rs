@@ -118,6 +118,39 @@ fn nested_arithmetic(mut planner: PlannerContext) {
     ");
 }
 
+// ---- IN / conjunction expressions ----
+
+/// A small `IN` list is rewritten by DuckDB's optimizer into an `OR` of
+/// equalities, which deserializes as `Expression::Conjunction`.
+#[rstest]
+fn in_list_lowers_to_or_conjunction(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT id FROM users WHERE score IN (1, 3, 5)")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(#0:INTEGER)
+      Projection(#1:INTEGER)
+        Filter((#0:INTEGER = 1:INTEGER -> BOOLEAN OR #0:INTEGER = 3:INTEGER -> BOOLEAN OR #0:INTEGER = 5:INTEGER -> BOOLEAN))
+          Input([#2:INTEGER, #0:INTEGER])
+    ");
+}
+
+/// An explicit `OR`/`AND` mix deserializes as nested `Conjunction`s.
+#[rstest]
+fn explicit_or_and_conjunction(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT id FROM users WHERE score = 1 OR (age = 2 AND active)")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(#0:INTEGER)
+      Projection(#3:INTEGER)
+        Filter((#0:INTEGER = 1:INTEGER -> BOOLEAN OR (#2:BOOLEAN AND #1:INTEGER = 2:INTEGER -> BOOLEAN)))
+          Input([#2:INTEGER, #3:INTEGER, #4:BOOLEAN, #0:INTEGER])
+    ");
+}
+
 // ---- Aggregate function expressions ----
 
 #[rstest]
