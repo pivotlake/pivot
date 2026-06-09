@@ -12,8 +12,9 @@
 //!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
 //!   means the stealing worker picks up data early in the dataflow, to not interrupt current
 //!   hot-in-cache processing
-//! - [`get_next_io_request`](DataFlow::get_next_io_request) — collect pending IO
-//!   requests from operators (e.g. parquet page reads).
+//! - [`get_next_fs_request`](DataFlow::get_next_fs_request) /
+//!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending IO
+//!   requests from operators (e.g. parquet page reads, or HTTP range reads).
 //! - [`process_io`](DataFlow::process_io) — deliver a completed IO buffer to the
 //!   operator that requested it.
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
@@ -270,7 +271,7 @@ impl DataFlow {
         self.try_run(|d| {
             d.graph.operators[node_id]
                 .operator
-                .process_disk_response(request)?;
+                .process_io_response(request)?;
             Ok(())
         });
     }
@@ -307,18 +308,43 @@ impl DataFlow {
         })
     }
 
-    /// Collect pending IO requests from operators (leaf-to-root).
-    /// Returns the first batch of requests found, or `None` if no operator needs IO.
-    pub fn get_next_io_request(&mut self) -> Option<Vec<DataFlowRequest>> {
+    /// Collect pending filesystem read requests from operators (leaf-to-root).
+    /// Returns the first batch found, or `None` if no operator needs disk IO.
+    /// The kind-specific [`FsRequest`](crate::io::FsRequest)s convert into the
+    /// transport-tagged [`IORequest`] here.
+    pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest>> {
         self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
-                    let requests = op.operator.next_io_requests()?;
+                    let requests = op.operator.next_fs_requests()?;
                     if !requests.is_empty() {
                         Ok(ControlFlow::Break(
                             requests
                                 .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
+                                .map(|r| DataFlowRequest::new(d.id, op.id, r.into()))
+                                .collect(),
+                        ))
+                    } else {
+                        Ok(ControlFlow::Continue(()))
+                    }
+                })
+                .map(|c| c.break_value())
+        })
+    }
+
+    /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
+    /// [`get_next_fs_request`](Self::get_next_fs_request); the kind-specific
+    /// [`HttpRequest`](crate::io::HttpRequest)s convert into [`IORequest`] here.
+    pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest>> {
+        self.try_run_or(None, |d| {
+            d.graph
+                .traverse_backwards(|op| {
+                    let requests = op.operator.next_http_requests()?;
+                    if !requests.is_empty() {
+                        Ok(ControlFlow::Break(
+                            requests
+                                .into_iter()
+                                .map(|r| DataFlowRequest::new(d.id, op.id, r.into()))
                                 .collect(),
                         ))
                     } else {

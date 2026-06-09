@@ -4,7 +4,6 @@
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
 use crate::catalog::{Catalog, DynamicScanPredicate};
-use crate::compile::create_table::CreateTableNullaryFactory;
 use crate::compile::dummy_scan::DummyScanNullaryFactory;
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
@@ -339,7 +338,9 @@ impl Input {
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
-        Ok(self.table.compile(dispatcher, projection, dynamic_filters))
+        self.table
+            .compile(dispatcher, projection, dynamic_filters)
+            .map_err(Error::TableScan)
     }
 }
 
@@ -476,18 +477,9 @@ impl CreateTable {
             ));
         }
 
-        let already_created = Arc::new(AtomicBool::new(false));
-
-        Ok(RecordBatchOperatorSpec::from_nullary(
-            dispatcher,
-            (0..dispatcher.worker_count()).map(|_| {
-                CreateTableNullaryFactory::new(
-                    catalog.clone(),
-                    self.request.clone(),
-                    already_created.clone(),
-                )
-            }),
-        ))
+        catalog
+            .create_table(self.request.clone(), dispatcher)
+            .map_err(Error::CreateTable)
     }
 }
 

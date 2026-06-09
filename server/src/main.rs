@@ -7,9 +7,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use catalog::ParquetCatalog;
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch};
+use goose::ParquetCatalog;
 use ingest::{IngestConfig, OtelConfig, Signal, SinkDestination};
 use server::{Error, Server};
 use tracing::info;

@@ -29,9 +29,11 @@
 //!    Returns [`WorkStatus::Ran`] if it did anything, [`WorkStatus::Pending`] if no work was available
 //!    to do.
 //!
-//! 2. [`next_io_requests`](Operator::next_io_requests) — return any pending IO requests
-//!    (e.g. read a parquet page from disk). The worker submits these asynchronously and
-//!    delivers completions via [`process_disk_response`](Operator::process_disk_response).
+//! 2. [`next_fs_requests`](Operator::next_fs_requests) /
+//!    [`next_http_requests`](Operator::next_http_requests) — return any pending IO requests
+//!    (e.g. read a parquet page from disk, or a byte range over HTTP). The worker submits
+//!    these asynchronously and delivers completions via
+//!    [`process_io_response`](Operator::process_io_response).
 //!
 //! 3. [`try_finish`](Operator::try_finish) — called when the input channel is drained
 //!    and all sibling operators (across workers) have also drained. The operator does
@@ -41,7 +43,7 @@
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
-use crate::io::IORequest;
+use crate::io::{FsRequest, HttpRequest, IORequest};
 use thiserror::Error;
 
 pub mod channels;
@@ -81,13 +83,24 @@ pub trait Operator {
     /// Returns [`WorkStatus::Ran`] if work was done, [`Pending`](WorkStatus::Pending) otherwise.
     fn run_cpu_work(&mut self) -> Result<WorkStatus>;
 
-    /// Return any pending IO requests (e.g. parquet page reads).
-    /// The worker will submit them and later call [`process_disk_response`](Self::process_disk_response).
-    fn next_io_requests(&mut self) -> Result<Vec<IORequest>>;
+    /// Return any pending filesystem read requests (e.g. parquet page reads from
+    /// a local file). The worker submits them and later calls
+    /// [`process_io_response`](Self::process_io_response).
+    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>>;
 
-    /// Handle a completed disk read (its bytes are already committed to the
-    /// cache). Called by the worker when IO finishes.
-    fn process_disk_response(&mut self, request: IORequest) -> Result<()>;
+    /// Return any pending HTTP requests (reads of [`Remote`](crate::io::FileLocation::Remote)
+    /// regions). The worker submits these on the same per-core io_uring and
+    /// delivers completions via the same
+    /// [`process_io_response`](Self::process_io_response) — by the time it is
+    /// called the bytes are already committed to the cache slot, identical to a
+    /// disk read.
+    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
+        Ok(vec![])
+    }
+
+    /// Handle a completed read (disk or HTTP); its bytes are already committed to
+    /// the cache. Called by the worker when IO finishes.
+    fn process_io_response(&mut self, request: IORequest) -> Result<()>;
 
     /// Attempt to finish, return whether the operator is ready to finish. Regardless of whether it
     /// is, this function may be called many times.

@@ -28,7 +28,7 @@
 //! use std::path::Path;
 //! use std::sync::Arc;
 //!
-//! use catalog::parquet::{ParquetTable, table_input};
+//! use goose::parquet::{ParquetTable, table_input};
 //! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
 //! use planner::catalog::{Catalog, Column, CreateTableRequest, DynamicScanPredicate, Table};
@@ -41,8 +41,8 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>) -> RecordBatchOperatorSpec {
-//!         table_input(dispatcher, &self.parquet, projection, false)
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>) -> planner::catalog::Result<RecordBatchOperatorSpec> {
+//!         Ok(table_input(dispatcher, &self.parquet, projection, false))
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
 //! }
@@ -70,8 +70,10 @@
 //!     }
 //! }
 //!
-//! // Wire one parquet directory into the catalog under the name "hits".
-//! let parquet = Arc::new(ParquetTable::from_directory(Path::new("/tmp/hits")).unwrap());
+//! // Wire one parquet directory into the catalog under the name "hits". The
+//! // footers are read once here, over the dispatch worker pool.
+//! let dispatch = Dispatch::spin_up(1, 10);
+//! let parquet = Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), Path::new("/tmp/hits")).unwrap());
 //! let template = MyTableTemplate {
 //!     parquet,
 //!     columns: vec![Column { name: "URL".into(), col_type: Type::Utf8 }],
@@ -81,7 +83,6 @@
 //! tables.insert("hits".to_string(), template);
 //! let catalog: Arc<dyn Catalog> = Arc::new(MyCatalog { tables });
 //!
-//! let dispatch = Dispatch::spin_up(1, 10);
 //! let mut planner = Planner::new(catalog);
 //!
 //! // SQL -> Pivot Plan -> dispatch operator spec -> execution.

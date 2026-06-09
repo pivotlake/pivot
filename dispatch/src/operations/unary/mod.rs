@@ -54,7 +54,7 @@ mod factory;
 pub use factory::*;
 
 use crate::data_flow::WorkStatus;
-use crate::io::IORequest;
+use crate::io::{FsRequest, HttpRequest, IORequest};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -116,8 +116,15 @@ pub trait Unary<I, O> {
     /// Process one input item, sending zero or more output items to `sender`.
     fn consume<S: Sender<O>>(&mut self, object: I, sender: &mut S) -> Result<()>;
 
-    /// Return any pending IO requests (e.g. async disk reads for parquet pages).
-    fn next_io_requests(&mut self) -> Result<Vec<IORequest>> {
+    /// Return any pending filesystem read requests (e.g. async disk reads for
+    /// parquet pages). See [`Operator::next_fs_requests`].
+    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
+        Ok(vec![])
+    }
+
+    /// Return any pending HTTP requests (reads of remote regions). See
+    /// [`Operator::next_http_requests`].
+    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
         Ok(vec![])
     }
 
@@ -127,8 +134,9 @@ pub trait Unary<I, O> {
         true
     }
 
-    /// Handle a completed disk read.
-    fn process_disk_response<S: Sender<O>>(
+    /// Handle a completed read (disk or HTTP); its bytes are already committed to
+    /// the cache slot.
+    fn process_io_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
         _request: IORequest,
@@ -197,14 +205,16 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(WorkStatus::Ran)
     }
 
-    fn next_io_requests(&mut self) -> super::Result<Vec<IORequest>> {
-        Ok(self.unary.next_io_requests()?)
+    fn next_fs_requests(&mut self) -> super::Result<Vec<FsRequest>> {
+        Ok(self.unary.next_fs_requests()?)
     }
 
-    fn process_disk_response(&mut self, context: IORequest) -> super::Result<()> {
-        Ok(self
-            .unary
-            .process_disk_response(&mut self.sender, context)?)
+    fn next_http_requests(&mut self) -> super::Result<Vec<HttpRequest>> {
+        Ok(self.unary.next_http_requests()?)
+    }
+
+    fn process_io_response(&mut self, context: IORequest) -> super::Result<()> {
+        Ok(self.unary.process_io_response(&mut self.sender, context)?)
     }
 
     fn try_finish(&mut self) -> super::Result<bool> {

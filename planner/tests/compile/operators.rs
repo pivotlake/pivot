@@ -489,9 +489,13 @@ impl Catalog for RecordingCatalog {
         None
     }
 
-    fn create_table(&self, request: CreateTableRequest) -> planner::catalog::Result<()> {
+    fn create_table(
+        &self,
+        request: CreateTableRequest,
+        dispatcher: &dispatch::DataFlowDispatcher,
+    ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
         self.created_tables.lock().unwrap().push(request);
-        Ok(())
+        Ok(dispatch::RecordBatchOperatorSpec::empty(dispatcher))
     }
 }
 

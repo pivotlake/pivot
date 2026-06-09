@@ -59,10 +59,10 @@ use crate::operations::channels::{
 use crate::operations::{
     AggSpec, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory, Count,
     CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
-    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory,
+    Nullary, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory,
     UnaryOperator, UnaryOperatorFactory, ValueExtractor,
 };
-use crate::{DataFlowDispatcher, DataFlowHandle};
+use crate::{DataFlowDispatcher, DataFlowHandle, NullaryResult, WorkStatus};
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
 /// Object-safe version of [`OperatorFactory<RecordBatch>`].
@@ -295,6 +295,15 @@ impl RecordBatchOperatorSpec {
                 .into_iter()
                 .map(NullaryOperatorFactory::new),
         ))
+    }
+
+    /// A spec that yields no rows. Useful for side-effecting / DDL statements
+    /// (e.g. `CREATE TABLE`) whose result set is empty.
+    pub fn empty(dispatcher: &DataFlowDispatcher) -> Self {
+        Self::from_nullary(
+            dispatcher,
+            (0..dispatcher.worker_count()).map(|_| NoRowsNullaryFactory),
+        )
     }
 
     /// Borrow the dispatcher this spec was built against.
@@ -627,5 +636,37 @@ impl RecordBatchOperatorSpec {
         self.unary((0..count).map(|_| CopyOutFactory))
             .execute()
             .collect()
+    }
+}
+
+/// Per-worker factory for [`NoRowsNullary`], backing
+/// [`RecordBatchOperatorSpec::empty`].
+struct NoRowsNullaryFactory;
+
+impl NullaryFactory<RecordBatch> for NoRowsNullaryFactory {
+    type Nullary = NoRowsNullary;
+
+    fn build_nullary(self) -> NoRowsNullary {
+        NoRowsNullary { ran: false }
+    }
+}
+
+/// A nullary that emits nothing and finishes immediately — the body of an empty
+/// (no-row) spec.
+struct NoRowsNullary {
+    ran: bool,
+}
+
+impl Nullary<RecordBatch> for NoRowsNullary {
+    fn run<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> NullaryResult<WorkStatus> {
+        if self.ran {
+            return Ok(WorkStatus::Pending);
+        }
+        self.ran = true;
+        Ok(WorkStatus::Ran)
+    }
+
+    fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> NullaryResult<bool> {
+        Ok(self.ran)
     }
 }
