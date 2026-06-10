@@ -35,6 +35,10 @@ impl PersistedKey for () {}
 /// xor-shift-right and a multiply by an odd constant). Distinct inputs therefore
 /// map to distinct outputs, so deduping by this value is exact, and its strong
 /// avalanche gives uniform top bits for slot/partition placement.
+///
+/// Every step maps 0 to 0, so the unique preimage of the hash-table's
+/// empty-slot sentinel (hash 0) is the key whose bit pattern is 0 — that one
+/// key is counted out of band rather than stored (see `DEDUP_BY_HASH`).
 #[inline(always)]
 fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -54,10 +58,25 @@ impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for HashOnlyIntKeyExtr
 where
     T::Native: IntBits,
 {
-    // Dedup is purely by the bijective hash (the key is `()`), so the table
-    // counts the single 0-hash key out of band instead of remapping it. Stays
-    // in-place (no radix) — the out-of-band count lives on the in-place table.
+    // Dedup is purely by the bijective hash (the key is `()`), so the single
+    // 0-hash key is counted out of band instead of remapped — both the in-place
+    // insert and the post-switch radix scatter skip it (see `AggregatedTable`).
     const DEDUP_BY_HASH: bool = true;
+
+    // Radix-eligible: a scattered row is `(hash, (), ZST)` — just the 8-byte
+    // bijective hash — and the merge's insert-by-stored-hash dedups `()` keys by
+    // hash equality, which the bijection makes exactly key equality. So a
+    // high-cardinality distinct build scatters into cache-resident partitions
+    // instead of probing one giant per-worker table that misses cache on every
+    // row, and loses no exactness doing it.
+    const SUPPORTS_RADIX: bool = true;
+
+    // Entries here are 8 bytes — a quarter of the ~32-byte entries the default
+    // switch threshold is tuned for — so the in-place table stays L2-resident to
+    // 4x the slot count. Defer the switch by the same factor: same byte budget,
+    // and a medium-cardinality distinct (tens of thousands of keys) keeps the
+    // cheap in-place path instead of scattering into a 4096-way merge.
+    const RADIX_SWITCH_SCALE: usize = 4;
 
     type Config = ();
     type Persisted = ();

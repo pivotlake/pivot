@@ -730,6 +730,97 @@ mod tests {
         );
     }
 
+    /// Run a keys-only global `COUNT(DISTINCT v)` (count-only output) over
+    /// `Int32` values and return the total: the sum of the emitted
+    /// per-partition distinct counts, plus the out-of-band 0-hash row if the
+    /// key 0 (the unique preimage of hash 0 — `mix64` fixes 0) was present.
+    fn run_distinct_count(worker_batches: Vec<Vec<RecordBatch>>, radix: RadixConfig) -> i64 {
+        init_test_free_pool(64);
+        let worker_count = worker_batches.len();
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let injector = Arc::new(Injector::new());
+        let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut rx_opt = Some(rx);
+
+        let groups: Vec<_> = (0..worker_count)
+            .map(|_| {
+                Group::<HashOnlyIntKeyExtractor<Int32Type>, DistinctValueExtractor>::new(
+                    arena.clone(),
+                    state.clone(),
+                    injector.clone(),
+                    vec![0],
+                    Vec::new(),
+                    (),
+                    None,
+                    None,
+                    true,
+                    tx.clone(),
+                    rx_opt.take(),
+                    partition_jobs_injected.clone(),
+                    radix,
+                )
+            })
+            .collect();
+        drop(tx);
+
+        let sender = run_consumers(groups, worker_batches);
+        sender.i64_column(0).into_iter().sum()
+    }
+
+    #[test]
+    fn distinct_count_zero_hash_key_in_place() {
+        // The default config never switches at 3 keys, so the 0 key (whose
+        // bijective hash collides with the empty-slot sentinel) is excluded by
+        // the in-place scalar path and counted via the extra output row.
+        let total = run_distinct_count(
+            vec![vec![batch_with_column(&[0, 1, 2, 0, 1])]],
+            RadixConfig::DEFAULT,
+        );
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn distinct_count_radix_switch_exact_across_workers() {
+        // Two workers over overlapping ranges (0 included in both), each with
+        // enough distinct values to switch to radix scatter partway through
+        // (threshold 256 × the keys-only 4x width scale = 1024 slots). The
+        // count must be exact: the merge dedups scattered rows by the
+        // bijective hash against both workers' pre-switch in-place stacks, and
+        // the 0-hash key — seen by both workers — counts exactly once.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let w1: Vec<i32> = (0..6000).collect();
+        let w2: Vec<i32> = std::iter::once(0).chain(3000..9000).collect();
+        let total = run_distinct_count(
+            vec![vec![batch_with_column(&w1)], vec![batch_with_column(&w2)]],
+            radix,
+        );
+        assert_eq!(total, 9000); // distinct(0..9000)
+    }
+
+    #[test]
+    fn distinct_count_zero_hash_key_skipped_by_scatter() {
+        // Feed the 0 key only *after* the worker has switched to radix, so it
+        // is the post-switch scatter — not the in-place path — that must
+        // exclude it (storing it would let the merge remap its 0 hash to 1 and
+        // alias a real key) and record it for the out-of-band count.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let big: Vec<i32> = (1..5000).collect(); // forces the switch
+        let tail = vec![0, 0, 17, 4999]; // 0 first arrives post-switch
+        let total = run_distinct_count(
+            vec![vec![batch_with_column(&big), batch_with_column(&tail)]],
+            radix,
+        );
+        assert_eq!(total, 5000); // distinct(1..5000) plus the 0 key
+    }
+
     /// (string key, count) pairs from a finished string group-by, sorted by key.
     fn string_group_pairs(sender: &CollectSender) -> Vec<(String, i64)> {
         let mut pairs: Vec<_> = sender
