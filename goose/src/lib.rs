@@ -383,6 +383,35 @@ impl Table for ParquetCatalogTable {
         materialize(input, self.parquet.clone(), projection)
     }
 
+    fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+        // Only sound for the whole, unfiltered table: a pushed-down predicate
+        // means the scan this binding stands for excludes rows.
+        if !self.predicates.is_empty() {
+            return None;
+        }
+        let row_groups = self.parquet.row_groups();
+        if row_groups.is_empty() {
+            return None;
+        }
+        // Every row group must carry both bounds; fold them with the arrow
+        // comparison kernels (stats come back typed as the physical column).
+        let mut min: Option<Scalar<ArrayRef>> = None;
+        let mut max: Option<Scalar<ArrayRef>> = None;
+        for rg in row_groups {
+            let stats = rg.column_statistics(column)?;
+            let (rg_min, rg_max) = (stats.min.as_ref()?, stats.max.as_ref()?);
+            min = Some(match min {
+                Some(m) if scalar_lt(&m, rg_min) => m,
+                _ => rg_min.clone(),
+            });
+            max = Some(match max {
+                Some(m) if scalar_lt(rg_max, &m) => m,
+                _ => rg_max.clone(),
+            });
+        }
+        Some((min?, max?))
+    }
+
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
         let TableFilter::Expression(expr) = filter else {
             return Ok(false);
@@ -408,6 +437,11 @@ impl Table for ParquetCatalogTable {
 
         Ok(false)
     }
+}
+
+/// `a < b` over two single-value scalars of the same physical type.
+fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
+    arrow_ord::cmp::lt(a, b).is_ok_and(|r| r.len() == 1 && r.value(0))
 }
 
 impl ParquetCatalogTable {

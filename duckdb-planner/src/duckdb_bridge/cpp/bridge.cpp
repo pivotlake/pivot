@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -19,6 +20,9 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -183,6 +187,56 @@ json build_function_expression(duckdb::BoundFunctionExpression *function) {
     };
 }
 
+// `a AND b AND ...` / `a OR b OR ...`. The optimizer rewrites a small
+// `x IN (a, b)` into `x = a OR x = b`, so this is the usual shape a pushed-down
+// IN membership test reaches us in. `conjunction_type` preserves AND vs OR.
+json build_conjunction_expression(duckdb::BoundConjunctionExpression *conj) {
+	json children = json::array();
+	for (auto &child : conj->children) {
+		children.push_back(build_expression(child.get()));
+	}
+	return {
+		{"conjunction_type", static_cast<uint8_t>(conj->type)},
+		{"children", std::move(children)},
+	};
+}
+
+// `x IN (a, b, ...)` is a BoundOperatorExpression whose first child is the
+// tested expression and whose remaining children are the list values.
+json build_in_expression(duckdb::BoundOperatorExpression *op) {
+	json values = json::array();
+	for (size_t i = 1; i < op->children.size(); i++) {
+		values.push_back(build_expression(op->children[i].get()));
+	}
+	return {
+		{"input", build_expression(op->children[0].get())},
+		{"values", std::move(values)},
+	};
+}
+
+// `CASE WHEN c0 THEN r0 WHEN c1 THEN r1 ... ELSE e END`. Each `(when, then)`
+// pair becomes a check; a CASE without an explicit ELSE has a NULL else_expr.
+json build_case_expression(duckdb::BoundCaseExpression *case_expr) {
+	json checks = json::array();
+	for (auto &check : case_expr->case_checks) {
+		checks.push_back({
+			{"when", build_expression(check.when_expr.get())},
+			{"then", build_expression(check.then_expr.get())},
+		});
+	}
+	return {
+		{"checks", std::move(checks)},
+		{"else_expr", build_expression(case_expr->else_expr.get())},
+	};
+}
+
+// `NOT expr` — a BoundOperatorExpression with a single child.
+json build_not_expression(duckdb::BoundOperatorExpression *op) {
+	return {
+		{"input", build_expression(op->children[0].get())},
+	};
+}
+
 json build_expression(duckdb::Expression *expr) {
 	json new_expression;
 	new_expression["type"] = expr->type;
@@ -220,6 +274,23 @@ json build_expression(duckdb::Expression *expr) {
 	}
 	case duckdb::ExpressionType::BOUND_FUNCTION: {
 		new_expression["data"] = build_function_expression(&expr->Cast<duckdb::BoundFunctionExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::COMPARE_IN: {
+		new_expression["data"] = build_in_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::CONJUNCTION_AND:
+	case duckdb::ExpressionType::CONJUNCTION_OR: {
+		new_expression["data"] = build_conjunction_expression(&expr->Cast<duckdb::BoundConjunctionExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::CASE_EXPR: {
+		new_expression["data"] = build_case_expression(&expr->Cast<duckdb::BoundCaseExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::OPERATOR_NOT: {
+		new_expression["data"] = build_not_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
 		break;
 	}
 	case duckdb::ExpressionType::OPERATOR_CAST: {
@@ -473,6 +544,39 @@ json build_top_n(duckdb::LogicalTopN *top_n, DynamicFilterDedup &df_dedup) {
 	    };
 }
 
+json build_limit(duckdb::LogicalLimit *limit) {
+	// Plain LIMIT/OFFSET (no ORDER BY fused in — that's LogicalTopN). Both
+	// values are BoundLimitNodes; only the constant (and absent) forms are
+	// supported. `LIMIT 10%` / `LIMIT (SELECT …)` stay unsupported.
+	json limit_val = nullptr;
+	switch (limit->limit_val.Type()) {
+	case duckdb::LimitNodeType::CONSTANT_VALUE:
+		limit_val = limit->limit_val.GetConstantValue();
+		break;
+	case duckdb::LimitNodeType::UNSET:
+		// `OFFSET m` without a LIMIT: serialized as null → unbounded.
+		break;
+	default:
+		throw UnsupportedPlanError("Unsupported LIMIT: only constant limits are supported");
+	}
+
+	duckdb::idx_t offset_val = 0;
+	switch (limit->offset_val.Type()) {
+	case duckdb::LimitNodeType::CONSTANT_VALUE:
+		offset_val = limit->offset_val.GetConstantValue();
+		break;
+	case duckdb::LimitNodeType::UNSET:
+		break;
+	default:
+		throw UnsupportedPlanError("Unsupported OFFSET: only constant offsets are supported");
+	}
+
+	return {
+	    {"limit", limit_val},
+	    {"offset", offset_val},
+	};
+}
+
 string create_table_option_to_string(duckdb::ParsedExpression &expr) {
     if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
         auto &value = expr.Cast<duckdb::ConstantExpression>().value;
@@ -714,6 +818,10 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
 		new_operator["data"] = build_top_n(&op->Cast<duckdb::LogicalTopN>(), df_dedup);
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_LIMIT: {
+		new_operator["data"] = build_limit(&op->Cast<duckdb::LogicalLimit>());
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE: {

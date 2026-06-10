@@ -29,7 +29,7 @@ use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBr
 use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int16Type, Int32Type, Int64Type};
+use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt16Type, UInt32Type};
 use arrow_array::{Array, ArrayRef, Int64Array, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
@@ -42,8 +42,8 @@ use std::sync::mpsc;
 /// [`OrderByLimitFactory`]: super::order_by_limit
 pub struct AggregateFactory<A: Accumulator> {
     slots: Arc<Vec<AggregationSlot>>,
-    sender: mpsc::Sender<Vec<A>>,
-    receiver: Option<mpsc::Receiver<Vec<A>>>,
+    sender: mpsc::Sender<Partials<A>>,
+    receiver: Option<mpsc::Receiver<Partials<A>>>,
 }
 
 impl<A: Accumulator> AggregateFactory<A> {
@@ -76,25 +76,60 @@ impl<A: Accumulator> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory
     }
 }
 
+/// A worker's partials: one accumulator per slot, plus the rows it saw —
+/// `MIN`/`MAX` over zero rows is `NULL`, which the identity accumulators
+/// (`i64::MAX` / `i64::MIN`) can't express on their own.
+pub struct Partials<A> {
+    totals: Vec<A>,
+    rows: u64,
+}
+
+/// The identity element a slot's fold starts from: 0 for the additive kinds,
+/// the saturating extreme for `MIN`/`MAX`. (Min/max inputs are at most 64-bit
+/// columns, so `i64`'s extremes are valid identities at any accumulator width.)
+fn identity<A: Accumulator>(kind: AggregationKind) -> A {
+    match kind {
+        AggregationKind::Min => A::from(i64::MAX),
+        AggregationKind::Max => A::from(i64::MIN),
+        _ => A::default(),
+    }
+}
+
+/// Fold a slot's incoming partial into its running total.
+#[inline(always)]
+fn fold<A: Accumulator>(kind: AggregationKind, total: A, partial: A) -> A {
+    match kind {
+        AggregationKind::Min => total.min(partial),
+        AggregationKind::Max => total.max(partial),
+        _ => {
+            let mut t = total;
+            t += partial;
+            t
+        }
+    }
+}
+
 /// Per-worker aggregate consumer. Accumulates local partials, then sends them
 /// down the shared channel on finalization.
 pub struct Aggregate<A: Accumulator> {
     slots: Arc<Vec<AggregationSlot>>,
     local: Vec<A>,
-    sender: mpsc::Sender<Vec<A>>,
-    receiver: Option<mpsc::Receiver<Vec<A>>>,
+    rows: u64,
+    sender: mpsc::Sender<Partials<A>>,
+    receiver: Option<mpsc::Receiver<Partials<A>>>,
 }
 
 impl<A: Accumulator> Aggregate<A> {
     fn new(
         slots: Arc<Vec<AggregationSlot>>,
-        sender: mpsc::Sender<Vec<A>>,
-        receiver: Option<mpsc::Receiver<Vec<A>>>,
+        sender: mpsc::Sender<Partials<A>>,
+        receiver: Option<mpsc::Receiver<Partials<A>>>,
     ) -> Self {
-        let local = vec![A::default(); slots.len()];
+        let local = slots.iter().map(|s| identity::<A>(s.kind)).collect();
         Aggregate {
             slots,
             local,
+            rows: 0,
             sender,
             receiver,
         }
@@ -128,8 +163,35 @@ fn sum_column<A: Accumulator>(arr: &dyn Array) -> A {
     }
 }
 
+/// The batch-local extreme of an integer primitive column, widened to `i64` —
+/// over any storage width an integer/date column scans as.
+fn extreme_column(arr: &dyn Array, min: bool) -> i64 {
+    macro_rules! extreme_primitive {
+        ($ty:ty) => {{
+            let a = arr.as_primitive::<$ty>();
+            let mut acc = if min { i64::MAX } else { i64::MIN };
+            for i in 0..a.len() {
+                let v = unsafe { a.value_unchecked(i) } as i64;
+                acc = if min { acc.min(v) } else { acc.max(v) };
+            }
+            acc
+        }};
+    }
+
+    match arr.data_type() {
+        DataType::Int8 => extreme_primitive!(Int8Type),
+        DataType::Int16 => extreme_primitive!(Int16Type),
+        DataType::Int32 => extreme_primitive!(Int32Type),
+        DataType::Int64 => extreme_primitive!(Int64Type),
+        DataType::UInt16 => extreme_primitive!(UInt16Type),
+        DataType::UInt32 => extreme_primitive!(UInt32Type),
+        other => panic!("aggregate MIN/MAX: unsupported column type {other:?}"),
+    }
+}
+
 /// Build the single output column for one aggregate slot from its accumulator.
-fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, ArrayRef) {
+/// `rows` is the total row count: a `MIN`/`MAX` over zero rows is `NULL`.
+fn result_column<A: Accumulator>(kind: AggregationKind, value: A, rows: u64) -> (Field, ArrayRef) {
     match kind {
         // `Int64` or `Decimal128(38, 0)` per the accumulator width.
         AggregationKind::Sum => {
@@ -147,6 +209,23 @@ fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, Arr
                 Arc::new(Int64Array::from(vec![count])),
             )
         }
+        AggregationKind::Min | AggregationKind::Max => {
+            let name = if kind == AggregationKind::Min {
+                "min"
+            } else {
+                "max"
+            };
+            let array: ArrayRef = if rows == 0 {
+                Arc::new(Int64Array::from(vec![None::<i64>]))
+            } else {
+                let v = i64::try_from(value.into()).expect("extreme exceeds i64 range");
+                Arc::new(Int64Array::from(vec![v]))
+            };
+            (Field::new(name, DataType::Int64, true), array)
+        }
+        AggregationKind::MinStr | AggregationKind::MaxStr => {
+            panic!("global string MIN/MAX is not supported")
+        }
     }
 }
 
@@ -159,7 +238,7 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
         _output: &mut OP,
     ) -> unary::Result<()> {
         for (i, slot) in self.slots.iter().enumerate() {
-            self.local[i] += match slot.kind {
+            let partial = match slot.kind {
                 // COUNT(*) counts every row and never reads a column.
                 AggregationKind::CountStar => A::from(batch.num_rows() as i64),
                 // COUNT(c) needs only the non-null count, not the values — read
@@ -169,8 +248,15 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
                     A::from((col.len() - col.null_count()) as i64)
                 }
                 AggregationKind::Sum => sum_column::<A>(batch.column(slot.column)),
+                AggregationKind::Min => A::from(extreme_column(batch.column(slot.column), true)),
+                AggregationKind::Max => A::from(extreme_column(batch.column(slot.column), false)),
+                AggregationKind::MinStr | AggregationKind::MaxStr => {
+                    panic!("global string MIN/MAX is not supported")
+                }
             };
+            self.local[i] = fold(slot.kind, self.local[i], partial);
         }
+        self.rows += batch.num_rows() as u64;
         Ok(())
     }
 
@@ -180,15 +266,19 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
         // unconditionally after the send avoids the lost-wakeup that bites when
         // a finishing worker drops its sender while the collector is parked.
         self.sender
-            .send(self.local)
+            .send(Partials {
+                totals: self.local,
+                rows: self.rows,
+            })
             .expect("aggregate collector dropped");
         worker_waker().notify();
 
-        let totals = vec![A::default(); self.slots.len()];
+        let totals = self.slots.iter().map(|s| identity::<A>(s.kind)).collect();
         Ok(self.receiver.map(|rx| AggregateOutputter {
             rx,
             slots: self.slots,
             totals,
+            rows: 0,
         }))
     }
 }
@@ -196,9 +286,10 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
 /// Output phase (one worker only): drains every sibling's partials from the
 /// channel, sums them, then emits the single-row result.
 pub struct AggregateOutputter<A: Accumulator> {
-    rx: mpsc::Receiver<Vec<A>>,
+    rx: mpsc::Receiver<Partials<A>>,
     slots: Arc<Vec<AggregationSlot>>,
     totals: Vec<A>,
+    rows: u64,
 }
 
 impl<A: Accumulator> Outputter<RecordBatch> for AggregateOutputter<A> {
@@ -206,9 +297,10 @@ impl<A: Accumulator> Outputter<RecordBatch> for AggregateOutputter<A> {
         loop {
             match self.rx.try_recv() {
                 Ok(partial) => {
-                    for (total, p) in self.totals.iter_mut().zip(&partial) {
-                        *total += *p;
+                    for (i, (total, p)) in self.totals.iter_mut().zip(&partial.totals).enumerate() {
+                        *total = fold(self.slots[i].kind, *total, *p);
                     }
+                    self.rows += partial.rows;
                 }
                 // Some siblings haven't finished yet; resume when re-driven.
                 Err(mpsc::TryRecvError::Empty) => return Ok(false),
@@ -218,7 +310,7 @@ impl<A: Accumulator> Outputter<RecordBatch> for AggregateOutputter<A> {
                         .slots
                         .iter()
                         .zip(&self.totals)
-                        .map(|(slot, total)| result_column(slot.kind, *total))
+                        .map(|(slot, total)| result_column(slot.kind, *total, self.rows))
                         .unzip();
                     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
                     output.send(batch)?;
@@ -334,6 +426,27 @@ mod tests {
         let ops = build::<i64>(1, vec![slot(AggregationKind::CountStar, 0)]);
         let out = run_consumers(ops, vec![vec![make_batch(&[5, 6, 7]), make_batch(&[8])]]);
         assert_eq!(col_i64(&out.items[0], 0), 4);
+    }
+
+    #[test]
+    fn min_max_across_workers() {
+        let ops = build::<i64>(
+            2,
+            vec![slot(AggregationKind::Min, 0), slot(AggregationKind::Max, 0)],
+        );
+        let out = run_consumers(
+            ops,
+            vec![vec![make_batch(&[5, -3, 9])], vec![make_batch(&[7, 0])]],
+        );
+        assert_eq!(col_i64(&out.items[0], 0), -3);
+        assert_eq!(col_i64(&out.items[0], 1), 9);
+    }
+
+    #[test]
+    fn min_over_empty_input_is_null() {
+        let ops = build::<i64>(1, vec![slot(AggregationKind::Min, 0)]);
+        let out = run_consumers(ops, vec![vec![]]);
+        assert!(out.items[0].column(0).is_null(0));
     }
 
     #[test]

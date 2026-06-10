@@ -181,6 +181,11 @@ pub enum AggregateFunc {
     /// Lowered in compilation to a two-level GROUP BY (dedup on the group keys
     /// plus `col`, then count rows per group); see [`crate::compile`].
     CountDistinct(NumericAggregate),
+    /// `MIN(col)` — over integers, dates (their stored day counts) or strings
+    /// (binary collation, matching DuckDB's default).
+    Min(NumericAggregate),
+    /// `MAX(col)`.
+    Max(NumericAggregate),
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
@@ -200,6 +205,8 @@ impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
             "avg" => Ok(AggregateFunc::Avg(a.try_into()?)),
             "count" if a.distinct => Ok(AggregateFunc::CountDistinct(a.try_into()?)),
             "count" => Ok(AggregateFunc::Count(a.try_into()?)),
+            "min" => Ok(AggregateFunc::Min(a.try_into()?)),
+            "max" => Ok(AggregateFunc::Max(a.try_into()?)),
             _ => Err(Error::UnsupportedAggregateFunction(a.aggregate_function)),
         }
     }
@@ -229,6 +236,131 @@ impl TryFrom<duckdb_expression::Function> for Contains {
     }
 }
 
+/// The operator of a binary integer [`Arithmetic`] expression.
+#[derive(Debug, Clone, Copy)]
+pub enum ArithmeticOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// Binary integer arithmetic (`lhs + rhs`, `lhs - rhs`, `lhs * rhs`). DuckDB
+/// lowers these as a `BOUND_FUNCTION` whose function name is the operator
+/// symbol itself (`"+"`, `"-"`, `"*"`). Division is separate ([`Divide`])
+/// because SQL `/` yields a non-integer quotient.
+#[derive(Debug, Clone)]
+pub struct Arithmetic {
+    pub op: ArithmeticOp,
+    pub left: Box<Expression>,
+    pub right: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Function> for Arithmetic {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        let op = match f.function.as_str() {
+            "+" => ArithmeticOp::Add,
+            "-" => ArithmeticOp::Sub,
+            "*" => ArithmeticOp::Mul,
+            _ => return Err(Error::UnsupportedScalarFunction(f.function)),
+        };
+        // Unary forms (e.g. `-x`) bind to the same function names with one
+        // parameter; only the binary forms are supported.
+        if f.params.len() != 2 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 2,
+                actual,
+            });
+        }
+        let right = Box::new(Expression::try_from(f.params.remove(1))?);
+        let left = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(Arithmetic { op, left, right })
+    }
+}
+
+/// SQL `length(string)` — the number of Unicode *characters* (not bytes) in
+/// the string, as `BIGINT`. Arrives as a `BOUND_FUNCTION` named `length`.
+#[derive(Debug, Clone)]
+pub struct Length {
+    pub input: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Function> for Length {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        if f.params.len() != 1 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 1,
+                actual,
+            });
+        }
+        let input = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(Length { input })
+    }
+}
+
+/// SQL `regexp_replace(input, pattern, replacement)` — replaces the *first*
+/// match of `pattern` in each row of `input` (DuckDB without the `'g'`
+/// option). The replacement string uses PostgreSQL-style `\N` group
+/// references. `pattern` and `replacement` must be constants so the regex can
+/// be compiled once at plan-compile time.
+#[derive(Debug, Clone)]
+pub struct RegexpReplace {
+    pub input: Box<Expression>,
+    pub pattern: String,
+    pub replacement: String,
+}
+
+impl TryFrom<duckdb_expression::Function> for RegexpReplace {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        // A fourth `options` argument (e.g. 'g' for replace-all) changes the
+        // semantics, so only the three-argument first-match form is accepted.
+        if f.params.len() != 3 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 3,
+                actual,
+            });
+        }
+        let replacement = constant_string(
+            Expression::try_from(f.params.remove(2))?,
+            "regexp_replace: replacement",
+        )?;
+        let pattern = constant_string(
+            Expression::try_from(f.params.remove(1))?,
+            "regexp_replace: pattern",
+        )?;
+        let input = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(RegexpReplace {
+            input,
+            pattern,
+            replacement,
+        })
+    }
+}
+
+/// Logical negation (`NOT expr`). DuckDB lowers it as a
+/// `BoundOperatorExpression` of type `OPERATOR_NOT` with a single child.
+#[derive(Debug, Clone)]
+pub struct Not {
+    pub input: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Not> for Not {
+    type Error = Error;
+    fn try_from(n: duckdb_expression::Not) -> Result<Self, Self::Error> {
+        Ok(Not {
+            input: Box::<Expression>::try_from(n.input)?,
+        })
+    }
+}
+
 /// SQL `lhs / rhs`. Used by `AVG`, which DuckDB lowers to `sum(x) / count(x)`.
 #[derive(Debug, Clone)]
 pub struct Divide {
@@ -253,6 +385,27 @@ impl TryFrom<duckdb_expression::Function> for Divide {
     }
 }
 
+/// Extract a constant string argument (e.g. a regex pattern or a `date_trunc`
+/// unit) from a converted expression, erroring with `context` when the
+/// argument is not a string constant.
+fn constant_string(e: Expression, context: &str) -> Result<String, Error> {
+    match e {
+        Expression::Constant(scalar) => {
+            let (arr, _) = scalar.get();
+            Ok(arr
+                .as_string_view_opt()
+                .ok_or_else(|| {
+                    Error::UnsupportedScalarFunction(format!("{context} must be a string"))
+                })?
+                .value(0)
+                .to_string())
+        }
+        _ => Err(Error::UnsupportedScalarFunction(format!(
+            "{context} must be a constant"
+        ))),
+    }
+}
+
 /// SQL `date_trunc(unit, source)` — truncate a timestamp down to `unit`
 /// (e.g. `date_trunc('minute', EventTime)`). DuckDB passes the unit as a string
 /// constant in the first argument and the timestamp expression second.
@@ -274,23 +427,137 @@ impl TryFrom<duckdb_expression::Function> for DateTrunc {
             });
         }
         let source = Box::new(Expression::try_from(f.params.remove(1))?);
-        let unit = match Expression::try_from(f.params.remove(0))? {
-            Expression::Constant(scalar) => {
-                let (arr, _) = scalar.get();
-                arr.as_string_view_opt()
-                    .ok_or_else(|| {
-                        Error::UnsupportedScalarFunction("date_trunc: unit must be a string".into())
-                    })?
-                    .value(0)
-                    .to_ascii_lowercase()
-            }
-            _ => {
-                return Err(Error::UnsupportedScalarFunction(
-                    "date_trunc: unit must be a constant".into(),
-                ));
-            }
-        };
+        let unit = constant_string(
+            Expression::try_from(f.params.remove(0))?,
+            "date_trunc: unit",
+        )?
+        .to_ascii_lowercase();
         Ok(DateTrunc { unit, source })
+    }
+}
+
+/// Which field of a timestamp a [`DatePart`] extracts. DuckDB lowers
+/// `extract(<part> FROM ts)` to a scalar function named after the part (e.g.
+/// `minute`, `year`); this enumerates the parts we evaluate from `EventTime`'s
+/// Int64 epoch-seconds representation. See [`DatePart`]'s compile impl for the
+/// per-part arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePartKind {
+    /// Whole seconds since the Unix epoch (the stored value, unchanged).
+    Epoch,
+    /// Second of minute, 0–59.
+    Second,
+    /// Millisecond of minute, 0–59000 (whole seconds only, so `second * 1000`).
+    Millisecond,
+    /// Microsecond of minute, `second * 1_000_000`.
+    Microsecond,
+    /// Minute of hour, 0–59.
+    Minute,
+    /// Hour of day, 0–23.
+    Hour,
+    /// Day of month, 1–31.
+    Day,
+    /// Month of year, 1–12.
+    Month,
+    /// Quarter of year, 1–4.
+    Quarter,
+    /// Full year (e.g. 2024).
+    Year,
+    /// Decade — `year / 10` (e.g. 202 for 2024).
+    Decade,
+    /// Century — e.g. 21 for years 2001–2100.
+    Century,
+    /// Millennium — e.g. 3 for years 2001–3000.
+    Millennium,
+    /// Day of week, 0 (Sunday)–6 (Saturday).
+    DayOfWeek,
+    /// ISO day of week, 1 (Monday)–7 (Sunday).
+    IsoDayOfWeek,
+    /// Day of year, 1–366.
+    DayOfYear,
+    /// ISO 8601 week of year, 1–53.
+    Week,
+}
+
+impl DatePartKind {
+    /// Resolve a DuckDB scalar-function name (as `extract` lowers it) to a part.
+    /// Includes the common DuckDB aliases (`dow`, `doy`, `weekofyear`).
+    pub fn from_function_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "epoch" => DatePartKind::Epoch,
+            "second" => DatePartKind::Second,
+            "millisecond" => DatePartKind::Millisecond,
+            "microsecond" => DatePartKind::Microsecond,
+            "minute" => DatePartKind::Minute,
+            "hour" => DatePartKind::Hour,
+            "day" => DatePartKind::Day,
+            "month" => DatePartKind::Month,
+            "quarter" => DatePartKind::Quarter,
+            "year" => DatePartKind::Year,
+            "decade" => DatePartKind::Decade,
+            "century" => DatePartKind::Century,
+            "millennium" => DatePartKind::Millennium,
+            "dayofweek" | "dow" => DatePartKind::DayOfWeek,
+            "isodow" => DatePartKind::IsoDayOfWeek,
+            "dayofyear" | "doy" => DatePartKind::DayOfYear,
+            "week" | "weekofyear" => DatePartKind::Week,
+            _ => return None,
+        })
+    }
+
+    /// The canonical DuckDB function name for this part, used for plan display.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DatePartKind::Epoch => "epoch",
+            DatePartKind::Second => "second",
+            DatePartKind::Millisecond => "millisecond",
+            DatePartKind::Microsecond => "microsecond",
+            DatePartKind::Minute => "minute",
+            DatePartKind::Hour => "hour",
+            DatePartKind::Day => "day",
+            DatePartKind::Month => "month",
+            DatePartKind::Quarter => "quarter",
+            DatePartKind::Year => "year",
+            DatePartKind::Decade => "decade",
+            DatePartKind::Century => "century",
+            DatePartKind::Millennium => "millennium",
+            DatePartKind::DayOfWeek => "dayofweek",
+            DatePartKind::IsoDayOfWeek => "isodow",
+            DatePartKind::DayOfYear => "dayofyear",
+            DatePartKind::Week => "week",
+        }
+    }
+}
+
+/// SQL `extract(<part> FROM source)` — a timestamp field accessor. DuckDB
+/// lowers each part to a scalar function (`minute`, `year`, …); `EventTime` is
+/// stored as Int64 epoch *seconds* (see [`Type::Timestamp`]), so every part is
+/// a pure integer computation. See its compile impl.
+///
+/// [`Type::Timestamp`]: crate::types::Type::Timestamp
+#[derive(Debug, Clone)]
+pub struct DatePart {
+    pub kind: DatePartKind,
+    pub source: Box<Expression>,
+}
+
+impl DatePart {
+    /// Build from a DuckDB function call once its name has been recognised as a
+    /// date part. Validates the single-argument arity.
+    fn from_function(
+        kind: DatePartKind,
+        mut f: duckdb_expression::Function,
+    ) -> Result<Self, Error> {
+        if f.params.len() != 1 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 1,
+                actual,
+            });
+        }
+        let source = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(DatePart { kind, source })
     }
 }
 
@@ -298,8 +565,12 @@ impl TryFrom<duckdb_expression::Function> for DateTrunc {
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
+    Arithmetic(Arithmetic),
+    Length(Length),
+    RegexpReplace(RegexpReplace),
     Divide(Divide),
     DateTrunc(DateTrunc),
+    DatePart(DatePart),
     /// `drop_cache()` — evict pivot's file cache, returning the regions dropped.
     /// A side-effecting admin function; evaluated once over the [`DummyScan`]
     /// row of a `FROM`-less `SELECT`. See its compile impl.
@@ -313,6 +584,9 @@ impl TryFrom<duckdb_expression::Function> for Function {
     fn try_from(f: duckdb_expression::Function) -> Result<Self, Self::Error> {
         match f.function.as_str() {
             "contains" => Ok(Function::Contains(f.try_into()?)),
+            "+" | "-" | "*" => Ok(Function::Arithmetic(f.try_into()?)),
+            "length" => Ok(Function::Length(f.try_into()?)),
+            "regexp_replace" => Ok(Function::RegexpReplace(f.try_into()?)),
             "/" => Ok(Function::Divide(f.try_into()?)),
             "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),
             "drop_cache" => {
@@ -325,8 +599,107 @@ impl TryFrom<duckdb_expression::Function> for Function {
                 }
                 Ok(Function::DropCache)
             }
-            _ => Err(Error::UnsupportedScalarFunction(f.function)),
+            // `extract(<part> FROM ts)` lowers to a function named after the
+            // part (`minute`, `year`, `dayofweek`, …).
+            name => match DatePartKind::from_function_name(name) {
+                Some(kind) => Ok(Function::DatePart(DatePart::from_function(kind, f)?)),
+                None => Err(Error::UnsupportedScalarFunction(f.function)),
+            },
         }
+    }
+}
+
+/// An `input IN (v0, v1, …)` membership test. Evaluates to a boolean column;
+/// see its compile impl, which expands it to an OR of per-value equalities.
+#[derive(Debug, Clone)]
+pub struct InList {
+    pub input: Box<Expression>,
+    pub values: Vec<Expression>,
+}
+
+impl TryFrom<duckdb_expression::InList> for InList {
+    type Error = Error;
+    fn try_from(i: duckdb_expression::InList) -> Result<Self, Self::Error> {
+        Ok(InList {
+            input: Box::<Expression>::try_from(i.input)?,
+            values: i
+                .values
+                .into_iter()
+                .map(Expression::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+/// Whether a [`Conjunction`] combines its children with boolean `AND` or `OR`.
+#[derive(Debug, Clone, Copy)]
+pub enum ConjunctionOp {
+    And,
+    Or,
+}
+
+/// A boolean `AND`/`OR` over two or more child predicates. DuckDB rewrites a
+/// small `x IN (a, b)` into the `OR` form, so this is how most membership tests
+/// reach the executor; it also covers any explicit `AND`/`OR` in a `WHERE`.
+#[derive(Debug, Clone)]
+pub struct Conjunction {
+    pub op: ConjunctionOp,
+    pub children: Vec<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Conjunction> for Conjunction {
+    type Error = Error;
+    fn try_from(c: duckdb_expression::Conjunction) -> Result<Self, Self::Error> {
+        let op = if c.conjunction_type.clone() as u8 == ExpressionType::CONJUNCTION_OR as u8 {
+            ConjunctionOp::Or
+        } else {
+            ConjunctionOp::And
+        };
+        Ok(Conjunction {
+            op,
+            children: c
+                .children
+                .into_iter()
+                .map(Expression::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+/// One `WHEN when THEN then` arm of a [`Case`].
+#[derive(Debug, Clone)]
+pub struct CaseCheck {
+    pub when: Box<Expression>,
+    pub then: Box<Expression>,
+}
+
+/// A `CASE WHEN … THEN … [WHEN …] ELSE … END` expression. Evaluates each
+/// `when` predicate in order and yields the first matching `then`, falling back
+/// to `else_expr`; see its compile impl, which folds the arms with arrow's
+/// `zip` kernel.
+#[derive(Debug, Clone)]
+pub struct Case {
+    pub checks: Vec<CaseCheck>,
+    pub else_expr: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Case> for Case {
+    type Error = Error;
+    fn try_from(c: duckdb_expression::Case) -> Result<Self, Self::Error> {
+        let checks = c
+            .checks
+            .into_iter()
+            .map(|check| {
+                Ok(CaseCheck {
+                    when: Box::<Expression>::try_from(check.when)?,
+                    then: Box::<Expression>::try_from(check.then)?,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Case {
+            checks,
+            else_expr: Box::<Expression>::try_from(c.else_expr)?,
+        })
     }
 }
 
@@ -339,6 +712,208 @@ pub enum Expression {
     Constant(Scalar<ArrayRef>),
     AggregateFunc(AggregateFunc),
     Function(Function),
+    InList(InList),
+    Conjunction(Conjunction),
+    Case(Case),
+    Not(Not),
+}
+
+impl Expression {
+    /// Best-effort static result type of a computed expression, used to pick a
+    /// group-key extractor when grouping on it (e.g. `GROUP BY CASE …`). Returns
+    /// `None` when the type can't be determined cheaply, in which case callers
+    /// fall back to their default.
+    pub fn result_type(&self) -> Option<Type> {
+        match self {
+            Expression::Ref(r) => Some(r.return_type.clone()),
+            Expression::Constant(s) => match s.get().0.data_type() {
+                arrow_schema::DataType::Utf8
+                | arrow_schema::DataType::LargeUtf8
+                | arrow_schema::DataType::Utf8View => Some(Type::Utf8),
+                arrow_schema::DataType::Int8 => Some(Type::Int8),
+                arrow_schema::DataType::Int16 => Some(Type::Int16),
+                arrow_schema::DataType::Int32 => Some(Type::Int32),
+                arrow_schema::DataType::Int64 => Some(Type::Int64),
+                _ => None,
+            },
+            // A CASE's branches are unified to one type by DuckDB, so the ELSE
+            // branch's type is the whole expression's type.
+            Expression::Case(c) => c.else_expr.result_type(),
+            Expression::Function(Function::DateTrunc(_)) => Some(Type::Timestamp),
+            // Every extract(<part>) evaluates to an Int64 field value.
+            Expression::Function(Function::DatePart(_)) => Some(Type::Int64),
+            Expression::Function(Function::Length(_)) => Some(Type::Int64),
+            Expression::Function(Function::RegexpReplace(_)) => Some(Type::Utf8),
+            // Same-typed operands keep their type; mixed widths are coerced to
+            // Int64 by the arithmetic kernels.
+            Expression::Function(Function::Arithmetic(a)) => {
+                match (a.left.result_type(), a.right.result_type()) {
+                    (Some(l), Some(r)) if l == r => Some(l),
+                    (Some(_), Some(_)) => Some(Type::Int64),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Append every input column index this expression reads to `out`.
+    /// Aggregate functions are not scalar expressions and never appear where
+    /// this is used (group keys / projections); they panic.
+    pub fn referenced_columns(&self, out: &mut Vec<usize>) {
+        match self {
+            Expression::Ref(r) => out.push(r.column_idx),
+            Expression::Constant(_) => {}
+            Expression::Compare(c) => {
+                c.left.referenced_columns(out);
+                c.right.referenced_columns(out);
+            }
+            Expression::Between(b) => {
+                b.input.referenced_columns(out);
+                b.lower.referenced_columns(out);
+                b.upper.referenced_columns(out);
+            }
+            Expression::InList(i) => {
+                i.input.referenced_columns(out);
+                for v in &i.values {
+                    v.referenced_columns(out);
+                }
+            }
+            Expression::Conjunction(c) => {
+                for child in &c.children {
+                    child.referenced_columns(out);
+                }
+            }
+            Expression::Case(c) => {
+                for check in &c.checks {
+                    check.when.referenced_columns(out);
+                    check.then.referenced_columns(out);
+                }
+                c.else_expr.referenced_columns(out);
+            }
+            Expression::Not(n) => n.input.referenced_columns(out),
+            Expression::Function(func) => match func {
+                Function::Contains(c) => {
+                    c.haystack.referenced_columns(out);
+                    c.needle.referenced_columns(out);
+                }
+                Function::Arithmetic(a) => {
+                    a.left.referenced_columns(out);
+                    a.right.referenced_columns(out);
+                }
+                Function::Divide(d) => {
+                    d.left.referenced_columns(out);
+                    d.right.referenced_columns(out);
+                }
+                Function::Length(l) => l.input.referenced_columns(out),
+                Function::RegexpReplace(r) => r.input.referenced_columns(out),
+                Function::DateTrunc(dt) => dt.source.referenced_columns(out),
+                Function::DatePart(dp) => dp.source.referenced_columns(out),
+                Function::DropCache => {}
+            },
+            Expression::AggregateFunc(_) => {
+                unreachable!("aggregate functions are not scalar expressions")
+            }
+        }
+    }
+
+    /// Clone this expression with every column reference rewritten through
+    /// `map` (input column index → new index). Panics on a column the map
+    /// doesn't cover — callers collect [`referenced_columns`] first.
+    ///
+    /// [`referenced_columns`]: Self::referenced_columns
+    pub fn remap_refs(&self, map: &std::collections::HashMap<usize, usize>) -> Expression {
+        let remap = |e: &Expression| Box::new(e.remap_refs(map));
+        match self {
+            Expression::Ref(r) => Expression::Ref(Ref {
+                column_idx: *map
+                    .get(&r.column_idx)
+                    .unwrap_or_else(|| panic!("column {} missing from remap", r.column_idx)),
+                return_type: r.return_type.clone(),
+            }),
+            Expression::Constant(c) => Expression::Constant(c.clone()),
+            Expression::Compare(c) => Expression::Compare(Compare {
+                left: remap(&c.left),
+                right: remap(&c.right),
+                compare_type: c.compare_type,
+                return_type: c.return_type.clone(),
+            }),
+            Expression::Between(b) => Expression::Between(Between {
+                input: remap(&b.input),
+                lower: remap(&b.lower),
+                upper: remap(&b.upper),
+                lower_inclusive: b.lower_inclusive,
+                upper_inclusive: b.upper_inclusive,
+            }),
+            Expression::InList(i) => Expression::InList(InList {
+                input: remap(&i.input),
+                values: i.values.iter().map(|v| v.remap_refs(map)).collect(),
+            }),
+            Expression::Conjunction(c) => Expression::Conjunction(Conjunction {
+                op: c.op,
+                children: c.children.iter().map(|x| x.remap_refs(map)).collect(),
+            }),
+            Expression::Case(c) => Expression::Case(Case {
+                checks: c
+                    .checks
+                    .iter()
+                    .map(|check| CaseCheck {
+                        when: remap(&check.when),
+                        then: remap(&check.then),
+                    })
+                    .collect(),
+                else_expr: remap(&c.else_expr),
+            }),
+            Expression::Not(n) => Expression::Not(Not {
+                input: remap(&n.input),
+            }),
+            Expression::Function(func) => Expression::Function(match func {
+                Function::Contains(c) => Function::Contains(Contains {
+                    haystack: remap(&c.haystack),
+                    needle: remap(&c.needle),
+                }),
+                Function::Arithmetic(a) => Function::Arithmetic(Arithmetic {
+                    op: a.op,
+                    left: remap(&a.left),
+                    right: remap(&a.right),
+                }),
+                Function::Divide(d) => Function::Divide(Divide {
+                    left: remap(&d.left),
+                    right: remap(&d.right),
+                }),
+                Function::Length(l) => Function::Length(Length {
+                    input: remap(&l.input),
+                }),
+                Function::RegexpReplace(r) => Function::RegexpReplace(RegexpReplace {
+                    input: remap(&r.input),
+                    pattern: r.pattern.clone(),
+                    replacement: r.replacement.clone(),
+                }),
+                Function::DateTrunc(dt) => Function::DateTrunc(DateTrunc {
+                    unit: dt.unit.clone(),
+                    source: remap(&dt.source),
+                }),
+                Function::DatePart(dp) => Function::DatePart(DatePart {
+                    kind: dp.kind,
+                    source: remap(&dp.source),
+                }),
+                Function::DropCache => Function::DropCache,
+            }),
+            Expression::AggregateFunc(_) => {
+                unreachable!("aggregate functions are not scalar expressions")
+            }
+        }
+    }
+}
+
+impl Display for ArithmeticOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArithmeticOp::Add => f.write_str("+"),
+            ArithmeticOp::Sub => f.write_str("-"),
+            ArithmeticOp::Mul => f.write_str("*"),
+        }
+    }
 }
 
 impl Display for CompareType {
@@ -392,14 +967,52 @@ impl Display for Expression {
             Expression::AggregateFunc(AggregateFunc::CountDistinct(a)) => {
                 write!(f, "count(distinct #{})", a.column.column_idx)
             }
+            Expression::AggregateFunc(AggregateFunc::Min(a)) => {
+                write!(f, "min(#{})", a.column.column_idx)
+            }
+            Expression::AggregateFunc(AggregateFunc::Max(a)) => {
+                write!(f, "max(#{})", a.column.column_idx)
+            }
             Expression::Function(Function::Contains(c)) => {
                 write!(f, "contains({}, {})", c.haystack, c.needle)
             }
+            Expression::Function(Function::Arithmetic(a)) => {
+                write!(f, "({} {} {})", a.left, a.op, a.right)
+            }
+            Expression::Function(Function::Length(l)) => write!(f, "length({})", l.input),
+            Expression::Function(Function::RegexpReplace(r)) => write!(
+                f,
+                "regexp_replace({}, '{}', '{}')",
+                r.input, r.pattern, r.replacement
+            ),
             Expression::Function(Function::Divide(d)) => write!(f, "({} / {})", d.left, d.right),
             Expression::Function(Function::DateTrunc(dt)) => {
                 write!(f, "date_trunc('{}', {})", dt.unit, dt.source)
             }
+            Expression::Function(Function::DatePart(d)) => {
+                write!(f, "{}({})", d.kind.name(), d.source)
+            }
             Expression::Function(Function::DropCache) => write!(f, "drop_cache()"),
+            Expression::InList(i) => {
+                let values: Vec<String> = i.values.iter().map(|v| v.to_string()).collect();
+                write!(f, "{} IN ({})", i.input, values.join(", "))
+            }
+            Expression::Conjunction(c) => {
+                let op = match c.op {
+                    ConjunctionOp::And => "AND",
+                    ConjunctionOp::Or => "OR",
+                };
+                let parts: Vec<String> = c.children.iter().map(|p| p.to_string()).collect();
+                write!(f, "({})", parts.join(&format!(" {op} ")))
+            }
+            Expression::Case(c) => {
+                write!(f, "CASE")?;
+                for check in &c.checks {
+                    write!(f, " WHEN {} THEN {}", check.when, check.then)?;
+                }
+                write!(f, " ELSE {} END", c.else_expr)
+            }
+            Expression::Not(n) => write!(f, "NOT({})", n.input),
         }
     }
 }
@@ -418,6 +1031,10 @@ impl TryFrom<duckdb_expression::Expression> for Expression {
                 Expression::AggregateFunc(a.try_into()?)
             }
             duckdb_expression::Expression::Function(f) => Expression::Function(f.try_into()?),
+            duckdb_expression::Expression::InList(i) => Expression::InList(i.try_into()?),
+            duckdb_expression::Expression::Conjunction(c) => Expression::Conjunction(c.try_into()?),
+            duckdb_expression::Expression::Case(c) => Expression::Case(c.try_into()?),
+            duckdb_expression::Expression::Not(n) => Expression::Not(n.try_into()?),
         })
     }
 }

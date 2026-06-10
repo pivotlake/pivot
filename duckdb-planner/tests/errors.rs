@@ -88,7 +88,9 @@ fn exception_location() {
 #[test]
 fn unsupported_plan_returns_error() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT CASE WHEN id > 0 THEN 1 ELSE 0 END FROM t");
+    // `IS NULL` (OPERATOR_IS_NULL) has no bridge mapping yet, so it surfaces as
+    // an UnsupportedPlan error rather than reaching the executor.
+    let result = p.plan("SELECT id IS NULL FROM t");
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::UnsupportedPlan(message)) => {

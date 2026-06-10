@@ -363,6 +363,104 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
     );
 }
 
+#[rstest]
+fn limit_over_group_by_emits_exact_count(mut testing_planner: TestingPlanner) {
+    // No ORDER BY: any 3 of the 5 groups are valid, but exactly 3 must come out.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a LIMIT 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 3);
+    let mut groups: Vec<i64> = rows.iter().map(|r| r["key"].as_i64().unwrap()).collect();
+    groups.sort();
+    groups.dedup();
+    assert_eq!(groups.len(), 3, "limit must emit distinct groups: {rows:?}");
+    for row in &rows {
+        assert!((1..=5).contains(&row["key"].as_i64().unwrap()));
+        assert_eq!(row["v0"].as_i64().unwrap(), 1);
+    }
+}
+
+#[rstest]
+fn limit_with_offset_over_group_by(mut testing_planner: TestingPlanner) {
+    // 5 groups, skip 3, keep min(3, 2) = 2.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a LIMIT 3 OFFSET 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(batches_to_json(&results).len(), 2);
+}
+
+#[rstest]
+fn limit_exceeding_row_count(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a LIMIT 100")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(batches_to_json(&results).len(), 5);
+}
+
+#[rstest]
+fn order_by_limit_with_offset(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2 OFFSET 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(
+        rows,
+        serde_json::json!([{"a": 4}, {"a": 3}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+// A window beyond DuckDB's Top-N threshold plans as OrderBy + Limit, which
+// pivot re-fuses into a TopN (see the plan tests): exercise that fused path
+// end to end, sorted output included.
+#[rstest]
+fn order_by_huge_limit_with_offset(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 100000 OFFSET 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(
+        rows,
+        serde_json::json!([{"a": 4}, {"a": 3}, {"a": 2}, {"a": 1}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
 // `SELECT *` over a filtered Top-N is exactly the late-materialization shape:
 // DuckDB scans only `a`/`name` for the predicate+sort, then materializes the
 // full row for the survivors. Exercises multi-column materialize + reordering
@@ -541,7 +639,10 @@ fn group_by_mixed_distinct(mut testing_planner: TestingPlanner) {
     };
     assert_eq!(rows[0]["key"], 1);
     let v1 = vals(&rows[0]);
-    assert!(v1.contains(&10) && v1.contains(&2) && v1.contains(&1), "g=1 {v1:?}");
+    assert!(
+        v1.contains(&10) && v1.contains(&2) && v1.contains(&1),
+        "g=1 {v1:?}"
+    );
     assert_eq!(rows[1]["key"], 2);
     let v2 = vals(&rows[1]);
     assert!(v2.contains(&7) && v2.contains(&1), "g=2 {v2:?}");
@@ -791,6 +892,407 @@ fn create_table_passes_with_options_to_catalog() {
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
     let result = testing_planner
         .planner
-        .plan("SELECT MIN(b) FROM example_table");
+        .plan("SELECT median(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
+}
+
+// ---- MIN / MAX aggregates ----
+
+#[rstest]
+fn global_min_max(mut testing_planner: TestingPlanner) {
+    // The in-memory test table exposes no metadata bounds, so this runs the
+    // scan-based global path.
+    let results = testing_planner
+        .planner
+        .plan("SELECT MIN(b), MAX(b), COUNT(*) FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    // The select-list projection passes the aggregate's columns through, so
+    // the output keeps the operator's own field names.
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["min"].as_i64(), Some(10));
+    assert_eq!(rows[0]["max"].as_i64(), Some(50));
+    assert_eq!(rows[0]["count"].as_i64(), Some(5));
+}
+
+#[rstest]
+fn grouped_numeric_min_max(mut testing_planner: TestingPlanner) {
+    // alice spans b=10 and b=50; everyone else has one row.
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, MIN(b), MAX(b), COUNT(*) FROM example_table GROUP BY name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(String, i64, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+                r["v1"].as_i64().unwrap(),
+                r["v2"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("alice".to_string(), 10, 50, 2),
+            ("bob".to_string(), 20, 20, 1),
+            ("charlie".to_string(), 30, 30, 1),
+            ("dave".to_string(), 40, 40, 1),
+        ]
+    );
+}
+
+#[rstest]
+fn grouped_string_min(mut testing_planner: TestingPlanner) {
+    // MIN over a string column, with candidates long enough to live in the
+    // arena and a key whose later row improves on its first.
+    testing_planner.add_table(
+        "pages",
+        &[
+            ("k", Type::Int32, int_col(vec![1, 1, 2, 1])),
+            (
+                "url",
+                Type::Utf8,
+                crate::common::str_col(vec![
+                    "http://example.com/zzz/very-long-path",
+                    "http://example.com/aaa/very-long-path",
+                    "http://other.org/x",
+                    "http://example.com/mmm",
+                ]),
+            ),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT k, MIN(url), COUNT(*) FROM pages GROUP BY k")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_i64().unwrap(),
+                r["v0"].as_str().unwrap().to_string(),
+                r["v1"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "http://example.com/aaa/very-long-path".to_string(), 3),
+            (2, "http://other.org/x".to_string(), 1),
+        ]
+    );
+}
+
+// ---- Multi-key grouping (row-encoded key extractor) ----
+
+#[rstest]
+fn group_by_int_and_string_keys(mut testing_planner: TestingPlanner) {
+    // Two-key (int, string) grouping with duplicates that fold: region 1
+    // pairs with "x" twice.
+    testing_planner.add_table(
+        "visits",
+        &[
+            ("region", Type::Int32, int_col(vec![1, 1, 2, 1])),
+            (
+                "site",
+                Type::Utf8,
+                crate::common::str_col(vec!["x", "x", "x", "y"]),
+            ),
+            ("v", Type::Int32, int_col(vec![10, 20, 30, 40])),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT region, site, COUNT(*), SUM(v) FROM visits GROUP BY region, site")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["k0"].as_i64().unwrap(),
+                r["k1"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+                r["v1"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "x".to_string(), 2, 30),
+            (1, "y".to_string(), 1, 40),
+            (2, "x".to_string(), 1, 30),
+        ]
+    );
+}
+
+#[rstest]
+fn group_by_string_key_with_sum(mut testing_planner: TestingPlanner) {
+    // A single string key with a SUM slot (not just COUNT): alice spans rows
+    // with b=10 and b=50.
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, SUM(b), COUNT(*) FROM example_table GROUP BY name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(String, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+                r["v1"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("alice".to_string(), 60, 2),
+            ("bob".to_string(), 20, 1),
+            ("charlie".to_string(), 30, 1),
+            ("dave".to_string(), 40, 1),
+        ]
+    );
+}
+
+#[rstest]
+fn group_by_constant_and_string(mut testing_planner: TestingPlanner) {
+    // `GROUP BY 1, name` — the positional 1 resolves to the constant select
+    // item, so one key column is a broadcast constant.
+    let results = testing_planner
+        .planner
+        .plan("SELECT 1, name, COUNT(*) AS c FROM example_table GROUP BY 1, name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_str().unwrap().to_string(),
+                r["col2"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".to_string(), 2),
+            (1, "bob".to_string(), 1),
+            (1, "charlie".to_string(), 1),
+            (1, "dave".to_string(), 1),
+        ]
+    );
+}
+
+#[rstest]
+fn group_by_derived_int_keys(mut testing_planner: TestingPlanner) {
+    // Computed sibling keys (`a, a - 1`) — both keys materialised by the
+    // key projection, grouped as an int pair.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, a - 1, COUNT(*) FROM example_table GROUP BY a, a - 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_i64().unwrap(),
+                r["col2"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![(1, 0, 1), (2, 1, 1), (3, 2, 1), (4, 3, 1), (5, 4, 1)]
+    );
+}
+
+#[rstest]
+fn group_by_three_keys_mixed(mut testing_planner: TestingPlanner) {
+    // Three keys, two ints and a string — beyond the packed-pair extractor.
+    // Rows 0 and 2 share (1, 7, "x") and fold into one group.
+    testing_planner.add_table(
+        "triples",
+        &[
+            ("g1", Type::Int32, int_col(vec![1, 1, 1, 2])),
+            ("g2", Type::Int32, int_col(vec![7, 8, 7, 7])),
+            (
+                "site",
+                Type::Utf8,
+                crate::common::str_col(vec!["x", "x", "x", "x"]),
+            ),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT g1, g2, site, COUNT(*) FROM triples GROUP BY g1, g2, site")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["k0"].as_i64().unwrap(),
+                r["k1"].as_i64().unwrap(),
+                r["k2"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 7, "x".to_string(), 2),
+            (1, 8, "x".to_string(), 1),
+            (2, 7, "x".to_string(), 1),
+        ]
+    );
+}
+
+#[rstest]
+fn derived_group_keys_are_recomputed(mut testing_planner: TestingPlanner) {
+    // `a - 1` and `a + 1` are pure functions of the key `a`: the grouping
+    // must collapse to `a` alone and recompute them per group.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, a - 1, a + 1, COUNT(*) FROM example_table GROUP BY 1, 2, 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_i64().unwrap(),
+                r["col2"].as_i64().unwrap(),
+                r["col3"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 0, 2, 1),
+            (2, 1, 3, 1),
+            (3, 2, 4, 1),
+            (4, 3, 5, 1),
+            (5, 4, 6, 1)
+        ]
+    );
+}
+
+#[rstest]
+fn constant_group_key_is_derived(mut testing_planner: TestingPlanner) {
+    // The constant key contributes nothing to grouping; it must be dropped
+    // from the hash key and broadcast back into the output.
+    let results = testing_planner
+        .planner
+        .plan("SELECT 7, name, COUNT(*) FROM example_table GROUP BY 1, 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_str().unwrap().to_string(),
+                r["col2"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (7, "alice".to_string(), 2),
+            (7, "bob".to_string(), 1),
+            (7, "charlie".to_string(), 1),
+            (7, "dave".to_string(), 1),
+        ]
+    );
+}
+
+#[rstest]
+fn bare_limit_over_group_short_circuits_partitions(mut testing_planner: TestingPlanner) {
+    // A bare LIMIT above a grouped aggregate annotates the group to stop
+    // merging once enough complete groups are out; the result must still be
+    // exactly `limit` genuine groups.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, name, COUNT(*) FROM example_table GROUP BY a, name LIMIT 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 3);
+    // Every emitted row is a real (a, name) group with count 1 (all rows of
+    // example_table are distinct (a, name) pairs).
+    assert!(rows.iter().all(|r| r["v0"] == 1));
+    assert!(
+        rows.iter()
+            .all(|r| (1..=5).contains(&r["k0"].as_i64().unwrap()))
+    );
 }

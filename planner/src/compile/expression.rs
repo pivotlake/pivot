@@ -5,16 +5,22 @@
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::expression::{
-    Between, Compare, CompareType, Contains, DateTrunc, Divide, Expression, Function, Ref,
+    Arithmetic, ArithmeticOp, Between, Case, Compare, CompareType, Conjunction, ConjunctionOp,
+    Contains, DatePart, DateTrunc, Divide, Expression, Function, InList, Length, Not, Ref,
+    RegexpReplace,
 };
 use crate::types::Type;
-use arrow::compute::kernels::boolean::and;
+use arrow::compute::kernels::boolean::{and, not, or};
+use arrow::compute::kernels::numeric::{add_wrapping, mul_wrapping, sub_wrapping};
+use arrow::compute::kernels::zip::zip;
+use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{ArrayRef, BooleanArray, Datum, Int64Array, RecordBatch, Scalar};
+use arrow_array::{Array, ArrayRef, BooleanArray, Datum, Int64Array, RecordBatch, Scalar};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{ArrowError, DataType};
 use dispatch::Contains as DispatchContains;
+use regex::Regex;
 use std::sync::Arc;
 
 /// Signature shared by arrow's scalar comparison kernels.
@@ -26,6 +32,36 @@ type CmpKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<BooleanArray,
 /// matching types; Int64 is a safe common type for every integer/date/timestamp
 /// column we compare.
 fn compare_coerced(left: &dyn Datum, right: &dyn Datum, kernel: CmpKernel) -> BooleanArray {
+    let (la, l_scalar) = left.get();
+    let (ra, r_scalar) = right.get();
+    if la.data_type() == ra.data_type() {
+        kernel(left, right).unwrap()
+    } else {
+        let lc = arrow::compute::cast(la, &DataType::Int64).unwrap();
+        let rc = arrow::compute::cast(ra, &DataType::Int64).unwrap();
+        let ld: Box<dyn Datum> = if l_scalar {
+            Box::new(Scalar::new(lc))
+        } else {
+            Box::new(lc)
+        };
+        let rd: Box<dyn Datum> = if r_scalar {
+            Box::new(Scalar::new(rc))
+        } else {
+            Box::new(rc)
+        };
+        kernel(ld.as_ref(), rd.as_ref()).unwrap()
+    }
+}
+
+/// Signature shared by arrow's wrapping arithmetic kernels.
+type ArithKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<ArrayRef, ArrowError>;
+
+/// Run an arithmetic kernel, coercing both operands to Int64 when their data
+/// types differ — same rationale as [`compare_coerced`]: arrow's kernels
+/// require matching types, and Int64 is a safe common type for every integer
+/// column we do arithmetic on (matching DuckDB's 64-bit promotion of mixed
+/// integer operands).
+fn arith_coerced(left: &dyn Datum, right: &dyn Datum, kernel: ArithKernel) -> ArrayRef {
     let (la, l_scalar) = left.get();
     let (ra, r_scalar) = right.get();
     if la.data_type() == ra.data_type() {
@@ -149,6 +185,298 @@ impl Contains {
     }
 }
 
+impl InList {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // `x IN (a, b, …)` is the disjunction `x = a OR x = b OR …`. We compile
+        // the tested expression and every list value once, then per batch
+        // OR-reduce the equality masks. `compare_coerced` aligns differing
+        // physical types (e.g. an Int16 column against Int32 literals) the same
+        // way `Compare` does, so an IN over any integer/string column works.
+        let input_builder = self.input.compile()?;
+        let value_builders = self
+            .values
+            .iter()
+            .map(|v| v.compile())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            let mut value_exprs: Vec<ExprEvalFn> = value_builders.iter().map(|b| b()).collect();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let mask = value_exprs
+                    .iter_mut()
+                    .map(|v| {
+                        let value = v(batch);
+                        compare_coerced(input.as_datum(), value.as_datum(), eq)
+                    })
+                    .reduce(|left, right| or(&left, &right).unwrap())
+                    // An empty list (`IN ()`) matches nothing; DuckDB folds this
+                    // away before planning, so this is only a defensive fallback.
+                    .unwrap_or_else(|| BooleanArray::from(vec![false; batch.num_rows()]));
+                ExprResult::Array(Arc::new(mask) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Arithmetic {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Wrapping kernels match DuckDB's behaviour for in-range values; we
+        // accept silent wraparound (rather than an error) on overflow.
+        let kernel: ArithKernel = match self.op {
+            ArithmeticOp::Add => add_wrapping,
+            ArithmeticOp::Sub => sub_wrapping,
+            ArithmeticOp::Mul => mul_wrapping,
+        };
+        let left_builder = self.left.compile()?;
+        let right_builder = self.right.compile()?;
+        Ok(Box::new(move || {
+            let mut left_expr = left_builder();
+            let mut right_expr = right_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let left = left_expr(batch);
+                let right = right_expr(batch);
+                ExprResult::Array(arith_coerced(left.as_datum(), right.as_datum(), kernel))
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Length {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        let input_builder = self.input.compile()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                let strings = arr.as_string_view();
+                // `length()` counts Unicode characters, not bytes (arrow's
+                // own length kernel returns *byte* lengths for Utf8View, so it
+                // can't be used here). ASCII-only values — the common case —
+                // skip the char walk since chars == bytes.
+                let lengths: Int64Array = strings
+                    .iter()
+                    .map(|v| {
+                        v.map(|s| {
+                            if s.is_ascii() {
+                                s.len() as i64
+                            } else {
+                                s.chars().count() as i64
+                            }
+                        })
+                    })
+                    .collect();
+                ExprResult::Array(Arc::new(lengths) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Conjunction {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Compile each child predicate once, then per batch reduce their boolean
+        // masks with the conjunction's kernel (`AND`/`OR`).
+        type BoolKernel = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
+        let kernel: BoolKernel = match self.op {
+            ConjunctionOp::And => and,
+            ConjunctionOp::Or => or,
+        };
+        let child_builders = self
+            .children
+            .iter()
+            .map(|c| c.compile())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Box::new(move || {
+            let mut child_exprs: Vec<ExprEvalFn> = child_builders.iter().map(|b| b()).collect();
+            Box::new(move |batch: &RecordBatch| {
+                let mask = child_exprs
+                    .iter_mut()
+                    .map(|c| {
+                        let result = c(batch);
+                        let (arr, _) = result.as_datum().get();
+                        arr.as_any().downcast_ref::<BooleanArray>().unwrap().clone()
+                    })
+                    .reduce(|left, right| kernel(&left, &right).unwrap())
+                    .expect("conjunction always has at least two children");
+                ExprResult::Array(Arc::new(mask) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Case {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Compile the ELSE branch and each (WHEN, THEN) arm once. Per batch we
+        // start from the ELSE value and fold the arms back-to-front with arrow's
+        // `zip` (selecting `then` where the WHEN mask is true, else the running
+        // result). Applying the *first* arm last makes it win on overlap, giving
+        // SQL's first-match-wins CASE semantics. A NULL WHEN reads as false.
+        //
+        // `zip` requires `then` and the running result share a data type; DuckDB
+        // unifies all branch types when binding the CASE, so they always do.
+        let else_builder = self.else_expr.compile()?;
+        let arm_builders = self
+            .checks
+            .iter()
+            .map(|c| Ok((c.when.compile()?, c.then.compile()?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Box::new(move || {
+            let mut else_eval = else_builder();
+            let mut arm_evals: Vec<(ExprEvalFn, ExprEvalFn)> = arm_builders
+                .iter()
+                .map(|(when, then)| (when(), then()))
+                .collect();
+            Box::new(move |batch: &RecordBatch| {
+                let mut result = else_eval(batch);
+                for (when_eval, then_eval) in arm_evals.iter_mut().rev() {
+                    let when = when_eval(batch);
+                    let (when_arr, _) = when.as_datum().get();
+                    let mask = when_arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let then = then_eval(batch);
+                    let zipped = zip(mask, then.as_datum(), result.as_datum()).unwrap();
+                    result = ExprResult::Array(zipped);
+                }
+                result
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+/// Translate a PostgreSQL-style `regexp_replace` replacement string (`\N`
+/// group references, `\\` literal backslash, `$` literal) into the `regex`
+/// crate's form (`${N}` group references, `$$` literal dollar). Group
+/// references are emitted braced so a digit following the reference is not
+/// absorbed into the group number.
+fn translate_replacement(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' => out.push_str("$$"),
+            '\\' => match chars.next() {
+                Some(d @ '0'..='9') => {
+                    out.push_str("${");
+                    out.push(d);
+                    out.push('}');
+                }
+                Some('\\') => out.push('\\'),
+                // Any other escape is not meaningful in either dialect; keep
+                // the pair as literal text.
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Memoised results cap for [`RegexpReplace`], per worker: stop inserting past
+/// this many entries or this many memoised string bytes (lookups continue), so
+/// a high-cardinality column can't grow the memo unboundedly. Sized small —
+/// value distributions are Zipfian, so the first tens of thousands of entries
+/// carry most of the hit rate, while the map itself (entries plus boxed
+/// strings) costs a few times the raw bytes.
+const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 19;
+const REGEX_MEMO_MAX_BYTES: usize = 48 << 20;
+
+impl RegexpReplace {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Validate the pattern once at plan-compile time; each worker then
+        // compiles its own `Regex` below. A shared (cloned) `Regex` funnels
+        // every thread through one internal cache pool whose atomics dominate
+        // the row loop under contention — per-worker instances give each
+        // thread the pool's owner fast path.
+        Regex::new(&self.pattern).map_err(|source| Error::InvalidRegexPattern {
+            pattern: self.pattern.clone(),
+            source,
+        })?;
+        let pattern = self.pattern.clone();
+        let replacement = translate_replacement(&self.replacement);
+        let input_builder = self.input.compile()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            let regex = Regex::new(&pattern).expect("pattern validated at plan compile");
+            let replacement = replacement.clone();
+            // Regex replacement is pure and expensive (capture extraction runs
+            // a backtracking engine), while real inputs (URLs, paths) repeat
+            // heavily — memoise per worker, with `None` standing for "no
+            // match, pass the input through" so unmatched rows don't store
+            // their text twice. Bounded: past the caps the memo stops growing
+            // but keeps serving hits.
+            let mut memo: std::collections::HashMap<
+                Box<str>,
+                Option<Box<str>>,
+                ahash::RandomState,
+            > = std::collections::HashMap::default();
+            let mut memo_bytes = 0usize;
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                let strings = arr.as_string_view();
+                let mut out = StringViewBuilder::with_capacity(strings.len());
+                // Values arrive in runs (sessions repeat the same URL), so an
+                // equal-to-previous check skips even the memo hash. `None`
+                // output means "no match, pass the input through".
+                let mut last_in: Option<&str> = None;
+                let mut last_out: Option<String> = None;
+                for v in strings.iter() {
+                    let Some(s) = v else {
+                        out.append_null();
+                        continue;
+                    };
+                    if last_in == Some(s) {
+                        out.append_value(last_out.as_deref().unwrap_or(s));
+                        continue;
+                    }
+                    last_in = Some(s);
+                    if let Some(hit) = memo.get(s) {
+                        out.append_value(hit.as_deref().unwrap_or(s));
+                        last_out = hit.as_deref().map(str::to_owned);
+                        continue;
+                    }
+                    // `replace` substitutes the first match only (DuckDB
+                    // semantics without the 'g' option). It returns
+                    // `Cow::Borrowed` when nothing matches.
+                    let replaced = regex.replace(s, replacement.as_str());
+                    let entry = match &replaced {
+                        std::borrow::Cow::Borrowed(_) => None,
+                        std::borrow::Cow::Owned(o) => Some(o.clone().into_boxed_str()),
+                    };
+                    out.append_value(&replaced);
+                    last_out = match &replaced {
+                        std::borrow::Cow::Borrowed(_) => None,
+                        std::borrow::Cow::Owned(o) => Some(o.clone()),
+                    };
+                    if memo.len() < REGEX_MEMO_MAX_ENTRIES && memo_bytes < REGEX_MEMO_MAX_BYTES {
+                        memo_bytes += s.len() + entry.as_deref().map(str::len).unwrap_or(0);
+                        memo.insert(s.into(), entry);
+                    }
+                }
+                ExprResult::Array(Arc::new(out.finish()) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Not {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        let input_builder = self.input.compile()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                ExprResult::Array(Arc::new(not(arr.as_boolean()).unwrap()) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Divide {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         let left_builder = self.left.compile()?;
@@ -206,12 +534,135 @@ impl DateTrunc {
     }
 }
 
+/// Seconds in a day / hour, for the time-of-day parts.
+const SECS_PER_DAY: i64 = 86_400;
+const SECS_PER_HOUR: i64 = 3_600;
+
+/// Convert a day count relative to the Unix epoch (1970-01-01) into a
+/// `(year, month, day)` civil date. Howard Hinnant's `civil_from_days`
+/// (<http://howardhinnant.github.io/date_algorithms.html>); valid for the full
+/// proleptic Gregorian range, including negative (pre-epoch) day counts.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// Inverse of [`civil_from_days`]: the epoch-relative day count for a civil
+/// date. Used to derive day-of-year and ISO week.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Number of ISO 8601 weeks (52 or 53) in the given year. A year has 53 weeks
+/// iff it starts on a Thursday, or it is a leap year starting on a Wednesday.
+fn iso_weeks_in_year(y: i64) -> i64 {
+    let p = |y: i64| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
+    if p(y) == 4 || p(y - 1) == 3 { 53 } else { 52 }
+}
+
+/// ISO 8601 week-of-year (1–53) for an epoch-relative day count. Week 1 is the
+/// week containing the year's first Thursday; days before it belong to the
+/// prior year's last week, and the year's tail can roll into week 1.
+fn iso_week(days: i64) -> i64 {
+    let (y, ..) = civil_from_days(days);
+    let ordinal = days - days_from_civil(y, 1, 1) + 1;
+    let iso_dow = (days + 3).rem_euclid(7) + 1;
+    let week = (ordinal - iso_dow + 10).div_euclid(7);
+    if week < 1 {
+        iso_weeks_in_year(y - 1)
+    } else if week > iso_weeks_in_year(y) {
+        1
+    } else {
+        week
+    }
+}
+
+impl DatePart {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // EventTime is stored as Int64 epoch *seconds* (UTC), so every part is a
+        // pure integer computation. Euclidean div/rem keep the time-of-day and
+        // calendar fields well-defined for pre-epoch (negative) timestamps,
+        // matching DuckDB's `extract(<part> FROM ...)`.
+        let kind = self.kind;
+        let source_builder = self.source.compile()?;
+        Ok(Box::new(move || {
+            let mut source_expr = source_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let src = source_expr(batch);
+                let (arr, _) = src.as_datum().get();
+                let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
+                let vals = i64arr.as_primitive::<Int64Type>();
+                // Dispatch on the part ONCE per batch, then run a single
+                // monomorphic, branch-free row loop per arm — so e.g. `minute`
+                // compiles to exactly its two-op loop with no per-row `kind`
+                // test (no reliance on the optimizer hoisting a loop-invariant
+                // branch). The civil-date parts share `civil_from_days`.
+                use crate::expression::DatePartKind::*;
+                macro_rules! map_part {
+                    ($f:expr) => {{
+                        let out: Int64Array = vals.iter().map(|v| v.map($f)).collect();
+                        out
+                    }};
+                }
+                let day = |t: i64| t.div_euclid(SECS_PER_DAY);
+                let out = match kind {
+                    Epoch => map_part!(|t: i64| t),
+                    Second => map_part!(|t: i64| t.rem_euclid(60)),
+                    Millisecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000),
+                    Microsecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000_000),
+                    Minute => map_part!(|t: i64| t.div_euclid(60).rem_euclid(60)),
+                    Hour => map_part!(|t: i64| t.div_euclid(SECS_PER_HOUR).rem_euclid(24)),
+                    // 0 = Sunday … 6 = Saturday. The epoch day (1970-01-01) was a
+                    // Thursday (4), so `(days + 4) mod 7` rebases to Sunday = 0.
+                    DayOfWeek => map_part!(|t: i64| (day(t) + 4).rem_euclid(7)),
+                    // 1 = Monday … 7 = Sunday.
+                    IsoDayOfWeek => map_part!(|t: i64| (day(t) + 3).rem_euclid(7) + 1),
+                    Day => map_part!(|t: i64| civil_from_days(day(t)).2),
+                    Month => map_part!(|t: i64| civil_from_days(day(t)).1),
+                    Quarter => map_part!(|t: i64| (civil_from_days(day(t)).1 - 1) / 3 + 1),
+                    Year => map_part!(|t: i64| civil_from_days(day(t)).0),
+                    Decade => map_part!(|t: i64| civil_from_days(day(t)).0.div_euclid(10)),
+                    Century => {
+                        map_part!(|t: i64| (civil_from_days(day(t)).0 - 1).div_euclid(100) + 1)
+                    }
+                    Millennium => {
+                        map_part!(|t: i64| (civil_from_days(day(t)).0 - 1).div_euclid(1000) + 1)
+                    }
+                    DayOfYear => map_part!(|t: i64| {
+                        let d = day(t);
+                        d - days_from_civil(civil_from_days(d).0, 1, 1) + 1
+                    }),
+                    Week => map_part!(|t: i64| iso_week(day(t))),
+                };
+                ExprResult::Array(Arc::new(out) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Function {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
             Function::Contains(c) => c.compile(),
+            Function::Arithmetic(a) => a.compile(),
+            Function::Length(l) => l.compile(),
+            Function::RegexpReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
+            Function::DatePart(d) => d.compile(),
             // `drop_cache()` evicts pivot's file cache as a side effect, then
             // returns the regions dropped. Evaluated over the single `DummyScan`
             // row on a worker thread (where `memory_ctx` is valid), so the
@@ -238,6 +689,10 @@ impl Expression {
             }
             Expression::Function(f) => f.compile(),
             Expression::Between(b) => b.compile(),
+            Expression::InList(i) => i.compile(),
+            Expression::Conjunction(c) => c.compile(),
+            Expression::Case(c) => c.compile(),
+            Expression::Not(n) => n.compile(),
             _ => Err(Error::UnsupportedExpression(self.clone())),
         }
     }
