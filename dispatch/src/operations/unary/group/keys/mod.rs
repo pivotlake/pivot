@@ -40,6 +40,9 @@ pub use hash_only_int::HashOnlyIntKeyExtractor;
 mod string;
 pub use string::{ArenaKey, StringKeyExtractor};
 
+mod row;
+pub use row::{RowKeyExtractor, RowKeySchema};
+
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
 pub trait KeyExtractor: Send + 'static {
@@ -56,19 +59,29 @@ pub trait KeyExtractor: Send + 'static {
     /// `!SUPPORTS_RADIX` (the radix scatter path has no such out-of-band count).
     const DEDUP_BY_HASH: bool = false;
 
+    /// Runtime configuration threaded from the operator spec to the per-batch
+    /// reader and the output key columns. `()` for extractors whose shape is
+    /// fully determined by their type; [`RowKeyExtractor`] carries its key
+    /// schema here (the one piece the output decode can't derive on its own).
+    type Config: Clone + Send + Sync + 'static;
     /// The `Copy` key representation stored inside hash table entries.
     type Persisted: PersistedKey;
     /// A transient key that borrows from the input batch and/or the worker arena.
     type LiveKey<'a, 'b>: LiveKey<Persisted = Self::Persisted>;
     /// A live key reconstructed from an already-persisted key (used during merge).
     type PersistedLiveKey<'a>: LiveKey<Persisted = Self::Persisted>;
-    /// Per-batch reader holding downcast key-column accessors.
+    /// Per-batch reader holding downcast key-column accessors (or, for the row
+    /// extractor, the batch's pre-encoded key rows).
     type Reader<'b>;
     /// Accumulates persisted keys into the result's leading key column(s).
-    type Columns: KeyColumns<Key = Self::Persisted>;
+    type Columns: KeyColumns<Key = Self::Persisted, Config = Self::Config>;
 
     /// Build a reader over `batch` for the given key columns.
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b>;
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        config: &Self::Config,
+    ) -> Self::Reader<'b>;
 
     /// Hash the key at row `idx`.
     fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64;
@@ -95,11 +108,20 @@ pub trait KeyExtractor: Send + 'static {
 /// the ring buffers; non-arena keys ignore it.
 pub trait KeyColumns {
     type Key;
+    /// The extractor's runtime configuration (see [`KeyExtractor::Config`]).
+    type Config;
 
     /// Allocate key-column builders over engine memory, sized for `rows` (one
     /// output chunk; must fit a single 2MB slab). Arena-backed keys (strings)
     /// ignore the allocator and pull their data from the shared arena at finish.
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self;
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, config: &Self::Config) -> Self;
     fn push(&mut self, key: &Self::Key);
-    fn finish(self, arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>);
+    /// Materialise the key columns. Takes the arena (for zero-copy string
+    /// views) and the chunk's allocator (for builders whose size is only
+    /// known at decode time, e.g. the row extractor's decoded columns).
+    fn finish(
+        self,
+        arena: &Arc<SharedArena>,
+        allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>);
 }

@@ -59,13 +59,18 @@ where
     // in-place (no radix) — the out-of-band count lives on the in-place table.
     const DEDUP_BY_HASH: bool = true;
 
+    type Config = ();
     type Persisted = ();
     type LiveKey<'a, 'b> = ();
     type PersistedLiveKey<'a> = ();
     type Reader<'b> = &'b PrimitiveArray<T>;
     type Columns = NoKeyColumns;
 
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _config: &(),
+    ) -> Self::Reader<'b> {
         batch.column(key_cols[0]).as_primitive::<T>()
     }
 
@@ -93,15 +98,20 @@ pub struct NoKeyColumns;
 
 impl KeyColumns for NoKeyColumns {
     type Key = ();
+    type Config = ();
 
-    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _config: &()) -> Self {
         NoKeyColumns
     }
 
     #[inline(always)]
     fn push(&mut self, _key: &()) {}
 
-    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        _arena: &Arc<SharedArena>,
+        _allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
     }
 }

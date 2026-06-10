@@ -125,7 +125,14 @@ impl WorkerArena {
     /// Push a string into the arena and return its ArenaKey (inline or view).
     #[inline]
     pub fn push(&mut self, s: &str) -> ArenaKey {
-        let data = s.as_bytes();
+        self.push_bytes(s.as_bytes())
+    }
+
+    /// Push an arbitrary byte string into the arena and return its ArenaKey
+    /// (inline or view). Strings and row-encoded multi-column keys share this
+    /// path — an [`ArenaKey`] is agnostic to what its bytes mean.
+    #[inline]
+    pub fn push_bytes(&mut self, data: &[u8]) -> ArenaKey {
         if data.len() <= MAX_INLINE_STRING_VIEW {
             return ArenaKey::inline(data);
         }
