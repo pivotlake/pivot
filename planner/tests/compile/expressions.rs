@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, StringViewArray};
+use arrow_array::{ArrayRef, Int32Array, StringViewArray};
 
 use crate::common::*;
 use planner::Error as PlannerError;
@@ -337,6 +337,163 @@ fn case_expression_multi_arm_group_key(mut testing_planner: TestingPlanner) {
             ("mid".to_string(), 2),
         ]
     );
+}
+
+#[rstest]
+fn arithmetic_in_projection(mut testing_planner: TestingPlanner) {
+    // Covers all three operators, a nested expression, and a mixed-width
+    // operand pair (Int32 column + BIGINT constant) that exercises the
+    // Int64 coercion path.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a + 1, b - 2, (a + b) * 2, a + 5000000000 FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+
+    assert_eq!(rows.len(), 5);
+    // First row: a=1, b=10.
+    assert_eq!(rows[0]["col0"], 2); // 1 + 1
+    assert_eq!(rows[0]["col1"], 8); // 10 - 2
+    assert_eq!(rows[0]["col2"], 22); // (1 + 10) * 2
+    assert_eq!(rows[0]["col3"], 5000000001i64); // 1 + 5000000000
+    // Last row: a=5, b=50.
+    assert_eq!(rows[4]["col0"], 6);
+    assert_eq!(rows[4]["col1"], 48);
+    assert_eq!(rows[4]["col2"], 110);
+    assert_eq!(rows[4]["col3"], 5000000005i64);
+}
+
+#[rstest]
+fn length_counts_unicode_chars(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "strs",
+        &[
+            (
+                "i",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3])) as ArrayRef,
+            ),
+            (
+                "s",
+                Type::Utf8,
+                Arc::new(StringViewArray::from(vec![
+                    "hello",
+                    "héllo",
+                    "",
+                    "日本語abc",
+                ])) as ArrayRef,
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT i, length(s) FROM strs")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+
+    // length() counts characters, not bytes: "héllo" is 6 bytes but 5 chars,
+    // "日本語abc" is 12 bytes but 6 chars.
+    let lengths: Vec<i64> = rows.iter().map(|r| r["col1"].as_i64().unwrap()).collect();
+    assert_eq!(lengths, vec![5, 5, 0, 6]);
+}
+
+#[rstest]
+fn filter_not_contains(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT name FROM example_table WHERE NOT contains(name, 'a')")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    // Only "bob" lacks an 'a'; alice (x2), charlie and dave are negated away.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "bob");
+}
+
+#[rstest]
+fn regexp_replace_extracts_group(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "urls",
+        &[
+            (
+                "i",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef,
+            ),
+            (
+                "url",
+                Type::Utf8,
+                Arc::new(StringViewArray::from(vec![
+                    "https://www.example.com/path/x",
+                    "http://foo.org/x",
+                    "no-match-here",
+                ])) as ArrayRef,
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan(r"SELECT i, regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') FROM urls")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+
+    // `\1` substitutes the captured group; a row without a match passes
+    // through unchanged.
+    assert_eq!(rows[0]["col1"], "example.com");
+    assert_eq!(rows[1]["col1"], "foo.org");
+    assert_eq!(rows[2]["col1"], "no-match-here");
+}
+
+#[rstest]
+fn regexp_replace_first_match_only(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "rep",
+        &[(
+            "s",
+            Type::Utf8,
+            Arc::new(StringViewArray::from(vec!["aaa"])) as ArrayRef,
+        )],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT regexp_replace(s, 'a', 'b') FROM rep")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    // Without the 'g' option only the first occurrence is replaced.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["col0"], "baa");
 }
 
 #[rstest]

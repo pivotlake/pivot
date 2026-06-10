@@ -2146,6 +2146,7 @@ dependencies = [
  "goose",
  "insta",
  "parquet",
+ "regex",
  "rstest",
  "serde_json",
  "tempfile",
