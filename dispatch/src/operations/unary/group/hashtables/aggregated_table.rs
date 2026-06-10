@@ -85,7 +85,8 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
-    /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
+    /// hash is 0, which is excluded from the tables and the scatter buffers
+    /// alike. Adds 1 to the distinct count.
     pub zero_hash_seen: bool,
 }
 
@@ -145,9 +146,10 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     /// with the original `unresolved_slots` as a sort of ping-pong (see merge_batch)
     next_unresolved_slots: Box<[u32; RECORD_BATCH_SIZE]>,
     /// `K::DEDUP_BY_HASH` only: a key whose bijective hash is exactly 0 collides
-    /// with the empty-slot sentinel, so it is excluded from the table and recorded
-    /// here. There is at most one such key (the hash is a bijection), so this
-    /// boolean adds 0 or 1 to the distinct count at output.
+    /// with the empty-slot sentinel, so it is excluded from the table and the
+    /// scatter buffers, and recorded here instead. There is at most one such key
+    /// (the hash is a bijection), so this boolean adds 0 or 1 to the distinct
+    /// count at output.
     zero_hash_seen: bool,
 }
 
@@ -223,14 +225,10 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
 
         // For a keys-only exact COUNT(DISTINCT), a hash of 0 collides with the
         // table's empty-slot sentinel and must be counted out of band rather than
-        // stored (see `consume_scalared`). The batched path can't do that — it
-        // remaps a 0 hash to 1 — so note whether the (rare) 0-hash key is present
-        // and, if so, take the scalar path. The check folds into the hash loop and
-        // is const-gated, so other group-bys pay nothing.
-        debug_assert!(
-            !(K::DEDUP_BY_HASH && K::SUPPORTS_RADIX),
-            "DEDUP_BY_HASH requires the in-place path (no radix scatter)"
-        );
+        // stored (see `consume_scalared` and `scatter_range`). The batched path
+        // can't do that — it remaps a 0 hash to 1 — so note whether the (rare)
+        // 0-hash key is present and, if so, take the scalar path. The check folds
+        // into the hash loop and is const-gated, so other group-bys pay nothing.
         let mut has_zero_hash = false;
         for i in 0..length {
             let h = K::hash(&key_reader, i, &self.hash_state);
@@ -341,7 +339,12 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     #[inline(always)]
     fn grow_or_switch(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
-        if K::SUPPORTS_RADIX && V::SUPPORTS_RADIX && next_size > self.radix_cfg.switch_threshold {
+        // The configured threshold is in slots but guards a byte budget (L2
+        // residency); `RADIX_SWITCH_SCALE` corrects it for key shapes whose
+        // entries are narrower than the ~32 bytes it was tuned for (the
+        // keys-only 8-byte entries stay cache-resident to 4x the slots).
+        let threshold = self.radix_cfg.switch_threshold * K::RADIX_SWITCH_SCALE;
+        if K::SUPPORTS_RADIX && V::SUPPORTS_RADIX && next_size > threshold {
             self.buffers = Some(
                 (0..self.radix_cfg.partitions)
                     .map(|_| SlabVec::new())
@@ -372,11 +375,21 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             buffers,
             hll,
             hashes,
+            zero_hash_seen,
             ..
         } = self;
         let buffers = buffers.as_mut().unwrap();
         for i in start..end {
             let hash = hashes[i];
+            // Keys-only exact COUNT(DISTINCT): exclude the 0-hash key here just
+            // as the in-place path does (see `consume_scalared`) — the merge
+            // inserts scattered rows under their stored hash, where a 0 would be
+            // remapped to 1 and alias a real key. Recording the flag instead
+            // keeps the count exact. Const-gated: free for other group-bys.
+            if K::DEDUP_BY_HASH && hash == 0 {
+                *zero_hash_seen = true;
+                continue;
+            }
             hll.add(hash);
             let p = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, worker_arena).persist();

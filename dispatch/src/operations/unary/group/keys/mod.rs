@@ -51,12 +51,28 @@ pub trait KeyExtractor: Send + 'static {
     /// occurrence un-deduped); fixed-width integer keys switch.
     const SUPPORTS_RADIX: bool = false;
 
+    /// Multiplier on [`RadixConfig::switch_threshold`] for this key shape.
+    ///
+    /// The threshold is slot-count-based and tuned for the typical ~24–32-byte
+    /// entry (hash + integer key + aggregate), but what it really guards is the
+    /// in-place table's *byte* footprint staying L2-resident. An extractor with
+    /// narrower entries can therefore grow to proportionally more slots before
+    /// its probes start missing cache; scaling the threshold keeps the switch at
+    /// the same byte budget, so a medium-cardinality build the in-place table
+    /// still serves from L2 doesn't pay scatter + a 4096-way merge for nothing.
+    /// The default of 1 leaves every existing key shape's behavior unchanged.
+    ///
+    /// [`RadixConfig::switch_threshold`]: super::hashtables::RadixConfig::switch_threshold
+    const RADIX_SWITCH_SCALE: usize = 1;
+
     /// When `true`, the persisted key is a zero-sized `()` and dedup is purely by
     /// the (bijective) hash, so a hash of 0 — which the table reserves as its
     /// empty-slot sentinel — cannot be remapped without aliasing a real key.
     /// [`AggregatedTable`](super::hashtables::AggregatedTable) instead counts the
-    /// single 0-hash key out of band (it never reaches the table). Implies
-    /// `!SUPPORTS_RADIX` (the radix scatter path has no such out-of-band count).
+    /// single 0-hash key out of band: it never reaches the in-place table *or*
+    /// the radix scatter buffers (the post-switch scatter skips it the same
+    /// way), so a stored hash of 0 always means "empty" and the merge's
+    /// insert-by-stored-hash never aliases it onto a real key.
     const DEDUP_BY_HASH: bool = false;
 
     /// Runtime configuration threaded from the operator spec to the per-batch
