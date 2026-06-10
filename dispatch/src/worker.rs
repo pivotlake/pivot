@@ -343,16 +343,26 @@ impl Worker {
     /// Deliver completed reads back to the operators that requested them, each
     /// transport to its own handler; by the time we're here each block's bytes
     /// are already committed to its cache slot.
+    ///
+    /// A completion may arrive for a dataflow this worker no longer holds —
+    /// the flow was cancelled (e.g. a sibling worker failed to build it, or an
+    /// operator errored) and dropped while the read was in flight. That's
+    /// fine: the read targeted a cache slot kept alive by the request's own
+    /// pin, and its bytes were committed before we got here, so the
+    /// completion is simply dropped rather than panicking the worker (which
+    /// would silently strand every future dataflow's sibling counters).
     fn process_io_completions(&mut self) -> Result<()> {
         for completion in self.io.completions()? {
             match completion {
                 Completion::Fs(r) => {
-                    let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
-                    data_flow.process_fs(r.operator_idx, r.request);
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.process_fs(r.operator_idx, r.request);
+                    }
                 }
                 Completion::Http(r) => {
-                    let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
-                    data_flow.process_http(r.operator_idx, r.request);
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.process_http(r.operator_idx, r.request);
+                    }
                 }
             }
         }
@@ -444,7 +454,13 @@ impl Worker {
                     self.data_flows.insert(data_flow.id(), data_flow);
                 }
                 Err(e) => {
-                    warn!("Failed to build dataflow {:?}", e)
+                    // `build` already cancelled the dataflow and queued the
+                    // error; wake the peers so any of them parked on the waker
+                    // observe the cancellation (and drop the flow) instead of
+                    // sleeping forever waiting for this worker's sibling
+                    // decrements, which will never come.
+                    warn!("Failed to build dataflow {:?}", e);
+                    self.waker.notify();
                 }
             }
         }

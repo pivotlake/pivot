@@ -85,6 +85,16 @@ impl DataFlowBuilder {
 
     /// Build the full operator chain and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
+    ///
+    /// A build failure must not just drop this worker out: every stage's
+    /// `siblings_left` counter is initialised to the full worker count, so if
+    /// one worker silently skips the dataflow the remaining workers process
+    /// all the data (work stealing covers the missing share), then wait
+    /// forever for a sibling decrement that never comes — every worker parks
+    /// and the query hangs with no error anywhere. Instead, cancel the
+    /// dataflow (the workers that did build it drop it on their next
+    /// iteration) and queue the error so the collector fails the query
+    /// cleanly.
     pub fn build(self) -> Result<DataFlow> {
         let chain = catch_unwind(AssertUnwindSafe(|| (self.build)())).map_err(|e| {
             let msg = e
@@ -92,6 +102,10 @@ impl DataFlowBuilder {
                 .map(|s| s.as_str())
                 .or_else(|| e.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
+            let _ = self.err_tx.send(crate::data_flow::Error::Panic(format!(
+                "dataflow build failed: {msg}"
+            )));
+            self.cancelled.store(true, Ordering::Relaxed);
             Error::PanicOnBuild(msg.to_string())
         })?;
 

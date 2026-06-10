@@ -348,3 +348,176 @@ fn staged_single_worker() {
     assert_eq!(staged, unstaged);
     assert_eq!(staged.len(), 5);
 }
+
+/// The 100M-row q31 hang shape: staged queries running against exhausted
+/// buffer pools (cache full, previous queries' results still held — the state
+/// between two queries of a cold sweep). Building a dataflow used to take
+/// pool buffers (`SlabAllocator::new`) and a build-time "Evicting" panic made
+/// the worker silently skip the dataflow, stranding its siblings' counters
+/// forever — every worker parked, no error, query hung (the deterministic
+/// regression test for that deadlock is `dispatch/tests/build_failure.rs`).
+/// Builds now take no pool memory and a failed build cancels the query, so
+/// under real "Evicting" pressure (every iteration here hits it) a staged
+/// query must always complete: either the correct rows or a clean error —
+/// never a hang, never a silently truncated result.
+#[test]
+fn staged_scan_with_exhausted_pool_never_hangs() {
+    const GROUPS: i64 = 15;
+    const ROWS_PER_GROUP: i64 = 500;
+
+    // ~30MB of incompressible payload → the file spans more 2MB cache
+    // regions than the pool below has slots.
+    let payload_batches: Vec<RecordBatch> = (0..GROUPS)
+        .map(|g| {
+            let first = g * ROWS_PER_GROUP;
+            let ids: Vec<i64> = (first..first + ROWS_PER_GROUP).collect();
+            let mut rng = 0x9E3779B97F4A7C15u64.wrapping_mul(g as u64 + 1) | 1;
+            let names: Vec<String> = ids
+                .iter()
+                .map(|_| {
+                    (0..512)
+                        .map(|_| {
+                            rng ^= rng << 13;
+                            rng ^= rng >> 7;
+                            rng ^= rng << 17;
+                            format!("{rng:016x}")
+                        })
+                        .collect::<String>()
+                })
+                .collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i * 100).collect();
+            RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(ids)) as ArrayRef,
+                    Arc::new(StringViewArray::from(
+                        names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Int64Array::from(vals)) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        })
+        .collect();
+    let dir = write_groups(&payload_batches, 64);
+
+    // Far fewer 2MB slots than the scan needs: the cache + the held results
+    // drain the pools, so anything that takes pool memory at the wrong time
+    // panics ("Evicting").
+    let dispatch = dispatch_with_buffers(4, 12);
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+
+    let (lo, hi) = (100i64, 4000i64);
+    let mut held_results = Vec::new();
+    for i in 0..3 {
+        let table = table.clone();
+        let dispatcher: dispatch::DataFlowDispatcher = (*dispatch).clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = table_input_with_filter_and_eq_predicates(
+                &dispatcher,
+                &table,
+                Projection::all(3),
+                false,
+                None,
+                None,
+                Arc::new(Vec::new()),
+                Some(id_range_filter(lo, hi)),
+            )
+            .filter(move || {
+                let pred = id_in_range(lo, hi);
+                move |batch: &RecordBatch| {
+                    let ids = batch.column(0).as_primitive::<Int64Type>();
+                    BooleanArray::from_iter(ids.iter().map(|v| Some(v.is_some_and(&pred))))
+                }
+            })
+            .collect();
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            // Either outcome is acceptable under memory pressure — only a
+            // hang (or a silently truncated Ok) is a bug.
+            Ok(Ok(results)) => {
+                let rows: usize = results.iter().map(|b| b.num_rows()).sum();
+                assert_eq!(rows, (hi - lo) as usize, "iteration {i} lost rows");
+                // Keep the results alive so the next query builds under
+                // drained pools, like a server holding the previous query's
+                // output while the next one starts.
+                held_results.push(results);
+            }
+            Ok(Err(_)) => {}
+            Err(_) => panic!("staged scan hung on iteration {i} under an exhausted pool"),
+        }
+    }
+}
+
+/// Scheduling stress over the staged phase-A → phase-B hand-off (many small
+/// row groups, 16 workers, a filter that survives in only some groups, run in
+/// a loop on one long-lived `Dispatch` with a fresh fd — hence real reads —
+/// per iteration). Each iteration runs the staged scan + filter on a
+/// watchdog; a hang or a lost row fails the test instead of wedging the
+/// harness.
+///
+/// Slow (tens of seconds); run explicitly:
+/// `cargo test -p goose --test staged_scan -- --ignored staged_many_groups_stress`
+#[test]
+#[ignore]
+fn staged_many_groups_stress() {
+    const GROUPS: i64 = 400;
+    const ROWS_PER_GROUP: i64 = 64;
+    const ITERATIONS: usize = 150;
+    const WORKERS: usize = 16;
+
+    let batches: Vec<RecordBatch> = (0..GROUPS)
+        .map(|g| batch(g * ROWS_PER_GROUP, ROWS_PER_GROUP as usize))
+        .collect();
+    // Small pages so groups are multi-page and survivor masks are partial.
+    let dir = write_groups(&batches, 8);
+
+    let dispatch = dispatch_with_buffers(WORKERS, 512);
+
+    // Survivors: rows 30..lim — kills the tail groups entirely, keeps parts
+    // of the rest, so phase B fetches a strict subset of the groups with
+    // partial filter masks in the boundary groups.
+    let (lo, hi) = (30i64, GROUPS * ROWS_PER_GROUP * 3 / 4);
+    let expected: i64 = (lo..hi).sum();
+
+    for i in 0..ITERATIONS {
+        // Re-open the table each iteration: a fresh fd clears its cached
+        // regions, so every iteration's phase B issues real reads (the hang
+        // was observed on cold runs).
+        let table = parquet_table_from_dir(&dispatch, dir.path());
+        let dispatcher: dispatch::DataFlowDispatcher = (*dispatch).clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let results = table_input_with_filter_and_eq_predicates(
+                &dispatcher,
+                &table,
+                Projection::all(3),
+                false,
+                None,
+                None,
+                Arc::new(Vec::new()),
+                Some(id_range_filter(lo, hi)),
+            )
+            .filter(move || {
+                let pred = id_in_range(lo, hi);
+                move |batch: &RecordBatch| {
+                    let ids = batch.column(0).as_primitive::<Int64Type>();
+                    BooleanArray::from_iter(ids.iter().map(|v| Some(v.is_some_and(&pred))))
+                }
+            })
+            .collect()
+            .unwrap();
+            let sum: i64 = results
+                .iter()
+                .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().iter())
+                .sum();
+            let _ = tx.send(sum);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(sum) => assert_eq!(sum, expected, "iteration {i} lost rows"),
+            Err(_) => panic!("staged scan hung on iteration {i}"),
+        }
+    }
+}

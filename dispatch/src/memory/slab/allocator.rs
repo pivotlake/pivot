@@ -14,23 +14,45 @@ use std::sync::Arc;
 /// use separate allocators for data with different lifetimes (e.g. one for short-lived scratch
 /// buffers, another for output that lives until Arrow arrays are consumed).
 pub struct SlabAllocator {
-    /// The current buffer we're bumping through.
-    working_buffer: Arc<WriteBuffer>,
+    /// The current buffer we're bumping through. `None` until the first
+    /// allocation: operators construct allocators while a dataflow is being
+    /// *built* on the worker, and taking pool memory at build time means a
+    /// build can fail (panic under `PANIC_ON_EVICT`) when the pools are
+    /// momentarily empty between queries — a failure mode the finishing
+    /// protocol cannot absorb (see [`DataFlowBuilder::build`]). Acquiring
+    /// lazily keeps dataflow construction free of pool traffic.
+    ///
+    /// [`DataFlowBuilder::build`]: crate::api::DataFlowBuilder::build
+    working_buffer: Option<Arc<WriteBuffer>>,
+    /// Whether the lazily-acquired first buffer should prefer the pre-zeroed
+    /// pool (the constructor's `zeroed` argument).
+    prefer_zeroed: bool,
     /// Byte offset of the next free region in `working_buffer`.
     offset: usize,
 }
 
 impl SlabAllocator {
-    /// Creates a new allocator with a fresh buffer from the free pool.
-    /// If `zeroed` is true, prefers a pre-zeroed buffer.
+    /// Creates a new allocator. If `zeroed` is true, prefers pre-zeroed
+    /// buffers. No buffer is acquired until the first allocation.
     pub fn new(zeroed: bool) -> Self {
         Self {
-            working_buffer: Arc::new(memory_ctx().get_write_buffer(zeroed)),
+            working_buffer: None,
+            prefer_zeroed: zeroed,
             offset: 0,
         }
     }
 
-    /// Bytes remaining in the current working buffer.
+    /// Acquire the working buffer if we don't hold one yet (the lazy
+    /// counterpart of the construction-time acquisition this allocator
+    /// deliberately avoids — see [`Self::working_buffer`]).
+    fn ensure_buffer(&mut self) {
+        if self.working_buffer.is_none() {
+            self.working_buffer = Some(Arc::new(memory_ctx().get_write_buffer(self.prefer_zeroed)));
+        }
+    }
+
+    /// Bytes remaining in the current working buffer. Only meaningful once
+    /// [`Self::ensure_buffer`] has run.
     #[inline(always)]
     fn remaining_in_buffer(&self) -> usize {
         BUFFER_SIZE - self.offset
@@ -40,12 +62,16 @@ impl SlabAllocator {
     /// Zeroes the slab if `zeroed` is requested but the buffer wasn't pre-zeroed.
     fn get_slab_from_current_buffer(&mut self, size: usize, zeroed: bool) -> Slab {
         debug_assert!(size <= self.remaining_in_buffer());
+        let buffer = self
+            .working_buffer
+            .as_ref()
+            .expect("ensure_buffer must run before carving slabs");
         let mut slab = Slab {
-            ptr: unsafe { self.working_buffer.ptr.add(self.offset) },
+            ptr: unsafe { buffer.ptr.add(self.offset) },
             size,
-            _buffer: self.working_buffer.clone(),
+            _buffer: buffer.clone(),
         };
-        if zeroed && !self.working_buffer.zeroed {
+        if zeroed && !buffer.zeroed {
             slab.zero_out();
         }
 
@@ -56,7 +82,7 @@ impl SlabAllocator {
     /// Discards the remaining space in the current buffer and acquires a fresh one.
     fn advance_to_new_buffer(&mut self, zeroed: bool) {
         self.offset = 0;
-        self.working_buffer = Arc::new(memory_ctx().get_write_buffer(zeroed));
+        self.working_buffer = Some(Arc::new(memory_ctx().get_write_buffer(zeroed)));
     }
 
     /// Allocates a single slab of exactly `size` bytes.
@@ -66,6 +92,7 @@ impl SlabAllocator {
     pub fn get_slab_of_size(&mut self, size: usize, zeroed: bool) -> Slab {
         assert!(size <= BUFFER_SIZE, "Size was {:?}", size);
 
+        self.ensure_buffer();
         if self.remaining_in_buffer() < size {
             self.advance_to_new_buffer(zeroed);
         }
@@ -78,6 +105,7 @@ impl SlabAllocator {
     /// Returns the slabs in order — the caller is responsible for treating them as a
     /// contiguous logical buffer (see [`MultiSlabBuffer`]).
     pub fn get_slabs_of_size(&mut self, size: usize, zeroed: bool) -> Vec<Slab> {
+        self.ensure_buffer();
         let mut slabs = vec![];
         let mut remaining = size;
         while remaining > 0 {
@@ -111,6 +139,7 @@ impl SlabAllocator {
     /// `MultiSlabBuffer`, but the extra addition was felt (~5% in some queries) since it appears
     /// in every single indexing operation.
     pub fn create_multi_slab_buffer<T>(&mut self, size: usize, zeroed: bool) -> MultiSlabBuffer<T> {
+        self.ensure_buffer();
         // `MultiSlabBuffer` packs `elems_per_slab` elements into each slab (it does NOT treat
         // the slabs as one contiguous byte run — see its docs), so a single slab fits tightly
         // but anything larger takes one full 2MB slab per `elems_per_slab` elements. Sizing by
@@ -146,6 +175,20 @@ impl SlabAllocator {
 mod tests {
     use super::*;
     use crate::memory::{BUFFER_SIZE, init_test_free_pool};
+
+    /// Constructing an allocator must not take pool memory: operators create
+    /// allocators while a dataflow is being *built*, and a build-time pool
+    /// acquisition panics (`PANIC_ON_EVICT`) when the pools are momentarily
+    /// empty between queries — which used to silently strand the dataflow's
+    /// sibling counters (see `dispatch/tests/build_failure.rs`). With empty
+    /// pools, `new` must succeed; only the first allocation may need memory.
+    #[test]
+    fn new_takes_no_buffer_until_first_allocation() {
+        init_test_free_pool(0);
+
+        let _zeroed = SlabAllocator::new(true);
+        let _dirty = SlabAllocator::new(false);
+    }
 
     #[test]
     fn returns_zeroed_slab() {
