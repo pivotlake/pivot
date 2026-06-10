@@ -294,12 +294,138 @@ impl TryFrom<duckdb_expression::Function> for DateTrunc {
     }
 }
 
+/// Which field of a timestamp a [`DatePart`] extracts. DuckDB lowers
+/// `extract(<part> FROM ts)` to a scalar function named after the part (e.g.
+/// `minute`, `year`); this enumerates the parts we evaluate from `EventTime`'s
+/// Int64 epoch-seconds representation. See [`DatePart`]'s compile impl for the
+/// per-part arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePartKind {
+    /// Whole seconds since the Unix epoch (the stored value, unchanged).
+    Epoch,
+    /// Second of minute, 0–59.
+    Second,
+    /// Millisecond of minute, 0–59000 (whole seconds only, so `second * 1000`).
+    Millisecond,
+    /// Microsecond of minute, `second * 1_000_000`.
+    Microsecond,
+    /// Minute of hour, 0–59.
+    Minute,
+    /// Hour of day, 0–23.
+    Hour,
+    /// Day of month, 1–31.
+    Day,
+    /// Month of year, 1–12.
+    Month,
+    /// Quarter of year, 1–4.
+    Quarter,
+    /// Full year (e.g. 2024).
+    Year,
+    /// Decade — `year / 10` (e.g. 202 for 2024).
+    Decade,
+    /// Century — e.g. 21 for years 2001–2100.
+    Century,
+    /// Millennium — e.g. 3 for years 2001–3000.
+    Millennium,
+    /// Day of week, 0 (Sunday)–6 (Saturday).
+    DayOfWeek,
+    /// ISO day of week, 1 (Monday)–7 (Sunday).
+    IsoDayOfWeek,
+    /// Day of year, 1–366.
+    DayOfYear,
+    /// ISO 8601 week of year, 1–53.
+    Week,
+}
+
+impl DatePartKind {
+    /// Resolve a DuckDB scalar-function name (as `extract` lowers it) to a part.
+    /// Includes the common DuckDB aliases (`dow`, `doy`, `weekofyear`).
+    pub fn from_function_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "epoch" => DatePartKind::Epoch,
+            "second" => DatePartKind::Second,
+            "millisecond" => DatePartKind::Millisecond,
+            "microsecond" => DatePartKind::Microsecond,
+            "minute" => DatePartKind::Minute,
+            "hour" => DatePartKind::Hour,
+            "day" => DatePartKind::Day,
+            "month" => DatePartKind::Month,
+            "quarter" => DatePartKind::Quarter,
+            "year" => DatePartKind::Year,
+            "decade" => DatePartKind::Decade,
+            "century" => DatePartKind::Century,
+            "millennium" => DatePartKind::Millennium,
+            "dayofweek" | "dow" => DatePartKind::DayOfWeek,
+            "isodow" => DatePartKind::IsoDayOfWeek,
+            "dayofyear" | "doy" => DatePartKind::DayOfYear,
+            "week" | "weekofyear" => DatePartKind::Week,
+            _ => return None,
+        })
+    }
+
+    /// The canonical DuckDB function name for this part, used for plan display.
+    pub fn name(&self) -> &'static str {
+        match self {
+            DatePartKind::Epoch => "epoch",
+            DatePartKind::Second => "second",
+            DatePartKind::Millisecond => "millisecond",
+            DatePartKind::Microsecond => "microsecond",
+            DatePartKind::Minute => "minute",
+            DatePartKind::Hour => "hour",
+            DatePartKind::Day => "day",
+            DatePartKind::Month => "month",
+            DatePartKind::Quarter => "quarter",
+            DatePartKind::Year => "year",
+            DatePartKind::Decade => "decade",
+            DatePartKind::Century => "century",
+            DatePartKind::Millennium => "millennium",
+            DatePartKind::DayOfWeek => "dayofweek",
+            DatePartKind::IsoDayOfWeek => "isodow",
+            DatePartKind::DayOfYear => "dayofyear",
+            DatePartKind::Week => "week",
+        }
+    }
+}
+
+/// SQL `extract(<part> FROM source)` — a timestamp field accessor. DuckDB
+/// lowers each part to a scalar function (`minute`, `year`, …); `EventTime` is
+/// stored as Int64 epoch *seconds* (see [`Type::Timestamp`]), so every part is
+/// a pure integer computation. See its compile impl.
+///
+/// [`Type::Timestamp`]: crate::types::Type::Timestamp
+#[derive(Debug, Clone)]
+pub struct DatePart {
+    pub kind: DatePartKind,
+    pub source: Box<Expression>,
+}
+
+impl DatePart {
+    /// Build from a DuckDB function call once its name has been recognised as a
+    /// date part. Validates the single-argument arity.
+    fn from_function(
+        kind: DatePartKind,
+        mut f: duckdb_expression::Function,
+    ) -> Result<Self, Error> {
+        if f.params.len() != 1 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 1,
+                actual,
+            });
+        }
+        let source = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(DatePart { kind, source })
+    }
+}
+
 /// A scalar function call (e.g. `year`, `substring`).
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
     Divide(Divide),
     DateTrunc(DateTrunc),
+    DatePart(DatePart),
     /// `drop_cache()` — evict pivot's file cache, returning the regions dropped.
     /// A side-effecting admin function; evaluated once over the [`DummyScan`]
     /// row of a `FROM`-less `SELECT`. See its compile impl.
@@ -325,7 +451,12 @@ impl TryFrom<duckdb_expression::Function> for Function {
                 }
                 Ok(Function::DropCache)
             }
-            _ => Err(Error::UnsupportedScalarFunction(f.function)),
+            // `extract(<part> FROM ts)` lowers to a function named after the
+            // part (`minute`, `year`, `dayofweek`, …).
+            name => match DatePartKind::from_function_name(name) {
+                Some(kind) => Ok(Function::DatePart(DatePart::from_function(kind, f)?)),
+                None => Err(Error::UnsupportedScalarFunction(f.function)),
+            },
         }
     }
 }
@@ -398,6 +529,9 @@ impl Display for Expression {
             Expression::Function(Function::Divide(d)) => write!(f, "({} / {})", d.left, d.right),
             Expression::Function(Function::DateTrunc(dt)) => {
                 write!(f, "date_trunc('{}', {})", dt.unit, dt.source)
+            }
+            Expression::Function(Function::DatePart(d)) => {
+                write!(f, "{}({})", d.kind.name(), d.source)
             }
             Expression::Function(Function::DropCache) => write!(f, "drop_cache()"),
         }
