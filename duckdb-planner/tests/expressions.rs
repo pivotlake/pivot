@@ -170,6 +170,50 @@ fn case_expression_structure(mut planner: PlannerContext) {
     ");
 }
 
+// ---- String scalar functions ----
+
+#[rstest]
+fn length_function(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT length(name) FROM users")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @"
+    Projection(length(#0:VARCHAR) -> BIGINT)
+      Input([#1:VARCHAR])
+    ");
+}
+
+#[rstest]
+fn regexp_replace_function(mut planner: PlannerContext) {
+    let plan = planner
+        .plan(r"SELECT regexp_replace(name, '^https?://(?:www\.)?([^/]+)/.*$', '\1') FROM users")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(regexp_replace(#0:VARCHAR, ^https?://(?:www\.)?([^/]+)/.*$:VARCHAR, \1:VARCHAR) -> VARCHAR)
+      Input([#1:VARCHAR])
+    ");
+}
+
+// ---- Operator expressions ----
+
+/// `NOT expr` arrives as a `BoundOperatorExpression` of type `OPERATOR_NOT`
+/// with a single child, serialized by the bridge as `{"input": ...}`.
+#[rstest]
+fn not_operator(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT id FROM users WHERE NOT contains(name, 'x')")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @"
+    Projection(#0:INTEGER)
+      Projection(#1:INTEGER)
+        Filter(NOT(contains(#0:VARCHAR, x:VARCHAR) -> BOOLEAN))
+          Input([#1:VARCHAR, #0:INTEGER])
+    ");
+}
+
 // ---- Aggregate function expressions ----
 
 #[rstest]
