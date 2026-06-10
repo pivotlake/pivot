@@ -65,6 +65,8 @@ pub struct Server {
     catalog: Arc<ParquetCatalog>,
     /// Ingest sources to start when [`serve`](Self::serve) runs.
     ingests: Vec<IngestConfig>,
+    /// Target size for the bundled compacter (`0` = don't run one).
+    compact_bytes: u64,
 }
 
 impl Server {
@@ -79,6 +81,7 @@ impl Server {
         dispatch: Dispatch,
         catalog: Arc<ParquetCatalog>,
         ingests: Vec<IngestConfig>,
+        compact_bytes: u64,
     ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
         // handler needs it to compile every plan, and the ingest sources need
@@ -97,6 +100,7 @@ impl Server {
             dispatcher,
             catalog,
             ingests,
+            compact_bytes,
         }
     }
 
@@ -123,7 +127,8 @@ impl Server {
         let mut ingestor = Some(Ingestor::start(
             std::mem::take(&mut self.ingests),
             self.dispatcher.clone(),
-            Some(self.catalog.clone()),
+            self.catalog.clone(),
+            self.compact_bytes,
         )?);
 
         loop {
@@ -220,7 +225,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let dispatch = Dispatch::spin_up(1, 32);
         let catalog = catalog(&dispatch);
-        let server = Server::new(bind(), dispatch, catalog, vec![]);
+        let server = Server::new(bind(), dispatch, catalog, vec![], 0);
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;

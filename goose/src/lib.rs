@@ -281,6 +281,12 @@ impl ParquetCatalog {
             .map(|entry| entry.table.clone())
     }
 
+    /// Every table this catalog knows, by name. What a maintenance sweep (a
+    /// compacter) iterates.
+    pub fn table_names(&self) -> Vec<String> {
+        self.tables.read().unwrap().keys().cloned().collect()
+    }
+
     /// The data files of `name`'s current in-memory version (logged name +
     /// size each). What a compacter scans for merge candidates.
     pub fn table_files(&self, name: &str) -> Option<Vec<LoggedFile>> {

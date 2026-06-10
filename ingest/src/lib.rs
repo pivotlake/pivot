@@ -17,9 +17,11 @@
 //! - The `otel` module turns each OTLP signal (logs / traces / metrics) into
 //!   batches and feeds a sink. Which signals run is configuration, not code:
 //!   see [`OtelConfig`].
-//! - The `compact` module merges a sink's small files into target-sized ones
-//!   in the background (decode + re-encode both on the dispatch pool) and
-//!   swaps them atomically through the catalog.
+//! - The `compact` module merges a table's small files into target-sized
+//!   ones (one scan→encode dataflow on the dispatch pool) and swaps them in
+//!   one table-log commit. It only watches the log, so the bundled background
+//!   task is a convenience — the same compacter can run in a separate
+//!   process over the same database root.
 //! - [`Ingestor`] is the lifecycle handle the server holds: [`Ingestor::start`]
 //!   launches every configured source; [`Ingestor::shutdown`] stops the
 //!   receivers and flushes whatever is still buffered **before** the dispatch
@@ -50,7 +52,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-pub use compact::DEFAULT_COMPACT_BYTES;
+pub use compact::{Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL};
 pub use otel::{ConfigError, DEFAULT_OTLP_ADDR, OtelConfig, Signal};
 pub use sink::SinkDestination;
 
@@ -82,14 +84,31 @@ impl Ingestor {
     ///
     /// Returns an `Ingestor` even when `configs` is empty — its
     /// [`shutdown`](Self::shutdown) is then a no-op.
+    /// `compact_bytes` sizes the bundled, catalog-wide [`Compacter`] (`0`
+    /// skips it — e.g. when a dedicated compacter process owns the job).
     pub fn start(
         configs: Vec<IngestConfig>,
         dispatcher: DataFlowDispatcher,
-        catalog: Option<Arc<ParquetCatalog>>,
+        catalog: Arc<ParquetCatalog>,
+        compact_bytes: u64,
     ) -> std::io::Result<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let mut tasks = Vec::new();
         let mut sinks = Vec::new();
+
+        // The bundled compacter: one catalog-wide maintenance loop, joined on
+        // shutdown like the flush timers (an in-flight merge encodes on the
+        // dispatch workers, so it must finish before they are torn down). It
+        // knows nothing of the sources below — the same loop can run in a
+        // separate process instead.
+        if compact_bytes > 0 {
+            let compacter = Arc::new(Compacter::new(
+                compact_bytes,
+                DEFAULT_COMPACT_POLL,
+                catalog.clone(),
+            ));
+            tasks.push(tokio::spawn(compacter.run(shutdown_tx.subscribe())));
+        }
 
         for config in configs {
             match config {
@@ -101,7 +120,7 @@ impl Ingestor {
                         );
                         continue;
                     }
-                    let server = OtelServer::build(&cfg, &dispatcher, catalog.as_ref())?;
+                    let server = OtelServer::build(&cfg, &dispatcher, &catalog)?;
                     info!(
                         addr = %server.addr,
                         logs = cfg.logs.is_some(),
@@ -120,13 +139,6 @@ impl Ingestor {
                             cfg.flush_interval,
                             shutdown_tx.subscribe(),
                         ));
-                    }
-
-                    // Per-sink compaction loops. Joined on shutdown like the
-                    // timers: an in-flight merge encodes on the dispatch
-                    // workers, so it must finish before they are torn down.
-                    for compacter in server.compacters {
-                        tasks.push(tokio::spawn(compacter.run(shutdown_tx.subscribe())));
                     }
 
                     let addr = server.addr;
@@ -257,12 +269,12 @@ mod tests {
     }
 
     /// Flush `requests` (one batch each) through a sink as a single flush,
-    /// registering the file with `catalog` when one is given.
+    /// registering each file with `catalog`.
     fn write_logs(
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
         requests: &[ExportLogsServiceRequest],
-        catalog: Option<Arc<goose::ParquetCatalog>>,
+        catalog: Arc<goose::ParquetCatalog>,
     ) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -272,15 +284,9 @@ mod tests {
             let dest = SinkDestination::Local(dir.to_path_buf());
             // usize::MAX threshold: appends never auto-flush, so one flush_now
             // writes all `requests` as a single multi-row-group file.
-            let sink = ParquetSink::new(
-                "otel_logs",
-                &dest,
-                usize::MAX,
-                dispatcher.clone(),
-                catalog,
-                None,
-            )
-            .unwrap();
+            let sink =
+                ParquetSink::new("otel_logs", &dest, usize::MAX, dispatcher.clone(), catalog)
+                    .unwrap();
             for request in requests {
                 sink.append(otel::logs_item_for_test(request.clone())).await;
             }
@@ -294,7 +300,7 @@ mod tests {
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
         requests: &[ExportLogsServiceRequest],
-        catalog: Option<Arc<goose::ParquetCatalog>>,
+        catalog: Arc<goose::ParquetCatalog>,
     ) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -302,15 +308,9 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let dest = SinkDestination::Local(dir.to_path_buf());
-            let sink = ParquetSink::new(
-                "otel_logs",
-                &dest,
-                usize::MAX,
-                dispatcher.clone(),
-                catalog,
-                None,
-            )
-            .unwrap();
+            let sink =
+                ParquetSink::new("otel_logs", &dest, usize::MAX, dispatcher.clone(), catalog)
+                    .unwrap();
             for request in requests {
                 sink.append(otel::logs_item_for_test(request.clone())).await;
                 sink.flush_now().await;
@@ -411,7 +411,12 @@ mod tests {
         let dispatch = Dispatch::spin_up(1, RING_BUFFERS);
         let dir = tempfile::tempdir().unwrap();
 
-        write_logs(dispatch.dispatcher(), dir.path(), &[log_request(3)], None);
+        write_logs(
+            dispatch.dispatcher(),
+            dir.path(),
+            &[log_request(3)],
+            Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone())),
+        );
         let table = read_table(&dispatch, dir.path());
         let batches = table_input(
             dispatch.dispatcher(),
@@ -452,7 +457,7 @@ mod tests {
             dispatch.dispatcher(),
             dir.path(),
             &vec![log_request(2); 5],
-            None,
+            Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone())),
         );
         let table = read_table(&dispatch, dir.path());
 
@@ -484,7 +489,7 @@ mod tests {
             dispatch.dispatcher(),
             dir.path(),
             &[log_request(3), log_request(2)],
-            Some(catalog.clone()),
+            catalog.clone(),
         );
 
         let table = catalog.parquet_table("otel_logs").unwrap();
@@ -522,7 +527,7 @@ mod tests {
             dispatch.dispatcher(),
             dir.path(),
             &[log_request(3), log_request(2), log_request(4)],
-            Some(catalog.clone()),
+            catalog.clone(),
         );
         assert_eq!(parquet_file_count(dir.path()), 3);
 
@@ -534,12 +539,12 @@ mod tests {
             .filter(|e| e.path().is_file())
             .map(|e| e.metadata().unwrap().len())
             .sum();
-        let compacter = crate::compact::Compacter::new("otel_logs", total, catalog.clone());
+        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), catalog.clone());
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(compacter.compact_eligible());
+            .block_on(compacter.compact_all());
 
         // One merged file replaced the three inputs, on disk and in the
         // catalog, and indices stayed sequential.
@@ -626,12 +631,12 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let compacter = crate::compact::Compacter::new("events", total, catalog.clone());
+        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), catalog.clone());
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(compacter.compact_eligible());
+            .block_on(compacter.compact_all());
 
         // One merged object replaced the two inputs, in the store and in the
         // catalog.
@@ -656,6 +661,61 @@ mod tests {
                 .sum::<i64>(),
             3
         );
+
+        dispatch.exit();
+    }
+
+    /// The compacter can live in a **separate process**: it holds nothing but
+    /// a catalog handle, and each poll round reloads the table from its log.
+    /// Here the "server" registers flushes through one catalog instance while
+    /// the compacter works through a second instance over the same database
+    /// root — and the server sees the swap at its next bind.
+    #[test]
+    fn compacter_in_another_process_compacts_the_servers_flushes() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
+        let db = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+
+        // "Server" process: creates the table and registers three flushes.
+        let server_catalog = Arc::new(
+            goose::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
+                .unwrap(),
+        );
+        create_catalog_table(&server_catalog, dispatch.dispatcher(), data_dir.path());
+        flush_each(
+            dispatch.dispatcher(),
+            data_dir.path(),
+            &[log_request(3), log_request(2), log_request(4)],
+            server_catalog.clone(),
+        );
+
+        // "Compacter" process: a separate catalog over the same root. Its
+        // poll round reloads the table from the log before scanning.
+        let compacter_catalog = Arc::new(
+            goose::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
+                .unwrap(),
+        );
+        let total: u64 = server_catalog
+            .table_files("otel_logs")
+            .unwrap()
+            .iter()
+            .map(|f| f.size)
+            .sum();
+        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), compacter_catalog);
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(compacter.compact_all());
+
+        // The server's next bind reloads to the compacted version.
+        assert!(planner::catalog::Catalog::table(&*server_catalog, "otel_logs").is_some());
+        let table = server_catalog.parquet_table("otel_logs").unwrap();
+        let groups = table.parquet.row_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].num_rows, 9);
+        assert!(groups[0].file_name.contains("compacted"));
+        assert_eq!(parquet_file_count(data_dir.path()), 1);
 
         dispatch.exit();
     }

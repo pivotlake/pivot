@@ -44,7 +44,6 @@ use tonic::transport::Server;
 use tonic::transport::server::Router;
 use tonic::{Request, Response, Status};
 
-use crate::compact::{Compacter, DEFAULT_COMPACT_BYTES};
 use crate::parquet_writing::ToRecordBatch;
 use crate::sink::{Flushable, ParquetSink, SinkDestination};
 use convert::CompiledMapping;
@@ -82,11 +81,6 @@ pub struct OtelConfig {
     /// Largest gRPC message we accept; collectors batch aggressively and blow
     /// past the 4 MiB default.
     pub max_decoding_message_size: usize,
-    /// Compaction target per sink: flushed files smaller than this are merged
-    /// into one once their combined size reaches it (CPU on the dispatch
-    /// pool). `0` disables compaction. Only applies to local destinations of a
-    /// catalog-backed ingest.
-    pub compact_bytes: u64,
     /// Logs setup (`None` disables the logs service).
     pub(crate) logs: Option<SignalSetup>,
     /// Traces setup (`None` disables the trace service).
@@ -105,7 +99,6 @@ impl OtelConfig {
             flush_rows: 50_000,
             flush_interval: Duration::from_secs(10),
             max_decoding_message_size: 256 * 1024 * 1024,
-            compact_bytes: DEFAULT_COMPACT_BYTES,
             logs: None,
             traces: None,
             metrics: None,
@@ -194,45 +187,27 @@ pub(crate) fn logs_item_for_test(req: ExportLogsServiceRequest) -> LogsItem {
 pub(crate) struct OtelServer {
     pub addr: SocketAddr,
     pub sinks: Vec<Arc<dyn Flushable>>,
-    /// One compacter per local, catalog-backed sink (when compaction is
-    /// enabled); the caller spawns their background loops.
-    pub compacters: Vec<Arc<Compacter>>,
     pub router: Router,
 }
 
 /// Create a sink for one signal, register it for flushing, and return the typed
-/// handle the gRPC service appends to. A local, catalog-backed sink also gets a
-/// [`Compacter`] (pushed to `compacters`; the sink wakes it after each flush).
-#[allow(clippy::too_many_arguments)]
+/// handle the gRPC service appends to.
 fn build_sink<T: ToRecordBatch>(
     name: &str,
     setup: &SignalSetup,
     cfg: &OtelConfig,
     dispatcher: &DataFlowDispatcher,
-    catalog: Option<&Arc<ParquetCatalog>>,
+    catalog: &Arc<ParquetCatalog>,
     sinks: &mut Vec<Arc<dyn Flushable>>,
-    compacters: &mut Vec<Arc<Compacter>>,
 ) -> std::io::Result<Arc<ParquetSink<T>>> {
-    // A compacter is wired wherever a catalog table can exist for the sink —
-    // i.e. the sink lands files locally and registers them. The compacter
-    // itself is location-agnostic (it works off the table's log and store),
-    // so this is only about who wakes it.
-    let compacter = match (&setup.destination, catalog) {
-        (SinkDestination::Local(_), Some(catalog)) if cfg.compact_bytes > 0 => Some(Arc::new(
-            Compacter::new(name, cfg.compact_bytes, catalog.clone()),
-        )),
-        _ => None,
-    };
     let sink = Arc::new(ParquetSink::new(
         name,
         &setup.destination,
         cfg.flush_rows,
         dispatcher.clone(),
-        catalog.cloned(),
-        compacter.clone(),
+        catalog.clone(),
     )?);
     sinks.push(sink.clone());
-    compacters.extend(compacter);
     Ok(sink)
 }
 
@@ -251,30 +226,21 @@ macro_rules! tune {
 
 impl OtelServer {
     /// Build the sinks and gRPC router for `cfg`. Creates each enabled signal's
-    /// output directory. When a `catalog` is given, every flushed file is
-    /// registered with the table named after its sink.
+    /// output directory. Every flushed file is registered with the catalog
+    /// table named after its sink.
     pub(crate) fn build(
         cfg: &OtelConfig,
         dispatcher: &DataFlowDispatcher,
-        catalog: Option<&Arc<ParquetCatalog>>,
+        catalog: &Arc<ParquetCatalog>,
     ) -> std::io::Result<Self> {
         let mut sinks = Vec::new();
-        let mut compacters = Vec::new();
 
         // For each enabled signal, build its sink (registered for flushing) and
         // wire the service. `tune!` stays at each use site so the concrete
         // generated server type is preserved.
         let logs = match &cfg.logs {
             Some(setup) => {
-                let sink = build_sink(
-                    "otel_logs",
-                    setup,
-                    cfg,
-                    dispatcher,
-                    catalog,
-                    &mut sinks,
-                    &mut compacters,
-                )?;
+                let sink = build_sink("otel_logs", setup, cfg, dispatcher, catalog, &mut sinks)?;
                 let svc = LogsSinkService {
                     sink,
                     mapping: setup.mapping.clone(),
@@ -285,15 +251,7 @@ impl OtelServer {
         };
         let traces = match &cfg.traces {
             Some(setup) => {
-                let sink = build_sink(
-                    "otel_traces",
-                    setup,
-                    cfg,
-                    dispatcher,
-                    catalog,
-                    &mut sinks,
-                    &mut compacters,
-                )?;
+                let sink = build_sink("otel_traces", setup, cfg, dispatcher, catalog, &mut sinks)?;
                 let svc = TraceSinkService {
                     sink,
                     mapping: setup.mapping.clone(),
@@ -304,15 +262,7 @@ impl OtelServer {
         };
         let metrics = match &cfg.metrics {
             Some(setup) => {
-                let sink = build_sink(
-                    "otel_metrics",
-                    setup,
-                    cfg,
-                    dispatcher,
-                    catalog,
-                    &mut sinks,
-                    &mut compacters,
-                )?;
+                let sink = build_sink("otel_metrics", setup, cfg, dispatcher, catalog, &mut sinks)?;
                 let svc = MetricsSinkService {
                     sink,
                     mapping: setup.mapping.clone(),
@@ -330,7 +280,6 @@ impl OtelServer {
         Ok(Self {
             addr: cfg.addr,
             sinks,
-            compacters,
             router,
         })
     }

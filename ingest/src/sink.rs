@@ -31,7 +31,6 @@ use object_store::{ObjectStore, PutPayload};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::compact::Compacter;
 use crate::parquet_writing::{self, ToRecordBatch};
 
 /// Rows per Parquet row group. A flush's items are cut into row groups of about
@@ -196,13 +195,12 @@ pub struct ParquetSink<T> {
     /// Flush once the buffer holds at least this many rows.
     flush_rows: usize,
     dispatcher: DataFlowDispatcher,
-    /// When present, every locally-written file is registered with the table
-    /// named [`name`](Self::name), so its rows are queryable immediately —
-    /// no re-`CREATE TABLE` needed.
-    catalog: Option<Arc<ParquetCatalog>>,
-    /// This sink's compacter, woken after each flush is registered so it can
-    /// merge small files once enough accumulate.
-    compacter: Option<Arc<Compacter>>,
+    /// Every locally-written file is registered with the table named
+    /// [`name`](Self::name), so its rows are queryable immediately — no
+    /// re-`CREATE TABLE` needed. (Remote destinations are write-only exports
+    /// and skip registration; a missing table just defers visibility to its
+    /// `CREATE TABLE`.)
+    catalog: Arc<ParquetCatalog>,
     buffer: Mutex<Buffer<T>>,
     /// Monotonic file sequence, so two flushes in the same millisecond don't
     /// collide on a filename.
@@ -232,8 +230,7 @@ impl<T> ParquetSink<T> {
         destination: &SinkDestination,
         flush_rows: usize,
         dispatcher: DataFlowDispatcher,
-        catalog: Option<Arc<ParquetCatalog>>,
-        compacter: Option<Arc<Compacter>>,
+        catalog: Arc<ParquetCatalog>,
     ) -> std::io::Result<Self> {
         Ok(Self {
             name: name.into(),
@@ -241,7 +238,6 @@ impl<T> ParquetSink<T> {
             flush_rows: flush_rows.max(1),
             dispatcher,
             catalog,
-            compacter,
             buffer: Mutex::new(Buffer::default()),
             seq: AtomicU64::new(0),
         })
@@ -344,12 +340,6 @@ impl<T: ToRecordBatch> ParquetSink<T> {
             Ok(Err(e)) => error!(sink = %self.name, error = %e, "parquet write pipeline failed"),
             Err(e) => error!(sink = %self.name, error = %e, "write pipeline task panicked"),
         }
-
-        // Every file of this flush is written and registered — let the
-        // compacter re-check whether enough small files piled up.
-        if let Some(compacter) = &self.compacter {
-            compacter.notify();
-        }
     }
 
     /// Register a freshly-written local file with the catalog table named after
@@ -360,9 +350,7 @@ impl<T: ToRecordBatch> ParquetSink<T> {
     /// directory, so the next `CREATE TABLE`/restart still finds it — so it is
     /// logged, never propagated.
     async fn register(&self, path: PathBuf) {
-        let Some(catalog) = self.catalog.clone() else {
-            return;
-        };
+        let catalog = self.catalog.clone();
         let table = self.name.clone();
         let registered = tokio::task::spawn_blocking(move || {
             let outcome = catalog.register_data_file(&table, &path);

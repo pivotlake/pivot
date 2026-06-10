@@ -26,17 +26,25 @@
 //! (an unlogged merged file, or already-swapped-out inputs), never a double
 //! read.
 //!
+//! The compacter is **deployment-agnostic** for the same reason: it talks to
+//! nothing but the catalog (and through it, the table log and store), so it
+//! can run inside the server or as a separate process over the same database
+//! root. It covers every table of the catalog it is handed and polls — each
+//! round reloads a table to its latest log version before scanning — rather
+//! than being woken by the ingest path; the sinks don't know it exists.
+//!
 //! [`replace_data_files`]: ParquetCatalog::replace_data_files
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dispatch::Projection;
 use goose::parquet::{ParquetTable, table_input};
 use goose::{LoggedFile, ParquetCatalog};
-use tokio::sync::{Notify, watch};
-use tracing::{debug, error, info};
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, error, info, warn};
 
 use crate::parquet_writing;
 use crate::sink::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
@@ -45,55 +53,46 @@ use crate::sink::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
 /// and a merge runs once their combined size reaches it.
 pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Compacts one table into target-sized Parquet files. Shared between the
-/// sink (which [`notify`](Self::notify)s it after every registered flush) and
-/// its background task ([`run`](Self::run)).
-pub(crate) struct Compacter {
-    /// The catalog table whose files are compacted; also the output file-name
-    /// prefix.
-    name: String,
+/// Default cadence for re-checking the tables' logs. Candidates only change
+/// when a flush commits a new version, so seconds-scale is plenty.
+pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
+
+/// Compacts every table of a catalog into target-sized Parquet files,
+/// entirely off the tables' logs: poll, reload, merge what's eligible. Holds
+/// nothing but a catalog handle, so the hosting process is a deployment
+/// detail — the server bundles one, and a dedicated process can run another
+/// over the same database root.
+pub struct Compacter {
     /// Candidate threshold and merge trigger (see [`DEFAULT_COMPACT_BYTES`]).
     target_bytes: u64,
+    /// How often to re-check the tables' logs for newly-accumulated files.
+    poll_interval: Duration,
     catalog: Arc<ParquetCatalog>,
-    /// Pinged by the sink after each registered flush.
-    wakeup: Notify,
     /// Monotonic sequence for merged-file names (same collision guard as the
     /// sink's).
     seq: AtomicU64,
 }
 
 impl Compacter {
-    pub(crate) fn new(
-        name: impl Into<String>,
-        target_bytes: u64,
-        catalog: Arc<ParquetCatalog>,
-    ) -> Self {
+    pub fn new(target_bytes: u64, poll_interval: Duration, catalog: Arc<ParquetCatalog>) -> Self {
         Self {
-            name: name.into(),
             target_bytes,
+            poll_interval,
             catalog,
-            wakeup: Notify::new(),
             seq: AtomicU64::new(0),
         }
     }
 
-    /// Wake the compaction task to re-check the table (called by the sink
-    /// after a flushed file is registered).
-    pub(crate) fn notify(&self) {
-        self.wakeup.notify_one();
-    }
-
-    /// The compaction loop: merge whatever is already eligible (so leftovers
-    /// from a previous run are handled at startup), then sleep until the sink
-    /// flushes again or shutdown flips.
-    pub(crate) async fn run(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
+    /// The compaction loop: every `poll_interval`, sweep the catalog's tables
+    /// and merge whatever is eligible, until shutdown flips. The first tick
+    /// fires immediately, so leftovers from a previous run are handled at
+    /// startup.
+    pub async fn run(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
+        let mut tick = tokio::time::interval(self.poll_interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
-            if *shutdown_rx.borrow() {
-                return;
-            }
-            self.compact_eligible().await;
             tokio::select! {
-                _ = self.wakeup.notified() => {}
+                _ = tick.tick() => self.compact_all().await,
                 res = shutdown_rx.changed() => {
                     if res.is_err() || *shutdown_rx.borrow() {
                         return;
@@ -103,18 +102,43 @@ impl Compacter {
         }
     }
 
-    /// Merge batches of eligible files until none remain. Each batch is capped
-    /// at roughly one output file's worth, so a long backlog (e.g. after a
-    /// restart) is worked off with bounded memory. Errors are logged and stop
-    /// this round — the next flush retries. (`pub(crate)` so tests can drive
-    /// one compaction round without the background loop.)
-    pub(crate) async fn compact_eligible(&self) {
+    /// One poll round over every table the catalog knows. (Public so tests —
+    /// and a future standalone compacter binary — can drive one round without
+    /// the loop.)
+    pub async fn compact_all(&self) {
+        for table in self.catalog.table_names() {
+            self.compact_table(&table).await;
+        }
+    }
+
+    /// One table's round: reload it to its latest log version (this is what
+    /// lets a compacter in *another process* see files the server
+    /// registered), then merge batches of eligible files until none remain.
+    /// Each batch is capped at roughly one output file's worth, so a long
+    /// backlog (e.g. after a restart) is worked off with bounded memory.
+    /// Errors are logged and end the table's round — the next poll retries.
+    async fn compact_table(&self, table: &str) {
         loop {
-            let Some(inputs) = self.next_batch() else {
+            let catalog = self.catalog.clone();
+            let name = table.to_string();
+            // refresh drives a footer-fetch dataflow, so it runs on a
+            // blocking thread like the merge itself.
+            match tokio::task::spawn_blocking(move || catalog.refresh(&name)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(table, error = %e, "table reload failed; skipping round");
+                    return;
+                }
+                Err(e) => {
+                    error!(table, error = %e, "table reload task panicked");
+                    return;
+                }
+            }
+            let Some(inputs) = self.next_batch(table) else {
                 return;
             };
             let job = CompactJob {
-                name: self.name.clone(),
+                name: table.to_string(),
                 catalog: self.catalog.clone(),
                 seq: self.seq.fetch_add(1, Ordering::Relaxed),
             };
@@ -122,32 +146,32 @@ impl Compacter {
             match tokio::task::spawn_blocking(move || job.compact(inputs)).await {
                 Ok(Ok(outputs)) => {
                     info!(
-                        table = %self.name,
+                        table,
                         inputs = count,
                         outputs = outputs.len(),
                         "compacted parquet files"
                     );
                 }
                 Ok(Err(e)) => {
-                    error!(table = %self.name, error = %e, "compaction failed");
+                    error!(table, error = %e, "compaction failed");
                     return;
                 }
                 Err(e) => {
-                    error!(table = %self.name, error = %e, "compaction task panicked");
+                    error!(table, error = %e, "compaction task panicked");
                     return;
                 }
             }
         }
     }
 
-    /// The next batch of files to merge, straight from the table's current
+    /// The next batch of `table`'s files to merge, straight from its current
     /// log version: files under the target size, oldest-named first, cut off
     /// once they amount to one output file. `None` when there's nothing worth
     /// doing (no table, fewer than two small files, or not enough bytes for a
     /// full output yet — merging earlier would just rewrite the same rows
     /// again on the next flush).
-    fn next_batch(&self) -> Option<Vec<LoggedFile>> {
-        let files = self.catalog.table_files(&self.name)?;
+    fn next_batch(&self, table: &str) -> Option<Vec<LoggedFile>> {
+        let files = self.catalog.table_files(table)?;
         let mut small: Vec<LoggedFile> = files
             .into_iter()
             .filter(|f| f.size < self.target_bytes)
@@ -168,7 +192,7 @@ impl Compacter {
             }
         }
         debug!(
-            table = %self.name,
+            table,
             files = batch.len(),
             bytes = total,
             "small files below compaction threshold; waiting for more"

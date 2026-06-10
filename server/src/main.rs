@@ -39,9 +39,7 @@ struct Args {
     ///
     /// The value is a comma-separated `key=value` spec. Keys: `addr`, `logs`,
     /// `traces`, `metrics` (destination per signal — at least one enables the
-    /// receiver), `flush_rows`, `flush_secs`, `compact_bytes` (merge flushed
-    /// files smaller than this once they amount to it; `0` disables
-    /// compaction). A destination is a local dir or an
+    /// receiver), `flush_rows`, `flush_secs`. A destination is a local dir or an
     /// object-store URL (`gs://bucket/prefix`, `s3://bucket/prefix`; object
     /// storage is write-only — read it elsewhere). Examples:
     ///
@@ -57,6 +55,12 @@ struct Args {
     /// for the file format.
     #[arg(long = "otel-config", value_name = "PATH")]
     otel_config: Vec<OtelFileSpec>,
+
+    /// Run the bundled compacter: any table's Parquet files smaller than this
+    /// are merged into one (CPU on the dispatch pool) once they amount to it.
+    /// `0` disables it — e.g. when a dedicated compacter process owns the job.
+    #[arg(long, default_value_t = ingest::DEFAULT_COMPACT_BYTES)]
+    compact_bytes: u64,
 }
 
 impl Args {
@@ -98,7 +102,6 @@ impl std::str::FromStr for OtelSpec {
         let mut metrics = None;
         let mut flush_rows = None;
         let mut flush_secs = None;
-        let mut compact_bytes = None;
 
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let (key, value) = part
@@ -124,13 +127,6 @@ impl std::str::FromStr for OtelSpec {
                             .map_err(|e| format!("flush_secs `{value}`: {e}"))?,
                     )
                 }
-                "compact_bytes" => {
-                    compact_bytes = Some(
-                        value
-                            .parse()
-                            .map_err(|e| format!("compact_bytes `{value}`: {e}"))?,
-                    )
-                }
                 other => return Err(format!("unknown key `{other}` in --otel spec")),
             }
         }
@@ -145,9 +141,6 @@ impl std::str::FromStr for OtelSpec {
         }
         if let Some(secs) = flush_secs {
             cfg.flush_interval = Duration::from_secs(secs);
-        }
-        if let Some(bytes) = compact_bytes {
-            cfg.compact_bytes = bytes;
         }
         // The inline spec uses the built-in default column mapping for each
         // enabled signal; `--otel-config` is the route to custom columns.
@@ -214,7 +207,7 @@ fn main() -> Result<(), Error> {
     };
 
     rt.block_on(async move {
-        let server = Server::new(args.bind, dispatch, catalog, ingests);
+        let server = Server::new(args.bind, dispatch, catalog, ingests, args.compact_bytes);
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;
         });
