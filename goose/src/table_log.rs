@@ -20,7 +20,7 @@
 //! The log holds file *lists*; table definitions (name, columns, location)
 //! stay in the [`manifest`](crate::manifest).
 
-use crate::store::{ObjectStore, StoreError};
+use crate::store::{FileRef, ObjectStore, StoreError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -43,32 +43,12 @@ const VERSION_DIGITS: usize = 20;
 /// The version a table's very first commit gets.
 pub const FIRST_VERSION: u64 = 1;
 
-/// One data file in a version: its name within the table's data location, and
-/// its size in bytes — carried so the reader can locate the Parquet footer
-/// without a `stat`/HEAD per file.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoggedFile {
-    pub name: String,
-    pub size: u64,
-}
-
-/// The logged form of a listed data file — how a directory listing (`CREATE
-/// TABLE`, the legacy no-log fallback) becomes a log version's content.
-impl From<&crate::store::DataFile> for LoggedFile {
-    fn from(file: &crate::store::DataFile) -> Self {
-        Self {
-            name: file.name.clone(),
-            size: file.size,
-        }
-    }
-}
-
 /// A table's complete file list at one version. The highest committed version
 /// is the table's current state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableVersion {
     pub version: u64,
-    pub files: Vec<LoggedFile>,
+    pub files: Vec<FileRef>,
 }
 
 impl TableVersion {
@@ -98,7 +78,7 @@ impl<'a> TableLog<'a> {
         let objects = self.store.list(&format!("{LOG_DIR}/{}", self.table))?;
         Ok(objects
             .iter()
-            .filter_map(|object| parse_version(&object.key))
+            .filter_map(|object| parse_version(&object.name))
             .max())
     }
 
@@ -133,7 +113,7 @@ impl<'a> TableLog<'a> {
     /// Atomically commit `files` as version `version`. `Ok(true)` means this
     /// writer won; `Ok(false)` means someone else committed that version
     /// first — re-read the latest and retry the change on top of it.
-    pub fn commit(&self, version: u64, files: &[LoggedFile]) -> Result<bool> {
+    pub fn commit(&self, version: u64, files: &[FileRef]) -> Result<bool> {
         let doc = VersionDoc {
             version,
             files: files.to_vec(),
@@ -174,7 +154,7 @@ fn parse_version(key: &str) -> Option<u64> {
 #[derive(Serialize, Deserialize)]
 struct VersionDoc {
     version: u64,
-    files: Vec<LoggedFile>,
+    files: Vec<FileRef>,
 }
 
 #[cfg(test)]
@@ -182,8 +162,8 @@ mod tests {
     use super::*;
     use crate::store::MemoryStore;
 
-    fn file(name: &str, size: u64) -> LoggedFile {
-        LoggedFile {
+    fn file(name: &str, size: u64) -> FileRef {
+        FileRef {
             name: name.into(),
             size,
         }

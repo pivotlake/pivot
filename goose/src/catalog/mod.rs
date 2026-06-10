@@ -42,9 +42,9 @@ use std::sync::{Arc, RwLock};
 use crate::manifest::{self, ManifestEntry};
 use crate::parquet::{LoadedFiles, ParquetTableError, RowGroupMetadata};
 use crate::store::{
-    self, DataFile, DataFileSource, LocalStore, MemoryStore, ObjectStore, join_prefix,
+    self, DataFile, DataFileSource, FileRef, LocalStore, MemoryStore, ObjectStore, join_prefix,
 };
-use crate::table_log::{self, FIRST_VERSION, LoggedFile, TableLog, TableVersion};
+use crate::table_log::{self, FIRST_VERSION, TableLog, TableVersion};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use entry::{TableEntry, TableFile, TableState};
 use planner::catalog::{
@@ -171,10 +171,7 @@ impl ParquetCatalog {
             let (version, logged) =
                 match TableLog::new(&*catalog.store, &manifest_entry.name).read_latest()? {
                     Some(current) => (current.version, current.files),
-                    None => {
-                        let listed = catalog.data_files(&manifest_entry.location)?;
-                        (0, listed.iter().map(LoggedFile::from).collect())
-                    }
+                    None => (0, catalog.data_files(&manifest_entry.location)?),
                 };
             let files = catalog.fetch_files(&manifest_entry.location, &logged)?;
             let entry = TableEntry::new(manifest_entry, TableState::new(version, files));
@@ -206,7 +203,7 @@ impl ParquetCatalog {
 
     /// The data files of `name`'s current in-memory version (logged name +
     /// size each). What a compacter scans for merge candidates.
-    pub fn table_files(&self, name: &str) -> Option<Vec<LoggedFile>> {
+    pub fn table_files(&self, name: &str) -> Option<Vec<FileRef>> {
         self.tables
             .read()
             .unwrap()
@@ -232,12 +229,12 @@ impl ParquetCatalog {
         })
     }
 
-    /// Resolve logged files of table `name` into fetchable [`DataFile`]s (e.g.
-    /// for a compaction read). `None` when no such table exists.
+    /// Locate `files` of table `name` for a fetch (e.g. a compaction read).
+    /// `None` when no such table exists.
     pub fn resolve_data_files(
         &self,
         name: &str,
-        files: &[LoggedFile],
+        files: &[FileRef],
     ) -> Result<Option<Vec<DataFile>>> {
         let Some(location) = self
             .tables
@@ -285,7 +282,7 @@ impl ParquetCatalog {
             (entry.location.clone(), known)
         };
         let target = log.read(latest_version)?;
-        let missing: Vec<LoggedFile> = target
+        let missing: Vec<FileRef> = target
             .files
             .iter()
             .filter(|f| !known.contains(&f.name))
@@ -322,7 +319,7 @@ impl ParquetCatalog {
                 return Ok(RegisterOutcome::LocationMismatch);
             }
         }
-        let logged = LoggedFile {
+        let logged = FileRef {
             name: path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -330,7 +327,6 @@ impl ParquetCatalog {
             size: std::fs::metadata(path)?.len(),
         };
         let data_file = DataFile {
-            name: logged.name.clone(),
             size: logged.size,
             source: DataFileSource::Local(path.to_path_buf()),
         };
@@ -363,7 +359,7 @@ impl ParquetCatalog {
         &self,
         name: &str,
         removed: &[String],
-        added: &[LoggedFile],
+        added: &[FileRef],
     ) -> Result<bool> {
         let resolved = match self.resolve_data_files(name, added)? {
             Some(resolved) => resolved,
@@ -398,7 +394,7 @@ impl ParquetCatalog {
     fn commit_change(
         &self,
         name: &str,
-        mut change: impl FnMut(&mut Vec<LoggedFile>) -> Option<()>,
+        mut change: impl FnMut(&mut Vec<FileRef>) -> Option<()>,
     ) -> Result<(TableVersion, Committed)> {
         let log = TableLog::new(&*self.store, name);
         loop {
@@ -487,8 +483,8 @@ impl ParquetCatalog {
         }
 
         let location = self.locate(&request)?;
-        let files = self.data_files(&location)?;
-        let logged: Vec<LoggedFile> = files.iter().map(LoggedFile::from).collect();
+        let logged = self.data_files(&location)?;
+        let datafiles = self.resolve_files(&location, &logged)?;
         let manifest_entry = ManifestEntry {
             name: request.name,
             columns: request.columns,
@@ -503,7 +499,7 @@ impl ParquetCatalog {
         let store = self.store.clone();
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
-            &files,
+            &datafiles,
             move |loaded: LoadedFiles| {
                 let mut map = tables.write().unwrap();
                 if map.contains_key(&manifest_entry.name) {
@@ -571,7 +567,7 @@ impl ParquetCatalog {
     /// empty/absent location yields no files. Used where the *directory* is
     /// the source of truth: `CREATE TABLE`, and reloading a legacy table with
     /// no log.
-    fn data_files(&self, location: &str) -> Result<Vec<DataFile>> {
+    fn data_files(&self, location: &str) -> Result<Vec<FileRef>> {
         if Path::new(location).is_absolute() {
             return Ok(store::local_parquet_files(Path::new(location))?);
         }
@@ -579,20 +575,19 @@ impl ParquetCatalog {
             .store
             .list(location)?
             .into_iter()
-            .filter(|object| object.key.ends_with(".parquet"))
-            .map(|object| self.store.data_file(&object.key, object.size))
-            .collect::<crate::store::Result<Vec<_>>>()?)
+            .filter(|file| file.name.ends_with(".parquet"))
+            .collect())
     }
 
-    /// Resolve logged files (name + size) at `location` into fetchable
-    /// [`DataFile`]s. The mirror of [`data_files`](Self::data_files) for when
-    /// the *log* is the source of truth.
-    fn resolve_files(&self, location: &str, files: &[LoggedFile]) -> Result<Vec<DataFile>> {
+    /// Locate `files` at `location` for the footer fetch: each [`FileRef`]
+    /// paired with where its bytes live. The mirror of
+    /// [`data_files`](Self::data_files) for when the *log* is the source of
+    /// truth.
+    fn resolve_files(&self, location: &str, files: &[FileRef]) -> Result<Vec<DataFile>> {
         if Path::new(location).is_absolute() {
             return Ok(files
                 .iter()
                 .map(|f| DataFile {
-                    name: f.name.clone(),
                     size: f.size,
                     source: DataFileSource::Local(Path::new(location).join(&f.name)),
                 })
@@ -611,7 +606,7 @@ impl ParquetCatalog {
     /// Fetch the footers of `files` at `location` (in parallel over the
     /// dispatch pool — a pipeline breaker, coordinator-only) into per-file
     /// state, in logged order.
-    fn fetch_files(&self, location: &str, files: &[LoggedFile]) -> Result<Vec<TableFile>> {
+    fn fetch_files(&self, location: &str, files: &[FileRef]) -> Result<Vec<TableFile>> {
         let resolved = self.resolve_files(location, files)?;
         let row_groups = self.load_per_file(&resolved)?;
         Ok(files

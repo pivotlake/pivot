@@ -42,24 +42,26 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// One object returned by [`ObjectStore::list`]: its key (relative to the store
-/// root) and size in bytes. The size lets a remote reader locate a Parquet
-/// footer without a separate HEAD.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ObjectMeta {
-    pub key: String,
+/// A table's data file: its name within the table's data location and its size
+/// in bytes. The single durable file identity — the [table log] records a
+/// `Vec<FileRef>`, [`ObjectStore::list`] returns these, and the catalog and
+/// compacter speak them. The size lets a reader locate a Parquet footer without
+/// a separate HEAD/`stat`.
+///
+/// [table log]: crate::table_log
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileRef {
+    pub name: String,
     pub size: u64,
 }
 
-/// One Parquet data file of a table, ready for the metadata fetcher: its name
-/// within the table's data location (the identity the
-/// [table log](crate::table_log) records — local and remote alike), its total
-/// size in bytes (locates the footer without a `stat`/HEAD), and where its
-/// bytes live. Produced by [`ObjectStore::data_file`] or
-/// [`local_parquet_files`].
+/// A [`FileRef`] located for reading: its size (locates the footer without a
+/// `stat`/HEAD) and where its bytes live. Produced transiently by
+/// [`ObjectStore::data_file`] / [`local_parquet_files`] and consumed straight by
+/// the metadata fetcher — never stored. The file's *name* isn't needed to read
+/// it; it stays in the [`FileRef`] the caller already holds.
 #[derive(Clone, Debug)]
 pub struct DataFile {
-    pub name: String,
     pub size: u64,
     pub source: DataFileSource,
 }
@@ -75,15 +77,9 @@ pub enum DataFileSource {
 }
 
 impl DataFile {
-    /// A data file on the local filesystem, named after its path's final
-    /// component.
+    /// A data file on the local filesystem.
     pub fn local(path: PathBuf, size: u64) -> Self {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         Self {
-            name,
             size,
             source: DataFileSource::Local(path),
         }
@@ -114,9 +110,9 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// the caller's goal (key absent) is already met.
     fn delete(&self, key: &str) -> Result<()>;
 
-    /// List objects directly under `prefix` (one level, not recursive), as keys
-    /// (relative to the root) paired with their sizes.
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
+    /// List objects directly under `prefix` (one level, not recursive), as
+    /// [`FileRef`]s (name within `prefix`, paired with size).
+    fn list(&self, prefix: &str) -> Result<Vec<FileRef>>;
 
     /// How the io_uring reader should fetch object `key` (`size` bytes): a local
     /// backend yields a filesystem path, a remote one a presigned GET URL. The
@@ -142,10 +138,11 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     }
 }
 
-/// The `*.parquet` files directly under a local directory, each as a local
-/// [`DataFile`] carrying its size. A missing directory yields none. This is how
-/// a local table's data files are enumerated for the metadata-fetch dataflow.
-pub fn local_parquet_files(dir: &Path) -> std::io::Result<Vec<DataFile>> {
+/// The `*.parquet` files directly under a local directory, each as a
+/// [`FileRef`] (name + size). A missing directory yields none. This is how a
+/// local table's data files are enumerated; the catalog locates each for the
+/// metadata-fetch dataflow.
+pub fn local_parquet_files(dir: &Path) -> std::io::Result<Vec<FileRef>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -156,7 +153,10 @@ pub fn local_parquet_files(dir: &Path) -> std::io::Result<Vec<DataFile>> {
         if path.extension().is_some_and(|ext| ext == "parquet") {
             let meta = entry.metadata()?;
             if meta.is_file() {
-                files.push(DataFile::local(path, meta.len()));
+                files.push(FileRef {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    size: meta.len(),
+                });
             }
         }
     }

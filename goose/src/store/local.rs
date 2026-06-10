@@ -1,7 +1,7 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFile, DataFileSource, ObjectMeta, ObjectStore, Result, StoreError};
+use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError};
 use std::path::PathBuf;
 
 /// The local-filesystem backend: keys are paths under `root`.
@@ -93,7 +93,7 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+    fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -117,8 +117,8 @@ impl ObjectStore for LocalStore {
                 source,
             })?;
             if let Some(name) = entry.file_name().to_str() {
-                objects.push(ObjectMeta {
-                    key: format!("{}/{}", prefix.trim_end_matches('/'), name),
+                objects.push(FileRef {
+                    name: name.to_string(),
                     size: meta.len(),
                 });
             }
@@ -128,7 +128,6 @@ impl ObjectStore for LocalStore {
 
     fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
         Ok(DataFile {
-            name: super::key_name(key),
             size,
             source: DataFileSource::Local(self.path_for(key)),
         })

@@ -4,7 +4,7 @@
 //! `WITH (path = …)` directories on the local filesystem), so it inherits the
 //! trait's default [`data_file`](ObjectStore::data_file).
 
-use super::{ObjectMeta, ObjectStore, Result};
+use super::{FileRef, ObjectStore, Result};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -47,7 +47,7 @@ impl ObjectStore for MemoryStore {
         Ok(())
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+    fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
         let prefix = format!("{}/", prefix.trim_end_matches('/'));
         Ok(self
             .objects
@@ -55,8 +55,8 @@ impl ObjectStore for MemoryStore {
             .unwrap()
             .iter()
             .filter(|(key, _)| key.starts_with(&prefix))
-            .map(|(key, bytes)| ObjectMeta {
-                key: key.clone(),
+            .map(|(key, bytes)| FileRef {
+                name: super::key_name(key),
                 size: bytes.len() as u64,
             })
             .collect())
@@ -80,14 +80,14 @@ mod tests {
             .list("a")
             .unwrap()
             .into_iter()
-            .map(|o| (o.key, o.size))
+            .map(|o| (o.name, o.size))
             .collect();
         under_a.sort();
         assert_eq!(
             under_a,
             vec![
-                ("a/x.parquet".to_string(), 5),
-                ("a/y.parquet".to_string(), 1),
+                ("x.parquet".to_string(), 5),
+                ("y.parquet".to_string(), 1),
             ]
         );
     }

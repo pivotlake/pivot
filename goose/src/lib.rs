@@ -25,4 +25,4 @@ pub mod table_log;
 
 pub use catalog::{Error, ParquetCatalog, RegisterOutcome, Result, TableBinding, TableStore};
 pub use manifest::ManifestEntry;
-pub use table_log::LoggedFile;
+pub use store::FileRef;

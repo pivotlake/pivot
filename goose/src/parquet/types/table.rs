@@ -111,8 +111,7 @@ impl ParquetTable {
 
     /// Build a table from remote files: concrete fetchable URLs paired with
     /// their total size (from the store listing), which locates each footer.
-    /// Each file is named after its URL's final path segment. Same coordinator
-    /// requirement as [`from_directory`](Self::from_directory).
+    /// Same coordinator requirement as [`from_directory`](Self::from_directory).
     pub fn from_remote_files(
         dispatcher: &DataFlowDispatcher,
         files: &[(Url, u64)],
@@ -121,11 +120,6 @@ impl ParquetTable {
             .iter()
             .cloned()
             .map(|(url, size)| DataFile {
-                name: url
-                    .path_segments()
-                    .and_then(|mut s| s.next_back())
-                    .unwrap_or_default()
-                    .to_string(),
                 size,
                 source: crate::store::DataFileSource::Remote(url),
             })

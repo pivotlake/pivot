@@ -6,14 +6,14 @@ use std::sync::Arc;
 use crate::catalog::TableBinding;
 use crate::manifest::ManifestEntry;
 use crate::parquet::{ParquetTable, RowGroupMetadata};
-use crate::table_log::LoggedFile;
+use crate::store::FileRef;
 use planner::catalog::Column;
 
-/// One data file of a table state: its logged identity paired with its
+/// One data file of a table state: its identity ([`FileRef`]) paired with its
 /// materialized row groups (file-local order).
 #[derive(Clone)]
 pub(super) struct TableFile {
-    pub(super) logged: LoggedFile,
+    pub(super) logged: FileRef,
     pub(super) row_groups: Vec<Arc<RowGroupMetadata>>,
 }
 
@@ -57,9 +57,9 @@ impl TableState {
         &self.files
     }
 
-    /// The file list in logged form — what a commit on top of this state
+    /// The file list as [`FileRef`]s — what a commit on top of this state
     /// builds on, and what a compacter scans.
-    pub(super) fn logged_files(&self) -> Vec<LoggedFile> {
+    pub(super) fn logged_files(&self) -> Vec<FileRef> {
         self.files.iter().map(|f| f.logged.clone()).collect()
     }
 }

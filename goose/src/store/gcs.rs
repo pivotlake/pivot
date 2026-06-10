@@ -8,7 +8,7 @@
 //! identity on Google compute). RS256 signing uses `ring`; everything is
 //! synchronous, no async runtime.
 
-use super::{DataFile, DataFileSource, ObjectMeta, ObjectStore, Result, StoreError, join_prefix};
+use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError, join_prefix};
 use base64::Engine;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -252,7 +252,7 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+    fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
         let token = self.bearer()?;
         let object_prefix = join_prefix(&self.prefix, prefix);
         let url = format!(
@@ -270,16 +270,11 @@ impl ObjectStore for GcsStore {
             .into_json()
             .map_err(|e| StoreError::Http(format!("GCS LIST parse: {e}")))?;
 
-        let strip = if self.prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", self.prefix.trim_matches('/'))
-        };
         body.items
             .into_iter()
             .map(|it| {
-                Ok(ObjectMeta {
-                    key: it.name.strip_prefix(&strip).unwrap_or(&it.name).to_string(),
+                Ok(FileRef {
+                    name: super::key_name(&it.name),
                     size: it.size.parse().map_err(|_| {
                         StoreError::Http(format!(
                             "GCS LIST: bad size `{}` for {}",
@@ -293,7 +288,6 @@ impl ObjectStore for GcsStore {
 
     fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
         Ok(DataFile {
-            name: super::key_name(key),
             size,
             source: DataFileSource::Remote(self.presign_get(key)?),
         })

@@ -41,7 +41,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dispatch::Projection;
 use goose::parquet::{ParquetTable, table_input};
-use goose::{LoggedFile, ParquetCatalog};
+use goose::{FileRef, ParquetCatalog};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
@@ -170,9 +170,9 @@ impl Compacter {
     /// doing (no table, fewer than two small files, or not enough bytes for a
     /// full output yet — merging earlier would just rewrite the same rows
     /// again on the next flush).
-    fn next_batch(&self, table: &str) -> Option<Vec<LoggedFile>> {
+    fn next_batch(&self, table: &str) -> Option<Vec<FileRef>> {
         let files = self.catalog.table_files(table)?;
-        let mut small: Vec<LoggedFile> = files
+        let mut small: Vec<FileRef> = files
             .into_iter()
             .filter(|f| f.size < self.target_bytes)
             .collect();
@@ -213,7 +213,7 @@ impl CompactJob {
     /// Decode `inputs` and re-encode them as one stream of target-sized row
     /// groups — a single scan→encode dataflow — then commit: write the merged
     /// file(s), swap them for the inputs in the table log, delete the inputs.
-    fn compact(self, inputs: Vec<LoggedFile>) -> Result<Vec<LoggedFile>, String> {
+    fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, String> {
         let dispatcher = self.catalog.dispatcher().clone();
         let resolved = self
             .catalog
@@ -237,7 +237,7 @@ impl CompactJob {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut outputs: Vec<LoggedFile> = Vec::new();
+        let mut outputs: Vec<FileRef> = Vec::new();
         for (idx, bytes) in
             parquet_writing::encode(scan, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE).enumerate()
         {
@@ -257,7 +257,7 @@ impl CompactJob {
                 remove_all(&data, &outputs);
                 return Err(format!("writing {name}: {e}"));
             }
-            outputs.push(LoggedFile {
+            outputs.push(FileRef {
                 name,
                 size: bytes.len() as u64,
             });
@@ -294,7 +294,7 @@ impl CompactJob {
 }
 
 /// Best-effort cleanup of staged (never-logged, hence invisible) outputs.
-fn remove_all(data: &goose::TableStore, files: &[LoggedFile]) {
+fn remove_all(data: &goose::TableStore, files: &[FileRef]) {
     for file in files {
         let _ = data.delete(&file.name);
     }

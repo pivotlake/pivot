@@ -6,7 +6,7 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFile, DataFileSource, ObjectMeta, ObjectStore, Result, StoreError, join_prefix};
+use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError, join_prefix};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -205,7 +205,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
+    fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
         let object_prefix = join_prefix(&self.prefix, prefix);
         // ListObjectsV2, one level (delimiter=/), under the object prefix.
         let query = format!(
@@ -225,17 +225,11 @@ impl ObjectStore for S3Store {
         let parsed: ListBucketResult = quick_xml::de::from_str(&body)
             .map_err(|e| StoreError::Http(format!("LIST parse: {e}")))?;
 
-        // Strip the in-bucket prefix so callers get catalog-relative keys.
-        let strip = if self.prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", self.prefix.trim_matches('/'))
-        };
         Ok(parsed
             .contents
             .into_iter()
-            .map(|c| ObjectMeta {
-                key: c.key.strip_prefix(&strip).unwrap_or(&c.key).to_string(),
+            .map(|c| FileRef {
+                name: super::key_name(&c.key),
                 size: c.size,
             })
             .collect())
@@ -243,7 +237,6 @@ impl ObjectStore for S3Store {
 
     fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
         Ok(DataFile {
-            name: super::key_name(key),
             size,
             source: DataFileSource::Remote(self.presign_get(key)?),
         })

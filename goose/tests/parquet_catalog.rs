@@ -426,7 +426,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
     let removed = vec!["data.parquet".to_string(), "extra.parquet".to_string()];
-    let added = vec![goose::LoggedFile {
+    let added = vec![goose::FileRef {
         name: "merged.parquet".to_string(),
         size: merged_size,
     }];
@@ -504,7 +504,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     // "Compact" data.parquet into merged.parquet but crash before deleting the
     // input: both files are on disk, only merged is in the log.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![goose::LoggedFile {
+    let added = vec![goose::FileRef {
         name: "merged.parquet".to_string(),
         size: std::fs::metadata(&merged).unwrap().len(),
     }];
