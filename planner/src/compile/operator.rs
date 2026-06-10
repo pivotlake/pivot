@@ -312,20 +312,33 @@ impl Aggregate {
             unreachable!("checked by simple_count")
         };
         let col = group.column_idx;
+        // Same dedicated count value as group_by_count, but with the top-k /
+        // bare-limit hints attached: a count feeding `ORDER BY c DESC LIMIT k`
+        // emits only each partition's top k rows instead of every group, and a
+        // bare LIMIT stops the merge early.
+        let slots = vec![dispatch::AggregationSlot::new(
+            dispatch::AggregationKind::CountStar,
+            0,
+        )];
+        macro_rules! count_key {
+            ($K:ty) => {
+                Ok(
+                    input.group_by_aggregate_limited::<$K, dispatch::Compiled<(dispatch::Count,)>>(
+                        vec![col],
+                        slots,
+                        self.top_k,
+                        self.output_limit,
+                        (),
+                    ),
+                )
+            };
+        }
         match &group.return_type {
-            Type::Int8 => {
-                Ok(input.group_by_count::<IntKeyExtractor<arrow_array::types::Int8Type>>(col))
-            }
-            Type::Int16 => {
-                Ok(input.group_by_count::<IntKeyExtractor<arrow_array::types::Int16Type>>(col))
-            }
-            Type::Int32 => {
-                Ok(input.group_by_count::<IntKeyExtractor<arrow_array::types::Int32Type>>(col))
-            }
-            Type::Int64 => {
-                Ok(input.group_by_count::<IntKeyExtractor<arrow_array::types::Int64Type>>(col))
-            }
-            Type::Utf8 => Ok(input.group_by_count::<StringKeyExtractor>(col)),
+            Type::Int8 => count_key!(IntKeyExtractor<arrow_array::types::Int8Type>),
+            Type::Int16 => count_key!(IntKeyExtractor<arrow_array::types::Int16Type>),
+            Type::Int32 => count_key!(IntKeyExtractor<arrow_array::types::Int32Type>),
+            Type::Int64 => count_key!(IntKeyExtractor<arrow_array::types::Int64Type>),
+            Type::Utf8 => count_key!(StringKeyExtractor),
             dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
         }
     }
