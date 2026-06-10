@@ -22,7 +22,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::values::{ValueColumns, ValueExtractor};
+use crate::operations::unary::group::values::{AggregationSlot, ValueColumns, ValueExtractor};
 
 use super::Result;
 
@@ -115,7 +115,7 @@ where
     Snd: Sender<RecordBatch>,
 {
     let (mut fields, mut columns) = keys.finish(arena, allocator);
-    let (value_fields, value_columns) = values.finish();
+    let (value_fields, value_columns) = values.finish(arena);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -131,6 +131,7 @@ fn emit_chunks<K, V, Snd, I>(
     arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
+    value_slots: &[AggregationSlot],
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -143,7 +144,7 @@ where
     while remaining > 0 {
         let chunk = remaining.min(OUTPUT_CHUNK_ROWS);
         let mut keys = K::Columns::with_capacity(allocator, chunk, key_config);
-        let mut values = V::Columns::with_capacity(allocator, chunk);
+        let mut values = V::Columns::with_capacity(allocator, chunk, value_slots);
         for _ in 0..chunk {
             let (key, value) = rows.next().expect("iterator yields `total` items");
             keys.push(&key);
@@ -161,6 +162,7 @@ where
 /// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
 /// `ORDER BY <value_slot> DESC LIMIT limit`; only this partition's top-`limit`
 /// rows are emitted in that case.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
     arena: &Arc<SharedArena>,
@@ -168,6 +170,7 @@ pub(crate) fn build_and_send<K, V, S, Snd>(
     top_k: Option<(usize, usize)>,
     count_only: bool,
     key_config: &K::Config,
+    value_slots: &[AggregationSlot],
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -200,13 +203,22 @@ where
                 arena,
                 allocator,
                 key_config,
+                value_slots,
                 sender,
             )
         }
         _ => {
             let total = table.len();
             let rows = table.iter(0).map(|e| (*e.key(), *e.value()));
-            emit_chunks::<K, V, Snd, _>(rows, total, arena, allocator, key_config, sender)
+            emit_chunks::<K, V, Snd, _>(
+                rows,
+                total,
+                arena,
+                allocator,
+                key_config,
+                value_slots,
+                sender,
+            )
         }
     }
 }
