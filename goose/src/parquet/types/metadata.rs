@@ -14,6 +14,7 @@ use arrow_schema::SchemaRef;
 use dispatch::io::{FileLocation, RemoteFile};
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,8 +24,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// this to key the cache and to tell the fetcher which kind of IO to issue.
 #[derive(Clone)]
 pub enum FileSource {
-    /// An open local file. The `Arc<File>` keeps the fd alive for the cache.
-    Local(Arc<File>),
+    /// An open local file. The `Arc<File>` keeps the fd alive for the cache;
+    /// the path identifies the file (so a newly-registered or compacted-away
+    /// file can be matched to its row groups).
+    Local { file: Arc<File>, path: Arc<PathBuf> },
     /// A remote object addressed by an (already DNS-resolved, possibly
     /// presigned) URL.
     Remote(Arc<RemoteFile>),
@@ -34,8 +37,16 @@ impl FileSource {
     /// The [`FileLocation`] used to key the file cache and select the IO path.
     pub fn location(&self) -> FileLocation {
         match self {
-            FileSource::Local(file) => FileLocation::Local(file.as_raw_fd()),
+            FileSource::Local { file, .. } => FileLocation::Local(file.as_raw_fd()),
             FileSource::Remote(remote) => FileLocation::Remote(remote.clone()),
+        }
+    }
+
+    /// The filesystem path of a local source, `None` for a remote one.
+    pub fn local_path(&self) -> Option<&Path> {
+        match self {
+            FileSource::Local { path, .. } => Some(path),
+            FileSource::Remote(_) => None,
         }
     }
 }

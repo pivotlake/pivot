@@ -12,10 +12,14 @@
 //! # Shape
 //!
 //! - `ParquetSink` buffers Arrow batches for one stream and
-//!   flushes one Parquet file per drain.
+//!   flushes one Parquet file per drain, registering it with the catalog so
+//!   the rows are queryable at once.
 //! - The `otel` module turns each OTLP signal (logs / traces / metrics) into
 //!   batches and feeds a sink. Which signals run is configuration, not code:
 //!   see [`OtelConfig`].
+//! - The `compact` module merges a sink's small files into target-sized ones
+//!   in the background (decode + re-encode both on the dispatch pool) and
+//!   swaps them atomically through the catalog.
 //! - [`Ingestor`] is the lifecycle handle the server holds: [`Ingestor::start`]
 //!   launches every configured source; [`Ingestor::shutdown`] stops the
 //!   receivers and flushes whatever is still buffered **before** the dispatch
@@ -24,10 +28,15 @@
 //! # Querying the output
 //!
 //! Each sink writes flat Parquet files into one directory, so the stream is
-//! queryable with `CREATE TABLE <name> (...) WITH (path = '<dir>')`. Files
-//! flushed after the `CREATE TABLE` are not visible until the table is
-//! (re)created — the catalog snapshots a directory at creation time.
+//! queryable with `CREATE TABLE <name> (...) WITH (path = '<dir>')`, where
+//! `<name>` is the sink's name (e.g. `otel_logs`) and `<dir>` its (absolute)
+//! destination. When the server hands [`Ingestor::start`] its catalog, each
+//! flushed file is *registered* with that table, so rows become queryable as
+//! soon as they land — no re-`CREATE` needed. Files flushed before the
+//! `CREATE TABLE` are picked up by the create itself (it snapshots the
+//! directory).
 
+mod compact;
 mod otel;
 mod parquet_writing;
 mod sink;
@@ -35,11 +44,13 @@ mod sink;
 use std::sync::Arc;
 
 use dispatch::DataFlowDispatcher;
+use goose::ParquetCatalog;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
+pub use compact::DEFAULT_COMPACT_BYTES;
 pub use otel::{ConfigError, DEFAULT_OTLP_ADDR, OtelConfig, Signal};
 pub use sink::SinkDestination;
 
@@ -74,6 +85,7 @@ impl Ingestor {
     pub fn start(
         configs: Vec<IngestConfig>,
         dispatcher: DataFlowDispatcher,
+        catalog: Option<Arc<ParquetCatalog>>,
     ) -> std::io::Result<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -89,7 +101,7 @@ impl Ingestor {
                         );
                         continue;
                     }
-                    let server = OtelServer::build(&cfg, &dispatcher)?;
+                    let server = OtelServer::build(&cfg, &dispatcher, catalog.as_ref())?;
                     info!(
                         addr = %server.addr,
                         logs = cfg.logs.is_some(),
@@ -108,6 +120,13 @@ impl Ingestor {
                             cfg.flush_interval,
                             shutdown_tx.subscribe(),
                         ));
+                    }
+
+                    // Per-sink compaction loops. Joined on shutdown like the
+                    // timers: an in-flight merge encodes on the dispatch
+                    // workers, so it must finish before they are torn down.
+                    for compacter in server.compacters {
+                        tasks.push(tokio::spawn(compacter.run(shutdown_tx.subscribe())));
                     }
 
                     let addr = server.addr;
@@ -237,11 +256,13 @@ mod tests {
         }
     }
 
-    /// Flush `requests` (one batch each) through a sink as a single flush.
+    /// Flush `requests` (one batch each) through a sink as a single flush,
+    /// registering the file with `catalog` when one is given.
     fn write_logs(
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
         requests: &[ExportLogsServiceRequest],
+        catalog: Option<Arc<goose::ParquetCatalog>>,
     ) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -251,8 +272,15 @@ mod tests {
             let dest = SinkDestination::Local(dir.to_path_buf());
             // usize::MAX threshold: appends never auto-flush, so one flush_now
             // writes all `requests` as a single multi-row-group file.
-            let sink =
-                ParquetSink::new("otel_logs", &dest, usize::MAX, dispatcher.clone()).unwrap();
+            let sink = ParquetSink::new(
+                "otel_logs",
+                &dest,
+                usize::MAX,
+                dispatcher.clone(),
+                catalog,
+                None,
+            )
+            .unwrap();
             for request in requests {
                 sink.append(otel::logs_item_for_test(request.clone())).await;
             }
@@ -260,16 +288,70 @@ mod tests {
         });
     }
 
-    /// Load the written directory back into a `ParquetTable` (on a worker).
+    /// Flush each request as its **own** Parquet file through one sink (one
+    /// flush per request), registering each with `catalog`.
+    fn flush_each(
+        dispatcher: &DataFlowDispatcher,
+        dir: &Path,
+        requests: &[ExportLogsServiceRequest],
+        catalog: Option<Arc<goose::ParquetCatalog>>,
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dest = SinkDestination::Local(dir.to_path_buf());
+            let sink = ParquetSink::new(
+                "otel_logs",
+                &dest,
+                usize::MAX,
+                dispatcher.clone(),
+                catalog,
+                None,
+            )
+            .unwrap();
+            for request in requests {
+                sink.append(otel::logs_item_for_test(request.clone())).await;
+                sink.flush_now().await;
+            }
+        });
+    }
+
+    /// `CREATE TABLE otel_logs (...) WITH (path = dir)` against `catalog`, the
+    /// way the server would run it. The declared columns don't matter to these
+    /// tests (they assert on the Parquet row groups, not the logical schema).
+    fn create_catalog_table(
+        catalog: &Arc<goose::ParquetCatalog>,
+        dispatcher: &DataFlowDispatcher,
+        dir: &Path,
+    ) {
+        use planner::catalog::{Catalog as _, Column, CreateTableRequest};
+        let request = CreateTableRequest {
+            name: "otel_logs".to_string(),
+            columns: vec![Column {
+                name: "Timestamp".to_string(),
+                col_type: planner::types::Type::Int64,
+            }],
+            options: std::collections::HashMap::from([(
+                "path".to_string(),
+                dir.to_str().unwrap().to_string(),
+            )]),
+            if_not_exists: false,
+        };
+        catalog
+            .create_table(request, dispatcher)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+    }
+
+    /// Load the written directory back into a `ParquetTable`. Drives the
+    /// metadata-fetch dataflow from this (coordinator) thread; the footer
+    /// reads themselves land on the workers.
     fn read_table(dispatch: &Dispatch, dir: &Path) -> Arc<ParquetTable> {
-        let dir = dir.to_path_buf();
-        Arc::new(
-            dispatch
-                .dispatcher()
-                .run_on_worker(move || ParquetTable::from_directory(&dir))
-                .unwrap()
-                .unwrap(),
-        )
+        Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir).unwrap())
     }
 
     fn parquet_file_count(dir: &Path) -> usize {
@@ -313,7 +395,7 @@ mod tests {
         let dispatch = Dispatch::spin_up(1, RING_BUFFERS);
         let dir = tempfile::tempdir().unwrap();
 
-        write_logs(dispatch.dispatcher(), dir.path(), &[log_request(3)]);
+        write_logs(dispatch.dispatcher(), dir.path(), &[log_request(3)], None);
         let table = read_table(&dispatch, dir.path());
         let batches = table_input(
             dispatch.dispatcher(),
@@ -350,12 +432,143 @@ mod tests {
         let dispatch = Dispatch::spin_up(workers, RING_BUFFERS);
         let dir = tempfile::tempdir().unwrap();
 
-        write_logs(dispatch.dispatcher(), dir.path(), &vec![log_request(2); 5]);
+        write_logs(
+            dispatch.dispatcher(),
+            dir.path(),
+            &vec![log_request(2); 5],
+            None,
+        );
         let table = read_table(&dispatch, dir.path());
 
         assert_eq!(parquet_file_count(dir.path()), 1);
         assert_eq!(table.row_groups().len(), 1);
         assert_eq!(table.row_groups()[0].num_rows, 10);
+
+        dispatch.exit();
+    }
+
+    /// A flush that lands after `CREATE TABLE` is registered with the catalog,
+    /// so its rows are visible to new binds without re-creating the table.
+    #[test]
+    fn flushed_file_is_registered_with_catalog_table() {
+        let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(goose::ParquetCatalog::new());
+        create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
+        assert!(
+            catalog
+                .parquet_table("otel_logs")
+                .unwrap()
+                .parquet
+                .row_groups()
+                .is_empty()
+        );
+
+        flush_each(
+            dispatch.dispatcher(),
+            dir.path(),
+            &[log_request(3), log_request(2)],
+            Some(catalog.clone()),
+        );
+
+        let table = catalog.parquet_table("otel_logs").unwrap();
+        let groups = table.parquet.row_groups();
+        assert_eq!(
+            groups.iter().map(|rg| rg.num_rows).sum::<i64>(),
+            5,
+            "both flushed files' rows should be registered"
+        );
+        assert!(
+            groups
+                .iter()
+                .enumerate()
+                .all(|(i, rg)| rg.global_row_group_idx == i)
+        );
+
+        dispatch.exit();
+    }
+
+    /// End-to-end compaction: several registered small files merge into one
+    /// (decode + re-encode on the dispatch pool), the catalog swaps to the
+    /// merged file atomically, the inputs are unlinked, and the merged file
+    /// decodes back to all the original rows.
+    #[test]
+    fn compaction_merges_registered_files_and_swaps_catalog() {
+        let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(goose::ParquetCatalog::new());
+        create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
+
+        flush_each(
+            dispatch.dispatcher(),
+            dir.path(),
+            &[log_request(3), log_request(2), log_request(4)],
+            Some(catalog.clone()),
+        );
+        assert_eq!(parquet_file_count(dir.path()), 3);
+
+        // Target = the three files' combined size: each is smaller than it
+        // (candidate) and together they reach it (trigger).
+        let total: u64 = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        let compacter = crate::compact::Compacter::new(
+            "otel_logs",
+            dir.path().to_path_buf(),
+            total,
+            dispatch.dispatcher().clone(),
+            catalog.clone(),
+        );
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(compacter.compact_eligible());
+
+        // One merged file replaced the three inputs, on disk and in the
+        // catalog, and indices stayed sequential.
+        assert_eq!(parquet_file_count(dir.path()), 1);
+        let table = catalog.parquet_table("otel_logs").unwrap();
+        let groups = table.parquet.row_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].num_rows, 9);
+        assert_eq!(groups[0].global_row_group_idx, 0);
+        assert!(
+            groups[0]
+                .source
+                .local_path()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("compacted")
+        );
+
+        // The merged file's contents round-trip through the engine's scan.
+        let reread = read_table(&dispatch, dir.path());
+        let batches = table_input(
+            dispatch.dispatcher(),
+            &reread,
+            Projection::all(NUM_LOG_COLUMNS),
+            false,
+        )
+        .collect()
+        .unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 9);
+        assert!(
+            i32_column(&batches, SEVERITY_NUMBER)
+                .iter()
+                .all(|&v| v == 9)
+        );
+        assert!(
+            str_column(&batches, SERVICE_NAME)
+                .iter()
+                .all(|v| v == "svc")
+        );
 
         dispatch.exit();
     }

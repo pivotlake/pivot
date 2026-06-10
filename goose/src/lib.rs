@@ -39,7 +39,7 @@ pub mod store;
 pub use manifest::ManifestEntry;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::parquet::{
@@ -209,6 +209,109 @@ impl ParquetCatalog {
         ))
     }
 
+    /// Register one newly-written local Parquet data file with table `name`,
+    /// making its rows visible to every query that binds the table from now on
+    /// (in-flight bindings keep the snapshot they cloned). This is how ingest
+    /// publishes each file it flushes without waiting for a re-`CREATE`.
+    ///
+    /// The file's footer is read over the dispatch worker pool *before* the
+    /// catalog lock is taken (so it must run on a coordinator thread, never
+    /// inside `run_on_worker`); only the in-memory append happens under the
+    /// write lock. Registering a path the table already holds is a no-op, so a
+    /// replayed notification can't double-count rows. The manifest is not
+    /// touched: it records the table's *location*, and a reload re-lists that
+    /// directory, so the new file's durability comes from the directory itself.
+    ///
+    /// The file must live in the table's data directory — and only a table over
+    /// an absolute local directory can accept one (a store-relative or remote
+    /// location is not where local files land); anything else is reported as
+    /// [`RegisterOutcome::LocationMismatch`] and the catalog is untouched.
+    pub fn register_data_file(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        name: &str,
+        path: &Path,
+    ) -> Result<RegisterOutcome> {
+        let loaded = ParquetTable::from_files(dispatcher, &[path])?;
+
+        let mut map = self.tables.write().unwrap();
+        let Some(table) = map.get_mut(name) else {
+            return Ok(RegisterOutcome::NoSuchTable);
+        };
+        if !file_in_table_dir(path, &table.location) {
+            return Ok(RegisterOutcome::LocationMismatch);
+        }
+        if table
+            .parquet
+            .row_groups()
+            .iter()
+            .any(|rg| rg.source.local_path() == Some(path))
+        {
+            return Ok(RegisterOutcome::AlreadyRegistered);
+        }
+        let mut combined = (*table.parquet).clone();
+        let offset = combined.row_groups().len();
+        combined
+            .row_groups_mut()
+            .extend(loaded.row_groups().iter().enumerate().map(|(i, rg)| {
+                let mut rg = (**rg).clone();
+                rg.global_row_group_idx = offset + i;
+                Arc::new(rg)
+            }));
+        table.parquet = Arc::new(combined);
+        Ok(RegisterOutcome::Registered)
+    }
+
+    /// Swap a set of table `name`'s local data files for another, atomically as
+    /// far as the catalog is concerned: drop the row groups of every file in
+    /// `removed`, append those of the (freshly-read) `added` files, and
+    /// renumber the global row-group indices. This is compaction's commit —
+    /// several small files become one merged file in a single step, so no
+    /// binding ever sees the rows doubled or missing. Queries already bound
+    /// keep their old snapshot; their open fds keep even an unlinked file's
+    /// bytes readable until they finish.
+    ///
+    /// Footers of `added` are read over the dispatch pool before the lock (same
+    /// coordinator requirement as
+    /// [`register_data_file`](Self::register_data_file)). Returns `false` when
+    /// no table named `name` exists.
+    pub fn replace_data_files(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        name: &str,
+        removed: &[PathBuf],
+        added: &[PathBuf],
+    ) -> Result<bool> {
+        let loaded = ParquetTable::from_files(dispatcher, added)?;
+        let removed: std::collections::HashSet<&Path> =
+            removed.iter().map(PathBuf::as_path).collect();
+
+        let mut map = self.tables.write().unwrap();
+        let Some(table) = map.get_mut(name) else {
+            return Ok(false);
+        };
+        let row_groups = table
+            .parquet
+            .row_groups()
+            .iter()
+            .filter(|rg| !rg.source.local_path().is_some_and(|p| removed.contains(p)))
+            .cloned()
+            .chain(loaded.row_groups().iter().cloned())
+            .enumerate()
+            .map(|(i, rg)| {
+                if rg.global_row_group_idx == i {
+                    rg
+                } else {
+                    let mut renumbered = (*rg).clone();
+                    renumbered.global_row_group_idx = i;
+                    Arc::new(renumbered)
+                }
+            })
+            .collect();
+        table.parquet = Arc::new(ParquetTable::new(row_groups));
+        Ok(true)
+    }
+
     /// The location stored for a new table: an explicit `path` (kept as given),
     /// or the table name under the database root.
     ///
@@ -252,6 +355,39 @@ impl ParquetCatalog {
             .filter(|object| object.key.ends_with(".parquet"))
             .map(|object| self.store.data_file(&object.key, object.size))
             .collect::<crate::store::Result<Vec<_>>>()?)
+    }
+}
+
+/// What [`ParquetCatalog::register_data_file`] did with the file. The non-
+/// `Registered` outcomes are not errors — a file can legitimately land before
+/// its table is created — but the caller (ingest) wants to log them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// Appended to the table; new binds see its rows.
+    Registered,
+    /// The table already holds this path (a replayed notification); no change.
+    AlreadyRegistered,
+    /// No table by that name exists yet; the file is picked up by a later
+    /// `CREATE TABLE` or restart instead.
+    NoSuchTable,
+    /// The table exists but its data does not live in this file's directory
+    /// (or is not an absolute local directory at all); refused.
+    LocationMismatch,
+}
+
+/// Whether `file` sits directly in the table data directory `location`. Only an
+/// absolute local location qualifies — a relative one lives inside the
+/// database's object store, which is not where a locally-written file is.
+/// Both sides are canonicalized so spelling differences don't refuse a
+/// legitimate registration.
+fn file_in_table_dir(file: &Path, location: &str) -> bool {
+    let dir = Path::new(location);
+    if !dir.is_absolute() {
+        return false;
+    }
+    match (std::fs::canonicalize(dir), file.parent()) {
+        (Ok(dir), Some(parent)) => std::fs::canonicalize(parent).is_ok_and(|p| p == dir),
+        _ => false,
     }
 }
 

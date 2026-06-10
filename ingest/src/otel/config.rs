@@ -71,6 +71,9 @@ impl OtelConfig {
         if let Some(size) = raw.max_decoding_message_size {
             cfg.max_decoding_message_size = size;
         }
+        if let Some(bytes) = raw.compact_bytes {
+            cfg.compact_bytes = bytes;
+        }
         cfg.logs = raw.logs.map(|s| s.into_setup(Signal::Logs)).transpose()?;
         cfg.traces = raw
             .traces
@@ -127,6 +130,8 @@ struct ReceiverToml {
     flush_rows: Option<usize>,
     flush_secs: Option<u64>,
     max_decoding_message_size: Option<usize>,
+    /// Compaction target in bytes (`0` disables). Default: 64 MiB.
+    compact_bytes: Option<u64>,
     logs: Option<SignalToml>,
     traces: Option<SignalToml>,
     metrics: Option<SignalToml>,

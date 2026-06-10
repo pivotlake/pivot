@@ -7,6 +7,10 @@ description = "Receivers that ingest external telemetry (OTLP today) and sink it
 [dependencies]
 dispatch = { path = "../dispatch" }
 thriftparquet = { path = "../thriftparquet" }
+# The catalog: each flushed Parquet file is registered with its table so new
+# rows are queryable immediately, and the compacter reads files back / swaps
+# them through it.
+goose = { path = "../goose" }
 
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
@@ -38,8 +42,9 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
-# The Parquet reader (now in catalog) — used to read back what the writer wrote.
-goose = { path = "../goose" }
+# `CreateTableRequest` etc., to set up catalog tables in the register/compact
+# integration tests.
+planner = { path = "../planner" }
 # Strict, spec-compliant reader used only as a test oracle: if arrow-rs's
 # reader accepts our hand-rolled files, other engines (DuckDB, etc.) will too.
 parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }

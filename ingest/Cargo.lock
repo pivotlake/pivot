@@ -1971,6 +1971,7 @@ dependencies = [
  "object_store",
  "opentelemetry-proto",
  "parquet",
+ "planner",
  "prost",
  "serde",
  "serde_json",

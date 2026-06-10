@@ -23,27 +23,29 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dispatch::DataFlowDispatcher;
+use goose::{ParquetCatalog, RegisterOutcome};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStore, PutPayload};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
+use crate::compact::Compacter;
 use crate::parquet_writing::{self, ToRecordBatch};
 
 /// Rows per Parquet row group. A flush's items are cut into row groups of about
 /// this many rows as they stream through the write pipeline.
-const ROW_GROUP_ROWS: usize = 128 * 1024;
+pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Row groups per Parquet file. Once this many accumulate, a file is emitted and
 /// written; the flush's remainder lands in a final, smaller file.
-const ROW_GROUPS_PER_FILE: usize = 8;
+pub(crate) const ROW_GROUPS_PER_FILE: usize = 8;
 
 /// Subdirectory (inside a local sink directory) where files are written before
 /// being atomically renamed into place. It is a directory, so
 /// `ParquetTable::from_directory` — which only looks at *files* in the top
 /// level — never tries to parse a half-written file.
-const INFLIGHT_DIR: &str = ".inflight";
+pub(crate) const INFLIGHT_DIR: &str = ".inflight";
 
 /// Where a sink writes its Parquet files.
 #[derive(Debug, Clone)]
@@ -112,11 +114,16 @@ impl Backend {
         }
     }
 
-    /// Write `bytes` as `file_name`, returning a printable location for logs.
-    /// Local writes go to the `.inflight` dir then atomically rename into place
-    /// (so a concurrent reader never sees a partial file); remote writes upload
-    /// directly.
-    async fn put(&self, file_name: &str, bytes: Vec<u8>) -> Result<String, String> {
+    /// Write `bytes` as `file_name`, returning a printable location for logs
+    /// plus — for a local write — the file's final path, which the caller
+    /// registers with the catalog. Local writes go to the `.inflight` dir then
+    /// atomically rename into place (so a concurrent reader never sees a
+    /// partial file); remote writes upload directly.
+    async fn put(
+        &self,
+        file_name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(String, Option<PathBuf>), String> {
         match self {
             Backend::Local { dir, inflight } => {
                 let final_path = dir.join(file_name);
@@ -131,7 +138,7 @@ impl Backend {
                 })
                 .await
                 .map_err(|e| format!("blocking write task: {e}"))??;
-                Ok(final_path.display().to_string())
+                Ok((final_path.display().to_string(), Some(final_path)))
             }
             Backend::Remote { store, prefix, url } => {
                 let path = prefix.child(file_name);
@@ -139,7 +146,7 @@ impl Backend {
                     .put(&path, PutPayload::from(bytes))
                     .await
                     .map_err(|e| format!("object store put: {e}"))?;
-                Ok(format!("{}/{}", url.trim_end_matches('/'), file_name))
+                Ok((format!("{}/{}", url.trim_end_matches('/'), file_name), None))
             }
         }
     }
@@ -182,12 +189,20 @@ pub(crate) trait Flushable: Send + Sync {
 /// share behind an `Arc`; all mutable state lives behind a `Mutex` so the gRPC
 /// handlers and the flush timer can both append.
 pub struct ParquetSink<T> {
-    /// Used as the file-name prefix and in log lines (e.g. `otel_logs`).
+    /// Used as the file-name prefix, in log lines, **and as the catalog table
+    /// name** each flushed file is registered under (e.g. `otel_logs`).
     name: String,
     backend: Backend,
     /// Flush once the buffer holds at least this many rows.
     flush_rows: usize,
     dispatcher: DataFlowDispatcher,
+    /// When present, every locally-written file is registered with the table
+    /// named [`name`](Self::name), so its rows are queryable immediately —
+    /// no re-`CREATE TABLE` needed.
+    catalog: Option<Arc<ParquetCatalog>>,
+    /// This sink's compacter, woken after each flush is registered so it can
+    /// merge small files once enough accumulate.
+    compacter: Option<Arc<Compacter>>,
     buffer: Mutex<Buffer<T>>,
     /// Monotonic file sequence, so two flushes in the same millisecond don't
     /// collide on a filename.
@@ -217,12 +232,16 @@ impl<T> ParquetSink<T> {
         destination: &SinkDestination,
         flush_rows: usize,
         dispatcher: DataFlowDispatcher,
+        catalog: Option<Arc<ParquetCatalog>>,
+        compacter: Option<Arc<Compacter>>,
     ) -> std::io::Result<Self> {
         Ok(Self {
             name: name.into(),
             backend: Backend::build(destination)?,
             flush_rows: flush_rows.max(1),
             dispatcher,
+            catalog,
+            compacter,
             buffer: Mutex::new(Buffer::default()),
             seq: AtomicU64::new(0),
         })
@@ -308,7 +327,12 @@ impl<T: ToRecordBatch> ParquetSink<T> {
                 .unwrap_or(0);
             let file_name = format!("{}-{}-{:06}.parquet", self.name, millis, seq);
             match self.backend.put(&file_name, bytes).await {
-                Ok(location) => info!(sink = %self.name, file = %location, "flushed parquet"),
+                Ok((location, local_path)) => {
+                    info!(sink = %self.name, file = %location, "flushed parquet");
+                    if let Some(path) = local_path {
+                        self.register(path).await;
+                    }
+                }
                 Err(e) => {
                     error!(sink = %self.name, file = %file_name, error = %e, "failed writing parquet")
                 }
@@ -319,6 +343,60 @@ impl<T: ToRecordBatch> ParquetSink<T> {
             Ok(Ok(())) => {}
             Ok(Err(e)) => error!(sink = %self.name, error = %e, "parquet write pipeline failed"),
             Err(e) => error!(sink = %self.name, error = %e, "write pipeline task panicked"),
+        }
+
+        // Every file of this flush is written and registered — let the
+        // compacter re-check whether enough small files piled up.
+        if let Some(compacter) = &self.compacter {
+            compacter.notify();
+        }
+    }
+
+    /// Register a freshly-written local file with the catalog table named after
+    /// this sink, making its rows queryable at once. Runs on a blocking thread:
+    /// the registration reads the file's footer by driving a dataflow (the
+    /// decode itself lands on the dispatch workers), which blocks the calling
+    /// thread. A failure only delays visibility — the file is in the table's
+    /// directory, so the next `CREATE TABLE`/restart still finds it — so it is
+    /// logged, never propagated.
+    async fn register(&self, path: PathBuf) {
+        let Some(catalog) = self.catalog.clone() else {
+            return;
+        };
+        let dispatcher = self.dispatcher.clone();
+        let table = self.name.clone();
+        let registered = tokio::task::spawn_blocking(move || {
+            let outcome = catalog.register_data_file(&dispatcher, &table, &path);
+            (outcome, path)
+        })
+        .await;
+        let (outcome, path) = match registered {
+            Ok(result) => result,
+            Err(e) => {
+                error!(sink = %self.name, error = %e, "catalog registration task panicked");
+                return;
+            }
+        };
+        match outcome {
+            Ok(RegisterOutcome::Registered) => {
+                info!(sink = %self.name, file = %path.display(), "registered parquet in catalog")
+            }
+            Ok(RegisterOutcome::AlreadyRegistered) => {}
+            Ok(RegisterOutcome::NoSuchTable) => {
+                debug!(
+                    sink = %self.name, file = %path.display(),
+                    "no catalog table for sink; file becomes visible at CREATE TABLE"
+                )
+            }
+            Ok(RegisterOutcome::LocationMismatch) => {
+                warn!(
+                    sink = %self.name, file = %path.display(),
+                    "catalog table location differs from sink directory; not registering"
+                )
+            }
+            Err(e) => {
+                error!(sink = %self.name, file = %path.display(), error = %e, "catalog registration failed")
+            }
         }
     }
 }

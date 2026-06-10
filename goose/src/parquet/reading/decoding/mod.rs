@@ -264,7 +264,10 @@ mod tests {
         let num_cols = schema.fields().len();
         let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
-            source: FileSource::Local(file),
+            source: FileSource::Local {
+                file,
+                path: Arc::new("/dev/null".into()),
+            },
             schema,
             columns: (0..num_cols)
                 .map(|_| ColumnChunkMeta {

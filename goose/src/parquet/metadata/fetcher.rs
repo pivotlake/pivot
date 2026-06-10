@@ -174,7 +174,11 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
             DataFileLocation::Local { path, size } => {
                 let file = open_direct_read(&path).map_err(crate::parquet::op_err)?;
                 let location = FileLocation::Local(file.as_raw_fd());
-                (location, FileSource::Local(Arc::new(file)), size as usize)
+                let source = FileSource::Local {
+                    file: Arc::new(file),
+                    path: Arc::new(path),
+                };
+                (location, source, size as usize)
             }
             DataFileLocation::Remote { url, size } => {
                 let remote = Arc::new(RemoteFile::open(url).map_err(crate::parquet::op_err)?);

@@ -47,7 +47,10 @@ pub(crate) mod test_utils {
 
     pub fn dummy_row_group() -> Arc<RowGroupMetadata> {
         Arc::new(RowGroupMetadata {
-            source: FileSource::Local(Arc::new(std::fs::File::open("/dev/null").unwrap())),
+            source: FileSource::Local {
+                file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+                path: Arc::new("/dev/null".into()),
+            },
             schema: Arc::new(Schema::empty()),
             columns: vec![],
             num_rows: 0,

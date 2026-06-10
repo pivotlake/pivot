@@ -2241,6 +2241,7 @@ dependencies = [
  "arrow-array 58.0.0",
  "arrow-schema 58.0.0",
  "dispatch",
+ "goose",
  "object_store",
  "opentelemetry-proto",
  "prost",

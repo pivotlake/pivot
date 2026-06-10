@@ -45,6 +45,18 @@ pub trait ToRecordBatch: Send + 'static {
     fn to_record_batch(self) -> Result<Option<arrow_array::RecordBatch>, ArrowError>;
 }
 
+/// A pre-built batch is its own conversion — compaction feeds the pipeline
+/// batches the scan dataflow already decoded, so stage 1 is a pass-through.
+impl ToRecordBatch for arrow_array::RecordBatch {
+    fn num_rows(&self) -> usize {
+        arrow_array::RecordBatch::num_rows(self)
+    }
+
+    fn to_record_batch(self) -> Result<Option<arrow_array::RecordBatch>, ArrowError> {
+        Ok((arrow_array::RecordBatch::num_rows(&self) > 0).then_some(self))
+    }
+}
+
 /// Carry a stage's `String` error (encode / assembly) onto the pipeline's
 /// `unary` error channel.
 fn to_arrow(e: String) -> ArrowError {

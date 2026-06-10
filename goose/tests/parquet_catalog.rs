@@ -10,7 +10,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
-use goose::{ParquetCatalog, ParquetCatalogTable};
+use goose::{ParquetCatalog, ParquetCatalogTable, RegisterOutcome};
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };
@@ -306,4 +306,176 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
         .unwrap();
 
     assert_eq!(row_group_count(&table), 3);
+}
+
+/// Write one Parquet file of `ids` (single row group) into `dir`, mirroring the
+/// `three_row_table` schema. Returns the file's path.
+fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8View, false),
+    ]));
+    let names: Vec<String> = ids.iter().map(|i| format!("n{i}")).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())) as ArrayRef,
+            Arc::new(StringViewArray::from(
+                names.iter().map(String::as_str).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let path = dir.join(file_name);
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    path
+}
+
+/// A file flushed after `CREATE TABLE` becomes visible to new binds once
+/// registered, with global row-group indices kept sequential.
+#[test]
+fn register_data_file_makes_new_file_visible_to_new_binds() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    assert_eq!(
+        catalog
+            .parquet_table("t")
+            .unwrap()
+            .parquet
+            .row_groups()
+            .len(),
+        3
+    );
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
+    assert_eq!(
+        catalog
+            .register_data_file(&dispatcher(), "t", &new_file)
+            .unwrap(),
+        RegisterOutcome::Registered
+    );
+
+    let table = catalog.parquet_table("t").unwrap();
+    let groups = table.parquet.row_groups();
+    assert_eq!(groups.len(), 4);
+    assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
+    assert!(
+        groups
+            .iter()
+            .enumerate()
+            .all(|(i, rg)| rg.global_row_group_idx == i)
+    );
+}
+
+/// Registering the same path twice (a replayed flush notification) must not
+/// double-count its rows.
+#[test]
+fn register_data_file_is_idempotent_per_path() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40]);
+    assert_eq!(
+        catalog
+            .register_data_file(&dispatcher(), "t", &new_file)
+            .unwrap(),
+        RegisterOutcome::Registered
+    );
+    assert_eq!(
+        catalog
+            .register_data_file(&dispatcher(), "t", &new_file)
+            .unwrap(),
+        RegisterOutcome::AlreadyRegistered
+    );
+
+    let table = catalog.parquet_table("t").unwrap();
+    assert_eq!(table.parquet.row_groups().len(), 4);
+}
+
+/// No table yet (ingest runs before `CREATE TABLE`): the registration reports
+/// `false` and the catalog is untouched.
+#[test]
+fn register_data_file_without_table_returns_false() {
+    let dir = TempDir::new().unwrap();
+    let catalog = Arc::new(ParquetCatalog::new());
+    let new_file = write_ids(dir.path(), "later.parquet", &[1]);
+    assert_eq!(
+        catalog
+            .register_data_file(&dispatcher(), "missing", &new_file)
+            .unwrap(),
+        RegisterOutcome::NoSuchTable
+    );
+}
+
+/// A file outside the table's data directory must not be appended to it.
+#[test]
+fn register_data_file_refuses_foreign_directory() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let elsewhere = TempDir::new().unwrap();
+    let foreign = write_ids(elsewhere.path(), "foreign.parquet", &[1]);
+    assert_eq!(
+        catalog
+            .register_data_file(&dispatcher(), "t", &foreign)
+            .unwrap(),
+        RegisterOutcome::LocationMismatch
+    );
+    assert_eq!(
+        catalog
+            .parquet_table("t")
+            .unwrap()
+            .parquet
+            .row_groups()
+            .len(),
+        3
+    );
+}
+
+/// Compaction's commit: the small files' row groups vanish, the merged file's
+/// appear, and indices are renumbered — one atomic swap of the master entry.
+#[test]
+fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    let extra = write_ids(dir.path(), "extra.parquet", &[40]);
+    assert_eq!(
+        catalog
+            .register_data_file(&dispatcher(), "t", &extra)
+            .unwrap(),
+        RegisterOutcome::Registered
+    );
+    assert_eq!(
+        catalog
+            .parquet_table("t")
+            .unwrap()
+            .parquet
+            .row_groups()
+            .len(),
+        4
+    );
+
+    let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
+    let removed = vec![dir.path().join("data.parquet"), extra];
+    assert!(
+        catalog
+            .replace_data_files(&dispatcher(), "t", &removed, &[merged])
+            .unwrap()
+    );
+
+    let table = catalog.parquet_table("t").unwrap();
+    let groups = table.parquet.row_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].num_rows, 4);
+    assert_eq!(groups[0].global_row_group_idx, 0);
 }
