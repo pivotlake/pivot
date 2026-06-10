@@ -87,9 +87,11 @@ mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 
 mod copy_out;
+mod limit;
 mod order_by_limit;
 
 pub use copy_out::CopyOutFactory;
+pub use limit::LimitFactory;
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
 #[derive(Debug, Error)]

@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -543,6 +544,39 @@ json build_top_n(duckdb::LogicalTopN *top_n, DynamicFilterDedup &df_dedup) {
 	    };
 }
 
+json build_limit(duckdb::LogicalLimit *limit) {
+	// Plain LIMIT/OFFSET (no ORDER BY fused in — that's LogicalTopN). Both
+	// values are BoundLimitNodes; only the constant (and absent) forms are
+	// supported. `LIMIT 10%` / `LIMIT (SELECT …)` stay unsupported.
+	json limit_val = nullptr;
+	switch (limit->limit_val.Type()) {
+	case duckdb::LimitNodeType::CONSTANT_VALUE:
+		limit_val = limit->limit_val.GetConstantValue();
+		break;
+	case duckdb::LimitNodeType::UNSET:
+		// `OFFSET m` without a LIMIT: serialized as null → unbounded.
+		break;
+	default:
+		throw UnsupportedPlanError("Unsupported LIMIT: only constant limits are supported");
+	}
+
+	duckdb::idx_t offset_val = 0;
+	switch (limit->offset_val.Type()) {
+	case duckdb::LimitNodeType::CONSTANT_VALUE:
+		offset_val = limit->offset_val.GetConstantValue();
+		break;
+	case duckdb::LimitNodeType::UNSET:
+		break;
+	default:
+		throw UnsupportedPlanError("Unsupported OFFSET: only constant offsets are supported");
+	}
+
+	return {
+	    {"limit", limit_val},
+	    {"offset", offset_val},
+	};
+}
+
 string create_table_option_to_string(duckdb::ParsedExpression &expr) {
     if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
         auto &value = expr.Cast<duckdb::ConstantExpression>().value;
@@ -784,6 +818,10 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
 		new_operator["data"] = build_top_n(&op->Cast<duckdb::LogicalTopN>(), df_dedup);
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_LIMIT: {
+		new_operator["data"] = build_limit(&op->Cast<duckdb::LogicalLimit>());
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE: {

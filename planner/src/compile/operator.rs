@@ -9,8 +9,8 @@ use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use crate::operator::{
-    Aggregate, CreateTable, DummyScan, Filter, Input, Materialize, OrderBy, OrderByDirection,
-    Projection, TopN,
+    Aggregate, CreateTable, DummyScan, Filter, Input, Limit, Materialize, OrderBy,
+    OrderByDirection, Projection, TopN,
 };
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
@@ -1577,6 +1577,20 @@ impl TopN {
             .as_ref()
             .map(|df| slot_for(slots, df.slot_id));
         Ok(input.order_by_limit_offset(orders, self.limit, self.offset, dynamic_filter))
+    }
+}
+
+impl Limit {
+    pub(crate) fn compile(
+        &self,
+        input: RecordBatchOperatorSpec,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        // Only the unordered shape reaches here — `Limit → OrderBy` was fused
+        // into a TopN during planning (except an unbounded `OFFSET`-only
+        // modifier, where the dispatch operator's `usize::MAX` convention
+        // applies and the sort below it emits a single batch whose order the
+        // limit stage preserves).
+        Ok(input.limit(self.limit.unwrap_or(usize::MAX), self.offset))
     }
 }
 
