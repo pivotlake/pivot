@@ -797,3 +797,199 @@ fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
         .plan("SELECT MIN(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }
+
+// ---- Multi-key grouping (row-encoded key extractor) ----
+
+#[rstest]
+fn group_by_int_and_string_keys(mut testing_planner: TestingPlanner) {
+    // Two-key (int, string) grouping with duplicates that fold: region 1
+    // pairs with "x" twice.
+    testing_planner.add_table(
+        "visits",
+        &[
+            ("region", Type::Int32, int_col(vec![1, 1, 2, 1])),
+            (
+                "site",
+                Type::Utf8,
+                crate::common::str_col(vec!["x", "x", "x", "y"]),
+            ),
+            ("v", Type::Int32, int_col(vec![10, 20, 30, 40])),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT region, site, COUNT(*), SUM(v) FROM visits GROUP BY region, site")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["k0"].as_i64().unwrap(),
+                r["k1"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+                r["v1"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "x".to_string(), 2, 30),
+            (1, "y".to_string(), 1, 40),
+            (2, "x".to_string(), 1, 30),
+        ]
+    );
+}
+
+#[rstest]
+fn group_by_string_key_with_sum(mut testing_planner: TestingPlanner) {
+    // A single string key with a SUM slot (not just COUNT): alice spans rows
+    // with b=10 and b=50.
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, SUM(b), COUNT(*) FROM example_table GROUP BY name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(String, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+                r["v1"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("alice".to_string(), 60, 2),
+            ("bob".to_string(), 20, 1),
+            ("charlie".to_string(), 30, 1),
+            ("dave".to_string(), 40, 1),
+        ]
+    );
+}
+
+#[rstest]
+fn group_by_constant_and_string(mut testing_planner: TestingPlanner) {
+    // `GROUP BY 1, name` — the positional 1 resolves to the constant select
+    // item, so one key column is a broadcast constant.
+    let results = testing_planner
+        .planner
+        .plan("SELECT 1, name, COUNT(*) AS c FROM example_table GROUP BY 1, name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["k0"].as_i64().unwrap(),
+                r["k1"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "alice".to_string(), 2),
+            (1, "bob".to_string(), 1),
+            (1, "charlie".to_string(), 1),
+            (1, "dave".to_string(), 1),
+        ]
+    );
+}
+
+#[rstest]
+fn group_by_derived_int_keys(mut testing_planner: TestingPlanner) {
+    // Computed sibling keys (`a, a - 1`) — both keys materialised by the
+    // key projection, grouped as an int pair.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, a - 1, COUNT(*) FROM example_table GROUP BY a, a - 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["k0"].as_i64().unwrap(),
+                r["k1"].as_i64().unwrap(),
+                r["v0"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![(1, 0, 1), (2, 1, 1), (3, 2, 1), (4, 3, 1), (5, 4, 1)]
+    );
+}
+
+#[rstest]
+fn group_by_three_keys_mixed(mut testing_planner: TestingPlanner) {
+    // Three keys, two ints and a string — beyond the packed-pair extractor.
+    // Rows 0 and 2 share (1, 7, "x") and fold into one group.
+    testing_planner.add_table(
+        "triples",
+        &[
+            ("g1", Type::Int32, int_col(vec![1, 1, 1, 2])),
+            ("g2", Type::Int32, int_col(vec![7, 8, 7, 7])),
+            (
+                "site",
+                Type::Utf8,
+                crate::common::str_col(vec!["x", "x", "x", "x"]),
+            ),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT g1, g2, site, COUNT(*) FROM triples GROUP BY g1, g2, site")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["k0"].as_i64().unwrap(),
+                r["k1"].as_i64().unwrap(),
+                r["k2"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 7, "x".to_string(), 2),
+            (1, 8, "x".to_string(), 1),
+            (2, 7, "x".to_string(), 1),
+        ]
+    );
+}
