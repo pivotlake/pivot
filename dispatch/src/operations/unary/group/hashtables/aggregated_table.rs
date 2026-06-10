@@ -214,26 +214,23 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 
-        // Keys-only exact COUNT(DISTINCT): the bijective hash makes hash-equality
-        // exactly key-equality, but a hash of 0 is the table's empty sentinel.
-        // Rather than remap it (which would alias another key), exclude any
-        // 0-hash row and record the flag — at most one key hashes to 0, so it
-        // contributes 1 to the count, added at output. The 0-check folds into the
-        // hash loop (no extra pass) and is gated by a const, so non-distinct
-        // group-bys pay nothing.
-        let mut any_zero = false;
+        // For a keys-only exact COUNT(DISTINCT), a hash of 0 collides with the
+        // table's empty-slot sentinel and must be counted out of band rather than
+        // stored (see `consume_scalared`). The batched path can't do that — it
+        // remaps a 0 hash to 1 — so note whether the (rare) 0-hash key is present
+        // and, if so, take the scalar path. The check folds into the hash loop and
+        // is const-gated, so other group-bys pay nothing.
+        debug_assert!(
+            !(K::DEDUP_BY_HASH && K::SUPPORTS_RADIX),
+            "DEDUP_BY_HASH requires the in-place path (no radix scatter)"
+        );
+        let mut has_zero_hash = false;
         for i in 0..length {
             let h = K::hash(&key_reader, i, &self.hash_state);
             self.hashes[i] = h;
             if K::DEDUP_BY_HASH {
-                any_zero |= h == 0;
+                has_zero_hash |= h == 0;
             }
-        }
-        if K::DEDUP_BY_HASH && any_zero {
-            debug_assert!(!K::SUPPORTS_RADIX, "DEDUP_BY_HASH implies !SUPPORTS_RADIX");
-            self.zero_hash_seen = true;
-            self.consume_scalared_skip_zero(length, &key_reader, &value_reader);
-            return;
         }
 
         if self.switched_to_radix {
@@ -241,13 +238,13 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             return;
         }
 
-        // The active table can take the whole batch iff no probe overflows it
-        // mid-batch; only then is the batched path safe.
+        // The batched path is safe iff the active table has room for the whole
+        // batch (no mid-batch overflow) and no 0-hash key needs skipping.
         let free = {
             let t = self.tables.last().unwrap();
             t.capacity() - t.len()
         };
-        if free > length {
+        if free > length && !has_zero_hash {
             self.consume_batched(length, &key_reader, value_reader);
         } else {
             self.consume_scalared(length, &key_reader, &value_reader);
@@ -297,6 +294,16 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         let mut i = 0;
         while i < length {
             let hash = self.hashes[i];
+            // Keys-only exact COUNT(DISTINCT): a 0 hash collides with the
+            // empty-slot sentinel, so don't store it (the table would remap it to
+            // 1 and alias a real key) — count it out of band instead. At most one
+            // key hashes to 0 (the hash is a bijection), so the flag adds 1 at
+            // output. Const-gated: zero cost for every other group-by.
+            if K::DEDUP_BY_HASH && hash == 0 {
+                self.zero_hash_seen = true;
+                i += 1;
+                continue;
+            }
             let overflowed = {
                 let table = self.tables.last_mut().unwrap();
                 if i + L2_DISTANCE < length {
@@ -315,32 +322,6 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 return;
             }
             i += 1;
-        }
-    }
-
-    /// Scalar insert that skips 0-hash rows — the rare path for `DEDUP_BY_HASH`
-    /// when a batch contains the (single) key whose bijective hash is 0. That key
-    /// is counted via `zero_hash_seen`, not stored, so `merge` never sees a 0 hash
-    /// and never remaps-and-aliases it. `DEDUP_BY_HASH` implies `!SUPPORTS_RADIX`,
-    /// so the table only ever grows here (no mid-batch switch to scatter).
-    fn consume_scalared_skip_zero<'b>(
-        &mut self,
-        length: usize,
-        key_reader: &K::Reader<'b>,
-        value_reader: &V::Reader<'b>,
-    ) {
-        for i in 0..length {
-            let hash = self.hashes[i];
-            if hash == 0 {
-                continue;
-            }
-            let table = self.tables.last_mut().unwrap();
-            let key = K::live_key(key_reader, i, &mut self.worker_arena);
-            let value = V::value(value_reader, i);
-            table.merge::<false, _>(hash, key, value);
-            if table.undersized() {
-                self.grow_or_switch();
-            }
         }
     }
 
