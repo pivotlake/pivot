@@ -622,8 +622,9 @@ impl Aggregate {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
         use dispatch::{
-            AggregationKind, AggregationRowValueExtractor, AggregationSlot, IntPairKeyExtractor,
-            MixedRowValueExtractor, RowKeyExtractor, RowKeySchema,
+            AggregationKind, AggregationRowValueExtractor, AggregationSlot, CompiledMixed, CountOp,
+            IntPairKeyExtractor, MinStrOp, MixedRowValueExtractor, RowKeyExtractor, RowKeySchema,
+            SumOp,
         };
 
         let key_refs: Vec<&crate::expression::Ref> = self
@@ -739,9 +740,12 @@ impl Aggregate {
         });
 
         // Monomorphise an aggregate stage over key type + slot arity, with the
-        // mixed extractor when extremes are present.
+        // mixed extractor when extremes are present. `$sum_i64` says every
+        // `Sum` slot reads an `Int64` column — true for the outer stage (its
+        // sums re-fold inner partials, always emitted as `Int64`) — gating the
+        // compiled shapes that monomorphise a sum's column type.
         macro_rules! staged {
-            ($spec:expr, $K:ty, $cols:expr, $slots:expr, $config:expr, $extremes:expr, $top_k:expr) => {{
+            ($spec:expr, $K:ty, $cols:expr, $slots:expr, $config:expr, $extremes:expr, $sum_i64:expr, $top_k:expr) => {{
                 let slots = $slots;
                 macro_rules! call {
                     ($V:ty) => {
@@ -749,14 +753,32 @@ impl Aggregate {
                     };
                 }
                 if $extremes {
-                    match slots.len() {
-                        1 => call!(MixedRowValueExtractor<1>),
-                        2 => call!(MixedRowValueExtractor<2>),
-                        3 => call!(MixedRowValueExtractor<3>),
-                        4 => call!(MixedRowValueExtractor<4>),
-                        5 => call!(MixedRowValueExtractor<5>),
-                        6 => call!(MixedRowValueExtractor<6>),
-                        n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                    use AggregationKind as AK;
+                    // Compiled mixed shapes first (straight-line init/fold/
+                    // combine); any other signature takes the enum-dispatched
+                    // mixed extractor of the right arity.
+                    match slots.iter().map(|s| s.kind).collect::<Vec<_>>().as_slice() {
+                        // MIN(str), MIN(str), COUNT — e.g. the inner stage's
+                        // string-extreme partials beside the subgroup count.
+                        [AK::MinStr, AK::MinStr, AK::CountStar | AK::Count] => {
+                            call!(CompiledMixed<(MinStrOp, MinStrOp, CountOp)>)
+                        }
+                        // MIN(str), MIN(str), SUM(i64), COUNT — e.g. the outer
+                        // re-fold of those partials plus a distinct count.
+                        [AK::MinStr, AK::MinStr, AK::Sum, AK::CountStar | AK::Count]
+                            if $sum_i64 =>
+                        {
+                            call!(CompiledMixed<(MinStrOp, MinStrOp, SumOp<Int64Type>, CountOp)>)
+                        }
+                        _ => match slots.len() {
+                            1 => call!(MixedRowValueExtractor<1>),
+                            2 => call!(MixedRowValueExtractor<2>),
+                            3 => call!(MixedRowValueExtractor<3>),
+                            4 => call!(MixedRowValueExtractor<4>),
+                            5 => call!(MixedRowValueExtractor<5>),
+                            6 => call!(MixedRowValueExtractor<6>),
+                            n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                        },
                     }
                 } else {
                     match slots.len() {
@@ -788,6 +810,7 @@ impl Aggregate {
                         inner_slots.clone(),
                         (),
                         inner_has_extremes,
+                        false,
                         None
                     )
                 };
@@ -824,6 +847,7 @@ impl Aggregate {
                 inner_slots.clone(),
                 schema,
                 inner_has_extremes,
+                false,
                 None
             )
         };
@@ -849,6 +873,7 @@ impl Aggregate {
                 outer_slots,
                 (),
                 outer_has_extremes,
+                true,
                 self.top_k
             ),
             [Type::Int16] => staged!(
@@ -858,6 +883,7 @@ impl Aggregate {
                 outer_slots,
                 (),
                 outer_has_extremes,
+                true,
                 self.top_k
             ),
             [Type::Int32] => staged!(
@@ -867,6 +893,7 @@ impl Aggregate {
                 outer_slots,
                 (),
                 outer_has_extremes,
+                true,
                 self.top_k
             ),
             [Type::Int64] => staged!(
@@ -876,6 +903,7 @@ impl Aggregate {
                 outer_slots,
                 (),
                 outer_has_extremes,
+                true,
                 self.top_k
             ),
             [Type::Utf8] => staged!(
@@ -885,6 +913,7 @@ impl Aggregate {
                 outer_slots,
                 (),
                 outer_has_extremes,
+                true,
                 self.top_k
             ),
             _ => {
@@ -901,6 +930,7 @@ impl Aggregate {
                     outer_slots,
                     schema,
                     outer_has_extremes,
+                    true,
                     self.top_k
                 )
             }
@@ -928,8 +958,8 @@ impl Aggregate {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
         use dispatch::{
-            AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
-            IntPairKeyExtractor, Sum,
+            AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled,
+            CompiledMixed, Count, CountOp, IntPairKeyExtractor, MinStrOp, Sum, SumOp,
         };
 
         // The columns the aggregate slots read (deduplicated, in first-use
@@ -1081,10 +1111,15 @@ impl Aggregate {
         // Per-slot signature (kind + the `SUM` column's type), used to pick a
         // compiled, monomorphised value extractor when the signature matches one
         // we've specialised; any other signature falls back to the generic enum
-        // extractor (`AggregationRowValueExtractor<N>`).
+        // extractors (`AggregationRowValueExtractor<N>` /
+        // `MixedRowValueExtractor<N>`).
         enum Sig {
             Count,
             Sum(Type),
+            MinInt,
+            MaxInt,
+            MinStr,
+            MaxStr,
         }
         let sig: Vec<Sig> = self
             .expressions
@@ -1092,6 +1127,20 @@ impl Aggregate {
             .map(|e| match e {
                 Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
                     Sig::Sum(a.column.return_type.clone())
+                }
+                Expression::AggregateFunc(AggregateFunc::Min(a)) => {
+                    if a.column.return_type == Type::Utf8 {
+                        Sig::MinStr
+                    } else {
+                        Sig::MinInt
+                    }
+                }
+                Expression::AggregateFunc(AggregateFunc::Max(a)) => {
+                    if a.column.return_type == Type::Utf8 {
+                        Sig::MaxStr
+                    } else {
+                        Sig::MaxInt
+                    }
                 }
                 // CountStar / Count — validated above when building `slots`.
                 _ => Sig::Count,
@@ -1225,7 +1274,38 @@ impl Aggregate {
         macro_rules! with_key {
             ($K:ty) => {{
                 if has_extremes {
-                    mixed_by_arity!($K)
+                    // Compiled mixed shapes: signatures with extremes we've
+                    // monomorphised (straight-line init/fold/combine, no
+                    // per-row slot dispatch). Anything else falls back to the
+                    // enum-dispatched mixed extractor.
+                    match sig.as_slice() {
+                        // MIN(str), COUNT — e.g. a per-group string extreme
+                        // alongside its frequency.
+                        [Sig::MinStr, Sig::Count] => {
+                            type V = CompiledMixed<(MinStrOp, CountOp)>;
+                            Ok(input.group_by_aggregate_limited::<$K, V>(
+                                key_cols,
+                                slots,
+                                top_k,
+                                output_limit,
+                                Default::default(),
+                            ))
+                        }
+                        // COUNT, SUM(i64), MIN(str), COUNT — e.g. an AVG
+                        // (sum + count) over a projected length plus a string
+                        // extreme.
+                        [Sig::Count, Sig::Sum(Type::Int64), Sig::MinStr, Sig::Count] => {
+                            type V = CompiledMixed<(CountOp, SumOp<Int64Type>, MinStrOp, CountOp)>;
+                            Ok(input.group_by_aggregate_limited::<$K, V>(
+                                key_cols,
+                                slots,
+                                top_k,
+                                output_limit,
+                                Default::default(),
+                            ))
+                        }
+                        _ => mixed_by_arity!($K),
+                    }
                 } else if lone_count {
                     Ok(input.group_by_aggregate_limited::<$K, Compiled<(Count,)>>(
                         key_cols,

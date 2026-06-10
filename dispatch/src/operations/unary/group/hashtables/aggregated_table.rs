@@ -335,35 +335,6 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         }
     }
 
-    /// Scalar insert that skips 0-hash rows — the rare path for `DEDUP_BY_HASH`
-    /// when a batch contains the (single) key whose bijective hash is 0. That key
-    /// is counted via `zero_hash_seen`, not stored, so `merge` never sees a 0 hash
-    /// and never remaps-and-aliases it. `DEDUP_BY_HASH` implies `!SUPPORTS_RADIX`,
-    /// so the table only ever grows here (no mid-batch switch to scatter).
-    fn consume_scalared_skip_zero<'b>(
-        &mut self,
-        length: usize,
-        key_reader: &K::Reader<'b>,
-        value_reader: &V::Reader<'b>,
-    ) {
-        for i in 0..length {
-            let hash = self.hashes[i];
-            if hash == 0 {
-                continue;
-            }
-            let table = self.tables.last_mut().unwrap();
-            let mut src = RowSrc::<K, V> {
-                key_reader,
-                value_reader,
-                arena: &mut self.worker_arena,
-            };
-            table.merge_row::<false, _>(hash, i, &mut src);
-            if table.undersized() {
-                self.grow_or_switch();
-            }
-        }
-    }
-
     /// Active table is full: either grow the stack (4x) or, for a radix-eligible
     /// key that would grow past [`SWITCH_THRESHOLD`], switch to scatter. Returns
     /// `true` if it switched.

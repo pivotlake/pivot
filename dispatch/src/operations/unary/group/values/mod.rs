@@ -19,6 +19,7 @@ mod aggregation_row;
 mod compiled;
 mod distinct;
 mod mixed;
+mod mixed_compiled;
 
 pub use accumulator::Accumulator;
 pub use aggregate::{Aggregate, Count, Sum};
@@ -26,6 +27,9 @@ pub use aggregation_row::AggregationRowValueExtractor;
 pub use compiled::Compiled;
 pub use distinct::DistinctValueExtractor;
 pub use mixed::MixedRowValueExtractor;
+pub use mixed_compiled::{
+    CompiledMixed, CountOp, MaxIntOp, MaxStrOp, MinIntOp, MinStrOp, MixedOp, SumOp,
+};
 
 /// Which per-group aggregate a value slot accumulates during the consume phase.
 ///
