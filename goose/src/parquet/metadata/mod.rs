@@ -9,12 +9,12 @@
 //!   assembles the [`ParquetTable`], and commits it.
 //!
 //! It is consumed two ways, both over the same fetch core ([`fetch_factories`]
-//! and [`LoadedTable::assemble`]): [`LoadedTable::load`] collects on the
+//! and [`LoadedFiles::assemble`]): [`LoadedFiles::load`] collects on the
 //! coordinator and returns the per-file row groups as a **value** (the
 //! catalog's reload and registrations; flattened via
-//! [`LoadedTable::into_table`] for whole-table constructors), while
+//! [`LoadedFiles::into_table`] for whole-table constructors), while
 //! [`create_load_and_commit_spec`] returns a `RecordBatchOperatorSpec` ending
-//! in the [`writer`] sink that hands the `LoadedTable` to a `commit` closure —
+//! in the [`writer`] sink that hands the `LoadedFiles` to a `commit` closure —
 //! the `CREATE TABLE` the server executes.
 
 mod fetcher;
@@ -71,11 +71,11 @@ fn fetch_factories(
 /// global indices not yet assigned. Callers that track files individually (the
 /// catalog's versioned table entries) keep this shape;
 /// [`into_table`](Self::into_table) flattens it for everyone else.
-pub struct LoadedTable {
+pub struct LoadedFiles {
     files: Vec<Vec<RowGroupMetadata>>,
 }
 
-impl LoadedTable {
+impl LoadedFiles {
     /// Read every file's footer in parallel over the worker pool and regroup
     /// the row groups per input file. A pipeline breaker — it drives a
     /// dataflow, so it must run on the coordinator (a nested dataflow would
@@ -129,7 +129,7 @@ impl LoadedTable {
 }
 
 /// A `RecordBatchOperatorSpec` that, when executed, reads every file's footer in
-/// parallel and — at its terminal stage — regroups the [`LoadedTable`] and
+/// parallel and — at its terminal stage — regroups the [`LoadedFiles`] and
 /// hands it to `commit` (which runs once, on the worker that finishes last, and
 /// returns an error to fail the statement). Emits no rows. This is `CREATE TABLE`
 /// as a single dataflow: fetch, then commit (the `commit` records the table in
@@ -140,7 +140,7 @@ pub fn create_load_and_commit_spec<C>(
     commit: C,
 ) -> RecordBatchOperatorSpec
 where
-    C: FnOnce(LoadedTable) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+    C: FnOnce(LoadedFiles) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + 'static,
 {

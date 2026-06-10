@@ -1,7 +1,7 @@
-//! The per-query **binding**: the independently-mutable [`ParquetCatalogTable`]
-//! every [`Catalog::table`](planner::catalog::Catalog::table) resolve clones
-//! out of the master entry, so a query's filter pushdown prunes its own view
-//! without affecting anyone else.
+//! The per-query **binding**: the independently-mutable [`TableBinding`] every
+//! [`Catalog::table`](planner::catalog::Catalog::table) resolve derives from
+//! the master entry, so a query's filter pushdown prunes its own view without
+//! affecting anyone else.
 
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ struct PushedPredicate {
 /// so each query accumulates its own pushed-down predicates via
 /// [`Table::pushdown_filter`] without affecting others.
 #[derive(Clone, Debug)]
-pub struct ParquetCatalogTable {
+pub struct TableBinding {
     pub columns: Vec<Column>,
     /// Where this table's Parquet data lives (a directory/key prefix in the
     /// database store). Kept so a future `refresh()` can re-read the latest files.
@@ -45,20 +45,19 @@ pub struct ParquetCatalogTable {
     predicates: Vec<PushedPredicate>,
 }
 
-impl ParquetCatalogTable {
-    /// A binding template with no scan view yet — the entry fills `parquet`
-    /// in when it (re)flattens its per-file state.
-    pub(super) fn empty(columns: Vec<Column>, location: String) -> Self {
+impl TableBinding {
+    /// A binding over one state's scan view, with no predicates pushed yet.
+    pub(super) fn new(columns: Vec<Column>, location: String, parquet: Arc<ParquetTable>) -> Self {
         Self {
             columns,
             location,
-            parquet: Arc::new(ParquetTable::new(Vec::new())),
+            parquet,
             predicates: Vec::new(),
         }
     }
 }
 
-impl Table for ParquetCatalogTable {
+impl Table for TableBinding {
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -141,7 +140,7 @@ impl Table for ParquetCatalogTable {
     }
 }
 
-impl ParquetCatalogTable {
+impl TableBinding {
     /// Clone this table's row groups and keep only those that survive this
     /// binding's pushed-down predicates — i.e. what [`Table::compile`] actually
     /// scans. A min/max stat that proves no row in a group can match drops it; a

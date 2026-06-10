@@ -9,7 +9,7 @@
 //! The compacter is **location-agnostic**: candidates come from the table's
 //! log (names + sizes — no directory scanning), reads resolve through the
 //! catalog (a local path or a presigned URL alike), and writes/deletes go
-//! through the table's [`goose::TableData`] store handle. A table under an `s3://`
+//! through the table's [`goose::TableStore`] store handle. A table under an `s3://`
 //! database root compacts through the exact same code path as a local one.
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
@@ -226,7 +226,7 @@ impl CompactJob {
         );
         let data = self
             .catalog
-            .table_data(&self.name)
+            .table_store(&self.name)
             .ok_or_else(|| format!("table `{}` vanished", self.name))?;
 
         // One dataflow: scan stages decode the inputs, encode stages cut and
@@ -294,7 +294,7 @@ impl CompactJob {
 }
 
 /// Best-effort cleanup of staged (never-logged, hence invisible) outputs.
-fn remove_all(data: &goose::TableData, files: &[LoggedFile]) {
+fn remove_all(data: &goose::TableStore, files: &[LoggedFile]) {
     for file in files {
         let _ = data.delete(&file.name);
     }

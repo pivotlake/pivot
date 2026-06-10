@@ -1,10 +1,10 @@
 //! Terminal (write) stage: the fan-in side of the dataflow. Every worker's row
 //! groups arrive on worker 0, which accumulates them and — at `finish` —
-//! regroups them into the [`LoadedTable`] and hands it to the `commit` closure.
+//! regroups them into the [`LoadedFiles`] and hands it to the `commit` closure.
 //! Workers `1..n` receive nothing (empty receiver, no commit) and no-op. Emits
 //! no rows.
 
-use super::{IndexedRowGroup, LoadedTable};
+use super::{IndexedRowGroup, LoadedFiles};
 use arrow_array::RecordBatch;
 use dispatch::{Sender, Unary, UnaryFactory};
 
@@ -23,7 +23,7 @@ impl<C> TableBuildSinkFactory<C> {
 
 impl<C> UnaryFactory<IndexedRowGroup, RecordBatch> for TableBuildSinkFactory<C>
 where
-    C: FnOnce(LoadedTable) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+    C: FnOnce(LoadedFiles) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + 'static,
 {
@@ -48,7 +48,7 @@ pub(super) struct TableBuildSink<C> {
 
 impl<C> Unary<IndexedRowGroup, RecordBatch> for TableBuildSink<C>
 where
-    C: FnOnce(LoadedTable) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+    C: FnOnce(LoadedFiles) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + 'static,
 {
@@ -63,7 +63,7 @@ where
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> dispatch::UnaryResult<bool> {
         if let Some(commit) = self.commit.take() {
-            let loaded = LoadedTable::assemble(std::mem::take(&mut self.rows), self.file_count);
+            let loaded = LoadedFiles::assemble(std::mem::take(&mut self.rows), self.file_count);
             commit(loaded).map_err(|e| crate::parquet::op_err(CommitFailed(e)))?;
         }
         Ok(true)

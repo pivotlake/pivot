@@ -478,7 +478,7 @@ mod tests {
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
         assert!(
             catalog
-                .parquet_table("otel_logs")
+                .binding("otel_logs")
                 .unwrap()
                 .parquet
                 .row_groups()
@@ -492,7 +492,7 @@ mod tests {
             catalog.clone(),
         );
 
-        let table = catalog.parquet_table("otel_logs").unwrap();
+        let table = catalog.binding("otel_logs").unwrap();
         let groups = table.parquet.row_groups();
         assert_eq!(
             groups.iter().map(|rg| rg.num_rows).sum::<i64>(),
@@ -549,7 +549,7 @@ mod tests {
         // One merged file replaced the three inputs, on disk and in the
         // catalog, and indices stayed sequential.
         assert_eq!(parquet_file_count(dir.path()), 1);
-        let table = catalog.parquet_table("otel_logs").unwrap();
+        let table = catalog.binding("otel_logs").unwrap();
         let groups = table.parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
@@ -651,7 +651,7 @@ mod tests {
             .collect();
         assert_eq!(on_disk, vec![files[0].name.clone()]);
 
-        let table = catalog.parquet_table("events").unwrap();
+        let table = catalog.binding("events").unwrap();
         assert_eq!(
             table
                 .parquet
@@ -710,7 +710,7 @@ mod tests {
 
         // The server's next bind reloads to the compacted version.
         assert!(planner::catalog::Catalog::table(&*server_catalog, "otel_logs").is_some());
-        let table = server_catalog.parquet_table("otel_logs").unwrap();
+        let table = server_catalog.binding("otel_logs").unwrap();
         let groups = table.parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);

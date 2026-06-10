@@ -10,7 +10,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
-use goose::{ParquetCatalog, ParquetCatalogTable, RegisterOutcome};
+use goose::{ParquetCatalog, RegisterOutcome, TableBinding};
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };
@@ -131,7 +131,7 @@ fn constant_comparison(
 // Row groups that survive the binding's pushed-down predicates (what `compile`
 // would scan). The row groups were materialized once at create time, so pruning
 // is a pure in-memory filter — no dispatcher needed.
-fn row_group_count(table: &ParquetCatalogTable) -> usize {
+fn row_group_count(table: &TableBinding) -> usize {
     table.pruned_parquet().row_groups().len()
 }
 
@@ -155,7 +155,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
     };
     // No path: the table lives under the (in-memory) database root with no data.
     create_table(&catalog, req).unwrap();
-    let table = catalog.parquet_table("t").unwrap();
+    let table = catalog.binding("t").unwrap();
     assert!(table.parquet.row_groups().is_empty());
 }
 
@@ -211,7 +211,7 @@ fn pushdown_filter_always_returns_false() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = catalog.parquet_table("t").unwrap();
+    let mut table = catalog.binding("t").unwrap();
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -224,7 +224,7 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = catalog.parquet_table("t").unwrap();
+    let mut table = catalog.binding("t").unwrap();
     assert_eq!(row_group_count(&table), 3);
 
     table
@@ -243,14 +243,14 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut first = catalog.parquet_table("t").unwrap();
+    let mut first = catalog.binding("t").unwrap();
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
     assert_eq!(row_group_count(&first), 2);
 
     // A fresh bind starts from the master entry's full row group set.
-    let second = catalog.parquet_table("t").unwrap();
+    let second = catalog.binding("t").unwrap();
     assert_eq!(row_group_count(&second), 3);
 }
 
@@ -261,7 +261,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 999` lies outside every (min,max) → all three row groups drop.
-    let mut table = catalog.parquet_table("t").unwrap();
+    let mut table = catalog.binding("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
@@ -275,7 +275,7 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 20` matches only the row group whose single value is 20.
-    let mut table = catalog.parquet_table("t").unwrap();
+    let mut table = catalog.binding("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -287,7 +287,7 @@ fn pushdown_filter_eq_returns_false() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = catalog.parquet_table("t").unwrap();
+    let mut table = catalog.binding("t").unwrap();
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -300,7 +300,7 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = catalog.parquet_table("t").unwrap();
+    let mut table = catalog.binding("t").unwrap();
     table
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
@@ -344,15 +344,7 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    assert_eq!(
-        catalog
-            .parquet_table("t")
-            .unwrap()
-            .parquet
-            .row_groups()
-            .len(),
-        3
-    );
+    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
     assert_eq!(
@@ -360,7 +352,7 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
         RegisterOutcome::Registered
     );
 
-    let table = catalog.parquet_table("t").unwrap();
+    let table = catalog.binding("t").unwrap();
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 4);
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
@@ -390,7 +382,7 @@ fn register_data_file_is_idempotent_per_path() {
         RegisterOutcome::AlreadyRegistered
     );
 
-    let table = catalog.parquet_table("t").unwrap();
+    let table = catalog.binding("t").unwrap();
     assert_eq!(table.parquet.row_groups().len(), 4);
 }
 
@@ -420,15 +412,7 @@ fn register_data_file_refuses_foreign_directory() {
         catalog.register_data_file("t", &foreign).unwrap(),
         RegisterOutcome::LocationMismatch
     );
-    assert_eq!(
-        catalog
-            .parquet_table("t")
-            .unwrap()
-            .parquet
-            .row_groups()
-            .len(),
-        3
-    );
+    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 }
 
 /// Compaction's commit: the small files' row groups vanish, the merged file's
@@ -443,15 +427,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         catalog.register_data_file("t", &extra).unwrap(),
         RegisterOutcome::Registered
     );
-    assert_eq!(
-        catalog
-            .parquet_table("t")
-            .unwrap()
-            .parquet
-            .row_groups()
-            .len(),
-        4
-    );
+    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
@@ -462,7 +438,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     }];
     assert!(catalog.replace_data_files("t", &removed, &added).unwrap());
 
-    let table = catalog.parquet_table("t").unwrap();
+    let table = catalog.binding("t").unwrap();
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].num_rows, 4);
@@ -482,15 +458,7 @@ fn other_catalog_instance_sees_registration_at_next_bind() {
 
     // The reader opens before the new file exists, at log version 1.
     let reader = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(
-        reader
-            .parquet_table("t")
-            .unwrap()
-            .parquet
-            .row_groups()
-            .len(),
-        3
-    );
+    assert_eq!(reader.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
     assert_eq!(
@@ -500,7 +468,7 @@ fn other_catalog_instance_sees_registration_at_next_bind() {
 
     // Binding through the trait (what a query does) reloads to version 2.
     assert!(PlannerCatalog::table(&reader, "t").is_some());
-    let table = reader.parquet_table("t").unwrap();
+    let table = reader.binding("t").unwrap();
     assert_eq!(
         table
             .parquet
@@ -526,7 +494,7 @@ fn reopened_database_restores_registered_files_from_log() {
         catalog.register_data_file("t", &new_file).unwrap();
     }
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    let table = reopened.parquet_table("t").unwrap();
+    let table = reopened.binding("t").unwrap();
     assert_eq!(table.parquet.row_groups().len(), 4);
 }
 
@@ -554,7 +522,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     );
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    let table = reopened.parquet_table("t").unwrap();
+    let table = reopened.binding("t").unwrap();
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the logged merged file is read");
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);

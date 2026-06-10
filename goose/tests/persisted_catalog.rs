@@ -103,7 +103,7 @@ fn create_table_with_path_scans_rows() {
     )
     .unwrap();
 
-    let table = catalog.parquet_table("events").expect("table created");
+    let table = catalog.binding("events").expect("table created");
     assert_eq!(table.columns.len(), 2);
     let parquet = table.parquet.clone();
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
@@ -140,7 +140,7 @@ fn tables_persist_across_reopen() {
     // Reopening (as a restart would) reloads the table and its data.
     let reopened = ParquetCatalog::open(db_uri, &dispatch).unwrap();
     let table = reopened
-        .parquet_table("events")
+        .binding("events")
         .expect("table reloaded from the manifest");
     assert_eq!(table.columns.len(), 2);
     let parquet = table.parquet.clone();
@@ -162,14 +162,14 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 
         // A data-less table: registered, with no row groups (its data lives under
         // `<root>/t`, which fills in once data is written there).
-        let t = catalog.parquet_table("t").unwrap();
+        let t = catalog.binding("t").unwrap();
         assert_eq!(t.location, "t");
         assert!(t.parquet.row_groups().is_empty());
     }
 
     // And it survives a reopen.
     let reopened = ParquetCatalog::open(db_uri, &dispatch).unwrap();
-    assert!(reopened.parquet_table("t").is_some());
+    assert!(reopened.binding("t").is_some());
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     )
     .unwrap();
 
-    let table = catalog.parquet_table("events").unwrap();
+    let table = catalog.binding("events").unwrap();
     assert_eq!(table.parquet.row_groups().len(), 8);
     let parquet = table.parquet.clone();
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
@@ -207,7 +207,7 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     // The no-data case drives the same fan-in with nothing to fetch: every
     // worker's sink finishes empty and worker 0 still commits.
     create(&dispatch, &catalog, rooted_request("empty", columns())).unwrap();
-    let empty = catalog.parquet_table("empty").unwrap();
+    let empty = catalog.binding("empty").unwrap();
     assert!(empty.parquet.row_groups().is_empty());
 }
 

@@ -15,36 +15,38 @@
 //!   of, as an append-only sequence of versions committed with the store's
 //!   compare-and-swap. The highest version is the table's current file list.
 //!
-//! Each table's in-memory [`entry`] tracks the log version it reflects, with
-//! row groups grouped per file. Resolving a table for a query
+//! Each table's in-memory [`entry`] pairs its definition with an immutable
+//! [`entry::TableState`] — the per-file row groups at one log version, with
+//! the flattened scan view derived at construction (the two cannot disagree;
+//! a change swaps in a whole new state). Resolving a table for a query
 //! ([`Catalog::table`]) first **reloads**: one LIST of the table's log
 //! directory; if a newer version exists, only the *new* files' footers are
-//! fetched (over the dispatch pool) and the entry is swapped to the new
-//! version — so a file registered by ingest, a compaction's swap, or even
-//! another process's commit becomes visible to the very next query.
+//! fetched (over the dispatch pool) and a new state is swapped in — so a file
+//! registered by ingest, a compaction's swap, or even another process's
+//! commit becomes visible to the very next query.
 //!
-//! Each resolve hands back a fresh [`binding`] clone, so per-query filter
+//! Each resolve hands back a fresh [`TableBinding`], so per-query filter
 //! pushdown accumulates on that binding alone.
 
 mod binding;
 mod data;
 mod entry;
 
-pub use binding::ParquetCatalogTable;
-pub use data::TableData;
+pub use binding::TableBinding;
+pub use data::TableStore;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use crate::manifest::{self, ManifestEntry};
-use crate::parquet::{LoadedTable, ParquetTableError, RowGroupMetadata};
+use crate::parquet::{LoadedFiles, ParquetTableError, RowGroupMetadata};
 use crate::store::{
     self, DataFile, DataFileSource, LocalStore, MemoryStore, ObjectStore, join_prefix,
 };
 use crate::table_log::{self, FIRST_VERSION, LoggedFile, TableLog, TableVersion};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
-use entry::{TableEntry, TableFileEntry};
+use entry::{TableEntry, TableFile, TableState};
 use planner::catalog::{
     Catalog, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
 };
@@ -112,7 +114,7 @@ pub enum RegisterOutcome {
 /// already hold.
 type FetchedFiles = HashMap<String, Vec<Arc<RowGroupMetadata>>>;
 
-/// Concurrent catalog of [`ParquetCatalogTable`]s, keyed by table name.
+/// Concurrent catalog of tables, keyed by name.
 ///
 /// `CREATE TABLE` compiles to a single dataflow that reads every data file's
 /// footer **once** (in parallel over the worker pool) and, at its terminal
@@ -175,7 +177,7 @@ impl ParquetCatalog {
                     }
                 };
             let files = catalog.fetch_files(&manifest_entry.location, &logged)?;
-            let entry = TableEntry::new(manifest_entry, version, files);
+            let entry = TableEntry::new(manifest_entry, TableState::new(version, files));
             catalog
                 .tables
                 .write()
@@ -185,19 +187,15 @@ impl ParquetCatalog {
         Ok(catalog)
     }
 
-    /// Resolve `name` to a fresh [`ParquetCatalogTable`] (same semantics as
+    /// Resolve `name` to a fresh [`TableBinding`] (same semantics as
     /// [`Catalog::table`] *minus the reload*, and typed). Useful for callers
     /// (and tests) that need state the [`Table`] trait does not expose.
-    ///
-    /// NOTE: Performance wise, cloning all the row groups for every new query resolve
-    /// might be expensive for very large dataset (10/100tb+). If this ever becomes
-    /// a bottleneck, we can consider using another mechanism.
-    pub fn parquet_table(&self, name: &str) -> Option<ParquetCatalogTable> {
+    pub fn binding(&self, name: &str) -> Option<TableBinding> {
         self.tables
             .read()
             .unwrap()
             .get(name)
-            .map(|entry| entry.table.clone())
+            .map(TableEntry::binding)
     }
 
     /// Every table this catalog knows, by name. What a maintenance sweep (a
@@ -213,21 +211,21 @@ impl ParquetCatalog {
             .read()
             .unwrap()
             .get(name)
-            .map(TableEntry::logged_files)
+            .map(|entry| entry.state.logged_files())
     }
 
-    /// Read/write access to `name`'s data location, wherever it lives — see
-    /// [`TableData`]. `None` when no such table exists.
-    pub fn table_data(&self, name: &str) -> Option<TableData> {
+    /// Write access to `name`'s data location, wherever it lives — see
+    /// [`TableStore`]. `None` when no such table exists.
+    pub fn table_store(&self, name: &str) -> Option<TableStore> {
         let map = self.tables.read().unwrap();
-        let location = &map.get(name)?.table.location;
+        let location = &map.get(name)?.location;
         Some(if Path::new(location).is_absolute() {
-            TableData {
+            TableStore {
                 store: Arc::new(LocalStore::new(location)),
                 prefix: String::new(),
             }
         } else {
-            TableData {
+            TableStore {
                 store: self.store.clone(),
                 prefix: location.clone(),
             }
@@ -246,7 +244,7 @@ impl ParquetCatalog {
             .read()
             .unwrap()
             .get(name)
-            .map(|e| e.table.location.clone())
+            .map(|e| e.location.clone())
         else {
             return Ok(None);
         };
@@ -275,11 +273,16 @@ impl ParquetCatalog {
             let Some(entry) = map.get(name) else {
                 return Ok(());
             };
-            if entry.version >= latest_version {
+            if entry.state.version() >= latest_version {
                 return Ok(());
             }
-            let known: HashSet<String> = entry.files.iter().map(|f| f.file.name.clone()).collect();
-            (entry.table.location.clone(), known)
+            let known: HashSet<String> = entry
+                .state
+                .files()
+                .iter()
+                .map(|f| f.logged.name.clone())
+                .collect();
+            (entry.location.clone(), known)
         };
         let target = log.read(latest_version)?;
         let missing: Vec<LoggedFile> = target
@@ -315,7 +318,7 @@ impl ParquetCatalog {
             let Some(entry) = map.get(name) else {
                 return Ok(RegisterOutcome::NoSuchTable);
             };
-            if !file_in_table_dir(path, &entry.table.location) {
+            if !file_in_table_dir(path, &entry.location) {
                 return Ok(RegisterOutcome::LocationMismatch);
             }
         }
@@ -407,7 +410,7 @@ impl ParquetCatalog {
                     .read()
                     .unwrap()
                     .get(name)
-                    .map(TableEntry::logged_files)
+                    .map(|entry| entry.state.logged_files())
                     .unwrap_or_default(),
             };
             if change(&mut files).is_none() {
@@ -423,23 +426,25 @@ impl ParquetCatalog {
         }
     }
 
-    /// Bring `name`'s in-memory entry up to `target`, reusing the row groups
-    /// of files the entry already has and taking new files' row groups from
-    /// `fetched`. A no-op if the entry already reflects `target` (or newer).
-    /// If a yet-newer concurrent version added files we didn't fetch, the
-    /// entry is left as is — the next reload converges.
+    /// Bring `name`'s in-memory entry up to `target`: build the new
+    /// [`TableState`], reusing the row groups of files the current state
+    /// already has and taking new files' row groups from `fetched`, then swap
+    /// it in. A no-op if the entry already reflects `target` (or newer). If a
+    /// yet-newer concurrent version added files we didn't fetch, the entry is
+    /// left as is — the next reload converges.
     fn apply_version(&self, name: &str, target: TableVersion, fetched: FetchedFiles) {
         let mut map = self.tables.write().unwrap();
         let Some(entry) = map.get_mut(name) else {
             return;
         };
-        if entry.version >= target.version {
+        if entry.state.version() >= target.version {
             return;
         }
         let mut available: HashMap<&str, &Vec<Arc<RowGroupMetadata>>> = entry
-            .files
+            .state
+            .files()
             .iter()
-            .map(|f| (f.file.name.as_str(), &f.row_groups))
+            .map(|f| (f.logged.name.as_str(), &f.row_groups))
             .collect();
         available.extend(fetched.iter().map(|(name, groups)| (name.as_str(), groups)));
 
@@ -448,14 +453,12 @@ impl ParquetCatalog {
             let Some(row_groups) = available.get(file.name.as_str()) else {
                 return;
             };
-            files.push(TableFileEntry {
-                file: file.clone(),
+            files.push(TableFile {
+                logged: file.clone(),
                 row_groups: (*row_groups).clone(),
             });
         }
-        entry.files = files;
-        entry.version = target.version;
-        entry.reflatten();
+        entry.state = TableState::new(target.version, files);
     }
 
     /// Compile a `CREATE TABLE` to the dataflow that runs it: read every Parquet
@@ -501,7 +504,7 @@ impl ParquetCatalog {
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
             &files,
-            move |loaded: LoadedTable| {
+            move |loaded: LoadedFiles| {
                 let mut map = tables.write().unwrap();
                 if map.contains_key(&manifest_entry.name) {
                     return Err(Box::new(Error::TableExists(manifest_entry.name))
@@ -522,12 +525,12 @@ impl ParquetCatalog {
                     .iter()
                     .cloned()
                     .zip(loaded.into_per_file())
-                    .map(|(file, row_groups)| TableFileEntry {
-                        file,
+                    .map(|(logged, row_groups)| TableFile {
+                        logged,
                         row_groups: row_groups.into_iter().map(Arc::new).collect(),
                     })
                     .collect();
-                let entry = TableEntry::new(manifest_entry, version, files);
+                let entry = TableEntry::new(manifest_entry, TableState::new(version, files));
                 map.insert(entry.name.clone(), entry);
                 Ok(())
             },
@@ -607,15 +610,15 @@ impl ParquetCatalog {
 
     /// Fetch the footers of `files` at `location` (in parallel over the
     /// dispatch pool — a pipeline breaker, coordinator-only) into per-file
-    /// entries, in logged order.
-    fn fetch_files(&self, location: &str, files: &[LoggedFile]) -> Result<Vec<TableFileEntry>> {
+    /// state, in logged order.
+    fn fetch_files(&self, location: &str, files: &[LoggedFile]) -> Result<Vec<TableFile>> {
         let resolved = self.resolve_files(location, files)?;
         let row_groups = self.load_per_file(&resolved)?;
         Ok(files
             .iter()
             .zip(row_groups)
-            .map(|(file, row_groups)| TableFileEntry {
-                file: file.clone(),
+            .map(|(logged, row_groups)| TableFile {
+                logged: logged.clone(),
                 row_groups,
             })
             .collect())
@@ -623,7 +626,7 @@ impl ParquetCatalog {
 
     /// Read `files`' footers over the dispatch pool, one `Vec` per input file.
     fn load_per_file(&self, files: &[DataFile]) -> Result<Vec<Vec<Arc<RowGroupMetadata>>>> {
-        let loaded = LoadedTable::load(&self.dispatcher, files)
+        let loaded = LoadedFiles::load(&self.dispatcher, files)
             .map_err(|e| ParquetTableError::Materialize(e.to_string()))?;
         Ok(loaded
             .into_per_file()
@@ -657,19 +660,19 @@ fn file_in_table_dir(file: &Path, location: &str) -> bool {
 }
 
 impl Catalog for ParquetCatalog {
-    /// Resolve `name` to a fresh, independently-mutable [`ParquetCatalogTable`],
+    /// Resolve `name` to a fresh, independently-mutable [`TableBinding`],
     /// **reloading first**: the table log is checked (one LIST) and any newer
     /// committed version is pulled in, so every query starts from the latest
-    /// file list. Each binding gets its own clone so per-query filter pushdown
-    /// can prune row groups without affecting the master entry or other
-    /// concurrent queries.
+    /// file list. Each binding is its own value, so per-query filter pushdown
+    /// prunes its view without affecting the master entry or other concurrent
+    /// queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
         if let Err(e) = self.refresh(name) {
             // Serve the version we have rather than failing the query; the
             // next bind retries the reload.
             warn!(table = name, error = %e, "table reload failed; serving last known version");
         }
-        self.parquet_table(name).map(|t| Box::new(t) as _)
+        self.binding(name).map(|t| Box::new(t) as _)
     }
 
     fn create_table(

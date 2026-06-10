@@ -36,10 +36,12 @@ const MANIFEST_KEY: &str = "_pivot_manifest.json";
 const MANIFEST_VERSION: u32 = 1;
 
 /// One table's entry in the manifest: its identity, declared schema, and where
-/// its Parquet data lives.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// its Parquet data lives. Serializes directly as the on-disk record; the
+/// columns round-trip through their SQL type spelling (see [`sql_columns`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub name: String,
+    #[serde(with = "sql_columns")]
     pub columns: Vec<Column>,
     /// Where this table's Parquet data lives, relative to the database root (or
     /// an absolute local path) — a directory for a local database, a key prefix
@@ -50,17 +52,13 @@ pub struct ManifestEntry {
 /// Every table the database has, recovered from its manifest. Empty for a fresh
 /// or in-memory database.
 pub fn load(store: &dyn ObjectStore) -> Result<Vec<ManifestEntry>> {
-    read_doc(store)?
-        .tables
-        .into_iter()
-        .map(TableRecord::into_entry)
-        .collect()
+    Ok(read_doc(store)?.tables)
 }
 
 /// Durably record a newly-created table (read-modify-write the document).
 pub fn insert(store: &dyn ObjectStore, entry: &ManifestEntry) -> Result<()> {
     let mut doc = read_doc(store)?;
-    doc.tables.push(TableRecord::from_entry(entry));
+    doc.tables.push(entry.clone());
     let bytes = serde_json::to_vec_pretty(&doc)
         .map_err(|e| ManifestError::Parse(format!("serializing manifest: {e}")))?;
     store.put(MANIFEST_KEY, &bytes)?;
@@ -86,7 +84,7 @@ fn read_doc(store: &dyn ObjectStore) -> Result<ManifestDoc> {
 #[derive(Serialize, Deserialize)]
 struct ManifestDoc {
     version: u32,
-    tables: Vec<TableRecord>,
+    tables: Vec<ManifestEntry>,
 }
 
 impl Default for ManifestDoc {
@@ -98,48 +96,49 @@ impl Default for ManifestDoc {
     }
 }
 
-/// Serialized form of one table entry.
-#[derive(Serialize, Deserialize)]
-struct TableRecord {
-    name: String,
-    columns: Vec<ColumnRecord>,
-    location: String,
-}
+/// Columns serialize as `{name, type}` pairs, with `type` spelled the way the
+/// planner declared it — the authoritative logical schema, which round-trips
+/// even when it deliberately reinterprets the physical Parquet type.
+mod sql_columns {
+    use super::*;
+    use serde::de::Error as _;
+    use serde::{Deserializer, Serializer};
 
-/// Serialized form of one column: name plus its SQL type spelling (the same
-/// spelling the planner declared), so the type round-trips through the manifest.
-#[derive(Serialize, Deserialize)]
-struct ColumnRecord {
-    name: String,
-    #[serde(rename = "type")]
-    type_sql: String,
-}
+    /// The on-disk shape of one column.
+    #[derive(Serialize, Deserialize)]
+    struct ColumnSql {
+        name: String,
+        #[serde(rename = "type")]
+        type_sql: String,
+    }
 
-impl TableRecord {
-    fn from_entry(entry: &ManifestEntry) -> Self {
-        Self {
-            name: entry.name.clone(),
-            columns: entry
-                .columns
+    pub fn serialize<S: Serializer>(
+        columns: &[Column],
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(
+            &columns
                 .iter()
-                .map(|c| ColumnRecord {
+                .map(|c| ColumnSql {
                     name: c.name.clone(),
                     type_sql: pivot_type_to_sql(&c.col_type).to_string(),
                 })
-                .collect(),
-            location: entry.location.clone(),
-        }
+                .collect::<Vec<_>>(),
+            serializer,
+        )
     }
 
-    fn into_entry(self) -> Result<ManifestEntry> {
-        let columns = self
-            .columns
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Vec<Column>, D::Error> {
+        let columns: Vec<ColumnSql> = serde::Deserialize::deserialize(deserializer)?;
+        columns
             .into_iter()
             .map(|c| {
                 let col_type = sql_type_to_pivot(&c.type_sql).ok_or_else(|| {
-                    ManifestError::Parse(format!(
-                        "unknown type `{}` for column `{}` of table `{}`",
-                        c.type_sql, c.name, self.name
+                    D::Error::custom(format!(
+                        "unknown type `{}` for column `{}`",
+                        c.type_sql, c.name
                     ))
                 })?;
                 Ok(Column {
@@ -147,12 +146,7 @@ impl TableRecord {
                     col_type,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(ManifestEntry {
-            name: self.name,
-            columns,
-            location: self.location,
-        })
+            .collect()
     }
 }
 

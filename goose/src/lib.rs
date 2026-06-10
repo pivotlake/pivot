@@ -23,6 +23,6 @@ mod sql_type;
 pub mod store;
 pub mod table_log;
 
-pub use catalog::{Error, ParquetCatalog, ParquetCatalogTable, RegisterOutcome, Result, TableData};
+pub use catalog::{Error, ParquetCatalog, RegisterOutcome, Result, TableBinding, TableStore};
 pub use manifest::ManifestEntry;
 pub use table_log::LoggedFile;

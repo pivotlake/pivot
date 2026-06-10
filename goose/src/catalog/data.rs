@@ -1,5 +1,4 @@
-//! Read/write access to one table's data files, wherever its location puts
-//! them.
+//! Write access to one table's data location, wherever it is.
 
 use std::sync::Arc;
 
@@ -10,12 +9,12 @@ use crate::store::{self, ObjectStore, join_prefix};
 /// store-relative location addresses the database's own store under that
 /// prefix. Callers (the compacter) write and delete data files through this
 /// one interface — local and remote are the same code path.
-pub struct TableData {
+pub struct TableStore {
     pub(super) store: Arc<dyn ObjectStore>,
     pub(super) prefix: String,
 }
 
-impl TableData {
+impl TableStore {
     /// Write a data file (whole). On a local directory this lands via a temp
     /// file + rename; on a remote store a PUT is atomic per object. Either
     /// way a reader never sees a partial file — and an unfinished file is

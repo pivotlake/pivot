@@ -25,7 +25,7 @@ pub use reading::{
 };
 
 mod metadata;
-pub use metadata::{LoadedTable, create_load_and_commit_spec};
+pub use metadata::{LoadedFiles, create_load_and_commit_spec};
 
 mod row_group_stats;
 pub use row_group_stats::{
