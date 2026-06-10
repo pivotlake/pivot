@@ -64,8 +64,6 @@ pub enum Error {
     UnsupportedExpression(Expression),
     #[error("Unsupported type for group by: {0:?}")]
     DataTypeNotSupportedForGroupBy(Type),
-    #[error("MIN/MAX cannot be combined with SUM over a 64-bit column in one grouped aggregate")]
-    UnsupportedWideSumWithExtremes,
     #[error("Unsupported expression for contains: {0:?}")]
     UnsupportedExpressionForContainsNeedle(Expression),
     #[error("Unsupported haystack expression for contains: {0:?}")]

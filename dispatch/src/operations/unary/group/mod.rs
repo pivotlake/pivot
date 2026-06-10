@@ -1124,6 +1124,70 @@ mod tests {
         );
     }
 
+    /// SUM beside a MIN over Int64 values near `i64::MAX / 2`: the mixed
+    /// extractors accumulate sums in i128, so a group total of `i64::MAX - 1`
+    /// (which would wrap an i32 — or an i64 mid-fold with one more value) must
+    /// come out exact, across two workers (exercising fold *and* combine).
+    fn wide_sum_batch(keys: &[i32], vals: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(keys.to_vec())),
+            Arc::new(arrow_array::Int64Array::from(vals.to_vec())),
+        ];
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    const WIDE_HALF: i64 = i64::MAX / 2;
+
+    fn wide_sum_slots() -> Vec<AggregationSlot> {
+        vec![
+            AggregationSlot::new(AggregationKind::Sum, 1),
+            AggregationSlot::new(AggregationKind::Min, 1),
+        ]
+    }
+
+    /// Key 1 sums to `i64::MAX - 1` across the two workers; key 2 stays small.
+    fn wide_sum_workers() -> Vec<Vec<RecordBatch>> {
+        vec![
+            vec![wide_sum_batch(&[1, 2], &[WIDE_HALF, 7])],
+            vec![wide_sum_batch(&[1], &[WIDE_HALF])],
+        ]
+    }
+
+    fn check_wide_sum(sender: CollectSender) {
+        let mut rows: Vec<(i32, i64, i64)> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .zip(sender.i64_column(2))
+            .map(|((k, s), m)| (k, s, m))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![(1, i64::MAX - 1, WIDE_HALF), (2, 7, 7)]);
+    }
+
+    #[test]
+    fn mixed_sum_wide_values_are_exact() {
+        check_wide_sum(run_mixed_group::<2>(
+            wide_sum_workers(),
+            0,
+            wide_sum_slots(),
+        ));
+    }
+
+    #[test]
+    fn compiled_mixed_sum_wide_values_are_exact() {
+        type V = values::CompiledMixed<(values::SumOp<Int64Type>, values::MinIntOp<Int64Type>)>;
+        check_wide_sum(run_mixed_group_with::<V>(
+            wide_sum_workers(),
+            0,
+            wide_sum_slots(),
+        ));
+    }
+
     #[test]
     fn top_k_limits_output_keeping_partition_maxima() {
         // key 0 dominates (count 100); keys 1..1000 appear once. ORDER BY count

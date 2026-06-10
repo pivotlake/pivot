@@ -9,7 +9,8 @@
 //! at the best candidate seen so far, and improving it persists the new
 //! candidate into the worker's arena. This extractor therefore:
 //!
-//! - stores each slot as a [`SlotAcc`] (an `i64` or an `ArenaKey`),
+//! - stores each slot as a [`SlotAcc`] (an `i64`, an `i128` for sums, or an
+//!   `ArenaKey`),
 //! - dispatches each slot's per-row behaviour at runtime from a small enum
 //!   reader (like the additive fallback extractor),
 //! - implements the context-aware [`ValueExtractor`] hooks: `init` persists a
@@ -41,13 +42,16 @@ use arrow_schema::{DataType, Field};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-/// One slot's accumulator: a running integer (count/sum/numeric extreme) or
-/// the persisted bytes of the best string seen (string extreme). Which arm a
-/// slot uses is fixed by its [`AggregationKind`]; the enum only exists because
-/// the row stores heterogeneous slots side by side.
+/// One slot's accumulator: a running `i64` (count/numeric extreme), a running
+/// `i128` (sum — wide enough that summing `i64` inputs can't overflow, same as
+/// the additive extractors' wide path), or the persisted bytes of the best
+/// string seen (string extreme). Which arm a slot uses is fixed by its
+/// [`AggregationKind`]; the enum only exists because the row stores
+/// heterogeneous slots side by side.
 #[derive(Copy, Clone)]
 pub enum SlotAcc {
     Int(i64),
+    Wide(i128),
     Str(ArenaKey),
 }
 
@@ -62,7 +66,15 @@ impl SlotAcc {
     fn int(self) -> i64 {
         match self {
             SlotAcc::Int(v) => v,
-            SlotAcc::Str(_) => unreachable!("integer slot holds a string accumulator"),
+            _ => unreachable!("narrow integer slot holds a non-i64 accumulator"),
+        }
+    }
+
+    #[inline(always)]
+    fn wide(self) -> i128 {
+        match self {
+            SlotAcc::Wide(v) => v,
+            _ => unreachable!("sum slot holds a non-i128 accumulator"),
         }
     }
 
@@ -70,7 +82,34 @@ impl SlotAcc {
     fn str_key(self) -> ArenaKey {
         match self {
             SlotAcc::Str(k) => k,
-            SlotAcc::Int(_) => unreachable!("string slot holds an integer accumulator"),
+            _ => unreachable!("string slot holds a non-string accumulator"),
+        }
+    }
+
+    /// The slot as an output `Int64` cell. A sum accumulates in `i128` but
+    /// emits `Int64`; a group total that genuinely exceeds 64 bits cannot be
+    /// represented, so narrow checked and fail loudly rather than wrap.
+    #[inline(always)]
+    fn output_i64(self) -> i64 {
+        match self {
+            SlotAcc::Int(v) => v,
+            SlotAcc::Wide(v) => i64::try_from(v)
+                .unwrap_or_else(|_| panic!("SUM overflowed 64 bits (group total {v})")),
+            SlotAcc::Str(_) => unreachable!("integer output slot holds a string accumulator"),
+        }
+    }
+
+    /// The slot as an `ORDER BY <slot> LIMIT k` sort key. A wide sum saturates
+    /// to the `i64` range: saturation is monotone, so ordering among all
+    /// representable totals is preserved; totals beyond `i64` could only tie
+    /// with each other at the clamp, and any such group would panic at output
+    /// time anyway (see [`Self::output_i64`]).
+    #[inline(always)]
+    fn sort_int(self) -> i64 {
+        match self {
+            SlotAcc::Int(v) => v,
+            SlotAcc::Wide(v) => v.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
+            SlotAcc::Str(_) => unreachable!("a string extreme is never a top-k sort slot"),
         }
     }
 }
@@ -163,7 +202,8 @@ impl<const N: usize> MixedRowValueExtractor<N> {
     fn slot_init(slot: &SlotReader<'_>, idx: usize, arena: &mut WorkerArena) -> SlotAcc {
         match slot {
             SlotReader::Count => SlotAcc::Int(1),
-            SlotReader::Sum(r) | SlotReader::ExtremeInt(r, _) => SlotAcc::Int(r.at(idx)),
+            SlotReader::Sum(r) => SlotAcc::Wide(r.at(idx) as i128),
+            SlotReader::ExtremeInt(r, _) => SlotAcc::Int(r.at(idx)),
             SlotReader::ExtremeStr(a, _) => {
                 let s = unsafe { a.value_unchecked(idx) };
                 SlotAcc::Str(arena.push_bytes(s.as_bytes()))
@@ -181,7 +221,7 @@ impl<const N: usize> MixedRowValueExtractor<N> {
     ) -> SlotAcc {
         match slot {
             SlotReader::Count => SlotAcc::Int(current.int() + 1),
-            SlotReader::Sum(r) => SlotAcc::Int(current.int() + r.at(idx)),
+            SlotReader::Sum(r) => SlotAcc::Wide(current.wide() + r.at(idx) as i128),
             SlotReader::ExtremeInt(r, min) => {
                 let v = r.at(idx);
                 let cur = current.int();
@@ -275,9 +315,10 @@ impl<const N: usize> ValueExtractor for MixedRowValueExtractor<N> {
         MixedRow(std::array::from_fn(|s| {
             let (a, b) = (current.0[s], incoming.0[s]);
             match slots[s].kind {
-                AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum => {
+                AggregationKind::CountStar | AggregationKind::Count => {
                     SlotAcc::Int(a.int() + b.int())
                 }
+                AggregationKind::Sum => SlotAcc::Wide(a.wide() + b.wide()),
                 AggregationKind::Min => SlotAcc::Int(a.int().min(b.int())),
                 AggregationKind::Max => SlotAcc::Int(a.int().max(b.int())),
                 AggregationKind::MinStr | AggregationKind::MaxStr => {
@@ -296,7 +337,7 @@ impl<const N: usize> ValueExtractor for MixedRowValueExtractor<N> {
 
     #[inline(always)]
     fn sort_key(value: &MixedRow<N>, slot: usize) -> i64 {
-        value.0[slot].int()
+        value.0[slot].sort_int()
     }
 }
 
@@ -342,7 +383,7 @@ impl<const N: usize> ValueColumns for MixedRowColumns<N> {
     fn push(&mut self, value: &MixedRow<N>) {
         for (s, col) in self.cols.iter_mut().enumerate() {
             match col {
-                MixedColBuilder::Int(b) => b.push(&value.0[s].int(), 1),
+                MixedColBuilder::Int(b) => b.push(&value.0[s].output_i64(), 1),
                 MixedColBuilder::Str(views) => views.push(value.0[s].str_key().as_u128()),
             }
         }

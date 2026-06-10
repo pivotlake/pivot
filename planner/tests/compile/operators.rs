@@ -1175,11 +1175,14 @@ fn constant_group_key_is_derived(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
-fn wide_sum_with_extremes_is_rejected(mut testing_planner: TestingPlanner) {
-    // SUM over a 64-bit column accumulates in i128; the mixed-slot extractor
-    // backing MIN/MAX is i64-only, so the combination must fail loudly at
-    // compile rather than risk silent overflow.
+fn wide_sum_with_extremes_accumulates_exactly(mut testing_planner: TestingPlanner) {
+    // SUM + MIN over an Int64 column in one grouped aggregate: the mixed-slot
+    // extractor accumulates its sum slots in i128 and narrows checked to Int64
+    // at output. Group 1's two i64::MAX/2 values sum to i64::MAX - 1 —
+    // exactly representable, far beyond i32 — and must come out exact (the old
+    // guard rejected this shape outright with UnsupportedWideSumWithExtremes).
     use arrow_array::Int64Array;
+    const HALF: i64 = i64::MAX / 2;
     testing_planner.add_table(
         "wide",
         &[
@@ -1187,17 +1190,95 @@ fn wide_sum_with_extremes_is_rejected(mut testing_planner: TestingPlanner) {
             (
                 "v",
                 Type::Int64,
-                Arc::new(Int64Array::from(vec![5i64, 6, 7])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![HALF, HALF, 7])) as ArrayRef,
             ),
         ],
     );
-    let result = testing_planner
+    let results = testing_planner
         .planner
         .plan("SELECT g, SUM(v), MIN(v) FROM wide GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher());
-    assert!(matches!(
-        result,
-        Err(planner::compile::Error::UnsupportedWideSumWithExtremes)
-    ));
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_i64().unwrap(),
+                r["v0"].as_i64().unwrap(),
+                r["v1"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![(1, i64::MAX - 1, HALF), (2, 7, 7)]);
+}
+
+#[rstest]
+fn grouped_avg_length_count_min_over_computed_key(mut testing_planner: TestingPlanner) {
+    // The q28 shape: GROUP BY a computed (regexp-extracted) key with
+    // AVG(length(s)) — which DuckDB lowers to SUM + COUNT over a projected
+    // Int64 length column — plus COUNT(*) and MIN over the string itself.
+    // The Int64-typed SUM input alongside the MIN(string) extreme must
+    // compile (the old wide-sum guard rejected it) and produce exact values.
+    testing_planner.add_table(
+        "refs",
+        &[
+            ("i", Type::Int32, int_col(vec![1, 2, 3, 4])),
+            (
+                "url",
+                Type::Utf8,
+                crate::common::str_col(vec![
+                    "http://example.com/a",   // 20 chars, key example.com
+                    "http://example.com/abc", // 22 chars, key example.com
+                    "http://other.org/xy",    // 19 chars, key other.org
+                    "",                       // filtered out
+                ]),
+            ),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan(
+            r"SELECT regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k,
+                     AVG(length(url)) AS l, COUNT(*) AS c, MIN(url) AS m
+              FROM refs WHERE url <> '' GROUP BY k ORDER BY l DESC LIMIT 25",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows: Vec<(String, f64, i64, String)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["col0"].as_str().unwrap().to_string(),
+                r["col1"].as_f64().unwrap(),
+                r["col2"].as_i64().unwrap(),
+                r["col3"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "example.com".to_string(),
+                21.0,
+                2,
+                "http://example.com/a".to_string()
+            ),
+            (
+                "other.org".to_string(),
+                19.0,
+                1,
+                "http://other.org/xy".to_string()
+            ),
+        ]
+    );
 }

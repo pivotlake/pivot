@@ -10,9 +10,10 @@
 //! [`ArenaKey`] whose improvement persists bytes into the worker arena. So the
 //! ops here are richer:
 //!
-//! - each op carries its own accumulator type (`i64` for counts / sums /
-//!   numeric extremes, [`ArenaKey`] for string extremes), so a tuple of ops
-//!   yields a heterogeneous accumulator row with no `SlotAcc`-style enum;
+//! - each op carries its own accumulator type (`i64` for counts / numeric
+//!   extremes, `i128` for sums, [`ArenaKey`] for string extremes), so a tuple
+//!   of ops yields a heterogeneous accumulator row with no `SlotAcc`-style
+//!   enum;
 //! - each op implements the arena-aware `init` / `fold` / `combine` hooks the
 //!   [`ValueExtractor`] contract exposes, plus its own output-column builder.
 //!
@@ -161,14 +162,18 @@ impl MixedOp for CountOp {
     }
 }
 
-/// `SUM(col)` over an integer column, widened to `i64`.
+/// `SUM(col)` over an integer column. The accumulator is `i128` — wide enough
+/// that summing `i64` inputs can't overflow, same as the additive extractors'
+/// wide path — while the output column stays `Int64`: a group total that
+/// genuinely exceeds 64 bits cannot be represented, so `push` narrows checked
+/// and fails loudly rather than wrap.
 pub struct SumOp<T>(PhantomData<T>);
 
 impl<T: ArrowPrimitiveType + Send> MixedOp for SumOp<T>
 where
     T::Native: Into<i64>,
 {
-    type Acc = i64;
+    type Acc = i128;
     type Reader<'b> = &'b PrimitiveArray<T>;
     type Builder = PrimitiveBuilder<Int64Type>;
 
@@ -177,27 +182,33 @@ where
         batch.column(column).as_primitive::<T>()
     }
     #[inline(always)]
-    fn init(reader: &&PrimitiveArray<T>, idx: usize, _arena: &mut WorkerArena) -> i64 {
-        unsafe { reader.value_unchecked(idx) }.into()
+    fn init(reader: &&PrimitiveArray<T>, idx: usize, _arena: &mut WorkerArena) -> i128 {
+        Into::<i64>::into(unsafe { reader.value_unchecked(idx) }) as i128
     }
     #[inline(always)]
-    fn fold(acc: i64, reader: &&PrimitiveArray<T>, idx: usize, _arena: &mut WorkerArena) -> i64 {
-        acc + unsafe { reader.value_unchecked(idx) }.into()
+    fn fold(acc: i128, reader: &&PrimitiveArray<T>, idx: usize, _arena: &mut WorkerArena) -> i128 {
+        acc + Into::<i64>::into(unsafe { reader.value_unchecked(idx) }) as i128
     }
     #[inline(always)]
-    fn combine(a: i64, b: i64, _arena: &SharedArena) -> i64 {
+    fn combine(a: i128, b: i128, _arena: &SharedArena) -> i128 {
         a + b
     }
+    /// Saturates to the `i64` range: saturation is monotone, so ordering among
+    /// all representable totals is preserved; totals beyond `i64` could only
+    /// tie with each other at the clamp, and any such group would panic at
+    /// output time anyway (see `push`).
     #[inline(always)]
-    fn sort_key(acc: i64) -> i64 {
-        acc
+    fn sort_key(acc: i128) -> i64 {
+        acc.clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
     fn make_builder(allocator: &mut SlabAllocator, rows: usize) -> Self::Builder {
         PrimitiveBuilder::with_capacity(allocator, rows)
     }
     #[inline(always)]
-    fn push(builder: &mut Self::Builder, acc: i64) {
-        builder.push(&acc, 1);
+    fn push(builder: &mut Self::Builder, acc: i128) {
+        let narrow = i64::try_from(acc)
+            .unwrap_or_else(|_| panic!("SUM overflowed 64 bits (group total {acc})"));
+        builder.push(&narrow, 1);
     }
     fn finish(builder: Self::Builder, slot: usize, _arena: &Arc<SharedArena>) -> (Field, ArrayRef) {
         finish_int(builder, slot)

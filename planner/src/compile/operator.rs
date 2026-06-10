@@ -99,9 +99,11 @@ impl Projection {
     }
 }
 
-/// Pick the aggregate accumulator width by column type — the single rule shared
-/// by the global and grouped paths: `i128` only when a `SUM` reads a 64-bit
-/// column (whose total can overflow `i64`), else `i64`.
+/// Pick the *additive* aggregate accumulator width by column type — the single
+/// rule shared by the global and grouped paths: `i128` only when a `SUM` reads
+/// a 64-bit column (whose total can overflow `i64`), else `i64`. The
+/// mixed-slot extractors (signatures with `MIN`/`MAX`) don't consult this:
+/// their sum slots always accumulate in `i128` and narrow checked at output.
 fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
     use crate::expression::AggregateFunc;
     exprs.iter().any(|e| {
@@ -636,18 +638,6 @@ impl Aggregate {
             SumOp,
         };
 
-        // The mixed-slot stages accumulate sums in i64; a SUM over a 64-bit
-        // column alongside MIN/MAX would risk silent overflow — refuse.
-        let any_extremes = self.expressions.iter().any(|e| {
-            matches!(
-                e,
-                Expression::AggregateFunc(AggregateFunc::Min(_) | AggregateFunc::Max(_))
-            )
-        });
-        if any_extremes && sum_reads_wide_column(&self.expressions) {
-            return Err(Error::UnsupportedWideSumWithExtremes);
-        }
-
         let key_refs: Vec<&crate::expression::Ref> = self
             .groups
             .iter()
@@ -1128,13 +1118,6 @@ impl Aggregate {
                     | AggregationKind::MaxStr
             )
         });
-        // The mixed extractor accumulates sums in i64; a SUM over a 64-bit
-        // column needs the i128 width it doesn't have. Refuse loudly rather
-        // than risk silent overflow.
-        if has_extremes && sum_reads_wide_column(&self.expressions) {
-            return Err(Error::UnsupportedWideSumWithExtremes);
-        }
-
         // Per-slot signature (kind + the `SUM` column's type), used to pick a
         // compiled, monomorphised value extractor when the signature matches one
         // we've specialised; any other signature falls back to the generic enum
@@ -1379,9 +1362,6 @@ impl Aggregate {
                     | AggregationKind::MaxStr
             )
         });
-        if has_extremes && wide {
-            return Err(Error::UnsupportedWideSumWithExtremes);
-        }
         if has_extremes {
             macro_rules! mixed {
                 ($n:literal) => {
