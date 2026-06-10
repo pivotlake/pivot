@@ -612,6 +612,7 @@ impl RecordBatchOperatorSpec {
                 Vec::new(),
                 K::Config::default(),
                 None,
+                None,
                 true,
                 worker_count,
                 buffers,
@@ -641,6 +642,21 @@ impl RecordBatchOperatorSpec {
         top_k: Option<(usize, usize)>,
         key_config: K::Config,
     ) -> Self {
+        self.group_by_aggregate_limited::<K, V>(key_cols, value_slots, top_k, None, key_config)
+    }
+
+    /// [`group_by_aggregate_config`](Self::group_by_aggregate_config) with a
+    /// bare-LIMIT hint: the group stops merging partitions once `output_limit`
+    /// complete groups have been emitted (any groups are a valid answer when
+    /// nothing orders them).
+    pub fn group_by_aggregate_limited<K: KeyExtractor, V: ValueExtractor>(
+        self,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        top_k: Option<(usize, usize)>,
+        output_limit: Option<usize>,
+        key_config: K::Config,
+    ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K, V>::create_for_workers(
@@ -648,6 +664,7 @@ impl RecordBatchOperatorSpec {
             value_slots,
             key_config,
             top_k,
+            output_limit,
             false,
             worker_count,
             buffers,

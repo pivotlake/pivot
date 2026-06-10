@@ -171,6 +171,7 @@ impl Planner {
         root.fuse_limit_order_by();
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
+        root.annotate_group_limit();
         Ok(Plan {
             catalog: self.catalog.clone(),
             root,

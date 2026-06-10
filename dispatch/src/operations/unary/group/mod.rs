@@ -170,6 +170,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         value_slots: Vec<AggregationSlot>,
         key_config: K::Config,
         top_k: Option<(usize, usize)>,
+        output_limit: Option<usize>,
         count_only: bool,
         sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
         receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
@@ -184,6 +185,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 receiver,
                 partition_jobs_injected,
                 top_k,
+                output_limit,
                 count_only,
                 key_config: key_config.clone(),
                 value_slots: value_slots.clone(),
@@ -234,6 +236,11 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     top_k: Option<(usize, usize)>,
+    /// A bare `LIMIT n` directly above the group (no ORDER BY): any `n`
+    /// complete groups are a valid answer, and every partition holds complete
+    /// groups — so the drainer merges partitions serially and stops as soon as
+    /// `n` rows have been emitted, skipping the rest of the merge entirely.
+    output_limit: Option<usize>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
     count_only: bool,
@@ -281,7 +288,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
         self,
         sender: &mut S,
         allocator: &mut SlabAllocator,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let result_map = merge::merge_combined::<K, V>(
             self.index,
             &self.buffers,
@@ -292,7 +299,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
             &self.value_slots,
         );
         if result_map.len() == 0 {
-            return Ok(());
+            return Ok(0);
         }
         output::build_and_send::<K, V, _, _>(
             result_map,
@@ -352,6 +359,40 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
 
             let buffers = Arc::new(all_buffers);
             let tables = Arc::new(all_tables);
+
+            // Bare `LIMIT n`: every partition holds complete groups, so any
+            // `n` of them answer the query. Merge partitions serially right
+            // here and stop as soon as enough rows have gone out — at high
+            // group counts this skips nearly the whole merge. Other workers
+            // see no jobs (the flag is set first) and finish immediately.
+            if let Some(n) = self.output_limit {
+                self.partition_jobs_injected.store(true, Ordering::Relaxed);
+                worker_waker().notify();
+                let allocator = self
+                    .output_allocator
+                    .get_or_insert_with(|| SlabAllocator::new(false));
+                let mut emitted = 0usize;
+                for i in 0..num_partitions {
+                    if emitted >= n {
+                        break;
+                    }
+                    let job = PartitionJob {
+                        buffers: buffers.clone(),
+                        tables: tables.clone(),
+                        index: i,
+                        arena: self.shared_arena.clone(),
+                        partition_capacity,
+                        num_partitions,
+                        top_k: self.top_k,
+                        count_only: self.count_only,
+                        key_config: self.key_config.clone(),
+                        value_slots: self.value_slots.clone(),
+                    };
+                    emitted += job.run(sender, allocator).map_err(unary::Error::from)?;
+                }
+                return Ok(true);
+            }
+
             for i in 0..num_partitions {
                 self.injector.push(PartitionJob {
                     buffers: buffers.clone(),
@@ -525,6 +566,7 @@ mod tests {
                     value_slots.clone(),
                     K::Config::default(),
                     top_k,
+                    None,
                     false,
                     tx.clone(),
                     rx_opt.take(),
@@ -782,6 +824,7 @@ mod tests {
                     value_slots.clone(),
                     schema.clone(),
                     None,
+                    None,
                     false,
                     tx.clone(),
                     rx_opt.take(),
@@ -915,6 +958,7 @@ mod tests {
                     vec![key_col],
                     value_slots.clone(),
                     (),
+                    None,
                     None,
                     false,
                     tx.clone(),
