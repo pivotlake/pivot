@@ -1271,3 +1271,28 @@ fn constant_group_key_is_derived(mut testing_planner: TestingPlanner) {
         ]
     );
 }
+
+#[rstest]
+fn bare_limit_over_group_short_circuits_partitions(mut testing_planner: TestingPlanner) {
+    // A bare LIMIT above a grouped aggregate annotates the group to stop
+    // merging once enough complete groups are out; the result must still be
+    // exactly `limit` genuine groups.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, name, COUNT(*) FROM example_table GROUP BY a, name LIMIT 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 3);
+    // Every emitted row is a real (a, name) group with count 1 (all rows of
+    // example_table are distinct (a, name) pairs).
+    assert!(rows.iter().all(|r| r["v0"] == 1));
+    assert!(
+        rows.iter()
+            .all(|r| (1..=5).contains(&r["k0"].as_i64().unwrap()))
+    );
+}

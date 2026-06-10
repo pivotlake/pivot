@@ -133,7 +133,7 @@ fn emit_chunks<K, V, Snd, I>(
     key_config: &K::Config,
     value_slots: &[AggregationSlot],
     sender: &mut Snd,
-) -> Result<()>
+) -> Result<usize>
 where
     K: KeyExtractor,
     V: ValueExtractor,
@@ -153,7 +153,7 @@ where
         emit::<K, V, Snd>(keys, values, arena, allocator, sender)?;
         remaining -= chunk;
     }
-    Ok(())
+    Ok(total)
 }
 
 /// Convert a completed partition table into output `RecordBatch`es (one per
@@ -162,6 +162,8 @@ where
 /// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
 /// `ORDER BY <value_slot> DESC LIMIT limit`; only this partition's top-`limit`
 /// rows are emitted in that case.
+/// Returns the number of result rows sent (used by a bare-LIMIT group to stop
+/// merging partitions once enough complete groups have been emitted).
 pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
     arena: &Arc<SharedArena>,
@@ -171,7 +173,7 @@ pub(crate) fn build_and_send<K, V, S, Snd>(
     key_config: &K::Config,
     value_slots: &[AggregationSlot],
     sender: &mut Snd,
-) -> Result<()>
+) -> Result<usize>
 where
     K: KeyExtractor,
     V: ValueExtractor,
@@ -189,7 +191,7 @@ where
         let field = ArrowField::new("v0", DataType::Int64, false);
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr])?;
         sender.send(batch)?;
-        return Ok(());
+        return Ok(1);
     }
 
     match top_k {

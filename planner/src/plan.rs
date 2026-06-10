@@ -112,6 +112,45 @@ impl PlanNode {
         self.inputs = order_by_node.inputs;
     }
 
+    /// Detect `grouped Aggregate → (projections) → Limit` with no ordering and
+    /// annotate the aggregate with `output_limit = limit + offset`: any that
+    /// many complete groups answer the query, so the group operator can stop
+    /// merging partitions early. Projections preserve row count, so walking
+    /// through them is safe; the `Limit` stays for the exact global window.
+    pub(crate) fn annotate_group_limit(&mut self) {
+        for child in &mut self.inputs {
+            child.annotate_group_limit();
+        }
+
+        let Operator::Limit(limit) = &self.operator else {
+            return;
+        };
+        let Some(rows) = limit.limit else {
+            return;
+        };
+        let needed = rows + limit.offset;
+
+        let mut node = match self.inputs.first_mut() {
+            Some(n) => n,
+            None => return,
+        };
+        loop {
+            match &mut node.operator {
+                Operator::Projection(_) => {
+                    node = match node.inputs.first_mut() {
+                        Some(n) => n,
+                        None => return,
+                    };
+                }
+                Operator::Aggregate(a) if !a.groups.is_empty() => {
+                    a.output_limit = Some(needed);
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+
     /// Detect `grouped Aggregate → (pass-through projections) → TopN(ORDER BY
     /// <agg col> DESC LIMIT k)` and annotate the aggregate with `top_k`, so the
     /// group operator emits only each partition's top-k rows instead of every

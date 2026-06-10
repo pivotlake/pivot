@@ -422,6 +422,7 @@ impl Aggregate {
             groups: base,
             expressions: self.expressions.clone(),
             top_k: self.top_k,
+            output_limit: self.output_limit,
         };
         Some((reduced, projections))
     }
@@ -1098,6 +1099,7 @@ impl Aggregate {
             .collect();
 
         let top_k = self.top_k;
+        let output_limit = self.output_limit;
 
         // Accumulator width, by the same column-type rule as the global path:
         // i128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
@@ -1111,36 +1113,54 @@ impl Aggregate {
         macro_rules! by_arity {
             ($K:ty, $acc:ty) => {
                 match slots.len() {
-                    1 => Ok(
-                        input.group_by_aggregate::<$K, AggregationRowValueExtractor<1, $acc>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    2 => Ok(
-                        input.group_by_aggregate::<$K, AggregationRowValueExtractor<2, $acc>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    3 => Ok(
-                        input.group_by_aggregate::<$K, AggregationRowValueExtractor<3, $acc>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    4 => Ok(
-                        input.group_by_aggregate::<$K, AggregationRowValueExtractor<4, $acc>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    5 => Ok(
-                        input.group_by_aggregate::<$K, AggregationRowValueExtractor<5, $acc>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    6 => Ok(
-                        input.group_by_aggregate::<$K, AggregationRowValueExtractor<6, $acc>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
+                    1 => Ok(input
+                        .group_by_aggregate_limited::<$K, AggregationRowValueExtractor<1, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    2 => Ok(input
+                        .group_by_aggregate_limited::<$K, AggregationRowValueExtractor<2, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    3 => Ok(input
+                        .group_by_aggregate_limited::<$K, AggregationRowValueExtractor<3, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    4 => Ok(input
+                        .group_by_aggregate_limited::<$K, AggregationRowValueExtractor<4, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    5 => Ok(input
+                        .group_by_aggregate_limited::<$K, AggregationRowValueExtractor<5, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    6 => Ok(input
+                        .group_by_aggregate_limited::<$K, AggregationRowValueExtractor<6, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             };
@@ -1149,36 +1169,54 @@ impl Aggregate {
         macro_rules! mixed_by_arity {
             ($K:ty) => {
                 match slots.len() {
-                    1 => Ok(
-                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<1>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    2 => Ok(
-                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<2>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    3 => Ok(
-                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<3>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    4 => Ok(
-                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<4>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    5 => Ok(
-                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<5>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
-                    6 => Ok(
-                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<6>>(
-                            key_cols, slots, top_k,
-                        ),
-                    ),
+                    1 => Ok(input
+                        .group_by_aggregate_limited::<$K, dispatch::MixedRowValueExtractor<1>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    2 => Ok(input
+                        .group_by_aggregate_limited::<$K, dispatch::MixedRowValueExtractor<2>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    3 => Ok(input
+                        .group_by_aggregate_limited::<$K, dispatch::MixedRowValueExtractor<3>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    4 => Ok(input
+                        .group_by_aggregate_limited::<$K, dispatch::MixedRowValueExtractor<4>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    5 => Ok(input
+                        .group_by_aggregate_limited::<$K, dispatch::MixedRowValueExtractor<5>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
+                    6 => Ok(input
+                        .group_by_aggregate_limited::<$K, dispatch::MixedRowValueExtractor<6>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            Default::default(),
+                        )),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             };
@@ -1189,7 +1227,13 @@ impl Aggregate {
                 if has_extremes {
                     mixed_by_arity!($K)
                 } else if lone_count {
-                    Ok(input.group_by_aggregate::<$K, Compiled<(Count,)>>(key_cols, slots, top_k))
+                    Ok(input.group_by_aggregate_limited::<$K, Compiled<(Count,)>>(
+                        key_cols,
+                        slots,
+                        top_k,
+                        output_limit,
+                        Default::default(),
+                    ))
                 } else if wide {
                     by_arity!($K, i128)
                 } else {
@@ -1229,7 +1273,13 @@ impl Aggregate {
                             Sig::Count,
                         ] => {
                             type V = Compiled<(Count, Sum<Int16Type>, Sum<Int16Type>, Count)>;
-                            Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
+                            Ok(input.group_by_aggregate_limited::<Key, V>(
+                                key_cols,
+                                slots,
+                                top_k,
+                                output_limit,
+                                Default::default(),
+                            ))
                         }
                         _ => with_key!(Key),
                     };
@@ -1272,6 +1322,7 @@ impl Aggregate {
                 .collect::<Result<Vec<_>, _>>()?,
         );
         let top_k = self.top_k;
+        let output_limit = self.output_limit;
         let wide = sum_reads_wide_column(&self.expressions);
 
         let has_extremes = slots.iter().any(|s| {
@@ -1287,8 +1338,12 @@ impl Aggregate {
             macro_rules! mixed {
                 ($n:literal) => {
                     Ok(input
-                        .group_by_aggregate_config::<RowKeyExtractor, MixedRowValueExtractor<$n>>(
-                            key_cols, slots, top_k, schema,
+                        .group_by_aggregate_limited::<RowKeyExtractor, MixedRowValueExtractor<$n>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            schema,
                         ))
                 };
             }
@@ -1305,8 +1360,12 @@ impl Aggregate {
 
         if lone_count {
             return Ok(
-                input.group_by_aggregate_config::<RowKeyExtractor, Compiled<(Count,)>>(
-                    key_cols, slots, top_k, schema,
+                input.group_by_aggregate_limited::<RowKeyExtractor, Compiled<(Count,)>>(
+                    key_cols,
+                    slots,
+                    top_k,
+                    output_limit,
+                    schema,
                 ),
             );
         }
@@ -1314,28 +1373,52 @@ impl Aggregate {
             ($acc:ty) => {
                 match slots.len() {
                     1 => Ok(input
-                        .group_by_aggregate_config::<RowKeyExtractor, AggregationRowValueExtractor<1, $acc>>(
-                            key_cols, slots, top_k, schema,
+                        .group_by_aggregate_limited::<RowKeyExtractor, AggregationRowValueExtractor<1, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            schema,
                         )),
                     2 => Ok(input
-                        .group_by_aggregate_config::<RowKeyExtractor, AggregationRowValueExtractor<2, $acc>>(
-                            key_cols, slots, top_k, schema,
+                        .group_by_aggregate_limited::<RowKeyExtractor, AggregationRowValueExtractor<2, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            schema,
                         )),
                     3 => Ok(input
-                        .group_by_aggregate_config::<RowKeyExtractor, AggregationRowValueExtractor<3, $acc>>(
-                            key_cols, slots, top_k, schema,
+                        .group_by_aggregate_limited::<RowKeyExtractor, AggregationRowValueExtractor<3, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            schema,
                         )),
                     4 => Ok(input
-                        .group_by_aggregate_config::<RowKeyExtractor, AggregationRowValueExtractor<4, $acc>>(
-                            key_cols, slots, top_k, schema,
+                        .group_by_aggregate_limited::<RowKeyExtractor, AggregationRowValueExtractor<4, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            schema,
                         )),
                     5 => Ok(input
-                        .group_by_aggregate_config::<RowKeyExtractor, AggregationRowValueExtractor<5, $acc>>(
-                            key_cols, slots, top_k, schema,
+                        .group_by_aggregate_limited::<RowKeyExtractor, AggregationRowValueExtractor<5, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            schema,
                         )),
                     6 => Ok(input
-                        .group_by_aggregate_config::<RowKeyExtractor, AggregationRowValueExtractor<6, $acc>>(
-                            key_cols, slots, top_k, schema,
+                        .group_by_aggregate_limited::<RowKeyExtractor, AggregationRowValueExtractor<6, $acc>>(
+                            key_cols,
+                            slots,
+                            top_k,
+                            output_limit,
+                            schema,
                         )),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }

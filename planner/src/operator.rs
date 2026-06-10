@@ -248,6 +248,11 @@ pub struct Aggregate {
     /// when this grouped aggregate feeds an `ORDER BY <slot> DESC LIMIT limit`,
     /// so the group operator emits only each partition's top-`limit` rows.
     pub top_k: Option<(usize, usize)>,
+    /// Set by the `group → Limit` detection pass when a bare `LIMIT` (no
+    /// ORDER BY) consumes this aggregate: any `n` complete groups answer the
+    /// query, so the group operator stops merging partitions once that many
+    /// rows are out.
+    pub output_limit: Option<usize>,
 }
 
 impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
@@ -255,6 +260,7 @@ impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
     fn try_from(a: duckdb_operator::Aggregate) -> Result<Self, Self::Error> {
         Ok(Aggregate {
             top_k: None,
+            output_limit: None,
             groups: a
                 .groups
                 .into_iter()
