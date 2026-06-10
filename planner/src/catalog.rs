@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use crate::expression::{CompareType, TableFilter};
 use crate::types::{Type, logical_from_type};
+use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
@@ -124,6 +125,15 @@ pub trait Table: Debug + Send + Sync {
     /// exceptions.
     fn pushdown_filter(&mut self, _filter: TableFilter) -> Result<bool> {
         Ok(false)
+    }
+
+    /// The column's min and max derived from table metadata, if they can be
+    /// answered without scanning any rows — e.g. Parquet row-group statistics
+    /// covering every row group, with no predicates pushed into this binding.
+    /// The scalars carry the column's physical storage type. `None` means
+    /// "unknown, scan instead" and is always a safe answer.
+    fn column_min_max(&self, _column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+        None
     }
 }
 

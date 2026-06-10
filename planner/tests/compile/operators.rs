@@ -794,8 +794,116 @@ fn create_table_passes_with_options_to_catalog() {
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
     let result = testing_planner
         .planner
-        .plan("SELECT MIN(b) FROM example_table");
+        .plan("SELECT median(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
+}
+
+// ---- MIN / MAX aggregates ----
+
+#[rstest]
+fn global_min_max(mut testing_planner: TestingPlanner) {
+    // The in-memory test table exposes no metadata bounds, so this runs the
+    // scan-based global path.
+    let results = testing_planner
+        .planner
+        .plan("SELECT MIN(b), MAX(b), COUNT(*) FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    // The select-list projection passes the aggregate's columns through, so
+    // the output keeps the operator's own field names.
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["min"].as_i64(), Some(10));
+    assert_eq!(rows[0]["max"].as_i64(), Some(50));
+    assert_eq!(rows[0]["count"].as_i64(), Some(5));
+}
+
+#[rstest]
+fn grouped_numeric_min_max(mut testing_planner: TestingPlanner) {
+    // alice spans b=10 and b=50; everyone else has one row.
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, MIN(b), MAX(b), COUNT(*) FROM example_table GROUP BY name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(String, i64, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+                r["v1"].as_i64().unwrap(),
+                r["v2"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("alice".to_string(), 10, 50, 2),
+            ("bob".to_string(), 20, 20, 1),
+            ("charlie".to_string(), 30, 30, 1),
+            ("dave".to_string(), 40, 40, 1),
+        ]
+    );
+}
+
+#[rstest]
+fn grouped_string_min(mut testing_planner: TestingPlanner) {
+    // MIN over a string column, with candidates long enough to live in the
+    // arena and a key whose later row improves on its first.
+    testing_planner.add_table(
+        "pages",
+        &[
+            ("k", Type::Int32, int_col(vec![1, 1, 2, 1])),
+            (
+                "url",
+                Type::Utf8,
+                crate::common::str_col(vec![
+                    "http://example.com/zzz/very-long-path",
+                    "http://example.com/aaa/very-long-path",
+                    "http://other.org/x",
+                    "http://example.com/mmm",
+                ]),
+            ),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT k, MIN(url), COUNT(*) FROM pages GROUP BY k")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["key"].as_i64().unwrap(),
+                r["v0"].as_str().unwrap().to_string(),
+                r["v1"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "http://example.com/aaa/very-long-path".to_string(), 3),
+            (2, "http://other.org/x".to_string(), 1),
+        ]
+    );
 }
 
 // ---- Multi-key grouping (row-encoded key extractor) ----
@@ -1064,4 +1172,32 @@ fn constant_group_key_is_derived(mut testing_planner: TestingPlanner) {
             (7, "dave".to_string(), 1),
         ]
     );
+}
+
+#[rstest]
+fn wide_sum_with_extremes_is_rejected(mut testing_planner: TestingPlanner) {
+    // SUM over a 64-bit column accumulates in i128; the mixed-slot extractor
+    // backing MIN/MAX is i64-only, so the combination must fail loudly at
+    // compile rather than risk silent overflow.
+    use arrow_array::Int64Array;
+    testing_planner.add_table(
+        "wide",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2])),
+            (
+                "v",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![5i64, 6, 7])) as ArrayRef,
+            ),
+        ],
+    );
+    let result = testing_planner
+        .planner
+        .plan("SELECT g, SUM(v), MIN(v) FROM wide GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher());
+    assert!(matches!(
+        result,
+        Err(planner::compile::Error::UnsupportedWideSumWithExtremes)
+    ));
 }
