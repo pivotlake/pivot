@@ -118,6 +118,9 @@ impl<const N: usize, A: Accumulator> ValueExtractor for AggregationRowValueExtra
                     }
                     other => panic!("grouped SUM: unsupported column type {other:?}"),
                 },
+                // MIN/MAX slots route to the mixed-slot extractor; the planner
+                // never sends them here.
+                kind => panic!("additive value extractor got a {kind:?} slot"),
             }
         });
         AggregationRowReader { slots }
@@ -143,7 +146,11 @@ pub struct AggregationRowColumns<const N: usize, A: Accumulator = i64> {
 impl<const N: usize, A: Accumulator> ValueColumns for AggregationRowColumns<N, A> {
     type Value = AggregationRow<N, A>;
 
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+    fn with_capacity(
+        allocator: &mut SlabAllocator,
+        rows: usize,
+        _value_slots: &[AggregationSlot],
+    ) -> Self {
         Self {
             cols: std::array::from_fn(|_| PrimitiveBuilder::with_capacity(allocator, rows)),
         }
@@ -156,7 +163,10 @@ impl<const N: usize, A: Accumulator> ValueColumns for AggregationRowColumns<N, A
         }
     }
 
-    fn finish(self) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        _arena: &std::sync::Arc<crate::operations::unary::group::arena::SharedArena>,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         let mut fields = Vec::with_capacity(N);
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(N);
         for (s, c) in self.cols.into_iter().enumerate() {

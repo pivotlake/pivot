@@ -118,3 +118,45 @@ fn function_contains(mut testing_planner: TestingPlanner) {
         Input([#3:Utf8])
     ");
 }
+
+/// `Function::Minute` — `extract(minute FROM ts)` lowers to the `minute`
+/// scalar function over a `Timestamp` column, here a computed GROUP BY key.
+#[rstest]
+fn function_minute(mut testing_planner: TestingPlanner) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use std::sync::Arc;
+    testing_planner.add_table(
+        "events",
+        &[(
+            "EventTime",
+            planner::types::Type::Timestamp,
+            Arc::new(Int64Array::from(vec![0i64, 90, 150])) as ArrayRef,
+        )],
+    );
+    let plan = testing_planner
+        .planner
+        .plan("SELECT extract(minute FROM EventTime) AS m, COUNT(*) FROM events GROUP BY m")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int64, #1:Int64)
+      Aggregate(groups: [minute(#0:Timestamp)], exprs: [count_star()])
+        Input([#0:Timestamp])
+    ");
+}
+
+/// `Case` — a `CASE WHEN … THEN … ELSE … END` used as a computed GROUP BY key.
+#[rstest]
+fn case_expression_group_key(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan(
+            "SELECT CASE WHEN a < 3 THEN 'low' ELSE 'high' END AS c, COUNT(*) \
+             FROM example_table GROUP BY 1",
+        )
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Utf8, #1:Int64)
+      Aggregate(groups: [CASE WHEN #0:Int32 < 3:Int32 -> Boolean THEN low:Utf8View ELSE high:Utf8View END], exprs: [count_star()])
+        Input([#0:Int32])
+    ");
+}

@@ -22,7 +22,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::values::{ValueColumns, ValueExtractor};
+use crate::operations::unary::group::values::{AggregationSlot, ValueColumns, ValueExtractor};
 
 use super::Result;
 
@@ -106,6 +106,7 @@ fn emit<K, V, Snd>(
     keys: K::Columns,
     values: V::Columns,
     arena: &Arc<SharedArena>,
+    allocator: &mut SlabAllocator,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -113,8 +114,8 @@ where
     V: ValueExtractor,
     Snd: Sender<RecordBatch>,
 {
-    let (mut fields, mut columns) = keys.finish(arena);
-    let (value_fields, value_columns) = values.finish();
+    let (mut fields, mut columns) = keys.finish(arena, allocator);
+    let (value_fields, value_columns) = values.finish(arena);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -129,8 +130,10 @@ fn emit_chunks<K, V, Snd, I>(
     total: usize,
     arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
+    key_config: &K::Config,
+    value_slots: &[AggregationSlot],
     sender: &mut Snd,
-) -> Result<()>
+) -> Result<usize>
 where
     K: KeyExtractor,
     V: ValueExtractor,
@@ -140,17 +143,17 @@ where
     let mut remaining = total;
     while remaining > 0 {
         let chunk = remaining.min(OUTPUT_CHUNK_ROWS);
-        let mut keys = K::Columns::with_capacity(allocator, chunk);
-        let mut values = V::Columns::with_capacity(allocator, chunk);
+        let mut keys = K::Columns::with_capacity(allocator, chunk, key_config);
+        let mut values = V::Columns::with_capacity(allocator, chunk, value_slots);
         for _ in 0..chunk {
             let (key, value) = rows.next().expect("iterator yields `total` items");
             keys.push(&key);
             values.push(&value);
         }
-        emit::<K, V, Snd>(keys, values, arena, sender)?;
+        emit::<K, V, Snd>(keys, values, arena, allocator, sender)?;
         remaining -= chunk;
     }
-    Ok(())
+    Ok(total)
 }
 
 /// Convert a completed partition table into output `RecordBatch`es (one per
@@ -159,14 +162,18 @@ where
 /// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
 /// `ORDER BY <value_slot> DESC LIMIT limit`; only this partition's top-`limit`
 /// rows are emitted in that case.
+/// Returns the number of result rows sent (used by a bare-LIMIT group to stop
+/// merging partitions once enough complete groups have been emitted).
 pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
     arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     top_k: Option<(usize, usize)>,
     count_only: bool,
+    key_config: &K::Config,
+    value_slots: &[AggregationSlot],
     sender: &mut Snd,
-) -> Result<()>
+) -> Result<usize>
 where
     K: KeyExtractor,
     V: ValueExtractor,
@@ -184,19 +191,35 @@ where
         let field = ArrowField::new("v0", DataType::Int64, false);
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr])?;
         sender.send(batch)?;
-        return Ok(());
+        return Ok(1);
     }
 
     match top_k {
         Some((slot, limit)) if limit < table.len() => {
             let rows = top_k_rows::<K, V, S>(&table, slot, limit);
             let total = rows.len();
-            emit_chunks::<K, V, Snd, _>(rows.into_iter(), total, arena, allocator, sender)
+            emit_chunks::<K, V, Snd, _>(
+                rows.into_iter(),
+                total,
+                arena,
+                allocator,
+                key_config,
+                value_slots,
+                sender,
+            )
         }
         _ => {
             let total = table.len();
             let rows = table.iter(0).map(|e| (*e.key(), *e.value()));
-            emit_chunks::<K, V, Snd, _>(rows, total, arena, allocator, sender)
+            emit_chunks::<K, V, Snd, _>(
+                rows,
+                total,
+                arena,
+                allocator,
+                key_config,
+                value_slots,
+                sender,
+            )
         }
     }
 }

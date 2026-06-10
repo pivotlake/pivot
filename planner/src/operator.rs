@@ -248,6 +248,11 @@ pub struct Aggregate {
     /// when this grouped aggregate feeds an `ORDER BY <slot> DESC LIMIT limit`,
     /// so the group operator emits only each partition's top-`limit` rows.
     pub top_k: Option<(usize, usize)>,
+    /// Set by the `group → Limit` detection pass when a bare `LIMIT` (no
+    /// ORDER BY) consumes this aggregate: any `n` complete groups answer the
+    /// query, so the group operator stops merging partitions once that many
+    /// rows are out.
+    pub output_limit: Option<usize>,
 }
 
 impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
@@ -255,6 +260,7 @@ impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
     fn try_from(a: duckdb_operator::Aggregate) -> Result<Self, Self::Error> {
         Ok(Aggregate {
             top_k: None,
+            output_limit: None,
             groups: a
                 .groups
                 .into_iter()
@@ -365,6 +371,41 @@ impl fmt::Display for TopN {
     }
 }
 
+/// Plain `LIMIT n [OFFSET m]` with no ordering attached.
+///
+/// Reaches the plan in two shapes: a LIMIT with no ORDER BY beneath it (any
+/// rows are valid output, only the count matters), or a `LIMIT … OFFSET` whose
+/// window was too large for DuckDB's Top-N optimizer, planned as a full
+/// `OrderBy` with this node above it. The latter shape is fused back into a
+/// [`TopN`] by [`PlanNode::fuse_limit_order_by`](crate::plan::PlanNode); only
+/// the unordered shape compiles to the dispatch `limit` operator.
+///
+/// `limit` is `None` for a bare `OFFSET m` (unbounded).
+#[derive(Debug)]
+pub struct Limit {
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+impl TryFrom<duckdb_operator::Limit> for Limit {
+    type Error = Error;
+    fn try_from(l: duckdb_operator::Limit) -> Result<Self, Self::Error> {
+        Ok(Limit {
+            limit: l.limit,
+            offset: l.offset,
+        })
+    }
+}
+
+impl fmt::Display for Limit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.limit {
+            Some(limit) => write!(f, "Limit(limit: {}, offset: {})", limit, self.offset),
+            None => write!(f, "Limit(limit: unbounded, offset: {})", self.offset),
+        }
+    }
+}
+
 /// CREATE TABLE with an explicit column list.
 #[derive(Debug)]
 pub struct CreateTable {
@@ -458,6 +499,7 @@ pub enum Operator {
     Aggregate(Aggregate),
     Filter(Filter),
     TopN(TopN),
+    Limit(Limit),
     CreateTable(CreateTable),
     DummyScan(DummyScan),
     /// Late-materialization fetch (synthesized by the rewrite, see [`Materialize`]).
@@ -475,6 +517,7 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
             duckdb_operator::Operator::Aggregate(a) => Operator::Aggregate(a.try_into()?),
             duckdb_operator::Operator::Filter(f) => Operator::Filter(f.try_into()?),
             duckdb_operator::Operator::TopN(t) => Operator::TopN(t.try_into()?),
+            duckdb_operator::Operator::Limit(l) => Operator::Limit(l.try_into()?),
             duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
             duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
             duckdb_operator::Operator::Materialize(m) => Operator::Materialize(m.try_into()?),
@@ -497,6 +540,7 @@ impl fmt::Display for Operator {
             Operator::Aggregate(a) => write!(f, "{a}"),
             Operator::Filter(fl) => write!(f, "{fl}"),
             Operator::TopN(t) => write!(f, "{t}"),
+            Operator::Limit(l) => write!(f, "{l}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::Materialize(m) => write!(f, "{m}"),

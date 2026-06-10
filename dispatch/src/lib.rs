@@ -99,8 +99,9 @@ pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
     Accumulator, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
     DistinctValueExtractor, DynamicFilterSlot, HashOnlyIntKeyExtractor, IntKeyExtractor,
-    IntPairKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator, OrderBy,
-    Result as OperatorResult, StringKeyExtractor, Sum, ValueExtractor,
+    IntPairKeyExtractor, MixedRowValueExtractor, Nullary, NullaryFactory, NullaryOperatorFactory,
+    Operator, OrderBy, Result as OperatorResult, RowKeyExtractor, RowKeySchema, StringKeyExtractor,
+    Sum, ValueExtractor,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,

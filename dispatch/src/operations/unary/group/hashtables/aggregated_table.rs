@@ -89,10 +89,11 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
     pub zero_hash_seen: bool,
 }
 
-/// [`BatchRowSource`] adapter for [`BaseHashTable::merge_batch`] (in-place phase).
+/// [`BatchRowSource`] adapter for [`BaseHashTable::merge_batch`] /
+/// [`BaseHashTable::merge_row`] (in-place phase).
 struct RowSrc<'r, 'b, K: KeyExtractor, V: ValueExtractor> {
     key_reader: &'r K::Reader<'b>,
-    value_reader: V::Reader<'b>,
+    value_reader: &'r V::Reader<'b>,
     arena: &'r mut WorkerArena,
 }
 
@@ -109,7 +110,11 @@ impl<K: KeyExtractor, V: ValueExtractor> BatchRowSource<K::Persisted, V::Value>
     }
     #[inline(always)]
     fn value(&mut self, i: usize) -> V::Value {
-        V::value(&self.value_reader, i)
+        V::init(self.value_reader, i, &mut *self.arena)
+    }
+    #[inline(always)]
+    fn fold_value(&mut self, i: usize, current: V::Value) -> V::Value {
+        V::fold(current, self.value_reader, i, &mut *self.arena)
     }
 }
 
@@ -190,16 +195,17 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         batch: &RecordBatch,
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
+        config: &K::Config,
     ) {
         let total = batch.num_rows();
         if total <= RECORD_BATCH_SIZE {
-            self.consume_window(batch, key_cols, value_slots);
+            self.consume_window(batch, key_cols, value_slots, config);
             return;
         }
         let mut start = 0;
         while start < total {
             let len = (total - start).min(RECORD_BATCH_SIZE);
-            self.consume_window(&batch.slice(start, len), key_cols, value_slots);
+            self.consume_window(&batch.slice(start, len), key_cols, value_slots, config);
             start += len;
         }
     }
@@ -209,8 +215,9 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         batch: &RecordBatch,
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
+        config: &K::Config,
     ) {
-        let key_reader = K::make_reader(batch, key_cols);
+        let key_reader = K::make_reader(batch, key_cols, config);
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 
@@ -262,7 +269,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     ) {
         let mut src = RowSrc::<K, V> {
             key_reader,
-            value_reader,
+            value_reader: &value_reader,
             arena: &mut self.worker_arena,
         };
         self.tables.last_mut().unwrap().merge_batch(
@@ -312,9 +319,12 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 if i + L1_DISTANCE < length {
                     table.prefetch(self.hashes[i + L1_DISTANCE]);
                 }
-                let key = K::live_key(key_reader, i, &mut self.worker_arena);
-                let value = V::value(value_reader, i);
-                table.merge::<false, _>(hash, key, value);
+                let mut src = RowSrc::<K, V> {
+                    key_reader,
+                    value_reader,
+                    arena: &mut self.worker_arena,
+                };
+                table.merge_row::<false, _>(hash, i, &mut src);
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
@@ -331,7 +341,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     #[inline(always)]
     fn grow_or_switch(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
-        if K::SUPPORTS_RADIX && next_size > self.radix_cfg.switch_threshold {
+        if K::SUPPORTS_RADIX && V::SUPPORTS_RADIX && next_size > self.radix_cfg.switch_threshold {
             self.buffers = Some(
                 (0..self.radix_cfg.partitions)
                     .map(|_| SlabVec::new())
@@ -348,12 +358,12 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
 
     /// Scatter rows `[start, end)` into per-partition buffers (post-switch).
     #[inline(always)]
-    fn scatter_range(
+    fn scatter_range<'b>(
         &mut self,
         start: usize,
         end: usize,
-        key_reader: &K::Reader<'_>,
-        value_reader: &V::Reader<'_>,
+        key_reader: &K::Reader<'b>,
+        value_reader: &V::Reader<'b>,
     ) {
         let shift = u64::BITS - self.radix_cfg.partitions.trailing_zeros();
         let Self {
@@ -370,7 +380,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             hll.add(hash);
             let p = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, worker_arena).persist();
-            let value = V::value(value_reader, i);
+            let value = V::init(value_reader, i, worker_arena);
             buffers[p].push(allocator, (hash, key, value));
         }
     }

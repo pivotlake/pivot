@@ -55,19 +55,33 @@ pub trait Value: Copy + Clone + Default {
     fn merge(self, v: Self) -> Self;
 }
 
-/// Supplies per-row keys and values to [`BaseHashTable::merge_batch`].
+/// Supplies per-row keys and values to [`BaseHashTable::merge_batch`] and
+/// [`BaseHashTable::merge_row`].
 ///
 /// Passed as a single `&mut` so the implementation can hold a mutable borrow
 /// (e.g. of a key arena) internally without it escaping through a closure return
 /// — the methods hand back owned keys/values or a bool, never a borrow tied to
 /// that internal state.
+///
+/// `value` and `fold_value` split the two ways a row meets the table: a fresh
+/// entry *builds* the row's value, an existing entry *folds* the row into its
+/// current value. For plain additive aggregates the two compose (`fold` =
+/// `merge(current, build())`, the default); aggregates with side effects —
+/// e.g. a string `MIN`, which persists its candidate into an arena — override
+/// `fold_value` so the side effect only happens when the row actually improves
+/// the entry.
 pub trait BatchRowSource<K: PersistedKey, V: Value> {
     /// The persisted key for row `i` (allocating in any backing arena as needed).
     fn persisted(&mut self, i: usize) -> K;
     /// Whether row `i`'s key equals the already-persisted key `persisted`.
     fn key_eq(&mut self, i: usize, persisted: &K) -> bool;
-    /// The aggregate value contributed by row `i`.
+    /// The aggregate value contributed by row `i`, for a fresh entry.
     fn value(&mut self, i: usize) -> V;
+    /// Fold row `i` into an existing entry's value.
+    fn fold_value(&mut self, i: usize, current: V) -> V {
+        let v = self.value(i);
+        current.merge(v)
+    }
 }
 
 /// A single slot in the hash table, storing the full hash, key, and value.
@@ -386,24 +400,73 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     /// - Average case: O(1) - at 70% load, expected probe length is ~1.8
     /// - Worst case: O(n) - pathological hash collisions
     #[inline(always)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn merge<const COUNT_COLLISIONS: bool, L: LiveKey<Persisted = K>>(
+        &mut self,
+        hash: u64,
+        key: L,
+        value: V,
+    ) {
+        self.merge_with::<COUNT_COLLISIONS, L>(hash, key, value, |current, v| current.merge(v));
+    }
+
+    /// Scalar insert/merge of one row, driven by a [`BatchRowSource`] — the
+    /// one-row counterpart of [`merge_batch`](Self::merge_batch). Unlike
+    /// [`merge`](Self::merge), the row's value is only *built* when the row
+    /// claims a fresh slot; an existing entry is updated via
+    /// [`BatchRowSource::fold_value`], so value-side side effects (e.g. a
+    /// string `MIN` persisting its candidate) happen only when needed.
+    #[inline(always)]
+    pub fn merge_row<const COUNT_COLLISIONS: bool, S: BatchRowSource<K, V>>(
+        &mut self,
+        mut hash: u64,
+        i: usize,
+        rows: &mut S,
+    ) {
+        if hash == 0 {
+            hash = 1;
+        }
+        let mut idx = self.slot_for(hash);
+        loop {
+            let entry = &self.buffer[idx];
+            if entry.hash == 0 {
+                let key = rows.persisted(i);
+                let value = rows.value(i);
+                self.buffer[idx] = Entry { hash, key, value };
+                self.length += 1;
+                return;
+            }
+            if entry.hash == hash && rows.key_eq(i, &entry.key) {
+                let current = self.buffer[idx].value;
+                self.buffer[idx].value = rows.fold_value(i, current);
+                return;
+            }
+            if COUNT_COLLISIONS {
+                self.collisions += 1;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
+    /// Insert/merge an already-built value with an explicit combine function —
+    /// used by the partition merge, where combining two persisted values can
+    /// need context [`Value::merge`] doesn't carry (e.g. the shared arena to
+    /// compare two persisted string `MIN`s).
+    #[inline(always)]
+    pub fn merge_with<const COUNT_COLLISIONS: bool, L: LiveKey<Persisted = K>>(
         &mut self,
         mut hash: u64,
         key: L,
         value: V,
+        combine: impl FnOnce(V, V) -> V,
     ) {
-        // hash == 0 is our empty sentinel, so remap actual zero hashes to 1
         if hash == 0 {
             hash = 1;
         }
-
         let mut idx = self.slot_for(hash);
-
         loop {
-            let entry = &mut self.buffer[idx];
-
+            let entry = &self.buffer[idx];
             if entry.hash == 0 {
-                // Empty slot found - persist the key and insert
                 let persisted = key.persist();
                 self.buffer[idx] = Entry {
                     hash,
@@ -413,18 +476,14 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
                 self.length += 1;
                 return;
             }
-
             if entry.hash == hash && key.eq_persisted(&entry.key) {
-                // Key exists - merge the values (e.g., add counts)
-                entry.value = entry.value.merge(value);
+                let current = self.buffer[idx].value;
+                self.buffer[idx].value = combine(current, value);
                 return;
             }
-
             if COUNT_COLLISIONS {
                 self.collisions += 1;
             }
-
-            // Collision with different key - linear probe to next slot
             idx = (idx + 1) & self.mask;
         }
     }
@@ -464,8 +523,8 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             self.length += 1;
             true
         } else if stored == hash && rows.key_eq(i, &self.buffer[slot].key) {
-            let value = rows.value(i);
-            self.buffer[slot].value = self.buffer[slot].value.merge(value);
+            let current = self.buffer[slot].value;
+            self.buffer[slot].value = rows.fold_value(i, current);
             true
         } else {
             self.collisions += 1;

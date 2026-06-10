@@ -60,14 +60,21 @@ pub struct DistinctValueColumns;
 impl ValueColumns for DistinctValueColumns {
     type Value = DistinctValue;
 
-    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+    fn with_capacity(
+        _allocator: &mut SlabAllocator,
+        _rows: usize,
+        _value_slots: &[AggregationSlot],
+    ) -> Self {
         DistinctValueColumns
     }
 
     #[inline(always)]
     fn push(&mut self, _value: &DistinctValue) {}
 
-    fn finish(self) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        _arena: &std::sync::Arc<crate::operations::unary::group::arena::SharedArena>,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
     }
 }
