@@ -125,6 +125,65 @@ fn row_key_data_type(t: &Type) -> Result<arrow_schema::DataType, Error> {
     })
 }
 
+/// Keys-only dedup of `cols` via the row-encoded multi-key extractor — the
+/// inner stage of a grouped `COUNT(DISTINCT)` whose tuple shape has no packed
+/// extractor.
+fn row_key_distinct(
+    input: RecordBatchOperatorSpec,
+    cols: Vec<usize>,
+    types: &[Type],
+) -> Result<RecordBatchOperatorSpec, Error> {
+    use dispatch::{RowKeyExtractor, RowKeySchema};
+    let schema = RowKeySchema::new(
+        types
+            .iter()
+            .map(row_key_data_type)
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    Ok(input.group_by_distinct_config::<RowKeyExtractor>(cols, schema))
+}
+
+/// `COUNT(*)` per group tuple over the leading columns of `input` (a deduped
+/// inner stage's output) — the outer stage of a grouped `COUNT(DISTINCT)`.
+fn count_per_group(
+    input: RecordBatchOperatorSpec,
+    group_types: &[Type],
+    top_k: Option<(usize, usize)>,
+) -> Result<RecordBatchOperatorSpec, Error> {
+    use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
+    use dispatch::{
+        AggregationKind, AggregationSlot, Compiled, Count, RowKeyExtractor, RowKeySchema,
+    };
+
+    let key_cols: Vec<usize> = (0..group_types.len()).collect();
+    let slots = vec![AggregationSlot::new(AggregationKind::CountStar, 0)];
+    macro_rules! count_with {
+        ($K:ty) => {
+            Ok(input.group_by_aggregate::<$K, Compiled<(Count,)>>(key_cols, slots, top_k))
+        };
+    }
+    match group_types {
+        [Type::Int8] => count_with!(IntKeyExtractor<Int8Type>),
+        [Type::Int16] => count_with!(IntKeyExtractor<Int16Type>),
+        [Type::Int32] => count_with!(IntKeyExtractor<Int32Type>),
+        [Type::Int64] => count_with!(IntKeyExtractor<Int64Type>),
+        [Type::Utf8] => count_with!(StringKeyExtractor),
+        _ => {
+            let schema = RowKeySchema::new(
+                group_types
+                    .iter()
+                    .map(row_key_data_type)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            Ok(
+                input.group_by_aggregate_config::<RowKeyExtractor, Compiled<(Count,)>>(
+                    key_cols, slots, top_k, schema,
+                ),
+            )
+        }
+    }
+}
+
 impl Aggregate {
     pub fn compile(
         &self,
@@ -366,67 +425,82 @@ impl Aggregate {
             return Ok(counts.aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::Sum, 0)]));
         }
 
-        if self.groups.len() != 1 {
-            return Err(Error::UnsupportedAggregateGroupAmount(self.groups.len()));
-        }
-        let g = match &self.groups[0] {
-            Expression::Ref(r) => r,
-            e => return Err(Error::UnexpectedAggExpression(e.clone())),
+        // Grouped: dedup the (groups…, x) tuples with a keys-only group (the
+        // inner GROUP BY emits just the key columns — no accumulator), then
+        // count rows per group tuple. Group keys must be plain columns.
+        let key_refs: Vec<&crate::expression::Ref> = self
+            .groups
+            .iter()
+            .map(|g| match g {
+                Expression::Ref(r) => Ok(r),
+                e => Err(Error::UnexpectedAggExpression(e.clone())),
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Inner dedup over [groups…, x].
+        let mut inner_cols: Vec<usize> = key_refs.iter().map(|r| r.column_idx).collect();
+        inner_cols.push(x_col);
+        let mut inner_types: Vec<Type> = key_refs.iter().map(|r| r.return_type.clone()).collect();
+        inner_types.push(x.return_type.clone());
+
+        // A single int group key with an int x keeps the packed pair extractor;
+        // everything else (string keys, several keys) row-encodes the tuple.
+        let deduped = if let [gt, xt] = inner_types.as_slice() {
+            macro_rules! pair {
+                ($g:ty, $x:ty) => {
+                    input.group_by_distinct::<IntPairKeyExtractor<$g, $x>>(inner_cols.clone())
+                };
+            }
+            macro_rules! by_x {
+                ($g:ty) => {
+                    match xt {
+                        Type::Int8 => pair!($g, Int8Type),
+                        Type::Int16 => pair!($g, Int16Type),
+                        Type::Int32 => pair!($g, Int32Type),
+                        Type::Int64 => pair!($g, Int64Type),
+                        _ => row_key_distinct(input, inner_cols, &inner_types)?,
+                    }
+                };
+            }
+            match gt {
+                Type::Int8 => by_x!(Int8Type),
+                Type::Int16 => by_x!(Int16Type),
+                Type::Int32 => by_x!(Int32Type),
+                Type::Int64 => by_x!(Int64Type),
+                _ => row_key_distinct(input, inner_cols, &inner_types)?,
+            }
+        } else {
+            row_key_distinct(input, inner_cols, &inner_types)?
         };
-        let g_col = g.column_idx;
 
-        // Dedup (g, x) pairs with a keys-only group (the inner GROUP BY emits
-        // just [g, x] — no accumulator), then count rows per g. The outer
-        // GROUP BY on column 0 (g) is the actual per-group distinct count.
-        macro_rules! two_level {
-            ($g:ty, $x:ty) => {{
-                let deduped =
-                    input.group_by_distinct::<IntPairKeyExtractor<$g, $x>>(vec![g_col, x_col]);
-                Ok(deduped.group_by_count::<IntKeyExtractor<$g>>(0))
-            }};
-        }
-
-        macro_rules! by_x {
-            ($g:ty) => {
-                match &x.return_type {
-                    Type::Int8 => two_level!($g, Int8Type),
-                    Type::Int16 => two_level!($g, Int16Type),
-                    Type::Int32 => two_level!($g, Int32Type),
-                    Type::Int64 => two_level!($g, Int64Type),
-                    dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
-                }
-            };
-        }
-
-        match &g.return_type {
-            Type::Int8 => by_x!(Int8Type),
-            Type::Int16 => by_x!(Int16Type),
-            Type::Int32 => by_x!(Int32Type),
-            Type::Int64 => by_x!(Int64Type),
-            dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
-        }
+        // Outer: count the deduped rows per group tuple (columns 0..k of the
+        // inner output). The distinct count is exactly that row count, so a
+        // top-k on it can be applied per partition.
+        let group_types: Vec<Type> = key_refs.iter().map(|r| r.return_type.clone()).collect();
+        count_per_group(deduped, &group_types, self.top_k)
     }
 
     /// Compile a grouped aggregate mixing one `COUNT(DISTINCT x)` with
-    /// non-distinct aggregates (e.g. ClickBench Q9:
-    /// `RegionID, SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth),
-    /// COUNT(DISTINCT UserID) GROUP BY RegionID`).
+    /// non-distinct aggregates (e.g. `g, SUM(a), COUNT(*), AVG(b),
+    /// COUNT(DISTINCT x) … GROUP BY g`).
     ///
     /// Lowered to a two-level GROUP BY by exploiting decomposability: the
-    /// non-distinct aggregates (SUM/COUNT/COUNT(*)) are sums of per-subgroup
-    /// partials, and `COUNT(DISTINCT x)` is the number of distinct `(group, x)`
-    /// subgroups. So:
-    /// * **Inner** GROUP BY `(group, x)` computes each non-distinct aggregate's
-    ///   partial → `[group, x, p0, p1, …]`.
-    /// * **Outer** GROUP BY `group` re-sums each partial (SUM over the inner
-    ///   column) and uses `COUNT(*)` of the inner rows for the distinct count.
+    /// non-distinct aggregates are folds of per-subgroup partials (sums add,
+    /// extremes take the extreme of extremes), and `COUNT(DISTINCT x)` is the
+    /// number of distinct `(groups…, x)` subgroups. So:
+    /// * **Inner** GROUP BY `(groups…, x)` computes each non-distinct
+    ///   aggregate's partial → `[groups…, x, p0, p1, …]`.
+    /// * **Outer** GROUP BY `groups…` re-folds each partial (SUM over a sum or
+    ///   count partial, MIN/MAX over an extreme partial) and uses `COUNT(*)`
+    ///   of the inner rows for the distinct count.
     ///
-    /// The outer slots are emitted in the original expression order — distinct
-    /// expr → `COUNT(*)`, each non-distinct expr → `SUM` of its inner partial —
-    /// so the output column layout matches DuckDB's aggregate output and the
-    /// downstream projection (e.g. the AVG divide) lines up. AVG is already split
-    /// by DuckDB into `sum`+`count` exprs, handled generically here. Single
-    /// integer group key only (the inner uses the two-int-key extractor).
+    /// The outer slots are emitted in the original expression order so the
+    /// output column layout matches the plan's aggregate output and the
+    /// downstream projection (e.g. the AVG divide) lines up. AVG is already
+    /// split by DuckDB into `sum`+`count` exprs, handled generically here.
+    /// Group keys must be plain columns; any int/string mix is supported (a
+    /// single int key with an int `x` keeps the packed pair extractor, other
+    /// shapes row-encode the tuple).
     fn compile_grouped_mixed_distinct(
         &self,
         input: RecordBatchOperatorSpec,
@@ -435,41 +509,44 @@ impl Aggregate {
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
         use dispatch::{
             AggregationKind, AggregationRowValueExtractor, AggregationSlot, IntPairKeyExtractor,
+            MixedRowValueExtractor, RowKeyExtractor, RowKeySchema,
         };
 
-        if self.groups.len() != 1 {
-            return Err(Error::UnsupportedAggregateGroupAmount(self.groups.len()));
-        }
-        let g = match &self.groups[0] {
-            Expression::Ref(r) => r,
-            e => return Err(Error::UnexpectedAggExpression(e.clone())),
-        };
-        let g_col = g.column_idx;
+        let key_refs: Vec<&crate::expression::Ref> = self
+            .groups
+            .iter()
+            .map(|g| match g {
+                Expression::Ref(r) => Ok(r),
+                e => Err(Error::UnexpectedAggExpression(e.clone())),
+            })
+            .collect::<Result<_, _>>()?;
+        let k = key_refs.len();
 
         // Walk the expressions once, building the inner (non-distinct partials
-        // over `(g, x)`) and outer (re-sum partials + COUNT(*) for the distinct)
-        // slot lists. The outer slots stay in expression order so the output
-        // columns match DuckDB's aggregate layout. The inner emits
-        // `[g, x, partial0, partial1, …]`, so partial `k` is at column `2 + k`.
+        // over `(groups…, x)`) and outer (re-fold partials + COUNT(*) for the
+        // distinct) slot lists. The outer slots stay in expression order so the
+        // output columns match the plan's aggregate layout. The inner emits
+        // `[groups…, x, partial0, …]`, so partial `j` is at column `k + 1 + j`.
         let mut x: Option<&crate::expression::Ref> = None;
         let mut inner_slots: Vec<AggregationSlot> = Vec::new();
         let mut outer_slots: Vec<AggregationSlot> = Vec::new();
-        // Coalesce inner partials that compute the *same* column, so each is
-        // scattered/merged once: all COUNT/COUNT(*) slots are identical (pivot's
-        // Count contributes +1 per row regardless of column/null, == COUNT(*)),
-        // and SUMs of the same column are identical. Fewer inner slots ⇒ a
-        // narrower scattered hash-table entry, which is the dominant cost of the
-        // high-cardinality inner. `partial_key`: None = a count, Some(col) = a sum.
-        // Maps that key to the inner output column (`2 + k`).
-        let mut partials: Vec<(Option<usize>, usize)> = Vec::new();
+        // Coalesce inner partials that compute the same thing, so each is
+        // scattered/merged once: all COUNT/COUNT(*) slots are identical
+        // (pivot's Count contributes +1 per row regardless of column, ==
+        // COUNT(*)), and same-kind aggregates of the same column are
+        // identical. Fewer inner slots ⇒ a narrower hash-table entry, the
+        // dominant cost of the high-cardinality inner. `partial_key` is
+        // (kind-class, column): None column = a count.
+        let mut partials: Vec<((AggregationKind, Option<usize>), usize)> = Vec::new();
+        let partial_base = k + 1;
         let mut intern = |inner_slots: &mut Vec<AggregationSlot>,
-                          key: Option<usize>,
+                          key: (AggregationKind, Option<usize>),
                           slot: AggregationSlot|
          -> usize {
-            if let Some(&(_, col)) = partials.iter().find(|(k, _)| *k == key) {
+            if let Some(&(_, col)) = partials.iter().find(|(p, _)| *p == key) {
                 return col;
             }
-            let col = 2 + inner_slots.len();
+            let col = partial_base + inner_slots.len();
             inner_slots.push(slot);
             partials.push((key, col));
             col
@@ -481,13 +558,13 @@ impl Aggregate {
                         return Err(Error::UnsupportedAggregateExpression(e.clone()));
                     }
                     x = Some(&a.column);
-                    // distinct count = number of inner (distinct-pair) rows for g.
+                    // distinct count = number of inner (distinct-tuple) rows.
                     outer_slots.push(AggregationSlot::new(AggregationKind::CountStar, 0));
                 }
                 Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {
                     let col = intern(
                         &mut inner_slots,
-                        None,
+                        (AggregationKind::CountStar, None),
                         AggregationSlot::new(AggregationKind::CountStar, 0),
                     );
                     outer_slots.push(AggregationSlot::new(AggregationKind::Sum, col));
@@ -496,7 +573,7 @@ impl Aggregate {
                     // Same value as COUNT(*) in pivot's Count semantics → coalesce.
                     let col = intern(
                         &mut inner_slots,
-                        None,
+                        (AggregationKind::CountStar, None),
                         AggregationSlot::new(AggregationKind::Count, a.column.column_idx),
                     );
                     outer_slots.push(AggregationSlot::new(AggregationKind::Sum, col));
@@ -504,74 +581,217 @@ impl Aggregate {
                 Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
                     let col = intern(
                         &mut inner_slots,
-                        Some(a.column.column_idx),
+                        (AggregationKind::Sum, Some(a.column.column_idx)),
                         AggregationSlot::new(AggregationKind::Sum, a.column.column_idx),
                     );
                     outer_slots.push(AggregationSlot::new(AggregationKind::Sum, col));
+                }
+                Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a)) => {
+                    let is_min = matches!(e, Expression::AggregateFunc(AggregateFunc::Min(_)));
+                    let kind = match (is_min, &a.column.return_type) {
+                        (true, Type::Utf8) => AggregationKind::MinStr,
+                        (false, Type::Utf8) => AggregationKind::MaxStr,
+                        (true, _) => AggregationKind::Min,
+                        (false, _) => AggregationKind::Max,
+                    };
+                    // An extreme of per-subgroup extremes is the extreme.
+                    let col = intern(
+                        &mut inner_slots,
+                        (kind, Some(a.column.column_idx)),
+                        AggregationSlot::new(kind, a.column.column_idx),
+                    );
+                    outer_slots.push(AggregationSlot::new(kind, col));
                 }
                 expr => return Err(Error::UnsupportedAggregateExpression(expr.clone())),
             }
         }
         // Guaranteed by the caller (exactly one CountDistinct), but stay total.
         let x = x.ok_or_else(|| Error::UnsupportedAggregateExpressionAmount(0))?;
-        let x_col = x.column_idx;
 
-        // group_by_aggregate monomorphised over key type + slot arity.
-        macro_rules! grouped {
-            ($spec:expr, $K:ty, $cols:expr, $slots:expr) => {{
+        // Inner stage: GROUP BY (groups…, x), computing the interned partials.
+        let mut inner_cols: Vec<usize> = key_refs.iter().map(|r| r.column_idx).collect();
+        inner_cols.push(x.column_idx);
+        let mut inner_types: Vec<Type> = key_refs.iter().map(|r| r.return_type.clone()).collect();
+        inner_types.push(x.return_type.clone());
+
+        let inner_has_extremes = inner_slots.iter().any(|s| {
+            matches!(
+                s.kind,
+                AggregationKind::Min
+                    | AggregationKind::Max
+                    | AggregationKind::MinStr
+                    | AggregationKind::MaxStr
+            )
+        });
+
+        // Monomorphise an aggregate stage over key type + slot arity, with the
+        // mixed extractor when extremes are present.
+        macro_rules! staged {
+            ($spec:expr, $K:ty, $cols:expr, $slots:expr, $config:expr, $extremes:expr, $top_k:expr) => {{
                 let slots = $slots;
-                match slots.len() {
-                    1 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<1>>(
-                        $cols, slots, None,
-                    ),
-                    2 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<2>>(
-                        $cols, slots, None,
-                    ),
-                    3 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<3>>(
-                        $cols, slots, None,
-                    ),
-                    4 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<4>>(
-                        $cols, slots, None,
-                    ),
-                    5 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<5>>(
-                        $cols, slots, None,
-                    ),
-                    6 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<6>>(
-                        $cols, slots, None,
-                    ),
-                    n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                macro_rules! call {
+                    ($V:ty) => {
+                        $spec.group_by_aggregate_config::<$K, $V>($cols, slots, $top_k, $config)
+                    };
+                }
+                if $extremes {
+                    match slots.len() {
+                        1 => call!(MixedRowValueExtractor<1>),
+                        2 => call!(MixedRowValueExtractor<2>),
+                        3 => call!(MixedRowValueExtractor<3>),
+                        4 => call!(MixedRowValueExtractor<4>),
+                        5 => call!(MixedRowValueExtractor<5>),
+                        6 => call!(MixedRowValueExtractor<6>),
+                        n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                    }
+                } else {
+                    match slots.len() {
+                        1 => call!(AggregationRowValueExtractor<1>),
+                        2 => call!(AggregationRowValueExtractor<2>),
+                        3 => call!(AggregationRowValueExtractor<3>),
+                        4 => call!(AggregationRowValueExtractor<4>),
+                        5 => call!(AggregationRowValueExtractor<5>),
+                        6 => call!(AggregationRowValueExtractor<6>),
+                        n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                    }
                 }
             }};
         }
-        macro_rules! build {
-            ($G:ty, $X:ty) => {{
-                let inner = grouped!(
-                    input,
-                    IntPairKeyExtractor<$G, $X>,
-                    vec![g_col, x_col],
-                    inner_slots
-                );
-                Ok(grouped!(inner, IntKeyExtractor<$G>, vec![0], outer_slots))
-            }};
-        }
-        macro_rules! by_x {
-            ($G:ty) => {
-                match &x.return_type {
-                    Type::Int8 => build!($G, Int8Type),
-                    Type::Int16 => build!($G, Int16Type),
-                    Type::Int32 => build!($G, Int32Type),
-                    Type::Int64 => build!($G, Int64Type),
-                    dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
-                }
-            };
-        }
-        match &g.return_type {
-            Type::Int8 => by_x!(Int8Type),
-            Type::Int16 => by_x!(Int16Type),
-            Type::Int32 => by_x!(Int32Type),
-            Type::Int64 => by_x!(Int64Type),
-            dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
-        }
+
+        // Inner: a single int group key with an int x keeps the packed pair
+        // extractor; other tuple shapes row-encode.
+        let inner = if let [
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64,
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64,
+        ] = inner_types.as_slice()
+        {
+            macro_rules! pair_inner {
+                ($g:ty, $x:ty) => {
+                    staged!(
+                        input,
+                        IntPairKeyExtractor<$g, $x>,
+                        inner_cols.clone(),
+                        inner_slots.clone(),
+                        (),
+                        inner_has_extremes,
+                        None
+                    )
+                };
+            }
+            macro_rules! by_x {
+                ($g:ty) => {
+                    match &inner_types[1] {
+                        Type::Int8 => pair_inner!($g, Int8Type),
+                        Type::Int16 => pair_inner!($g, Int16Type),
+                        Type::Int32 => pair_inner!($g, Int32Type),
+                        Type::Int64 => pair_inner!($g, Int64Type),
+                        _ => unreachable!("matched as int above"),
+                    }
+                };
+            }
+            match &inner_types[0] {
+                Type::Int8 => by_x!(Int8Type),
+                Type::Int16 => by_x!(Int16Type),
+                Type::Int32 => by_x!(Int32Type),
+                Type::Int64 => by_x!(Int64Type),
+                _ => unreachable!("matched as int above"),
+            }
+        } else {
+            let schema = RowKeySchema::new(
+                inner_types
+                    .iter()
+                    .map(row_key_data_type)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            staged!(
+                input,
+                RowKeyExtractor,
+                inner_cols.clone(),
+                inner_slots.clone(),
+                schema,
+                inner_has_extremes,
+                None
+            )
+        };
+
+        // Outer: GROUP BY the leading group columns of the inner output,
+        // re-folding partials in expression order.
+        let group_types: Vec<Type> = key_refs.iter().map(|r| r.return_type.clone()).collect();
+        let outer_cols: Vec<usize> = (0..k).collect();
+        let outer_has_extremes = outer_slots.iter().any(|s| {
+            matches!(
+                s.kind,
+                AggregationKind::Min
+                    | AggregationKind::Max
+                    | AggregationKind::MinStr
+                    | AggregationKind::MaxStr
+            )
+        });
+        let outer = match group_types.as_slice() {
+            [Type::Int8] => staged!(
+                inner,
+                IntKeyExtractor<Int8Type>,
+                outer_cols,
+                outer_slots,
+                (),
+                outer_has_extremes,
+                self.top_k
+            ),
+            [Type::Int16] => staged!(
+                inner,
+                IntKeyExtractor<Int16Type>,
+                outer_cols,
+                outer_slots,
+                (),
+                outer_has_extremes,
+                self.top_k
+            ),
+            [Type::Int32] => staged!(
+                inner,
+                IntKeyExtractor<Int32Type>,
+                outer_cols,
+                outer_slots,
+                (),
+                outer_has_extremes,
+                self.top_k
+            ),
+            [Type::Int64] => staged!(
+                inner,
+                IntKeyExtractor<Int64Type>,
+                outer_cols,
+                outer_slots,
+                (),
+                outer_has_extremes,
+                self.top_k
+            ),
+            [Type::Utf8] => staged!(
+                inner,
+                StringKeyExtractor,
+                outer_cols,
+                outer_slots,
+                (),
+                outer_has_extremes,
+                self.top_k
+            ),
+            _ => {
+                let schema =
+                    RowKeySchema::new(group_types.iter().map(row_key_data_type).collect::<Result<
+                        Vec<_>,
+                        _,
+                    >>(
+                    )?);
+                staged!(
+                    inner,
+                    RowKeyExtractor,
+                    outer_cols,
+                    outer_slots,
+                    schema,
+                    outer_has_extremes,
+                    self.top_k
+                )
+            }
+        };
+        Ok(outer)
     }
 
     /// Compile a grouped multi-aggregate (`GROUP BY k1, k2 …` with one or more
