@@ -375,34 +375,68 @@ fn translate_replacement(replacement: &str) -> String {
     out
 }
 
+/// Memoised results cap for [`RegexpReplace`]: stop inserting past this many
+/// entries or this many memoised bytes (lookups continue) so a high-cardinality
+/// column can't grow the memo unboundedly.
+const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 20;
+const REGEX_MEMO_MAX_BYTES: usize = 256 << 20;
+
 impl RegexpReplace {
     pub fn compile(&self) -> Result<ExprFn, Error> {
-        // The pattern is a plan constant: compile it once here, not per batch.
-        // `Regex` is internally reference-counted, so the per-worker clones
-        // below share the compiled program.
-        let regex = Regex::new(&self.pattern).map_err(|source| Error::InvalidRegexPattern {
+        // Validate the pattern once at plan-compile time; each worker then
+        // compiles its own `Regex` below. A shared (cloned) `Regex` funnels
+        // every thread through one internal cache pool whose atomics dominate
+        // the row loop under contention — per-worker instances give each
+        // thread the pool's owner fast path.
+        Regex::new(&self.pattern).map_err(|source| Error::InvalidRegexPattern {
             pattern: self.pattern.clone(),
             source,
         })?;
+        let pattern = self.pattern.clone();
         let replacement = translate_replacement(&self.replacement);
         let input_builder = self.input.compile()?;
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
-            let regex = regex.clone();
+            let regex = Regex::new(&pattern).expect("pattern validated at plan compile");
             let replacement = replacement.clone();
+            // Regex replacement is pure and expensive (capture extraction runs
+            // a backtracking engine), while real inputs (URLs, paths) repeat
+            // heavily — memoise per worker, with `None` standing for "no
+            // match, pass the input through" so unmatched rows don't store
+            // their text twice. Bounded: past the caps the memo stops growing
+            // but keeps serving hits.
+            let mut memo: std::collections::HashMap<
+                Box<str>,
+                Option<Box<str>>,
+                ahash::RandomState,
+            > = std::collections::HashMap::default();
+            let mut memo_bytes = 0usize;
             Box::new(move |batch: &RecordBatch| {
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();
                 let mut out = StringViewBuilder::with_capacity(strings.len());
                 for v in strings.iter() {
-                    match v {
-                        // `replace` substitutes the first match only (DuckDB
-                        // semantics without the 'g' option). It returns
-                        // `Cow::Borrowed` when nothing matches, so unmatched
-                        // rows append without allocating a new string.
-                        Some(s) => out.append_value(regex.replace(s, replacement.as_str())),
-                        None => out.append_null(),
+                    let Some(s) = v else {
+                        out.append_null();
+                        continue;
+                    };
+                    if let Some(hit) = memo.get(s) {
+                        out.append_value(hit.as_deref().unwrap_or(s));
+                        continue;
+                    }
+                    // `replace` substitutes the first match only (DuckDB
+                    // semantics without the 'g' option). It returns
+                    // `Cow::Borrowed` when nothing matches.
+                    let replaced = regex.replace(s, replacement.as_str());
+                    let entry = match &replaced {
+                        std::borrow::Cow::Borrowed(_) => None,
+                        std::borrow::Cow::Owned(o) => Some(o.clone().into_boxed_str()),
+                    };
+                    out.append_value(replaced);
+                    if memo.len() < REGEX_MEMO_MAX_ENTRIES && memo_bytes < REGEX_MEMO_MAX_BYTES {
+                        memo_bytes += s.len() + entry.as_deref().map(str::len).unwrap_or(0);
+                        memo.insert(s.into(), entry);
                     }
                 }
                 ExprResult::Array(Arc::new(out.finish()) as ArrayRef)

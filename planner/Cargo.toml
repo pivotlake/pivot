@@ -11,6 +11,7 @@ arrow-arith = { path = "../arrow-rs/arrow-arith" }
 arrow = { path = "../arrow-rs/arrow" }
 duckdb-planner = { path = "../duckdb-planner" }
 dispatch = { path = "../dispatch" }
+ahash = "0.8"
 regex = "1"
 thiserror = "2.0.18"
 
