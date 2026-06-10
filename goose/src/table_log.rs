@@ -40,6 +40,8 @@ const LOG_DIR: &str = "_goose_logs";
 /// Version numbers are zero-padded to this width so lexicographic key order is
 /// numeric order.
 const VERSION_DIGITS: usize = 20;
+/// The version a table's very first commit gets.
+pub const FIRST_VERSION: u64 = 1;
 
 /// One data file in a version: its name within the table's data location, and
 /// its size in bytes — carried so the reader can locate the Parquet footer
@@ -48,6 +50,17 @@ const VERSION_DIGITS: usize = 20;
 pub struct LoggedFile {
     pub name: String,
     pub size: u64,
+}
+
+/// The logged form of a listed data file — how a directory listing (`CREATE
+/// TABLE`, the legacy no-log fallback) becomes a log version's content.
+impl From<&crate::store::DataFile> for LoggedFile {
+    fn from(file: &crate::store::DataFile) -> Self {
+        Self {
+            name: file.name.clone(),
+            size: file.size,
+        }
+    }
 }
 
 /// A table's complete file list at one version. The highest committed version
@@ -59,19 +72,89 @@ pub struct TableVersion {
 }
 
 impl TableVersion {
-    /// The version a change on top of this state must commit as. On `None`
-    /// (no log yet) start at 1.
-    pub fn next_after(current: Option<&TableVersion>) -> u64 {
-        current.map_or(1, |v| v.version + 1)
+    /// The version a change on top of this state must commit as.
+    pub fn next(&self) -> u64 {
+        self.version + 1
     }
 }
 
-/// Key of one version document.
-fn version_key(table: &str, version: u64) -> String {
-    format!(
-        "{LOG_DIR}/{table}/{version:0width$}.json",
-        width = VERSION_DIGITS
-    )
+/// One table's log: every operation against `_goose_logs/<table>/` in one
+/// store, bound once instead of threading `(store, table)` through each call.
+pub struct TableLog<'a> {
+    store: &'a dyn ObjectStore,
+    table: &'a str,
+}
+
+impl<'a> TableLog<'a> {
+    pub fn new(store: &'a dyn ObjectStore, table: &'a str) -> Self {
+        Self { store, table }
+    }
+
+    /// The highest committed version *number*, from one LIST — the cheap
+    /// staleness probe. `None` for a table with no log (yet). For the
+    /// version's contents, [`read`](Self::read) it (or use
+    /// [`read_latest`](Self::read_latest)).
+    pub fn latest_version(&self) -> Result<Option<u64>> {
+        let objects = self.store.list(&format!("{LOG_DIR}/{}", self.table))?;
+        Ok(objects
+            .iter()
+            .filter_map(|object| parse_version(&object.key))
+            .max())
+    }
+
+    /// Read one committed version's document.
+    pub fn read(&self, version: u64) -> Result<TableVersion> {
+        let key = self.version_key(version);
+        let Some(bytes) = self.store.get(&key)? else {
+            return Err(TableLogError::Missing {
+                table: self.table.to_string(),
+                version,
+            });
+        };
+        let doc: VersionDoc = serde_json::from_slice(&bytes).map_err(|e| TableLogError::Parse {
+            key,
+            reason: e.to_string(),
+        })?;
+        Ok(TableVersion {
+            version,
+            files: doc.files,
+        })
+    }
+
+    /// Read the current (highest) version's document, or `None` if the table
+    /// has no log. One LIST plus one GET.
+    pub fn read_latest(&self) -> Result<Option<TableVersion>> {
+        match self.latest_version()? {
+            Some(version) => Ok(Some(self.read(version)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically commit `files` as version `version`. `Ok(true)` means this
+    /// writer won; `Ok(false)` means someone else committed that version
+    /// first — re-read the latest and retry the change on top of it.
+    pub fn commit(&self, version: u64, files: &[LoggedFile]) -> Result<bool> {
+        let doc = VersionDoc {
+            version,
+            files: files.to_vec(),
+        };
+        let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| TableLogError::Parse {
+            key: self.version_key(version),
+            reason: format!("serializing: {e}"),
+        })?;
+        Ok(self
+            .store
+            .put_if_absent(&self.version_key(version), &bytes)?)
+    }
+
+    /// Key of one version document.
+    fn version_key(&self, version: u64) -> String {
+        format!(
+            "{LOG_DIR}/{}/{version:0width$}.json",
+            self.table,
+            width = VERSION_DIGITS
+        )
+    }
 }
 
 /// Parse a listed key back into its version number. Foreign objects (temp
@@ -84,65 +167,6 @@ fn parse_version(key: &str) -> Option<u64> {
         return None;
     }
     digits.parse().ok()
-}
-
-/// The highest committed version number of `table`'s log, from one LIST.
-/// `None` for a table with no log (yet).
-pub fn latest_version(store: &dyn ObjectStore, table: &str) -> Result<Option<u64>> {
-    let dir = format!("{LOG_DIR}/{table}");
-    let objects = store.list(&dir)?;
-    Ok(objects
-        .iter()
-        .filter_map(|object| parse_version(&object.key))
-        .max())
-}
-
-/// Read one committed version of `table`'s log.
-pub fn read(store: &dyn ObjectStore, table: &str, version: u64) -> Result<TableVersion> {
-    let key = version_key(table, version);
-    let Some(bytes) = store.get(&key)? else {
-        return Err(TableLogError::Missing {
-            table: table.to_string(),
-            version,
-        });
-    };
-    let doc: VersionDoc = serde_json::from_slice(&bytes).map_err(|e| TableLogError::Parse {
-        key,
-        reason: e.to_string(),
-    })?;
-    Ok(TableVersion {
-        version,
-        files: doc.files,
-    })
-}
-
-/// The current (highest) version of `table`'s log, or `None` if the table has
-/// no log. One LIST plus one GET.
-pub fn latest(store: &dyn ObjectStore, table: &str) -> Result<Option<TableVersion>> {
-    match latest_version(store, table)? {
-        Some(version) => Ok(Some(read(store, table, version)?)),
-        None => Ok(None),
-    }
-}
-
-/// Atomically commit `files` as version `version` of `table`. `Ok(true)` means
-/// this writer won; `Ok(false)` means someone else committed that version first
-/// — re-read [`latest`] and retry the change on top of it.
-pub fn commit(
-    store: &dyn ObjectStore,
-    table: &str,
-    version: u64,
-    files: &[LoggedFile],
-) -> Result<bool> {
-    let doc = VersionDoc {
-        version,
-        files: files.to_vec(),
-    };
-    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| TableLogError::Parse {
-        key: version_key(table, version),
-        reason: format!("serializing: {e}"),
-    })?;
-    Ok(store.put_if_absent(&version_key(table, version), &bytes)?)
 }
 
 /// Serialized form of one version document. Carries its version number too, so
@@ -168,40 +192,35 @@ mod tests {
     #[test]
     fn versions_round_trip_and_latest_wins() {
         let store = MemoryStore::new();
-        assert_eq!(latest(&store, "t").unwrap(), None);
+        let log = TableLog::new(&store, "t");
+        assert_eq!(log.read_latest().unwrap(), None);
 
-        assert!(commit(&store, "t", 1, &[file("a.parquet", 10)]).unwrap());
+        assert!(log.commit(1, &[file("a.parquet", 10)]).unwrap());
         assert!(
-            commit(
-                &store,
-                "t",
-                2,
-                &[file("a.parquet", 10), file("b.parquet", 20)]
-            )
-            .unwrap()
+            log.commit(2, &[file("a.parquet", 10), file("b.parquet", 20)])
+                .unwrap()
         );
 
-        let current = latest(&store, "t").unwrap().unwrap();
+        let current = log.read_latest().unwrap().unwrap();
         assert_eq!(current.version, 2);
         assert_eq!(
             current.files,
             vec![file("a.parquet", 10), file("b.parquet", 20)]
         );
+        assert_eq!(current.next(), 3);
         // Older versions stay readable (immutable history).
-        assert_eq!(
-            read(&store, "t", 1).unwrap().files,
-            vec![file("a.parquet", 10)]
-        );
+        assert_eq!(log.read(1).unwrap().files, vec![file("a.parquet", 10)]);
     }
 
     #[test]
     fn conflicting_commit_loses_and_state_is_the_winners() {
         let store = MemoryStore::new();
-        assert!(commit(&store, "t", 1, &[file("a.parquet", 1)]).unwrap());
+        let log = TableLog::new(&store, "t");
+        assert!(log.commit(1, &[file("a.parquet", 1)]).unwrap());
         // A racing writer targeting the same version loses cleanly.
-        assert!(!commit(&store, "t", 1, &[file("b.parquet", 2)]).unwrap());
+        assert!(!log.commit(1, &[file("b.parquet", 2)]).unwrap());
         assert_eq!(
-            latest(&store, "t").unwrap().unwrap().files,
+            log.read_latest().unwrap().unwrap().files,
             vec![file("a.parquet", 1)]
         );
     }
@@ -209,21 +228,18 @@ mod tests {
     #[test]
     fn logs_are_per_table_and_foreign_keys_are_ignored() {
         let store = MemoryStore::new();
-        assert!(commit(&store, "a", 1, &[file("x.parquet", 1)]).unwrap());
-        assert_eq!(latest(&store, "b").unwrap(), None);
+        assert!(
+            TableLog::new(&store, "a")
+                .commit(1, &[file("x.parquet", 1)])
+                .unwrap()
+        );
+        assert_eq!(TableLog::new(&store, "b").read_latest().unwrap(), None);
 
         // A stray object in the log directory is not a version.
         store.put("_goose_logs/a/garbage.tmp", b"junk").unwrap();
-        assert_eq!(latest_version(&store, "a").unwrap(), Some(1));
-    }
-
-    #[test]
-    fn next_after_starts_at_one() {
-        assert_eq!(TableVersion::next_after(None), 1);
-        let v = TableVersion {
-            version: 7,
-            files: vec![],
-        };
-        assert_eq!(TableVersion::next_after(Some(&v)), 8);
+        assert_eq!(
+            TableLog::new(&store, "a").latest_version().unwrap(),
+            Some(1)
+        );
     }
 }

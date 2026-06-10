@@ -9,13 +9,13 @@
 //!   assembles the [`ParquetTable`], and commits it.
 //!
 //! It is consumed two ways, both over the same fetch core ([`fetch_factories`]
-//! and [`LoadedTable::assemble`]): [`load`] collects on the coordinator and
-//! returns a [`LoadedTable`] **value** of per-file row groups (the catalog's
-//! reload and registrations; [`load_table`] flattens it for the test/bench
-//! constructors), while [`create_load_and_commit_spec`] returns a
-//! `RecordBatchOperatorSpec` ending in the [`writer`] sink that hands the
-//! `LoadedTable` to a `commit` closure — the `CREATE TABLE` the server
-//! executes.
+//! and [`LoadedTable::assemble`]): [`LoadedTable::load`] collects on the
+//! coordinator and returns the per-file row groups as a **value** (the
+//! catalog's reload and registrations; flattened via
+//! [`LoadedTable::into_table`] for whole-table constructors), while
+//! [`create_load_and_commit_spec`] returns a `RecordBatchOperatorSpec` ending
+//! in the [`writer`] sink that hands the `LoadedTable` to a `commit` closure —
+//! the `CREATE TABLE` the server executes.
 
 mod fetcher;
 mod injector;
@@ -76,6 +76,24 @@ pub struct LoadedTable {
 }
 
 impl LoadedTable {
+    /// Read every file's footer in parallel over the worker pool and regroup
+    /// the row groups per input file. A pipeline breaker — it drives a
+    /// dataflow, so it must run on the coordinator (a nested dataflow would
+    /// deadlock a worker). The value path, used by the catalog; `CREATE TABLE`
+    /// uses [`create_load_and_commit_spec`] instead.
+    pub fn load(
+        dispatcher: &DataFlowDispatcher,
+        files: &[DataFile],
+    ) -> Result<Self, dispatch::DataFlowError> {
+        if files.is_empty() {
+            return Ok(Self { files: Vec::new() });
+        }
+        let n = dispatcher.worker_count().max(1);
+        let collected =
+            OperatorSpec::new(dispatcher.clone(), fetch_factories(files, n)).collect()?;
+        Ok(Self::assemble(collected, files.len()))
+    }
+
     /// Regroup the fetch's interleaved output by `(file order, file-internal
     /// order)`, so the result is identical regardless of how the parallel
     /// fetch raced.
@@ -108,32 +126,6 @@ impl LoadedTable {
             .collect();
         ParquetTable::new(rows)
     }
-}
-
-/// Materialize a list of data files into a [`LoadedTable`] value on the
-/// coordinator: read every footer in parallel and regroup per file. A pipeline
-/// breaker — it drives a dataflow, so it must run on the coordinator (a nested
-/// dataflow would deadlock a worker). The value path, used by the catalog;
-/// `CREATE TABLE` uses [`create_load_and_commit_spec`] instead.
-pub fn load(
-    dispatcher: &DataFlowDispatcher,
-    files: &[DataFile],
-) -> Result<LoadedTable, dispatch::DataFlowError> {
-    if files.is_empty() {
-        return Ok(LoadedTable { files: Vec::new() });
-    }
-    let n = dispatcher.worker_count().max(1);
-    let collected = OperatorSpec::new(dispatcher.clone(), fetch_factories(files, n)).collect()?;
-    Ok(LoadedTable::assemble(collected, files.len()))
-}
-
-/// [`load`] flattened into a [`ParquetTable`] — the test/bench constructors'
-/// path.
-pub fn load_table(
-    dispatcher: &DataFlowDispatcher,
-    files: &[DataFile],
-) -> Result<ParquetTable, dispatch::DataFlowError> {
-    Ok(load(dispatcher, files)?.into_table())
 }
 
 /// A `RecordBatchOperatorSpec` that, when executed, reads every file's footer in

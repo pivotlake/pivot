@@ -5,7 +5,7 @@
 //! Thrift footer, converts the Parquet schema to Arrow, and collects
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
-use crate::parquet::load_table;
+use crate::parquet::LoadedTable;
 use crate::parquet::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
 use crate::parquet::types::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::parquet::types::thrift::general::{Encoding, PageType};
@@ -138,7 +138,9 @@ impl ParquetTable {
     /// files. Same coordinator requirement as
     /// [`from_directory`](Self::from_directory).
     pub fn from_locations(dispatcher: &DataFlowDispatcher, files: Vec<DataFile>) -> Result<Self> {
-        load_table(dispatcher, &files).map_err(|e| Error::Materialize(e.to_string()))
+        LoadedTable::load(dispatcher, &files)
+            .map(LoadedTable::into_table)
+            .map_err(|e| Error::Materialize(e.to_string()))
     }
 
     /// Returns the Arrow schema (taken from the first row group).

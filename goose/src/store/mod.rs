@@ -169,9 +169,9 @@ pub(crate) fn key_name(key: &str) -> String {
     key.rsplit('/').next().unwrap_or(key).to_string()
 }
 
-/// Join a relative catalog key onto an in-bucket prefix, preserving the prefix's
-/// (possibly empty) value. Shared by the remote backends.
-fn join_prefix(prefix: &str, key: &str) -> String {
+/// Join a relative key onto a (possibly empty) directory/prefix. Shared by the
+/// remote backends and the catalog's location handling.
+pub(crate) fn join_prefix(prefix: &str, key: &str) -> String {
     let prefix = prefix.trim_matches('/');
     if prefix.is_empty() {
         key.trim_start_matches('/').to_string()
