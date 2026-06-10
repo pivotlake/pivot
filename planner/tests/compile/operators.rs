@@ -1296,3 +1296,31 @@ fn bare_limit_over_group_short_circuits_partitions(mut testing_planner: TestingP
             .all(|r| (1..=5).contains(&r["k0"].as_i64().unwrap()))
     );
 }
+
+#[rstest]
+fn wide_sum_with_extremes_is_rejected(mut testing_planner: TestingPlanner) {
+    // SUM over a 64-bit column accumulates in i128; the mixed-slot extractor
+    // backing MIN/MAX is i64-only, so the combination must fail loudly at
+    // compile rather than risk silent overflow.
+    use arrow_array::Int64Array;
+    testing_planner.add_table(
+        "wide",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2])),
+            (
+                "v",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![5i64, 6, 7])) as ArrayRef,
+            ),
+        ],
+    );
+    let result = testing_planner
+        .planner
+        .plan("SELECT g, SUM(v), MIN(v) FROM wide GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher());
+    assert!(matches!(
+        result,
+        Err(planner::compile::Error::UnsupportedWideSumWithExtremes)
+    ));
+}
