@@ -15,14 +15,14 @@
 //!   of, as an append-only sequence of versions committed with the store's
 //!   compare-and-swap. The highest version is the table's current file list.
 //!
-//! Each table's in-memory [`entry`] pairs its definition with an immutable
-//! [`entry::TableState`] — the per-file row groups at one log version, with
-//! the flattened scan view derived at construction (the two cannot disagree;
-//! a change swaps in a whole new state). Resolving a table for a query
+//! Each table's in-memory [`entry::CatalogTable`] pairs its definition with the
+//! per-file row groups at one log version; the flattened scan view a query sees
+//! is derived from those files on demand, so there is no cached copy to drift.
+//! A change swaps `version` + `files` whole. Resolving a table for a query
 //! ([`Catalog::table`]) first **reloads**: one LIST of the table's log
 //! directory; if a newer version exists, only the *new* files' footers are
-//! fetched (over the dispatch pool) and a new state is swapped in — so a file
-//! registered by ingest, a compaction's swap, or even another process's
+//! fetched (over the dispatch pool) and the new file set is swapped in — so a
+//! file registered by ingest, a compaction's swap, or even another process's
 //! commit becomes visible to the very next query.
 //!
 //! Each resolve hands back a fresh [`TableBinding`], so per-query filter
@@ -46,7 +46,7 @@ use crate::store::{
 };
 use crate::table_log::{self, FIRST_VERSION, TableLog, TableVersion};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
-use entry::{TableEntry, TableFile, TableState};
+use entry::{CatalogTable, TableFile};
 use planner::catalog::{
     Catalog, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
 };
@@ -124,7 +124,7 @@ type FetchedFiles = HashMap<String, Vec<Arc<RowGroupMetadata>>>;
 /// [`replace_data_files`](Self::replace_data_files)) and every query resolve
 /// reloads the entry up to the latest committed version.
 pub struct ParquetCatalog {
-    tables: Arc<RwLock<HashMap<String, TableEntry>>>,
+    tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
     /// The database's object store: an in-memory [`MemoryStore`] by default
     /// (ephemeral), or a local directory / S3 / GCS for one opened with
     /// [`open`](Self::open). It holds the table [`manifest`], the per-table
@@ -174,7 +174,7 @@ impl ParquetCatalog {
                     None => (0, catalog.data_files(&manifest_entry.location)?),
                 };
             let files = catalog.fetch_files(&manifest_entry.location, &logged)?;
-            let entry = TableEntry::new(manifest_entry, TableState::new(version, files));
+            let entry = CatalogTable::new(manifest_entry, version, files);
             catalog
                 .tables
                 .write()
@@ -192,7 +192,7 @@ impl ParquetCatalog {
             .read()
             .unwrap()
             .get(name)
-            .map(TableEntry::binding)
+            .map(CatalogTable::binding)
     }
 
     /// Every table this catalog knows, by name. What a maintenance sweep (a
@@ -208,7 +208,7 @@ impl ParquetCatalog {
             .read()
             .unwrap()
             .get(name)
-            .map(|entry| entry.state.logged_files())
+            .map(|entry| entry.logged_files())
     }
 
     /// Write access to `name`'s data location, wherever it lives — see
@@ -270,14 +270,13 @@ impl ParquetCatalog {
             let Some(entry) = map.get(name) else {
                 return Ok(());
             };
-            if entry.state.version() >= latest_version {
+            if entry.version >= latest_version {
                 return Ok(());
             }
             let known: HashSet<String> = entry
-                .state
-                .files()
+                .files
                 .iter()
-                .map(|f| f.logged.name.clone())
+                .map(|f| f.file.name.clone())
                 .collect();
             (entry.location.clone(), known)
         };
@@ -406,7 +405,7 @@ impl ParquetCatalog {
                     .read()
                     .unwrap()
                     .get(name)
-                    .map(|entry| entry.state.logged_files())
+                    .map(|entry| entry.logged_files())
                     .unwrap_or_default(),
             };
             if change(&mut files).is_none() {
@@ -422,25 +421,24 @@ impl ParquetCatalog {
         }
     }
 
-    /// Bring `name`'s in-memory entry up to `target`: build the new
-    /// [`TableState`], reusing the row groups of files the current state
-    /// already has and taking new files' row groups from `fetched`, then swap
-    /// it in. A no-op if the entry already reflects `target` (or newer). If a
-    /// yet-newer concurrent version added files we didn't fetch, the entry is
-    /// left as is — the next reload converges.
+    /// Bring `name`'s in-memory entry up to `target`: build its new file set,
+    /// reusing the row groups of files the entry already has and taking new
+    /// files' row groups from `fetched`, then swap it in. A no-op if the entry
+    /// already reflects `target` (or newer). If a yet-newer concurrent version
+    /// added files we didn't fetch, the entry is left as is — the next reload
+    /// converges.
     fn apply_version(&self, name: &str, target: TableVersion, fetched: FetchedFiles) {
         let mut map = self.tables.write().unwrap();
         let Some(entry) = map.get_mut(name) else {
             return;
         };
-        if entry.state.version() >= target.version {
+        if entry.version >= target.version {
             return;
         }
         let mut available: HashMap<&str, &Vec<Arc<RowGroupMetadata>>> = entry
-            .state
-            .files()
+            .files
             .iter()
-            .map(|f| (f.logged.name.as_str(), &f.row_groups))
+            .map(|f| (f.file.name.as_str(), &f.row_groups))
             .collect();
         available.extend(fetched.iter().map(|(name, groups)| (name.as_str(), groups)));
 
@@ -450,11 +448,11 @@ impl ParquetCatalog {
                 return;
             };
             files.push(TableFile {
-                logged: file.clone(),
+                file: file.clone(),
                 row_groups: (*row_groups).clone(),
             });
         }
-        entry.state = TableState::new(target.version, files);
+        entry.set_version(target.version, files);
     }
 
     /// Compile a `CREATE TABLE` to the dataflow that runs it: read every Parquet
@@ -521,12 +519,12 @@ impl ParquetCatalog {
                     .iter()
                     .cloned()
                     .zip(loaded.into_per_file())
-                    .map(|(logged, row_groups)| TableFile {
-                        logged,
+                    .map(|(file, row_groups)| TableFile {
+                        file,
                         row_groups: row_groups.into_iter().map(Arc::new).collect(),
                     })
                     .collect();
-                let entry = TableEntry::new(manifest_entry, TableState::new(version, files));
+                let entry = CatalogTable::new(manifest_entry, version, files);
                 map.insert(entry.name.clone(), entry);
                 Ok(())
             },
@@ -612,8 +610,8 @@ impl ParquetCatalog {
         Ok(files
             .iter()
             .zip(row_groups)
-            .map(|(logged, row_groups)| TableFile {
-                logged: logged.clone(),
+            .map(|(file, row_groups)| TableFile {
+                file: file.clone(),
                 row_groups,
             })
             .collect())
