@@ -51,7 +51,7 @@ use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
     Catalog, Column, CreateTableRequest, DynamicScanPredicate, Error as CatalogError,
-    Result as CatalogResult, Table,
+    Result as CatalogResult, ScanFilter, Table,
 };
 use planner::expression::{CompareType, Expression, TableFilter};
 use thiserror::Error;
@@ -334,6 +334,7 @@ impl Table for ParquetCatalogTable {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        scan_filter: Option<ScanFilter>,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         // Equality predicates additionally let the decoder skip row groups whose
         // dictionary for that column excludes the constant.
@@ -351,6 +352,12 @@ impl Table for ParquetCatalogTable {
         // predicates' stats. No footer re-read — the row groups were built once
         // when the table was defined.
         let parquet = Arc::new(self.pruned_parquet());
+        // Policy: only hand the scan the pushed row filter when the staged
+        // fetch can plausibly pay for itself on this table's actual byte
+        // layout (see `staging_pays`). The scan stages whenever it receives
+        // `Some` — the economics decision is the catalog's.
+        let scan_filter =
+            scan_filter.filter(|sf| staging_pays(&parquet, sf.columns.as_slice(), &projection));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -362,6 +369,7 @@ impl Table for ParquetCatalogTable {
             row_group_filter_from(dynamic_filters),
             scan_order,
             Arc::new(eq_predicates),
+            scan_filter,
         ))
     }
 
@@ -439,6 +447,40 @@ impl Table for ParquetCatalogTable {
     }
 }
 
+/// Whether a staged fetch can plausibly pay for itself, judged from the
+/// table's actual compressed byte layout.
+///
+/// Staging trades CPU for I/O: the filter columns are fetched once (their
+/// phase-B re-listing hits the file cache) but *indexed, decompressed, decoded
+/// and evaluated twice*, while the only possible saving is the bytes of the
+/// **remaining** (non-filter) projected columns in row groups the filter
+/// empties. When those remaining bytes are small next to the filter columns —
+/// e.g. a wide string filter feeding a scan whose only other column is a
+/// fixed-width id — even a perfectly selective filter can't save more than the
+/// staging tax costs. So: stage only when the skippable remainder is at least
+/// as large as the filter columns themselves (the double-processed part).
+/// Filter selectivity is unknown at compile time; this is the static half of
+/// the bet, computed from chunk metadata already in memory.
+///
+/// `filter_columns` are positions into `projection` (the [`ScanFilter`]
+/// convention).
+fn staging_pays(parquet: &ParquetTable, filter_columns: &[usize], projection: &Projection) -> bool {
+    let bytes_of = |table_col: usize| -> i64 {
+        parquet
+            .row_groups()
+            .iter()
+            .map(|rg| rg.columns[table_col].total_compressed_size)
+            .sum()
+    };
+    let filter_bytes: i64 = filter_columns
+        .iter()
+        .filter_map(|&p| projection.column_indices.get(p))
+        .map(|&c| bytes_of(c))
+        .sum();
+    let total_bytes: i64 = projection.column_indices.iter().map(|&c| bytes_of(c)).sum();
+    total_bytes - filter_bytes >= filter_bytes
+}
+
 /// `a < b` over two single-value scalars of the same physical type.
 fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
     arrow_ord::cmp::lt(a, b).is_ok_and(|r| r.len() == 1 && r.value(0))
@@ -460,5 +502,56 @@ impl ParquetCatalogTable {
             })
         });
         parquet
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parquet::RowGroupMetadata;
+    use arrow_schema::Schema;
+    use std::fs::File;
+
+    /// A single-row-group table whose column chunks have the given compressed
+    /// sizes (all other metadata inert).
+    fn table_with_chunk_sizes(sizes: &[i64]) -> ParquetTable {
+        use crate::parquet::types::metadata::FileSource;
+        ParquetTable::new(vec![Arc::new(RowGroupMetadata {
+            source: FileSource::Local(Arc::new(File::open("/dev/null").unwrap())),
+            schema: Arc::new(Schema::empty()),
+            columns: sizes
+                .iter()
+                .map(
+                    |&total_compressed_size| crate::parquet::types::metadata::ColumnChunkMeta {
+                        dictionary_page_offset: None,
+                        data_page_offset: 0,
+                        total_compressed_size,
+                        max_def_level: 0,
+                        statistics: None,
+                        data_pages_all_dictionary: false,
+                    },
+                )
+                .collect(),
+            num_rows: 1,
+            file_row_group_idx: 0,
+            global_row_group_idx: 0,
+        })])
+    }
+
+    /// The staging bet: skippable remainder must be at least as large as the
+    /// (double-processed) filter columns.
+    #[test]
+    fn staging_pays_judges_byte_layout() {
+        // Columns: [tiny filter, huge string, huge string].
+        let table = table_with_chunk_sizes(&[100, 50_000, 50_000]);
+        let all = Projection::columns([0, 1, 2]);
+        // Filter on the tiny column 0: the remainder dwarfs it — stage.
+        assert!(staging_pays(&table, &[0], &all));
+        // Filter on a huge column with only the tiny one left to skip: the
+        // double-processing tax can't be repaid — don't stage.
+        let strings_and_id = Projection::columns([1, 0]);
+        assert!(!staging_pays(&table, &[0], &strings_and_id));
+        // Filter on both strings, remainder is the tiny id — don't stage.
+        assert!(!staging_pays(&table, &[1, 2], &all));
     }
 }

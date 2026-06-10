@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::expression::{CompareType, TableFilter};
 use crate::types::{Type, logical_from_type};
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
@@ -44,6 +44,43 @@ pub struct DynamicScanPredicate {
     pub column_idx: usize,
     pub compare_type: CompareType,
     pub slot: Arc<DynamicFilterSlot>,
+}
+
+/// A per-worker row-filter evaluator: takes a `RecordBatch` of the filter's
+/// input columns and returns one boolean per row (`true` / valid = the row
+/// survives; `false` or null = it does not).
+pub type ScanFilterEval = Box<dyn FnMut(&RecordBatch) -> BooleanArray + Send>;
+
+/// A compiled copy of the row filter sitting directly above a table scan,
+/// handed to the scan so the storage backend can *stage* its reads: fetch only
+/// the filter's columns first, evaluate the filter, and skip fetching the
+/// remaining projected columns of any region (e.g. a Parquet row group) where
+/// no row survives.
+///
+/// This is purely an I/O optimization and never affects correctness: the
+/// `Filter` operator above the scan still runs unchanged, so a backend may
+/// ignore the scan filter entirely. A backend that uses it must only ever
+/// *drop rows the filter rejects* — it must never invent or duplicate rows —
+/// since the upstream `Filter` is idempotent over the surviving rows.
+pub struct ScanFilter {
+    /// Positions **within the scan's projection** (i.e. indices into the scan's
+    /// output schema, not the table schema) of the columns the filter reads.
+    /// Sorted ascending and deduplicated.
+    pub columns: Vec<usize>,
+    /// Factory producing one [`ScanFilterEval`] per worker thread (mirroring
+    /// the planner's two-level closure pattern, so each worker gets private
+    /// state without synchronization). The evaluator is compiled against a
+    /// `RecordBatch` containing **just** the [`columns`](Self::columns), in
+    /// that order — column references are already remapped accordingly.
+    pub evaluator: Arc<dyn Fn() -> ScanFilterEval + Send + Sync>,
+}
+
+impl Debug for ScanFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanFilter")
+            .field("columns", &self.columns)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A single column in a [`Table`]'s schema: name plus Pivot [`Type`].
@@ -86,12 +123,19 @@ pub trait Table: Debug + Send + Sync {
     /// row-group ID and per-row index). Backends that don't materialize can
     /// ignore it; the bridge only sets it on a late-materialized query's narrow
     /// scan.
+    ///
+    /// `scan_filter` is a compiled copy of the row filter directly above the
+    /// scan (when there is one reading a strict subset of the projection). A
+    /// backend may use it to stage its fetches — read the filter's columns
+    /// first and skip the rest where no row survives — or ignore it; ignoring
+    /// is always correct, the upstream `Filter` operator runs regardless.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        scan_filter: Option<ScanFilter>,
     ) -> Result<RecordBatchOperatorSpec>;
 
     /// Return the table's schema.

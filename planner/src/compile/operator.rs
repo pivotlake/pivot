@@ -3,7 +3,7 @@
 //! Each [`Operator`](crate::operator::Operator) variant has a `compile`
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
-use crate::catalog::{Catalog, DynamicScanPredicate};
+use crate::catalog::{Catalog, DynamicScanPredicate, ScanFilter, ScanFilterEval};
 use crate::compile::dummy_scan::DummyScanNullaryFactory;
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
@@ -1437,6 +1437,7 @@ impl Input {
         &self,
         dispatcher: &DataFlowDispatcher,
         slots: &mut DynamicFilterSlots,
+        scan_filter: Option<ScanFilter>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let column_indices: Vec<usize> = self
             .columns
@@ -1457,6 +1458,7 @@ impl Input {
                 projection,
                 dynamic_filters,
                 self.emit_row_group_metadata,
+                scan_filter,
             )
             .map_err(Error::TableScan)
     }
@@ -1502,6 +1504,24 @@ fn build_dynamic_scan_predicates(
         .collect()
 }
 
+/// Build one worker's conjunction evaluator over the compiled `filters`:
+/// evaluate each, AND the boolean results. Shared by the `Filter` operator and
+/// the staged-scan [`ScanFilter`] it hands the scan below it.
+fn conjunction_eval(filters: &Arc<Vec<ExprFn>>) -> ScanFilterEval {
+    let mut eval_fns: Vec<ExprEvalFn> = filters.iter().map(|f| f()).collect();
+    Box::new(move |batch: &RecordBatch| {
+        eval_fns
+            .iter_mut()
+            .map(|f| {
+                let result = f(batch);
+                let (arr, _) = result.as_datum().get();
+                arr.as_any().downcast_ref::<BooleanArray>().unwrap().clone()
+            })
+            .reduce(|left, right| and(&left, &right).unwrap())
+            .unwrap()
+    })
+}
+
 impl Filter {
     pub(crate) fn compile(
         &self,
@@ -1515,19 +1535,57 @@ impl Filter {
         );
         assert!(!filters.is_empty());
 
-        Ok(input.filter(|| {
-            let mut eval_fns: Vec<ExprEvalFn> = filters.iter().map(|f| f()).collect();
-            move |batch: &RecordBatch| {
-                eval_fns
-                    .iter_mut()
-                    .map(|f| {
-                        let result = f(batch);
-                        let (arr, _) = result.as_datum().get();
-                        arr.as_any().downcast_ref::<BooleanArray>().unwrap().clone()
-                    })
-                    .reduce(|left, right| and(&left, &right).unwrap())
-                    .unwrap()
-            }
+        Ok(input.filter(move || conjunction_eval(&filters)))
+    }
+
+    /// Build the [`ScanFilter`] to push into `scan` when this `Filter` sits
+    /// directly above it: the (deduplicated, sorted) scan-output positions its
+    /// conditions read, plus an evaluator factory compiled against a batch of
+    /// just those columns (references remapped to that narrower schema).
+    ///
+    /// Returns `None` — "don't stage" — when staging cannot pay off or is not
+    /// applicable: a metadata-emitting scan (late materialization re-reads
+    /// survivors itself), a filter reading no columns at all, or one reading
+    /// *every* projected column (phase A would already fetch everything).
+    /// Compile errors propagate; the same conditions are compiled by
+    /// [`compile`](Self::compile) anyway, so an error here is never masked.
+    pub(crate) fn scan_filter(&self, scan: &Input) -> Result<Option<ScanFilter>, Error> {
+        if scan.emit_row_group_metadata {
+            return Ok(None);
+        }
+        // Width of the scan's output schema: its projected (non-sentinel)
+        // column references. Filter conditions index into this output.
+        let width = scan
+            .columns
+            .iter()
+            .filter(|e| matches!(e, Expression::Ref(r) if r.column_idx != usize::MAX))
+            .count();
+        let mut columns = Vec::new();
+        for condition in &self.conditions {
+            condition.referenced_columns(&mut columns);
+        }
+        columns.sort_unstable();
+        columns.dedup();
+        if columns.is_empty() || columns.len() >= width || columns.iter().any(|&c| c >= width) {
+            return Ok(None);
+        }
+
+        // Remap each condition from scan-output positions to positions within
+        // the filter-column batch (column `columns[i]` arrives at position `i`).
+        let map: std::collections::HashMap<usize, usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(staged, &output)| (output, staged))
+            .collect();
+        let filters = Arc::new(
+            self.conditions
+                .iter()
+                .map(|e| e.remap_refs(&map).compile())
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(Some(ScanFilter {
+            columns,
+            evaluator: Arc::new(move || conjunction_eval(&filters)),
         }))
     }
 }

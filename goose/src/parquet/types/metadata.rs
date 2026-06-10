@@ -142,6 +142,20 @@ impl QueryRowGroupMetadata {
         }
     }
 
+    /// A fresh per-query view of the same row group, reading only
+    /// `filtered_indices` (or everything when `None`), with its own pruned
+    /// flag. Used by the staged scan to build the phase-B (remaining columns)
+    /// request from the phase-A (filter columns) metadata: the new view shares
+    /// the static [`RowGroupMetadata`] but none of the old read's state.
+    pub fn with_filtered_indices(&self, filtered_indices: Option<Vec<u32>>) -> Self {
+        Self {
+            row_group_metadata: self.row_group_metadata.clone(),
+            filtered_indices,
+            row_group_index: self.row_group_index,
+            pruned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Whether this row group has been pruned (no row can match a pushed-down
     /// predicate), so its remaining pages need not be decompressed or decoded.
     pub fn is_pruned(&self) -> bool {

@@ -40,6 +40,7 @@ impl Table for RecordingTable {
         _projection: Projection,
         _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
+        _scan_filter: Option<planner::catalog::ScanFilter>,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("plan-only test should not reach compile")
     }

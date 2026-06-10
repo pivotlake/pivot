@@ -12,7 +12,9 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
-use goose::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
+use goose::parquet::{
+    ParquetTable, row_group_filter_from, table_input_with_filter_and_eq_predicates,
+};
 use planner::Planner;
 use planner::catalog::{Catalog, Column, DynamicScanPredicate, Table};
 use planner::types::Type;
@@ -74,13 +76,19 @@ impl Table for TestTable {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        scan_filter: Option<planner::catalog::ScanFilter>,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
-        Ok(table_input_with_filter(
+        // Forward the pushed row filter so planner compile tests exercise the
+        // staged scan path end-to-end whenever a query's shape enables it.
+        Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
             &self.parquet_table,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
+            None,
+            Arc::new(Vec::new()),
+            scan_filter,
         ))
     }
 

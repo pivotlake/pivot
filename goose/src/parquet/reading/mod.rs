@@ -6,6 +6,8 @@
 //! - [`decompressor`] — decompresses each page.
 //! - [`decoding`] — decodes pages into Arrow arrays.
 //! - [`materializer`] — late materialization: re-reads surviving rows by row id.
+//! - [`staged`] — staged scans: evaluates a pushed row filter on the fetched
+//!   filter columns and requests the remaining columns only where rows survive.
 //! - [`scan`] — the builders that chain the stages into one spec.
 //!
 //! It scans the row groups the [`metadata`](super::metadata) (table-load)
@@ -25,6 +27,9 @@ pub use decoding::{DecoderFactory, RowGroupDecoderError, ScanEqualityPredicate};
 
 mod materializer;
 pub use materializer::MaterializerFactory;
+
+mod staged;
+pub use staged::StagingDecoderFactory;
 
 mod record_batch_metadata;
 

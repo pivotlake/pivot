@@ -251,6 +251,101 @@ fn filter_equal_no_match(mut testing_planner: TestingPlanner) {
 }
 
 // ---------------------------------------------------------------------------
+// Staged scan tests: a filter over a strict subset of the projected columns is
+// also pushed into the scan as a `ScanFilter` (`TestTable` forwards it), so
+// these queries run the staged fetch path end-to-end — phase A reads the
+// filter columns, phase B fetches the rest only where rows survive, and the
+// Filter operator above runs unchanged.
+// ---------------------------------------------------------------------------
+
+#[rstest]
+fn staged_filter_on_column_subset(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b, c FROM example_table WHERE a > 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["a"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"a": 3, "b": 30, "c": 300},
+            {"a": 4, "b": 40, "c": 400},
+            {"a": 5, "b": 50, "c": 500},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn staged_filter_matching_no_rows(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b, name FROM example_table WHERE name = 'nobody'")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert!(rows.is_empty(), "expected no rows, got: {rows:?}");
+}
+
+#[rstest]
+fn staged_filter_matching_all_rows(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b, c FROM example_table WHERE a >= 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 5);
+}
+
+#[rstest]
+fn staged_filter_multiple_conditions(mut testing_planner: TestingPlanner) {
+    // Filter columns {a, name} are a strict subset of the scanned columns
+    // {a, b, name}; references must be remapped into the two-column phase-A
+    // batch correctly (a -> 0, name -> 1).
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b FROM example_table WHERE a > 1 AND name <> 'bob'")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["a"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"a": 3, "b": 30},
+            {"a": 4, "b": 40},
+            {"a": 5, "b": 50},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // OrderBy tests
 // ---------------------------------------------------------------------------
 

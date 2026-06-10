@@ -127,13 +127,30 @@ impl PlanNode {
             return Ok(spec);
         }
 
+        // Peephole: a Filter directly above a table scan, reading a strict
+        // subset of the scanned columns, also hands the scan a compiled copy of
+        // itself (a [`ScanFilter`](crate::catalog::ScanFilter)). The storage
+        // backend may use it to stage its fetches — read the filter's columns
+        // first and skip fetching the rest where no row survives. The Filter
+        // operator itself still compiles and runs above, unchanged, so this is
+        // purely an I/O optimization.
+        if let crate::Operator::Filter(f) = &self.operator
+            && let [child] = self.inputs.as_slice()
+            && let crate::Operator::Input(scan) = &child.operator
+            && child.inputs.is_empty()
+            && let Some(scan_filter) = f.scan_filter(scan)?
+        {
+            let scanned = scan.compile(dispatcher, slots, Some(scan_filter))?;
+            return f.compile(scanned);
+        }
+
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             inputs.push(input.compile(dispatcher, catalog, slots)?);
         }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher, slots),
+            crate::Operator::Input(o) => o.compile(dispatcher, slots, None),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
