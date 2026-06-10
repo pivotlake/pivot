@@ -381,8 +381,8 @@ fn translate_replacement(replacement: &str) -> String {
 /// value distributions are Zipfian, so the first tens of thousands of entries
 /// carry most of the hit rate, while the map itself (entries plus boxed
 /// strings) costs a few times the raw bytes.
-const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 16;
-const REGEX_MEMO_MAX_BYTES: usize = 16 << 20;
+const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 19;
+const REGEX_MEMO_MAX_BYTES: usize = 48 << 20;
 
 impl RegexpReplace {
     pub fn compile(&self) -> Result<ExprFn, Error> {
@@ -419,13 +419,24 @@ impl RegexpReplace {
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();
                 let mut out = StringViewBuilder::with_capacity(strings.len());
+                // Values arrive in runs (sessions repeat the same URL), so an
+                // equal-to-previous check skips even the memo hash. `None`
+                // output means "no match, pass the input through".
+                let mut last_in: Option<&str> = None;
+                let mut last_out: Option<String> = None;
                 for v in strings.iter() {
                     let Some(s) = v else {
                         out.append_null();
                         continue;
                     };
+                    if last_in == Some(s) {
+                        out.append_value(last_out.as_deref().unwrap_or(s));
+                        continue;
+                    }
+                    last_in = Some(s);
                     if let Some(hit) = memo.get(s) {
                         out.append_value(hit.as_deref().unwrap_or(s));
+                        last_out = hit.as_deref().map(str::to_owned);
                         continue;
                     }
                     // `replace` substitutes the first match only (DuckDB
@@ -436,7 +447,11 @@ impl RegexpReplace {
                         std::borrow::Cow::Borrowed(_) => None,
                         std::borrow::Cow::Owned(o) => Some(o.clone().into_boxed_str()),
                     };
-                    out.append_value(replaced);
+                    out.append_value(&replaced);
+                    last_out = match &replaced {
+                        std::borrow::Cow::Borrowed(_) => None,
+                        std::borrow::Cow::Owned(o) => Some(o.clone()),
+                    };
                     if memo.len() < REGEX_MEMO_MAX_ENTRIES && memo_bytes < REGEX_MEMO_MAX_BYTES {
                         memo_bytes += s.len() + entry.as_deref().map(str::len).unwrap_or(0);
                         memo.insert(s.into(), entry);
