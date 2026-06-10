@@ -74,11 +74,18 @@ impl Projection {
         Ok(input.project(move || {
             let mut evals: Vec<ExprEvalFn> = builders.iter().map(|b| b()).collect();
             move |batch: RecordBatch| {
+                let n = batch.num_rows();
                 let columns: Vec<ArrayRef> = evals
                     .iter_mut()
                     .map(|eval| match eval(&batch) {
                         ExprResult::Array(a) => a,
-                        ExprResult::Scalar(s) => s.into_inner(),
+                        // A constant column (e.g. `SELECT 1, …`): broadcast to
+                        // the batch's row count so the columns line up.
+                        ExprResult::Scalar(s) => {
+                            let arr = s.into_inner();
+                            let zeros = arrow_array::UInt32Array::from(vec![0u32; n]);
+                            arrow::compute::take(&arr, &zeros, None).unwrap()
+                        }
                     })
                     .collect();
                 let fields: Vec<Field> = columns
@@ -191,6 +198,16 @@ impl Aggregate {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
         use dispatch::{AggregationKind, AggregationSlot};
+
+        // Derived group keys — computed purely from other (plain-column) keys,
+        // or constants — can't split or merge groups, so they are dropped
+        // before grouping and recomputed from the surviving keys afterwards.
+        // `GROUP BY ip, ip - 1` then groups on `ip` alone (narrower hash-table
+        // entries, and a single int key keeps its specialised extractor).
+        if let Some((reduced, post)) = self.split_derived_keys() {
+            let grouped = reduced.compile(input)?;
+            return Projection { projections: post }.compile(grouped);
+        }
 
         // `COUNT(DISTINCT x)` (the sole aggregate) lowers to a two-level GROUP BY
         // rather than a single-pass accumulator — see [`compile_count_distinct`].
@@ -311,6 +328,102 @@ impl Aggregate {
             Type::Utf8 => Ok(input.group_by_count::<StringKeyExtractor>(col)),
             dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
         }
+    }
+
+    /// Partition the group keys into *base* keys (plain columns, plus computed
+    /// expressions that read non-key columns) and *derived* keys — expressions
+    /// whose every input is itself a base key column, including constants and
+    /// duplicate columns. A derived key is a pure function of the base keys, so
+    /// grouping with or without it yields the same groups.
+    ///
+    /// Returns `None` when nothing is derived (or everything would be — a
+    /// degenerate constant-only GROUP BY). Otherwise returns the reduced
+    /// aggregate (base keys only) plus the projection that rebuilds the
+    /// original output layout `[keys…, values…]` from the reduced output,
+    /// recomputing each derived key from the base keys' emitted values.
+    fn split_derived_keys(&self) -> Option<(Aggregate, Vec<Expression>)> {
+        use std::collections::HashMap;
+
+        // Pass 1: every first occurrence of a plain column key is a base key.
+        let mut base_pos: HashMap<usize, usize> = HashMap::new();
+        let mut base: Vec<Expression> = Vec::new();
+        for g in &self.groups {
+            if let Expression::Ref(r) = g {
+                if !base_pos.contains_key(&r.column_idx) {
+                    base_pos.insert(r.column_idx, base.len());
+                    base.push(g.clone());
+                }
+            }
+        }
+
+        // Pass 2: a computed key whose inputs are all base columns is derived;
+        // anything else is a (computed) base key. A repeated plain column is
+        // derived too (it re-reads its first occurrence).
+        enum Kind {
+            Base(usize),
+            Derived,
+        }
+        let mut kinds: Vec<Kind> = Vec::with_capacity(self.groups.len());
+        let mut any_derived = false;
+        for g in &self.groups {
+            match g {
+                Expression::Ref(r) => {
+                    let pos = base_pos[&r.column_idx];
+                    // First occurrence is the base; a repeated column re-reads it.
+                    if kinds
+                        .iter()
+                        .any(|k| matches!(k, Kind::Base(p) if *p == pos))
+                    {
+                        kinds.push(Kind::Derived);
+                        any_derived = true;
+                    } else {
+                        kinds.push(Kind::Base(pos));
+                    }
+                }
+                computed => {
+                    let mut cols = Vec::new();
+                    computed.referenced_columns(&mut cols);
+                    if cols.iter().all(|c| base_pos.contains_key(c)) {
+                        kinds.push(Kind::Derived);
+                        any_derived = true;
+                    } else {
+                        kinds.push(Kind::Base(base.len()));
+                        base.push(computed.clone());
+                    }
+                }
+            }
+        }
+        if !any_derived || base.is_empty() {
+            return None;
+        }
+
+        // The reduced output is [base keys…, values…]; rebuild the original
+        // layout, remapping derived keys' column refs onto the emitted base
+        // key positions.
+        let mut projections: Vec<Expression> =
+            Vec::with_capacity(self.groups.len() + self.expressions.len());
+        for (g, kind) in self.groups.iter().zip(&kinds) {
+            match kind {
+                Kind::Base(pos) => projections.push(Expression::Ref(crate::expression::Ref {
+                    column_idx: *pos,
+                    return_type: g.result_type().unwrap_or(Type::Int64),
+                })),
+                Kind::Derived => projections.push(g.remap_refs(&base_pos)),
+            }
+        }
+        for v in 0..self.expressions.len() {
+            projections.push(Expression::Ref(crate::expression::Ref {
+                column_idx: base.len() + v,
+                return_type: Type::Int64,
+            }));
+        }
+
+        let reduced = Aggregate {
+            groups: base,
+            expressions: self.expressions.clone(),
+            top_k: self.top_k,
+        };
+        Some((reduced, projections))
     }
 
     /// Answer an unfiltered global `MIN`/`MAX`-only aggregate straight from
