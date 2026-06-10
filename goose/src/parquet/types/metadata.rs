@@ -11,45 +11,9 @@
 use crate::parquet::types::table::ParquetTable;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
-use dispatch::io::{FileLocation, RemoteFile};
-use std::fs::File;
-use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use dispatch::io::FileLocation;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// Where a row group's bytes live, and how the file cache addresses them: a
-/// local file (read via the io_uring file path) or a remote object (read via
-/// HTTP range requests on the same ring). A [`FileLocation`] is derived from
-/// this to key the cache and to tell the fetcher which kind of IO to issue.
-#[derive(Clone)]
-pub enum FileSource {
-    /// An open local file. The `Arc<File>` keeps the fd alive for the cache;
-    /// the path identifies the file (so a newly-registered or compacted-away
-    /// file can be matched to its row groups).
-    Local { file: Arc<File>, path: Arc<PathBuf> },
-    /// A remote object addressed by an (already DNS-resolved, possibly
-    /// presigned) URL.
-    Remote(Arc<RemoteFile>),
-}
-
-impl FileSource {
-    /// The [`FileLocation`] used to key the file cache and select the IO path.
-    pub fn location(&self) -> FileLocation {
-        match self {
-            FileSource::Local { file, .. } => FileLocation::Local(file.as_raw_fd()),
-            FileSource::Remote(remote) => FileLocation::Remote(remote.clone()),
-        }
-    }
-
-    /// The filesystem path of a local source, `None` for a remote one.
-    pub fn local_path(&self) -> Option<&Path> {
-        match self {
-            FileSource::Local { path, .. } => Some(path),
-            FileSource::Remote(_) => None,
-        }
-    }
-}
 
 /// Decoded min/max (and counts) for one column of a row group. Each bound is an
 /// arrow [`Scalar<ArrayRef>`] — the same shape the planner uses for SQL
@@ -99,8 +63,12 @@ pub struct ColumnChunkMeta {
 /// queries may reference the same row group.
 #[derive(Clone)]
 pub struct RowGroupMetadata {
-    /// Where the Parquet file's bytes live (local fd or remote object).
-    pub source: FileSource,
+    /// The open file holding this row group's bytes (local file or remote
+    /// object) — what the fetcher reads from and the file cache keys on.
+    pub location: FileLocation,
+    /// The file's name within its table's data location — the identity the
+    /// [table log](crate::table_log) speaks, for local and remote files alike.
+    pub file_name: Arc<str>,
     /// Arrow schema describing the columns in this row group.
     pub schema: SchemaRef,
     /// Per-column-chunk byte layout (offsets and sizes).

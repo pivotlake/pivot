@@ -210,7 +210,7 @@ fn main() -> Result<(), Error> {
                 }),
             )
         }
-        None => Arc::new(ParquetCatalog::new()),
+        None => Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone())),
     };
 
     rt.block_on(async move {

@@ -1,7 +1,8 @@
 //! A generic key→bytes object store — local filesystem, S3, or GCS — and nothing
-//! catalog-specific. It knows how to `get`/`put`/`list` objects and turn a key
-//! into a ring-readable [`DataFileLocation`]; the table manifest and catalog
-//! build on it one layer up.
+//! catalog-specific. It knows how to `get`/`put`/`list`/`delete` objects, do a
+//! conditional create ([`ObjectStore::put_if_absent`], the table log's CAS),
+//! and turn a key into a ring-readable [`DataFile`]; the table manifest,
+//! table log, and catalog build on it one layer up.
 //!
 //! Everything here is **synchronous** and pulls in no async runtime: local
 //! access is plain `std::fs`; S3/GCS go over [`ureq`] (blocking HTTP + rustls).
@@ -50,15 +51,43 @@ pub struct ObjectMeta {
     pub size: u64,
 }
 
-/// How the io_uring data plane should read one of a store's objects — a local
-/// backend by filesystem path, a remote one by a presigned GET URL. The size
-/// travels with it, so a reader can locate (e.g.) a Parquet footer without a
-/// separate `stat`/HEAD. Produced by [`ObjectStore::data_file`]; which variant
-/// you get is entirely the store's business, not the caller's.
+/// One Parquet data file of a table, ready for the metadata fetcher: its name
+/// within the table's data location (the identity the
+/// [table log](crate::table_log) records — local and remote alike), its total
+/// size in bytes (locates the footer without a `stat`/HEAD), and where its
+/// bytes live. Produced by [`ObjectStore::data_file`] or
+/// [`local_parquet_files`].
 #[derive(Clone, Debug)]
-pub enum DataFileLocation {
-    Local { path: PathBuf, size: u64 },
-    Remote { url: url::Url, size: u64 },
+pub struct DataFile {
+    pub name: String,
+    pub size: u64,
+    pub source: DataFileSource,
+}
+
+/// Where a data file's bytes live: a local filesystem path (read via the
+/// io_uring file path) or a concrete — already presigned — URL (read via HTTP
+/// range requests on the same ring). Which variant a store yields is entirely
+/// its business, not the caller's.
+#[derive(Clone, Debug)]
+pub enum DataFileSource {
+    Local(PathBuf),
+    Remote(url::Url),
+}
+
+impl DataFile {
+    /// A data file on the local filesystem, named after its path's final
+    /// component.
+    pub fn local(path: PathBuf, size: u64) -> Self {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Self {
+            name,
+            size,
+            source: DataFileSource::Local(path),
+        }
+    }
 }
 
 /// A flat key→bytes object store rooted at one database. Keys are relative to
@@ -74,6 +103,17 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// which a single server writes on the occasional `CREATE TABLE`.)
     fn put(&self, key: &str, data: &[u8]) -> Result<()>;
 
+    /// Create `key` with `data` only if it does not already exist — the
+    /// compare-and-swap the versioned [table log](crate::table_log) builds its
+    /// commits on. `Ok(true)` means this writer created the object; `Ok(false)`
+    /// means the key was already there (the caller lost the race: re-read the
+    /// latest state and retry at the next version).
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool>;
+
+    /// Delete `key`. Deleting an object that does not exist is not an error —
+    /// the caller's goal (key absent) is already met.
+    fn delete(&self, key: &str) -> Result<()>;
+
     /// List objects directly under `prefix` (one level, not recursive), as keys
     /// (relative to the root) paired with their sizes.
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>>;
@@ -82,7 +122,7 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// backend yields a filesystem path, a remote one a presigned GET URL. The
     /// default store serves no readable data files (e.g. a pure in-memory store
     /// holds only the manifest) — local/remote backends override it.
-    fn data_file(&self, _key: &str, _size: u64) -> Result<DataFileLocation> {
+    fn data_file(&self, _key: &str, _size: u64) -> Result<DataFile> {
         Err(StoreError::Config(
             "this store has no readable data files".to_string(),
         ))
@@ -102,11 +142,10 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     }
 }
 
-/// The `*.parquet` files directly under a local directory, each as a
-/// [`DataFileLocation::Local`] carrying its size. A missing directory yields
-/// none. This is how a local table's data files are enumerated for the
-/// metadata-fetch dataflow.
-pub fn local_parquet_files(dir: &Path) -> std::io::Result<Vec<DataFileLocation>> {
+/// The `*.parquet` files directly under a local directory, each as a local
+/// [`DataFile`] carrying its size. A missing directory yields none. This is how
+/// a local table's data files are enumerated for the metadata-fetch dataflow.
+pub fn local_parquet_files(dir: &Path) -> std::io::Result<Vec<DataFile>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -117,14 +156,17 @@ pub fn local_parquet_files(dir: &Path) -> std::io::Result<Vec<DataFileLocation>>
         if path.extension().is_some_and(|ext| ext == "parquet") {
             let meta = entry.metadata()?;
             if meta.is_file() {
-                files.push(DataFileLocation::Local {
-                    path,
-                    size: meta.len(),
-                });
+                files.push(DataFile::local(path, meta.len()));
             }
         }
     }
     Ok(files)
+}
+
+/// The final path segment of a store key — the object's name within its
+/// directory/prefix, as the table log records it.
+pub(crate) fn key_name(key: &str) -> String {
+    key.rsplit('/').next().unwrap_or(key).to_string()
 }
 
 /// Join a relative catalog key onto an in-bucket prefix, preserving the prefix's

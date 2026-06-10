@@ -77,7 +77,8 @@ where
 {
     // Size-`limit` min-heap (via `Reverse`) keyed by the sort scalar; keeps the
     // `limit` largest entries seen.
-    let mut heap: BinaryHeap<Reverse<TopK<K::Persisted, V::Value, V::SortKey>>> =
+    type MinHeap<K, V, S> = BinaryHeap<Reverse<TopK<K, V, S>>>;
+    let mut heap: MinHeap<K::Persisted, V::Value, V::SortKey> =
         BinaryHeap::with_capacity(limit + 1);
     for entry in table.iter(0) {
         let sort = V::sort_key(entry.value(), slot);

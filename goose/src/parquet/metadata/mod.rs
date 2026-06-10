@@ -8,12 +8,13 @@
 //! - [`writer`] — the terminal fan-in sink: gathers the row groups on one worker,
 //!   assembles the [`ParquetTable`], and commits it.
 //!
-//! It is consumed two ways, both over the same fetch core ([`fetch_factories`] +
-//! [`assemble`]): [`load_table`] collects on the coordinator and returns a
-//! [`ParquetTable`] **value** (the catalog's reload and the test/bench
+//! It is consumed two ways, both over the same fetch core ([`fetch_factories`]
+//! and [`LoadedTable::assemble`]): [`load`] collects on the coordinator and
+//! returns a [`LoadedTable`] **value** of per-file row groups (the catalog's
+//! reload and registrations; [`load_table`] flattens it for the test/bench
 //! constructors), while [`create_load_and_commit_spec`] returns a
-//! `RecordBatchOperatorSpec` ending in the [`writer`] sink that assembles the
-//! table and hands it to a `commit` closure — the `CREATE TABLE` the server
+//! `RecordBatchOperatorSpec` ending in the [`writer`] sink that hands the
+//! `LoadedTable` to a `commit` closure — the `CREATE TABLE` the server
 //! executes.
 
 mod fetcher;
@@ -22,7 +23,7 @@ mod writer;
 
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::ParquetTable;
-use crate::store::DataFileLocation;
+use crate::store::DataFile;
 use dispatch::{
     DataFlowDispatcher, DefaultUnaryFactory, OperatorSpec, RecordBatchOperatorSpec,
     RootUnaryOperatorFactory, fan_in,
@@ -33,16 +34,16 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use writer::TableBuildSinkFactory;
 
-/// A file location tagged with its position in the input list, so the row groups
-/// can be numbered in file order regardless of which worker reads which footer.
-type IndexedFile = (usize, DataFileLocation);
+/// A data file tagged with its position in the input list, so the row groups
+/// can be regrouped in file order regardless of which worker reads which footer.
+type IndexedFile = (usize, DataFile);
 /// A row group tagged with the index of the file it came from.
 type IndexedRowGroup = (usize, RowGroupMetadata);
 
 /// The per-worker source→fetch factories: each worker steals files from a shared
 /// injector and reads their footers, emitting one [`IndexedRowGroup`] per group.
 fn fetch_factories(
-    files: &[DataFileLocation],
+    files: &[DataFile],
     workers: usize,
 ) -> Vec<
     RootUnaryOperatorFactory<
@@ -65,57 +66,94 @@ fn fetch_factories(
         .collect()
 }
 
-/// Order the gathered row groups by `(file order, file-internal order)` and
-/// assign each its global index, so the result is identical regardless of how
-/// the parallel fetch interleaved.
-fn assemble(mut rows: Vec<IndexedRowGroup>) -> Vec<Arc<RowGroupMetadata>> {
-    rows.sort_by_key(|(file_idx, rg)| (*file_idx, rg.file_row_group_idx));
-    rows.into_iter()
-        .enumerate()
-        .map(|(global_idx, (_, mut rg))| {
-            rg.global_row_group_idx = global_idx;
-            Arc::new(rg)
-        })
-        .collect()
+/// The result of one metadata fetch over a list of data files: each input
+/// file's row groups, in input-file order (file-internal order within), with
+/// global indices not yet assigned. Callers that track files individually (the
+/// catalog's versioned table entries) keep this shape;
+/// [`into_table`](Self::into_table) flattens it for everyone else.
+pub struct LoadedTable {
+    files: Vec<Vec<RowGroupMetadata>>,
 }
 
-/// Materialize a list of data files into a [`ParquetTable`] value on the
-/// coordinator: read every footer in parallel, gather, and assemble. A pipeline
+impl LoadedTable {
+    /// Regroup the fetch's interleaved output by `(file order, file-internal
+    /// order)`, so the result is identical regardless of how the parallel
+    /// fetch raced.
+    pub(super) fn assemble(mut rows: Vec<IndexedRowGroup>, file_count: usize) -> Self {
+        rows.sort_by_key(|(file_idx, rg)| (*file_idx, rg.file_row_group_idx));
+        let mut files = vec![Vec::new(); file_count];
+        for (file_idx, rg) in rows {
+            files[file_idx].push(rg);
+        }
+        Self { files }
+    }
+
+    /// Each input file's row groups, in input order.
+    pub fn into_per_file(self) -> Vec<Vec<RowGroupMetadata>> {
+        self.files
+    }
+
+    /// Flatten into a [`ParquetTable`], assigning global row-group indices in
+    /// file order.
+    pub fn into_table(self) -> ParquetTable {
+        let rows = self
+            .files
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(global_idx, mut rg)| {
+                rg.global_row_group_idx = global_idx;
+                Arc::new(rg)
+            })
+            .collect();
+        ParquetTable::new(rows)
+    }
+}
+
+/// Materialize a list of data files into a [`LoadedTable`] value on the
+/// coordinator: read every footer in parallel and regroup per file. A pipeline
 /// breaker — it drives a dataflow, so it must run on the coordinator (a nested
-/// dataflow would deadlock a worker). The value path, used by the catalog's
-/// reload and the `ParquetTable` test/bench constructors; `CREATE TABLE` uses
-/// [`create_load_and_commit_spec`] instead.
-pub fn load_table(
+/// dataflow would deadlock a worker). The value path, used by the catalog;
+/// `CREATE TABLE` uses [`create_load_and_commit_spec`] instead.
+pub fn load(
     dispatcher: &DataFlowDispatcher,
-    files: &[DataFileLocation],
-) -> Result<ParquetTable, dispatch::DataFlowError> {
+    files: &[DataFile],
+) -> Result<LoadedTable, dispatch::DataFlowError> {
     if files.is_empty() {
-        return Ok(ParquetTable::new(Vec::new()));
+        return Ok(LoadedTable { files: Vec::new() });
     }
     let n = dispatcher.worker_count().max(1);
     let collected = OperatorSpec::new(dispatcher.clone(), fetch_factories(files, n)).collect()?;
-    Ok(ParquetTable::new(assemble(collected)))
+    Ok(LoadedTable::assemble(collected, files.len()))
+}
+
+/// [`load`] flattened into a [`ParquetTable`] — the test/bench constructors'
+/// path.
+pub fn load_table(
+    dispatcher: &DataFlowDispatcher,
+    files: &[DataFile],
+) -> Result<ParquetTable, dispatch::DataFlowError> {
+    Ok(load(dispatcher, files)?.into_table())
 }
 
 /// A `RecordBatchOperatorSpec` that, when executed, reads every file's footer in
-/// parallel and — at its terminal stage — assembles the [`ParquetTable`] and
+/// parallel and — at its terminal stage — regroups the [`LoadedTable`] and
 /// hands it to `commit` (which runs once, on the worker that finishes last, and
 /// returns an error to fail the statement). Emits no rows. This is `CREATE TABLE`
 /// as a single dataflow: fetch, then commit (the `commit` records the table in
-/// the manifest and the catalog map).
+/// the manifest, the table log, and the catalog map).
 pub fn create_load_and_commit_spec<C>(
     dispatcher: &DataFlowDispatcher,
-    files: &[DataFileLocation],
+    files: &[DataFile],
     commit: C,
 ) -> RecordBatchOperatorSpec
 where
-    C: FnOnce(
-            Arc<ParquetTable>,
-        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+    C: FnOnce(LoadedTable) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + 'static,
 {
     let n = dispatcher.worker_count().max(1);
+    let file_count = files.len();
     let fetch = OperatorSpec::new(dispatcher.clone(), fetch_factories(files, n));
 
     // `fan_in` funnels every worker's row groups to worker 0; only worker 0 gets
@@ -123,7 +161,7 @@ where
     // shared state — the channel closing is the "all fetched" signal.
     let mut commit = Some(commit);
     let sinks: Vec<_> = (0..n)
-        .map(|_| TableBuildSinkFactory::new(commit.take()))
+        .map(|_| TableBuildSinkFactory::new(commit.take(), file_count))
         .collect();
     RecordBatchOperatorSpec::from_spec(fetch.chain(fan_in::<IndexedRowGroup>(n), sinks))
 }

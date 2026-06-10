@@ -497,8 +497,18 @@ mod tests {
     use crate::memory::context::{init_test_free_pool, memory_ctx};
 
     const SB: usize = SUB_BLOCK_SIZE;
-    // A local location used as the cache key throughout these tests.
-    const FD: FileLocation = FileLocation::Local(7);
+
+    /// A local location used as the cache key throughout these tests. One
+    /// shared open file, so every call keys the same cache bucket.
+    #[allow(non_snake_case)]
+    fn FD() -> FileLocation {
+        use std::sync::OnceLock;
+        static FILE: OnceLock<std::sync::Arc<std::fs::File>> = OnceLock::new();
+        FileLocation::Local(
+            FILE.get_or_init(|| std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()))
+                .clone(),
+        )
+    }
 
     fn cache() -> &'static FileCache {
         memory_ctx().file_cache()
@@ -558,10 +568,10 @@ mod tests {
     #[test]
     fn miss_then_fill_then_hit() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
         // A fresh region: looking up the first sub-block misses with one block.
-        let region = miss(cache().get_region(&FD, 0, 0, 10));
+        let region = miss(cache().get_region(&FD(), 0, 0, 10));
         assert_eq!(region.missing().len(), 1);
         let block = region.missing()[0].clone();
         assert_eq!((block.first_sub, block.sub_count, block.len), (0, 1, SB));
@@ -570,17 +580,17 @@ mod tests {
         read_and_commit(&block, 0xAB);
         drop(region);
 
-        let bytes = hit(cache().get_region(&FD, 0, 0, 10));
+        let bytes = hit(cache().get_region(&FD(), 0, 0, 10));
         assert_eq!(&bytes[..], &[0xAB; 10]);
     }
 
     #[test]
     fn coalesces_contiguous_missing_sub_blocks_into_one_block() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
         // Range spanning three sub-blocks, none present → a single coalesced run.
-        let region = miss(cache().get_region(&FD, 0, 0, 2 * SB + 1));
+        let region = miss(cache().get_region(&FD(), 0, 0, 2 * SB + 1));
         assert_eq!(region.missing().len(), 1);
         let block = &region.missing()[0];
         assert_eq!(
@@ -592,15 +602,15 @@ mod tests {
     #[test]
     fn partial_validity_only_reports_the_holes() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
         // Fill sub-block 0 only.
-        let region = miss(cache().get_region(&FD, 0, 0, 10));
+        let region = miss(cache().get_region(&FD(), 0, 0, 10));
         read_and_commit(&region.missing()[0].clone(), 1);
         drop(region);
 
         // Now ask for sub-blocks 0..=2; only 1 and 2 are missing, coalesced.
-        let region = miss(cache().get_region(&FD, 0, 0, 2 * SB + 1));
+        let region = miss(cache().get_region(&FD(), 0, 0, 2 * SB + 1));
         assert_eq!(region.missing().len(), 1);
         let block = &region.missing()[0];
         assert_eq!((block.first_sub, block.sub_count), (1, 2));
@@ -609,21 +619,21 @@ mod tests {
     #[test]
     fn distinct_regions_use_distinct_slots() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
-        let r0 = miss(cache().get_region(&FD, 0, 0, 10));
-        let r1 = miss(cache().get_region(&FD, BUFFER_SIZE, 0, 10));
+        let r0 = miss(cache().get_region(&FD(), 0, 0, 10));
+        let r1 = miss(cache().get_region(&FD(), BUFFER_SIZE, 0, 10));
         assert_ne!(r0.missing()[0].slot_idx, r1.missing()[0].slot_idx);
     }
 
     #[test]
     fn second_column_in_same_region_shares_the_slot() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
         // Two disjoint ranges within the same 2 MB region resolve to one slot.
-        let a = miss(cache().get_region(&FD, 0, 0, 10));
-        let b = miss(cache().get_region(&FD, 0, 5 * SB, 5 * SB + 10));
+        let a = miss(cache().get_region(&FD(), 0, 0, 10));
+        let b = miss(cache().get_region(&FD(), 0, 5 * SB, 5 * SB + 10));
         assert_eq!(a.missing()[0].slot_idx, b.missing()[0].slot_idx);
         // ...and a's fill doesn't satisfy b's distant sub-block.
         assert_eq!(b.missing()[0].first_sub, 5);
@@ -634,12 +644,12 @@ mod tests {
     #[test]
     fn hit_reassembles_bytes_across_sub_blocks() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
-        let region = miss(cache().get_region(&FD, 0, SB - 5, 2 * SB + 5));
+        cache().open_entry(FD());
+        let region = miss(cache().get_region(&FD(), 0, SB - 5, 2 * SB + 5));
         fill_pattern(0, &region);
         drop(region);
 
-        let bytes = hit(cache().get_region(&FD, 0, SB - 5, 2 * SB + 5));
+        let bytes = hit(cache().get_region(&FD(), 0, SB - 5, 2 * SB + 5));
 
         assert_pattern(&bytes, SB - 5);
         assert_eq!(bytes.len(), SB + 10);
@@ -650,10 +660,10 @@ mod tests {
     #[test]
     fn hit_returns_the_exact_requested_byte_range() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
-        fill_pattern(0, &miss(cache().get_region(&FD, 0, 0, SB)));
+        cache().open_entry(FD());
+        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 0, SB)));
 
-        let bytes = hit(cache().get_region(&FD, 0, 3, 9));
+        let bytes = hit(cache().get_region(&FD(), 0, 3, 9));
 
         assert_eq!(bytes.len(), 6);
         assert_pattern(&bytes, 3);
@@ -664,12 +674,12 @@ mod tests {
     #[test]
     fn committed_bytes_serve_an_overlapping_later_lookup() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
-        let first = miss(cache().get_region(&FD, 0, 0, 2 * SB));
+        cache().open_entry(FD());
+        let first = miss(cache().get_region(&FD(), 0, 0, 2 * SB));
         fill_pattern(0, &first);
         drop(first);
 
-        let bytes = hit(cache().get_region(&FD, 0, SB / 2, SB + SB / 2));
+        let bytes = hit(cache().get_region(&FD(), 0, SB / 2, SB + SB / 2));
 
         assert_pattern(&bytes, SB / 2);
     }
@@ -679,9 +689,9 @@ mod tests {
     #[test]
     fn into_data_yields_the_freshly_filled_range() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
-        let region = miss(cache().get_region(&FD, 0, 10, SB + 10));
+        let region = miss(cache().get_region(&FD(), 0, 10, SB + 10));
         fill_pattern(0, &region);
         let bytes = region.into_data();
 
@@ -694,14 +704,14 @@ mod tests {
     #[test]
     fn interleaved_gaps_split_then_fill_to_a_full_hit() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
-        fill_pattern(0, &miss(cache().get_region(&FD, 0, 0, 1))); // sub-block 0
-        fill_pattern(0, &miss(cache().get_region(&FD, 0, 2 * SB, 2 * SB + 1))); // sub-block 2
+        cache().open_entry(FD());
+        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 0, 1))); // sub-block 0
+        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 2 * SB, 2 * SB + 1))); // sub-block 2
 
-        let gaps = miss(cache().get_region(&FD, 0, 0, 4 * SB));
+        let gaps = miss(cache().get_region(&FD(), 0, 0, 4 * SB));
         fill_pattern(0, &gaps);
         drop(gaps);
-        let bytes = hit(cache().get_region(&FD, 0, 0, 4 * SB));
+        let bytes = hit(cache().get_region(&FD(), 0, 0, 4 * SB));
 
         assert_pattern(&bytes, 0);
     }
@@ -711,12 +721,12 @@ mod tests {
     #[test]
     fn reopening_a_file_forgets_its_cached_regions() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
-        fill_pattern(0, &miss(cache().get_region(&FD, 0, 0, SB)));
+        cache().open_entry(FD());
+        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 0, SB)));
 
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
-        assert!(!cache().get_region(&FD, 0, 0, SB).missing().is_empty());
+        assert!(!cache().get_region(&FD(), 0, 0, SB).missing().is_empty());
     }
 
     /// The public range API hides bucketing: a range within one 2 MB window is a
@@ -724,10 +734,10 @@ mod tests {
     #[test]
     fn get_splits_a_range_across_buckets() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
 
-        let within_one = cache().get(&FD, 100, SB);
-        let across_two = cache().get(&FD, BUFFER_SIZE - SB, 2 * SB);
+        let within_one = cache().get(&FD(), 100, SB);
+        let across_two = cache().get(&FD(), BUFFER_SIZE - SB, 2 * SB);
 
         assert_eq!(within_one.len(), 1);
         assert_eq!(across_two.len(), 2);
@@ -738,13 +748,13 @@ mod tests {
     #[test]
     fn get_spanning_cached_and_uncached_windows() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
         fill_pattern(
             0,
-            &miss(cache().get_region(&FD, 0, BUFFER_SIZE - SB, BUFFER_SIZE)),
+            &miss(cache().get_region(&FD(), 0, BUFFER_SIZE - SB, BUFFER_SIZE)),
         );
 
-        let parts = cache().get(&FD, BUFFER_SIZE - SB, 2 * SB);
+        let parts = cache().get(&FD(), BUFFER_SIZE - SB, 2 * SB);
         assert!(parts[0].missing().is_empty()); // cached window: full hit
         assert!(!parts[1].missing().is_empty()); // uncached window: has holes
         fill_pattern(BUFFER_SIZE, &parts[1]);
@@ -762,13 +772,13 @@ mod tests {
     #[test]
     fn a_partially_cached_window_is_one_miss_that_keeps_the_cached_bytes() {
         init_test_free_pool(8);
-        cache().open_entry(FD);
+        cache().open_entry(FD());
         read_and_commit(
-            &miss(cache().get_region(&FD, 0, 0, 1)).missing()[0].clone(),
+            &miss(cache().get_region(&FD(), 0, 0, 1)).missing()[0].clone(),
             0xAA,
         );
 
-        let m = miss(cache().get_region(&FD, 0, 0, 2 * SB));
+        let m = miss(cache().get_region(&FD(), 0, 0, 2 * SB));
         assert_eq!(m.missing().len(), 1);
         assert_eq!(m.missing()[0].file_offset, SB); // only the hole (sub-block 1)
         read_and_commit(&m.missing()[0].clone(), 0xBB);

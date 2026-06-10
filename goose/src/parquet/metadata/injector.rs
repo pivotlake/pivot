@@ -2,7 +2,7 @@
 //! with its index) exactly once, to whatever worker steals it next.
 
 use super::IndexedFile;
-use crate::store::DataFileLocation;
+use crate::store::DataFile;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
 use std::sync::Arc;
@@ -14,10 +14,10 @@ pub(super) struct FileInjectorFactory {
 }
 
 impl FileInjectorFactory {
-    pub(super) fn new(files: &[DataFileLocation]) -> Self {
+    pub(super) fn new(files: &[DataFile]) -> Self {
         let injector = Injector::new();
-        for (idx, location) in files.iter().enumerate() {
-            injector.push((idx, location.clone()));
+        for (idx, file) in files.iter().enumerate() {
+            injector.push((idx, file.clone()));
         }
         Self {
             files: Arc::new(injector),

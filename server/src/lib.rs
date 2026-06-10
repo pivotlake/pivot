@@ -33,7 +33,7 @@
 //! # async fn run() -> Result<(), server::Error> {
 //! let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 //! let dispatch = Dispatch::spin_up(workers, 32);
-//! let catalog = Arc::new(ParquetCatalog::new());
+//! let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
 //! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
 //! let server = Server::new(bind, dispatch, catalog, vec![]);

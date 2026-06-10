@@ -211,14 +211,16 @@ mod tests {
 
     /// An empty in-memory catalog: `Server::serve` only consults it on
     /// incoming queries, which these tests don't drive.
-    fn catalog() -> Arc<ParquetCatalog> {
-        Arc::new(ParquetCatalog::new())
+    fn catalog(dispatch: &Dispatch) -> Arc<ParquetCatalog> {
+        Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()))
     }
 
     #[tokio::test]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
-        let server = Server::new(bind(), Dispatch::spin_up(1, 32), catalog(), vec![]);
+        let dispatch = Dispatch::spin_up(1, 32);
+        let catalog = catalog(&dispatch);
+        let server = Server::new(bind(), dispatch, catalog, vec![]);
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;

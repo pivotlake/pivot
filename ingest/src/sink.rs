@@ -363,10 +363,9 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         let Some(catalog) = self.catalog.clone() else {
             return;
         };
-        let dispatcher = self.dispatcher.clone();
         let table = self.name.clone();
         let registered = tokio::task::spawn_blocking(move || {
-            let outcome = catalog.register_data_file(&dispatcher, &table, &path);
+            let outcome = catalog.register_data_file(&table, &path);
             (outcome, path)
         })
         .await;

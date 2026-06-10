@@ -32,6 +32,21 @@ impl ObjectStore for MemoryStore {
         Ok(())
     }
 
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        match self.objects.lock().unwrap().entry(key.to_string()) {
+            std::collections::hash_map::Entry::Occupied(_) => Ok(false),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(data.to_vec());
+                Ok(true)
+            }
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let prefix = format!("{}/", prefix.trim_end_matches('/'));
         Ok(self
@@ -75,6 +90,17 @@ mod tests {
                 ("a/y.parquet".to_string(), 1),
             ]
         );
+    }
+
+    #[test]
+    fn put_if_absent_creates_once_and_delete_is_idempotent() {
+        let store = MemoryStore::new();
+        assert!(store.put_if_absent("k", b"first").unwrap());
+        assert!(!store.put_if_absent("k", b"second").unwrap());
+        assert_eq!(store.get("k").unwrap().unwrap(), b"first");
+        store.delete("k").unwrap();
+        assert!(store.get("k").unwrap().is_none());
+        store.delete("k").unwrap();
     }
 
     #[test]

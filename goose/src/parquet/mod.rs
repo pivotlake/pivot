@@ -25,7 +25,7 @@ pub use reading::{
 };
 
 mod metadata;
-pub use metadata::{create_load_and_commit_spec, load_table};
+pub use metadata::{LoadedTable, create_load_and_commit_spec, load, load_table};
 
 mod row_group_stats;
 pub use row_group_stats::{
@@ -40,17 +40,16 @@ pub use types::table::{Error as ParquetTableError, ParquetTable};
 
 #[cfg(test)]
 pub(crate) mod test_utils {
-    use crate::parquet::types::metadata::{FileSource, QueryRowGroupMetadata, RowGroupMetadata};
+    use crate::parquet::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
     use crate::parquet::types::table::ParquetTable;
     use arrow_schema::Schema;
+    use dispatch::io::FileLocation;
     use std::sync::Arc;
 
     pub fn dummy_row_group() -> Arc<RowGroupMetadata> {
         Arc::new(RowGroupMetadata {
-            source: FileSource::Local {
-                file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
-                path: Arc::new("/dev/null".into()),
-            },
+            location: FileLocation::Local(Arc::new(std::fs::File::open("/dev/null").unwrap())),
+            file_name: Arc::from("dummy.parquet"),
             schema: Arc::new(Schema::empty()),
             columns: vec![],
             num_rows: 0,

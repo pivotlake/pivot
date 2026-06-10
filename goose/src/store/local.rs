@@ -1,7 +1,7 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFileLocation, ObjectMeta, ObjectStore, Result, StoreError};
+use super::{DataFile, DataFileSource, ObjectMeta, ObjectStore, Result, StoreError};
 use std::path::PathBuf;
 
 /// The local-filesystem backend: keys are paths under `root`.
@@ -53,6 +53,46 @@ impl ObjectStore for LocalStore {
         })
     }
 
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        let path = self.path_for(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                key: key.to_string(),
+                source,
+            })?;
+        }
+        // Write the full content to a writer-unique temp file, then `link` it
+        // to the target name: `link` fails with `AlreadyExists` if the target
+        // exists, so creation is atomic *and* a concurrent reader can never see
+        // a partially-written object.
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, data).map_err(|source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        })?;
+        let created = match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        };
+        let _ = std::fs::remove_file(&tmp);
+        created
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        match std::fs::remove_file(self.path_for(key)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {
@@ -86,10 +126,11 @@ impl ObjectStore for LocalStore {
         Ok(objects)
     }
 
-    fn data_file(&self, key: &str, size: u64) -> Result<DataFileLocation> {
-        Ok(DataFileLocation::Local {
-            path: self.path_for(key),
+    fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
+        Ok(DataFile {
+            name: super::key_name(key),
             size,
+            source: DataFileSource::Local(self.path_for(key)),
         })
     }
 }
@@ -105,6 +146,26 @@ mod tests {
         store.put("k", b"first").unwrap();
         store.put("k", b"second").unwrap();
         assert_eq!(store.get("k").unwrap().unwrap(), b"second");
+    }
+
+    #[test]
+    fn put_if_absent_creates_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        assert!(store.put_if_absent("v/1.json", b"first").unwrap());
+        assert!(!store.put_if_absent("v/1.json", b"second").unwrap());
+        // The loser's bytes never land.
+        assert_eq!(store.get("v/1.json").unwrap().unwrap(), b"first");
+    }
+
+    #[test]
+    fn delete_removes_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("k", b"v").unwrap();
+        store.delete("k").unwrap();
+        assert!(store.get("k").unwrap().is_none());
+        store.delete("k").unwrap();
     }
 
     #[test]

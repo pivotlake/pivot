@@ -122,7 +122,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         {
             let rg = self.in_flight[slot].as_mut().unwrap();
             for fs in rg.pending_fs().iter() {
-                keys.push((FileLocation::Local(fs.fd), fs.block.file_offset()));
+                keys.push((FileLocation::Local(fs.file.clone()), fs.block.file_offset()));
             }
         }
         {
@@ -167,7 +167,10 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         sender: &mut S,
         request: FsRequest,
     ) -> dispatch::UnaryResult<()> {
-        let key = (FileLocation::Local(request.fd), request.block.file_offset());
+        let key = (
+            FileLocation::Local(request.file),
+            request.block.file_offset(),
+        );
         self.process_completion(key, sender)
     }
 

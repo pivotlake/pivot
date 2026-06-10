@@ -1400,6 +1400,7 @@ dependencies = [
  "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=1e20a92f7bcad208bf6869f5394101288850ee2e)",
  "thiserror 2.0.18",
  "thriftparquet",
+ "tracing",
  "ureq",
  "url",
 ]

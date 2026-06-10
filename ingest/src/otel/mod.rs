@@ -213,16 +213,14 @@ fn build_sink<T: ToRecordBatch>(
     sinks: &mut Vec<Arc<dyn Flushable>>,
     compacters: &mut Vec<Arc<Compacter>>,
 ) -> std::io::Result<Arc<ParquetSink<T>>> {
+    // A compacter is wired wherever a catalog table can exist for the sink —
+    // i.e. the sink lands files locally and registers them. The compacter
+    // itself is location-agnostic (it works off the table's log and store),
+    // so this is only about who wakes it.
     let compacter = match (&setup.destination, catalog) {
-        (SinkDestination::Local(dir), Some(catalog)) if cfg.compact_bytes > 0 => {
-            Some(Arc::new(Compacter::new(
-                name,
-                dir.clone(),
-                cfg.compact_bytes,
-                dispatcher.clone(),
-                catalog.clone(),
-            )))
-        }
+        (SinkDestination::Local(_), Some(catalog)) if cfg.compact_bytes > 0 => Some(Arc::new(
+            Compacter::new(name, cfg.compact_bytes, catalog.clone()),
+        )),
         _ => None,
     };
     let sink = Arc::new(ParquetSink::new(

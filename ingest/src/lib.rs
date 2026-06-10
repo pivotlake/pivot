@@ -326,17 +326,33 @@ mod tests {
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
     ) {
+        create_table(catalog, dispatcher, "otel_logs", Some(dir));
+    }
+
+    /// `CREATE TABLE <name>` against `catalog` the way the server would run
+    /// it: with an explicit absolute `path` option, or — when `dir` is `None`
+    /// — at `<name>` under the database root (a store-relative table).
+    fn create_table(
+        catalog: &Arc<goose::ParquetCatalog>,
+        dispatcher: &DataFlowDispatcher,
+        name: &str,
+        dir: Option<&Path>,
+    ) {
         use planner::catalog::{Catalog as _, Column, CreateTableRequest};
+        let options = match dir {
+            Some(dir) => std::collections::HashMap::from([(
+                "path".to_string(),
+                dir.to_str().unwrap().to_string(),
+            )]),
+            None => std::collections::HashMap::new(),
+        };
         let request = CreateTableRequest {
-            name: "otel_logs".to_string(),
+            name: name.to_string(),
             columns: vec![Column {
                 name: "Timestamp".to_string(),
                 col_type: planner::types::Type::Int64,
             }],
-            options: std::collections::HashMap::from([(
-                "path".to_string(),
-                dir.to_str().unwrap().to_string(),
-            )]),
+            options,
             if_not_exists: false,
         };
         catalog
@@ -453,7 +469,7 @@ mod tests {
     fn flushed_file_is_registered_with_catalog_table() {
         let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
         let dir = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(goose::ParquetCatalog::new());
+        let catalog = Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
         assert!(
             catalog
@@ -489,14 +505,17 @@ mod tests {
     }
 
     /// End-to-end compaction: several registered small files merge into one
-    /// (decode + re-encode on the dispatch pool), the catalog swaps to the
-    /// merged file atomically, the inputs are unlinked, and the merged file
-    /// decodes back to all the original rows.
+    /// (a single scan→encode dataflow on the dispatch pool), the catalog swaps
+    /// to the merged file in one log commit, the inputs are deleted, and the
+    /// merged file decodes back to all the original rows.
     #[test]
     fn compaction_merges_registered_files_and_swaps_catalog() {
-        let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+        // 4× the usual test ring: the fused scan→encode dataflow keeps decode
+        // and encode in flight together, so decompressed pages (a full ring
+        // buffer each, however small the page) queue while workers encode.
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
         let dir = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(goose::ParquetCatalog::new());
+        let catalog = Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
 
         flush_each(
@@ -515,13 +534,7 @@ mod tests {
             .filter(|e| e.path().is_file())
             .map(|e| e.metadata().unwrap().len())
             .sum();
-        let compacter = crate::compact::Compacter::new(
-            "otel_logs",
-            dir.path().to_path_buf(),
-            total,
-            dispatch.dispatcher().clone(),
-            catalog.clone(),
-        );
+        let compacter = crate::compact::Compacter::new("otel_logs", total, catalog.clone());
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -536,17 +549,7 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
         assert_eq!(groups[0].global_row_group_idx, 0);
-        assert!(
-            groups[0]
-                .source
-                .local_path()
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .contains("compacted")
-        );
+        assert!(groups[0].file_name.contains("compacted"));
 
         // The merged file's contents round-trip through the engine's scan.
         let reread = read_table(&dispatch, dir.path());
@@ -568,6 +571,90 @@ mod tests {
             str_column(&batches, SERVICE_NAME)
                 .iter()
                 .all(|v| v == "svc")
+        );
+
+        dispatch.exit();
+    }
+    /// Compaction is location-agnostic: a **store-relative** table (data under
+    /// the database root, resolved through the store — the same path a remote
+    /// `s3://` root takes) compacts through the exact same code, with writes
+    /// and deletes going through the table's store handle.
+    #[test]
+    fn compaction_works_on_store_relative_tables() {
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
+        let db = tempfile::tempdir().unwrap();
+        let table_dir = db.path().join("events");
+        std::fs::create_dir_all(&table_dir).unwrap();
+
+        // Two small files under the table's prefix inside the database root.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "Timestamp",
+            DataType::Int64,
+            false,
+        )]));
+        for (name, values) in [("a.parquet", vec![1i64, 2]), ("b.parquet", vec![3i64])] {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(values)) as _],
+            )
+            .unwrap();
+            let file = std::fs::File::create(table_dir.join(name)).unwrap();
+            // SNAPPY, like every pivot-written file — the engine's decompressor
+            // expects it.
+            let props = parquet::file::properties::WriterProperties::builder()
+                .set_compression(parquet::basic::Compression::SNAPPY)
+                .build();
+            let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let catalog = Arc::new(
+            goose::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
+                .unwrap(),
+        );
+        // No `path` option: the table lives at `events` under the root.
+        create_table(&catalog, dispatch.dispatcher(), "events", None);
+
+        let total: u64 = catalog
+            .table_files("events")
+            .unwrap()
+            .iter()
+            .map(|f| f.size)
+            .sum();
+        let compacter = crate::compact::Compacter::new("events", total, catalog.clone());
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(compacter.compact_eligible());
+
+        // One merged object replaced the two inputs, in the store and in the
+        // catalog.
+        let files = catalog.table_files("events").unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].name.contains("compacted"));
+        let on_disk: Vec<_> = std::fs::read_dir(&table_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".parquet"))
+            .collect();
+        assert_eq!(on_disk, vec![files[0].name.clone()]);
+
+        let table = catalog.parquet_table("events").unwrap();
+        assert_eq!(
+            table
+                .parquet
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows)
+                .sum::<i64>(),
+            3
         );
 
         dispatch.exit();

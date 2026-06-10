@@ -1,18 +1,17 @@
 //! Fetch stage: reads each file's Parquet footer — through the io_uring ring and
 //! the file cache, exactly like a column-chunk read — and emits the file's row
-//! groups. Mirrors the column-chunk [`RowGroupFetcher`](crate::parquet::reading::fetching::fetcher):
+//! groups. Mirrors the column-chunk `RowGroupFetcher` (the scan's fetch stage):
 //! many footer reads in flight, bounded per medium, so an all-remote directory's
 //! footers load in parallel instead of one network round trip after another.
 
 use super::{IndexedFile, IndexedRowGroup};
-use crate::parquet::types::metadata::{FileSource, RowGroupMetadata};
+use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
-use crate::store::DataFileLocation;
+use crate::store::{DataFile, DataFileSource};
 use dispatch::io::{FileLocation, FsRequest, HttpRequest, RemoteFile, open_direct_read};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
@@ -79,7 +78,7 @@ impl RowGroupMetadataFetcher {
         let request = self.in_flight[slot].as_ref().unwrap();
         let mut keys: Vec<(FileLocation, usize)> = Vec::new();
         for fs in &request.pending_fs {
-            keys.push((FileLocation::Local(fs.fd), fs.block.file_offset()));
+            keys.push((FileLocation::Local(fs.file.clone()), fs.block.file_offset()));
         }
         for http in &request.pending_http {
             keys.push((
@@ -163,32 +162,30 @@ impl RowGroupMetadataFetcher {
 impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
     fn consume<S: Sender<IndexedRowGroup>>(
         &mut self,
-        (file_idx, location): IndexedFile,
+        (file_idx, file): IndexedFile,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        // Resolve the location to its transport and byte source. The size — which
-        // locates the footer's tail window with no HEAD/suffix probe — is already
-        // carried by the location (`stat`ed at listing time for a local file,
-        // from the store listing for a remote one).
-        let (location, source, size) = match location {
-            DataFileLocation::Local { path, size } => {
+        // Open the file's transport. The size — which locates the footer's tail
+        // window with no HEAD/suffix probe — is already carried by the data
+        // file (`stat`ed at listing time for a local file, from the store
+        // listing for a remote one).
+        let DataFile { name, size, source } = file;
+        let location = match source {
+            DataFileSource::Local(path) => {
                 let file = open_direct_read(&path).map_err(crate::parquet::op_err)?;
-                let location = FileLocation::Local(file.as_raw_fd());
-                let source = FileSource::Local {
-                    file: Arc::new(file),
-                    path: Arc::new(path),
-                };
-                (location, source, size as usize)
+                FileLocation::Local(Arc::new(file))
             }
-            DataFileLocation::Remote { url, size } => {
+            DataFileSource::Remote(url) => {
                 let remote = Arc::new(RemoteFile::open(url).map_err(crate::parquet::op_err)?);
-                let location = FileLocation::Remote(remote.clone());
-                (location, FileSource::Remote(remote), size as usize)
+                FileLocation::Remote(remote)
             }
         };
 
         let slot = self.alloc_slot(RowGroupMetadataRequest::start(
-            file_idx, location, source, size,
+            file_idx,
+            location,
+            Arc::from(name),
+            size as usize,
         ));
         self.register_routes(slot);
         self.advance(slot, sender)
@@ -219,7 +216,10 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
         sender: &mut S,
         request: FsRequest,
     ) -> dispatch::UnaryResult<()> {
-        let key = (FileLocation::Local(request.fd), request.block.file_offset());
+        let key = (
+            FileLocation::Local(request.file),
+            request.block.file_offset(),
+        );
         self.process_completion(key, sender)
     }
 
@@ -252,9 +252,11 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
 /// groups (or issues the exact re-read).
 struct RowGroupMetadataRequest {
     file_idx: usize,
+    /// The open file (it keeps the handle alive, and travels into the row
+    /// groups as their location).
     location: FileLocation,
-    /// Keeps the file handle (fd / remote) alive; travels into the row groups.
-    source: FileSource,
+    /// The file's name — the table log identity stamped onto its row groups.
+    file_name: Arc<str>,
     /// Total file size, known when the read starts.
     size: usize,
     /// Cache lookups pinning the region currently being read.
@@ -271,12 +273,12 @@ struct RowGroupMetadataRequest {
 impl RowGroupMetadataRequest {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
-    fn start(file_idx: usize, location: FileLocation, source: FileSource, size: usize) -> Self {
+    fn start(file_idx: usize, location: FileLocation, file_name: Arc<str>, size: usize) -> Self {
         memory_ctx().file_cache().open_entry(location.clone());
         let mut request = Self {
             file_idx,
             location,
-            source,
+            file_name,
             size,
             lookups: Vec::new(),
             pending_fs: Vec::new(),
@@ -316,8 +318,8 @@ impl RowGroupMetadataRequest {
         for lookup in &self.lookups {
             for block in lookup.missing() {
                 match &self.location {
-                    FileLocation::Local(fd) => self.pending_fs.push(FsRequest {
-                        fd: *fd,
+                    FileLocation::Local(file) => self.pending_fs.push(FsRequest {
+                        file: file.clone(),
                         block: block.clone(),
                     }),
                     FileLocation::Remote(remote) => self.pending_http.push(HttpRequest {
@@ -369,6 +371,10 @@ impl RowGroupMetadataRequest {
             &bytes[start..bytes.len() - 8]
         };
 
-        Ok(Some(row_groups_from_footer(footer, self.source.clone())?))
+        Ok(Some(row_groups_from_footer(
+            footer,
+            self.location.clone(),
+            self.file_name.clone(),
+        )?))
     }
 }

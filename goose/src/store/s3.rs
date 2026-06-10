@@ -6,7 +6,7 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFileLocation, ObjectMeta, ObjectStore, Result, StoreError, join_prefix};
+use super::{DataFile, DataFileSource, ObjectMeta, ObjectStore, Result, StoreError, join_prefix};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -178,6 +178,33 @@ impl ObjectStore for S3Store {
         }
     }
 
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        let object = join_prefix(&self.prefix, key);
+        let url = self.url_for(&object);
+        // S3 conditional write: `If-None-Match: *` fails the PUT with 412 when
+        // the object already exists. A 409 means another conditional write on
+        // the same key is in flight — also "lost the race" to the caller.
+        let signed = self.sign("PUT", &url, &[("if-none-match", "*")], data)?;
+        let req = Self::apply(self.agent.put(&url), &signed);
+        match req.send_bytes(data) {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(412 | 409, _)) => Ok(false),
+            Err(e) => Err(StoreError::Http(format!("conditional PUT {object}: {e}"))),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let object = join_prefix(&self.prefix, key);
+        let url = self.url_for(&object);
+        let signed = self.sign("DELETE", &url, &[], &[])?;
+        let req = Self::apply(self.agent.delete(&url), &signed);
+        match req.call() {
+            // DELETE is idempotent; a missing key is the goal state.
+            Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(e) => Err(StoreError::Http(format!("DELETE {object}: {e}"))),
+        }
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let object_prefix = join_prefix(&self.prefix, prefix);
         // ListObjectsV2, one level (delimiter=/), under the object prefix.
@@ -214,10 +241,11 @@ impl ObjectStore for S3Store {
             .collect())
     }
 
-    fn data_file(&self, key: &str, size: u64) -> Result<DataFileLocation> {
-        Ok(DataFileLocation::Remote {
-            url: self.presign_get(key)?,
+    fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
+        Ok(DataFile {
+            name: super::key_name(key),
             size,
+            source: DataFileSource::Remote(self.presign_get(key)?),
         })
     }
 }

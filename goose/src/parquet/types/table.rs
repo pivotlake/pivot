@@ -6,13 +6,11 @@
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
 use crate::parquet::load_table;
-use crate::parquet::types::metadata::{
-    ColumnChunkMeta, ColumnStatistics, FileSource, RowGroupMetadata,
-};
+use crate::parquet::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
 use crate::parquet::types::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::parquet::types::thrift::general::{Encoding, PageType};
 use crate::parquet::types::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
-use crate::store::DataFileLocation;
+use crate::store::DataFile;
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, Scalar, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
@@ -75,30 +73,23 @@ impl ParquetTable {
         &mut self.row_groups
     }
 
-    /// Build a table from every Parquet file in a local directory, reading all
-    /// footers in parallel over the io_uring ring.
+    /// Build a table from every Parquet file in a local directory: list the
+    /// `*.parquet` files, then delegate to [`from_files`](Self::from_files).
     ///
     /// Drives the metadata-fetch dataflow, so it must run on the **coordinator**
     /// (the thread holding `dispatcher`), not inside a `run_on_worker` closure —
     /// a nested dataflow would deadlock the worker pool.
     pub fn from_directory(dispatcher: &DataFlowDispatcher, path: &Path) -> Result<Self> {
-        let mut files = Vec::new();
+        let mut paths = Vec::new();
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let path = entry.path();
-            // Only `*.parquet` — skip any sidecar files (and the cheap extension
-            // check comes before the `stat`).
-            if path.extension().is_some_and(|ext| ext == "parquet") {
-                let meta = entry.metadata()?;
-                if meta.is_file() {
-                    files.push(DataFileLocation::Local {
-                        path,
-                        size: meta.len(),
-                    });
-                }
+            // Only `*.parquet` — skip any sidecar files.
+            if path.extension().is_some_and(|ext| ext == "parquet") && path.is_file() {
+                paths.push(path);
             }
         }
-        Self::from_locations(dispatcher, files)
+        Self::from_files(dispatcher, &paths)
     }
 
     /// Build a table from an explicit, ordered list of local files. Same
@@ -112,15 +103,16 @@ impl ParquetTable {
             .map(|p| {
                 let path = PathBuf::from(p.as_ref());
                 let size = fs::metadata(&path)?.len();
-                Ok(DataFileLocation::Local { path, size })
+                Ok(DataFile::local(path, size))
             })
             .collect::<Result<Vec<_>>>()?;
         Self::from_locations(dispatcher, files)
     }
 
-    /// Build a table from remote files: concrete fetchable URLs paired with their
-    /// total size (from the store listing), which locates each footer. Same
-    /// coordinator requirement as [`from_directory`](Self::from_directory).
+    /// Build a table from remote files: concrete fetchable URLs paired with
+    /// their total size (from the store listing), which locates each footer.
+    /// Each file is named after its URL's final path segment. Same coordinator
+    /// requirement as [`from_directory`](Self::from_directory).
     pub fn from_remote_files(
         dispatcher: &DataFlowDispatcher,
         files: &[(Url, u64)],
@@ -128,7 +120,15 @@ impl ParquetTable {
         let files = files
             .iter()
             .cloned()
-            .map(|(url, size)| DataFileLocation::Remote { url, size })
+            .map(|(url, size)| DataFile {
+                name: url
+                    .path_segments()
+                    .and_then(|mut s| s.next_back())
+                    .unwrap_or_default()
+                    .to_string(),
+                size,
+                source: crate::store::DataFileSource::Remote(url),
+            })
             .collect();
         Self::from_locations(dispatcher, files)
     }
@@ -137,10 +137,7 @@ impl ParquetTable {
     /// assemble the row groups. The locations may freely mix local and remote
     /// files. Same coordinator requirement as
     /// [`from_directory`](Self::from_directory).
-    pub fn from_locations(
-        dispatcher: &DataFlowDispatcher,
-        files: Vec<DataFileLocation>,
-    ) -> Result<Self> {
+    pub fn from_locations(dispatcher: &DataFlowDispatcher, files: Vec<DataFile>) -> Result<Self> {
         load_table(dispatcher, &files).map_err(|e| Error::Materialize(e.to_string()))
     }
 
@@ -163,18 +160,20 @@ pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 /// indices), tying each to `source` for the column-chunk reads that follow.
 pub(crate) fn row_groups_from_footer(
     footer: &[u8],
-    source: FileSource,
+    location: dispatch::io::FileLocation,
+    file_name: Arc<str>,
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    build_row_groups(0, file_meta, source)
+    build_row_groups(0, file_meta, location, file_name)
 }
 
-/// Build the per-row-group metadata from a parsed footer and a (local or
-/// remote) byte source. Shared by the local and remote readers.
+/// Build the per-row-group metadata from a parsed footer and the (local or
+/// remote) open file. Shared by the local and remote readers.
 fn build_row_groups(
     global_row_group_offset: usize,
     file_meta: FileMetaData,
-    source: FileSource,
+    location: dispatch::io::FileLocation,
+    file_name: Arc<str>,
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
     let schema = Arc::new(schema);
@@ -207,7 +206,8 @@ fn build_row_groups(
                 })
                 .collect();
             RowGroupMetadata {
-                source: source.clone(),
+                location: location.clone(),
+                file_name: file_name.clone(),
                 schema: schema.clone(),
                 columns,
                 num_rows,

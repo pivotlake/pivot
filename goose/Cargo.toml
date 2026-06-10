@@ -12,16 +12,18 @@ arrow-ord = { path = "../arrow-rs/arrow-ord" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
 thiserror = "2.0.18"
+tracing = "0.1"
 bytes = "1.11.0"
 crossbeam-deque = "0.8.6"
 ahash = "0.8.12"
 snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "1e20a92f7bcad208bf6869f5394101288850ee2e" }
-# Catalog metadata is serialized as JSON (the `_goose_log/<version>.json`
-# snapshots). serde replaces goose's hand-rolled json parser.
+# Catalog metadata is serialized as JSON: the `_pivot_manifest.json` table
+# manifest and the `_goose_logs/<table>/<version>.json` table-log versions.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Synchronous object-store access for the catalog control plane (LIST/GET/PUT of
-# the `_goose_log/` snapshots), so the engine never spins up an async runtime.
+# Synchronous object-store access for the catalog control plane (LIST/GET/PUT/
+# conditional-PUT of the manifest and `_goose_logs/` versions), so the engine
+# never spins up an async runtime.
 # `ureq` is blocking HTTP + rustls; `aws-sigv4::sign` is a pure sync function we
 # call to sign S3 requests (the tokio it transitively pulls is never driven).
 # Credentials are read from the environment ourselves. GCS uses an OAuth bearer

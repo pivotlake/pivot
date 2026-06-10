@@ -8,7 +8,7 @@
 //! identity on Google compute). RS256 signing uses `ring`; everything is
 //! synchronous, no async runtime.
 
-use super::{DataFileLocation, ObjectMeta, ObjectStore, Result, StoreError, join_prefix};
+use super::{DataFile, DataFileSource, ObjectMeta, ObjectStore, Result, StoreError, join_prefix};
 use base64::Engine;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -211,6 +211,47 @@ impl ObjectStore for GcsStore {
         }
     }
 
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        let token = self.bearer()?;
+        // GCS conditional create: `ifGenerationMatch=0` only succeeds when no
+        // live generation of the object exists; otherwise 412.
+        let url = format!(
+            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}&ifGenerationMatch=0",
+            self.bucket,
+            self.object_path(key)
+        );
+        match self
+            .agent
+            .post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/octet-stream")
+            .send_bytes(data)
+        {
+            Ok(_) => Ok(true),
+            Err(ureq::Error::Status(412, _)) => Ok(false),
+            Err(e) => Err(StoreError::Http(format!("GCS conditional PUT {key}: {e}"))),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let token = self.bearer()?;
+        let url = format!(
+            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
+            self.bucket,
+            self.object_path(key)
+        );
+        match self
+            .agent
+            .delete(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+        {
+            // DELETE is idempotent; a missing key is the goal state.
+            Ok(_) | Err(ureq::Error::Status(404, _)) => Ok(()),
+            Err(e) => Err(StoreError::Http(format!("GCS DELETE {key}: {e}"))),
+        }
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let token = self.bearer()?;
         let object_prefix = join_prefix(&self.prefix, prefix);
@@ -250,10 +291,11 @@ impl ObjectStore for GcsStore {
             .collect()
     }
 
-    fn data_file(&self, key: &str, size: u64) -> Result<DataFileLocation> {
-        Ok(DataFileLocation::Remote {
-            url: self.presign_get(key)?,
+    fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
+        Ok(DataFile {
+            name: super::key_name(key),
             size,
+            source: DataFileSource::Remote(self.presign_get(key)?),
         })
     }
 }

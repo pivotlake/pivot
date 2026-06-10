@@ -138,7 +138,7 @@ fn row_group_count(table: &ParquetCatalogTable) -> usize {
 #[test]
 fn create_table_succeeds_with_valid_path() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     assert!(catalog.table("t").is_some());
 }
@@ -146,7 +146,7 @@ fn create_table_succeeds_with_valid_path() {
 #[test]
 fn create_table_without_a_path_makes_an_empty_table() {
     let (_dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let req = CreateTableRequest {
         name: "t".to_string(),
         columns,
@@ -162,7 +162,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
 #[test]
 fn create_table_fails_when_path_does_not_exist() {
     let (_dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
     let err = create_table(&catalog, create_request("t", bogus, columns))
         .unwrap_err()
@@ -177,7 +177,7 @@ fn create_table_fails_when_path_does_not_exist() {
 fn create_table_fails_when_path_is_a_file() {
     let (dir, columns) = three_row_table();
     let file_path = dir.path().join("data.parquet");
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let err = create_table(&catalog, create_request("t", &file_path, columns))
         .unwrap_err()
         .to_string();
@@ -190,7 +190,7 @@ fn create_table_fails_when_path_is_a_file() {
 #[test]
 fn create_table_rejects_a_url_path() {
     let (_dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     // A table path is always a plain path — its storage is the database's, not the
     // path's — so a scheme is rejected regardless of the database's storage class.
     let req = CreateTableRequest {
@@ -209,7 +209,7 @@ fn create_table_rejects_a_url_path() {
 #[test]
 fn pushdown_filter_always_returns_false() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let mut table = catalog.parquet_table("t").unwrap();
     let pushed = table
@@ -221,7 +221,7 @@ fn pushdown_filter_always_returns_false() {
 #[test]
 fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let mut table = catalog.parquet_table("t").unwrap();
@@ -240,7 +240,7 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
 #[test]
 fn second_bind_is_independent_of_first_bind_pushdown() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let mut first = catalog.parquet_table("t").unwrap();
@@ -257,7 +257,7 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
 #[test]
 fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 999` lies outside every (min,max) → all three row groups drop.
@@ -271,7 +271,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
 #[test]
 fn pushdown_filter_eq_keeps_only_matching_row_group() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 20` matches only the row group whose single value is 20.
@@ -285,7 +285,7 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
 #[test]
 fn pushdown_filter_eq_returns_false() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let mut table = catalog.parquet_table("t").unwrap();
     let pushed = table
@@ -297,7 +297,7 @@ fn pushdown_filter_eq_returns_false() {
 #[test]
 fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let mut table = catalog.parquet_table("t").unwrap();
@@ -342,7 +342,7 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 #[test]
 fn register_data_file_makes_new_file_visible_to_new_binds() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     assert_eq!(
         catalog
@@ -356,9 +356,7 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
     assert_eq!(
-        catalog
-            .register_data_file(&dispatcher(), "t", &new_file)
-            .unwrap(),
+        catalog.register_data_file("t", &new_file).unwrap(),
         RegisterOutcome::Registered
     );
 
@@ -379,20 +377,16 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
 #[test]
 fn register_data_file_is_idempotent_per_path() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40]);
     assert_eq!(
-        catalog
-            .register_data_file(&dispatcher(), "t", &new_file)
-            .unwrap(),
+        catalog.register_data_file("t", &new_file).unwrap(),
         RegisterOutcome::Registered
     );
     assert_eq!(
-        catalog
-            .register_data_file(&dispatcher(), "t", &new_file)
-            .unwrap(),
+        catalog.register_data_file("t", &new_file).unwrap(),
         RegisterOutcome::AlreadyRegistered
     );
 
@@ -405,12 +399,10 @@ fn register_data_file_is_idempotent_per_path() {
 #[test]
 fn register_data_file_without_table_returns_false() {
     let dir = TempDir::new().unwrap();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let new_file = write_ids(dir.path(), "later.parquet", &[1]);
     assert_eq!(
-        catalog
-            .register_data_file(&dispatcher(), "missing", &new_file)
-            .unwrap(),
+        catalog.register_data_file("missing", &new_file).unwrap(),
         RegisterOutcome::NoSuchTable
     );
 }
@@ -419,15 +411,13 @@ fn register_data_file_without_table_returns_false() {
 #[test]
 fn register_data_file_refuses_foreign_directory() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let elsewhere = TempDir::new().unwrap();
     let foreign = write_ids(elsewhere.path(), "foreign.parquet", &[1]);
     assert_eq!(
-        catalog
-            .register_data_file(&dispatcher(), "t", &foreign)
-            .unwrap(),
+        catalog.register_data_file("t", &foreign).unwrap(),
         RegisterOutcome::LocationMismatch
     );
     assert_eq!(
@@ -446,13 +436,11 @@ fn register_data_file_refuses_foreign_directory() {
 #[test]
 fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let extra = write_ids(dir.path(), "extra.parquet", &[40]);
     assert_eq!(
-        catalog
-            .register_data_file(&dispatcher(), "t", &extra)
-            .unwrap(),
+        catalog.register_data_file("t", &extra).unwrap(),
         RegisterOutcome::Registered
     );
     assert_eq!(
@@ -466,16 +454,108 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     );
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
-    let removed = vec![dir.path().join("data.parquet"), extra];
-    assert!(
-        catalog
-            .replace_data_files(&dispatcher(), "t", &removed, &[merged])
-            .unwrap()
-    );
+    let merged_size = std::fs::metadata(&merged).unwrap().len();
+    let removed = vec!["data.parquet".to_string(), "extra.parquet".to_string()];
+    let added = vec![goose::LoggedFile {
+        name: "merged.parquet".to_string(),
+        size: merged_size,
+    }];
+    assert!(catalog.replace_data_files("t", &removed, &added).unwrap());
 
     let table = catalog.parquet_table("t").unwrap();
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].num_rows, 4);
     assert_eq!(groups[0].global_row_group_idx, 0);
+}
+
+/// A second catalog over the same persisted root sees another instance's
+/// registration at its next bind: `Catalog::table` reloads from the table log,
+/// so cross-process commits surface without any re-`CREATE`.
+#[test]
+fn other_catalog_instance_sees_registration_at_next_bind() {
+    let (data_dir, columns) = three_row_table();
+    let db = TempDir::new().unwrap();
+    let writer =
+        Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
+    create_table(&writer, create_request("t", data_dir.path(), columns)).unwrap();
+
+    // The reader opens before the new file exists, at log version 1.
+    let reader = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    assert_eq!(
+        reader
+            .parquet_table("t")
+            .unwrap()
+            .parquet
+            .row_groups()
+            .len(),
+        3
+    );
+
+    let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
+    assert_eq!(
+        writer.register_data_file("t", &new_file).unwrap(),
+        RegisterOutcome::Registered
+    );
+
+    // Binding through the trait (what a query does) reloads to version 2.
+    assert!(PlannerCatalog::table(&reader, "t").is_some());
+    let table = reader.parquet_table("t").unwrap();
+    assert_eq!(
+        table
+            .parquet
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows)
+            .sum::<i64>(),
+        5
+    );
+}
+
+/// Restart reads the table log, not the directory: files registered after the
+/// `CREATE` survive a reopen.
+#[test]
+fn reopened_database_restores_registered_files_from_log() {
+    let (data_dir, columns) = three_row_table();
+    let db = TempDir::new().unwrap();
+    {
+        let catalog =
+            Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
+        create_table(&catalog, create_request("t", data_dir.path(), columns)).unwrap();
+        let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
+        catalog.register_data_file("t", &new_file).unwrap();
+    }
+    let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let table = reopened.parquet_table("t").unwrap();
+    assert_eq!(table.parquet.row_groups().len(), 4);
+}
+
+/// Only log-committed files exist: after a compaction swap, a leftover input
+/// (e.g. a crash before the unlink) is invisible to a reopen — no double-read.
+#[test]
+fn unlogged_leftover_file_is_invisible_after_swap() {
+    let (data_dir, columns) = three_row_table();
+    let db = TempDir::new().unwrap();
+    let catalog =
+        Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
+    create_table(&catalog, create_request("t", data_dir.path(), columns)).unwrap();
+
+    // "Compact" data.parquet into merged.parquet but crash before deleting the
+    // input: both files are on disk, only merged is in the log.
+    let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
+    let added = vec![goose::LoggedFile {
+        name: "merged.parquet".to_string(),
+        size: std::fs::metadata(&merged).unwrap().len(),
+    }];
+    assert!(
+        catalog
+            .replace_data_files("t", &["data.parquet".to_string()], &added)
+            .unwrap()
+    );
+
+    let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let table = reopened.parquet_table("t").unwrap();
+    let groups = table.parquet.row_groups();
+    assert_eq!(groups.len(), 1, "only the logged merged file is read");
+    assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);
 }

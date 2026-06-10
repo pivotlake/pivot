@@ -54,7 +54,7 @@ pub fn server_port() -> u16 {
 
         thread::spawn(move || {
             let dispatch = Dispatch::spin_up(workers, 32);
-            let catalog = Arc::new(ParquetCatalog::new());
+            let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

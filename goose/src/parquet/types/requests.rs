@@ -1,4 +1,4 @@
-use crate::parquet::types::metadata::{ColumnChunkMeta, FileSource, QueryRowGroupMetadata};
+use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use bytes::Bytes;
 use dispatch::io::{FileLocation, FsRequest, HttpRequest};
@@ -33,8 +33,8 @@ impl ColumnRequest {
         for lookup in &parts {
             for block in lookup.missing() {
                 match location {
-                    FileLocation::Local(fd) => fs_requests.push(FsRequest {
-                        fd: *fd,
+                    FileLocation::Local(file) => fs_requests.push(FsRequest {
+                        file: file.clone(),
                         block: block.clone(),
                     }),
                     FileLocation::Remote(remote) => http_requests.push(HttpRequest {
@@ -75,7 +75,7 @@ pub struct RowGroupRequest {
 impl RowGroupRequest {
     /// Build a request for all projected columns in the given row group.
     pub fn from(metadata_handle: QueryRowGroupMetadata, projection: &Projection) -> Self {
-        let location = metadata_handle.get_metadata().source.location();
+        let location = metadata_handle.get_metadata().location.clone();
         let columns = metadata_handle.columns();
 
         let mut pending_fs = vec![];
@@ -106,7 +106,10 @@ impl RowGroupRequest {
     /// disk). The fetcher uses this to charge the read against its disk or HTTP
     /// in-flight pool.
     pub fn is_remote(&self) -> bool {
-        matches!(self.metadata.get_metadata().source, FileSource::Remote(_))
+        matches!(
+            self.metadata.get_metadata().location,
+            FileLocation::Remote(_)
+        )
     }
 
     /// Record that one queued read has landed (and been committed to its slot).
