@@ -165,8 +165,13 @@ impl Planner {
     pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
         let duckdb_plan = self.planner_context.plan(query)?;
         let mut root = PlanNode::try_from(duckdb_plan)?;
+        // Re-fuse `Limit → OrderBy` (a window too large for DuckDB's Top-N
+        // optimizer) into a TopN, before the top-k annotation so fused nodes
+        // benefit from it too.
+        root.fuse_limit_order_by();
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
+        root.annotate_group_limit();
         Ok(Plan {
             catalog: self.catalog.clone(),
             root,

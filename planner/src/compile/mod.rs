@@ -70,6 +70,12 @@ pub enum Error {
     UnsupportedExpressionForContainsHaystack(Expression),
     #[error("Failed to downcast scalar into string: {0:?}")]
     FailedToDowncastScalarIntoString(Scalar<ArrayRef>),
+    #[error("Invalid regexp_replace pattern '{pattern}': {source}")]
+    InvalidRegexPattern {
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
     #[error("CREATE TABLE does not support OR REPLACE yet")]
     UnsupportedCreateTableOrReplace,
     #[error("CREATE TEMPORARY TABLE is not supported yet")]
@@ -108,6 +114,19 @@ impl PlanNode {
         catalog: &Arc<dyn Catalog>,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        // Peephole: an unfiltered global MIN/MAX over plain columns is fully
+        // determined by table metadata (e.g. parquet row-group statistics).
+        // It must run before the child scan is compiled — succeeding means no
+        // scan happens at all.
+        if let crate::Operator::Aggregate(agg) = &self.operator
+            && let [child] = self.inputs.as_slice()
+            && let crate::Operator::Input(scan) = &child.operator
+            && child.inputs.is_empty()
+            && let Some(spec) = agg.try_compile_from_stats(scan, dispatcher)?
+        {
+            return Ok(spec);
+        }
+
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             inputs.push(input.compile(dispatcher, catalog, slots)?);
@@ -120,6 +139,7 @@ impl PlanNode {
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
+            crate::Operator::Limit(o) => o.compile(inputs.remove(0)),
             crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {

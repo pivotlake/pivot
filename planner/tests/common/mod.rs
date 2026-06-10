@@ -151,7 +151,7 @@ fn int_col(values: Vec<i32>) -> ArrayRef {
     Arc::new(Int32Array::from(values))
 }
 
-fn str_col(values: Vec<&'static str>) -> ArrayRef {
+pub fn str_col(values: Vec<&'static str>) -> ArrayRef {
     Arc::new(StringViewArray::from(values))
 }
 

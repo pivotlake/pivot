@@ -118,6 +118,102 @@ fn nested_arithmetic(mut planner: PlannerContext) {
     ");
 }
 
+// ---- IN / conjunction expressions ----
+
+/// A small `IN` list is rewritten by DuckDB's optimizer into an `OR` of
+/// equalities, which deserializes as `Expression::Conjunction`.
+#[rstest]
+fn in_list_lowers_to_or_conjunction(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT id FROM users WHERE score IN (1, 3, 5)")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(#0:INTEGER)
+      Projection(#1:INTEGER)
+        Filter((#0:INTEGER = 1:INTEGER -> BOOLEAN OR #0:INTEGER = 3:INTEGER -> BOOLEAN OR #0:INTEGER = 5:INTEGER -> BOOLEAN))
+          Input([#2:INTEGER, #0:INTEGER])
+    ");
+}
+
+/// An explicit `OR`/`AND` mix deserializes as nested `Conjunction`s.
+#[rstest]
+fn explicit_or_and_conjunction(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT id FROM users WHERE score = 1 OR (age = 2 AND active)")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(#0:INTEGER)
+      Projection(#3:INTEGER)
+        Filter((#0:INTEGER = 1:INTEGER -> BOOLEAN OR (#2:BOOLEAN AND #1:INTEGER = 2:INTEGER -> BOOLEAN)))
+          Input([#2:INTEGER, #3:INTEGER, #4:BOOLEAN, #0:INTEGER])
+    ");
+}
+
+// ---- CASE expressions ----
+
+/// `CASE WHEN … THEN … ELSE … END` deserializes as `Expression::Case` and
+/// renders each arm. A two-arm CASE here exercises both checks and the ELSE.
+#[rstest]
+fn case_expression_structure(mut planner: PlannerContext) {
+    let plan = planner
+        .plan(
+            "SELECT CASE WHEN score < 10 THEN 'lo' WHEN score < 20 THEN 'mid' ELSE 'hi' END \
+             FROM users",
+        )
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(CASE WHEN #0:INTEGER < 10:INTEGER -> BOOLEAN THEN lo:VARCHAR WHEN #0:INTEGER < 20:INTEGER -> BOOLEAN THEN mid:VARCHAR ELSE hi:VARCHAR END)
+      Input([#2:INTEGER])
+    ");
+}
+
+// ---- String scalar functions ----
+
+#[rstest]
+fn length_function(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT length(name) FROM users")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @"
+    Projection(length(#0:VARCHAR) -> BIGINT)
+      Input([#1:VARCHAR])
+    ");
+}
+
+#[rstest]
+fn regexp_replace_function(mut planner: PlannerContext) {
+    let plan = planner
+        .plan(r"SELECT regexp_replace(name, '^https?://(?:www\.)?([^/]+)/.*$', '\1') FROM users")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Projection(regexp_replace(#0:VARCHAR, ^https?://(?:www\.)?([^/]+)/.*$:VARCHAR, \1:VARCHAR) -> VARCHAR)
+      Input([#1:VARCHAR])
+    ");
+}
+
+// ---- Operator expressions ----
+
+/// `NOT expr` arrives as a `BoundOperatorExpression` of type `OPERATOR_NOT`
+/// with a single child, serialized by the bridge as `{"input": ...}`.
+#[rstest]
+fn not_operator(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT id FROM users WHERE NOT contains(name, 'x')")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @"
+    Projection(#0:INTEGER)
+      Projection(#1:INTEGER)
+        Filter(NOT(contains(#0:VARCHAR, x:VARCHAR) -> BOOLEAN))
+          Input([#1:VARCHAR, #0:INTEGER])
+    ");
+}
+
 // ---- Aggregate function expressions ----
 
 #[rstest]

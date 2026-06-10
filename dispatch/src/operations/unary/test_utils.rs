@@ -52,6 +52,22 @@ impl CollectSender<RecordBatch> {
             .collect()
     }
 
+    /// All values from column `col` as i16s, preserving order.
+    pub fn i16_column(&self, col: usize) -> Vec<i16> {
+        self.items
+            .iter()
+            .flat_map(|b| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int16Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
     /// All values from column `col` as i64s, preserving order (e.g. aggregate
     /// outputs like `COUNT(*)`, which are `Int64`).
     pub fn i64_column(&self, col: usize) -> Vec<i64> {

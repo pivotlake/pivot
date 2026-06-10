@@ -58,9 +58,9 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     Accumulator, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory,
-    Count, CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
-    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory,
-    UnaryOperator, UnaryOperatorFactory, ValueExtractor,
+    Count, CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor,
+    LimitFactory, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory, ValueExtractor,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -525,6 +525,23 @@ impl RecordBatchOperatorSpec {
         ))
     }
 
+    /// Plain `LIMIT … OFFSET` with no ordering: skip `offset` arbitrary rows,
+    /// then keep the next `limit` (SQL leaves *which* rows unspecified without
+    /// an ORDER BY — only the count is guaranteed). Pass `usize::MAX` as
+    /// `limit` for an `OFFSET`-only modifier.
+    ///
+    /// Workers each keep at most `limit + offset` rows, then funnel them to a
+    /// single output stage that applies the offset and final truncation (the
+    /// skip must be globally consistent, so it happens at one point).
+    pub fn limit(self, limit: usize, offset: usize) -> Self {
+        let worker_count = self.worker_count();
+        self.unary(LimitFactory::create_for_workers(
+            limit,
+            offset,
+            worker_count,
+        ))
+    }
+
     /// Group by a column and count occurrences per group.
     ///
     /// The type parameter `K` selects the key extractor for the group column
@@ -545,7 +562,7 @@ impl RecordBatchOperatorSpec {
     /// spec.group_by_count::<StringKeyExtractor>(0)
     /// # ;
     /// ```
-    pub fn group_by_count<K: KeyExtractor>(self, group_column: usize) -> Self {
+    pub fn group_by_count<K: KeyExtractor<Config: Default>>(self, group_column: usize) -> Self {
         // `COUNT(*)` is one aggregate slot whose column is unused.
         self.group_by_aggregate::<K, Compiled<(Count,)>>(
             vec![group_column],
@@ -558,11 +575,22 @@ impl RecordBatchOperatorSpec {
     /// distinct key (the key column(s) only, no value column). Backs the dedup
     /// stage of `COUNT(DISTINCT x)`: the per-entry value is zero-sized, so the
     /// hash-table entry is just hash + key.
-    pub fn group_by_distinct<K: KeyExtractor>(self, key_cols: Vec<usize>) -> Self {
-        self.group_by_aggregate::<K, crate::operations::DistinctValueExtractor>(
+    pub fn group_by_distinct<K: KeyExtractor<Config: Default>>(self, key_cols: Vec<usize>) -> Self {
+        self.group_by_distinct_config::<K>(key_cols, K::Config::default())
+    }
+
+    /// [`group_by_distinct`](Self::group_by_distinct) with an explicit key
+    /// extractor configuration (e.g. the row extractor's key schema).
+    pub fn group_by_distinct_config<K: KeyExtractor>(
+        self,
+        key_cols: Vec<usize>,
+        key_config: K::Config,
+    ) -> Self {
+        self.group_by_aggregate_config::<K, crate::operations::DistinctValueExtractor>(
             key_cols,
             Vec::new(),
             None,
+            key_config,
         )
     }
 
@@ -572,13 +600,18 @@ impl RecordBatchOperatorSpec {
     /// those rows yields the total — without materialising the (potentially huge)
     /// key column. Pair with a keys-only extractor (e.g. `HashOnlyIntKeyExtractor`)
     /// for an 8-byte entry.
-    pub fn group_by_distinct_count<K: KeyExtractor>(self, key_cols: Vec<usize>) -> Self {
+    pub fn group_by_distinct_count<K: KeyExtractor<Config: Default>>(
+        self,
+        key_cols: Vec<usize>,
+    ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
         self.unary(
             GroupFactory::<K, crate::operations::DistinctValueExtractor>::create_for_workers(
                 key_cols,
                 Vec::new(),
+                K::Config::default(),
+                None,
                 None,
                 true,
                 worker_count,
@@ -590,18 +623,48 @@ impl RecordBatchOperatorSpec {
     /// GROUP BY one or more key columns computing one or more aggregate value
     /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key
     /// shape, `V` the aggregate shape (e.g. its arity).
-    pub fn group_by_aggregate<K: KeyExtractor, V: ValueExtractor>(
+    pub fn group_by_aggregate<K: KeyExtractor<Config: Default>, V: ValueExtractor>(
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
+    ) -> Self {
+        self.group_by_aggregate_config::<K, V>(key_cols, value_slots, top_k, K::Config::default())
+    }
+
+    /// [`group_by_aggregate`](Self::group_by_aggregate) with an explicit key
+    /// extractor configuration. The row extractor requires its key schema here;
+    /// extractors whose shape is fully typed use the config-free form.
+    pub fn group_by_aggregate_config<K: KeyExtractor, V: ValueExtractor>(
+        self,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        top_k: Option<(usize, usize)>,
+        key_config: K::Config,
+    ) -> Self {
+        self.group_by_aggregate_limited::<K, V>(key_cols, value_slots, top_k, None, key_config)
+    }
+
+    /// [`group_by_aggregate_config`](Self::group_by_aggregate_config) with a
+    /// bare-LIMIT hint: the group stops merging partitions once `output_limit`
+    /// complete groups have been emitted (any groups are a valid answer when
+    /// nothing orders them).
+    pub fn group_by_aggregate_limited<K: KeyExtractor, V: ValueExtractor>(
+        self,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        top_k: Option<(usize, usize)>,
+        output_limit: Option<usize>,
+        key_config: K::Config,
     ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K, V>::create_for_workers(
             key_cols,
             value_slots,
+            key_config,
             top_k,
+            output_limit,
             false,
             worker_count,
             buffers,

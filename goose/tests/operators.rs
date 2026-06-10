@@ -11,6 +11,28 @@ use common::*;
 use dispatch::{Contains, IntKeyExtractor, OrderBy, Projection, StringKeyExtractor};
 use goose::parquet::table_input;
 
+/// A bare `COUNT(*)` scan reads no columns: the empty projection is answered
+/// from row-group metadata alone, and the count must still be the row total.
+#[test]
+fn count_with_empty_projection() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(
+        &dispatch,
+        &[strings_and_ints(
+            &["a", "b", "c", "d", "e"],
+            &[1, 2, 3, 4, 5],
+        )],
+        true,
+    );
+
+    let results = table_input(&dispatch, &table, Projection::columns([]), false)
+        .count()
+        .collect()
+        .unwrap();
+
+    assert_eq!(extract_count(&results), 5);
+}
+
 #[test]
 fn count() {
     let dispatch = dispatch(1);

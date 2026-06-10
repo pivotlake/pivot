@@ -79,6 +79,50 @@ pub struct Function {
     pub return_type: LogicalTypeId,
 }
 
+/// An `input IN (v0, v1, …)` membership test. DuckDB keeps a small constant
+/// list as a `BoundOperatorExpression`; the bridge serializes its first child
+/// as `input` and the remaining children as `values`.
+#[derive(CustomDeserializer, Debug)]
+pub struct InList {
+    pub input: Box<Expression>,
+    pub values: Vec<Expression>,
+}
+
+/// A boolean `AND`/`OR` of two or more child predicates
+/// (`BoundConjunctionExpression`). `conjunction_type` is DuckDB's
+/// `CONJUNCTION_AND` (50) or `CONJUNCTION_OR` (51); the optimizer rewrites a
+/// small `x IN (a, b)` into the `OR` form, so this is how most pushed-down `IN`
+/// membership tests arrive.
+#[derive(CustomDeserializer, Debug)]
+pub struct Conjunction {
+    pub conjunction_type: ExpressionType,
+    pub children: Vec<Expression>,
+}
+
+/// One `WHEN when THEN then` arm of a [`Case`].
+#[derive(CustomDeserializer, Debug)]
+pub struct CaseCheck {
+    pub when: Box<Expression>,
+    pub then: Box<Expression>,
+}
+
+/// A `CASE WHEN … THEN … [WHEN …] ELSE … END` expression
+/// (`BoundCaseExpression`). DuckDB always materializes an `else_expr` —
+/// a `CASE` without an explicit `ELSE` carries a `NULL` constant there.
+#[derive(CustomDeserializer, Debug)]
+pub struct Case {
+    pub checks: Vec<CaseCheck>,
+    pub else_expr: Box<Expression>,
+}
+
+/// Logical negation (`NOT expr`). DuckDB lowers it as a
+/// `BoundOperatorExpression` of type [`ExpressionType::OPERATOR_NOT`] with a
+/// single child.
+#[derive(CustomDeserializer, Debug)]
+pub struct Not {
+    pub input: Box<Expression>,
+}
+
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
 #[derive(CustomDeserializer, Debug)]
 pub enum Expression {
@@ -99,6 +143,15 @@ pub enum Expression {
     AggregateFunc(AggregateFunc),
     #[type_tag(ExpressionType::BOUND_FUNCTION)]
     Function(Function),
+    #[type_tag(ExpressionType::COMPARE_IN)]
+    InList(InList),
+    #[type_tag(ExpressionType::CONJUNCTION_AND)]
+    #[type_tag(ExpressionType::CONJUNCTION_OR)]
+    Conjunction(Conjunction),
+    #[type_tag(ExpressionType::CASE_EXPR)]
+    Case(Case),
+    #[type_tag(ExpressionType::OPERATOR_NOT)]
+    Not(Not),
 }
 
 /// A constant comparison against a single column (e.g. `col <> 42`).
@@ -212,6 +265,29 @@ impl fmt::Display for Expression {
                     type_name(&func.return_type)
                 )
             }
+            Expression::InList(in_list) => {
+                let values: Vec<String> = in_list.values.iter().map(|v| v.to_string()).collect();
+                write!(f, "{} IN ({})", in_list.input, values.join(", "))
+            }
+            Expression::Conjunction(conj) => {
+                let op = if conj.conjunction_type.clone() as u8
+                    == ExpressionType::CONJUNCTION_OR as u8
+                {
+                    "OR"
+                } else {
+                    "AND"
+                };
+                let parts: Vec<String> = conj.children.iter().map(|c| c.to_string()).collect();
+                write!(f, "({})", parts.join(&format!(" {op} ")))
+            }
+            Expression::Case(case) => {
+                write!(f, "CASE")?;
+                for check in &case.checks {
+                    write!(f, " WHEN {} THEN {}", check.when, check.then)?;
+                }
+                write!(f, " ELSE {} END", case.else_expr)
+            }
+            Expression::Not(n) => write!(f, "NOT({})", n.input),
         }
     }
 }

@@ -113,6 +113,13 @@ pub fn table_input_with_filter_and_eq_predicates(
     scan_order: Option<ScanOrder>,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
+    // A scan that reads no columns (`SELECT COUNT(*)`-shaped) is answered
+    // from row-group metadata alone: each group contributes an empty-schema
+    // batch carrying only its row count — no pages are fetched or decoded.
+    if projection.column_indices.is_empty() && !add_row_group_metadata {
+        return count_only_scan(dispatcher, table, filter);
+    }
+
     let n = dispatcher.worker_count();
     let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
     let siblings = Arc::new(AtomicUsize::new(n));
@@ -136,6 +143,36 @@ pub fn table_input_with_filter_and_eq_predicates(
         add_row_group_metadata,
         eq_predicates,
     )
+}
+
+/// A columnless scan: stream the table's row groups and emit, per group, one
+/// empty-schema `RecordBatch` whose row count comes straight from the group's
+/// metadata. Pure metadata — no I/O — so a bare `COUNT(*)` costs nothing. A
+/// dynamic [`RowGroupFilter`] is still consulted per group (a pruned group
+/// contributes zero rows), keeping the contract of the regular scan.
+fn count_only_scan(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    filter: Option<RowGroupFilter>,
+) -> RecordBatchOperatorSpec {
+    use arrow_array::RecordBatchOptions;
+    use arrow_schema::Schema;
+
+    let groups: Vec<_> = table.row_groups().to_vec();
+    dispatch::values_input(dispatcher, groups)
+        .map_each(move |rg| {
+            let rows = match &filter {
+                Some(keep) if !keep(rg.as_ref()) => 0,
+                _ => rg.num_rows as usize,
+            };
+            RecordBatch::try_new_with_options(
+                Arc::new(Schema::empty()),
+                Vec::new(),
+                &RecordBatchOptions::new().with_row_count(Some(rows)),
+            )
+            .expect("an empty-schema batch with an explicit row count is always valid")
+        })
+        .record_batches()
 }
 
 /// Late materialization: take an existing `RecordBatch` spec (whose rows carry

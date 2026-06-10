@@ -100,6 +100,21 @@ pub struct TopN {
     pub produces_dynamic_filter: Option<DynamicFilter>,
 }
 
+/// Plain `LIMIT n [OFFSET m]` with no ordering attached.
+///
+/// DuckDB lowers `ORDER BY … LIMIT` into [`TopN`] when its Top-N optimizer
+/// fires; a `LogicalLimit` survives to the optimized plan only when there is
+/// no ORDER BY beneath it (any rows are valid output) or when the limit+offset
+/// window is large enough that DuckDB prefers a full sort + limit over Top-N.
+/// `limit` is `None` for a bare `OFFSET m` (unbounded); only constant
+/// limits/offsets reach here — percentage and expression forms are rejected by
+/// the bridge.
+#[derive(CustomDeserializer, Debug)]
+pub struct Limit {
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
 /// A single column definition inside a CREATE TABLE statement.
 #[derive(CustomDeserializer, Debug)]
 pub struct CreateTableColumn {
@@ -185,6 +200,8 @@ pub enum Operator {
     Filter(Filter),
     #[type_tag(LogicalOperatorType::LOGICAL_TOP_N)]
     TopN(TopN),
+    #[type_tag(LogicalOperatorType::LOGICAL_LIMIT)]
+    Limit(Limit),
     #[type_tag(LogicalOperatorType::LOGICAL_CREATE_TABLE)]
     CreateTable(CreateTable),
     #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
@@ -203,7 +220,7 @@ pub enum Operator {
 impl Operator {
     /// Returns the expressions that define this operator's output columns, or
     /// `None` for pass-through operators where the output schema is
-    /// inherited from the child (Filter, OrderBy, TopN).
+    /// inherited from the child (Filter, OrderBy, TopN, Limit).
     pub fn get_output_expressions(&self) -> Option<Vec<&Expression>> {
         match self {
             Operator::Projection(p) => Some(p.projections.iter().collect()),
@@ -212,6 +229,7 @@ impl Operator {
             Operator::Filter(_)
             | Operator::OrderBy(_)
             | Operator::TopN(_)
+            | Operator::Limit(_)
             | Operator::CreateTable(_)
             | Operator::DummyScan(_)
             | Operator::Materialize(_)
@@ -287,6 +305,10 @@ impl fmt::Display for Operator {
                     orders.join(", ")
                 )
             }
+            Operator::Limit(l) => match l.limit {
+                Some(limit) => write!(f, "Limit(limit: {}, offset: {})", limit, l.offset),
+                None => write!(f, "Limit(limit: unbounded, offset: {})", l.offset),
+            },
             Operator::CreateTable(c) => {
                 let columns: Vec<String> = c
                     .columns
