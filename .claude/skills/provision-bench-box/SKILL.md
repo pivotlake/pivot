@@ -19,7 +19,7 @@ Always launch from one of the ready AMIs below — they carry the slow parts (to
 
 | Target instances | Arch | AMI | Name | Notes |
 |---|---|---|---|---|
-| c8g.*, c7g.*, x8g.* | arm64 | `ami-06c63fa89d232c7bd` | `clickbench-c8g-ready-20260607` | Fully provisioned (rust, duckdb, `~/pivotdb`, `~/hits`). 500 GB gp2 root. **Known-good.** |
+| c8g.*, c7g.*, x8g.* | arm64 | `ami-0345cd0f5eda1ac2e` | `clickbench-c8g-ready-20260610` | Fully provisioned (rust, duckdb, `~/pivotdb`, `~/hits`, `~/hits_sampled` = 7 random partitions for fast pgo-gen). 500 GB gp2 root. Warm split PGO target dirs (`target-pgogen`/`target-pgouse`, see pgo.just) + saved profiles in `~/profiles` (copy one to `/tmp/benchmarks-pgo/merged.profdata` after boot — `/tmp` is wiped) and experiment binaries in `~/binaries`. Predecessor: `ami-06c63fa89d232c7bd` (20260607). |
 | c6a.*, c7a.* | x86_64 | `ami-0f45bd48e0a5c58cf` | `pivotdb-clickbench-base-20260607` | Snapshot of the original clickbench box. 150 GB gp3 root → **override to 500 GB gp2 at launch**; verify `~/hits` + toolchain on first use. |
 
 If a ready AMI is missing or stale for an arch, build one (see **Refresh the ready AMI**).
