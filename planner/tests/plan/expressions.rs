@@ -118,3 +118,28 @@ fn function_contains(mut testing_planner: TestingPlanner) {
         Input([#3:Utf8])
     ");
 }
+
+/// `Function::Minute` — `extract(minute FROM ts)` lowers to the `minute`
+/// scalar function over a `Timestamp` column, here a computed GROUP BY key.
+#[rstest]
+fn function_minute(mut testing_planner: TestingPlanner) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use std::sync::Arc;
+    testing_planner.add_table(
+        "events",
+        &[(
+            "EventTime",
+            planner::types::Type::Timestamp,
+            Arc::new(Int64Array::from(vec![0i64, 90, 150])) as ArrayRef,
+        )],
+    );
+    let plan = testing_planner
+        .planner
+        .plan("SELECT extract(minute FROM EventTime) AS m, COUNT(*) FROM events GROUP BY m")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int64, #1:Int64)
+      Aggregate(groups: [minute(#0:Timestamp)], exprs: [count_star()])
+        Input([#0:Timestamp])
+    ");
+}

@@ -5,7 +5,7 @@
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::expression::{
-    Between, Compare, CompareType, Contains, DateTrunc, Divide, Expression, Function, Ref,
+    Between, Compare, CompareType, Contains, DatePart, DateTrunc, Divide, Expression, Function, Ref,
 };
 use crate::types::Type;
 use arrow::compute::kernels::boolean::and;
@@ -206,12 +206,132 @@ impl DateTrunc {
     }
 }
 
+/// Seconds in a day / hour, for the time-of-day parts.
+const SECS_PER_DAY: i64 = 86_400;
+const SECS_PER_HOUR: i64 = 3_600;
+
+/// Convert a day count relative to the Unix epoch (1970-01-01) into a
+/// `(year, month, day)` civil date. Howard Hinnant's `civil_from_days`
+/// (<http://howardhinnant.github.io/date_algorithms.html>); valid for the full
+/// proleptic Gregorian range, including negative (pre-epoch) day counts.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (y + i64::from(m <= 2), m, d)
+}
+
+/// Inverse of [`civil_from_days`]: the epoch-relative day count for a civil
+/// date. Used to derive day-of-year and ISO week.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Number of ISO 8601 weeks (52 or 53) in the given year. A year has 53 weeks
+/// iff it starts on a Thursday, or it is a leap year starting on a Wednesday.
+fn iso_weeks_in_year(y: i64) -> i64 {
+    let p = |y: i64| (y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)).rem_euclid(7);
+    if p(y) == 4 || p(y - 1) == 3 { 53 } else { 52 }
+}
+
+/// ISO 8601 week-of-year (1–53) for an epoch-relative day count. Week 1 is the
+/// week containing the year's first Thursday; days before it belong to the
+/// prior year's last week, and the year's tail can roll into week 1.
+fn iso_week(days: i64) -> i64 {
+    let (y, ..) = civil_from_days(days);
+    let ordinal = days - days_from_civil(y, 1, 1) + 1;
+    let iso_dow = (days + 3).rem_euclid(7) + 1;
+    let week = (ordinal - iso_dow + 10).div_euclid(7);
+    if week < 1 {
+        iso_weeks_in_year(y - 1)
+    } else if week > iso_weeks_in_year(y) {
+        1
+    } else {
+        week
+    }
+}
+
+impl DatePart {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // EventTime is stored as Int64 epoch *seconds* (UTC), so every part is a
+        // pure integer computation. Euclidean div/rem keep the time-of-day and
+        // calendar fields well-defined for pre-epoch (negative) timestamps,
+        // matching DuckDB's `extract(<part> FROM ...)`.
+        let kind = self.kind;
+        let source_builder = self.source.compile()?;
+        Ok(Box::new(move || {
+            let mut source_expr = source_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let src = source_expr(batch);
+                let (arr, _) = src.as_datum().get();
+                let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
+                let vals = i64arr.as_primitive::<Int64Type>();
+                // Dispatch on the part ONCE per batch, then run a single
+                // monomorphic, branch-free row loop per arm — so e.g. `minute`
+                // compiles to exactly its two-op loop with no per-row `kind`
+                // test (no reliance on the optimizer hoisting a loop-invariant
+                // branch). The civil-date parts share `civil_from_days`.
+                use crate::expression::DatePartKind::*;
+                macro_rules! map_part {
+                    ($f:expr) => {{
+                        let out: Int64Array = vals.iter().map(|v| v.map($f)).collect();
+                        out
+                    }};
+                }
+                let day = |t: i64| t.div_euclid(SECS_PER_DAY);
+                let out = match kind {
+                    Epoch => map_part!(|t: i64| t),
+                    Second => map_part!(|t: i64| t.rem_euclid(60)),
+                    Millisecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000),
+                    Microsecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000_000),
+                    Minute => map_part!(|t: i64| t.div_euclid(60).rem_euclid(60)),
+                    Hour => map_part!(|t: i64| t.div_euclid(SECS_PER_HOUR).rem_euclid(24)),
+                    // 0 = Sunday … 6 = Saturday. The epoch day (1970-01-01) was a
+                    // Thursday (4), so `(days + 4) mod 7` rebases to Sunday = 0.
+                    DayOfWeek => map_part!(|t: i64| (day(t) + 4).rem_euclid(7)),
+                    // 1 = Monday … 7 = Sunday.
+                    IsoDayOfWeek => map_part!(|t: i64| (day(t) + 3).rem_euclid(7) + 1),
+                    Day => map_part!(|t: i64| civil_from_days(day(t)).2),
+                    Month => map_part!(|t: i64| civil_from_days(day(t)).1),
+                    Quarter => map_part!(|t: i64| (civil_from_days(day(t)).1 - 1) / 3 + 1),
+                    Year => map_part!(|t: i64| civil_from_days(day(t)).0),
+                    Decade => map_part!(|t: i64| civil_from_days(day(t)).0.div_euclid(10)),
+                    Century => {
+                        map_part!(|t: i64| (civil_from_days(day(t)).0 - 1).div_euclid(100) + 1)
+                    }
+                    Millennium => {
+                        map_part!(|t: i64| (civil_from_days(day(t)).0 - 1).div_euclid(1000) + 1)
+                    }
+                    DayOfYear => map_part!(|t: i64| {
+                        let d = day(t);
+                        d - days_from_civil(civil_from_days(d).0, 1, 1) + 1
+                    }),
+                    Week => map_part!(|t: i64| iso_week(day(t))),
+                };
+                ExprResult::Array(Arc::new(out) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Function {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
             Function::Contains(c) => c.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
+            Function::DatePart(d) => d.compile(),
             // `drop_cache()` evicts pivot's file cache as a side effect, then
             // returns the regions dropped. Evaluated over the single `DummyScan`
             // row on a worker thread (where `memory_ctx` is valid), so the
