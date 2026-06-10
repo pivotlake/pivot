@@ -375,11 +375,14 @@ fn translate_replacement(replacement: &str) -> String {
     out
 }
 
-/// Memoised results cap for [`RegexpReplace`]: stop inserting past this many
-/// entries or this many memoised bytes (lookups continue) so a high-cardinality
-/// column can't grow the memo unboundedly.
-const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 20;
-const REGEX_MEMO_MAX_BYTES: usize = 256 << 20;
+/// Memoised results cap for [`RegexpReplace`], per worker: stop inserting past
+/// this many entries or this many memoised string bytes (lookups continue), so
+/// a high-cardinality column can't grow the memo unboundedly. Sized small —
+/// value distributions are Zipfian, so the first tens of thousands of entries
+/// carry most of the hit rate, while the map itself (entries plus boxed
+/// strings) costs a few times the raw bytes.
+const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 16;
+const REGEX_MEMO_MAX_BYTES: usize = 16 << 20;
 
 impl RegexpReplace {
     pub fn compile(&self) -> Result<ExprFn, Error> {
