@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int32Array, StringViewArray};
+use arrow_array::{ArrayRef, Float64Array, Int32Array, StringViewArray};
 
 use crate::common::*;
 use planner::Error as PlannerError;
@@ -411,6 +411,54 @@ fn length_counts_unicode_chars(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn arithmetic_does_not_truncate_floats(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "mixed",
+        &[
+            (
+                "f",
+                Type::Float64,
+                Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5])) as ArrayRef,
+            ),
+            (
+                "n",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+            ),
+        ],
+    );
+
+    // `f` is a DOUBLE column, `n` an INTEGER column (a float *constant* isn't
+    // supported, so both operands must be columns). DuckDB casts `n` to DOUBLE,
+    // but the bridge unwraps that column cast, so the operands reach the kernel
+    // with mismatched types (Float64 array vs Int32 array) and hit the coercion
+    // branch. Coercing both to Int64 there would truncate `f` (1.5 -> 1) before
+    // adding; the result must keep the fractional input.
+    let results = testing_planner
+        .planner
+        .plan("SELECT f + n FROM mixed")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by(|x, y| {
+        x["col0"]
+            .as_f64()
+            .unwrap()
+            .partial_cmp(&y["col0"].as_f64().unwrap())
+            .unwrap()
+    });
+
+    // f ∈ {1.5, 2.5, 3.5} + n ∈ {10, 20, 30} → {11.5, 22.5, 33.5}; an Int64
+    // coercion would truncate to {11.0, 22.0, 33.0}.
+    let sums: Vec<f64> = rows.iter().map(|r| r["col0"].as_f64().unwrap()).collect();
+    assert_eq!(sums, vec![11.5, 22.5, 33.5]);
+}
+
+#[rstest]
 fn filter_not_contains(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .planner
@@ -494,6 +542,36 @@ fn regexp_replace_first_match_only(mut testing_planner: TestingPlanner) {
     // Without the 'g' option only the first occurrence is replaced.
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["col0"], "baa");
+}
+
+#[rstest]
+fn regexp_replace_escaped_dollar_is_literal(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "rep",
+        &[(
+            "s",
+            Type::Utf8,
+            Arc::new(StringViewArray::from(vec!["price"])) as ArrayRef,
+        )],
+    );
+
+    // `\$` is an escaped literal dollar. The regex crate's replacement dialect
+    // treats a bare `$` as a (here empty, thus deleted) group reference, so it
+    // must be translated to the crate's `$$` escape — otherwise the `$` would
+    // vanish from the output.
+    let results = testing_planner
+        .planner
+        .plan(r"SELECT regexp_replace(s, 'price', '\$') FROM rep")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["col0"], "$");
 }
 
 #[rstest]

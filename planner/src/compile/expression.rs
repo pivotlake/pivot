@@ -56,31 +56,42 @@ fn compare_coerced(left: &dyn Datum, right: &dyn Datum, kernel: CmpKernel) -> Bo
 /// Signature shared by arrow's wrapping arithmetic kernels.
 type ArithKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<ArrayRef, ArrowError>;
 
-/// Run an arithmetic kernel, coercing both operands to Int64 when their data
-/// types differ — same rationale as [`compare_coerced`]: arrow's kernels
-/// require matching types, and Int64 is a safe common type for every integer
-/// column we do arithmetic on (matching DuckDB's 64-bit promotion of mixed
-/// integer operands).
+/// Run an arithmetic kernel, coercing both operands to a common type when
+/// their data types differ — arrow's kernels require matching types (the
+/// kernel falls through to `InvalidArgumentError` on any mismatch). DuckDB
+/// normally pre-casts both operands to one type, so the matching-type branch
+/// (which runs the kernel natively for integers, floats, and decimals alike)
+/// is the common case; the coercion branch only fires when the declared
+/// logical type and the physical parquet array diverge.
+///
+/// The common type must *preserve values*: unconditionally casting to Int64
+/// would silently truncate floating-point and decimal operands (`1.5 -> 1`),
+/// so we promote to Float64 whenever either side is non-integer and only fall
+/// back to Int64 for genuinely integer operands.
 fn arith_coerced(left: &dyn Datum, right: &dyn Datum, kernel: ArithKernel) -> ArrayRef {
     let (la, l_scalar) = left.get();
     let (ra, r_scalar) = right.get();
     if la.data_type() == ra.data_type() {
-        kernel(left, right).unwrap()
-    } else {
-        let lc = arrow::compute::cast(la, &DataType::Int64).unwrap();
-        let rc = arrow::compute::cast(ra, &DataType::Int64).unwrap();
-        let ld: Box<dyn Datum> = if l_scalar {
-            Box::new(Scalar::new(lc))
-        } else {
-            Box::new(lc)
-        };
-        let rd: Box<dyn Datum> = if r_scalar {
-            Box::new(Scalar::new(rc))
-        } else {
-            Box::new(rc)
-        };
-        kernel(ld.as_ref(), rd.as_ref()).unwrap()
+        return kernel(left, right).unwrap();
     }
+    let common = if la.data_type().is_integer() && ra.data_type().is_integer() {
+        DataType::Int64
+    } else {
+        DataType::Float64
+    };
+    let lc = arrow::compute::cast(la, &common).unwrap();
+    let rc = arrow::compute::cast(ra, &common).unwrap();
+    let ld: Box<dyn Datum> = if l_scalar {
+        Box::new(Scalar::new(lc))
+    } else {
+        Box::new(lc)
+    };
+    let rd: Box<dyn Datum> = if r_scalar {
+        Box::new(Scalar::new(rc))
+    } else {
+        Box::new(rc)
+    };
+    kernel(ld.as_ref(), rd.as_ref()).unwrap()
 }
 
 impl Ref {
@@ -253,18 +264,21 @@ impl Length {
                 let strings = arr.as_string_view();
                 // `length()` counts Unicode characters, not bytes (arrow's
                 // own length kernel returns *byte* lengths for Utf8View, so it
-                // can't be used here). ASCII-only values — the common case —
-                // skip the char walk since chars == bytes.
+                // can't be used here).
+                //
+                // In UTF-8 each character is encoded as exactly one leading
+                // byte followed by zero or more continuation bytes, and a
+                // continuation byte is the only kind that starts with the bit
+                // pattern `10xxxxxx`. So the number of characters equals the
+                // number of *non*-continuation bytes. `b & 0xC0` masks off the
+                // low 6 bits, leaving the top two; `!= 0x80` (i.e. `!= 10xxxxxx`)
+                // is true for every leading byte. Counting those is a single
+                // branch-free pass that vectorizes and avoids the per-codepoint
+                // decoding `chars().count()` would do.
                 let lengths: Int64Array = strings
                     .iter()
                     .map(|v| {
-                        v.map(|s| {
-                            if s.is_ascii() {
-                                s.len() as i64
-                            } else {
-                                s.chars().count() as i64
-                            }
-                        })
+                        v.map(|s| s.bytes().filter(|&b| (b & 0xC0) != 0x80).count() as i64)
                     })
                     .collect();
                 ExprResult::Array(Arc::new(lengths) as ArrayRef)
@@ -361,6 +375,10 @@ fn translate_replacement(replacement: &str) -> String {
                     out.push('}');
                 }
                 Some('\\') => out.push('\\'),
+                // An escaped dollar is a literal `$`, which is special in the
+                // regex crate's replacement dialect — emit its `$$` escape so
+                // it isn't mis-read as a (here empty, thus deleted) group ref.
+                Some('$') => out.push_str("$$"),
                 // Any other escape is not meaningful in either dialect; keep
                 // the pair as literal text.
                 Some(other) => {
@@ -375,22 +393,65 @@ fn translate_replacement(replacement: &str) -> String {
     out
 }
 
-/// Memoised results cap for [`RegexpReplace`], per worker: stop inserting past
-/// this many entries or this many memoised string bytes (lookups continue), so
-/// a high-cardinality column can't grow the memo unboundedly. Sized small —
-/// value distributions are Zipfian, so the first tens of thousands of entries
-/// carry most of the hit rate, while the map itself (entries plus boxed
-/// strings) costs a few times the raw bytes.
+/// Memoised results cap for [`MemoizedReplacer`], per worker: stop inserting
+/// past this many entries or this many memoised string bytes (lookups
+/// continue), so a high-cardinality column can't grow the memo unboundedly.
+/// Sized small — value distributions are Zipfian, so the first tens of
+/// thousands of entries carry most of the hit rate, while the map itself
+/// (entries plus boxed strings) costs a few times the raw bytes.
 const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 19;
 const REGEX_MEMO_MAX_BYTES: usize = 48 << 20;
+
+/// Per-worker first-match regex replacement with a bounded result memo.
+///
+/// Replacement is pure and expensive (capture extraction runs a backtracking
+/// engine), while real inputs (URLs, paths) repeat heavily, so each result is
+/// memoised. A memo value of `None` means "no match — the input passes through
+/// unchanged", so unmatched rows don't store their text a second time. The
+/// `regex` lives per worker rather than shared: a cloned `Regex` funnels every
+/// thread through one internal cache pool whose atomics dominate the row loop
+/// under contention, whereas a per-worker instance gets the pool's owner fast
+/// path.
+struct MemoizedReplacer {
+    regex: Regex,
+    replacement: String,
+    memo: std::collections::HashMap<Box<str>, Option<Box<str>>, ahash::RandomState>,
+    memo_bytes: usize,
+}
+
+impl MemoizedReplacer {
+    /// Replace the first match of the pattern in `s` (DuckDB semantics without
+    /// the `'g'` option). Returns `None` when nothing matched — the caller
+    /// appends `s` itself, so the passthrough text is never copied — and
+    /// otherwise the replaced text, borrowed from the memo on the hot path.
+    fn replace(&mut self, s: &str) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        // Probe with `contains_key` first (its borrow ends immediately) so the
+        // mutating insert path below doesn't overlap a live borrow — the
+        // borrow checker can't yet prove a returned `get` borrow is confined
+        // to the hit branch.
+        if self.memo.contains_key(s) {
+            return self.memo.get(s).unwrap().as_deref().map(Cow::Borrowed);
+        }
+        // `replace` returns `Cow::Borrowed` when nothing matched.
+        let entry = match self.regex.replace(s, self.replacement.as_str()) {
+            Cow::Borrowed(_) => None,
+            Cow::Owned(o) => Some(o.into_boxed_str()),
+        };
+        if self.memo.len() < REGEX_MEMO_MAX_ENTRIES && self.memo_bytes < REGEX_MEMO_MAX_BYTES {
+            self.memo_bytes += s.len() + entry.as_deref().map(str::len).unwrap_or(0);
+            self.memo.insert(s.into(), entry);
+            return self.memo.get(s).unwrap().as_deref().map(Cow::Borrowed);
+        }
+        // Past the cap: serve this result without growing the memo.
+        entry.map(|o| Cow::Owned(o.into_string()))
+    }
+}
 
 impl RegexpReplace {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         // Validate the pattern once at plan-compile time; each worker then
-        // compiles its own `Regex` below. A shared (cloned) `Regex` funnels
-        // every thread through one internal cache pool whose atomics dominate
-        // the row loop under contention — per-worker instances give each
-        // thread the pool's owner fast path.
+        // compiles its own `Regex` in the builder below.
         Regex::new(&self.pattern).map_err(|source| Error::InvalidRegexPattern {
             pattern: self.pattern.clone(),
             source,
@@ -400,20 +461,12 @@ impl RegexpReplace {
         let input_builder = self.input.compile()?;
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
-            let regex = Regex::new(&pattern).expect("pattern validated at plan compile");
-            let replacement = replacement.clone();
-            // Regex replacement is pure and expensive (capture extraction runs
-            // a backtracking engine), while real inputs (URLs, paths) repeat
-            // heavily — memoise per worker, with `None` standing for "no
-            // match, pass the input through" so unmatched rows don't store
-            // their text twice. Bounded: past the caps the memo stops growing
-            // but keeps serving hits.
-            let mut memo: std::collections::HashMap<
-                Box<str>,
-                Option<Box<str>>,
-                ahash::RandomState,
-            > = std::collections::HashMap::default();
-            let mut memo_bytes = 0usize;
+            let mut replacer = MemoizedReplacer {
+                regex: Regex::new(&pattern).expect("pattern validated at plan compile"),
+                replacement: replacement.clone(),
+                memo: std::collections::HashMap::default(),
+                memo_bytes: 0,
+            };
             Box::new(move |batch: &RecordBatch| {
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
@@ -434,27 +487,15 @@ impl RegexpReplace {
                         continue;
                     }
                     last_in = Some(s);
-                    if let Some(hit) = memo.get(s) {
-                        out.append_value(hit.as_deref().unwrap_or(s));
-                        last_out = hit.as_deref().map(str::to_owned);
-                        continue;
-                    }
-                    // `replace` substitutes the first match only (DuckDB
-                    // semantics without the 'g' option). It returns
-                    // `Cow::Borrowed` when nothing matches.
-                    let replaced = regex.replace(s, replacement.as_str());
-                    let entry = match &replaced {
-                        std::borrow::Cow::Borrowed(_) => None,
-                        std::borrow::Cow::Owned(o) => Some(o.clone().into_boxed_str()),
-                    };
-                    out.append_value(&replaced);
-                    last_out = match &replaced {
-                        std::borrow::Cow::Borrowed(_) => None,
-                        std::borrow::Cow::Owned(o) => Some(o.clone()),
-                    };
-                    if memo.len() < REGEX_MEMO_MAX_ENTRIES && memo_bytes < REGEX_MEMO_MAX_BYTES {
-                        memo_bytes += s.len() + entry.as_deref().map(str::len).unwrap_or(0);
-                        memo.insert(s.into(), entry);
+                    match replacer.replace(s) {
+                        Some(replaced) => {
+                            out.append_value(&replaced);
+                            last_out = Some(replaced.into_owned());
+                        }
+                        None => {
+                            out.append_value(s);
+                            last_out = None;
+                        }
                     }
                 }
                 ExprResult::Array(Arc::new(out.finish()) as ArrayRef)
