@@ -733,6 +733,19 @@ impl Expression {
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
             Expression::Function(Function::DateTrunc(_)) => Some(Type::Timestamp),
+            // Every extract(<part>) evaluates to an Int64 field value.
+            Expression::Function(Function::DatePart(_)) => Some(Type::Int64),
+            Expression::Function(Function::Length(_)) => Some(Type::Int64),
+            Expression::Function(Function::RegexpReplace(_)) => Some(Type::Utf8),
+            // Same-typed operands keep their type; mixed widths are coerced to
+            // Int64 by the arithmetic kernels.
+            Expression::Function(Function::Arithmetic(a)) => {
+                match (a.left.result_type(), a.right.result_type()) {
+                    (Some(l), Some(r)) if l == r => Some(l),
+                    (Some(_), Some(_)) => Some(Type::Int64),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
