@@ -749,6 +749,154 @@ impl Expression {
             _ => None,
         }
     }
+
+    /// Append every input column index this expression reads to `out`.
+    /// Aggregate functions are not scalar expressions and never appear where
+    /// this is used (group keys / projections); they panic.
+    pub fn referenced_columns(&self, out: &mut Vec<usize>) {
+        match self {
+            Expression::Ref(r) => out.push(r.column_idx),
+            Expression::Constant(_) => {}
+            Expression::Compare(c) => {
+                c.left.referenced_columns(out);
+                c.right.referenced_columns(out);
+            }
+            Expression::Between(b) => {
+                b.input.referenced_columns(out);
+                b.lower.referenced_columns(out);
+                b.upper.referenced_columns(out);
+            }
+            Expression::InList(i) => {
+                i.input.referenced_columns(out);
+                for v in &i.values {
+                    v.referenced_columns(out);
+                }
+            }
+            Expression::Conjunction(c) => {
+                for child in &c.children {
+                    child.referenced_columns(out);
+                }
+            }
+            Expression::Case(c) => {
+                for check in &c.checks {
+                    check.when.referenced_columns(out);
+                    check.then.referenced_columns(out);
+                }
+                c.else_expr.referenced_columns(out);
+            }
+            Expression::Not(n) => n.input.referenced_columns(out),
+            Expression::Function(func) => match func {
+                Function::Contains(c) => {
+                    c.haystack.referenced_columns(out);
+                    c.needle.referenced_columns(out);
+                }
+                Function::Arithmetic(a) => {
+                    a.left.referenced_columns(out);
+                    a.right.referenced_columns(out);
+                }
+                Function::Divide(d) => {
+                    d.left.referenced_columns(out);
+                    d.right.referenced_columns(out);
+                }
+                Function::Length(l) => l.input.referenced_columns(out),
+                Function::RegexpReplace(r) => r.input.referenced_columns(out),
+                Function::DateTrunc(dt) => dt.source.referenced_columns(out),
+                Function::DatePart(dp) => dp.source.referenced_columns(out),
+                Function::DropCache => {}
+            },
+            Expression::AggregateFunc(_) => {
+                unreachable!("aggregate functions are not scalar expressions")
+            }
+        }
+    }
+
+    /// Clone this expression with every column reference rewritten through
+    /// `map` (input column index → new index). Panics on a column the map
+    /// doesn't cover — callers collect [`referenced_columns`] first.
+    ///
+    /// [`referenced_columns`]: Self::referenced_columns
+    pub fn remap_refs(&self, map: &std::collections::HashMap<usize, usize>) -> Expression {
+        let remap = |e: &Expression| Box::new(e.remap_refs(map));
+        match self {
+            Expression::Ref(r) => Expression::Ref(Ref {
+                column_idx: *map
+                    .get(&r.column_idx)
+                    .unwrap_or_else(|| panic!("column {} missing from remap", r.column_idx)),
+                return_type: r.return_type.clone(),
+            }),
+            Expression::Constant(c) => Expression::Constant(c.clone()),
+            Expression::Compare(c) => Expression::Compare(Compare {
+                left: remap(&c.left),
+                right: remap(&c.right),
+                compare_type: c.compare_type,
+                return_type: c.return_type.clone(),
+            }),
+            Expression::Between(b) => Expression::Between(Between {
+                input: remap(&b.input),
+                lower: remap(&b.lower),
+                upper: remap(&b.upper),
+                lower_inclusive: b.lower_inclusive,
+                upper_inclusive: b.upper_inclusive,
+            }),
+            Expression::InList(i) => Expression::InList(InList {
+                input: remap(&i.input),
+                values: i.values.iter().map(|v| v.remap_refs(map)).collect(),
+            }),
+            Expression::Conjunction(c) => Expression::Conjunction(Conjunction {
+                op: c.op,
+                children: c.children.iter().map(|x| x.remap_refs(map)).collect(),
+            }),
+            Expression::Case(c) => Expression::Case(Case {
+                checks: c
+                    .checks
+                    .iter()
+                    .map(|check| CaseCheck {
+                        when: remap(&check.when),
+                        then: remap(&check.then),
+                    })
+                    .collect(),
+                else_expr: remap(&c.else_expr),
+            }),
+            Expression::Not(n) => Expression::Not(Not {
+                input: remap(&n.input),
+            }),
+            Expression::Function(func) => Expression::Function(match func {
+                Function::Contains(c) => Function::Contains(Contains {
+                    haystack: remap(&c.haystack),
+                    needle: remap(&c.needle),
+                }),
+                Function::Arithmetic(a) => Function::Arithmetic(Arithmetic {
+                    op: a.op,
+                    left: remap(&a.left),
+                    right: remap(&a.right),
+                }),
+                Function::Divide(d) => Function::Divide(Divide {
+                    left: remap(&d.left),
+                    right: remap(&d.right),
+                }),
+                Function::Length(l) => Function::Length(Length {
+                    input: remap(&l.input),
+                }),
+                Function::RegexpReplace(r) => Function::RegexpReplace(RegexpReplace {
+                    input: remap(&r.input),
+                    pattern: r.pattern.clone(),
+                    replacement: r.replacement.clone(),
+                }),
+                Function::DateTrunc(dt) => Function::DateTrunc(DateTrunc {
+                    unit: dt.unit.clone(),
+                    source: remap(&dt.source),
+                }),
+                Function::DatePart(dp) => Function::DatePart(DatePart {
+                    kind: dp.kind,
+                    source: remap(&dp.source),
+                }),
+                Function::DropCache => Function::DropCache,
+            }),
+            Expression::AggregateFunc(_) => {
+                unreachable!("aggregate functions are not scalar expressions")
+            }
+        }
+    }
 }
 
 impl Display for ArithmeticOp {

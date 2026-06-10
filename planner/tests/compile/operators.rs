@@ -899,9 +899,9 @@ fn group_by_constant_and_string(mut testing_planner: TestingPlanner) {
         .iter()
         .map(|r| {
             (
-                r["k0"].as_i64().unwrap(),
-                r["k1"].as_str().unwrap().to_string(),
-                r["v0"].as_i64().unwrap(),
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_str().unwrap().to_string(),
+                r["col2"].as_i64().unwrap(),
             )
         })
         .collect();
@@ -934,9 +934,9 @@ fn group_by_derived_int_keys(mut testing_planner: TestingPlanner) {
         .iter()
         .map(|r| {
             (
-                r["k0"].as_i64().unwrap(),
-                r["k1"].as_i64().unwrap(),
-                r["v0"].as_i64().unwrap(),
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_i64().unwrap(),
+                r["col2"].as_i64().unwrap(),
             )
         })
         .collect();
@@ -990,6 +990,78 @@ fn group_by_three_keys_mixed(mut testing_planner: TestingPlanner) {
             (1, 7, "x".to_string(), 2),
             (1, 8, "x".to_string(), 1),
             (2, 7, "x".to_string(), 1),
+        ]
+    );
+}
+
+#[rstest]
+fn derived_group_keys_are_recomputed(mut testing_planner: TestingPlanner) {
+    // `a - 1` and `a + 1` are pure functions of the key `a`: the grouping
+    // must collapse to `a` alone and recompute them per group.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, a - 1, a + 1, COUNT(*) FROM example_table GROUP BY 1, 2, 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, i64, i64, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_i64().unwrap(),
+                r["col2"].as_i64().unwrap(),
+                r["col3"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 0, 2, 1),
+            (2, 1, 3, 1),
+            (3, 2, 4, 1),
+            (4, 3, 5, 1),
+            (5, 4, 6, 1)
+        ]
+    );
+}
+
+#[rstest]
+fn constant_group_key_is_derived(mut testing_planner: TestingPlanner) {
+    // The constant key contributes nothing to grouping; it must be dropped
+    // from the hash key and broadcast back into the output.
+    let results = testing_planner
+        .planner
+        .plan("SELECT 7, name, COUNT(*) FROM example_table GROUP BY 1, 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(i64, String, i64)> = batches_to_json(&results)
+        .iter()
+        .map(|r| {
+            (
+                r["col0"].as_i64().unwrap(),
+                r["col1"].as_str().unwrap().to_string(),
+                r["col2"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (7, "alice".to_string(), 2),
+            (7, "bob".to_string(), 1),
+            (7, "charlie".to_string(), 1),
+            (7, "dave".to_string(), 1),
         ]
     );
 }
