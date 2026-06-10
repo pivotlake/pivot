@@ -5,18 +5,22 @@
 //! in `dispatch` can call.
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult, stateless_expr};
 use crate::expression::{
-    Between, Case, Compare, CompareType, Conjunction, ConjunctionOp, Contains, DatePart, DateTrunc,
-    Divide, Expression, Function, InList, Ref,
+    Arithmetic, ArithmeticOp, Between, Case, Compare, CompareType, Conjunction, ConjunctionOp,
+    Contains, DatePart, DateTrunc, Divide, Expression, Function, InList, Length, Not, Ref,
+    RegexpReplace,
 };
 use crate::types::Type;
-use arrow::compute::kernels::boolean::{and, or};
+use arrow::compute::kernels::boolean::{and, not, or};
+use arrow::compute::kernels::numeric::{add_wrapping, mul_wrapping, sub_wrapping};
 use arrow::compute::kernels::zip::zip;
+use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{ArrayRef, BooleanArray, Datum, Int64Array, RecordBatch, Scalar};
+use arrow_array::{Array, ArrayRef, BooleanArray, Datum, Int64Array, RecordBatch, Scalar};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{ArrowError, DataType};
 use dispatch::Contains as DispatchContains;
+use regex::Regex;
 use std::sync::Arc;
 
 /// Signature shared by arrow's scalar comparison kernels.
@@ -28,6 +32,36 @@ type CmpKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<BooleanArray,
 /// matching types; Int64 is a safe common type for every integer/date/timestamp
 /// column we compare.
 fn compare_coerced(left: &dyn Datum, right: &dyn Datum, kernel: CmpKernel) -> BooleanArray {
+    let (la, l_scalar) = left.get();
+    let (ra, r_scalar) = right.get();
+    if la.data_type() == ra.data_type() {
+        kernel(left, right).unwrap()
+    } else {
+        let lc = arrow::compute::cast(la, &DataType::Int64).unwrap();
+        let rc = arrow::compute::cast(ra, &DataType::Int64).unwrap();
+        let ld: Box<dyn Datum> = if l_scalar {
+            Box::new(Scalar::new(lc))
+        } else {
+            Box::new(lc)
+        };
+        let rd: Box<dyn Datum> = if r_scalar {
+            Box::new(Scalar::new(rc))
+        } else {
+            Box::new(rc)
+        };
+        kernel(ld.as_ref(), rd.as_ref()).unwrap()
+    }
+}
+
+/// Signature shared by arrow's wrapping arithmetic kernels.
+type ArithKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<ArrayRef, ArrowError>;
+
+/// Run an arithmetic kernel, coercing both operands to Int64 when their data
+/// types differ — same rationale as [`compare_coerced`]: arrow's kernels
+/// require matching types, and Int64 is a safe common type for every integer
+/// column we do arithmetic on (matching DuckDB's 64-bit promotion of mixed
+/// integer operands).
+fn arith_coerced(left: &dyn Datum, right: &dyn Datum, kernel: ArithKernel) -> ArrayRef {
     let (la, l_scalar) = left.get();
     let (ra, r_scalar) = right.get();
     if la.data_type() == ra.data_type() {
@@ -185,6 +219,60 @@ impl InList {
     }
 }
 
+impl Arithmetic {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Wrapping kernels match DuckDB's behaviour for in-range values; we
+        // accept silent wraparound (rather than an error) on overflow.
+        let kernel: ArithKernel = match self.op {
+            ArithmeticOp::Add => add_wrapping,
+            ArithmeticOp::Sub => sub_wrapping,
+            ArithmeticOp::Mul => mul_wrapping,
+        };
+        let left_builder = self.left.compile()?;
+        let right_builder = self.right.compile()?;
+        Ok(Box::new(move || {
+            let mut left_expr = left_builder();
+            let mut right_expr = right_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let left = left_expr(batch);
+                let right = right_expr(batch);
+                ExprResult::Array(arith_coerced(left.as_datum(), right.as_datum(), kernel))
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Length {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        let input_builder = self.input.compile()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                let strings = arr.as_string_view();
+                // `length()` counts Unicode characters, not bytes (arrow's
+                // own length kernel returns *byte* lengths for Utf8View, so it
+                // can't be used here). ASCII-only values — the common case —
+                // skip the char walk since chars == bytes.
+                let lengths: Int64Array = strings
+                    .iter()
+                    .map(|v| {
+                        v.map(|s| {
+                            if s.is_ascii() {
+                                s.len() as i64
+                            } else {
+                                s.chars().count() as i64
+                            }
+                        })
+                    })
+                    .collect();
+                ExprResult::Array(Arc::new(lengths) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 impl Conjunction {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         // Compile each child predicate once, then per batch reduce their boolean
@@ -250,6 +338,140 @@ impl Case {
                     result = ExprResult::Array(zipped);
                 }
                 result
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+/// Translate a PostgreSQL-style `regexp_replace` replacement string (`\N`
+/// group references, `\\` literal backslash, `$` literal) into the `regex`
+/// crate's form (`${N}` group references, `$$` literal dollar). Group
+/// references are emitted braced so a digit following the reference is not
+/// absorbed into the group number.
+fn translate_replacement(replacement: &str) -> String {
+    let mut out = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' => out.push_str("$$"),
+            '\\' => match chars.next() {
+                Some(d @ '0'..='9') => {
+                    out.push_str("${");
+                    out.push(d);
+                    out.push('}');
+                }
+                Some('\\') => out.push('\\'),
+                // Any other escape is not meaningful in either dialect; keep
+                // the pair as literal text.
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Memoised results cap for [`RegexpReplace`], per worker: stop inserting past
+/// this many entries or this many memoised string bytes (lookups continue), so
+/// a high-cardinality column can't grow the memo unboundedly. Sized small —
+/// value distributions are Zipfian, so the first tens of thousands of entries
+/// carry most of the hit rate, while the map itself (entries plus boxed
+/// strings) costs a few times the raw bytes.
+const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 19;
+const REGEX_MEMO_MAX_BYTES: usize = 48 << 20;
+
+impl RegexpReplace {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        // Validate the pattern once at plan-compile time; each worker then
+        // compiles its own `Regex` below. A shared (cloned) `Regex` funnels
+        // every thread through one internal cache pool whose atomics dominate
+        // the row loop under contention — per-worker instances give each
+        // thread the pool's owner fast path.
+        Regex::new(&self.pattern).map_err(|source| Error::InvalidRegexPattern {
+            pattern: self.pattern.clone(),
+            source,
+        })?;
+        let pattern = self.pattern.clone();
+        let replacement = translate_replacement(&self.replacement);
+        let input_builder = self.input.compile()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            let regex = Regex::new(&pattern).expect("pattern validated at plan compile");
+            let replacement = replacement.clone();
+            // Regex replacement is pure and expensive (capture extraction runs
+            // a backtracking engine), while real inputs (URLs, paths) repeat
+            // heavily — memoise per worker, with `None` standing for "no
+            // match, pass the input through" so unmatched rows don't store
+            // their text twice. Bounded: past the caps the memo stops growing
+            // but keeps serving hits.
+            let mut memo: std::collections::HashMap<
+                Box<str>,
+                Option<Box<str>>,
+                ahash::RandomState,
+            > = std::collections::HashMap::default();
+            let mut memo_bytes = 0usize;
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                let strings = arr.as_string_view();
+                let mut out = StringViewBuilder::with_capacity(strings.len());
+                // Values arrive in runs (sessions repeat the same URL), so an
+                // equal-to-previous check skips even the memo hash. `None`
+                // output means "no match, pass the input through".
+                let mut last_in: Option<&str> = None;
+                let mut last_out: Option<String> = None;
+                for v in strings.iter() {
+                    let Some(s) = v else {
+                        out.append_null();
+                        continue;
+                    };
+                    if last_in == Some(s) {
+                        out.append_value(last_out.as_deref().unwrap_or(s));
+                        continue;
+                    }
+                    last_in = Some(s);
+                    if let Some(hit) = memo.get(s) {
+                        out.append_value(hit.as_deref().unwrap_or(s));
+                        last_out = hit.as_deref().map(str::to_owned);
+                        continue;
+                    }
+                    // `replace` substitutes the first match only (DuckDB
+                    // semantics without the 'g' option). It returns
+                    // `Cow::Borrowed` when nothing matches.
+                    let replaced = regex.replace(s, replacement.as_str());
+                    let entry = match &replaced {
+                        std::borrow::Cow::Borrowed(_) => None,
+                        std::borrow::Cow::Owned(o) => Some(o.clone().into_boxed_str()),
+                    };
+                    out.append_value(&replaced);
+                    last_out = match &replaced {
+                        std::borrow::Cow::Borrowed(_) => None,
+                        std::borrow::Cow::Owned(o) => Some(o.clone()),
+                    };
+                    if memo.len() < REGEX_MEMO_MAX_ENTRIES && memo_bytes < REGEX_MEMO_MAX_BYTES {
+                        memo_bytes += s.len() + entry.as_deref().map(str::len).unwrap_or(0);
+                        memo.insert(s.into(), entry);
+                    }
+                }
+                ExprResult::Array(Arc::new(out.finish()) as ArrayRef)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+impl Not {
+    pub fn compile(&self) -> Result<ExprFn, Error> {
+        let input_builder = self.input.compile()?;
+        Ok(Box::new(move || {
+            let mut input_expr = input_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                ExprResult::Array(Arc::new(not(arr.as_boolean()).unwrap()) as ArrayRef)
             }) as ExprEvalFn
         }))
     }
@@ -435,6 +657,9 @@ impl Function {
     pub fn compile(&self) -> Result<ExprFn, Error> {
         match self {
             Function::Contains(c) => c.compile(),
+            Function::Arithmetic(a) => a.compile(),
+            Function::Length(l) => l.compile(),
+            Function::RegexpReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
             Function::DatePart(d) => d.compile(),
@@ -467,6 +692,7 @@ impl Expression {
             Expression::InList(i) => i.compile(),
             Expression::Conjunction(c) => c.compile(),
             Expression::Case(c) => c.compile(),
+            Expression::Not(n) => n.compile(),
             _ => Err(Error::UnsupportedExpression(self.clone())),
         }
     }

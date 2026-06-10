@@ -70,6 +70,12 @@ pub enum Error {
     UnsupportedExpressionForContainsHaystack(Expression),
     #[error("Failed to downcast scalar into string: {0:?}")]
     FailedToDowncastScalarIntoString(Scalar<ArrayRef>),
+    #[error("Invalid regexp_replace pattern '{pattern}': {source}")]
+    InvalidRegexPattern {
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
     #[error("CREATE TABLE does not support OR REPLACE yet")]
     UnsupportedCreateTableOrReplace,
     #[error("CREATE TEMPORARY TABLE is not supported yet")]
