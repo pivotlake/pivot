@@ -45,8 +45,8 @@ mod group;
 pub use group::{
     Accumulator, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
     DistinctValueExtractor, GroupFactory, HashOnlyIntKeyExtractor, IntKeyExtractor,
-    IntPairKeyExtractor, KeyExtractor, RowKeyExtractor, RowKeySchema, StringKeyExtractor, Sum,
-    ValueExtractor,
+    IntPairKeyExtractor, KeyExtractor, MixedRowValueExtractor, RowKeyExtractor, RowKeySchema,
+    StringKeyExtractor, Sum, ValueExtractor,
 };
 
 #[cfg(any(test, feature = "test-util"))]

@@ -103,7 +103,7 @@ pub use keys::{
 };
 pub use values::{
     Accumulator, Aggregate, AggregationKind, AggregationRowValueExtractor, AggregationSlot,
-    Compiled, Count, DistinctValueExtractor, Sum, ValueExtractor,
+    Compiled, Count, DistinctValueExtractor, MixedRowValueExtractor, Sum, ValueExtractor,
 };
 
 use crate::memory::SlabAllocator;
@@ -177,7 +177,6 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
     ) -> Self {
         Self {
             key_cols,
-            value_slots,
             outputter: GroupOutputter {
                 shared_arena: shared_arena.clone(),
                 injector,
@@ -186,10 +185,12 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 top_k,
                 count_only,
                 key_config: key_config.clone(),
+                value_slots: value_slots.clone(),
                 output_allocator: None,
             },
             sender,
             key_config,
+            value_slots,
             aggregated_table: AggregatedTable::new(state, shared_arena, radix),
         }
     }
@@ -238,6 +239,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     /// The key extractor's runtime configuration, forwarded to each partition
     /// job so the output columns can be built (e.g. the row extractor's schema).
     key_config: K::Config,
+    /// The query's aggregate slots, forwarded to each partition job for
+    /// kind-aware value combining and output column building.
+    value_slots: Vec<AggregationSlot>,
     /// One allocator per worker for the output columns of every partition this
     /// worker handles, so small per-partition outputs pack into shared buffers
     /// instead of each grabbing a fresh 2MB one. Created lazily on the first job.
@@ -264,6 +268,7 @@ pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
     top_k: Option<(usize, usize)>,
     count_only: bool,
     key_config: K::Config,
+    value_slots: Vec<AggregationSlot>,
 }
 
 unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
@@ -283,6 +288,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
             self.partition_capacity,
             self.num_partitions,
             &self.arena,
+            &self.value_slots,
         );
         if result_map.len() == 0 {
             return Ok(());
@@ -294,6 +300,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
             self.top_k,
             self.count_only,
             &self.key_config,
+            &self.value_slots,
             sender,
         )
     }
@@ -355,6 +362,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                     top_k: self.top_k,
                     count_only: self.count_only,
                     key_config: self.key_config.clone(),
+                    value_slots: self.value_slots.clone(),
                 });
             }
 
@@ -879,6 +887,112 @@ mod tests {
 
         assert_eq!(sender.total_rows(), n);
         assert!(sender.i64_column(2).into_iter().all(|c| c == 2));
+    }
+
+    /// Run a grouped aggregate over the mixed-slot extractor with explicit
+    /// slots (its column shapes depend on the slot kinds).
+    fn run_mixed_group<const N: usize>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_col: usize,
+        value_slots: Vec<AggregationSlot>,
+    ) -> CollectSender {
+        init_test_free_pool(64);
+        let worker_count = worker_batches.len();
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let injector = Arc::new(Injector::new());
+        let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut rx_opt = Some(rx);
+
+        let groups: Vec<_> = (0..worker_count)
+            .map(|_| {
+                Group::<IntExtractor, values::MixedRowValueExtractor<N>>::new(
+                    arena.clone(),
+                    state.clone(),
+                    injector.clone(),
+                    vec![key_col],
+                    value_slots.clone(),
+                    (),
+                    None,
+                    false,
+                    tx.clone(),
+                    rx_opt.take(),
+                    partition_jobs_injected.clone(),
+                    RadixConfig::DEFAULT,
+                )
+            })
+            .collect();
+        drop(tx);
+
+        run_consumers(groups, worker_batches)
+    }
+
+    /// An `Int32` key column plus a `Utf8View` value column for string extremes.
+    fn keyed_string_batch(keys: &[i32], vals: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("s", DataType::Utf8View, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(keys.to_vec())),
+            Arc::new(StringViewArray::from(vals.to_vec())),
+        ];
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    #[test]
+    fn mixed_numeric_min_max_per_group() {
+        // MIN(val), MAX(val), COUNT(*) per key.
+        let batch = keyed_i32_batch(&[1, 2, 1, 2, 1], &[30, 5, 10, 50, 20]);
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::Min, 1),
+            AggregationSlot::new(AggregationKind::Max, 1),
+            AggregationSlot::new(AggregationKind::CountStar, 0),
+        ];
+
+        let sender = run_mixed_group::<3>(vec![vec![batch]], 0, slots);
+
+        let mut rows: Vec<(i32, i64, i64, i64)> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .zip(sender.i64_column(2))
+            .zip(sender.i64_column(3))
+            .map(|(((k, mn), mx), c)| (k, mn, mx, c))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![(1, 10, 30, 3), (2, 5, 50, 2)]);
+    }
+
+    #[test]
+    fn mixed_string_min_across_workers() {
+        // MIN over strings, mixing inline (≤12B) and arena-backed (>12B)
+        // candidates, deduped within workers and combined across them in the
+        // partition merge.
+        let long_low = "aaaa-long-string-over-12-bytes";
+        let long_high = "zzzz-long-string-over-12-bytes";
+        let w1 = keyed_string_batch(&[1, 1, 2], &["mmm", long_low, long_high]);
+        let w2 = keyed_string_batch(&[1, 2, 2], &["zzz", long_high, "bbb"]);
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::MinStr, 1),
+            AggregationSlot::new(AggregationKind::CountStar, 0),
+        ];
+
+        let sender = run_mixed_group::<2>(vec![vec![w1], vec![w2]], 0, slots);
+
+        let mut rows: Vec<(i32, String, i64)> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.i64_column(2))
+            .map(|((k, s), c)| (k, s, c))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, long_low.to_string(), 3), (2, "bbb".to_string(), 3),]
+        );
     }
 
     #[test]

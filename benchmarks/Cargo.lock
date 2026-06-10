@@ -2988,6 +2988,7 @@ dependencies = [
  "arrow-schema 58.0.0",
  "dispatch",
  "duckdb-planner",
+ "regex",
  "thiserror 2.0.18",
 ]
 

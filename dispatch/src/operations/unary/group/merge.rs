@@ -36,6 +36,7 @@ use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
     DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage, ValueExtractor,
 };
+use crate::operations::unary::group::values::AggregationSlot;
 
 /// Collision-to-entry ratio at which we double the target table.
 ///
@@ -87,6 +88,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
+    value_slots: &[AggregationSlot],
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let start = (partition * slot_count) >> partition_bits;
@@ -112,10 +114,11 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
                 // are data-dependent on random hashes and mispredict heavily.
                 let take = (h != 0) & ((h >> partition_shift) as usize == partition);
                 if take {
-                    target.merge::<true, _>(
+                    target.merge_with::<true, _>(
                         h,
                         K::resolve_persisted(arena, *entry.key()),
                         *entry.value(),
+                        |current, v| V::combine(current, v, arena, value_slots),
                     );
                     resize_if_needed::<K, V>(allocator, target);
                 }
@@ -139,6 +142,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
+    value_slots: &[AggregationSlot],
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let end = ((partition + 1) * slot_count) >> partition_bits;
@@ -153,10 +157,11 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
                 break;
             }
             if (h >> partition_shift) as usize == partition {
-                target.merge::<true, _>(
+                target.merge_with::<true, _>(
                     h,
                     K::resolve_persisted(arena, *entry.key()),
                     *entry.value(),
+                    |current, v| V::combine(current, v, arena, value_slots),
                 );
                 resize_if_needed::<K, V>(allocator, target);
             }
@@ -174,6 +179,7 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
     tables: Vec<&Table<K, V, S>>,
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
+    value_slots: &[AggregationSlot],
 ) {
     merge_within_partition_bounds::<K, V, S>(
         allocator,
@@ -183,6 +189,7 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
         &tables,
         target,
         partition_bits,
+        value_slots,
     );
     merge_past_partition_bounds::<K, V, S>(
         allocator,
@@ -192,6 +199,7 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
         &tables,
         target,
         partition_bits,
+        value_slots,
     );
 }
 
@@ -212,6 +220,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
     partition_capacity: usize,
     num_partitions: usize,
     arena: &SharedArena,
+    value_slots: &[AggregationSlot],
 ) -> MultiSlabTable<K, V> {
     let partition_bits = num_partitions.trailing_zeros();
     let mut allocator = SlabAllocator::new(true);
@@ -226,7 +235,9 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
         wb.0[partition].for_each(|(hash, key, value)| {
             grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
             let live = K::resolve_persisted(arena, key);
-            target.merge::<false, _>(hash, live, value);
+            target.merge_with::<false, _>(hash, live, value, |current, v| {
+                V::combine(current, v, arena, value_slots)
+            });
         });
     }
 
@@ -252,6 +263,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
             group,
             &mut target,
             partition_bits,
+            value_slots,
         );
     }
     target
@@ -337,6 +349,7 @@ mod tests {
                 partition_cap,
                 PARTITIONS,
                 arena,
+                &[],
             );
             for entry in result.iter(0) {
                 all_entries.push((*entry.key(), entry.value().0[0] as usize));
@@ -441,6 +454,7 @@ mod tests {
                 partition_cap,
                 PARTITIONS,
                 &arena,
+                &[],
             );
             total += result.iter(0).count();
         }
@@ -540,6 +554,7 @@ mod tests {
                 DEFAULT_CAPACITY,
                 num_partitions,
                 &arena,
+                &[],
             );
             for entry in result.iter(0) {
                 occurrences[*entry.key() as usize] += 1;
