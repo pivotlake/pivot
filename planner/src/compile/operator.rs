@@ -188,6 +188,24 @@ impl Aggregate {
                         Expression::AggregateFunc(AggregateFunc::CountStar(_)) => {
                             Ok(AggregationSlot::new(AggregationKind::CountStar, 0))
                         }
+                        // Global string extremes are not supported (no query
+                        // shape needs them yet); integer/date ones are.
+                        Expression::AggregateFunc(AggregateFunc::Min(a))
+                            if a.column.return_type != Type::Utf8 =>
+                        {
+                            Ok(AggregationSlot::new(
+                                AggregationKind::Min,
+                                a.column.column_idx,
+                            ))
+                        }
+                        Expression::AggregateFunc(AggregateFunc::Max(a))
+                            if a.column.return_type != Type::Utf8 =>
+                        {
+                            Ok(AggregationSlot::new(
+                                AggregationKind::Max,
+                                a.column.column_idx,
+                            ))
+                        }
                         expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -234,6 +252,65 @@ impl Aggregate {
             Type::Utf8 => Ok(input.group_by_count::<StringKeyExtractor>(col)),
             dt => Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
         }
+    }
+
+    /// Answer an unfiltered global `MIN`/`MAX`-only aggregate straight from
+    /// table metadata (e.g. parquet row-group statistics), skipping the scan
+    /// entirely. Applies when the aggregate sits directly on a scan with no
+    /// dynamic predicates, every expression is a `MIN`/`MAX` over a plain
+    /// column, and the table can prove both bounds for each column
+    /// ([`Table::column_min_max`](crate::catalog::Table::column_min_max));
+    /// any miss returns `None` and the ordinary scan-based path runs.
+    pub(crate) fn try_compile_from_stats(
+        &self,
+        scan: &Input,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Result<Option<RecordBatchOperatorSpec>, Error> {
+        use crate::expression::AggregateFunc;
+
+        if !self.groups.is_empty() || self.expressions.is_empty() {
+            return Ok(None);
+        }
+        if !scan.dynamic_filters.is_empty() {
+            return Ok(None);
+        }
+
+        let mut fields = Vec::with_capacity(self.expressions.len());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.expressions.len());
+        for e in &self.expressions {
+            let (agg, is_min) = match e {
+                Expression::AggregateFunc(AggregateFunc::Min(a)) => (a, true),
+                Expression::AggregateFunc(AggregateFunc::Max(a)) => (a, false),
+                _ => return Ok(None),
+            };
+            // The aggregate's ref indexes the scan's output columns; map it
+            // back to the table column the stats are kept under.
+            let table_col = match scan.columns.get(agg.column.column_idx) {
+                Some(Expression::Ref(r)) => r.column_idx,
+                _ => return Ok(None),
+            };
+            let Some((min, max)) = scan.table.column_min_max(table_col) else {
+                return Ok(None);
+            };
+            let scalar = if is_min { min } else { max };
+            // Emit Int64, the same output type as the scan-based global
+            // MIN/MAX (stats carry the column's physical storage type).
+            let arr = scalar.into_inner();
+            let casted = arrow::compute::cast(&arr, &arrow_schema::DataType::Int64)
+                .map_err(|_| Error::UnsupportedAggregateExpression(e.clone()))?;
+            fields.push(Field::new(
+                if is_min { "min" } else { "max" },
+                arrow_schema::DataType::Int64,
+                false,
+            ));
+            columns.push(casted);
+        }
+
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("stat scalars are single-row arrays");
+        Ok(Some(
+            dispatch::values_input(dispatcher, [batch]).record_batches(),
+        ))
     }
 
     /// Compile `COUNT(DISTINCT x)` — the sole aggregate of the node — into a
@@ -527,7 +604,12 @@ impl Aggregate {
         let mut agg_cols: Vec<usize> = Vec::new();
         for e in &self.expressions {
             match e {
-                Expression::AggregateFunc(AggregateFunc::Sum(a) | AggregateFunc::Count(a)) => {
+                Expression::AggregateFunc(
+                    AggregateFunc::Sum(a)
+                    | AggregateFunc::Count(a)
+                    | AggregateFunc::Min(a)
+                    | AggregateFunc::Max(a),
+                ) => {
                     if !agg_cols.contains(&a.column.column_idx) {
                         agg_cols.push(a.column.column_idx);
                     }
@@ -623,6 +705,22 @@ impl Aggregate {
                     AggregationKind::Count,
                     col_of(a.column.column_idx),
                 )),
+                Expression::AggregateFunc(AggregateFunc::Min(a)) => {
+                    let kind = if a.column.return_type == Type::Utf8 {
+                        AggregationKind::MinStr
+                    } else {
+                        AggregationKind::Min
+                    };
+                    Ok(AggregationSlot::new(kind, col_of(a.column.column_idx)))
+                }
+                Expression::AggregateFunc(AggregateFunc::Max(a)) => {
+                    let kind = if a.column.return_type == Type::Utf8 {
+                        AggregationKind::MaxStr
+                    } else {
+                        AggregationKind::Max
+                    };
+                    Ok(AggregationSlot::new(kind, col_of(a.column.column_idx)))
+                }
                 expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
             })
             .collect::<Result<_, _>>()?;
@@ -633,6 +731,18 @@ impl Aggregate {
             self.expressions.as_slice(),
             [Expression::AggregateFunc(AggregateFunc::CountStar(_))]
         );
+
+        // MIN/MAX slots need the mixed-slot extractor (heterogeneous, fold- and
+        // arena-aware); the additive extractors can't represent them.
+        let has_extremes = slots.iter().any(|s| {
+            matches!(
+                s.kind,
+                AggregationKind::Min
+                    | AggregationKind::Max
+                    | AggregationKind::MinStr
+                    | AggregationKind::MaxStr
+            )
+        });
 
         // Per-slot signature (kind + the `SUM` column's type), used to pick a
         // compiled, monomorphised value extractor when the signature matches one
@@ -702,10 +812,50 @@ impl Aggregate {
                 }
             };
         }
+        // The mixed-slot extractor, monomorphised by arity, for a typed key.
+        macro_rules! mixed_by_arity {
+            ($K:ty) => {
+                match slots.len() {
+                    1 => Ok(
+                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<1>>(
+                            key_cols, slots, top_k,
+                        ),
+                    ),
+                    2 => Ok(
+                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<2>>(
+                            key_cols, slots, top_k,
+                        ),
+                    ),
+                    3 => Ok(
+                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<3>>(
+                            key_cols, slots, top_k,
+                        ),
+                    ),
+                    4 => Ok(
+                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<4>>(
+                            key_cols, slots, top_k,
+                        ),
+                    ),
+                    5 => Ok(
+                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<5>>(
+                            key_cols, slots, top_k,
+                        ),
+                    ),
+                    6 => Ok(
+                        input.group_by_aggregate::<$K, dispatch::MixedRowValueExtractor<6>>(
+                            key_cols, slots, top_k,
+                        ),
+                    ),
+                    n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                }
+            };
+        }
         // Full value-extractor selection for a typed key extractor.
         macro_rules! with_key {
             ($K:ty) => {{
-                if lone_count {
+                if has_extremes {
+                    mixed_by_arity!($K)
+                } else if lone_count {
                     Ok(input.group_by_aggregate::<$K, Compiled<(Count,)>>(key_cols, slots, top_k))
                 } else if wide {
                     by_arity!($K, i128)
@@ -778,7 +928,8 @@ impl Aggregate {
         lone_count: bool,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use dispatch::{
-            AggregationRowValueExtractor, Compiled, Count, RowKeyExtractor, RowKeySchema,
+            AggregationKind, AggregationRowValueExtractor, Compiled, Count, MixedRowValueExtractor,
+            RowKeyExtractor, RowKeySchema,
         };
 
         let schema = RowKeySchema::new(
@@ -789,6 +940,35 @@ impl Aggregate {
         );
         let top_k = self.top_k;
         let wide = sum_reads_wide_column(&self.expressions);
+
+        let has_extremes = slots.iter().any(|s| {
+            matches!(
+                s.kind,
+                AggregationKind::Min
+                    | AggregationKind::Max
+                    | AggregationKind::MinStr
+                    | AggregationKind::MaxStr
+            )
+        });
+        if has_extremes {
+            macro_rules! mixed {
+                ($n:literal) => {
+                    Ok(input
+                        .group_by_aggregate_config::<RowKeyExtractor, MixedRowValueExtractor<$n>>(
+                            key_cols, slots, top_k, schema,
+                        ))
+                };
+            }
+            return match slots.len() {
+                1 => mixed!(1),
+                2 => mixed!(2),
+                3 => mixed!(3),
+                4 => mixed!(4),
+                5 => mixed!(5),
+                6 => mixed!(6),
+                n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+            };
+        }
 
         if lone_count {
             return Ok(

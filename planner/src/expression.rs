@@ -181,6 +181,11 @@ pub enum AggregateFunc {
     /// Lowered in compilation to a two-level GROUP BY (dedup on the group keys
     /// plus `col`, then count rows per group); see [`crate::compile`].
     CountDistinct(NumericAggregate),
+    /// `MIN(col)` — over integers, dates (their stored day counts) or strings
+    /// (binary collation, matching DuckDB's default).
+    Min(NumericAggregate),
+    /// `MAX(col)`.
+    Max(NumericAggregate),
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
@@ -200,6 +205,8 @@ impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
             "avg" => Ok(AggregateFunc::Avg(a.try_into()?)),
             "count" if a.distinct => Ok(AggregateFunc::CountDistinct(a.try_into()?)),
             "count" => Ok(AggregateFunc::Count(a.try_into()?)),
+            "min" => Ok(AggregateFunc::Min(a.try_into()?)),
+            "max" => Ok(AggregateFunc::Max(a.try_into()?)),
             _ => Err(Error::UnsupportedAggregateFunction(a.aggregate_function)),
         }
     }
@@ -811,6 +818,12 @@ impl Display for Expression {
             }
             Expression::AggregateFunc(AggregateFunc::CountDistinct(a)) => {
                 write!(f, "count(distinct #{})", a.column.column_idx)
+            }
+            Expression::AggregateFunc(AggregateFunc::Min(a)) => {
+                write!(f, "min(#{})", a.column.column_idx)
+            }
+            Expression::AggregateFunc(AggregateFunc::Max(a)) => {
+                write!(f, "max(#{})", a.column.column_idx)
             }
             Expression::Function(Function::Contains(c)) => {
                 write!(f, "contains({}, {})", c.haystack, c.needle)
