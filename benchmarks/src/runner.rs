@@ -84,6 +84,12 @@ pub fn discover_suite(name: &str, suite_dir: &Path) -> Result<Suite> {
             Some(s) if s != "setup" => s.to_string(),
             _ => continue,
         };
+        // `<query>-duckdb.sql` files are DuckDB-side overrides consumed by
+        // run-duckdb.sh (e.g. inline timestamp conversions the raw-integer
+        // view needs); they aren't pivot queries.
+        if stem.ends_with("-duckdb") {
+            continue;
+        }
         queries.push(Query {
             id: stem.clone(),
             sql_path: path.clone(),

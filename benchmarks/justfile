@@ -1,2 +1,19 @@
 pgo_dir := "/tmp/benchmarks-pgo"
 import '../pgo.just'
+
+# The PGO training set: one representative query per hot code path, including
+# the heavyweight shapes (string group-by, regex/string scalar functions,
+# count-distinct, multi-key grouping, top-n scans). Training on a fast-only
+# subset leaves the slowest queries — exactly the ones with the thinnest
+# margins — running on a profile trained elsewhere.
+pgo_queries := "q00,q02,q04,q05,q06,q07,q12,q13,q14,q16,q18,q19,q20,q21,q24,q27,q28,q29,q32,q33,q35,q36,q40,q41,q42"
+
+# Generate the merged PGO profile from the training set against `source`
+# (instrumented build, ~80x slower per query — expect several minutes for the
+# heavy queries):
+#
+#   just pgo-train ~/hits
+pgo-train source:
+    rm -rf {{pgo_dir}}
+    just pgo-gen run --release -- --source {{source}} \
+        --query {{pgo_queries}} --iterations 1 --skip-check
