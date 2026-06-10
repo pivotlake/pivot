@@ -70,6 +70,35 @@ fn order_by_without_limit_produces_order_by(mut testing_planner: TestingPlanner)
 }
 
 #[rstest]
+fn limit_offset_over_order_by_fuses_into_top_n(mut testing_planner: TestingPlanner) {
+    // limit + offset beyond DuckDB's Top-N threshold: DuckDB plans a full
+    // OrderBy with a separate Limit above it; pivot re-fuses them into TopN.
+    let plan = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2 OFFSET 100000")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    TopN(limit: 2, offset: 100000, order: #0:Int32 DESC)
+      Projection(#0:Int32)
+        Input([#0:Int32])
+    ");
+}
+
+#[rstest]
+fn limit_without_order_by_stays_limit(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a LIMIT 3")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Projection(#0:Int32, #1:Int64)
+      Limit(limit: 3, offset: 0)
+        Aggregate(groups: [#0:Int32], exprs: [count_star()])
+          Input([#0:Int32])
+    ");
+}
+
+#[rstest]
 fn simple_aggregate(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .planner

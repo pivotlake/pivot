@@ -65,6 +65,53 @@ impl fmt::Display for PlanNode {
 }
 
 impl PlanNode {
+    /// Fuse `Limit → OrderBy` into a single [`TopN`](Operator::TopN).
+    ///
+    /// DuckDB only emits `LogicalTopN` when its Top-N optimizer decides the
+    /// window is small enough; a large `LIMIT … OFFSET` over an ORDER BY is
+    /// planned as a full sort with a separate `LogicalLimit` above it. Pivot's
+    /// Top-N operator handles arbitrary windows (workers keep `limit + offset`
+    /// candidates each), so re-fusing recovers the partial-sort path — and the
+    /// `group → TopN` top-k annotation below — instead of a fully materialized
+    /// sort followed by truncation.
+    ///
+    /// Unbounded limits (`OFFSET` without `LIMIT`) are left unfused: `TopN`
+    /// needs a finite window, and the plain `OrderBy → Limit` pipeline is
+    /// correct for them (the sort emits one globally sorted batch, which the
+    /// limit stage merely slices).
+    pub(crate) fn fuse_limit_order_by(&mut self) {
+        for child in &mut self.inputs {
+            child.fuse_limit_order_by();
+        }
+
+        let Operator::Limit(limit) = &self.operator else {
+            return;
+        };
+        let Some(limit_rows) = limit.limit else {
+            return;
+        };
+        if !matches!(
+            self.inputs.first().map(|n| &n.operator),
+            Some(Operator::OrderBy(_))
+        ) {
+            return;
+        }
+
+        let order_by_node = self.inputs.remove(0);
+        let Operator::OrderBy(order_by) = order_by_node.operator else {
+            unreachable!("matched OrderBy above");
+        };
+        self.operator = Operator::TopN(crate::operator::TopN {
+            order_bys: order_by.order_bys,
+            limit: limit_rows,
+            offset: limit.offset,
+            // DuckDB never installs a dynamic-filter producer on a plan it
+            // declined to Top-N-optimize, so there is no slot to wire up.
+            produces_dynamic_filter: None,
+        });
+        self.inputs = order_by_node.inputs;
+    }
+
     /// Detect `grouped Aggregate → (pass-through projections) → TopN(ORDER BY
     /// <agg col> DESC LIMIT k)` and annotate the aggregate with `top_k`, so the
     /// group operator emits only each partition's top-k rows instead of every
@@ -79,7 +126,12 @@ impl PlanNode {
             Operator::TopN(t) if t.order_bys.len() == 1 => {
                 let ob = &t.order_bys[0];
                 match (&ob.direction, &ob.expression) {
-                    (OrderByDirection::Desc, Expression::Ref(r)) => (r.column_idx, t.limit),
+                    // The per-partition window must cover the offset too: the
+                    // global rows `offset..offset+limit` are only guaranteed to
+                    // be among each partition's top `limit + offset`.
+                    (OrderByDirection::Desc, Expression::Ref(r)) => {
+                        (r.column_idx, t.limit + t.offset)
+                    }
                     _ => return,
                 }
             }

@@ -363,6 +363,104 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
     );
 }
 
+#[rstest]
+fn limit_over_group_by_emits_exact_count(mut testing_planner: TestingPlanner) {
+    // No ORDER BY: any 3 of the 5 groups are valid, but exactly 3 must come out.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a LIMIT 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 3);
+    let mut groups: Vec<i64> = rows.iter().map(|r| r["key"].as_i64().unwrap()).collect();
+    groups.sort();
+    groups.dedup();
+    assert_eq!(groups.len(), 3, "limit must emit distinct groups: {rows:?}");
+    for row in &rows {
+        assert!((1..=5).contains(&row["key"].as_i64().unwrap()));
+        assert_eq!(row["v0"].as_i64().unwrap(), 1);
+    }
+}
+
+#[rstest]
+fn limit_with_offset_over_group_by(mut testing_planner: TestingPlanner) {
+    // 5 groups, skip 3, keep min(3, 2) = 2.
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a LIMIT 3 OFFSET 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(batches_to_json(&results).len(), 2);
+}
+
+#[rstest]
+fn limit_exceeding_row_count(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a LIMIT 100")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(batches_to_json(&results).len(), 5);
+}
+
+#[rstest]
+fn order_by_limit_with_offset(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2 OFFSET 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(
+        rows,
+        serde_json::json!([{"a": 4}, {"a": 3}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+// A window beyond DuckDB's Top-N threshold plans as OrderBy + Limit, which
+// pivot re-fuses into a TopN (see the plan tests): exercise that fused path
+// end to end, sorted output included.
+#[rstest]
+fn order_by_huge_limit_with_offset(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 100000 OFFSET 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(
+        rows,
+        serde_json::json!([{"a": 4}, {"a": 3}, {"a": 2}, {"a": 1}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
 // `SELECT *` over a filtered Top-N is exactly the late-materialization shape:
 // DuckDB scans only `a`/`name` for the predicate+sort, then materializes the
 // full row for the survivors. Exercises multi-column materialize + reordering

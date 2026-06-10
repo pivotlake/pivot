@@ -58,9 +58,9 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     Accumulator, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory,
-    Count, CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
-    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory,
-    UnaryOperator, UnaryOperatorFactory, ValueExtractor,
+    Count, CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor,
+    LimitFactory, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory, ValueExtractor,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -522,6 +522,23 @@ impl RecordBatchOperatorSpec {
             offset,
             worker_count,
             dynamic_filter,
+        ))
+    }
+
+    /// Plain `LIMIT … OFFSET` with no ordering: skip `offset` arbitrary rows,
+    /// then keep the next `limit` (SQL leaves *which* rows unspecified without
+    /// an ORDER BY — only the count is guaranteed). Pass `usize::MAX` as
+    /// `limit` for an `OFFSET`-only modifier.
+    ///
+    /// Workers each keep at most `limit + offset` rows, then funnel them to a
+    /// single output stage that applies the offset and final truncation (the
+    /// skip must be globally consistent, so it happens at one point).
+    pub fn limit(self, limit: usize, offset: usize) -> Self {
+        let worker_count = self.worker_count();
+        self.unary(LimitFactory::create_for_workers(
+            limit,
+            offset,
+            worker_count,
         ))
     }
 
