@@ -265,7 +265,6 @@ mod tests {
         let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
             location: dispatch::io::FileLocation::Local(file),
-            file_name: Arc::from("dummy.parquet"),
             schema,
             columns: (0..num_cols)
                 .map(|_| ColumnChunkMeta {
@@ -279,7 +278,6 @@ mod tests {
                 .collect(),
             num_rows,
             file_row_group_idx: 0,
-            global_row_group_idx: 0,
         })]))
     }
 

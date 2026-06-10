@@ -30,22 +30,13 @@ pub(super) struct TableState {
 
 impl TableState {
     /// Build the state for `version` from its files: concatenate every file's
-    /// row groups in log order and assign global indices, yielding the scan
-    /// view. Row groups whose index already matches are shared, not cloned.
+    /// row groups in log order, yielding the scan view. A row group's global
+    /// index is simply its position in this flat list, so the `Arc`s are shared
+    /// as-is — no clone, no renumber.
     pub(super) fn new(version: u64, files: Vec<TableFile>) -> Self {
         let rows = files
             .iter()
-            .flat_map(|f| f.row_groups.iter())
-            .enumerate()
-            .map(|(global_idx, rg)| {
-                if rg.global_row_group_idx == global_idx {
-                    rg.clone()
-                } else {
-                    let mut renumbered = (**rg).clone();
-                    renumbered.global_row_group_idx = global_idx;
-                    Arc::new(renumbered)
-                }
-            })
+            .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
         Self {
             version,

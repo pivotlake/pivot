@@ -67,10 +67,10 @@ fn fetch_factories(
 }
 
 /// The result of one metadata fetch over a list of data files: each input
-/// file's row groups, in input-file order (file-internal order within), with
-/// global indices not yet assigned. Callers that track files individually (the
-/// catalog's versioned table entries) keep this shape;
-/// [`into_table`](Self::into_table) flattens it for everyone else.
+/// file's row groups, in input-file order (file-internal order within).
+/// Callers that track files individually (the catalog's versioned table
+/// entries) keep this shape; [`into_table`](Self::into_table) flattens it for
+/// everyone else.
 pub struct LoadedFiles {
     files: Vec<Vec<RowGroupMetadata>>,
 }
@@ -111,19 +111,10 @@ impl LoadedFiles {
         self.files
     }
 
-    /// Flatten into a [`ParquetTable`], assigning global row-group indices in
-    /// file order.
+    /// Flatten into a [`ParquetTable`] in file order. A row group's global
+    /// index is simply its position in this flat list.
     pub fn into_table(self) -> ParquetTable {
-        let rows = self
-            .files
-            .into_iter()
-            .flatten()
-            .enumerate()
-            .map(|(global_idx, mut rg)| {
-                rg.global_row_group_idx = global_idx;
-                Arc::new(rg)
-            })
-            .collect();
+        let rows = self.files.into_iter().flatten().map(Arc::new).collect();
         ParquetTable::new(rows)
     }
 }

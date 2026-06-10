@@ -66,20 +66,16 @@ pub struct RowGroupMetadata {
     /// The open file holding this row group's bytes (local file or remote
     /// object) — what the fetcher reads from and the file cache keys on.
     pub location: FileLocation,
-    /// The file's name within its table's data location — the identity the
-    /// [table log](crate::table_log) speaks, for local and remote files alike.
-    pub file_name: Arc<str>,
     /// Arrow schema describing the columns in this row group.
     pub schema: SchemaRef,
     /// Per-column-chunk byte layout (offsets and sizes).
     pub columns: Vec<ColumnChunkMeta>,
     /// Total number of rows in this row group.
     pub num_rows: i64,
-    /// Index of this row group within its Parquet file.
+    /// Index of this row group within its Parquet file. Note that this should
+    /// not be conflated with the row group's *global* index, which is simply
+    /// its position in the table's flat `row_groups` list.
     pub file_row_group_idx: usize,
-    /// The global index of the row group within the table's `Vec<RowGroupMetadata>`. Note that this
-    /// should not be conflated with the row group number within a particular parquet file.
-    pub global_row_group_idx: usize,
 }
 
 impl RowGroupMetadata {
@@ -102,7 +98,8 @@ pub struct QueryRowGroupMetadata {
     pub row_group_metadata: Arc<RowGroupMetadata>,
     /// Sorted row indices to read, or `None` to read the full row group.
     pub filtered_indices: Option<Vec<u32>>,
-    /// Global row-group index (same as [`RowGroupMetadata::global_row_group_idx`]).
+    /// The row group's global index — its position in the table's flat
+    /// `row_groups` list, which is how the materializer addresses it back.
     pub row_group_index: usize,
     /// Shared across every page of this row group: the decoder flips it once the
     /// row group is pruned (e.g. a dictionary excludes a pushed-down equality

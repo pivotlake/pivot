@@ -356,12 +356,6 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 4);
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
-    assert!(
-        groups
-            .iter()
-            .enumerate()
-            .all(|(i, rg)| rg.global_row_group_idx == i)
-    );
 }
 
 /// Registering the same path twice (a replayed flush notification) must not
@@ -442,7 +436,6 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].num_rows, 4);
-    assert_eq!(groups[0].global_row_group_idx, 0);
 }
 
 /// A second catalog over the same persisted root sees another instance's

@@ -159,23 +159,22 @@ impl ParquetTable {
 pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 
 /// Parse raw thrift footer bytes into this file's row groups (file-local
-/// indices), tying each to `source` for the column-chunk reads that follow.
+/// indices), tying each to `location` for the column-chunk reads that follow.
 pub(crate) fn row_groups_from_footer(
     footer: &[u8],
     location: dispatch::io::FileLocation,
-    file_name: Arc<str>,
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    build_row_groups(0, file_meta, location, file_name)
+    build_row_groups(file_meta, location)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
-/// remote) open file. Shared by the local and remote readers.
+/// remote) open file. Shared by the local and remote readers. Row groups carry
+/// only their *file-local* index; the global index is the row group's eventual
+/// position in the table's flat list.
 fn build_row_groups(
-    global_row_group_offset: usize,
     file_meta: FileMetaData,
     location: dispatch::io::FileLocation,
-    file_name: Arc<str>,
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
     let schema = Arc::new(schema);
@@ -209,12 +208,10 @@ fn build_row_groups(
                 .collect();
             RowGroupMetadata {
                 location: location.clone(),
-                file_name: file_name.clone(),
                 schema: schema.clone(),
                 columns,
                 num_rows,
                 file_row_group_idx: i,
-                global_row_group_idx: global_row_group_offset + i,
             }
         })
         .collect();

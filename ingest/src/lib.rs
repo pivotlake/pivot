@@ -499,12 +499,6 @@ mod tests {
             5,
             "both flushed files' rows should be registered"
         );
-        assert!(
-            groups
-                .iter()
-                .enumerate()
-                .all(|(i, rg)| rg.global_row_group_idx == i)
-        );
 
         dispatch.exit();
     }
@@ -553,8 +547,13 @@ mod tests {
         let groups = table.parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
-        assert_eq!(groups[0].global_row_group_idx, 0);
-        assert!(groups[0].file_name.contains("compacted"));
+        assert!(
+            catalog
+                .table_files("otel_logs")
+                .unwrap()
+                .iter()
+                .any(|f| f.name.contains("compacted"))
+        );
 
         // The merged file's contents round-trip through the engine's scan.
         let reread = read_table(&dispatch, dir.path());
@@ -714,7 +713,13 @@ mod tests {
         let groups = table.parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
-        assert!(groups[0].file_name.contains("compacted"));
+        assert!(
+            server_catalog
+                .table_files("otel_logs")
+                .unwrap()
+                .iter()
+                .any(|f| f.name.contains("compacted"))
+        );
         assert_eq!(parquet_file_count(data_dir.path()), 1);
 
         dispatch.exit();

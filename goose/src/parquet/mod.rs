@@ -49,12 +49,10 @@ pub(crate) mod test_utils {
     pub fn dummy_row_group() -> Arc<RowGroupMetadata> {
         Arc::new(RowGroupMetadata {
             location: FileLocation::Local(Arc::new(std::fs::File::open("/dev/null").unwrap())),
-            file_name: Arc::from("dummy.parquet"),
             schema: Arc::new(Schema::empty()),
             columns: vec![],
             num_rows: 0,
             file_row_group_idx: 0,
-            global_row_group_idx: 0,
         })
     }
 

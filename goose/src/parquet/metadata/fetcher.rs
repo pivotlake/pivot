@@ -169,7 +169,7 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
         // window with no HEAD/suffix probe — is already carried by the data
         // file (`stat`ed at listing time for a local file, from the store
         // listing for a remote one).
-        let DataFile { name, size, source } = file;
+        let DataFile { size, source, .. } = file;
         let location = match source {
             DataFileSource::Local(path) => {
                 let file = open_direct_read(&path).map_err(crate::parquet::op_err)?;
@@ -181,12 +181,8 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
             }
         };
 
-        let slot = self.alloc_slot(RowGroupMetadataRequest::start(
-            file_idx,
-            location,
-            Arc::from(name),
-            size as usize,
-        ));
+        let slot =
+            self.alloc_slot(RowGroupMetadataRequest::start(file_idx, location, size as usize));
         self.register_routes(slot);
         self.advance(slot, sender)
     }
@@ -255,8 +251,6 @@ struct RowGroupMetadataRequest {
     /// The open file (it keeps the handle alive, and travels into the row
     /// groups as their location).
     location: FileLocation,
-    /// The file's name — the table log identity stamped onto its row groups.
-    file_name: Arc<str>,
     /// Total file size, known when the read starts.
     size: usize,
     /// Cache lookups pinning the region currently being read.
@@ -273,12 +267,11 @@ struct RowGroupMetadataRequest {
 impl RowGroupMetadataRequest {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
-    fn start(file_idx: usize, location: FileLocation, file_name: Arc<str>, size: usize) -> Self {
+    fn start(file_idx: usize, location: FileLocation, size: usize) -> Self {
         memory_ctx().file_cache().open_entry(location.clone());
         let mut request = Self {
             file_idx,
             location,
-            file_name,
             size,
             lookups: Vec::new(),
             pending_fs: Vec::new(),
@@ -371,10 +364,6 @@ impl RowGroupMetadataRequest {
             &bytes[start..bytes.len() - 8]
         };
 
-        Ok(Some(row_groups_from_footer(
-            footer,
-            self.location.clone(),
-            self.file_name.clone(),
-        )?))
+        Ok(Some(row_groups_from_footer(footer, self.location.clone())?))
     }
 }
