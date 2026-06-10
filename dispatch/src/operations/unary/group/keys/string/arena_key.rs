@@ -50,14 +50,23 @@ impl ArenaKey {
         unsafe { std::slice::from_raw_parts(ptr.add(4), self.len() as usize) }
     }
 
+    /// Buffer index of a non-inline key (the arena ring buffer holding its bytes).
     #[inline]
-    fn buffer_index(&self) -> u32 {
+    pub(crate) fn buffer_index(&self) -> u32 {
         (self.0 >> 64) as u32
     }
 
+    /// Byte offset of a non-inline key within its arena buffer.
     #[inline]
-    fn offset(&self) -> u32 {
+    pub(crate) fn offset(&self) -> u32 {
         (self.0 >> 96) as u32
+    }
+
+    /// Reconstruct a key from its raw `u128` bit pattern (the inverse of
+    /// [`Self::as_u128`]).
+    #[inline]
+    pub(crate) fn from_raw(raw: u128) -> Self {
+        Self(raw)
     }
 
     /// Resolve to the underlying bytes.

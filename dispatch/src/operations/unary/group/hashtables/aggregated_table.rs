@@ -190,16 +190,17 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         batch: &RecordBatch,
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
+        config: &K::Config,
     ) {
         let total = batch.num_rows();
         if total <= RECORD_BATCH_SIZE {
-            self.consume_window(batch, key_cols, value_slots);
+            self.consume_window(batch, key_cols, value_slots, config);
             return;
         }
         let mut start = 0;
         while start < total {
             let len = (total - start).min(RECORD_BATCH_SIZE);
-            self.consume_window(&batch.slice(start, len), key_cols, value_slots);
+            self.consume_window(&batch.slice(start, len), key_cols, value_slots, config);
             start += len;
         }
     }
@@ -209,8 +210,9 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         batch: &RecordBatch,
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
+        config: &K::Config,
     ) {
-        let key_reader = K::make_reader(batch, key_cols);
+        let key_reader = K::make_reader(batch, key_cols, config);
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 
@@ -348,12 +350,12 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
 
     /// Scatter rows `[start, end)` into per-partition buffers (post-switch).
     #[inline(always)]
-    fn scatter_range(
+    fn scatter_range<'b>(
         &mut self,
         start: usize,
         end: usize,
-        key_reader: &K::Reader<'_>,
-        value_reader: &V::Reader<'_>,
+        key_reader: &K::Reader<'b>,
+        value_reader: &V::Reader<'b>,
     ) {
         let shift = u64::BITS - self.radix_cfg.partitions.trailing_zeros();
         let Self {
