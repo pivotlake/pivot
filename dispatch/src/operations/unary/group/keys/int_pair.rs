@@ -76,13 +76,18 @@ where
     B::Native: IntBits,
 {
     const SUPPORTS_RADIX: bool = true;
+    type Config = ();
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
     type PersistedLiveKey<'a> = u128;
     type Reader<'b> = PairReader<'b, A, B>;
     type Columns = IntPairKeyColumns<A, B>;
 
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _config: &(),
+    ) -> Self::Reader<'b> {
         let a = batch.column(key_cols[0]).as_primitive::<A>();
         let b = batch.column(key_cols[1]).as_primitive::<B>();
         PairReader { a, b }
@@ -123,8 +128,9 @@ where
     B::Native: IntBits,
 {
     type Key = u128;
+    type Config = ();
 
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, _config: &()) -> Self {
         Self {
             a: PrimitiveBuilder::<A>::with_capacity(allocator, rows),
             b: PrimitiveBuilder::<B>::with_capacity(allocator, rows),
@@ -138,7 +144,11 @@ where
         self.b.push(&B::Native::from_u64(packed as u64), 1);
     }
 
-    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        _arena: &Arc<SharedArena>,
+        _allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![
             Field::new("k0", A::DATA_TYPE, false),
             Field::new("k1", B::DATA_TYPE, false),

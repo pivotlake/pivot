@@ -23,13 +23,18 @@ use std::sync::Arc;
 pub struct StringKeyExtractor;
 
 impl KeyExtractor for StringKeyExtractor {
+    type Config = ();
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;
     type PersistedLiveKey<'a> = ResolvedKey<'a>;
     type Reader<'b> = &'b StringViewArray;
     type Columns = StringKeyColumn;
 
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _config: &(),
+    ) -> Self::Reader<'b> {
         batch
             .column(key_cols[0])
             .as_any()
@@ -68,8 +73,9 @@ pub struct StringKeyColumn {
 
 impl KeyColumns for StringKeyColumn {
     type Key = ArenaKey;
+    type Config = ();
 
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, _config: &()) -> Self {
         // The view headers (one `u128` per group) are built onto a slab, like the
         // primitive output columns; the string bytes they point at already live
         // on the shared arena's ring buffers.
@@ -83,7 +89,11 @@ impl KeyColumns for StringKeyColumn {
         self.views.push(key.as_u128());
     }
 
-    fn finish(self, arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        arena: &Arc<SharedArena>,
+        _allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         let len = self.views.len();
         let views = ScalarBuffer::<u128>::new(self.views.into_buffer(), 0, len);
         let buffers = arena.to_arrow_buffers();
