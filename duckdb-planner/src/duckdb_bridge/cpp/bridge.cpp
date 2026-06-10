@@ -229,6 +229,13 @@ json build_case_expression(duckdb::BoundCaseExpression *case_expr) {
 	};
 }
 
+// `NOT expr` — a BoundOperatorExpression with a single child.
+json build_not_expression(duckdb::BoundOperatorExpression *op) {
+	return {
+		{"input", build_expression(op->children[0].get())},
+	};
+}
+
 json build_expression(duckdb::Expression *expr) {
 	json new_expression;
 	new_expression["type"] = expr->type;
@@ -279,6 +286,10 @@ json build_expression(duckdb::Expression *expr) {
 	}
 	case duckdb::ExpressionType::CASE_EXPR: {
 		new_expression["data"] = build_case_expression(&expr->Cast<duckdb::BoundCaseExpression>());
+		break;
+	}
+	case duckdb::ExpressionType::OPERATOR_NOT: {
+		new_expression["data"] = build_not_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
 		break;
 	}
 	case duckdb::ExpressionType::OPERATOR_CAST: {

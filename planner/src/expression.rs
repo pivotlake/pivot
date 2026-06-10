@@ -229,6 +229,131 @@ impl TryFrom<duckdb_expression::Function> for Contains {
     }
 }
 
+/// The operator of a binary integer [`Arithmetic`] expression.
+#[derive(Debug, Clone, Copy)]
+pub enum ArithmeticOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// Binary integer arithmetic (`lhs + rhs`, `lhs - rhs`, `lhs * rhs`). DuckDB
+/// lowers these as a `BOUND_FUNCTION` whose function name is the operator
+/// symbol itself (`"+"`, `"-"`, `"*"`). Division is separate ([`Divide`])
+/// because SQL `/` yields a non-integer quotient.
+#[derive(Debug, Clone)]
+pub struct Arithmetic {
+    pub op: ArithmeticOp,
+    pub left: Box<Expression>,
+    pub right: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Function> for Arithmetic {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        let op = match f.function.as_str() {
+            "+" => ArithmeticOp::Add,
+            "-" => ArithmeticOp::Sub,
+            "*" => ArithmeticOp::Mul,
+            _ => return Err(Error::UnsupportedScalarFunction(f.function)),
+        };
+        // Unary forms (e.g. `-x`) bind to the same function names with one
+        // parameter; only the binary forms are supported.
+        if f.params.len() != 2 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 2,
+                actual,
+            });
+        }
+        let right = Box::new(Expression::try_from(f.params.remove(1))?);
+        let left = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(Arithmetic { op, left, right })
+    }
+}
+
+/// SQL `length(string)` — the number of Unicode *characters* (not bytes) in
+/// the string, as `BIGINT`. Arrives as a `BOUND_FUNCTION` named `length`.
+#[derive(Debug, Clone)]
+pub struct Length {
+    pub input: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Function> for Length {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        if f.params.len() != 1 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 1,
+                actual,
+            });
+        }
+        let input = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(Length { input })
+    }
+}
+
+/// SQL `regexp_replace(input, pattern, replacement)` — replaces the *first*
+/// match of `pattern` in each row of `input` (DuckDB without the `'g'`
+/// option). The replacement string uses PostgreSQL-style `\N` group
+/// references. `pattern` and `replacement` must be constants so the regex can
+/// be compiled once at plan-compile time.
+#[derive(Debug, Clone)]
+pub struct RegexpReplace {
+    pub input: Box<Expression>,
+    pub pattern: String,
+    pub replacement: String,
+}
+
+impl TryFrom<duckdb_expression::Function> for RegexpReplace {
+    type Error = Error;
+    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
+        // A fourth `options` argument (e.g. 'g' for replace-all) changes the
+        // semantics, so only the three-argument first-match form is accepted.
+        if f.params.len() != 3 {
+            let actual = f.params.len();
+            return Err(Error::InvalidParameterCount {
+                function: f.function,
+                expected: 3,
+                actual,
+            });
+        }
+        let replacement = constant_string(
+            Expression::try_from(f.params.remove(2))?,
+            "regexp_replace: replacement",
+        )?;
+        let pattern = constant_string(
+            Expression::try_from(f.params.remove(1))?,
+            "regexp_replace: pattern",
+        )?;
+        let input = Box::new(Expression::try_from(f.params.remove(0))?);
+        Ok(RegexpReplace {
+            input,
+            pattern,
+            replacement,
+        })
+    }
+}
+
+/// Logical negation (`NOT expr`). DuckDB lowers it as a
+/// `BoundOperatorExpression` of type `OPERATOR_NOT` with a single child.
+#[derive(Debug, Clone)]
+pub struct Not {
+    pub input: Box<Expression>,
+}
+
+impl TryFrom<duckdb_expression::Not> for Not {
+    type Error = Error;
+    fn try_from(n: duckdb_expression::Not) -> Result<Self, Self::Error> {
+        Ok(Not {
+            input: Box::<Expression>::try_from(n.input)?,
+        })
+    }
+}
+
 /// SQL `lhs / rhs`. Used by `AVG`, which DuckDB lowers to `sum(x) / count(x)`.
 #[derive(Debug, Clone)]
 pub struct Divide {
@@ -253,6 +378,27 @@ impl TryFrom<duckdb_expression::Function> for Divide {
     }
 }
 
+/// Extract a constant string argument (e.g. a regex pattern or a `date_trunc`
+/// unit) from a converted expression, erroring with `context` when the
+/// argument is not a string constant.
+fn constant_string(e: Expression, context: &str) -> Result<String, Error> {
+    match e {
+        Expression::Constant(scalar) => {
+            let (arr, _) = scalar.get();
+            Ok(arr
+                .as_string_view_opt()
+                .ok_or_else(|| {
+                    Error::UnsupportedScalarFunction(format!("{context} must be a string"))
+                })?
+                .value(0)
+                .to_string())
+        }
+        _ => Err(Error::UnsupportedScalarFunction(format!(
+            "{context} must be a constant"
+        ))),
+    }
+}
+
 /// SQL `date_trunc(unit, source)` — truncate a timestamp down to `unit`
 /// (e.g. `date_trunc('minute', EventTime)`). DuckDB passes the unit as a string
 /// constant in the first argument and the timestamp expression second.
@@ -274,22 +420,11 @@ impl TryFrom<duckdb_expression::Function> for DateTrunc {
             });
         }
         let source = Box::new(Expression::try_from(f.params.remove(1))?);
-        let unit = match Expression::try_from(f.params.remove(0))? {
-            Expression::Constant(scalar) => {
-                let (arr, _) = scalar.get();
-                arr.as_string_view_opt()
-                    .ok_or_else(|| {
-                        Error::UnsupportedScalarFunction("date_trunc: unit must be a string".into())
-                    })?
-                    .value(0)
-                    .to_ascii_lowercase()
-            }
-            _ => {
-                return Err(Error::UnsupportedScalarFunction(
-                    "date_trunc: unit must be a constant".into(),
-                ));
-            }
-        };
+        let unit = constant_string(
+            Expression::try_from(f.params.remove(0))?,
+            "date_trunc: unit",
+        )?
+        .to_ascii_lowercase();
         Ok(DateTrunc { unit, source })
     }
 }
@@ -423,6 +558,9 @@ impl DatePart {
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
+    Arithmetic(Arithmetic),
+    Length(Length),
+    RegexpReplace(RegexpReplace),
     Divide(Divide),
     DateTrunc(DateTrunc),
     DatePart(DatePart),
@@ -439,6 +577,9 @@ impl TryFrom<duckdb_expression::Function> for Function {
     fn try_from(f: duckdb_expression::Function) -> Result<Self, Self::Error> {
         match f.function.as_str() {
             "contains" => Ok(Function::Contains(f.try_into()?)),
+            "+" | "-" | "*" => Ok(Function::Arithmetic(f.try_into()?)),
+            "length" => Ok(Function::Length(f.try_into()?)),
+            "regexp_replace" => Ok(Function::RegexpReplace(f.try_into()?)),
             "/" => Ok(Function::Divide(f.try_into()?)),
             "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),
             "drop_cache" => {
@@ -567,6 +708,7 @@ pub enum Expression {
     InList(InList),
     Conjunction(Conjunction),
     Case(Case),
+    Not(Not),
 }
 
 impl Expression {
@@ -592,6 +734,16 @@ impl Expression {
             Expression::Case(c) => c.else_expr.result_type(),
             Expression::Function(Function::DateTrunc(_)) => Some(Type::Timestamp),
             _ => None,
+        }
+    }
+}
+
+impl Display for ArithmeticOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ArithmeticOp::Add => f.write_str("+"),
+            ArithmeticOp::Sub => f.write_str("-"),
+            ArithmeticOp::Mul => f.write_str("*"),
         }
     }
 }
@@ -650,6 +802,15 @@ impl Display for Expression {
             Expression::Function(Function::Contains(c)) => {
                 write!(f, "contains({}, {})", c.haystack, c.needle)
             }
+            Expression::Function(Function::Arithmetic(a)) => {
+                write!(f, "({} {} {})", a.left, a.op, a.right)
+            }
+            Expression::Function(Function::Length(l)) => write!(f, "length({})", l.input),
+            Expression::Function(Function::RegexpReplace(r)) => write!(
+                f,
+                "regexp_replace({}, '{}', '{}')",
+                r.input, r.pattern, r.replacement
+            ),
             Expression::Function(Function::Divide(d)) => write!(f, "({} / {})", d.left, d.right),
             Expression::Function(Function::DateTrunc(dt)) => {
                 write!(f, "date_trunc('{}', {})", dt.unit, dt.source)
@@ -677,6 +838,7 @@ impl Display for Expression {
                 }
                 write!(f, " ELSE {} END", c.else_expr)
             }
+            Expression::Not(n) => write!(f, "NOT({})", n.input),
         }
     }
 }
@@ -698,6 +860,7 @@ impl TryFrom<duckdb_expression::Expression> for Expression {
             duckdb_expression::Expression::InList(i) => Expression::InList(i.try_into()?),
             duckdb_expression::Expression::Conjunction(c) => Expression::Conjunction(c.try_into()?),
             duckdb_expression::Expression::Case(c) => Expression::Case(c.try_into()?),
+            duckdb_expression::Expression::Not(n) => Expression::Not(n.try_into()?),
         })
     }
 }

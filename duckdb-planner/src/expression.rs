@@ -115,6 +115,14 @@ pub struct Case {
     pub else_expr: Box<Expression>,
 }
 
+/// Logical negation (`NOT expr`). DuckDB lowers it as a
+/// `BoundOperatorExpression` of type [`ExpressionType::OPERATOR_NOT`] with a
+/// single child.
+#[derive(CustomDeserializer, Debug)]
+pub struct Not {
+    pub input: Box<Expression>,
+}
+
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
 #[derive(CustomDeserializer, Debug)]
 pub enum Expression {
@@ -142,6 +150,8 @@ pub enum Expression {
     Conjunction(Conjunction),
     #[type_tag(ExpressionType::CASE_EXPR)]
     Case(Case),
+    #[type_tag(ExpressionType::OPERATOR_NOT)]
+    Not(Not),
 }
 
 /// A constant comparison against a single column (e.g. `col <> 42`).
@@ -277,6 +287,7 @@ impl fmt::Display for Expression {
                 }
                 write!(f, " ELSE {} END", case.else_expr)
             }
+            Expression::Not(n) => write!(f, "NOT({})", n.input),
         }
     }
 }
