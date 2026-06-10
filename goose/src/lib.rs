@@ -441,7 +441,7 @@ impl Table for ParquetCatalogTable {
 
 /// `a < b` over two single-value scalars of the same physical type.
 fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
-    arrow_ord::cmp::lt(a, b).map_or(false, |r| r.len() == 1 && r.value(0))
+    arrow_ord::cmp::lt(a, b).is_ok_and(|r| r.len() == 1 && r.value(0))
 }
 
 impl ParquetCatalogTable {

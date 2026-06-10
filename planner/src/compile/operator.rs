@@ -348,11 +348,11 @@ impl Aggregate {
         let mut base_pos: HashMap<usize, usize> = HashMap::new();
         let mut base: Vec<Expression> = Vec::new();
         for g in &self.groups {
-            if let Expression::Ref(r) = g {
-                if !base_pos.contains_key(&r.column_idx) {
-                    base_pos.insert(r.column_idx, base.len());
-                    base.push(g.clone());
-                }
+            if let Expression::Ref(r) = g
+                && !base_pos.contains_key(&r.column_idx)
+            {
+                base_pos.insert(r.column_idx, base.len());
+                base.push(g.clone());
             }
         }
 

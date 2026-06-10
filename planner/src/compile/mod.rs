@@ -118,16 +118,13 @@ impl PlanNode {
         // determined by table metadata (e.g. parquet row-group statistics).
         // It must run before the child scan is compiled — succeeding means no
         // scan happens at all.
-        if let crate::Operator::Aggregate(agg) = &self.operator {
-            if let [child] = self.inputs.as_slice() {
-                if let crate::Operator::Input(scan) = &child.operator {
-                    if child.inputs.is_empty() {
-                        if let Some(spec) = agg.try_compile_from_stats(scan, dispatcher)? {
-                            return Ok(spec);
-                        }
-                    }
-                }
-            }
+        if let crate::Operator::Aggregate(agg) = &self.operator
+            && let [child] = self.inputs.as_slice()
+            && let crate::Operator::Input(scan) = &child.operator
+            && child.inputs.is_empty()
+            && let Some(spec) = agg.try_compile_from_stats(scan, dispatcher)?
+        {
+            return Ok(spec);
         }
 
         let mut inputs = Vec::with_capacity(self.inputs.len());
