@@ -2,13 +2,16 @@
 
 use std::sync::Arc;
 
-use crate::store::{self, ObjectStore, join_prefix};
+use crate::store::{self, ObjectStore, location_key};
 
-/// One table's data location as a writable store: an absolute local directory
-/// is wrapped in a [`LocalStore`](crate::store::LocalStore) rooted at it, a
-/// store-relative location addresses the database's own store under that
-/// prefix. Callers (the compacter) write and delete data files through this
-/// one interface — local and remote are the same code path.
+/// One table's data location as a writable store. An absolute path on a *local*
+/// database is wrapped in a [`LocalStore`](crate::store::LocalStore) rooted at
+/// that directory (`prefix` empty); every other case addresses the database's
+/// own store under `prefix` — a relative location under the database prefix, or,
+/// on a remote database, an absolute location from the bucket root (the leading
+/// slash is preserved through [`location_key`] for the store to interpret).
+/// Callers (the compacter) write and delete data files through this one
+/// interface — local and remote are the same code path.
 pub struct TableStore {
     pub(super) store: Arc<dyn ObjectStore>,
     pub(super) prefix: String,
@@ -29,6 +32,6 @@ impl TableStore {
     }
 
     fn key(&self, name: &str) -> String {
-        join_prefix(&self.prefix, name)
+        location_key(&self.prefix, name)
     }
 }

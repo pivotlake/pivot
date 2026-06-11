@@ -42,7 +42,7 @@ use std::sync::{Arc, RwLock};
 use crate::manifest::{self, ManifestEntry};
 use crate::parquet::{LoadedFiles, ParquetTableError, RowGroupMetadata};
 use crate::store::{
-    self, DataFile, DataFileSource, FileRef, LocalStore, MemoryStore, ObjectStore, join_prefix,
+    self, DataFile, DataFileSource, FileRef, LocalStore, MemoryStore, ObjectStore, location_key,
 };
 use crate::table_log::{self, FIRST_VERSION, TableLog, TableVersion};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
@@ -216,7 +216,7 @@ impl ParquetCatalog {
     pub fn table_store(&self, name: &str) -> Option<TableStore> {
         let map = self.tables.read().unwrap();
         let location = &map.get(name)?.location;
-        Some(if Path::new(location).is_absolute() {
+        Some(if Path::new(location).is_absolute() && !self.store.is_remote() {
             TableStore {
                 store: Arc::new(LocalStore::new(location)),
                 prefix: String::new(),
@@ -535,10 +535,12 @@ impl ParquetCatalog {
     /// or the table name under the database root.
     ///
     /// A table path is always a plain path, never a URL (no scheme) — where it
-    /// physically lives is the database's storage, not the path's. An *absolute*
-    /// path names an external directory on the server's local filesystem
-    /// (whatever the database's store) and must already exist; a relative one
-    /// lives in the store under the database root.
+    /// physically lives is the database's storage, not the path's. A *relative*
+    /// path lives under the database root. An *absolute* path is taken from the
+    /// root of the database's storage medium: on a local database, a directory
+    /// on the server's filesystem (which must already exist); on a remote
+    /// database, a key from the **bucket root** (ignoring the prefix the
+    /// database was opened at).
     fn locate(&self, request: &CreateTableRequest) -> Result<String> {
         let Some(path) = request.options.get(PATH_OPTION) else {
             return Ok(request.name.clone());
@@ -546,8 +548,12 @@ impl ParquetCatalog {
         if path.contains("://") {
             return Err(Error::TablePathWithScheme(path.clone()));
         }
+        // An absolute path on a local database is a directory on the server's
+        // disk, so validate it exists. On a remote (bucket) database an absolute
+        // path is a key from the bucket root — there is no local directory to
+        // stat, and a missing prefix just yields an empty table.
         let dir = Path::new(path);
-        if dir.is_absolute() {
+        if dir.is_absolute() && !self.store.is_remote() {
             if !dir.exists() {
                 return Err(Error::PathNotFound(path.clone()));
             }
@@ -566,7 +572,11 @@ impl ParquetCatalog {
     /// the source of truth: `CREATE TABLE`, and reloading a legacy table with
     /// no log.
     fn data_files(&self, location: &str) -> Result<Vec<FileRef>> {
-        if Path::new(location).is_absolute() {
+        // An absolute path on a *local* database is a directory on the server's
+        // disk, listed directly. Everything else — relative locations, and
+        // absolute locations on a remote database (a key from the bucket root) —
+        // is listed through the store.
+        if Path::new(location).is_absolute() && !self.store.is_remote() {
             return Ok(store::local_parquet_files(Path::new(location))?);
         }
         Ok(self
@@ -582,7 +592,8 @@ impl ParquetCatalog {
     /// [`data_files`](Self::data_files) for when the *log* is the source of
     /// truth.
     fn resolve_files(&self, location: &str, files: &[FileRef]) -> Result<Vec<DataFile>> {
-        if Path::new(location).is_absolute() {
+        // Absolute path on a local database → a directory on the server's disk.
+        if Path::new(location).is_absolute() && !self.store.is_remote() {
             return Ok(files
                 .iter()
                 .map(|f| DataFile {
@@ -591,12 +602,14 @@ impl ParquetCatalog {
                 })
                 .collect());
         }
+        // Otherwise the store resolves it. `location_key` keeps a leading slash
+        // so the store reads an absolute location from the bucket root.
         files
             .iter()
             .map(|f| {
                 Ok(self
                     .store
-                    .data_file(&join_prefix(location, &f.name), f.size)?)
+                    .data_file(&location_key(location, &f.name), f.size)?)
             })
             .collect()
     }

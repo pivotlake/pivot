@@ -123,6 +123,16 @@ pub trait ObjectStore: Debug + Send + Sync {
             "this store has no readable data files".to_string(),
         ))
     }
+
+    /// Whether this store is a remote object store (S3/GCS) rather than the
+    /// server's local filesystem. The catalog uses it to decide what an
+    /// *absolute* table path means: on a local store an absolute path is a
+    /// directory on the server's disk; on a remote store it is a key from the
+    /// bucket root (see [`object_key`]). Local/in-memory stores keep the
+    /// default.
+    fn is_remote(&self) -> bool {
+        false
+    }
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
@@ -180,9 +190,56 @@ pub(crate) fn join_prefix(prefix: &str, key: &str) -> String {
     }
 }
 
+/// The in-bucket object key a remote backend should address for a store key.
+/// A leading `/` marks an **absolute** key — taken from the bucket root,
+/// ignoring `prefix` (the database's own prefix within the bucket); any other
+/// key lives under `prefix`. The "absolute = the store's root" companion to
+/// [`join_prefix`].
+pub(crate) fn object_key(prefix: &str, key: &str) -> String {
+    if key.starts_with('/') {
+        key.trim_start_matches('/').to_string()
+    } else {
+        join_prefix(prefix, key)
+    }
+}
+
+/// Join `name` onto a table `location` for a store key, **preserving** whether
+/// the location is absolute (a leading `/`, meaning the bucket root). The
+/// absolute-aware companion to [`join_prefix`], used where the resulting key is
+/// later handed to a store that interprets the leading `/` itself
+/// ([`object_key`]).
+pub(crate) fn location_key(location: &str, name: &str) -> String {
+    let joined = join_prefix(location, name);
+    if location.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_key_relative_lives_under_prefix_absolute_at_bucket_root() {
+        // Relative keys hang under the database's own prefix in the bucket.
+        assert_eq!(object_key("mydb", "events/a.parquet"), "mydb/events/a.parquet");
+        // An absolute key escapes the database prefix to the bucket root.
+        assert_eq!(object_key("mydb", "/shared/a.parquet"), "shared/a.parquet");
+        // Bucket root with no database prefix configured behaves the same.
+        assert_eq!(object_key("", "events/a.parquet"), "events/a.parquet");
+        assert_eq!(object_key("", "/shared/a.parquet"), "shared/a.parquet");
+    }
+
+    #[test]
+    fn location_key_preserves_absoluteness_for_the_store_to_interpret() {
+        // A relative table location yields a relative key (store prepends its prefix).
+        assert_eq!(location_key("events", "a.parquet"), "events/a.parquet");
+        // An absolute table location keeps its leading slash so the store reads
+        // it from the bucket root.
+        assert_eq!(location_key("/shared/events", "a.parquet"), "/shared/events/a.parquet");
+    }
 
     #[test]
     fn open_store_routes_local_and_file_uri() {

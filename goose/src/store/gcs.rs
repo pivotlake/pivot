@@ -8,7 +8,7 @@
 //! identity on Google compute). RS256 signing uses `ring`; everything is
 //! synchronous, no async runtime.
 
-use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError, join_prefix};
+use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError, object_key};
 use base64::Engine;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -158,7 +158,7 @@ impl GcsStore {
 
     /// `storage.googleapis.com` object path for a catalog-relative key.
     fn object_path(&self, key: &str) -> String {
-        percent_encode(&join_prefix(&self.prefix, key))
+        percent_encode(&object_key(&self.prefix, key))
     }
 }
 
@@ -254,7 +254,7 @@ impl ObjectStore for GcsStore {
 
     fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
         let token = self.bearer()?;
-        let object_prefix = join_prefix(&self.prefix, prefix);
+        let object_prefix = object_key(&self.prefix, prefix);
         let url = format!(
             "https://storage.googleapis.com/storage/v1/b/{}/o?prefix={}%2F&delimiter=%2F",
             self.bucket,
@@ -292,6 +292,10 @@ impl ObjectStore for GcsStore {
             source: DataFileSource::Remote(self.presign_get(key)?),
         })
     }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
 }
 
 impl GcsStore {
@@ -323,7 +327,7 @@ impl GcsStore {
         let client_email = field(&creds, "client_email")?;
         let private_key = field(&creds, "private_key")?;
 
-        let object = join_prefix(&self.prefix, key);
+        let object = object_key(&self.prefix, key);
         let canonical_uri = format!("/{}/{}", self.bucket, encode_path(&object));
         let (date, datetime) = goog_v4_timestamp();
         let scope = format!("{date}/auto/storage/goog4_request");
