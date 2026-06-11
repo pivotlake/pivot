@@ -32,9 +32,6 @@ struct PushedPredicate {
 #[derive(Clone, Debug)]
 pub struct TableBinding {
     pub columns: Vec<Column>,
-    /// Where this table's Parquet data lives (a directory/key prefix in the
-    /// database store). Kept so a future `refresh()` can re-read the latest files.
-    pub location: String,
     /// The table's row-group metadata, read once when the table was defined and
     /// shared across every binding/query (cheap `Arc` clone). Pruning a binding's
     /// predicates clones the row-group `Vec` and filters it — no footer re-read.
@@ -46,11 +43,11 @@ pub struct TableBinding {
 }
 
 impl TableBinding {
-    /// A binding over one state's scan view, with no predicates pushed yet.
-    pub(super) fn new(columns: Vec<Column>, location: String, parquet: Arc<ParquetTable>) -> Self {
+    /// A binding over one table version's scan view, with no predicates pushed
+    /// yet.
+    pub(super) fn new(columns: Vec<Column>, parquet: Arc<ParquetTable>) -> Self {
         Self {
             columns,
-            location,
             parquet,
             predicates: Vec::new(),
         }

@@ -58,11 +58,7 @@ impl CatalogTable {
             .iter()
             .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
-        TableBinding::new(
-            self.columns.clone(),
-            self.location.clone(),
-            Arc::new(ParquetTable::new(row_groups)),
-        )
+        TableBinding::new(self.columns.clone(), Arc::new(ParquetTable::new(row_groups)))
     }
 
     /// The current file list as [`FileRef`]s — what a commit on top of this

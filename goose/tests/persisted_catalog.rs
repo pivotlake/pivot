@@ -161,9 +161,8 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
         create(&dispatch, &catalog, rooted_request("t", columns())).unwrap();
 
         // A data-less table: registered, with no row groups (its data lives under
-        // `<root>/t`, which fills in once data is written there).
+        // `<root>/t`, which fills in once a file is registered there).
         let t = catalog.binding("t").unwrap();
-        assert_eq!(t.location, "t");
         assert!(t.parquet.row_groups().is_empty());
     }
 
