@@ -87,24 +87,28 @@ impl RowGroupFetcher {
 
     /// A completed read (fs or http): the requester already committed its bytes
     /// into the cache slot, so route it to the owning row group and count it off.
+    ///
+    /// Every submitted read registered a waiter in `consume`, and the ring
+    /// delivers exactly one completion per read, so the key is always present
+    /// with a non-empty queue and the slot is still in flight. The queue can hold
+    /// more than one waiter (two column chunks sharing a cache region issue two
+    /// reads at the same key); any waiter claims a completion, since the bytes are
+    /// already committed.
     fn process_completion<S: Sender<RowGroupBuffer>>(
         &mut self,
         key: (FileLocation, usize),
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        let (slot, drained) = match self.routing.get_mut(&key) {
-            Some(waiters) => (waiters.pop_front(), waiters.is_empty()),
-            None => (None, false),
-        };
-        if drained {
+        let waiters = self
+            .routing
+            .get_mut(&key)
+            .expect("completion for an unrouted read");
+        let slot = waiters.pop_front().expect("empty routing queue");
+        if waiters.is_empty() {
             self.routing.remove(&key);
         }
-        if let Some(slot) = slot {
-            if let Some(rg) = self.in_flight[slot].as_mut() {
-                rg.complete_one();
-            }
-            self.emit_if_complete(slot, sender)?;
-        }
+        self.in_flight[slot].as_mut().unwrap().complete_one();
+        self.emit_if_complete(slot, sender)?;
         Ok(())
     }
 }
