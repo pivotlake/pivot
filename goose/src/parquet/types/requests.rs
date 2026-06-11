@@ -102,16 +102,6 @@ impl RowGroupRequest {
         }
     }
 
-    /// Whether this row group's file lives on remote object storage (vs local
-    /// disk). The fetcher uses this to charge the read against its disk or HTTP
-    /// in-flight pool.
-    pub fn is_remote(&self) -> bool {
-        matches!(
-            self.metadata.get_metadata().location,
-            FileLocation::Remote(_)
-        )
-    }
-
     /// Record that one queued read has landed (and been committed to its slot).
     pub fn complete_one(&mut self) {
         self.remaining -= 1;
