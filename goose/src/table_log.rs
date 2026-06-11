@@ -160,7 +160,7 @@ struct VersionDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
+    use crate::store::LocalStore;
 
     fn file(name: &str, size: u64) -> FileRef {
         FileRef {
@@ -171,7 +171,8 @@ mod tests {
 
     #[test]
     fn versions_round_trip_and_latest_wins() {
-        let store = MemoryStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
         let log = TableLog::new(&store, "t");
         assert_eq!(log.read_latest().unwrap(), None);
 
@@ -194,7 +195,8 @@ mod tests {
 
     #[test]
     fn conflicting_commit_loses_and_state_is_the_winners() {
-        let store = MemoryStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
         let log = TableLog::new(&store, "t");
         assert!(log.commit(1, &[file("a.parquet", 1)]).unwrap());
         // A racing writer targeting the same version loses cleanly.
@@ -207,7 +209,8 @@ mod tests {
 
     #[test]
     fn logs_are_per_table_and_foreign_keys_are_ignored() {
-        let store = MemoryStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
         assert!(
             TableLog::new(&store, "a")
                 .commit(1, &[file("x.parquet", 1)])

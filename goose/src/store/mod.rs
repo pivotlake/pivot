@@ -17,11 +17,9 @@ use std::path::PathBuf;
 
 mod gcs;
 mod local;
-mod memory;
 mod s3;
 pub use gcs::GcsStore;
 pub use local::LocalStore;
-pub use memory::MemoryStore;
 pub use s3::S3Store;
 
 #[derive(Debug, thiserror::Error)]
@@ -115,15 +113,8 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn list(&self, prefix: &str) -> Result<Vec<FileRef>>;
 
     /// How the io_uring reader should fetch object `key` (`size` bytes): a local
-    /// backend yields a filesystem path, a remote one a presigned GET URL. The
-    /// default store serves no readable data files (e.g. a pure in-memory store
-    /// holds only the manifest) — local/remote backends override it.
-    fn data_file(&self, _key: &str, _size: u64) -> Result<DataFile> {
-        Err(StoreError::Config(
-            "this store has no readable data files".to_string(),
-        ))
-    }
-
+    /// backend yields a filesystem path, a remote one a presigned GET URL.
+    fn data_file(&self, key: &str, size: u64) -> Result<DataFile>;
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,

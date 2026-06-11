@@ -3,9 +3,8 @@
 //!
 //! It's a single JSON document at the `_pivot_manifest.json` key of the
 //! database's [`ObjectStore`] — so the same [`load`]/[`insert`] serve any
-//! database, in-memory ([`MemoryStore`](crate::store::MemoryStore)) or persisted
-//! (local directory / S3 / GCS). Opening the catalog [`load`]s it; every
-//! `CREATE TABLE` [`insert`]s into it.
+//! database, whether its store is a local directory or S3 / GCS. Opening the
+//! catalog [`load`]s it; every `CREATE TABLE` [`insert`]s into it.
 //!
 //! The manifest tracks only table *definitions* (name, declared schema, and the
 //! location of the data). The Parquet row-group metadata itself is read from
@@ -153,7 +152,7 @@ mod sql_columns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemoryStore;
+    use crate::store::LocalStore;
     use planner::types::Type;
 
     fn entry(name: &str) -> ManifestEntry {
@@ -169,7 +168,8 @@ mod tests {
 
     #[test]
     fn round_trips_through_the_store() {
-        let store = MemoryStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
         assert!(load(&store).unwrap().is_empty());
 
         insert(&store, &entry("first")).unwrap();

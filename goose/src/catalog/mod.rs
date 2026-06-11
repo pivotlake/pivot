@@ -35,12 +35,13 @@ pub use binding::TableBinding;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::manifest::{self, ManifestEntry};
 use crate::parquet::{LoadedFiles, ParquetTableError, RowGroupMetadata};
 use crate::store::{
-    self, DataFile, DataFileSource, FileRef, MemoryStore, ObjectStore, location_key,
+    self, DataFile, DataFileSource, FileRef, LocalStore, ObjectStore, location_key,
 };
 use crate::table_log::{self, FIRST_VERSION, TableLog, TableVersion};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
@@ -120,13 +121,14 @@ type FetchedFiles = HashMap<String, Vec<Arc<RowGroupMetadata>>>;
 pub struct ParquetCatalog {
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
     /// The database's object store — both the table [`manifest`]/[`table_log`]s
-    /// and the tables' Parquet data. An in-memory [`MemoryStore`] by default
-    /// (ephemeral; it keeps catalog metadata in memory but serves table data
-    /// from local files), or a local directory / S3 / GCS for one opened with
-    /// [`open`](Self::open). The catalog reads and writes a table's data through
-    /// this one store — relative locations live under the database root, an
-    /// absolute location at the store's own root (the filesystem root, or the
-    /// bucket root).
+    /// and the tables' Parquet data. A local directory by default ([`new`], an
+    /// ephemeral one under the temp dir), or the directory / S3 / GCS root a
+    /// database is [`open`](Self::open)ed at. The catalog reads and writes a
+    /// table's data through this one store: relative locations live under the
+    /// database root, an absolute location at the store's own root (the
+    /// filesystem root, or the bucket root).
+    ///
+    /// [`new`]: Self::new
     store: Arc<dyn ObjectStore>,
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
@@ -142,13 +144,17 @@ impl std::fmt::Debug for ParquetCatalog {
 }
 
 impl ParquetCatalog {
-    /// An ephemeral, in-memory database: the catalog (manifest, logs) lives in
-    /// memory and vanishes on restart, while a table's data lives on disk
-    /// (under the current directory, or wherever a `WITH (path = …)` points).
+    /// An ephemeral database rooted at a fresh directory under the system temp
+    /// dir: catalog and data are written there and simply abandoned on exit. For
+    /// a persisted database use [`open`](Self::open).
     pub fn new(dispatcher: DataFlowDispatcher) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("goose-{}-{}", std::process::id(), seq));
         Self {
             tables: Arc::new(RwLock::new(HashMap::new())),
-            store: Arc::new(MemoryStore::new()),
+            store: Arc::new(LocalStore::new(root)),
             dispatcher,
         }
     }
