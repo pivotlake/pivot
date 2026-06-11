@@ -29,11 +29,9 @@
 //! pushdown accumulates on that binding alone.
 
 mod binding;
-mod data;
 mod entry;
 
 pub use binding::TableBinding;
-pub use data::TableStore;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -42,7 +40,7 @@ use std::sync::{Arc, RwLock};
 use crate::manifest::{self, ManifestEntry};
 use crate::parquet::{LoadedFiles, ParquetTableError, RowGroupMetadata};
 use crate::store::{
-    self, DataFile, DataFileSource, FileRef, LocalStore, MemoryStore, ObjectStore, location_key,
+    self, DataFile, DataFileSource, FileRef, MemoryStore, ObjectStore, location_key,
 };
 use crate::table_log::{self, FIRST_VERSION, TableLog, TableVersion};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
@@ -57,10 +55,6 @@ const PATH_OPTION: &str = "path";
 
 #[derive(Debug, ThisError)]
 pub enum Error {
-    #[error("path `{0}` does not exist")]
-    PathNotFound(String),
-    #[error("path `{0}` is not a directory")]
-    PathNotDirectory(String),
     #[error(
         "table path `{0}` must be a plain path, not a URL — a table's storage is the database's, so the path carries no scheme"
     )]
@@ -125,11 +119,14 @@ type FetchedFiles = HashMap<String, Vec<Arc<RowGroupMetadata>>>;
 /// reloads the entry up to the latest committed version.
 pub struct ParquetCatalog {
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    /// The database's object store: an in-memory [`MemoryStore`] by default
-    /// (ephemeral), or a local directory / S3 / GCS for one opened with
-    /// [`open`](Self::open). It holds the table [`manifest`], the per-table
-    /// [`table_log`]s, and the data of tables that live under the database
-    /// root; `WITH (path = …)` tables read their own local directory directly.
+    /// The database's object store — both the table [`manifest`]/[`table_log`]s
+    /// and the tables' Parquet data. An in-memory [`MemoryStore`] by default
+    /// (ephemeral; it keeps catalog metadata in memory but serves table data
+    /// from local files), or a local directory / S3 / GCS for one opened with
+    /// [`open`](Self::open). The catalog reads and writes a table's data through
+    /// this one store — relative locations live under the database root, an
+    /// absolute location at the store's own root (the filesystem root, or the
+    /// bucket root).
     store: Arc<dyn ObjectStore>,
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
@@ -145,8 +142,9 @@ impl std::fmt::Debug for ParquetCatalog {
 }
 
 impl ParquetCatalog {
-    /// An ephemeral, in-memory database: tables vanish on restart and must
-    /// each name a `WITH (path = …)`.
+    /// An ephemeral, in-memory database: the catalog (manifest, logs) lives in
+    /// memory and vanishes on restart, while a table's data lives on disk
+    /// (under the current directory, or wherever a `WITH (path = …)` points).
     pub fn new(dispatcher: DataFlowDispatcher) -> Self {
         Self {
             tables: Arc::new(RwLock::new(HashMap::new())),
@@ -211,22 +209,34 @@ impl ParquetCatalog {
             .map(|entry| entry.logged_files())
     }
 
-    /// Write access to `name`'s data location, wherever it lives — see
-    /// [`TableStore`]. `None` when no such table exists.
-    pub fn table_store(&self, name: &str) -> Option<TableStore> {
-        let map = self.tables.read().unwrap();
-        let location = &map.get(name)?.location;
-        Some(if Path::new(location).is_absolute() && !self.store.is_remote() {
-            TableStore {
-                store: Arc::new(LocalStore::new(location)),
-                prefix: String::new(),
-            }
-        } else {
-            TableStore {
-                store: self.store.clone(),
-                prefix: location.clone(),
-            }
-        })
+    /// Write `bytes` as data file `file` of table `name` (whole-file and
+    /// atomic, so a reader never sees a partial write). `Ok(false)` when no such
+    /// table exists. Used by the compacter for its merged outputs.
+    pub fn write_data_file(&self, name: &str, file: &str, bytes: &[u8]) -> Result<bool> {
+        let Some(location) = self.location_of(name) else {
+            return Ok(false);
+        };
+        self.store.put(&location_key(&location, file), bytes)?;
+        Ok(true)
+    }
+
+    /// Delete data file `file` of table `name` (idempotent; a no-op if the table
+    /// is gone). Used by the compacter to reclaim a swapped-out input's space.
+    pub fn delete_data_file(&self, name: &str, file: &str) -> Result<()> {
+        let Some(location) = self.location_of(name) else {
+            return Ok(());
+        };
+        self.store.delete(&location_key(&location, file))?;
+        Ok(())
+    }
+
+    /// The data location of table `name`, or `None` if it does not exist.
+    fn location_of(&self, name: &str) -> Option<String> {
+        self.tables
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|e| e.location.clone())
     }
 
     /// Locate `files` of table `name` for a fetch (e.g. a compaction read).
@@ -538,9 +548,8 @@ impl ParquetCatalog {
     /// physically lives is the database's storage, not the path's. A *relative*
     /// path lives under the database root. An *absolute* path is taken from the
     /// root of the database's storage medium: on a local database, a directory
-    /// on the server's filesystem (which must already exist); on a remote
-    /// database, a key from the **bucket root** (ignoring the prefix the
-    /// database was opened at).
+    /// on the server's filesystem; on a remote database, a key from the **bucket
+    /// root** (ignoring the prefix the database was opened at).
     fn locate(&self, request: &CreateTableRequest) -> Result<String> {
         let Some(path) = request.options.get(PATH_OPTION) else {
             return Ok(request.name.clone());
@@ -548,37 +557,13 @@ impl ParquetCatalog {
         if path.contains("://") {
             return Err(Error::TablePathWithScheme(path.clone()));
         }
-        // An absolute path on a local database is a directory on the server's
-        // disk, so validate it exists. On a remote (bucket) database an absolute
-        // path is a key from the bucket root — there is no local directory to
-        // stat, and a missing prefix just yields an empty table.
-        let dir = Path::new(path);
-        if dir.is_absolute() && !self.store.is_remote() {
-            if !dir.exists() {
-                return Err(Error::PathNotFound(path.clone()));
-            }
-            if !dir.is_dir() {
-                return Err(Error::PathNotDirectory(path.clone()));
-            }
-        }
         Ok(path.clone())
     }
 
-    /// List the Parquet data files at `location`, ready for the metadata
-    /// fetch. An absolute path is an external local directory, read from the
-    /// filesystem; a relative location lives under the database root, in the
-    /// store (which yields a local path or presigned remote per object). An
-    /// empty/absent location yields no files. Used where the *directory* is
-    /// the source of truth: `CREATE TABLE`, and reloading a legacy table with
-    /// no log.
+    /// List the Parquet data files at `location` through the store. An
+    /// empty/absent location yields no files. Used where the *listing* is the
+    /// source of truth: `CREATE TABLE`, and reloading a legacy table with no log.
     fn data_files(&self, location: &str) -> Result<Vec<FileRef>> {
-        // An absolute path on a *local* database is a directory on the server's
-        // disk, listed directly. Everything else — relative locations, and
-        // absolute locations on a remote database (a key from the bucket root) —
-        // is listed through the store.
-        if Path::new(location).is_absolute() && !self.store.is_remote() {
-            return Ok(store::local_parquet_files(Path::new(location))?);
-        }
         Ok(self
             .store
             .list(location)?
@@ -590,20 +575,9 @@ impl ParquetCatalog {
     /// Locate `files` at `location` for the footer fetch: each [`FileRef`]
     /// paired with where its bytes live. The mirror of
     /// [`data_files`](Self::data_files) for when the *log* is the source of
-    /// truth.
+    /// truth. `location_key` keeps a leading slash so an absolute location is
+    /// read from the store's root (the filesystem root, or the bucket root).
     fn resolve_files(&self, location: &str, files: &[FileRef]) -> Result<Vec<DataFile>> {
-        // Absolute path on a local database → a directory on the server's disk.
-        if Path::new(location).is_absolute() && !self.store.is_remote() {
-            return Ok(files
-                .iter()
-                .map(|f| DataFile {
-                    size: f.size,
-                    source: DataFileSource::Local(Path::new(location).join(&f.name)),
-                })
-                .collect());
-        }
-        // Otherwise the store resolves it. `location_key` keeps a leading slash
-        // so the store reads an absolute location from the bucket root.
         files
             .iter()
             .map(|f| {

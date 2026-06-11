@@ -292,10 +292,6 @@ impl ObjectStore for GcsStore {
             source: DataFileSource::Remote(self.presign_get(key)?),
         })
     }
-
-    fn is_remote(&self) -> bool {
-        true
-    }
 }
 
 impl GcsStore {

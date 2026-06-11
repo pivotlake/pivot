@@ -241,10 +241,6 @@ impl ObjectStore for S3Store {
             source: DataFileSource::Remote(self.presign_get(key)?),
         })
     }
-
-    fn is_remote(&self) -> bool {
-        true
-    }
 }
 
 impl S3Store {

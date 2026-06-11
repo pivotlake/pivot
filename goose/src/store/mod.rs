@@ -13,7 +13,7 @@
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
 use std::fmt::Debug;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod gcs;
 mod local;
@@ -124,15 +124,6 @@ pub trait ObjectStore: Debug + Send + Sync {
         ))
     }
 
-    /// Whether this store is a remote object store (S3/GCS) rather than the
-    /// server's local filesystem. The catalog uses it to decide what an
-    /// *absolute* table path means: on a local store an absolute path is a
-    /// directory on the server's disk; on a remote store it is a key from the
-    /// bucket root (see [`object_key`]). Local/in-memory stores keep the
-    /// default.
-    fn is_remote(&self) -> bool {
-        false
-    }
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
@@ -146,31 +137,6 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
         let path = uri.strip_prefix("file://").unwrap_or(uri);
         Ok(Box::new(LocalStore::new(path)))
     }
-}
-
-/// The `*.parquet` files directly under a local directory, each as a
-/// [`FileRef`] (name + size). A missing directory yields none. This is how a
-/// local table's data files are enumerated; the catalog locates each for the
-/// metadata-fetch dataflow.
-pub fn local_parquet_files(dir: &Path) -> std::io::Result<Vec<FileRef>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "parquet") {
-            let meta = entry.metadata()?;
-            if meta.is_file() {
-                files.push(FileRef {
-                    name: entry.file_name().to_string_lossy().into_owned(),
-                    size: meta.len(),
-                });
-            }
-        }
-    }
-    Ok(files)
 }
 
 /// The final path segment of a store key — the object's name within its

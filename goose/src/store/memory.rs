@@ -1,30 +1,61 @@
-//! An in-memory [`ObjectStore`] — a `HashMap` of key → bytes. Backs the default
-//! (ephemeral) database: it holds the table manifest in memory, so tables vanish
-//! on restart. It serves no readable data files of its own (those come from the
-//! `WITH (path = …)` directories on the local filesystem), so it inherits the
-//! trait's default [`data_file`](ObjectStore::data_file).
+//! The default (ephemeral) database's store. Catalog metadata (the manifest and
+//! table logs — relative keys) lives in an in-memory `HashMap` and vanishes on
+//! restart. A table's *data*, though, is real files on disk, named by an
+//! **absolute** key (a `WITH (path = …)` directory); those keys are delegated to
+//! a [`LocalStore`] on the local filesystem.
+//!
+//! Splitting on absolute-vs-relative is a deliberate stopgap — the two halves
+//! duplicate `LocalStore`'s filesystem handling rather than share an
+//! abstraction. Good enough until the store layer is unified.
 
-use super::{FileRef, ObjectStore, Result};
+use super::{DataFile, FileRef, LocalStore, ObjectStore, Result};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemoryStore {
     objects: Mutex<HashMap<String, Vec<u8>>>,
+    /// Where absolute (filesystem) keys are served from. Its root is unused —
+    /// absolute keys ignore it — but it anchors the in-memory database's data at
+    /// the current directory.
+    disk: LocalStore,
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryStore {
     pub fn new() -> Self {
-        Self::default()
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self {
+            objects: Mutex::new(HashMap::new()),
+            disk: LocalStore::new(cwd),
+        }
     }
+}
+
+/// Whether `key` is a filesystem path (table data) rather than an in-memory
+/// metadata key.
+fn on_disk(key: &str) -> bool {
+    Path::new(key).is_absolute()
 }
 
 impl ObjectStore for MemoryStore {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if on_disk(key) {
+            return self.disk.get(key);
+        }
         Ok(self.objects.lock().unwrap().get(key).cloned())
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        if on_disk(key) {
+            return self.disk.put(key, data);
+        }
         self.objects
             .lock()
             .unwrap()
@@ -33,6 +64,9 @@ impl ObjectStore for MemoryStore {
     }
 
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+        if on_disk(key) {
+            return self.disk.put_if_absent(key, data);
+        }
         match self.objects.lock().unwrap().entry(key.to_string()) {
             std::collections::hash_map::Entry::Occupied(_) => Ok(false),
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -43,11 +77,17 @@ impl ObjectStore for MemoryStore {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        if on_disk(key) {
+            return self.disk.delete(key);
+        }
         self.objects.lock().unwrap().remove(key);
         Ok(())
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
+        if on_disk(prefix) {
+            return self.disk.list(prefix);
+        }
         let prefix = format!("{}/", prefix.trim_end_matches('/'));
         Ok(self
             .objects
@@ -60,6 +100,10 @@ impl ObjectStore for MemoryStore {
                 size: bytes.len() as u64,
             })
             .collect())
+    }
+
+    fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
+        self.disk.data_file(key, size)
     }
 }
 

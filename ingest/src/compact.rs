@@ -9,8 +9,12 @@
 //! The compacter is **location-agnostic**: candidates come from the table's
 //! log (names + sizes — no directory scanning), reads resolve through the
 //! catalog (a local path or a presigned URL alike), and writes/deletes go
-//! through the table's [`goose::TableStore`] store handle. A table under an `s3://`
-//! database root compacts through the exact same code path as a local one.
+//! through the catalog's [`write_data_file`]/[`delete_data_file`]. A table under
+//! an `s3://` database root compacts through the exact same code path as a local
+//! one.
+//!
+//! [`write_data_file`]: ParquetCatalog::write_data_file
+//! [`delete_data_file`]: ParquetCatalog::delete_data_file
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups and the write pipeline's encode stages
@@ -224,11 +228,6 @@ impl CompactJob {
             ParquetTable::from_locations(&dispatcher, resolved)
                 .map_err(|e| format!("reading input footers: {e}"))?,
         );
-        let data = self
-            .catalog
-            .table_store(&self.name)
-            .ok_or_else(|| format!("table `{}` vanished", self.name))?;
-
         // One dataflow: scan stages decode the inputs, encode stages cut and
         // compress full-size row groups, finished files stream out here.
         let columns = table.schema().fields().len();
@@ -245,7 +244,7 @@ impl CompactJob {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     // Unlogged files are invisible; deleting them is hygiene.
-                    remove_all(&data, &outputs);
+                    remove_all(&self.catalog, &self.name, &outputs);
                     return Err(format!("re-encoding: {e}"));
                 }
             };
@@ -253,9 +252,16 @@ impl CompactJob {
                 "{}-compacted-{}-{:06}-{:03}.parquet",
                 self.name, millis, self.seq, idx
             );
-            if let Err(e) = data.put(&name, &bytes) {
-                remove_all(&data, &outputs);
-                return Err(format!("writing {name}: {e}"));
+            match self.catalog.write_data_file(&self.name, &name, &bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    remove_all(&self.catalog, &self.name, &outputs);
+                    return Err(format!("table `{}` vanished", self.name));
+                }
+                Err(e) => {
+                    remove_all(&self.catalog, &self.name, &outputs);
+                    return Err(format!("writing {name}: {e}"));
+                }
             }
             outputs.push(FileRef {
                 name,
@@ -271,18 +277,18 @@ impl CompactJob {
         {
             Ok(true) => {}
             Ok(false) => {
-                remove_all(&data, &outputs);
+                remove_all(&self.catalog, &self.name, &outputs);
                 return Err(format!("table `{}` vanished before the swap", self.name));
             }
             Err(e) => {
-                remove_all(&data, &outputs);
+                remove_all(&self.catalog, &self.name, &outputs);
                 return Err(format!("log swap: {e}"));
             }
         }
         // The inputs are out of the log; deleting them reclaims space. A
         // failure (or a crash) just leaves invisible orphans.
         for input in &inputs {
-            if let Err(e) = data.delete(&input.name) {
+            if let Err(e) = self.catalog.delete_data_file(&self.name, &input.name) {
                 error!(
                     table = %self.name, file = %input.name, error = %e,
                     "failed deleting compacted input"
@@ -294,8 +300,8 @@ impl CompactJob {
 }
 
 /// Best-effort cleanup of staged (never-logged, hence invisible) outputs.
-fn remove_all(data: &goose::TableStore, files: &[FileRef]) {
+fn remove_all(catalog: &ParquetCatalog, table: &str, files: &[FileRef]) {
     for file in files {
-        let _ = data.delete(&file.name);
+        let _ = catalog.delete_data_file(table, &file.name);
     }
 }

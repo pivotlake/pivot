@@ -160,17 +160,15 @@ fn create_table_without_a_path_makes_an_empty_table() {
 }
 
 #[test]
-fn create_table_fails_when_path_does_not_exist() {
+fn create_table_over_a_missing_path_yields_an_empty_table() {
+    // A location with no files yields an empty table — the same as a relative or
+    // no-path location. The catalog no longer eagerly stats the path (which only
+    // made sense for a local store; on a bucket an absolute path is just a key).
     let (_dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
-    let err = create_table(&catalog, create_request("t", bogus, columns))
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("does not exist"),
-        "expected path-not-found error: {err}"
-    );
+    create_table(&catalog, create_request("t", bogus, columns)).unwrap();
+    assert!(catalog.binding("t").unwrap().parquet.row_groups().is_empty());
 }
 
 #[test]
@@ -178,11 +176,12 @@ fn create_table_fails_when_path_is_a_file() {
     let (dir, columns) = three_row_table();
     let file_path = dir.path().join("data.parquet");
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    // Listing a file as a directory fails, so the create errors.
     let err = create_table(&catalog, create_request("t", &file_path, columns))
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("not a directory"),
+        err.to_lowercase().contains("not a directory"),
         "expected not-a-directory error: {err}"
     );
 }

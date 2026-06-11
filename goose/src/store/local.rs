@@ -2,7 +2,7 @@
 //! directory, the CAS primitive is an `O_EXCL` create.
 
 use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The local-filesystem backend: keys are paths under `root`.
 #[derive(Debug)]
@@ -15,8 +15,17 @@ impl LocalStore {
         Self { root: root.into() }
     }
 
+    /// The filesystem path for `key`. A relative key lives under the store
+    /// root; an **absolute** key is taken as-is — it names a location outside
+    /// the root (an external data directory). Made explicit rather than relying
+    /// on `Path::join`'s absolute-component behavior.
     fn path_for(&self, key: &str) -> PathBuf {
-        self.root.join(key)
+        let key = Path::new(key);
+        if key.is_absolute() {
+            key.to_path_buf()
+        } else {
+            self.root.join(key)
+        }
     }
 }
 
@@ -116,6 +125,10 @@ impl ObjectStore for LocalStore {
                 key: prefix.to_string(),
                 source,
             })?;
+            // One level only: skip subdirectories (a table's data files are flat).
+            if !meta.is_file() {
+                continue;
+            }
             if let Some(name) = entry.file_name().to_str() {
                 objects.push(FileRef {
                     name: name.to_string(),
