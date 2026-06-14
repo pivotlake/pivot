@@ -113,6 +113,36 @@ fn remap_zero(hash: u64) -> u64 {
     if hash == 0 { 1 } else { hash }
 }
 
+/// Prefetch the cache line at `ptr` into L1 (x86 `T0` / ARM `pldl1keep`).
+#[inline(always)]
+fn prefetch_l1_line(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
+
+/// Prefetch the cache line at `ptr` into L2 only (x86 `T1` / ARM `pldl2keep`).
+#[inline(always)]
+fn prefetch_l2_line(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl2keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
+
 /// A linear probing hash table optimized for never rehashing, exposing a very raw interface allowing
 /// maximum control by the caller.
 ///
@@ -308,18 +338,9 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     pub fn prefetch(&self, hash: u64) {
         let idx = self.slot_for(hash);
         let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                ptr.add(64) as *const i8
-            );
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
-                ptr.add(128) as *const i8
-            );
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = ptr;
+        prefetch_l1_line(ptr);
+        prefetch_l1_line(ptr.wrapping_add(64));
+        prefetch_l1_line(ptr.wrapping_add(128));
     }
 
     /// Prefetch the slot's cache line into L2 (`T1`) only. Issued *far* ahead of
@@ -331,12 +352,7 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     pub fn prefetch_l2(&self, hash: u64) {
         let idx = self.slot_for(hash);
         let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = ptr;
+        prefetch_l2_line(ptr);
     }
 
     /// Returns an iterator over all non-empty entries in the table.
@@ -429,16 +445,14 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
         }
     }
 
-    /// Prefetch the cache line backing slot `idx` into L1.
+    /// Prefetch the cache lines backing slot `idx` into L1 — two lines, so the
+    /// expected short linear-probe chain (~1.8 slots at max load) is covered
+    /// even when the home slot sits at the end of its line.
     #[inline(always)]
     fn prefetch_entry(&self, idx: usize) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            let ptr = &self.buffer[idx] as *const Entry<K, V> as *const i8;
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = idx;
+        let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
+        prefetch_l1_line(ptr);
+        prefetch_l1_line(ptr.wrapping_add(64));
     }
 
     /// Probe row `i` (hash `hash`) against `slot` for [`merge_batch`](Self::merge_batch).
