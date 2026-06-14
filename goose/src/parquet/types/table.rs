@@ -97,7 +97,15 @@ impl ParquetTable {
         dispatcher: &DataFlowDispatcher,
         paths: &[P],
     ) -> Result<Self> {
-        todo!()
+        let files = paths
+            .iter()
+            .map(|p| {
+                let path = p.as_ref();
+                let size = fs::metadata(path)?.len();
+                Ok(DataFile::local(path.to_path_buf(), size))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Self::from_locations(dispatcher, files)
     }
 
     /// Build a table from remote files: concrete fetchable URLs paired with
@@ -107,7 +115,11 @@ impl ParquetTable {
         dispatcher: &DataFlowDispatcher,
         files: &[(Url, u64)],
     ) -> Result<Self> {
-        todo!()
+        let files = files
+            .iter()
+            .map(|(url, size)| DataFile::remote(url.clone(), *size))
+            .collect();
+        Self::from_locations(dispatcher, files)
     }
 
     /// Read every file's footer in parallel (the metadata-fetch dataflow) and
@@ -115,7 +127,13 @@ impl ParquetTable {
     /// files. Same coordinator requirement as
     /// [`from_directory`](Self::from_directory).
     pub fn from_locations(dispatcher: &DataFlowDispatcher, files: Vec<DataFile>) -> Result<Self> {
-        todo!()
+        let table_files = crate::parquet::metadata::load_table_files(dispatcher, &files)
+            .map_err(|e| Error::Materialize(e.to_string()))?;
+        let row_groups = table_files
+            .iter()
+            .flat_map(|f| f.row_groups().iter().cloned())
+            .collect();
+        Ok(Self::new(row_groups))
     }
 
     /// Returns the Arrow schema (taken from the first row group).

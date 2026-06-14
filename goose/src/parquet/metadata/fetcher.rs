@@ -7,11 +7,10 @@
 //! parse the footer, and — if it overflowed the probe — read it exactly before
 //! parsing.
 
-use super::{IndexedFile, IndexedRowGroup};
 use crate::parquet::request_tracker::{ReadRequest, PendingRequest, RequestTracker};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
-use crate::store::{DataFile, DataFileSource};
+use crate::store::{DataFile, DataFileSource, FileRef};
 use dispatch::io::{FileLocation, FsRequest, HttpRequest, RemoteFile, open_direct_read};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
@@ -50,7 +49,7 @@ pub(super) struct TableFileMetadataFetcher {
 impl TableFileMetadataFetcher {
     /// Advance the read in `slot` as far as it can without blocking on IO: while
     /// its current region is fully present, parse it and either emit the file's
-    /// row groups (done) or issue the next region's read (the exact-footer
+    /// [`TableFile`] (done) or issue the next region's read (the exact-footer
     /// re-read). Stop once a region has reads outstanding or the file is finished.
     ///
     /// Called from `consume` (after the probe) and on each completion — both just
@@ -74,9 +73,8 @@ impl TableFileMetadataFetcher {
                 None => self.tracker.stage_reads_for_slot(slot),
                 Some(row_groups) => {
                     let request = self.tracker.take_request_at_slot(slot);
-                    for rg in row_groups {
-                        // sender.send((request.file_idx, rg))?;
-                    }
+                    let row_groups = row_groups.into_iter().map(Arc::new).collect();
+                    sender.send(TableFile::new(request.file, row_groups))?;
                     return Ok(());
                 }
             }
@@ -85,17 +83,19 @@ impl TableFileMetadataFetcher {
     }
 }
 
-impl Unary<IndexedFile, TableFile> for TableFileMetadataFetcher {
+impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
     fn consume<S: Sender<TableFile>>(
         &mut self,
-        (file_idx, file): IndexedFile,
+        file: DataFile,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
         // Open the file's transport. The size — which locates the footer's tail
         // window with no HEAD/suffix probe — is already carried by the data
         // file (`stat`ed at listing time for a local file, from the store
-        // listing for a remote one).
-        let DataFile { size, source, .. } = file;
+        // listing for a remote one). The `file` ref rides through to the
+        // emitted `TableFile`.
+        let DataFile { file, source } = file;
+        let size = file.size as usize;
         let location = match source {
             DataFileSource::Local(path) => {
                 let file = open_direct_read(&path).map_err(crate::parquet::op_err)?;
@@ -109,7 +109,7 @@ impl Unary<IndexedFile, TableFile> for TableFileMetadataFetcher {
 
         let slot = self
             .tracker
-            .admit_request(RowGroupMetadataRequest::start(file_idx, location, size as usize));
+            .admit_request(RowGroupMetadataRequest::start(file, location, size));
         self.advance(slot, sender)
     }
 
@@ -166,7 +166,8 @@ impl Unary<IndexedFile, TableFile> for TableFileMetadataFetcher {
 /// all landed, [`parse_region`](Self::parse_region) turns it into the file's row
 /// groups (or issues the exact re-read).
 struct RowGroupMetadataRequest {
-    file_idx: usize,
+    /// The file's durable identity, stamped onto the emitted [`TableFile`].
+    file: FileRef,
     /// The open file (it keeps the handle alive, and travels into the row
     /// groups as their location).
     location: FileLocation,
@@ -196,10 +197,10 @@ impl PendingRequest for RowGroupMetadataRequest {
 impl RowGroupMetadataRequest {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
-    fn start(file_idx: usize, location: FileLocation, size: usize) -> Self {
+    fn start(file: FileRef, location: FileLocation, size: usize) -> Self {
         memory_ctx().file_cache().open_entry(location.clone());
         let mut request = Self {
-            file_idx,
+            file,
             location,
             size,
             lookups: Vec::new(),

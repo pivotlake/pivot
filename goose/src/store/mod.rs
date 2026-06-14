@@ -53,14 +53,14 @@ pub struct FileRef {
     pub size: u64,
 }
 
-/// A [`FileRef`] located for reading: its size (locates the footer without a
-/// `stat`/HEAD) and where its bytes live. Produced transiently by
-/// [`ObjectStore::data_file`] / [`local_parquet_files`] and consumed straight by
-/// the metadata fetcher — never stored. The file's *name* isn't needed to read
-/// it; it stays in the [`FileRef`] the caller already holds.
+/// A [`FileRef`] located for reading: its identity (`file`, whose size locates
+/// the footer without a `stat`/HEAD) plus where its bytes live (`source`).
+/// Produced transiently by [`ObjectStore::data_file`] and consumed straight by
+/// the metadata fetcher, which stamps the `file` onto the `TableFile` it emits —
+/// so the file's identity travels with its bytes through the load.
 #[derive(Clone, Debug)]
 pub struct DataFile {
-    pub size: u64,
+    pub file: FileRef,
     pub source: DataFileSource,
 }
 
@@ -75,11 +75,30 @@ pub enum DataFileSource {
 }
 
 impl DataFile {
-    /// A data file on the local filesystem.
+    /// A data file on the local filesystem; its [`FileRef`] name is the path's
+    /// final component.
     pub fn local(path: PathBuf, size: u64) -> Self {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         Self {
-            size,
+            file: FileRef { name, size },
             source: DataFileSource::Local(path),
+        }
+    }
+
+    /// A data file at a concrete (already-presigned) remote URL; its [`FileRef`]
+    /// name is the URL path's final segment.
+    pub fn remote(url: url::Url, size: u64) -> Self {
+        let name = url
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .unwrap_or_default()
+            .to_string();
+        Self {
+            file: FileRef { name, size },
+            source: DataFileSource::Remote(url),
         }
     }
 }
@@ -144,6 +163,21 @@ pub(crate) fn join_prefix(prefix: &str, key: &str) -> String {
         key.trim_start_matches('/').to_string()
     } else {
         format!("{prefix}/{}", key.trim_start_matches('/'))
+    }
+}
+
+/// The store key of a file `name` sitting directly in table-data location
+/// `location` — `location/name`, preserving `location`'s absoluteness (a leading
+/// `/` marks a location at the store's own root) so the store interprets
+/// relative-vs-absolute exactly as it does for any other key. The companion to
+/// [`join_prefix`] used where the *table's* data location, not the database
+/// prefix, is the directory.
+pub(crate) fn location_key(location: &str, name: &str) -> String {
+    let joined = join_prefix(location, name);
+    if location.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
     }
 }
 

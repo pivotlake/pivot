@@ -237,7 +237,10 @@ impl ObjectStore for S3Store {
 
     fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
         Ok(DataFile {
-            size,
+            file: FileRef {
+                name: super::key_name(key),
+                size,
+            },
             source: DataFileSource::Remote(self.presign_get(key)?),
         })
     }

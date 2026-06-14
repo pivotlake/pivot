@@ -5,7 +5,6 @@
 //! no rows.
 
 use std::mem;
-use super::{IndexedRowGroup};
 use arrow_array::RecordBatch;
 use dispatch::{Sender, Unary, UnaryFactory};
 use crate::catalog::TableFile;

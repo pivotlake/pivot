@@ -1,5 +1,5 @@
 //! The catalog's master record of one table: its definition plus its current
-//! content — the files at one [`table_log`](crate::table_log) version.
+//! content — the files at one manifest version.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,6 +19,19 @@ pub struct TableFile {
     pub(super) row_groups: Vec<Arc<RowGroupMetadata>>,
 }
 
+impl TableFile {
+    /// Pair a file's identity with the row groups read from its footer. Built by
+    /// the metadata fetcher (one per file) and the catalog's table assembly.
+    pub(crate) fn new(file: FileRef, row_groups: Vec<Arc<RowGroupMetadata>>) -> Self {
+        Self { file, row_groups }
+    }
+
+    /// This file's row groups, in file-local order.
+    pub(crate) fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
+        &self.row_groups
+    }
+}
+
 /// The catalog's master record of one table: its definition (name, declared
 /// columns, data location) and its current content — the per-file row groups at
 /// one log version. A change (a registered file, a compaction swap) replaces
@@ -34,8 +47,21 @@ pub struct CatalogTable {
 }
 
 impl CatalogTable {
-    pub(super) fn new(...) {
-        
+    /// Assemble the master record from a table's definition (`manifest`), the
+    /// manifest `version` those files were read at, and the per-file row groups
+    /// (`files`). `store` is retained so the entry can reload itself in place.
+    pub(super) fn new(
+        manifest: TableManifest,
+        version: u64,
+        files: Vec<TableFile>,
+        store: Arc<dyn ObjectStore>,
+    ) -> Self {
+        Self {
+            manifest,
+            version,
+            files,
+            store,
+        }
     }
 
 

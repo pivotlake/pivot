@@ -225,6 +225,15 @@ impl ParquetCatalog {
         let location = Self::get_path_for_create_table(&request)?;
         let manifest_entry = CatalogManifestTableEntry::new(request.name);
 
+        // Locate every data file under the table's directory for reading, keeping
+        // its `FileRef` identity so each footer's row groups land on the right
+        // `TableFile`.
+        let files = self
+            .list_file_refs(&location)?
+            .into_iter()
+            .map(|f| self.store.data_file(&location_key(&location, &f.name), f.size))
+            .collect::<store::Result<Vec<DataFile>>>()?;
+
         // The commit runs on the dataflow's last worker once the footers are
         // fetched: record the table durably (manifest + seed log version), then
         // in the in-memory map (re-checking the name under the lock as a race
@@ -232,14 +241,14 @@ impl ParquetCatalog {
         let tables = self.tables.clone();
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
-            self.list_file_refs(&location)?.into_iter().map(|f| self.store.data_file(&f.name, f.size)),
-            move |loaded: Vec<TableFile>| {
+            &files,
+            move |_loaded: Vec<TableFile>| {
                 let mut map = tables.write().unwrap();
                 if map.contains_key(&manifest_entry.name) {
                     return Err(Box::new(Error::TableExists(manifest_entry.name))
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
-                // todo: Create new CatalogTable, update manifest
+                // todo: Create new CatalogTable from `_loaded`, update manifest.
                 Ok(())
             },
         ))
