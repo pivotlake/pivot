@@ -369,19 +369,23 @@ impl Catalog for ParquetCatalog {
     /// pushdown prunes its view without affecting other concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
         let mut table = self.tables.read().unwrap().get(name)?.clone();
-        match table.refresh() {
-            // Advanced — publish the reloaded copy for the next resolve.
-            Ok(true) => {
-                self.tables.write().unwrap().insert(name.to_string(), table.clone());
-            }
-            Ok(false) => {}
+        let advanced = match table.refresh() {
+            Ok(advanced) => advanced,
             // Serve the version we have rather than failing the query; the next
             // resolve retries the reload.
             Err(e) => {
-                warn!(table = name, error = %e, "table refresh failed; serving last known version")
+                warn!(table = name, error = %e, "table refresh failed; serving last known version");
+                false
             }
+        };
+        // Take the binding off the copy (it clones only the row-group `Arc`s it
+        // needs), then — if the copy advanced — publish it for the next resolve
+        // by moving it in, no second full clone.
+        let binding = table.binding();
+        if advanced {
+            self.tables.write().unwrap().insert(name.to_string(), table);
         }
-        Some(Box::new(table.binding()))
+        Some(Box::new(binding))
     }
 
     fn create_table(
