@@ -4,6 +4,39 @@ use bytes::Bytes;
 use dispatch::io::{FileLocation, FsRequest, HttpRequest};
 use dispatch::memory::{CacheLookup, memory_ctx};
 
+/// Identity of one cache-block read a row group needs: which file, and the exact
+/// byte run (`offset`, `len`) within it. Hashable so the fetcher can dedup
+/// identical reads and route a completion to *every* waiter that needs exactly
+/// this run. Including `len` in the identity is what keeps two reads at the same
+/// offset but different lengths distinct — a short read never satisfies a waiter
+/// that needs a longer one.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RowGroupRead {
+    pub location: FileLocation,
+    pub offset: usize,
+    pub len: usize,
+}
+
+impl RowGroupRead {
+    /// The read a local filesystem request fulfills.
+    pub fn of_fs(req: &FsRequest) -> Self {
+        Self {
+            location: FileLocation::Local(req.file.clone()),
+            offset: req.block.file_offset(),
+            len: req.block.len(),
+        }
+    }
+
+    /// The read a remote HTTP request fulfills.
+    pub fn of_http(req: &HttpRequest) -> Self {
+        Self {
+            location: FileLocation::Remote(req.remote.clone()),
+            offset: req.block.file_offset(),
+            len: req.block.len(),
+        }
+    }
+}
+
 /// Tracks the IO state for a single column chunk within a row group.
 ///
 /// The chunk's byte range is looked up in the file cache as one
@@ -64,11 +97,13 @@ impl ColumnRequest {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     column_requests: Vec<ColumnRequest>,
-    /// Local filesystem read requests not yet submitted to io-uring.
+    /// Local filesystem reads not yet handed to the fetcher (drained when the
+    /// row group is admitted).
     pending_fs: Vec<FsRequest>,
-    /// Remote HTTP range-read requests not yet submitted to the ring.
+    /// Remote HTTP reads not yet handed to the fetcher.
     pending_http: Vec<HttpRequest>,
-    /// Outstanding read count (pending + in-flight).
+    /// Outstanding read count (decremented as each of this row group's reads
+    /// lands).
     remaining: usize,
 }
 
@@ -112,12 +147,13 @@ impl RowGroupRequest {
         self.remaining == 0
     }
 
-    /// Returns local filesystem read requests that haven't been submitted yet.
+    /// This row group's not-yet-submitted local filesystem reads (drained by the
+    /// fetcher when the row group is admitted).
     pub fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
         &mut self.pending_fs
     }
 
-    /// Returns remote HTTP range-read requests that haven't been submitted yet.
+    /// This row group's not-yet-submitted remote HTTP reads.
     pub fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
         &mut self.pending_http
     }

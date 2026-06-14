@@ -18,18 +18,21 @@
 //! gates (an all-remote scan keeps `disk_in_flight` at 0, an all-local scan
 //! keeps `http_in_flight` at 0).
 //!
-//! Completions are routed back to the in-flight row group that issued them by
-//! their `(location, file offset)`. The route is a queue, not a single slot,
-//! because a row group can issue more than one read at the same offset (two
-//! small column chunks sharing a cache region) and completions for a key are
-//! interchangeable (the bytes are already committed) — so any waiter claims one.
+//! Reads are keyed by [`RowGroupRead`] — `(location, offset, len)`, i.e. the
+//! exact byte run, not just the offset. When a row group is admitted, each of
+//! its reads is registered against that key; if the *same* read is already
+//! scheduled (another waiter, or another column of the same row group), the new
+//! waiter just joins the existing route and no duplicate read is issued. A
+//! completion for a key then credits *every* waiter on it — sound because they
+//! all need exactly that run, whose bytes are now committed. (Keying on offset
+//! alone would let a short read wrongly satisfy a waiter needing a longer run at
+//! the same offset.)
 
-use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRequest};
+use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRead, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::io::{FileLocation, FsRequest, HttpRequest};
+use dispatch::io::{FsRequest, HttpRequest};
 use std::collections::HashMap;
-use std::collections::VecDeque;
 
 /// Disk-backed read blocks outstanding per worker before admitting another row
 /// group. One keeps disk reads serial — io_uring gives a single read ample
@@ -46,10 +49,15 @@ pub struct RowGroupFetcher {
     in_flight: Vec<Option<RowGroupRequest>>,
     /// Reusable freed slot indices.
     free_slots: Vec<usize>,
-    /// `(location, file offset)` → slots awaiting a completion at that key. A
-    /// queue, not a single slot: two column chunks sharing a cache region issue
-    /// two reads at the same key, so a key can have several waiters.
-    routing: HashMap<(FileLocation, usize), VecDeque<usize>>,
+    /// Each scheduled [`RowGroupRead`] → the slots awaiting it. Doubles as the
+    /// dedup index: a read already present here is in flight, so a new waiter
+    /// joins the list instead of issuing the read again.
+    routing: HashMap<RowGroupRead, Vec<usize>>,
+    /// Local filesystem reads queued but not yet submitted to the ring (deduped;
+    /// drained by [`next_fs_requests`](Self::next_fs_requests)).
+    pending_fs: Vec<FsRequest>,
+    /// Remote HTTP reads queued but not yet submitted.
+    pending_http: Vec<HttpRequest>,
     /// Outstanding disk-backed read blocks (soft-capped at [`MAX_DISK_IN_FLIGHT`]
     /// when admitting new row groups).
     disk_in_flight: usize,
@@ -69,29 +77,41 @@ impl RowGroupFetcher {
         }
     }
 
-    /// Count the row group in `slot`'s reads toward the in-flight cap — one per
-    /// missing block, not per row group — and route each block's completion back
-    /// to `slot`. A request is local xor remote, so only one counter moves.
+    /// Register the row group in `slot`'s reads: route each back to `slot`, and
+    /// for any read not already scheduled, queue it for submission and count it
+    /// toward the in-flight cap. A read already in `routing` is deduped — the
+    /// new waiter just joins it, no second read is issued or counted.
     ///
-    /// Counting per block makes the cap soft: a row group may stage more blocks
-    /// than the cap, but [`ready_for_more_work`](Self::ready_for_more_work) then
-    /// stops admitting the *next* row group until they drain.
+    /// Counting per submitted read (not per row group) makes the cap soft: a row
+    /// group may push over it, but [`ready_for_more_work`](Self::ready_for_more_work)
+    /// then stops admitting the *next* until they drain.
     fn stage_reads(&mut self, slot: usize) {
-        let rg = self.in_flight[slot].as_mut().unwrap();
-        let fs_keys: Vec<(FileLocation, usize)> = rg
-            .pending_fs()
-            .iter()
-            .map(|fs| (FileLocation::Local(fs.file.clone()), fs.block.file_offset()))
-            .collect();
-        let http_keys: Vec<(FileLocation, usize)> = rg
-            .pending_http()
-            .iter()
-            .map(|http| (FileLocation::Remote(http.remote.clone()), http.block.file_offset()))
-            .collect();
-        self.disk_in_flight += fs_keys.len();
-        self.http_in_flight += http_keys.len();
-        for key in fs_keys.into_iter().chain(http_keys) {
-            self.routing.entry(key).or_default().push_back(slot);
+        let (fs, http) = {
+            let rg = self.in_flight[slot].as_mut().unwrap();
+            (
+                std::mem::take(rg.pending_fs()),
+                std::mem::take(rg.pending_http()),
+            )
+        };
+        for req in fs {
+            let read = RowGroupRead::of_fs(&req);
+            if let Some(waiters) = self.routing.get_mut(&read) {
+                waiters.push(slot);
+            } else {
+                self.routing.insert(read, vec![slot]);
+                self.pending_fs.push(req);
+                self.disk_in_flight += 1;
+            }
+        }
+        for req in http {
+            let read = RowGroupRead::of_http(&req);
+            if let Some(waiters) = self.routing.get_mut(&read) {
+                waiters.push(slot);
+            } else {
+                self.routing.insert(read, vec![slot]);
+                self.pending_http.push(req);
+                self.http_in_flight += 1;
+            }
         }
     }
 
@@ -109,30 +129,27 @@ impl RowGroupFetcher {
         Ok(())
     }
 
-    /// A completed read (fs or http): the requester already committed its bytes
-    /// into the cache slot, so route it to the owning row group and count it off.
-    ///
-    /// Every submitted read registered a waiter in `consume`, and the ring
-    /// delivers exactly one completion per read, so the key is always present
-    /// with a non-empty queue and the slot is still in flight. The queue can hold
-    /// more than one waiter (two column chunks sharing a cache region issue two
-    /// reads at the same key); any waiter claims a completion, since the bytes are
-    /// already committed.
+    /// A completed read (fs or http): its bytes are now committed in the cache,
+    /// so credit *every* row group waiting on this exact read and emit any that
+    /// are now done. The read was registered (and submitted once) in `consume`,
+    /// and the ring delivers one completion per submitted read, so the entry is
+    /// present. Credit all before emitting, so a slot listed twice (a row group
+    /// that needed this read for two columns) is fully counted before it emits.
     fn process_completion<S: Sender<RowGroupBuffer>>(
         &mut self,
-        key: (FileLocation, usize),
+        read: RowGroupRead,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
         let waiters = self
             .routing
-            .get_mut(&key)
+            .remove(&read)
             .expect("completion for an unrouted read");
-        let slot = waiters.pop_front().expect("empty routing queue");
-        if waiters.is_empty() {
-            self.routing.remove(&key);
+        for &slot in &waiters {
+            self.in_flight[slot].as_mut().unwrap().complete_one();
         }
-        self.in_flight[slot].as_mut().unwrap().complete_one();
-        self.emit_if_complete(slot, sender)?;
+        for slot in waiters {
+            self.emit_if_complete(slot, sender)?;
+        }
         Ok(())
     }
 }
@@ -151,19 +168,11 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
     }
 
     fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
-        let mut all = Vec::new();
-        for rg in self.in_flight.iter_mut().flatten() {
-            all.append(rg.pending_fs());
-        }
-        Ok(all)
+        Ok(std::mem::take(&mut self.pending_fs))
     }
 
     fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
-        let mut all = Vec::new();
-        for rg in self.in_flight.iter_mut().flatten() {
-            all.append(rg.pending_http());
-        }
-        Ok(all)
+        Ok(std::mem::take(&mut self.pending_http))
     }
 
     fn ready_for_more_work(&mut self) -> bool {
@@ -176,11 +185,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         request: FsRequest,
     ) -> dispatch::UnaryResult<()> {
         self.disk_in_flight -= 1;
-        let key = (
-            FileLocation::Local(request.file),
-            request.block.file_offset(),
-        );
-        self.process_completion(key, sender)
+        self.process_completion(RowGroupRead::of_fs(&request), sender)
     }
 
     fn process_http_response<S: Sender<RowGroupBuffer>>(
@@ -189,11 +194,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         request: HttpRequest,
     ) -> dispatch::UnaryResult<()> {
         self.http_in_flight -= 1;
-        let key = (
-            FileLocation::Remote(request.remote),
-            request.block.file_offset(),
-        );
-        self.process_completion(key, sender)
+        self.process_completion(RowGroupRead::of_http(&request), sender)
     }
 
     fn finish<S: Sender<RowGroupBuffer>>(
