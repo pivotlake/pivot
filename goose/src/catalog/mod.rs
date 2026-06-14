@@ -68,8 +68,6 @@ pub enum Error {
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
     TableExists(String),
-    #[error("no file at `{0}` in the table's data location to register")]
-    FileNotInTableLocation(ObjectPath),
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
@@ -98,7 +96,7 @@ impl From<Error> for CatalogError {
 /// the entry in this shared map. After that, a table evolves by manifest commits
 /// on a [`CatalogTable`] *copy* — a writer takes one with
 /// [`table_handle`](Self::table_handle) and calls
-/// [`register_data_file`](CatalogTable::register_data_file) /
+/// [`append_data_file`](CatalogTable::append_data_file) /
 /// [`replace_data_files`](CatalogTable::replace_data_files), which CAS a new
 /// version into the store. Copies drift; every query resolve refreshes its copy
 /// to the latest committed version, so a commit by another process (or this one)
@@ -215,7 +213,7 @@ impl ParquetCatalog {
     }
 
     /// A clone of the named table's current state for a writer (ingest,
-    /// compaction) to evolve — [`register_data_file`](CatalogTable::register_data_file)
+    /// compaction) to evolve — [`append_data_file`](CatalogTable::append_data_file)
     /// or [`replace_data_files`](CatalogTable::replace_data_files). Those commit
     /// a new version by CAS to the shared store, so this catalog's own copy may
     /// lag until its next resolve refreshes it (which is fine — the store is the

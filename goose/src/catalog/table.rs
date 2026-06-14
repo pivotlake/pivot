@@ -41,7 +41,7 @@ impl TableFile {
 /// It is a plain **value** — `Clone`, no interior locks. A writer (ingest,
 /// compaction) clones one out of the catalog, mutates its own copy, and lets the
 /// durable manifest be the source of truth: every mutation
-/// ([`register_data_file`](Self::register_data_file),
+/// ([`append_data_file`](Self::append_data_file),
 /// [`replace_data_files`](Self::replace_data_files)) commits a new manifest
 /// version by compare-and-swap, retrying past a concurrent writer. Copies drift
 /// freely; [`refresh`](Self::refresh) reconciles any copy to the latest version
@@ -133,33 +133,6 @@ impl CatalogTable {
     pub fn append_data_file(&mut self, path: ObjectPath, bytes: &[u8]) -> crate::Result<()> {
         let file = self.write_data_file(path, bytes)?;
         self.commit_added_file(file)
-    }
-
-    /// Register an already-written Parquet data file at object path `path`:
-    /// commit a new manifest version whose file list is `latest + this file`,
-    /// retrying past concurrent commits.
-    ///
-    /// `path` may be relative to the table's data location or absolute; either
-    /// way it must resolve to a file a `list` of the location actually finds
-    /// (which is where its size comes from, and what confirms it belongs to the
-    /// table) — otherwise [`Error::FileNotInTableLocation`]. Registering a file
-    /// the manifest already holds is an idempotent no-op (so a replayed
-    /// notification can't double-count rows). The file is recorded by its
-    /// location-relative path.
-    pub fn register_data_file(&mut self, path: ObjectPath) -> crate::Result<()> {
-        // Match the file in the location's listing by resolved path, so a
-        // relative or absolute `path` both land on the same file — and one
-        // pointing outside the table's location matches nothing.
-        let target = self.location.resolve(&path);
-        let Some(new_file) = self
-            .store
-            .list(&self.location)?
-            .into_iter()
-            .find(|f| self.location.resolve(&f.path) == target)
-        else {
-            return Err(Error::FileNotInTableLocation(path));
-        };
-        self.commit_added_file(new_file)
     }
 
     /// CAS-commit one already-written file into the manifest, retrying past a

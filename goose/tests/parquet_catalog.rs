@@ -337,17 +337,17 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
     path
 }
 
-/// Register `path` with table `name` through a cloned-out handle — the
-/// table-level API a writer (ingest) uses: it CAS-commits a new manifest version
-/// to the shared store. The catalog's own copy is not touched (a later `resolve`
-/// reconciles it). Registers by a **table-relative** path (just the file's
-/// name), which the table resolves under its location.
-fn register(catalog: &ParquetCatalog, name: &str, path: &Path) {
+/// Append the file at `path` to table `name` through a cloned-out handle — the
+/// table-level API a writer (ingest) uses: it writes the bytes into the table's
+/// location and CAS-commits the file. The catalog's own copy is not touched (a
+/// later `resolve` reconciles it). Recorded by its location-relative name.
+fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
+    let bytes = std::fs::read(path).unwrap();
     let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
     catalog
         .table_handle(name)
         .expect("table exists")
-        .register_data_file(relative)
+        .append_data_file(relative, &bytes)
         .unwrap()
 }
 
@@ -358,17 +358,17 @@ fn resolve(catalog: &ParquetCatalog, name: &str) {
 }
 
 
-/// A file flushed after `CREATE TABLE` becomes visible to new binds once
-/// registered, with global row-group indices kept sequential.
+/// A file appended after `CREATE TABLE` becomes visible to new binds, with
+/// global row-group indices kept sequential.
 #[test]
-fn register_data_file_makes_new_file_visible_to_new_binds() {
+fn append_data_file_makes_new_file_visible_to_new_binds() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
-    register(&catalog, "t", &new_file);
+    append(&catalog, "t", &new_file);
 
     resolve(&catalog, "t");
     let table = catalog.binding("t").unwrap();
@@ -377,55 +377,30 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
 }
 
-/// Registering the same path twice (a replayed flush notification) must not
+/// Appending the same path twice (a replayed flush notification) must not
 /// double-count its rows. The second handle starts a version behind, so it CAS-
 /// conflicts, refreshes, and sees the file already present.
 #[test]
-fn register_data_file_is_idempotent_per_path() {
+fn append_data_file_is_idempotent_per_path() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40]);
-    register(&catalog, "t", &new_file);
-    // Registering the same file again is a no-op (it must not double-count).
-    register(&catalog, "t", &new_file);
+    append(&catalog, "t", &new_file);
+    // Appending the same file again is a no-op (it must not double-count).
+    append(&catalog, "t", &new_file);
 
     resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
 }
 
 /// No table yet (ingest runs before `CREATE TABLE`): there is no handle to
-/// register against.
+/// append against.
 #[test]
-fn register_data_file_without_table_is_unresolvable() {
-    let dir = TempDir::new().unwrap();
+fn table_handle_for_a_missing_table_is_none() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    let _new_file = write_ids(dir.path(), "later.parquet", &[1]);
     assert!(catalog.table_handle("missing").is_none());
-}
-
-/// A file outside the table's data directory (an absolute path resolving
-/// elsewhere) must not be appended to it.
-#[test]
-fn register_data_file_refuses_foreign_directory() {
-    let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-
-    let elsewhere = TempDir::new().unwrap();
-    let foreign = write_ids(elsewhere.path(), "foreign.parquet", &[1]);
-    let err = catalog
-        .table_handle("t")
-        .unwrap()
-        .register_data_file(ObjectPath::new(foreign.to_string_lossy()))
-        .unwrap_err();
-    assert!(
-        matches!(err, goose::Error::FileNotInTableLocation(_)),
-        "expected a not-in-location error: {err}"
-    );
-    resolve(&catalog, "t");
-    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 }
 
 /// Compaction's commit: the small files' row groups vanish, the merged file's
@@ -436,7 +411,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let extra = write_ids(dir.path(), "extra.parquet", &[40]);
-    register(&catalog, "t", &extra);
+    append(&catalog, "t", &extra);
     resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
 
@@ -461,10 +436,10 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 }
 
 /// A second catalog over the same persisted root sees another instance's
-/// registration at its next bind: `Catalog::table` refreshes from the committed
+/// append at its next bind: `Catalog::table` refreshes from the committed
 /// manifest, so cross-process commits surface without any re-`CREATE`.
 #[test]
-fn other_catalog_instance_sees_registration_at_next_bind() {
+fn other_catalog_instance_sees_append_at_next_bind() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     let writer =
@@ -476,7 +451,7 @@ fn other_catalog_instance_sees_registration_at_next_bind() {
     assert_eq!(reader.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
-    register(&writer, "t", &new_file);
+    append(&writer, "t", &new_file);
 
     // Binding through the trait (what a query does) reloads to version 2.
     assert!(PlannerCatalog::table(&reader, "t").is_some());
@@ -492,10 +467,10 @@ fn other_catalog_instance_sees_registration_at_next_bind() {
     );
 }
 
-/// Restart reads the committed manifest, not the directory: files registered
+/// Restart reads the committed manifest, not the directory: files appended
 /// after the `CREATE` survive a reopen.
 #[test]
-fn reopened_database_restores_registered_files_from_log() {
+fn reopened_database_restores_appended_files_from_manifest() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
@@ -503,7 +478,7 @@ fn reopened_database_restores_registered_files_from_log() {
             Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
         create_table(&catalog, create_request("t", data_dir.path(), columns)).unwrap();
         let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
-        register(&catalog, "t", &new_file);
+        append(&catalog, "t", &new_file);
     }
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let table = reopened.binding("t").unwrap();
