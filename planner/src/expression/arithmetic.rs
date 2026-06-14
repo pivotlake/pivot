@@ -1,12 +1,53 @@
 //! [`Arithmetic`] — binary integer `+`/`-`/`*` and its [`ArithmeticOp`].
 
-use super::shared::{ArithKernel, arith_coerced};
 use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::numeric::{add_wrapping, mul_wrapping, sub_wrapping};
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
+use arrow_schema::{ArrowError, DataType};
 use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
+
+/// Signature shared by arrow's wrapping arithmetic kernels.
+type ArithKernel = fn(&dyn Datum, &dyn Datum) -> std::result::Result<ArrayRef, ArrowError>;
+
+/// Run an arithmetic kernel, coercing both operands to a common type when
+/// their data types differ — arrow's kernels require matching types (the
+/// kernel falls through to `InvalidArgumentError` on any mismatch). DuckDB
+/// normally pre-casts both operands to one type, so the matching-type branch
+/// (which runs the kernel natively for integers, floats, and decimals alike)
+/// is the common case; the coercion branch only fires when the declared
+/// logical type and the physical parquet array diverge.
+///
+/// The common type must *preserve values*: unconditionally casting to Int64
+/// would silently truncate floating-point and decimal operands (`1.5 -> 1`),
+/// so we promote to Float64 whenever either side is non-integer and only fall
+/// back to Int64 for genuinely integer operands.
+fn arith_coerced(left: &dyn Datum, right: &dyn Datum, kernel: ArithKernel) -> ArrayRef {
+    let (la, l_scalar) = left.get();
+    let (ra, r_scalar) = right.get();
+    if la.data_type() == ra.data_type() {
+        return kernel(left, right).unwrap();
+    }
+    let common = if la.data_type().is_integer() && ra.data_type().is_integer() {
+        DataType::Int64
+    } else {
+        DataType::Float64
+    };
+    let lc = arrow::compute::cast(la, &common).unwrap();
+    let rc = arrow::compute::cast(ra, &common).unwrap();
+    let ld: Box<dyn Datum> = if l_scalar {
+        Box::new(Scalar::new(lc))
+    } else {
+        Box::new(lc)
+    };
+    let rd: Box<dyn Datum> = if r_scalar {
+        Box::new(Scalar::new(rc))
+    } else {
+        Box::new(rc)
+    };
+    kernel(ld.as_ref(), rd.as_ref()).unwrap()
+}
 
 /// The operator of a binary integer [`Arithmetic`] expression.
 #[derive(Debug, Clone, Copy)]

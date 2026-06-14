@@ -7,8 +7,8 @@
 //! [`ExprFn`](crate::compile::ExprFn). This module holds the cross-cutting
 //! pieces: the [`Expression`] / [`Function`] enums that tie the kinds together,
 //! the conversion [`Error`], the pushed-down [`TableFilter`], and the small
-//! `Display`/constant helpers shared across kinds. Coercion and civil-date
-//! helpers used by more than one `compile` impl live in [`shared`].
+//! `Display`/constant helpers shared across kinds. The comparison-coercion
+//! helper used by more than one `compile` impl lives in [`shared`].
 
 mod aggregate;
 mod arithmetic;
