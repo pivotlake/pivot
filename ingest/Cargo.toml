@@ -31,8 +31,6 @@ opentelemetry-proto = { version = "0.31", default-features = false, features = [
 ] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
-# Upload Parquet to object storage (gs://, s3://). Local writes bypass this.
-object_store = { version = "0.12", features = ["gcp", "aws"] }
 # OTLP column mappings are configured via TOML (see `otel::config`).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

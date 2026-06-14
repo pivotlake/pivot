@@ -24,11 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dispatch::DataFlowDispatcher;
 use goose::ParquetCatalog;
-use goose::store::ObjectPath;
-use object_store::aws::AmazonS3Builder;
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::path::Path as StorePath;
-use object_store::{ObjectStore, PutPayload};
+use goose::store::{ObjectPath, ObjectStore, open_store};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -41,12 +37,6 @@ pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// written; the flush's remainder lands in a final, smaller file.
 pub(crate) const ROW_GROUPS_PER_FILE: usize = 8;
 
-/// Subdirectory (inside a local sink directory) where files are written before
-/// being atomically renamed into place. It is a directory, so
-/// `ParquetTable::from_directory` — which only looks at *files* in the top
-/// level — never tries to parse a half-written file.
-pub(crate) const INFLIGHT_DIR: &str = ".inflight";
-
 /// Where a sink writes its Parquet files.
 #[derive(Debug, Clone)]
 pub enum SinkDestination {
@@ -55,10 +45,11 @@ pub enum SinkDestination {
     Local(PathBuf),
     /// An object-store URL (`gs://bucket/prefix` or `s3://bucket/prefix`).
     ///
-    /// **Write-only**: pivot's reader only opens local directories, so object
-    /// storage is an export target — read it elsewhere (e.g. DuckDB
-    /// `read_parquet`). Credentials come from the environment
-    /// (`GOOGLE_APPLICATION_CREDENTIALS`, `AWS_*`, workload identity, …).
+    /// **Write-only export**: the files are written through goose's store but
+    /// not registered with the catalog (the catalog's own database store, not
+    /// this sink's, is what reads a table — they only align for a local sink).
+    /// Credentials come from the environment (`GOOGLE_APPLICATION_CREDENTIALS`,
+    /// `AWS_*`, workload identity, …).
     Remote(String),
 }
 
@@ -75,105 +66,55 @@ impl SinkDestination {
     }
 }
 
-/// The resolved write target for a sink.
-enum Backend {
-    Local {
-        dir: PathBuf,
-        inflight: PathBuf,
-    },
-    Remote {
-        store: Arc<dyn ObjectStore>,
-        prefix: StorePath,
-        /// Original URL, for human-readable log lines.
-        url: String,
-    },
+/// The resolved write target for a sink: a goose [`ObjectStore`] rooted at the
+/// destination (a local dir, S3, or GCS — built once so misconfiguration
+/// surfaces at startup) plus a human-readable form for logs. The same store
+/// stack the catalog reads through, so a flushed file is written and registered
+/// through one mechanism. `registers` is set for a **local** destination (whose
+/// files the catalog can read back and so register for immediate visibility); a
+/// remote destination is a write-only export.
+struct Backend {
+    store: Arc<dyn ObjectStore>,
+    registers: bool,
+    /// The destination, for log lines.
+    display: String,
 }
 
 impl Backend {
-    /// Resolve a [`SinkDestination`] into a usable backend, creating local
-    /// directories or building the object-store client up front so
+    /// Resolve a [`SinkDestination`] into a goose store, creating a local
+    /// directory or building/validating the remote client up front so
     /// misconfiguration is reported at startup.
     fn build(dest: &SinkDestination) -> std::io::Result<Self> {
-        match dest {
+        let (uri, registers, display) = match dest {
             SinkDestination::Local(dir) => {
-                let inflight = dir.join(INFLIGHT_DIR);
-                std::fs::create_dir_all(&inflight)?;
-                Ok(Backend::Local {
-                    dir: dir.clone(),
-                    inflight,
-                })
+                // Create the directory now so a bad path is reported at startup.
+                std::fs::create_dir_all(dir)?;
+                let uri = dir.to_str().ok_or_else(|| {
+                    std::io::Error::other(format!("non-UTF-8 sink path {}", dir.display()))
+                })?;
+                (uri.to_string(), true, dir.display().to_string())
             }
-            SinkDestination::Remote(url) => {
-                let (store, prefix) = build_object_store(url).map_err(std::io::Error::other)?;
-                Ok(Backend::Remote {
-                    store,
-                    prefix,
-                    url: url.clone(),
-                })
-            }
-        }
+            SinkDestination::Remote(url) => (url.clone(), false, url.clone()),
+        };
+        let store: Arc<dyn ObjectStore> = open_store(&uri).map_err(std::io::Error::other)?.into();
+        Ok(Self {
+            store,
+            registers,
+            display,
+        })
     }
 
-    /// Write `bytes` as `file_name`, returning a printable location for logs
-    /// plus — for a local write — the file's final path, which the caller
-    /// registers with the catalog. Local writes go to the `.inflight` dir then
-    /// atomically rename into place (so a concurrent reader never sees a
-    /// partial file); remote writes upload directly.
-    async fn put(
-        &self,
-        file_name: &str,
-        bytes: Vec<u8>,
-    ) -> Result<(String, Option<PathBuf>), String> {
-        match self {
-            Backend::Local { dir, inflight } => {
-                let final_path = dir.join(file_name);
-                let inflight_path = inflight.join(file_name);
-                let dest = final_path.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    std::fs::write(&inflight_path, &bytes)
-                        .map_err(|e| format!("write {}: {e}", inflight_path.display()))?;
-                    std::fs::rename(&inflight_path, &dest)
-                        .map_err(|e| format!("rename into {}: {e}", dest.display()))?;
-                    Ok(())
-                })
-                .await
-                .map_err(|e| format!("blocking write task: {e}"))??;
-                Ok((final_path.display().to_string(), Some(final_path)))
-            }
-            Backend::Remote { store, prefix, url } => {
-                let path = prefix.child(file_name);
-                store
-                    .put(&path, PutPayload::from(bytes))
-                    .await
-                    .map_err(|e| format!("object store put: {e}"))?;
-                Ok((format!("{}/{}", url.trim_end_matches('/'), file_name), None))
-            }
-        }
-    }
-}
-
-/// Build an [`ObjectStore`] and base prefix from a `gs://` / `s3://` URL.
-/// Credentials are read from the environment.
-fn build_object_store(url: &str) -> Result<(Arc<dyn ObjectStore>, StorePath), String> {
-    if let Some(rest) = url.strip_prefix("gs://") {
-        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-        let store = GoogleCloudStorageBuilder::from_env()
-            .with_bucket_name(bucket)
-            .build()
-            .map_err(|e| format!("building GCS store for `{bucket}`: {e}"))?;
-        Ok((Arc::new(store), StorePath::from(prefix)))
-    } else if let Some(rest) = url
-        .strip_prefix("s3://")
-        .or_else(|| url.strip_prefix("s3a://"))
-    {
-        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-        let store = AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .build()
-            .map_err(|e| format!("building S3 store for `{bucket}`: {e}"))?;
-        Ok((Arc::new(store), StorePath::from(prefix)))
-    } else {
-        Err(format!("unsupported object-store url `{url}`"))
+    /// Write `bytes` as `file_name` directly under the destination. goose's
+    /// store does the atomic write (a sibling temp object renamed into place),
+    /// so a concurrent reader never sees a half-written `.parquet`. The store is
+    /// synchronous, so the write runs on a blocking thread.
+    async fn put(&self, file_name: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let store = self.store.clone();
+        let path = ObjectPath::new(file_name);
+        tokio::task::spawn_blocking(move || store.put(&path, &bytes))
+            .await
+            .map_err(|e| format!("blocking write task: {e}"))?
+            .map_err(|e| format!("object store put: {e}"))
     }
 }
 
@@ -324,14 +265,14 @@ impl<T: ToRecordBatch> ParquetSink<T> {
                 .unwrap_or(0);
             let file_name = format!("{}-{}-{:06}.parquet", self.name, millis, seq);
             match self.backend.put(&file_name, bytes).await {
-                Ok((location, local_path)) => {
-                    info!(sink = %self.name, file = %location, "flushed parquet");
-                    if let Some(path) = local_path {
-                        self.register(path).await;
+                Ok(()) => {
+                    info!(sink = %self.name, dest = %self.backend.display, file = file_name, "flushed parquet");
+                    if self.backend.registers {
+                        self.register(&file_name).await;
                     }
                 }
                 Err(e) => {
-                    error!(sink = %self.name, file = %file_name, error = %e, "failed writing parquet")
+                    error!(sink = %self.name, file = file_name, error = %e, "failed writing parquet")
                 }
             }
         }
@@ -343,26 +284,26 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         }
     }
 
-    /// Register a freshly-written local file with the catalog table named after
-    /// this sink, making its rows queryable at once. Runs on a blocking thread:
-    /// the registration reads the file's footer by driving a dataflow (the
-    /// decode itself lands on the dispatch workers), which blocks the calling
-    /// thread. A failure only delays visibility — the file is in the table's
-    /// directory, so the next `CREATE TABLE`/restart still finds it — so it is
-    /// logged, never propagated.
-    async fn register(&self, path: PathBuf) {
+    /// Register a freshly-written file (`file_name`, relative to the table's
+    /// data location) with the catalog table named after this sink, making its
+    /// rows queryable at once. Runs on a blocking thread: the registration reads
+    /// the file's footer by driving a dataflow (the decode itself lands on the
+    /// dispatch workers), which blocks the calling thread. A failure only delays
+    /// visibility — the file is in the table's directory, so the next
+    /// `CREATE TABLE`/restart still finds it — so it is logged, never propagated.
+    async fn register(&self, file_name: &str) {
         let catalog = self.catalog.clone();
         let table = self.name.clone();
+        let path = ObjectPath::new(file_name);
         let registered = tokio::task::spawn_blocking(move || {
             // A writer evolves a cloned-out table handle; `None` (no such table
             // yet) just defers visibility to the table's `CREATE TABLE`.
-            let result = catalog
+            catalog
                 .table_handle(&table)
-                .map(|mut handle| handle.register_data_file(ObjectPath::new(path.to_string_lossy())));
-            (result, path)
+                .map(|mut handle| handle.register_data_file(path))
         })
         .await;
-        let (result, path) = match registered {
+        let result = match registered {
             Ok(result) => result,
             Err(e) => {
                 error!(sink = %self.name, error = %e, "catalog registration task panicked");
@@ -371,16 +312,16 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         };
         match result {
             Some(Ok(())) => {
-                info!(sink = %self.name, file = %path.display(), "registered parquet in catalog")
+                info!(sink = %self.name, file = file_name, "registered parquet in catalog")
             }
             // Non-fatal: the file is on disk, so the next `CREATE TABLE`/restart
             // still finds it (e.g. a location mismatch, or a transient store error).
             Some(Err(e)) => {
-                warn!(sink = %self.name, file = %path.display(), error = %e, "catalog registration failed")
+                warn!(sink = %self.name, file = file_name, error = %e, "catalog registration failed")
             }
             None => {
                 debug!(
-                    sink = %self.name, file = %path.display(),
+                    sink = %self.name, file = file_name,
                     "no catalog table for sink; file becomes visible at CREATE TABLE"
                 )
             }
