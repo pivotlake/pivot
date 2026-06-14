@@ -1,25 +1,22 @@
+//! Multi-stage operator chains fed from in-memory `RecordBatch`es via
+//! [`values_input`]: filter→project, filter→count, and
+//! filter→group_by→order_by, all without a Parquet scan.
+
 mod common;
 
 use arrow_array::{Array, BooleanArray, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 
 use common::*;
-use dispatch::{Contains, OrderBy, Projection, StringKeyExtractor};
-use goose::parquet::table_input;
+use dispatch::{Contains, OrderBy, StringKeyExtractor, values_input};
 
 #[test]
 fn filter_then_project() {
-    let dispatcher = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatcher,
-        &[strings_and_ints(
-            &["alice", "bob", "alice"],
-            &[100, 200, 300],
-        )],
-        true,
-    );
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["alice", "bob", "alice"], &[100, 200, 300]);
 
-    let results = table_input(&dispatcher, &table, Projection::all(2), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
             move |batch: &RecordBatch| {
@@ -46,17 +43,11 @@ fn filter_then_project() {
 
 #[test]
 fn filter_then_count() {
-    let dispatcher = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatcher,
-        &[strings_and_ints(
-            &["alice", "bob", "alice", "dave", "alice"],
-            &[1, 2, 3, 4, 5],
-        )],
-        true,
-    );
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["alice", "bob", "alice", "dave", "alice"], &[1, 2, 3, 4, 5]);
 
-    let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
             move |batch: &RecordBatch| {
@@ -78,27 +69,24 @@ fn filter_then_count() {
 
 #[test]
 fn filter_then_group_by_then_order_by() {
-    let dispatcher = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatcher,
-        &[strings_and_ints(
-            &[
-                "google.com",
-                "apple.com",
-                "google.com",
-                "google.com",
-                "meta.com",
-                "apple.com",
-                "google.com",
-                "meta.com",
-                "other.com",
-            ],
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
-        )],
-        true,
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(
+        &[
+            "google.com",
+            "apple.com",
+            "google.com",
+            "google.com",
+            "meta.com",
+            "apple.com",
+            "google.com",
+            "meta.com",
+            "other.com",
+        ],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8],
     );
 
-    let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .filter(|| {
             move |batch: &RecordBatch| {
                 let col = batch
