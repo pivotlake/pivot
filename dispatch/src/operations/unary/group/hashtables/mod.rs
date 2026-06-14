@@ -19,7 +19,7 @@ pub use crate::operations::unary::group::keys::KeyExtractor;
 pub use crate::operations::unary::group::values::ValueExtractor;
 
 mod hash_table;
-pub use hash_table::{BatchRowSource, Entry, LiveKey, MAX_LOAD_FACTOR, PersistedKey, Value};
+pub use hash_table::{Entry, LiveKey, MAX_LOAD_FACTOR, PersistedKey, Value};
 
 mod aggregated_table;
 pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuffers, RadixConfig};

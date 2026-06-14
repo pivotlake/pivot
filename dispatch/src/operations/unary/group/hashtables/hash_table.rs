@@ -55,21 +55,6 @@ pub trait Value: Copy + Clone + Default {
     fn merge(self, v: Self) -> Self;
 }
 
-/// Supplies per-row keys and values to [`BaseHashTable::merge_batch`].
-///
-/// Passed as a single `&mut` so the implementation can hold a mutable borrow
-/// (e.g. of a key arena) internally without it escaping through a closure return
-/// — the methods hand back owned keys/values or a bool, never a borrow tied to
-/// that internal state.
-pub trait BatchRowSource<K: PersistedKey, V: Value> {
-    /// The persisted key for row `i` (allocating in any backing arena as needed).
-    fn persisted(&mut self, i: usize) -> K;
-    /// Whether row `i`'s key equals the already-persisted key `persisted`.
-    fn key_eq(&mut self, i: usize, persisted: &K) -> bool;
-    /// The aggregate value contributed by row `i`.
-    fn value(&mut self, i: usize) -> V;
-}
-
 /// A single slot in the hash table, storing the full hash, key, and value.
 ///
 /// `hash == 0` marks an empty slot. Real zero hashes are remapped to 1
@@ -106,13 +91,6 @@ fn max_load_for_len(len: usize) -> usize {
     (len as f64 * MAX_LOAD_FACTOR).round() as usize
 }
 
-/// Remap the empty-slot sentinel: `hash == 0` marks an empty slot, so a real
-/// zero hash is bumped to 1 before it is stored or probed.
-#[inline(always)]
-fn remap_zero(hash: u64) -> u64 {
-    if hash == 0 { 1 } else { hash }
-}
-
 /// Prefetch the cache line at `ptr` into L1 (x86 `T0` / ARM `pldl1keep`).
 #[inline(always)]
 fn prefetch_l1_line(ptr: *const u8) {
@@ -121,6 +99,10 @@ fn prefetch_l1_line(ptr: *const u8) {
         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
     }
     #[cfg(target_arch = "aarch64")]
+    // `prfm` is a hint with no architecturally-observable memory effect, so
+    // `nomem` is correct and lets the compiler schedule freely around it in the
+    // hot probe loop; the lint's pointer-with-nomem heuristic is a false positive.
+    #[allow(clippy::pointers_in_nomem_asm_block)]
     unsafe {
         std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
     }
@@ -136,6 +118,7 @@ fn prefetch_l2_line(ptr: *const u8) {
         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
     }
     #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::pointers_in_nomem_asm_block)]
     unsafe {
         std::arch::asm!("prfm pldl2keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
     }
@@ -442,130 +425,6 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
 
             // Collision with different key - linear probe to next slot
             idx = (idx + 1) & self.mask;
-        }
-    }
-
-    /// Prefetch the cache lines backing slot `idx` into L1 — two lines, so the
-    /// expected short linear-probe chain (~1.8 slots at max load) is covered
-    /// even when the home slot sits at the end of its line.
-    #[inline(always)]
-    fn prefetch_entry(&self, idx: usize) {
-        let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
-        prefetch_l1_line(ptr);
-        prefetch_l1_line(ptr.wrapping_add(64));
-    }
-
-    /// Probe row `i` (hash `hash`) against `slot` for [`merge_batch`](Self::merge_batch).
-    ///
-    /// Returns `true` when the row is resolved — either by claiming an empty slot
-    /// (insert) or by merging into a slot holding the same key. On a collision
-    /// (occupied by a different key) it advances `slots[i]` to the next slot and
-    /// returns `false`, so the caller re-queues the row for the following pass.
-    #[inline(always)]
-    fn probe_row_for_slot<S: BatchRowSource<K, V>>(
-        &mut self,
-        i: usize,
-        slot: usize,
-        hash: u64,
-        probe_slots: &mut [usize],
-        rows: &mut S,
-    ) -> bool {
-        let stored = self.buffer[slot].hash;
-        if stored == 0 {
-            let key = rows.persisted(i);
-            let value = rows.value(i);
-            self.buffer[slot] = Entry { hash, key, value };
-            self.length += 1;
-            true
-        } else if stored == hash && rows.key_eq(i, &self.buffer[slot].key) {
-            let value = rows.value(i);
-            self.buffer[slot].value = self.buffer[slot].value.merge(value);
-            true
-        } else {
-            self.collisions += 1;
-            probe_slots[i] = (slot + 1) & self.mask;
-            false
-        }
-    }
-
-    /// Insert/merge a whole batch of rows with a batched, multi-pass linear probe.
-    ///
-    /// The scalar [`merge`](Self::merge) walks one row's probe chain to the end
-    /// before starting the next, so each cache-missing slot is a serial
-    /// dependency. Instead, this advances every unresolved row by just **one**
-    /// slot per pass, so the many probes in a pass hit independent slots and the
-    /// CPU keeps their misses in flight.
-    ///
-    /// Steps:
-    /// 1. **Pass 1** — for each row, compute its home slot and try to resolve it
-    ///    there via [`probe_row_for_slot`](Self::probe_row_for_slot): claim an
-    ///    empty slot (insert), or merge into a slot holding the same key. A row
-    ///    that collides (slot held by a *different* key) has its probe advanced
-    ///    one slot and its index pushed onto the `unresolved` worklist.
-    /// 2. **Passes 2+** — re-probe only the `unresolved` rows at their advanced
-    ///    slots; any that still collide spill into `unresolved_scratch`. Swap the
-    ///    two worklists and repeat over the shrinking set until none remain.
-    ///
-    /// Re-reading the slot each pass keeps duplicate keys within the batch
-    /// correct: the first row claims the slot, the rest take the equal-key merge.
-    ///
-    /// `slots`, `unresolved`, `unresolved_scratch` are caller scratch of length
-    /// ≥ `length`; `hashes` holds the row hashes (0 is remapped to 1 in place to
-    /// keep the empty-slot sentinel). The caller MUST ensure `capacity - len >
-    /// length`, so every probe eventually finds an empty slot and the passes
-    /// terminate.
-    #[inline]
-    pub fn merge_batch<S: BatchRowSource<K, V>>(
-        &mut self,
-        length: usize,
-        hashes: &mut [u64],
-        probe_slots: &mut [usize],
-        unresolved: &mut [u32],
-        unresolved_scratch: &mut [u32],
-        rows: &mut S,
-    ) {
-        /// How far ahead, in row positions, to prefetch each slot.
-        const PREFETCH_DIST: usize = 16;
-
-        // Pass 1: probe every row at its home slot, computing the slot inline.
-        // Rows that resolve here (insert or merge) never touch the scratch
-        // arrays; only collided rows are recorded — advanced slot in `slots[i]`,
-        // index onto `unresolved` — for the follow-up passes. Folding the slot
-        // computation in here avoids materialising a slot for *every* row, which
-        // is pure overhead in the common low-collision / merge-heavy case.
-        let mut collided = 0usize;
-        for i in 0..length {
-            if i + PREFETCH_DIST < length {
-                self.prefetch_entry(self.slot_for(hashes[i + PREFETCH_DIST]));
-            }
-            let hash = remap_zero(hashes[i]);
-            hashes[i] = hash;
-            let slot = self.slot_for(hash);
-            if !self.probe_row_for_slot(i, slot, hash, probe_slots, rows) {
-                unresolved[collided] = i as u32;
-                collided += 1;
-            }
-        }
-
-        // Passes 2+: walk only the still-unresolved rows, ping-ponging the
-        // worklist between the two scratch buffers. Each pass advances every row
-        // by one slot, keeping their probes independent so misses stay in flight.
-        let (mut work, mut spill) = (unresolved, unresolved_scratch);
-        let mut remaining = collided;
-        while remaining > 0 {
-            let mut collided = 0usize;
-            for k in 0..remaining {
-                if k + PREFETCH_DIST < remaining {
-                    self.prefetch_entry(probe_slots[work[k + PREFETCH_DIST] as usize]);
-                }
-                let i = work[k] as usize;
-                if !self.probe_row_for_slot(i, probe_slots[i], hashes[i], probe_slots, rows) {
-                    spill[collided] = i as u32;
-                    collided += 1;
-                }
-            }
-            std::mem::swap(&mut work, &mut spill);
-            remaining = collided;
         }
     }
 
