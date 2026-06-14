@@ -56,6 +56,22 @@ pub struct FileRef {
     pub size: u64,
 }
 
+impl FileRef {
+    /// Turn this ref into a [`DataFile`] to read it for a table at `location`:
+    /// its path is relative to the table's location (an absolute one escapes to
+    /// the store root), so resolve it against `location` for the read source —
+    /// keeping the ref itself as the identity that flows onto the `TableFile` and
+    /// matches the manifest.
+    pub(crate) fn into_data_file(
+        self,
+        store: &dyn ObjectStore,
+        location: &ObjectPath,
+    ) -> Result<DataFile> {
+        let source = store.source(&location.resolve(&self.path))?;
+        Ok(DataFile { file: self, source })
+    }
+}
+
 /// A [`FileRef`] located for reading: its identity (`file`, whose size locates
 /// the footer without a `stat`/HEAD) plus where its bytes live (`source`).
 /// Produced transiently by [`ObjectStore::data_file`] and consumed straight by

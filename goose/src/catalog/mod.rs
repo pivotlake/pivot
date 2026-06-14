@@ -199,7 +199,7 @@ impl ParquetCatalog {
         let files = manifest
             .entries
             .iter()
-            .map(|f| locate(store.as_ref(), &entry.location, f))
+            .map(|f| f.clone().into_data_file(store.as_ref(), &entry.location))
             .collect::<store::Result<Vec<DataFile>>>()?;
         let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
         Ok(CatalogTable::new(
@@ -272,8 +272,8 @@ impl ParquetCatalog {
         // `TableFile`.
         let files = self
             .list_file_refs(&location)?
-            .iter()
-            .map(|f| locate(self.store.as_ref(), &location, f))
+            .into_iter()
+            .map(|f| f.into_data_file(self.store.as_ref(), &location))
             .collect::<store::Result<Vec<DataFile>>>()?;
 
         // The commit runs on the dataflow's last worker once the footers are
@@ -341,21 +341,6 @@ impl ParquetCatalog {
             .filter(|file| file.path.as_str().ends_with(".parquet"))
             .collect())
     }
-}
-
-/// Build a [`DataFile`] to read `file` for a table at `location`: a `FileRef`'s
-/// path is relative to its table's location (an absolute one escapes to the
-/// store root), so resolve it for the read source while keeping `file` itself as
-/// the identity that flows onto the [`TableFile`] and matches the manifest.
-pub(super) fn locate(
-    store: &dyn ObjectStore,
-    location: &ObjectPath,
-    file: &FileRef,
-) -> store::Result<DataFile> {
-    Ok(DataFile {
-        file: file.clone(),
-        source: store.source(&location.resolve(&file.path))?,
-    })
 }
 
 impl Catalog for ParquetCatalog {

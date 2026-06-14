@@ -227,7 +227,7 @@ impl CatalogTable {
             .entries
             .iter()
             .filter(|e| !self.files.iter().any(|f| f.file.path == e.path))
-            .map(|e| super::locate(self.store.as_ref(), &self.location, e))
+            .map(|e| e.clone().into_data_file(self.store.as_ref(), &self.location))
             .collect::<store::Result<_>>()?;
         Ok(crate::parquet::load_table_files(&self.dispatcher, &to_fetch)?)
     }
