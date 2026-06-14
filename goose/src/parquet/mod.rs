@@ -17,6 +17,8 @@ pub(crate) fn op_err(e: impl std::error::Error + Send + Sync + 'static) -> dispa
     dispatch::UnaryError::Operator(Box::new(e))
 }
 
+mod request_tracker;
+
 mod reading;
 pub use reading::{
     DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory, MaterializerFactory,

@@ -1,41 +1,9 @@
+use crate::parquet::request_tracker::PendingRequest;
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use bytes::Bytes;
 use dispatch::io::{FileLocation, FsRequest, HttpRequest};
 use dispatch::memory::{CacheLookup, memory_ctx};
-
-/// Identity of one cache-block read a row group needs: which file, and the exact
-/// byte run (`offset`, `len`) within it. Hashable so the fetcher can dedup
-/// identical reads and route a completion to *every* waiter that needs exactly
-/// this run. Including `len` in the identity is what keeps two reads at the same
-/// offset but different lengths distinct — a short read never satisfies a waiter
-/// that needs a longer one.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct RowGroupRead {
-    pub location: FileLocation,
-    pub offset: usize,
-    pub len: usize,
-}
-
-impl RowGroupRead {
-    /// The read a local filesystem request fulfills.
-    pub fn of_fs(req: &FsRequest) -> Self {
-        Self {
-            location: FileLocation::Local(req.file.clone()),
-            offset: req.block.file_offset(),
-            len: req.block.len(),
-        }
-    }
-
-    /// The read a remote HTTP request fulfills.
-    pub fn of_http(req: &HttpRequest) -> Self {
-        Self {
-            location: FileLocation::Remote(req.remote.clone()),
-            offset: req.block.file_offset(),
-            len: req.block.len(),
-        }
-    }
-}
 
 /// Tracks the IO state for a single column chunk within a row group.
 ///
@@ -147,17 +115,6 @@ impl RowGroupRequest {
         self.remaining == 0
     }
 
-    /// This row group's not-yet-submitted local filesystem reads (drained by the
-    /// fetcher when the row group is admitted).
-    pub fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
-        &mut self.pending_fs
-    }
-
-    /// This row group's not-yet-submitted remote HTTP reads.
-    pub fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
-        &mut self.pending_http
-    }
-
     /// Consume this request into a `RowGroupBuffer`.
     pub fn into_row_group_buffer(self) -> RowGroupBuffer {
         RowGroupBuffer {
@@ -168,6 +125,16 @@ impl RowGroupRequest {
                 .map(|c| c.into_buffers())
                 .collect(),
         }
+    }
+}
+
+impl PendingRequest for RowGroupRequest {
+    fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
+        &mut self.pending_fs
+    }
+
+    fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
+        &mut self.pending_http
     }
 }
 
