@@ -48,7 +48,3 @@ arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
 tempfile = "3"
 core_affinity = "0.8.3"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-
-[[bench]]
-name = "clickbench"
-harness = false
