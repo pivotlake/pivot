@@ -1,27 +1,29 @@
 //! Fetch stage: reads each file's Parquet footer — through the io_uring ring and
 //! the file cache, exactly like a column-chunk read — and emits the file's row
-//! groups. Mirrors the column-chunk `RowGroupFetcher` (the scan's fetch stage):
-//! many footer reads in flight, bounded per medium, so an all-remote directory's
-//! footers load in parallel instead of one network round trip after another.
+//! groups. Like the column-chunk scan fetcher, it keeps many footer reads in
+//! flight, bounded per medium, and shares the same slot/routing/in-flight
+//! bookkeeping ([`RequestTracker`]). The footer-specific part is the per-file
+//! state machine ([`RowGroupMetadataRequest`]): read the tail probe window,
+//! parse the footer, and — if it overflowed the probe — read it exactly before
+//! parsing.
 
 use super::{IndexedFile, IndexedRowGroup};
+use crate::parquet::request_tracker::{ReadRequest, PendingRequest, RequestTracker};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
 use crate::store::{DataFile, DataFileSource};
 use dispatch::io::{FileLocation, FsRequest, HttpRequest, RemoteFile, open_direct_read};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
 
-/// Disk-backed footer-read *blocks* outstanding per worker before admitting
-/// another file. A soft cap: a file already admitted may push over it (its
-/// blocks still complete) — we just stop pulling in new files. One keeps disk
-/// reads serial, since io_uring gives a single read ample depth.
+/// Disk-backed footer-read blocks outstanding per worker before admitting
+/// another file. One keeps disk reads serial, since io_uring gives a single read
+/// ample depth.
 const MAX_DISK_IN_FLIGHT: usize = 1;
-/// Remote-backed footer-read *blocks* outstanding per worker before admitting
+/// Remote-backed footer-read blocks outstanding per worker before admitting
 /// another file. Larger, to hide the HTTP round trip each read costs.
 const MAX_HTTP_IN_FLIGHT: usize = 32;
 
@@ -36,115 +38,41 @@ fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
     Ok(u32::from_le_bytes(len.try_into().unwrap()) as usize)
 }
 
-/// Reads files' footers and emits each file's row groups. It keeps many footer
-/// reads in flight, bounded independently by medium ([`MAX_DISK_IN_FLIGHT`]
-/// disk-backed, [`MAX_HTTP_IN_FLIGHT`] remote-backed). Each [`RowGroupMetadataRequest`]
-/// reads its file's tail probe window, parses the footer, and — if the footer
-/// overflowed the probe — reads it exactly before parsing. Completions route back
-/// to the owning request by their `(location, file offset)`.
+/// Reads files' footers and emits each file's row groups, keeping many reads in
+/// flight (bounded by [`MAX_DISK_IN_FLIGHT`]/[`MAX_HTTP_IN_FLIGHT`] via the
+/// shared [`RequestTracker`]).
 #[derive(Default)]
 pub(super) struct RowGroupMetadataFetcher {
-    /// In-flight footer reads, slot-indexed (`None` = free slot).
-    in_flight: Vec<Option<RowGroupMetadataRequest>>,
-    /// Reusable freed slot indices.
-    free_slots: Vec<usize>,
-    /// `(location, file offset)` → the slot awaiting that block's completion.
-    /// Exactly one waiter per key: each request reads its own file (a distinct
-    /// fd, which is how a [`FileLocation`] is identified), so no two in-flight
-    /// reads ever target the same key.
-    routing: HashMap<(FileLocation, usize), usize>,
-    /// Outstanding disk-backed footer-read blocks (soft-capped at
-    /// [`MAX_DISK_IN_FLIGHT`] when admitting new files).
-    disk_in_flight: usize,
-    /// Outstanding remote-backed footer-read blocks (soft-capped at
-    /// [`MAX_HTTP_IN_FLIGHT`]).
-    http_in_flight: usize,
+    tracker: RequestTracker<RowGroupMetadataRequest>,
 }
 
 impl RowGroupMetadataFetcher {
-    fn alloc_slot(&mut self, request: RowGroupMetadataRequest) -> usize {
-        if let Some(slot) = self.free_slots.pop() {
-            self.in_flight[slot] = Some(request);
-            slot
-        } else {
-            self.in_flight.push(Some(request));
-            self.in_flight.len() - 1
-        }
-    }
-
-    /// Stage the request in `slot`'s freshly-generated reads: count each missing
-    /// block toward the in-flight cap, and route its completion back to `slot`.
-    /// Called after a region's reads are queued (`start`, or an exact re-read)
-    /// and before [`next_fs_requests`](Self::next_fs_requests) drains them.
+    /// Advance the read in `slot` as far as it can without blocking on IO: while
+    /// its current region is fully present, parse it and either emit the file's
+    /// row groups (done) or issue the next region's read (the exact-footer
+    /// re-read). Stop once a region has reads outstanding or the file is finished.
     ///
-    /// Counting per block (not per file) makes the cap a soft one: a request can
-    /// stage more blocks than the cap, but [`ready_for_more_work`] then stops
-    /// admitting the *next* file until they drain. A request is local xor remote,
-    /// so only one of the two counters moves.
-    ///
-    /// [`ready_for_more_work`]: Self::ready_for_more_work
-    fn stage_reads(&mut self, slot: usize) {
-        let request = self.in_flight[slot].as_ref().unwrap();
-        let fs_keys: Vec<(FileLocation, usize)> = request
-            .pending_fs
-            .iter()
-            .map(|fs| (FileLocation::Local(fs.file.clone()), fs.block.file_offset()))
-            .collect();
-        let http_keys: Vec<(FileLocation, usize)> = request
-            .pending_http
-            .iter()
-            .map(|http| (FileLocation::Remote(http.remote.clone()), http.block.file_offset()))
-            .collect();
-        self.disk_in_flight += fs_keys.len();
-        self.http_in_flight += http_keys.len();
-        for key in fs_keys.into_iter().chain(http_keys) {
-            self.routing.insert(key, slot);
-        }
-    }
-
-    /// A completed read (fs or http): find the slot waiting on its
-    /// `(location, file offset)` key, count the landed block off its current
-    /// region, and advance the request.
-    fn process_completion<S: Sender<IndexedRowGroup>>(
-        &mut self,
-        key: (FileLocation, usize),
-        sender: &mut S,
-    ) -> dispatch::UnaryResult<()> {
-        if let Some(slot) = self.routing.remove(&key) {
-            self.in_flight[slot].as_mut().unwrap().record_block();
-            self.advance(slot, sender)?;
-        }
-        Ok(())
-    }
-
-    /// Advance the in-flight read in `slot` as far as it can without blocking on
-    /// IO. While its current region is fully present, parse the region and either
-    /// emit the file's row groups (done) or issue the next region's read (the
-    /// exact-footer re-read); stop once a region has reads outstanding (await
-    /// their completions) or the file is finished.
-    ///
-    /// Called from `consume` (after issuing the probe) and `process_completion`
-    /// (after a block lands) — both just "make a read happen, then advance" — so
-    /// the pending-vs-already-cached decision lives only here.
+    /// Called from `consume` (after the probe) and on each completion — both just
+    /// "make a read happen, then advance" — so the pending-vs-cached decision
+    /// lives only here.
     fn advance<S: Sender<IndexedRowGroup>>(
         &mut self,
         slot: usize,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        while !self.in_flight[slot].as_ref().unwrap().is_pending() {
-            let parsed = self.in_flight[slot]
-                .as_mut()
+        while !self.tracker.request_for_slot(slot).unwrap().is_pending() {
+            let parsed = self
+                .tracker
+                .request_for_slot(slot)
                 .unwrap()
                 .parse_region()
                 .map_err(crate::parquet::op_err)?;
             match parsed {
-                // The footer overflowed the probe; an exact read was issued. Stage
-                // it; the loop condition re-checks whether it needs IO or was
-                // already cached (and should be parsed right away).
-                None => self.stage_reads(slot),
+                // The footer overflowed the probe; an exact read was queued. Stage
+                // it; the loop re-checks whether it needs IO or was already cached.
+                None => self.tracker.stage_reads_for_slot(slot),
                 Some(row_groups) => {
-                    let request = self.in_flight[slot].take().unwrap();
-                    self.free_slots.push(slot);
+                    let request = self.tracker.take_request_at_slot(slot);
                     for rg in row_groups {
                         sender.send((request.file_idx, rg))?;
                     }
@@ -178,30 +106,23 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
             }
         };
 
-        let slot =
-            self.alloc_slot(RowGroupMetadataRequest::start(file_idx, location, size as usize));
-        self.stage_reads(slot);
+        let slot = self
+            .tracker
+            .admit_request(RowGroupMetadataRequest::start(file_idx, location, size as usize));
         self.advance(slot, sender)
     }
 
     fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
-        let mut all = Vec::new();
-        for request in self.in_flight.iter_mut().flatten() {
-            all.append(&mut request.pending_fs);
-        }
-        Ok(all)
+        Ok(self.tracker.take_fs_requests())
     }
 
     fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
-        let mut all = Vec::new();
-        for request in self.in_flight.iter_mut().flatten() {
-            all.append(&mut request.pending_http);
-        }
-        Ok(all)
+        Ok(self.tracker.take_http_requests())
     }
 
     fn ready_for_more_work(&mut self) -> bool {
-        self.disk_in_flight < MAX_DISK_IN_FLIGHT && self.http_in_flight < MAX_HTTP_IN_FLIGHT
+        self.tracker.disk_in_flight() < MAX_DISK_IN_FLIGHT
+            && self.tracker.http_in_flight() < MAX_HTTP_IN_FLIGHT
     }
 
     fn process_fs_response<S: Sender<IndexedRowGroup>>(
@@ -209,12 +130,11 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
         sender: &mut S,
         request: FsRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.disk_in_flight -= 1;
-        let key = (
-            FileLocation::Local(request.file),
-            request.block.file_offset(),
-        );
-        self.process_completion(key, sender)
+        for slot in self.tracker.complete(&ReadRequest::of_fs(&request)) {
+            self.tracker.request_for_slot(slot).unwrap().record_block();
+            self.advance(slot, sender)?;
+        }
+        Ok(())
     }
 
     fn process_http_response<S: Sender<IndexedRowGroup>>(
@@ -222,19 +142,18 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
         sender: &mut S,
         request: HttpRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.http_in_flight -= 1;
-        let key = (
-            FileLocation::Remote(request.remote),
-            request.block.file_offset(),
-        );
-        self.process_completion(key, sender)
+        for slot in self.tracker.complete(&ReadRequest::of_http(&request)) {
+            self.tracker.request_for_slot(slot).unwrap().record_block();
+            self.advance(slot, sender)?;
+        }
+        Ok(())
     }
 
     fn finish<S: Sender<IndexedRowGroup>>(
         &mut self,
         _sender: &mut S,
     ) -> dispatch::UnaryResult<bool> {
-        Ok(self.disk_in_flight == 0 && self.http_in_flight == 0)
+        Ok(self.tracker.is_idle())
     }
 }
 
@@ -261,6 +180,16 @@ struct RowGroupMetadataRequest {
     /// `false` while reading the tail probe window; `true` once the footer was
     /// found to overflow the probe and the exact footer is being read.
     reading_exact: bool,
+}
+
+impl PendingRequest for RowGroupMetadataRequest {
+    fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
+        &mut self.pending_fs
+    }
+
+    fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
+        &mut self.pending_http
+    }
 }
 
 impl RowGroupMetadataRequest {
@@ -299,8 +228,8 @@ impl RowGroupMetadataRequest {
 
     /// Look up `[offset, offset + len)` in the cache and queue any missing blocks
     /// as the current region. The previous region's blocks must already be
-    /// drained (submitted) and completed — the fetcher counts `pending_*` as it
-    /// stages them, so a leftover would be double-counted.
+    /// drained (staged) and completed — the tracker counts staged reads, so a
+    /// leftover would be double-counted.
     fn read_region(&mut self, offset: usize, len: usize) {
         debug_assert!(
             self.pending_fs.is_empty() && self.pending_http.is_empty(),
