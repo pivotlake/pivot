@@ -68,33 +68,17 @@ impl TableManifest {
         format!("{}/{version:0VERSION_DIGITS$}.json", Self::dir(name))
     }
 
-    /// The highest committed version of table `name`, or `None` if it has none
-    /// yet — one `list` of the table's manifest directory.
-    pub fn latest_version(store: &dyn ObjectStore, name: &str) -> Result<Option<u64>> {
-        let mut latest = None;
-        for file in store.list(&Self::dir(name))? {
-            if let Some(version) = file
-                .name
-                .strip_suffix(".json")
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                latest = Some(latest.map_or(version, |cur: u64| cur.max(version)));
-            }
-        }
-        Ok(latest)
-    }
-
-    /// Load table `name`'s latest committed manifest. The database manifest is
-    /// the index of which tables exist, so a name listed there with no manifest
-    /// is a corrupt catalog — an error, not an absent table.
+    /// Load table `name`'s latest committed manifest — one `list` of its version
+    /// directory for the highest version, then a `get` of it. The database
+    /// manifest is the index of which tables exist, so a name listed there with
+    /// no manifest is a corrupt catalog — an error, not an absent table.
     pub fn load(store: &dyn ObjectStore, name: &str) -> Result<Self> {
-        let version = Self::latest_version(store, name)?
+        let version = store
+            .list(&Self::dir(name))?
+            .iter()
+            .filter_map(|file| file.name.strip_suffix(".json").and_then(|v| v.parse::<u64>().ok()))
+            .max()
             .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;
-        Self::load_version(store, name, version)
-    }
-
-    /// Load one specific `version` of table `name`'s manifest.
-    pub fn load_version(store: &dyn ObjectStore, name: &str, version: u64) -> Result<Self> {
         let bytes = store
             .get(&Self::key(name, version))?
             .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;

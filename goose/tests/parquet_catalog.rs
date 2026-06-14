@@ -344,7 +344,7 @@ fn register(catalog: &ParquetCatalog, name: &str, path: &Path) -> RegisterOutcom
     catalog
         .table_handle(name)
         .expect("table exists")
-        .register_data_file(&dispatcher(), path)
+        .register_data_file(path)
         .unwrap()
 }
 
@@ -442,7 +442,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     catalog
         .table_handle("t")
         .unwrap()
-        .replace_data_files(&dispatcher(), &removed, &added)
+        .replace_data_files(&removed, &added)
         .unwrap();
 
     resolve(&catalog, "t");
@@ -522,7 +522,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     catalog
         .table_handle("t")
         .unwrap()
-        .replace_data_files(&dispatcher(), &["data.parquet".to_string()], &added)
+        .replace_data_files(&["data.parquet".to_string()], &added)
         .unwrap();
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();

@@ -75,8 +75,6 @@ pub enum Error {
     Store(#[from] store::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
-    #[error("data file `{0}` referenced by the manifest could not be loaded")]
-    MissingFile(String),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(transparent)]
@@ -211,6 +209,7 @@ impl ParquetCatalog {
             manifest,
             table_files,
             store.clone(),
+            dispatcher.clone(),
         ))
     }
 
@@ -285,6 +284,7 @@ impl ParquetCatalog {
         // name as a race backstop.
         let tables = self.tables.clone();
         let store = self.store.clone();
+        let pool = dispatcher.clone();
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
             &files,
@@ -300,6 +300,7 @@ impl ParquetCatalog {
                     loaded,
                     request.columns,
                     store.clone(),
+                    pool,
                 )?;
                 // Record name → location in the database index.
                 let mut index = CatalogManifest::load(store.as_ref())?;
@@ -344,20 +345,15 @@ impl ParquetCatalog {
 }
 
 
-/// Whether `file` sits directly in the table data directory `location`. Only an
-/// absolute local location qualifies — a relative one lives inside the
-/// database's object store, which is not where a locally-written file is.
-/// Both sides are canonicalized so spelling differences don't refuse a
-/// legitimate registration.
+/// Whether `file` sits directly in the table data directory `location`.
+/// Registration is a local-file operation, so this is a local-path check: only
+/// an absolute local location can be the home of a locally-written file (a
+/// store-relative or remote location is a store key, not a filesystem path, and
+/// `canonicalize`-style resolution would be meaningless there). `file`'s parent
+/// must be exactly `location`.
 fn file_in_table_dir(file: &Path, location: &str) -> bool {
     let dir = Path::new(location);
-    if !dir.is_absolute() {
-        return false;
-    }
-    match (std::fs::canonicalize(dir), file.parent()) {
-        (Ok(dir), Some(parent)) => std::fs::canonicalize(parent).is_ok_and(|p| p == dir),
-        _ => false,
-    }
+    dir.is_absolute() && file.parent() == Some(dir)
 }
 
 impl Catalog for ParquetCatalog {
@@ -371,7 +367,7 @@ impl Catalog for ParquetCatalog {
     /// pushdown prunes its view without affecting other concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
         let mut table = self.tables.read().unwrap().get(name)?.clone();
-        match table.refresh(&self.dispatcher) {
+        match table.refresh() {
             // Advanced — publish the reloaded copy for the next resolve.
             Ok(true) => {
                 self.tables.write().unwrap().insert(name.to_string(), table.clone());

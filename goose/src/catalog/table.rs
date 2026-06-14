@@ -1,7 +1,7 @@
 //! The catalog's master record of one table: its definition plus its current
 //! content — the files at one manifest version.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -57,6 +57,9 @@ pub struct CatalogTable {
     pub(super) manifest: TableManifest,
     pub(super) files: Vec<TableFile>,
     store: Arc<dyn ObjectStore>,
+    /// The pool a reload/commit fetches footers on, so the mutators need no
+    /// dispatcher passed in.
+    dispatcher: DataFlowDispatcher,
 }
 
 impl CatalogTable {
@@ -69,6 +72,7 @@ impl CatalogTable {
         manifest: TableManifest,
         files: Vec<TableFile>,
         store: Arc<dyn ObjectStore>,
+        dispatcher: DataFlowDispatcher,
     ) -> Self {
         Self {
             name,
@@ -76,6 +80,7 @@ impl CatalogTable {
             manifest,
             files,
             store,
+            dispatcher,
         }
     }
 
@@ -90,6 +95,7 @@ impl CatalogTable {
         files: Vec<TableFile>,
         columns: Vec<Column>,
         store: Arc<dyn ObjectStore>,
+        dispatcher: DataFlowDispatcher,
     ) -> crate::Result<Self> {
         let entries = files.iter().map(|f| f.file.clone()).collect();
         let manifest = TableManifest {
@@ -106,21 +112,20 @@ impl CatalogTable {
             manifest,
             files,
             store,
+            dispatcher,
         })
     }
 
-    /// Reload this copy to the latest committed version, if any writer has moved
-    /// past the version it holds. Cheap when current (one `list` to check the
-    /// latest version); when behind, loads the latest manifest and fetches only
-    /// the footers of files it doesn't already hold. Returns whether it advanced.
-    pub fn refresh(&mut self, dispatcher: &DataFlowDispatcher) -> crate::Result<bool> {
-        let latest = match TableManifest::latest_version(self.store.as_ref(), &self.name)? {
-            Some(version) if version > self.manifest.version => version,
-            _ => return Ok(false),
-        };
-        let manifest = TableManifest::load_version(self.store.as_ref(), &self.name, latest)?;
-        self.files = self.assemble_files(dispatcher, &manifest)?;
+    /// Reload this copy to the latest committed version. Errors if the table has
+    /// no manifest at all (a corrupt catalog). Returns whether it advanced;
+    /// `Ok(false)` means this copy was already current.
+    pub fn refresh(&mut self) -> crate::Result<bool> {
+        let manifest = TableManifest::load(self.store.as_ref(), &self.name)?;
+        if manifest.version <= self.manifest.version {
+            return Ok(false);
+        }
         self.manifest = manifest;
+        self.sync_files_to_manifest()?;
         Ok(true)
     }
 
@@ -131,14 +136,10 @@ impl CatalogTable {
     /// double-count rows.
     ///
     /// The file must sit directly in the table's data directory, which only an
-    /// absolute local location can be — a store-relative location is not where a
-    /// locally-written file lands; otherwise [`RegisterOutcome::LocationMismatch`]
-    /// and nothing is committed.
-    pub fn register_data_file(
-        &mut self,
-        dispatcher: &DataFlowDispatcher,
-        path: &Path,
-    ) -> crate::Result<RegisterOutcome> {
+    /// absolute local location can be — a store-relative or remote location is
+    /// not where a locally-written file lands; otherwise
+    /// [`RegisterOutcome::LocationMismatch`] and nothing is committed.
+    pub fn register_data_file(&mut self, path: &Path) -> crate::Result<RegisterOutcome> {
         if !super::file_in_table_dir(path, &self.location) {
             return Ok(RegisterOutcome::LocationMismatch);
         }
@@ -156,11 +157,11 @@ impl CatalogTable {
             }
             let mut entries = self.manifest.entries.clone();
             entries.push(new_file.clone());
-            if self.try_commit(dispatcher, entries)? {
+            if self.try_commit(entries)? {
                 return Ok(RegisterOutcome::Registered);
             }
             // Lost the race — rebase onto the winner's version and retry.
-            self.refresh(dispatcher)?;
+            self.refresh()?;
         }
     }
 
@@ -170,7 +171,6 @@ impl CatalogTable {
     /// doubled or missing.
     pub fn replace_data_files(
         &mut self,
-        dispatcher: &DataFlowDispatcher,
         removed: &[String],
         added: &[FileRef],
     ) -> crate::Result<()> {
@@ -183,22 +183,18 @@ impl CatalogTable {
                 .cloned()
                 .collect();
             entries.extend(added.iter().cloned());
-            if self.try_commit(dispatcher, entries)? {
+            if self.try_commit(entries)? {
                 return Ok(());
             }
-            self.refresh(dispatcher)?;
+            self.refresh()?;
         }
     }
 
     /// Try to commit `entries` as the next version via compare-and-swap. On
-    /// success, swaps this copy's manifest + files (fetching only the new
-    /// footers) and returns `true`; on a CAS conflict returns `false` without
-    /// touching this copy.
-    fn try_commit(
-        &mut self,
-        dispatcher: &DataFlowDispatcher,
-        entries: Vec<FileRef>,
-    ) -> crate::Result<bool> {
+    /// success, swaps in the new manifest + files (fetching only the new footers)
+    /// and returns `true`; on a CAS conflict returns `false` without touching
+    /// this copy.
+    fn try_commit(&mut self, entries: Vec<FileRef>) -> crate::Result<bool> {
         let manifest = TableManifest {
             version: self.manifest.version + 1,
             columns: self.manifest.columns.clone(),
@@ -207,41 +203,32 @@ impl CatalogTable {
         if !manifest.commit(self.store.as_ref(), &self.name)? {
             return Ok(false);
         }
-        self.files = self.assemble_files(dispatcher, &manifest)?;
         self.manifest = manifest;
+        self.sync_files_to_manifest()?;
         Ok(true)
     }
 
-    /// The [`TableFile`]s for `manifest`'s entries, in entry order: reuse the
-    /// footers this copy already holds and fetch only the rest over the pool.
-    fn assemble_files(
-        &self,
-        dispatcher: &DataFlowDispatcher,
-        manifest: &TableManifest,
-    ) -> crate::Result<Vec<TableFile>> {
-        let held: HashMap<&str, &TableFile> =
-            self.files.iter().map(|f| (f.file.name.as_str(), f)).collect();
-        let to_fetch: Vec<DataFile> = manifest
+    /// Reconcile `files` to the current `manifest`: drop the files no longer in
+    /// it, then fetch and append the ones not yet held.
+    fn sync_files_to_manifest(&mut self) -> crate::Result<()> {
+        let kept: HashSet<&str> = self.manifest.entries.iter().map(|e| e.name.as_str()).collect();
+        self.files.retain(|f| kept.contains(f.file.name.as_str()));
+        let missing = self.retrieve_missing_table_files()?;
+        self.files.extend(missing);
+        Ok(())
+    }
+
+    /// Fetch the [`TableFile`]s for this table's manifest entries that aren't
+    /// already held — the footers this copy is missing (disjoint from `files`).
+    fn retrieve_missing_table_files(&self) -> crate::Result<Vec<TableFile>> {
+        let to_fetch: Vec<DataFile> = self
+            .manifest
             .entries
             .iter()
-            .filter(|e| !held.contains_key(e.name.as_str()))
+            .filter(|e| !self.files.iter().any(|f| f.file.name == e.name))
             .map(|e| self.store.data_file(&location_key(&self.location, &e.name), e.size))
             .collect::<store::Result<_>>()?;
-        let mut fetched: HashMap<String, TableFile> = crate::parquet::load_table_files(dispatcher, &to_fetch)?
-            .into_iter()
-            .map(|f| (f.file.name.clone(), f))
-            .collect();
-
-        manifest
-            .entries
-            .iter()
-            .map(|e| {
-                held.get(e.name.as_str())
-                    .map(|f| (*f).clone())
-                    .or_else(|| fetched.remove(&e.name))
-                    .ok_or_else(|| Error::MissingFile(e.name.clone()))
-            })
-            .collect()
+        Ok(crate::parquet::load_table_files(&self.dispatcher, &to_fetch)?)
     }
 
     pub fn files(&self) -> &[TableFile] {
