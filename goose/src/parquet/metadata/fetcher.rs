@@ -16,6 +16,7 @@ use dispatch::io::{FileLocation, FsRequest, HttpRequest, RemoteFile, open_direct
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
 use std::sync::Arc;
+use crate::catalog::TableFile;
 
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
 
@@ -42,11 +43,11 @@ fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
 /// flight (bounded by [`MAX_DISK_IN_FLIGHT`]/[`MAX_HTTP_IN_FLIGHT`] via the
 /// shared [`RequestTracker`]).
 #[derive(Default)]
-pub(super) struct RowGroupMetadataFetcher {
+pub(super) struct TableFileMetadataFetcher {
     tracker: RequestTracker<RowGroupMetadataRequest>,
 }
 
-impl RowGroupMetadataFetcher {
+impl TableFileMetadataFetcher {
     /// Advance the read in `slot` as far as it can without blocking on IO: while
     /// its current region is fully present, parse it and either emit the file's
     /// row groups (done) or issue the next region's read (the exact-footer
@@ -55,7 +56,7 @@ impl RowGroupMetadataFetcher {
     /// Called from `consume` (after the probe) and on each completion — both just
     /// "make a read happen, then advance" — so the pending-vs-cached decision
     /// lives only here.
-    fn advance<S: Sender<IndexedRowGroup>>(
+    fn advance<S: Sender<TableFile>>(
         &mut self,
         slot: usize,
         sender: &mut S,
@@ -74,7 +75,7 @@ impl RowGroupMetadataFetcher {
                 Some(row_groups) => {
                     let request = self.tracker.take_request_at_slot(slot);
                     for rg in row_groups {
-                        sender.send((request.file_idx, rg))?;
+                        // sender.send((request.file_idx, rg))?;
                     }
                     return Ok(());
                 }
@@ -84,8 +85,8 @@ impl RowGroupMetadataFetcher {
     }
 }
 
-impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
-    fn consume<S: Sender<IndexedRowGroup>>(
+impl Unary<IndexedFile, TableFile> for TableFileMetadataFetcher {
+    fn consume<S: Sender<TableFile>>(
         &mut self,
         (file_idx, file): IndexedFile,
         sender: &mut S,
@@ -125,7 +126,7 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
             && self.tracker.http_in_flight() < MAX_HTTP_IN_FLIGHT
     }
 
-    fn process_fs_response<S: Sender<IndexedRowGroup>>(
+    fn process_fs_response<S: Sender<TableFile>>(
         &mut self,
         sender: &mut S,
         request: FsRequest,
@@ -137,7 +138,7 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
         Ok(())
     }
 
-    fn process_http_response<S: Sender<IndexedRowGroup>>(
+    fn process_http_response<S: Sender<TableFile>>(
         &mut self,
         sender: &mut S,
         request: HttpRequest,
@@ -149,7 +150,7 @@ impl Unary<IndexedFile, IndexedRowGroup> for RowGroupMetadataFetcher {
         Ok(())
     }
 
-    fn finish<S: Sender<IndexedRowGroup>>(
+    fn finish<S: Sender<TableFile>>(
         &mut self,
         _sender: &mut S,
     ) -> dispatch::UnaryResult<bool> {

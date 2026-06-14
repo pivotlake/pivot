@@ -4,9 +4,11 @@
 //! Workers `1..n` receive nothing (empty receiver, no commit) and no-op. Emits
 //! no rows.
 
-use super::{IndexedRowGroup, LoadedFiles};
+use std::mem;
+use super::{IndexedRowGroup};
 use arrow_array::RecordBatch;
 use dispatch::{Sender, Unary, UnaryFactory};
+use crate::catalog::TableFile;
 
 /// Per-worker factory for [`TableBuildSink`]. Only the worker-0 factory carries
 /// the `commit` (the rest are `None`).
@@ -21,9 +23,9 @@ impl<C> TableBuildSinkFactory<C> {
     }
 }
 
-impl<C> UnaryFactory<IndexedRowGroup, RecordBatch> for TableBuildSinkFactory<C>
+impl<C> UnaryFactory<TableFile, RecordBatch> for TableBuildSinkFactory<C>
 where
-    C: FnOnce(LoadedFiles) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+    C: FnOnce(Vec<TableFile>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + 'static,
 {
@@ -31,40 +33,37 @@ where
 
     fn build_unary(self) -> TableBuildSink<C> {
         TableBuildSink {
-            rows: Vec::new(),
+            table_files: vec![],
             commit: self.commit,
-            file_count: self.file_count,
         }
     }
 }
 
 pub(super) struct TableBuildSink<C> {
-    rows: Vec<IndexedRowGroup>,
+    table_files: Vec<TableFile>,
     /// `Some` only on the receiving worker; `take`n so the commit runs once even
     /// if `finish` is called more than once.
     commit: Option<C>,
-    file_count: usize,
 }
 
-impl<C> Unary<IndexedRowGroup, RecordBatch> for TableBuildSink<C>
+impl<C> Unary<TableFile, RecordBatch> for TableBuildSink<C>
 where
-    C: FnOnce(LoadedFiles) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
+    C: FnOnce(Vec<TableFile>) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>
         + Send
         + 'static,
 {
     fn consume<S: Sender<RecordBatch>>(
         &mut self,
-        row_group: IndexedRowGroup,
+        table_file: TableFile,
         _sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        self.rows.push(row_group);
+        self.table_files.push(table_file);
         Ok(())
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> dispatch::UnaryResult<bool> {
         if let Some(commit) = self.commit.take() {
-            let loaded = LoadedFiles::assemble(std::mem::take(&mut self.rows), self.file_count);
-            commit(loaded).map_err(|e| crate::parquet::op_err(CommitFailed(e)))?;
+            commit(mem::take(&mut self.table_files)).map_err(|e| crate::parquet::op_err(CommitFailed(e)))?;
         }
         Ok(true)
     }

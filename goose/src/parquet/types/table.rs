@@ -5,7 +5,6 @@
 //! Thrift footer, converts the Parquet schema to Arrow, and collects
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
-use crate::parquet::LoadedFiles;
 use crate::parquet::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
 use crate::parquet::types::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::parquet::types::thrift::general::{Encoding, PageType};
@@ -98,15 +97,7 @@ impl ParquetTable {
         dispatcher: &DataFlowDispatcher,
         paths: &[P],
     ) -> Result<Self> {
-        let files = paths
-            .iter()
-            .map(|p| {
-                let path = PathBuf::from(p.as_ref());
-                let size = fs::metadata(&path)?.len();
-                Ok(DataFile::local(path, size))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Self::from_locations(dispatcher, files)
+        todo!()
     }
 
     /// Build a table from remote files: concrete fetchable URLs paired with
@@ -116,15 +107,7 @@ impl ParquetTable {
         dispatcher: &DataFlowDispatcher,
         files: &[(Url, u64)],
     ) -> Result<Self> {
-        let files = files
-            .iter()
-            .cloned()
-            .map(|(url, size)| DataFile {
-                size,
-                source: crate::store::DataFileSource::Remote(url),
-            })
-            .collect();
-        Self::from_locations(dispatcher, files)
+        todo!()
     }
 
     /// Read every file's footer in parallel (the metadata-fetch dataflow) and
@@ -132,9 +115,7 @@ impl ParquetTable {
     /// files. Same coordinator requirement as
     /// [`from_directory`](Self::from_directory).
     pub fn from_locations(dispatcher: &DataFlowDispatcher, files: Vec<DataFile>) -> Result<Self> {
-        LoadedFiles::load(dispatcher, &files)
-            .map(LoadedFiles::into_table)
-            .map_err(|e| Error::Materialize(e.to_string()))
+        todo!()
     }
 
     /// Returns the Arrow schema (taken from the first row group).

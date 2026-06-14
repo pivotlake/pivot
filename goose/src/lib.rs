@@ -17,12 +17,10 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 mod catalog;
-pub mod manifest;
 pub mod parquet;
 mod sql_type;
 pub mod store;
-pub mod table_log;
+mod manifest;
 
-pub use catalog::{Error, ParquetCatalog, RegisterOutcome, Result, TableBinding};
-pub use manifest::ManifestEntry;
+pub use catalog::{Error, ParquetCatalog, RegisterOutcome, Result, TableBinding, CatalogTable};
 pub use store::FileRef;

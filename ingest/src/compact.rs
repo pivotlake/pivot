@@ -43,9 +43,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use dispatch::Projection;
+use dispatch::{DataFlowDispatcher, Projection};
 use goose::parquet::{ParquetTable, table_input};
-use goose::{FileRef, ParquetCatalog};
+use goose::{CatalogTable, FileRef, ParquetCatalog};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
@@ -110,8 +110,8 @@ impl Compacter {
     /// and a future standalone compacter binary — can drive one round without
     /// the loop.)
     pub async fn compact_all(&self) {
-        for table in self.catalog.table_names() {
-            self.compact_table(&table).await;
+        for table in self.catalog.tables() {
+            self.compact_table(table).await;
         }
     }
 
@@ -121,51 +121,10 @@ impl Compacter {
     /// Each batch is capped at roughly one output file's worth, so a long
     /// backlog (e.g. after a restart) is worked off with bounded memory.
     /// Errors are logged and end the table's round — the next poll retries.
-    async fn compact_table(&self, table: &str) {
-        loop {
-            let catalog = self.catalog.clone();
-            let name = table.to_string();
-            // refresh drives a footer-fetch dataflow, so it runs on a
-            // blocking thread like the merge itself.
-            match tokio::task::spawn_blocking(move || catalog.refresh(&name)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(table, error = %e, "table reload failed; skipping round");
-                    return;
-                }
-                Err(e) => {
-                    error!(table, error = %e, "table reload task panicked");
-                    return;
-                }
-            }
-            let Some(inputs) = self.next_batch(table) else {
-                return;
-            };
-            let job = CompactJob {
-                name: table.to_string(),
-                catalog: self.catalog.clone(),
-                seq: self.seq.fetch_add(1, Ordering::Relaxed),
-            };
-            let count = inputs.len();
-            match tokio::task::spawn_blocking(move || job.compact(inputs)).await {
-                Ok(Ok(outputs)) => {
-                    info!(
-                        table,
-                        inputs = count,
-                        outputs = outputs.len(),
-                        "compacted parquet files"
-                    );
-                }
-                Ok(Err(e)) => {
-                    error!(table, error = %e, "compaction failed");
-                    return;
-                }
-                Err(e) => {
-                    error!(table, error = %e, "compaction task panicked");
-                    return;
-                }
-            }
-        }
+    async fn compact_table(&self, table: &CatalogTable) {
+        // Refresh table, compact it (in dispatch from a spawn blocking thread), as long as there is 
+        // what to compact for this table
+        todo!()
     }
 
     /// The next batch of `table`'s files to merge, straight from its current
@@ -174,8 +133,8 @@ impl Compacter {
     /// doing (no table, fewer than two small files, or not enough bytes for a
     /// full output yet — merging earlier would just rewrite the same rows
     /// again on the next flush).
-    fn next_batch(&self, table: &str) -> Option<Vec<FileRef>> {
-        let files = self.catalog.table_files(table)?;
+    fn next_batch(&self, table: &CatalogTable) -> Option<Vec<FileRef>> {
+        let files = table.files()?;
         let mut small: Vec<FileRef> = files
             .into_iter()
             .filter(|f| f.size < self.target_bytes)
@@ -208,8 +167,8 @@ impl Compacter {
 /// One merge, run on a blocking thread (it drives a dataflow, which blocks the
 /// driving thread while the work itself runs on the dispatch workers).
 struct CompactJob {
-    name: String,
-    catalog: Arc<ParquetCatalog>,
+    dispatcher: DataFlowDispatcher,
+    table: CatalogTable,
     seq: u64,
 }
 
@@ -218,90 +177,6 @@ impl CompactJob {
     /// groups — a single scan→encode dataflow — then commit: write the merged
     /// file(s), swap them for the inputs in the table log, delete the inputs.
     fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, String> {
-        let dispatcher = self.catalog.dispatcher().clone();
-        let resolved = self
-            .catalog
-            .resolve_data_files(&self.name, &inputs)
-            .map_err(|e| format!("resolving inputs: {e}"))?
-            .ok_or_else(|| format!("table `{}` vanished", self.name))?;
-        let table = Arc::new(
-            ParquetTable::from_locations(&dispatcher, resolved)
-                .map_err(|e| format!("reading input footers: {e}"))?,
-        );
-        // One dataflow: scan stages decode the inputs, encode stages cut and
-        // compress full-size row groups, finished files stream out here.
-        let columns = table.schema().fields().len();
-        let scan = table_input(&dispatcher, &table, Projection::all(columns), false);
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut outputs: Vec<FileRef> = Vec::new();
-        for (idx, bytes) in
-            parquet_writing::encode(scan, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE).enumerate()
-        {
-            let bytes = match bytes {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    // Unlogged files are invisible; deleting them is hygiene.
-                    remove_all(&self.catalog, &self.name, &outputs);
-                    return Err(format!("re-encoding: {e}"));
-                }
-            };
-            let name = format!(
-                "{}-compacted-{}-{:06}-{:03}.parquet",
-                self.name, millis, self.seq, idx
-            );
-            match self.catalog.write_data_file(&self.name, &name, &bytes) {
-                Ok(true) => {}
-                Ok(false) => {
-                    remove_all(&self.catalog, &self.name, &outputs);
-                    return Err(format!("table `{}` vanished", self.name));
-                }
-                Err(e) => {
-                    remove_all(&self.catalog, &self.name, &outputs);
-                    return Err(format!("writing {name}: {e}"));
-                }
-            }
-            outputs.push(FileRef {
-                name,
-                size: bytes.len() as u64,
-            });
-        }
-
-        // The commit: one log version replaces the inputs with the outputs.
-        let removed: Vec<String> = inputs.iter().map(|f| f.name.clone()).collect();
-        match self
-            .catalog
-            .replace_data_files(&self.name, &removed, &outputs)
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                remove_all(&self.catalog, &self.name, &outputs);
-                return Err(format!("table `{}` vanished before the swap", self.name));
-            }
-            Err(e) => {
-                remove_all(&self.catalog, &self.name, &outputs);
-                return Err(format!("log swap: {e}"));
-            }
-        }
-        // The inputs are out of the log; deleting them reclaims space. A
-        // failure (or a crash) just leaves invisible orphans.
-        for input in &inputs {
-            if let Err(e) = self.catalog.delete_data_file(&self.name, &input.name) {
-                error!(
-                    table = %self.name, file = %input.name, error = %e,
-                    "failed deleting compacted input"
-                );
-            }
-        }
-        Ok(outputs)
-    }
-}
-
-/// Best-effort cleanup of staged (never-logged, hence invisible) outputs.
-fn remove_all(catalog: &ParquetCatalog, table: &str, files: &[FileRef]) {
-    for file in files {
-        let _ = catalog.delete_data_file(table, &file.name);
+        // todo!()
     }
 }

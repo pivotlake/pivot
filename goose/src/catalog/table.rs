@@ -1,18 +1,20 @@
 //! The catalog's master record of one table: its definition plus its current
 //! content — the files at one [`table_log`](crate::table_log) version.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::catalog::TableBinding;
-use crate::manifest::ManifestEntry;
+use crate::manifest::{TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
-use crate::store::FileRef;
+use crate::store::{FileRef, ObjectStore};
 use planner::catalog::Column;
+use crate::RegisterOutcome;
 
 /// One data file of a table: its identity ([`FileRef`]) paired with its
 /// materialized row groups (file-local order).
 #[derive(Clone)]
-pub(super) struct TableFile {
+pub struct TableFile {
     pub(super) file: FileRef,
     pub(super) row_groups: Vec<Arc<RowGroupMetadata>>,
 }
@@ -23,31 +25,44 @@ pub(super) struct TableFile {
 /// `version` + `files` whole via [`set_version`](Self::set_version); the scan
 /// view a query sees is derived from `files` on demand, so there is no cached
 /// copy to keep in sync.
-pub(super) struct CatalogTable {
-    pub(super) name: String,
-    pub(super) columns: Vec<Column>,
-    pub(super) location: String,
+pub struct CatalogTable {
+    pub(super) manifest: TableManifest,
     pub(super) version: u64,
     pub(super) files: Vec<TableFile>,
+    // todo: remove this comment, but this allows us to refresh in place
+    store: Arc<dyn ObjectStore>
 }
 
 impl CatalogTable {
-    pub(super) fn new(manifest: ManifestEntry, version: u64, files: Vec<TableFile>) -> Self {
-        Self {
-            name: manifest.name,
-            columns: manifest.columns,
-            location: manifest.location,
-            version,
-            files,
-        }
+    pub(super) fn new(...) {
+        
     }
 
-    /// Swap in a newer log version's content.
-    pub(super) fn set_version(&mut self, version: u64, files: Vec<TableFile>) {
-        self.version = version;
-        self.files = files;
+
+    /// Register one newly-written local Parquet data file with table `name`:
+    /// read its footer (over the dispatch pool), commit a new log version
+    /// whose file list is `latest + this file` — retrying past CAS conflicts
+    /// with other writers — and swap the new version into the in-memory entry.
+    /// Registering a name the log already holds is a no-op, so a replayed
+    /// notification can't double-count rows.
+    ///
+    /// The file must live in the table's data directory — and only a table
+    /// over an absolute local directory can accept a *path* (a store-relative
+    /// location is not where local files land); anything else is reported as
+    /// [`RegisterOutcome::LocationMismatch`] and nothing is committed.
+    pub fn register_data_file(&self, path: &Path) -> crate::Result<RegisterOutcome> {
+        // TODO
+        todo!()
+    }
+    
+    pub fn files(&self) -> &[TableFile] {
+        &self.files
     }
 
+    pub fn refresh() {
+        todo!()
+    }
+    
     /// A fresh per-query [`TableBinding`] over a flat scan view of the current
     /// files: every file's row groups concatenated in log order, where a row
     /// group's global index is simply its position. Derived here (cheap `Arc`
@@ -58,7 +73,7 @@ impl CatalogTable {
             .iter()
             .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
-        TableBinding::new(self.columns.clone(), Arc::new(ParquetTable::new(row_groups)))
+        TableBinding::new(self.manifest.columns.clone(), Arc::new(ParquetTable::new(row_groups)))
     }
 
     /// The current file list as [`FileRef`]s — what a commit on top of this

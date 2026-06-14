@@ -160,19 +160,6 @@ pub(crate) fn object_key(prefix: &str, key: &str) -> String {
     }
 }
 
-/// Join `name` onto a table `location` for a store key, **preserving** whether
-/// the location is absolute (a leading `/`, meaning the bucket root). The
-/// absolute-aware companion to [`join_prefix`], used where the resulting key is
-/// later handed to a store that interprets the leading `/` itself
-/// ([`object_key`]).
-pub(crate) fn location_key(location: &str, name: &str) -> String {
-    let joined = join_prefix(location, name);
-    if location.starts_with('/') {
-        format!("/{joined}")
-    } else {
-        joined
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -27,12 +27,13 @@ pub use reading::{
 };
 
 mod metadata;
-pub use metadata::{LoadedFiles, create_load_and_commit_spec};
+pub use metadata::{create_load_and_commit_spec};
 
 mod row_group_stats;
 pub use row_group_stats::{
     RowGroupFilter, ScanOrder, row_group_eliminated, row_group_filter_from, scan_order_from,
 };
+
 
 pub(crate) mod types;
 pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
