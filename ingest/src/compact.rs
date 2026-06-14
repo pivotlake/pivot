@@ -7,14 +7,11 @@
 //! groups) and swaps it into the table in a single log commit.
 //!
 //! The compacter is **location-agnostic**: candidates come from the table's
-//! log (names + sizes — no directory scanning), reads resolve through the
+//! manifest (paths + sizes — no directory scanning), reads resolve through the
 //! catalog (a local path or a presigned URL alike), and writes/deletes go
-//! through the catalog's [`write_data_file`]/[`delete_data_file`]. A table under
-//! an `s3://` database root compacts through the exact same code path as a local
-//! one.
-//!
-//! [`write_data_file`]: ParquetCatalog::write_data_file
-//! [`delete_data_file`]: ParquetCatalog::delete_data_file
+//! through the table's [`CatalogTable::write_data_file`] /
+//! [`CatalogTable::delete_data_file`]. A table under an `s3://` database root
+//! compacts through the exact same code path as a local one.
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups and the write pipeline's encode stages
@@ -44,7 +41,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dispatch::{DataFlowDispatcher, Projection};
-use goose::parquet::{ParquetTable, table_input};
+use goose::parquet::table_input;
+use goose::store::ObjectPath;
 use goose::{CatalogTable, FileRef, ParquetCatalog};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -121,10 +119,36 @@ impl Compacter {
     /// Each batch is capped at roughly one output file's worth, so a long
     /// backlog (e.g. after a restart) is worked off with bounded memory.
     /// Errors are logged and end the table's round — the next poll retries.
-    async fn compact_table(&self, table: &CatalogTable) {
-        // Refresh table, compact it (in dispatch from a spawn blocking thread), as long as there is 
-        // what to compact for this table
-        todo!()
+    async fn compact_table(&self, mut table: CatalogTable) {
+        if let Err(e) = table.refresh() {
+            warn!(table = table.name(), error = %e, "compaction: table refresh failed");
+            return;
+        }
+        while let Some(inputs) = self.next_batch(&table) {
+            let job = CompactJob {
+                dispatcher: self.catalog.dispatcher().clone(),
+                table: table.clone(),
+                seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            };
+            match tokio::task::spawn_blocking(move || job.compact(inputs)).await {
+                Ok(Ok(merged)) => {
+                    info!(table = table.name(), files = merged.len(), "compacted batch");
+                    // Pull in the swap we just committed before scanning again.
+                    if let Err(e) = table.refresh() {
+                        warn!(table = table.name(), error = %e, "compaction: refresh after merge failed");
+                        return;
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!(table = table.name(), error = e, "compaction merge failed");
+                    return;
+                }
+                Err(e) => {
+                    error!(table = table.name(), error = %e, "compaction job panicked");
+                    return;
+                }
+            }
+        }
     }
 
     /// The next batch of `table`'s files to merge, straight from its current
@@ -134,8 +158,8 @@ impl Compacter {
     /// full output yet — merging earlier would just rewrite the same rows
     /// again on the next flush).
     fn next_batch(&self, table: &CatalogTable) -> Option<Vec<FileRef>> {
-        let files = table.files()?;
-        let mut small: Vec<FileRef> = files
+        let mut small: Vec<FileRef> = table
+            .file_refs()
             .into_iter()
             .filter(|f| f.size < self.target_bytes)
             .collect();
@@ -144,7 +168,7 @@ impl Compacter {
         }
         // Oldest first (sink file names embed a timestamp + sequence),
         // stopping once the batch fills one output.
-        small.sort_by(|a, b| a.name.cmp(&b.name));
+        small.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
         let mut total = 0u64;
         let mut batch = Vec::new();
         for file in small {
@@ -155,7 +179,7 @@ impl Compacter {
             }
         }
         debug!(
-            table,
+            table = table.name(),
             files = batch.len(),
             bytes = total,
             "small files below compaction threshold; waiting for more"
@@ -175,8 +199,47 @@ struct CompactJob {
 impl CompactJob {
     /// Decode `inputs` and re-encode them as one stream of target-sized row
     /// groups — a single scan→encode dataflow — then commit: write the merged
-    /// file(s), swap them for the inputs in the table log, delete the inputs.
+    /// file(s), swap them for the inputs in one manifest version, delete the
+    /// inputs. Returns the merged files written.
     fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, String> {
-        // todo!()
+        // Scan just the input files and re-encode their rows into target-sized
+        // merged files — one scan→encode dataflow on the worker pool.
+        let parquet = self.table.parquet_table_for(&inputs);
+        let columns = parquet.schema().fields().len();
+        let scan = table_input(&self.dispatcher, &parquet, Projection::all(columns), false);
+        let merged_bytes = parquet_writing::encode(scan, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE)
+            .collect()
+            .map_err(|e| format!("compaction encode: {e}"))?;
+
+        // Write each merged file into the table's data location.
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut added = Vec::with_capacity(merged_bytes.len());
+        for (i, bytes) in merged_bytes.into_iter().enumerate() {
+            let name = format!("compacted-{millis}-{:06}-{i}.parquet", self.seq);
+            let file = self
+                .table
+                .write_data_file(ObjectPath::new(name), &bytes)
+                .map_err(|e| format!("writing merged file: {e}"))?;
+            added.push(file);
+        }
+
+        // Commit the swap (one manifest version: inputs out, merged in), then
+        // delete the now-orphaned inputs. The order is crash-safe: a file is part
+        // of the table iff the committed manifest lists it, so a crash before the
+        // deletes leaves only orphan objects, never a double read.
+        let removed: Vec<ObjectPath> = inputs.iter().map(|f| f.path.clone()).collect();
+        let mut table = self.table;
+        table
+            .replace_data_files(&removed, &added)
+            .map_err(|e| format!("committing compaction swap: {e}"))?;
+        for input in &inputs {
+            if let Err(e) = table.delete_data_file(&input.path) {
+                warn!(error = %e, file = %input.path, "compaction: deleting merged-away input failed (orphan left)");
+            }
+        }
+        Ok(added)
     }
 }

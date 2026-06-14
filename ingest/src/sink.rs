@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dispatch::DataFlowDispatcher;
+use goose::store::ObjectPath;
 use goose::{ParquetCatalog, RegisterOutcome};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -353,7 +354,14 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         let catalog = self.catalog.clone();
         let table = self.name.clone();
         let registered = tokio::task::spawn_blocking(move || {
-            let outcome = catalog.register_data_file(&table, &path);
+            // A writer evolves a cloned-out table handle; no such table yet just
+            // defers visibility to the table's `CREATE TABLE`.
+            let outcome = match catalog.table_handle(&table) {
+                Some(mut handle) => {
+                    handle.register_data_file(ObjectPath::new(path.to_string_lossy()))
+                }
+                None => Ok(RegisterOutcome::NoSuchTable),
+            };
             (outcome, path)
         })
         .await;

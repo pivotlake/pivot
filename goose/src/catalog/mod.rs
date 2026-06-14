@@ -240,6 +240,21 @@ impl ParquetCatalog {
         self.tables.read().unwrap().get(name).cloned()
     }
 
+    /// A snapshot clone of every table the catalog currently holds — for a sweep
+    /// (e.g. the compacter) that refreshes and evolves each one independently.
+    pub fn tables(&self) -> Vec<CatalogTable> {
+        self.tables.read().unwrap().values().cloned().collect()
+    }
+
+    /// Table `name`'s current committed files — refreshing to the latest version
+    /// first, so a commit by ingest/compaction (in this process or another) is
+    /// reflected. `None` if no such table exists.
+    pub fn table_files(&self, name: &str) -> Option<Vec<FileRef>> {
+        let mut table = self.table_handle(name)?;
+        let _ = table.refresh();
+        Some(table.file_refs())
+    }
+
     /// Compile a `CREATE TABLE` to the dataflow that runs it: read every Parquet
     /// footer under the table's location in parallel and, at the final stage,
     /// record the table in the manifest with the files found, and publish it in

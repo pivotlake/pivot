@@ -236,6 +236,50 @@ impl CatalogTable {
         &self.files
     }
 
+    /// The table's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The table's current files as [`FileRef`]s — what a compacter scans to pick
+    /// merge candidates, and names in a [`replace_data_files`](Self::replace_data_files) swap.
+    pub fn file_refs(&self) -> Vec<FileRef> {
+        self.files.iter().map(|f| f.file.clone()).collect()
+    }
+
+    /// A scannable [`ParquetTable`] over just the `wanted` files (matched by
+    /// path) — the compaction read view: feed it to
+    /// [`table_input`](crate::parquet::table_input) to decode their rows.
+    pub fn parquet_table_for(&self, wanted: &[FileRef]) -> Arc<ParquetTable> {
+        let want: HashSet<&ObjectPath> = wanted.iter().map(|f| &f.path).collect();
+        let row_groups = self
+            .files
+            .iter()
+            .filter(|f| want.contains(&f.file.path))
+            .flat_map(|f| f.row_groups.iter().cloned())
+            .collect();
+        Arc::new(ParquetTable::new(row_groups))
+    }
+
+    /// Write `bytes` as a new data file at `path` (resolved against the table's
+    /// location like any [`FileRef`] path), returning its [`FileRef`]. The
+    /// compaction writer's output, committed with
+    /// [`replace_data_files`](Self::replace_data_files).
+    pub fn write_data_file(&self, path: ObjectPath, bytes: &[u8]) -> crate::Result<FileRef> {
+        self.store.put(&self.location.resolve(&path), bytes)?;
+        Ok(FileRef {
+            path,
+            size: bytes.len() as u64,
+        })
+    }
+
+    /// Delete a data file (a compaction input swapped out of the manifest).
+    /// `path` resolves against the table's location like any [`FileRef`] path.
+    pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
+        self.store.delete(&self.location.resolve(path))?;
+        Ok(())
+    }
+
     /// A fresh per-query [`TableBinding`] over a flat scan view of the current
     /// files: every file's row groups concatenated in manifest order, where a row
     /// group's global index is simply its position. Derived here (cheap `Arc`

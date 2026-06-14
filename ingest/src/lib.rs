@@ -363,6 +363,16 @@ mod tests {
             .unwrap();
     }
 
+    /// Resolve `name` through the catalog trait — what a query bind does — so the
+    /// catalog refreshes its in-memory copy from the latest committed manifest
+    /// (a writer evolves a cloned-out handle, so the catalog's own copy lags
+    /// until a resolve), then return the typed binding.
+    fn fresh_binding(catalog: &goose::ParquetCatalog, name: &str) -> goose::TableBinding {
+        use planner::catalog::Catalog as _;
+        let _ = catalog.table(name);
+        catalog.binding(name).unwrap()
+    }
+
     /// Load the written directory back into a `ParquetTable`. Drives the
     /// metadata-fetch dataflow from this (coordinator) thread; the footer
     /// reads themselves land on the workers.
@@ -492,7 +502,7 @@ mod tests {
             catalog.clone(),
         );
 
-        let table = catalog.binding("otel_logs").unwrap();
+        let table = fresh_binding(&catalog, "otel_logs");
         let groups = table.parquet.row_groups();
         assert_eq!(
             groups.iter().map(|rg| rg.num_rows).sum::<i64>(),
@@ -543,7 +553,7 @@ mod tests {
         // One merged file replaced the three inputs, on disk and in the
         // catalog, and indices stayed sequential.
         assert_eq!(parquet_file_count(dir.path()), 1);
-        let table = catalog.binding("otel_logs").unwrap();
+        let table = fresh_binding(&catalog, "otel_logs");
         let groups = table.parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
@@ -552,7 +562,7 @@ mod tests {
                 .table_files("otel_logs")
                 .unwrap()
                 .iter()
-                .any(|f| f.name.contains("compacted"))
+                .any(|f| f.path.as_str().contains("compacted"))
         );
 
         // The merged file's contents round-trip through the engine's scan.
@@ -641,14 +651,14 @@ mod tests {
         // catalog.
         let files = catalog.table_files("events").unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files[0].name.contains("compacted"));
+        assert!(files[0].path.as_str().contains("compacted"));
         let on_disk: Vec<_> = std::fs::read_dir(&table_dir)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".parquet"))
             .collect();
-        assert_eq!(on_disk, vec![files[0].name.clone()]);
+        assert_eq!(on_disk, vec![files[0].path.as_str().to_string()]);
 
         let table = catalog.binding("events").unwrap();
         assert_eq!(
@@ -718,7 +728,7 @@ mod tests {
                 .table_files("otel_logs")
                 .unwrap()
                 .iter()
-                .any(|f| f.name.contains("compacted"))
+                .any(|f| f.path.as_str().contains("compacted"))
         );
         assert_eq!(parquet_file_count(data_dir.path()), 1);
 
