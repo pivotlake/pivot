@@ -13,12 +13,13 @@
 //!
 //! - `operator` (private) — per-operator `compile` impls (one `impl` block
 //!   per [`Operator`](crate::operator::Operator) variant).
-//! - `expression` (private) — per-expression `compile` impls, producing
-//!   [`ExprFn`]s.
+//!
+//! The per-expression `compile` impls producing [`ExprFn`]s live alongside
+//! their AST types in the [`expression`](crate::expression) submodules, not
+//! here.
 //!
 
 mod dummy_scan;
-mod expression;
 mod operator;
 
 use crate::catalog::Catalog;
