@@ -2,7 +2,8 @@
 //!
 //! A single gRPC endpoint exposes whichever of the three OTLP services
 //! (logs / traces / metrics) the configuration enables — a signal is enabled by
-//! giving it a [`SignalSetup`] (a destination plus a column mapping). A service
+//! giving it a [`SignalSetup`] (the catalog table to append to plus a column
+//! mapping). A service
 //! does no real work on the receive path: it pairs its payload with the
 //! signal's [`CompiledMapping`] (see [`mapping`]) into
 //! a buffered item and hands it to that signal's [`ParquetSink`]. Flattening to
@@ -45,21 +46,31 @@ use tonic::transport::server::Router;
 use tonic::{Request, Response, Status};
 
 use crate::parquet_writing::ToRecordBatch;
-use crate::sink::{Flushable, ParquetSink, SinkDestination};
+use crate::sink::{Flushable, ParquetSink};
 use convert::CompiledMapping;
 use mapping::{LogsItem, MetricsItem, TracesItem};
 
 pub use config::ConfigError;
 pub use mapping::Signal;
 
+/// The catalog table a signal writes to when none is configured.
+pub(crate) fn default_table(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Logs => "otel_logs",
+        Signal::Traces => "otel_traces",
+        Signal::Metrics => "otel_metrics",
+    }
+}
+
 /// Default OTLP/gRPC port (the OpenTelemetry collector's `otlp` receiver
 /// default).
 pub const DEFAULT_OTLP_ADDR: &str = "0.0.0.0:4317";
 
-/// One enabled signal: where to write it and how to flatten it into columns.
+/// One enabled signal: which catalog table it appends to and how to flatten it
+/// into columns.
 #[derive(Debug, Clone)]
 pub(crate) struct SignalSetup {
-    pub(crate) destination: SinkDestination,
+    pub(crate) table: String,
     pub(crate) mapping: Arc<CompiledMapping>,
 }
 
@@ -191,22 +202,27 @@ pub(crate) struct OtelServer {
 }
 
 /// Create a sink for one signal, register it for flushing, and return the typed
-/// handle the gRPC service appends to.
+/// handle the gRPC service appends to. Fails fast if the signal's catalog table
+/// doesn't exist — the sink only writes into a table, never creates one.
 fn build_sink<T: ToRecordBatch>(
-    name: &str,
     setup: &SignalSetup,
     cfg: &OtelConfig,
     dispatcher: &DataFlowDispatcher,
     catalog: &Arc<ParquetCatalog>,
     sinks: &mut Vec<Arc<dyn Flushable>>,
 ) -> std::io::Result<Arc<ParquetSink<T>>> {
+    if !catalog.contains_table(&setup.table) {
+        return Err(std::io::Error::other(format!(
+            "ingest table `{}` does not exist — create it before starting ingest",
+            setup.table
+        )));
+    }
     let sink = Arc::new(ParquetSink::new(
-        name,
-        &setup.destination,
+        &setup.table,
         cfg.flush_rows,
         dispatcher.clone(),
         catalog.clone(),
-    )?);
+    ));
     sinks.push(sink.clone());
     Ok(sink)
 }
@@ -225,9 +241,9 @@ macro_rules! tune {
 }
 
 impl OtelServer {
-    /// Build the sinks and gRPC router for `cfg`. Creates each enabled signal's
-    /// output directory. Every flushed file is registered with the catalog
-    /// table named after its sink.
+    /// Build the sinks and gRPC router for `cfg`. Fails if an enabled signal's
+    /// catalog table doesn't exist — each sink appends to (and never creates)
+    /// the table named after it.
     pub(crate) fn build(
         cfg: &OtelConfig,
         dispatcher: &DataFlowDispatcher,
@@ -240,7 +256,7 @@ impl OtelServer {
         // generated server type is preserved.
         let logs = match &cfg.logs {
             Some(setup) => {
-                let sink = build_sink("otel_logs", setup, cfg, dispatcher, catalog, &mut sinks)?;
+                let sink = build_sink(setup, cfg, dispatcher, catalog, &mut sinks)?;
                 let svc = LogsSinkService {
                     sink,
                     mapping: setup.mapping.clone(),
@@ -251,7 +267,7 @@ impl OtelServer {
         };
         let traces = match &cfg.traces {
             Some(setup) => {
-                let sink = build_sink("otel_traces", setup, cfg, dispatcher, catalog, &mut sinks)?;
+                let sink = build_sink(setup, cfg, dispatcher, catalog, &mut sinks)?;
                 let svc = TraceSinkService {
                     sink,
                     mapping: setup.mapping.clone(),
@@ -262,7 +278,7 @@ impl OtelServer {
         };
         let metrics = match &cfg.metrics {
             Some(setup) => {
-                let sink = build_sink("otel_metrics", setup, cfg, dispatcher, catalog, &mut sinks)?;
+                let sink = build_sink(setup, cfg, dispatcher, catalog, &mut sinks)?;
                 let svc = MetricsSinkService {
                     sink,
                     mapping: setup.mapping.clone(),

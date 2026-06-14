@@ -12,8 +12,9 @@
 //! # Shape
 //!
 //! - `ParquetSink` buffers Arrow batches for one stream and
-//!   flushes one Parquet file per drain, registering it with the catalog so
-//!   the rows are queryable at once.
+//!   flushes Parquet files per drain, **appending** each into its catalog table
+//!   (writing into the table's own data location and committing it) so the rows
+//!   are queryable at once.
 //! - The `otel` module turns each OTLP signal (logs / traces / metrics) into
 //!   batches and feeds a sink. Which signals run is configuration, not code:
 //!   see [`OtelConfig`].
@@ -29,14 +30,13 @@
 //!
 //! # Querying the output
 //!
-//! Each sink writes flat Parquet files into one directory, so the stream is
-//! queryable with `CREATE TABLE <name> (...) WITH (path = '<dir>')`, where
-//! `<name>` is the sink's name (e.g. `otel_logs`) and `<dir>` its (absolute)
-//! destination. When the server hands [`Ingestor::start`] its catalog, each
-//! flushed file is *registered* with that table, so rows become queryable as
-//! soon as they land — no re-`CREATE` needed. Files flushed before the
-//! `CREATE TABLE` are picked up by the create itself (it snapshots the
-//! directory).
+//! A sink **appends to an existing catalog table** — its name (e.g. `otel_logs`)
+//! is the table it writes into. Create the table first, e.g.
+//! `CREATE TABLE otel_logs (...) WITH (path = '<dir>')`; [`Ingestor::start`]
+//! refuses to start a sink whose table doesn't exist. Each flush writes a file
+//! into that table's data location and commits it, so rows become queryable as
+//! soon as they land — no re-`CREATE` needed, and the sink never has to guess
+//! where the data lives (the table is the single source of truth).
 
 mod compact;
 mod otel;
@@ -54,7 +54,6 @@ use tracing::{error, info, warn};
 
 pub use compact::{Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL};
 pub use otel::{ConfigError, DEFAULT_OTLP_ADDR, OtelConfig, Signal};
-pub use sink::SinkDestination;
 
 use crate::otel::OtelServer;
 use crate::sink::Flushable;
@@ -268,25 +267,35 @@ mod tests {
         }
     }
 
+    /// Ensure the `otel_logs` table exists at `dir` (the sink only ever writes
+    /// into an existing table), creating it if a fresh catalog was handed in.
+    fn ensure_otel_logs(
+        catalog: &Arc<goose::ParquetCatalog>,
+        dispatcher: &DataFlowDispatcher,
+        dir: &Path,
+    ) {
+        if !catalog.contains_table("otel_logs") {
+            create_table(catalog, dispatcher, "otel_logs", Some(dir));
+        }
+    }
+
     /// Flush `requests` (one batch each) through a sink as a single flush,
-    /// registering each file with `catalog`.
+    /// appending each file to the `otel_logs` table (at `dir`).
     fn write_logs(
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
         requests: &[ExportLogsServiceRequest],
         catalog: Arc<goose::ParquetCatalog>,
     ) {
+        ensure_otel_logs(&catalog, dispatcher, dir);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let dest = SinkDestination::Local(dir.to_path_buf());
             // usize::MAX threshold: appends never auto-flush, so one flush_now
             // writes all `requests` as a single multi-row-group file.
-            let sink =
-                ParquetSink::new("otel_logs", &dest, usize::MAX, dispatcher.clone(), catalog)
-                    .unwrap();
+            let sink = ParquetSink::new("otel_logs", usize::MAX, dispatcher.clone(), catalog);
             for request in requests {
                 sink.append(otel::logs_item_for_test(request.clone())).await;
             }
@@ -295,22 +304,20 @@ mod tests {
     }
 
     /// Flush each request as its **own** Parquet file through one sink (one
-    /// flush per request), registering each with `catalog`.
+    /// flush per request), appending each to the `otel_logs` table (at `dir`).
     fn flush_each(
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
         requests: &[ExportLogsServiceRequest],
         catalog: Arc<goose::ParquetCatalog>,
     ) {
+        ensure_otel_logs(&catalog, dispatcher, dir);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
-            let dest = SinkDestination::Local(dir.to_path_buf());
-            let sink =
-                ParquetSink::new("otel_logs", &dest, usize::MAX, dispatcher.clone(), catalog)
-                    .unwrap();
+            let sink = ParquetSink::new("otel_logs", usize::MAX, dispatcher.clone(), catalog);
             for request in requests {
                 sink.append(otel::logs_item_for_test(request.clone())).await;
                 sink.flush_now().await;

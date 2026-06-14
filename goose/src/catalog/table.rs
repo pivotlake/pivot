@@ -127,11 +127,17 @@ impl CatalogTable {
         Ok(true)
     }
 
-    /// Register one newly-written Parquet data file at object path `path`: commit
-    /// a new manifest version whose file list is `latest + this file`, retrying
-    /// past concurrent commits. Registering a name the manifest already holds is
-    /// a no-op ([`RegisterOutcome::AlreadyRegistered`]), so a replayed
-    /// notification can't double-count rows.
+    /// Write `bytes` as a new data file at `path` (under the table's location)
+    /// and commit it into the table — the ingest sink's append, one call for the
+    /// write and the manifest commit. Idempotent on `path`.
+    pub fn append_data_file(&mut self, path: ObjectPath, bytes: &[u8]) -> crate::Result<()> {
+        let file = self.write_data_file(path, bytes)?;
+        self.commit_added_file(file)
+    }
+
+    /// Register an already-written Parquet data file at object path `path`:
+    /// commit a new manifest version whose file list is `latest + this file`,
+    /// retrying past concurrent commits.
     ///
     /// `path` may be relative to the table's data location or absolute; either
     /// way it must resolve to a file a `list` of the location actually finds
@@ -153,17 +159,22 @@ impl CatalogTable {
         else {
             return Err(Error::FileNotInTableLocation(path));
         };
+        self.commit_added_file(new_file)
+    }
 
+    /// CAS-commit one already-written file into the manifest, retrying past a
+    /// concurrent writer (refresh + retry). A file the manifest already holds is
+    /// an idempotent no-op, so a replayed append can't double-count rows.
+    fn commit_added_file(&mut self, file: FileRef) -> crate::Result<()> {
         loop {
-            if self.manifest.entries.iter().any(|e| e.path == new_file.path) {
-                return Ok(()); // already registered — idempotent
+            if self.manifest.entries.iter().any(|e| e.path == file.path) {
+                return Ok(());
             }
             let mut entries = self.manifest.entries.clone();
-            entries.push(new_file.clone());
+            entries.push(file.clone());
             if self.try_commit(entries)? {
                 return Ok(());
             }
-            // Lost the race — rebase onto the winner's version and retry.
             self.refresh()?;
         }
     }

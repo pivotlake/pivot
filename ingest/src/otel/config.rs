@@ -9,7 +9,8 @@
 //! flush_secs = 10
 //!
 //! [logs]
-//! destination = "./otel/logs"   # local dir, or gs:// / s3:// under the db bucket
+//! table = "otel_logs"   # the catalog table to append to (must already exist);
+//!                       # defaults to `otel_<signal>` if omitted
 //! columns = [
 //!   { name = "Timestamp",          field      = "time_unix_nano" },
 //!   { name = "ServiceName",        attr       = "resource:service.name" },
@@ -17,7 +18,7 @@
 //! ]
 //!
 //! # Omit `columns` to use the built-in default mapping for that signal.
-//! # Omit a whole signal table ([traces] / [metrics]) to disable it.
+//! # Omit a whole signal section ([traces] / [metrics]) to disable it.
 //! ```
 //!
 //! Each column carries exactly one of `field`, `attr` (`"scope:key"`), or
@@ -30,8 +31,7 @@ use serde::Deserialize;
 
 use super::convert::{AttrScope, ColumnSpec, CompiledMapping, Source, UnknownField};
 use super::mapping::Signal;
-use super::{DEFAULT_OTLP_ADDR, OtelConfig, SignalSetup};
-use crate::sink::SinkDestination;
+use super::{DEFAULT_OTLP_ADDR, OtelConfig, SignalSetup, default_table};
 
 /// An error building an [`OtelConfig`] from TOML.
 #[derive(Debug, thiserror::Error)]
@@ -83,16 +83,15 @@ impl OtelConfig {
         Ok(cfg)
     }
 
-    /// Enable `signal` writing to `destination` with the built-in default
-    /// column mapping. Used by the inline `--otel` CLI spec and anywhere a
-    /// caller wants the out-of-the-box layout.
-    pub fn enable_default(
-        &mut self,
-        signal: Signal,
-        destination: SinkDestination,
-    ) -> Result<&mut Self, ConfigError> {
-        let setup =
-            SignalSetup::compile(signal, destination, super::defaults::columns_for(signal))?;
+    /// Enable `signal` with the built-in default column mapping, appending to
+    /// its conventional table (`otel_<signal>`). Used by the inline `--otel` CLI
+    /// spec and anywhere a caller wants the out-of-the-box layout.
+    pub fn enable_default(&mut self, signal: Signal) -> Result<&mut Self, ConfigError> {
+        let setup = SignalSetup::compile(
+            signal,
+            default_table(signal).to_string(),
+            super::defaults::columns_for(signal),
+        )?;
         *self.signal_slot(signal) = Some(setup);
         Ok(self)
     }
@@ -107,14 +106,15 @@ impl OtelConfig {
 }
 
 impl SignalSetup {
-    /// Compile `columns` for `signal` and pair them with a destination.
+    /// Compile `columns` for `signal` and pair them with the catalog `table` it
+    /// appends to.
     fn compile(
         signal: Signal,
-        destination: SinkDestination,
+        table: String,
         columns: Vec<ColumnSpec>,
     ) -> Result<Self, UnknownField> {
         Ok(SignalSetup {
-            destination,
+            table,
             mapping: Arc::new(CompiledMapping::compile(signal, &columns)?),
         })
     }
@@ -135,7 +135,8 @@ struct ReceiverToml {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SignalToml {
-    destination: String,
+    /// The catalog table to append to; defaults to `otel_<signal>`.
+    table: Option<String>,
     #[serde(default)]
     columns: Vec<ColumnToml>,
 }
@@ -150,11 +151,10 @@ impl SignalToml {
                 .map(ColumnToml::into_spec)
                 .collect::<Result<Vec<_>, _>>()?
         };
-        Ok(SignalSetup::compile(
-            signal,
-            SinkDestination::parse(&self.destination),
-            columns,
-        )?)
+        let table = self
+            .table
+            .unwrap_or_else(|| default_table(signal).to_string());
+        Ok(SignalSetup::compile(signal, table, columns)?)
     }
 }
 
@@ -221,7 +221,6 @@ mod tests {
             flush_rows = 100
 
             [logs]
-            destination = "./out/logs"
             columns = [
               { name = "Ts",      field      = "time_unix_nano" },
               { name = "Svc",     attr       = "resource:service.name" },
@@ -255,7 +254,6 @@ mod tests {
     fn empty_columns_fall_back_to_defaults() {
         let toml = r#"
             [traces]
-            destination = "./out/traces"
         "#;
 
         let cfg = OtelConfig::from_toml(toml).unwrap();
@@ -270,7 +268,6 @@ mod tests {
     fn unknown_field_is_rejected() {
         let toml = r#"
             [logs]
-            destination = "./out/logs"
             columns = [ { name = "X", field = "not_a_field" } ]
         "#;
 
@@ -283,7 +280,6 @@ mod tests {
     fn ambiguous_source_is_rejected() {
         let toml = r#"
             [logs]
-            destination = "./out/logs"
             columns = [ { name = "X", field = "body", attr = "resource:k" } ]
         "#;
 

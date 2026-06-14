@@ -224,6 +224,13 @@ impl ParquetCatalog {
         self.tables.read().unwrap().get(name).cloned()
     }
 
+    /// Whether a table named `name` exists in the catalog (a cheap membership
+    /// check — no clone). Used by ingest to fail fast at startup when a sink's
+    /// table hasn't been created.
+    pub fn contains_table(&self, name: &str) -> bool {
+        self.tables.read().unwrap().contains_key(name)
+    }
+
     /// A snapshot clone of every table the catalog currently holds — for a sweep
     /// (e.g. the compacter) that refreshes and evolves each one independently.
     pub fn tables(&self) -> Vec<CatalogTable> {
