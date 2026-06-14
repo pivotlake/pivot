@@ -1,21 +1,27 @@
+//! Error- and cancellation-path tests, fed from in-memory `RecordBatch`es via
+//! [`values_input`] instead of a Parquet scan. The cancel test splits its rows
+//! across many batches so each is a separate work item — cancellation is
+//! checked between items, so a partially-drained query can still stop early.
+
 mod common;
 
 use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 
 use common::*;
-use dispatch::Projection;
-use goose::parquet::table_input;
+use dispatch::values_input;
 
 /// A panicking filter on every batch should surface as an error from
 /// `.collect()`, not a silent empty result.
 #[test]
 fn panic_in_filter_returns_error() {
-    let dispatcher = dispatch(1);
+    let dispatch = dispatch(1);
     let names: Vec<&str> = (0..1000).map(|_| "x").collect();
     let values: Vec<i64> = (0..1000).collect();
-    let (_dir, table) = parquet_table(&dispatcher, &[strings_and_ints(&names, &values)], true);
-    let result = table_input(&dispatcher, &table, Projection::columns([1]), false)
+    let batch = strings_and_ints(&names, &values);
+
+    let result = values_input(&dispatch, vec![batch])
+        .record_batches()
         .filter(|| move |_batch: &RecordBatch| panic!("intentional panic in filter"))
         .count()
         .collect();
@@ -35,19 +41,28 @@ fn panic_in_filter_returns_error() {
 ///   3. return at most the full result, often less.
 #[test]
 fn cancelled_query_returns_without_hanging() {
-    // Setup: a table large enough that finishing in one tick is unlikely.
-    let dispatcher = dispatch(1);
-    let n = 200_000;
-    let names: Vec<&str> = (0..n).map(|_| "x").collect();
-    let values: Vec<i64> = (0..n as i64).collect();
-    let (_dir, table) = parquet_table(&dispatcher, &[strings_and_ints(&names, &values)], true);
+    // Setup: enough batches that finishing in one tick is unlikely. Each batch
+    // is a separate work item, so cancellation can take effect between them.
+    let dispatch = dispatch(1);
+    let n: i64 = 200_000;
+    let chunk = 8192;
+    let batches: Vec<RecordBatch> = (0..n)
+        .step_by(chunk)
+        .map(|start| {
+            let end = (start + chunk as i64).min(n);
+            let names: Vec<&str> = (start..end).map(|_| "x").collect();
+            let values: Vec<i64> = (start..end).collect();
+            strings_and_ints(&names, &values)
+        })
+        .collect();
 
     // Execute: kick off the query, immediately cancel, then drain the handle.
-    let handle = table_input(&dispatcher, &table, Projection::columns([1]), false)
+    let handle = values_input(&dispatch, batches)
+        .record_batches()
         .filter(|| {
             move |batch: &RecordBatch| {
                 let col = batch
-                    .column(0)
+                    .column(1)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap();
@@ -58,11 +73,11 @@ fn cancelled_query_returns_without_hanging() {
     handle.cancel();
     let result = handle.collect();
 
-    // Assert: collect succeeded and returned no more rows than the table holds.
+    // Assert: collect succeeded and returned no more rows than we fed in.
     let batches = result.expect("cancelled query should not return an error");
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert!(
-        total <= n,
-        "cancelled query returned more rows ({total}) than the table ({n})"
+        total <= n as usize,
+        "cancelled query returned more rows ({total}) than the input ({n})"
     );
 }
