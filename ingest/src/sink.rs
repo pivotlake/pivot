@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dispatch::DataFlowDispatcher;
+use goose::ParquetCatalog;
 use goose::store::ObjectPath;
-use goose::{ParquetCatalog, RegisterOutcome};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as StorePath;
@@ -354,43 +354,35 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         let catalog = self.catalog.clone();
         let table = self.name.clone();
         let registered = tokio::task::spawn_blocking(move || {
-            // A writer evolves a cloned-out table handle; no such table yet just
-            // defers visibility to the table's `CREATE TABLE`.
-            let outcome = match catalog.table_handle(&table) {
-                Some(mut handle) => {
-                    handle.register_data_file(ObjectPath::new(path.to_string_lossy()))
-                }
-                None => Ok(RegisterOutcome::NoSuchTable),
-            };
-            (outcome, path)
+            // A writer evolves a cloned-out table handle; `None` (no such table
+            // yet) just defers visibility to the table's `CREATE TABLE`.
+            let result = catalog
+                .table_handle(&table)
+                .map(|mut handle| handle.register_data_file(ObjectPath::new(path.to_string_lossy())));
+            (result, path)
         })
         .await;
-        let (outcome, path) = match registered {
+        let (result, path) = match registered {
             Ok(result) => result,
             Err(e) => {
                 error!(sink = %self.name, error = %e, "catalog registration task panicked");
                 return;
             }
         };
-        match outcome {
-            Ok(RegisterOutcome::Registered) => {
+        match result {
+            Some(Ok(())) => {
                 info!(sink = %self.name, file = %path.display(), "registered parquet in catalog")
             }
-            Ok(RegisterOutcome::AlreadyRegistered) => {}
-            Ok(RegisterOutcome::NoSuchTable) => {
+            // Non-fatal: the file is on disk, so the next `CREATE TABLE`/restart
+            // still finds it (e.g. a location mismatch, or a transient store error).
+            Some(Err(e)) => {
+                warn!(sink = %self.name, file = %path.display(), error = %e, "catalog registration failed")
+            }
+            None => {
                 debug!(
                     sink = %self.name, file = %path.display(),
                     "no catalog table for sink; file becomes visible at CREATE TABLE"
                 )
-            }
-            Ok(RegisterOutcome::LocationMismatch) => {
-                warn!(
-                    sink = %self.name, file = %path.display(),
-                    "catalog table location differs from sink directory; not registering"
-                )
-            }
-            Err(e) => {
-                error!(sink = %self.name, file = %path.display(), error = %e, "catalog registration failed")
             }
         }
     }

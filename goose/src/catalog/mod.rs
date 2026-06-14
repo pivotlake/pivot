@@ -68,6 +68,8 @@ pub enum Error {
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
     TableExists(String),
+    #[error("no file at `{0}` in the table's data location to register")]
+    FileNotInTableLocation(ObjectPath),
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
@@ -86,24 +88,6 @@ impl From<Error> for CatalogError {
     fn from(value: Error) -> Self {
         CatalogError::Other(Box::new(value))
     }
-}
-
-/// What [`CatalogTable::register_data_file`] did with the file. The non-
-/// `Registered` outcomes are not errors — a file can legitimately land before
-/// its table is created — but the caller (ingest) wants to log them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RegisterOutcome {
-    /// Committed to the table's log; new binds see its rows.
-    Registered,
-    /// The table's log already holds this name (a replayed notification); no
-    /// new version was committed.
-    AlreadyRegistered,
-    /// No table by that name exists yet; the file is picked up by a later
-    /// `CREATE TABLE` instead.
-    NoSuchTable,
-    /// The table exists but its data does not live in this file's directory
-    /// (or is not an absolute local directory at all); refused.
-    LocationMismatch,
 }
 
 /// Concurrent catalog of tables, keyed by name.

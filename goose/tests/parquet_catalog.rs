@@ -11,7 +11,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 use goose::store::ObjectPath;
-use goose::{ParquetCatalog, RegisterOutcome, TableBinding};
+use goose::{ParquetCatalog, TableBinding};
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };
@@ -342,7 +342,7 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 /// to the shared store. The catalog's own copy is not touched (a later `resolve`
 /// reconciles it). Registers by a **table-relative** path (just the file's
 /// name), which the table resolves under its location.
-fn register(catalog: &ParquetCatalog, name: &str, path: &Path) -> RegisterOutcome {
+fn register(catalog: &ParquetCatalog, name: &str, path: &Path) {
     let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
     catalog
         .table_handle(name)
@@ -368,7 +368,7 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
-    assert_eq!(register(&catalog, "t", &new_file), RegisterOutcome::Registered);
+    register(&catalog, "t", &new_file);
 
     resolve(&catalog, "t");
     let table = catalog.binding("t").unwrap();
@@ -387,11 +387,9 @@ fn register_data_file_is_idempotent_per_path() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40]);
-    assert_eq!(register(&catalog, "t", &new_file), RegisterOutcome::Registered);
-    assert_eq!(
-        register(&catalog, "t", &new_file),
-        RegisterOutcome::AlreadyRegistered
-    );
+    register(&catalog, "t", &new_file);
+    // Registering the same file again is a no-op (it must not double-count).
+    register(&catalog, "t", &new_file);
 
     resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
@@ -417,12 +415,15 @@ fn register_data_file_refuses_foreign_directory() {
 
     let elsewhere = TempDir::new().unwrap();
     let foreign = write_ids(elsewhere.path(), "foreign.parquet", &[1]);
-    let outcome = catalog
+    let err = catalog
         .table_handle("t")
         .unwrap()
         .register_data_file(ObjectPath::new(foreign.to_string_lossy()))
-        .unwrap();
-    assert_eq!(outcome, RegisterOutcome::LocationMismatch);
+        .unwrap_err();
+    assert!(
+        matches!(err, goose::Error::FileNotInTableLocation(_)),
+        "expected a not-in-location error: {err}"
+    );
     resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 }
@@ -435,7 +436,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let extra = write_ids(dir.path(), "extra.parquet", &[40]);
-    assert_eq!(register(&catalog, "t", &extra), RegisterOutcome::Registered);
+    register(&catalog, "t", &extra);
     resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
 
@@ -475,7 +476,7 @@ fn other_catalog_instance_sees_registration_at_next_bind() {
     assert_eq!(reader.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
-    assert_eq!(register(&writer, "t", &new_file), RegisterOutcome::Registered);
+    register(&writer, "t", &new_file);
 
     // Binding through the trait (what a query does) reloads to version 2.
     assert!(PlannerCatalog::table(&reader, "t").is_some());

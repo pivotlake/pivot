@@ -10,7 +10,7 @@ use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use dispatch::DataFlowDispatcher;
 use planner::catalog::Column;
-use crate::{Error, RegisterOutcome};
+use crate::Error;
 
 /// One data file of a table: its identity ([`FileRef`]) paired with its
 /// materialized row groups (file-local order).
@@ -136,9 +136,11 @@ impl CatalogTable {
     /// `path` may be relative to the table's data location or absolute; either
     /// way it must resolve to a file a `list` of the location actually finds
     /// (which is where its size comes from, and what confirms it belongs to the
-    /// table) — otherwise [`RegisterOutcome::LocationMismatch`] and nothing is
-    /// committed. The file is recorded by its location-relative path.
-    pub fn register_data_file(&mut self, path: ObjectPath) -> crate::Result<RegisterOutcome> {
+    /// table) — otherwise [`Error::FileNotInTableLocation`]. Registering a file
+    /// the manifest already holds is an idempotent no-op (so a replayed
+    /// notification can't double-count rows). The file is recorded by its
+    /// location-relative path.
+    pub fn register_data_file(&mut self, path: ObjectPath) -> crate::Result<()> {
         // Match the file in the location's listing by resolved path, so a
         // relative or absolute `path` both land on the same file — and one
         // pointing outside the table's location matches nothing.
@@ -149,17 +151,17 @@ impl CatalogTable {
             .into_iter()
             .find(|f| self.location.resolve(&f.path) == target)
         else {
-            return Ok(RegisterOutcome::LocationMismatch);
+            return Err(Error::FileNotInTableLocation(path));
         };
 
         loop {
             if self.manifest.entries.iter().any(|e| e.path == new_file.path) {
-                return Ok(RegisterOutcome::AlreadyRegistered);
+                return Ok(()); // already registered — idempotent
             }
             let mut entries = self.manifest.entries.clone();
             entries.push(new_file.clone());
             if self.try_commit(entries)? {
-                return Ok(RegisterOutcome::Registered);
+                return Ok(());
             }
             // Lost the race — rebase onto the winner's version and retry.
             self.refresh()?;

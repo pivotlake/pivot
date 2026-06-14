@@ -21,5 +21,5 @@ mod sql_type;
 pub mod store;
 mod manifest;
 
-pub use catalog::{Error, ParquetCatalog, RegisterOutcome, Result, TableBinding, CatalogTable};
+pub use catalog::{Error, ParquetCatalog, Result, TableBinding, CatalogTable};
 pub use store::FileRef;
