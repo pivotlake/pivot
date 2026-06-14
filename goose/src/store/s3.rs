@@ -6,7 +6,7 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFile, DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -229,20 +229,14 @@ impl ObjectStore for S3Store {
             .contents
             .into_iter()
             .map(|c| FileRef {
-                path: prefix.join(&super::key_name(&c.key)),
+                path: ObjectPath::new(super::key_name(&c.key)),
                 size: c.size,
             })
             .collect())
     }
 
-    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
-        Ok(DataFile {
-            file: FileRef {
-                path: key.clone(),
-                size,
-            },
-            source: DataFileSource::Remote(self.presign_get(key)?),
-        })
+    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
+        Ok(DataFileSource::Remote(self.presign_get(key)?))
     }
 }
 

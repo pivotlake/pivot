@@ -71,6 +71,19 @@ impl ObjectPath {
         let idx = trimmed.rfind('/')?;
         Some(ObjectPath(trimmed[..idx].to_string()))
     }
+
+    /// Resolve `child` against this path as a base directory: an **absolute**
+    /// `child` is taken as-is (it escapes the base — e.g. a file in a shared
+    /// directory); any other `child` is relative to this base and joined under
+    /// it. How a table reads a [`FileRef`](crate::FileRef) whose path may be
+    /// relative to the table's location or absolute.
+    pub fn resolve(&self, child: &ObjectPath) -> ObjectPath {
+        if child.is_absolute() {
+            child.clone()
+        } else {
+            self.join(child.as_str())
+        }
+    }
 }
 
 impl fmt::Display for ObjectPath {
@@ -120,5 +133,22 @@ mod tests {
 
         // A bare name has no parent.
         assert_eq!(ObjectPath::new("a.parquet").parent(), None);
+    }
+
+    #[test]
+    fn resolve_relative_under_base_absolute_escapes() {
+        let location = ObjectPath::new("events");
+        // A relative child is read under the table's location.
+        assert_eq!(location.resolve(&ObjectPath::new("a.parquet")).as_str(), "events/a.parquet");
+        // An absolute child escapes the location to the store root.
+        assert_eq!(
+            location.resolve(&ObjectPath::new("/shared/a.parquet")).as_str(),
+            "/shared/a.parquet"
+        );
+        // An absolute location keeps its leading slash through resolution.
+        assert_eq!(
+            ObjectPath::new("/data/events").resolve(&ObjectPath::new("a.parquet")).as_str(),
+            "/data/events/a.parquet"
+        );
     }
 }

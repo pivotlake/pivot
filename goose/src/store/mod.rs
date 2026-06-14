@@ -129,13 +129,15 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn delete(&self, key: &ObjectPath) -> Result<()>;
 
     /// List objects directly under `prefix` (one level, not recursive), as
-    /// [`FileRef`]s — each a full [`ObjectPath`] (`prefix` joined with the
-    /// object's name) paired with its size.
+    /// [`FileRef`]s — each a **relative** [`ObjectPath`] (the object's name
+    /// within `prefix`) paired with its size. The caller pairs it with the
+    /// `prefix` it listed to read it.
     fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>>;
 
-    /// How the io_uring reader should fetch object `key` (`size` bytes): a local
-    /// backend yields a filesystem path, a remote one a presigned GET URL.
-    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile>;
+    /// How the io_uring reader should fetch object `key`: a local backend yields
+    /// a filesystem path, a remote one a presigned GET URL. (Identity — the
+    /// [`FileRef`] — is the caller's; this is only how to read the bytes.)
+    fn source(&self, key: &ObjectPath) -> Result<DataFileSource>;
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,

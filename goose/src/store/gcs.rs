@@ -8,7 +8,7 @@
 //! identity on Google compute). RS256 signing uses `ring`; everything is
 //! synchronous, no async runtime.
 
-use super::{DataFile, DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use base64::Engine;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -274,7 +274,7 @@ impl ObjectStore for GcsStore {
             .into_iter()
             .map(|it| {
                 Ok(FileRef {
-                    path: prefix.join(&super::key_name(&it.name)),
+                    path: ObjectPath::new(super::key_name(&it.name)),
                     size: it.size.parse().map_err(|_| {
                         StoreError::Http(format!(
                             "GCS LIST: bad size `{}` for {}",
@@ -286,14 +286,8 @@ impl ObjectStore for GcsStore {
             .collect()
     }
 
-    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
-        Ok(DataFile {
-            file: FileRef {
-                path: key.clone(),
-                size,
-            },
-            source: DataFileSource::Remote(self.presign_get(key)?),
-        })
+    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
+        Ok(DataFileSource::Remote(self.presign_get(key)?))
     }
 }
 

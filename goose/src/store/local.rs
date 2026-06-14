@@ -1,7 +1,7 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFile, DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError};
+use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError};
 use std::path::PathBuf;
 
 /// The local-filesystem backend: keys are paths under `root`.
@@ -130,7 +130,7 @@ impl ObjectStore for LocalStore {
             }
             if let Some(name) = entry.file_name().to_str() {
                 objects.push(FileRef {
-                    path: prefix.join(name),
+                    path: ObjectPath::new(name),
                     size: meta.len(),
                 });
             }
@@ -138,14 +138,8 @@ impl ObjectStore for LocalStore {
         Ok(objects)
     }
 
-    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
-        Ok(DataFile {
-            file: FileRef {
-                path: key.clone(),
-                size,
-            },
-            source: DataFileSource::Local(self.path_for(key)),
-        })
+    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
+        Ok(DataFileSource::Local(self.path_for(key)))
     }
 }
 

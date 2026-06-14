@@ -340,12 +340,14 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 /// Register `path` with table `name` through a cloned-out handle — the
 /// table-level API a writer (ingest) uses: it CAS-commits a new manifest version
 /// to the shared store. The catalog's own copy is not touched (a later `resolve`
-/// reconciles it).
+/// reconciles it). Registers by a **table-relative** path (just the file's
+/// name), which the table resolves under its location.
 fn register(catalog: &ParquetCatalog, name: &str, path: &Path) -> RegisterOutcome {
+    let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
     catalog
         .table_handle(name)
         .expect("table exists")
-        .register_data_file(ObjectPath::new(path.to_string_lossy()))
+        .register_data_file(relative)
         .unwrap()
 }
 
@@ -355,11 +357,6 @@ fn resolve(catalog: &ParquetCatalog, name: &str) {
     let _ = PlannerCatalog::table(catalog, name);
 }
 
-/// The object path of `name` directly under `dir` — a local table's location, so
-/// the path is the file's absolute filesystem path.
-fn opath(dir: &Path, name: &str) -> ObjectPath {
-    ObjectPath::new(dir.join(name).to_string_lossy())
-}
 
 /// A file flushed after `CREATE TABLE` becomes visible to new binds once
 /// registered, with global row-group indices kept sequential.
@@ -410,7 +407,8 @@ fn register_data_file_without_table_is_unresolvable() {
     assert!(catalog.table_handle("missing").is_none());
 }
 
-/// A file outside the table's data directory must not be appended to it.
+/// A file outside the table's data directory (an absolute path resolving
+/// elsewhere) must not be appended to it.
 #[test]
 fn register_data_file_refuses_foreign_directory() {
     let (dir, columns) = three_row_table();
@@ -419,10 +417,12 @@ fn register_data_file_refuses_foreign_directory() {
 
     let elsewhere = TempDir::new().unwrap();
     let foreign = write_ids(elsewhere.path(), "foreign.parquet", &[1]);
-    assert_eq!(
-        register(&catalog, "t", &foreign),
-        RegisterOutcome::LocationMismatch
-    );
+    let outcome = catalog
+        .table_handle("t")
+        .unwrap()
+        .register_data_file(ObjectPath::new(foreign.to_string_lossy()))
+        .unwrap();
+    assert_eq!(outcome, RegisterOutcome::LocationMismatch);
     resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 }
@@ -441,9 +441,9 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
-    let removed = vec![opath(dir.path(), "data.parquet"), opath(dir.path(), "extra.parquet")];
+    let removed = vec![ObjectPath::new("data.parquet"), ObjectPath::new("extra.parquet")];
     let added = vec![goose::FileRef {
-        path: opath(dir.path(), "merged.parquet"),
+        path: ObjectPath::new("merged.parquet"),
         size: merged_size,
     }];
     catalog
@@ -523,13 +523,13 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     // input: both files are on disk, only merged is in the manifest.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
     let added = vec![goose::FileRef {
-        path: opath(data_dir.path(), "merged.parquet"),
+        path: ObjectPath::new("merged.parquet"),
         size: std::fs::metadata(&merged).unwrap().len(),
     }];
     catalog
         .table_handle("t")
         .unwrap()
-        .replace_data_files(&[opath(data_dir.path(), "data.parquet")], &added)
+        .replace_data_files(&[ObjectPath::new("data.parquet")], &added)
         .unwrap();
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();

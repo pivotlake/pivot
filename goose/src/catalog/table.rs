@@ -133,19 +133,21 @@ impl CatalogTable {
     /// a no-op ([`RegisterOutcome::AlreadyRegistered`]), so a replayed
     /// notification can't double-count rows.
     ///
-    /// The file must sit directly in the table's data location, and a `list`
-    /// there must actually find it (which is where its size comes from);
-    /// otherwise [`RegisterOutcome::LocationMismatch`] and nothing is committed.
+    /// `path` may be relative to the table's data location or absolute; either
+    /// way it must resolve to a file a `list` of the location actually finds
+    /// (which is where its size comes from, and what confirms it belongs to the
+    /// table) — otherwise [`RegisterOutcome::LocationMismatch`] and nothing is
+    /// committed. The file is recorded by its location-relative path.
     pub fn register_data_file(&mut self, path: ObjectPath) -> crate::Result<RegisterOutcome> {
-        if path.parent().as_ref() != Some(&self.location) {
-            return Ok(RegisterOutcome::LocationMismatch);
-        }
-        // Locate the file in the store to confirm it's there and learn its size.
+        // Match the file in the location's listing by resolved path, so a
+        // relative or absolute `path` both land on the same file — and one
+        // pointing outside the table's location matches nothing.
+        let target = self.location.resolve(&path);
         let Some(new_file) = self
             .store
             .list(&self.location)?
             .into_iter()
-            .find(|f| f.path == path)
+            .find(|f| self.location.resolve(&f.path) == target)
         else {
             return Ok(RegisterOutcome::LocationMismatch);
         };
@@ -225,7 +227,7 @@ impl CatalogTable {
             .entries
             .iter()
             .filter(|e| !self.files.iter().any(|f| f.file.path == e.path))
-            .map(|e| self.store.data_file(&e.path, e.size))
+            .map(|e| super::locate(self.store.as_ref(), &self.location, e))
             .collect::<store::Result<_>>()?;
         Ok(crate::parquet::load_table_files(&self.dispatcher, &to_fetch)?)
     }
