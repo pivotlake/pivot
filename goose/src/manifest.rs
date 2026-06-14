@@ -32,6 +32,12 @@ const TABLE_MANIFEST_DIR: &str = "_goose_tables";
 const VERSION_DIGITS: usize = 20;
 /// The version a table's first commit gets.
 pub const FIRST_VERSION: u64 = 1;
+/// How many of the most-recent manifest versions to keep when pruning. A reader
+/// loads by listing then `get`ting the max it saw; retaining a tail means a
+/// reader that observed an older max (e.g. under an eventually-consistent
+/// `list`) before its `get` never races a prune. Everything older is dead
+/// weight — pure space, and it slows the `list` every bind does.
+const VERSIONS_RETAINED: u64 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -92,6 +98,27 @@ impl TableManifest {
     pub fn commit(&self, store: &dyn ObjectStore, name: &str) -> Result<bool> {
         Ok(store.put_if_absent(&Self::key(name, self.version), &serde_json::to_vec(self)?)?)
     }
+
+    /// Best-effort GC of superseded versions: delete every committed version of
+    /// table `name` older than the [`VERSIONS_RETAINED`] most recent. Called
+    /// after a commit; safe to fail (the commit stands either way) and safe to
+    /// run concurrently — a double delete of the same key is harmless.
+    pub fn prune_old_versions(store: &dyn ObjectStore, name: &str, latest: u64) -> Result<()> {
+        let cutoff = latest.saturating_sub(VERSIONS_RETAINED);
+        if cutoff == 0 {
+            return Ok(());
+        }
+        let stale: Vec<u64> = store
+            .list(&Self::dir(name))?
+            .iter()
+            .filter_map(|f| f.path.name().strip_suffix(".json").and_then(|v| v.parse::<u64>().ok()))
+            .filter(|&v| v < cutoff)
+            .collect();
+        for v in stale {
+            store.delete(&Self::key(name, v))?;
+        }
+        Ok(())
+    }
 }
 
 /// One table's entry in the [`CatalogManifest`]: its name and the
@@ -137,5 +164,77 @@ impl CatalogManifest {
         self.tables.retain(|t| t.name != entry.name);
         self.tables.push(entry);
         self.version += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::LocalStore;
+    use tempfile::TempDir;
+
+    fn manifest(version: u64) -> TableManifest {
+        TableManifest { version, columns: vec![], entries: vec![] }
+    }
+
+    fn live_versions(store: &dyn ObjectStore, name: &str) -> Vec<u64> {
+        store
+            .list(&TableManifest::dir(name))
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.path.name().strip_suffix(".json").and_then(|v| v.parse().ok()))
+            .collect()
+    }
+
+    /// Pruning keeps only the most-recent [`VERSIONS_RETAINED`] versions (plus
+    /// the latest itself), deletes everything older, and leaves the table still
+    /// loadable at its latest version.
+    #[test]
+    fn prune_keeps_only_the_recent_tail() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::new(dir.path());
+        let latest = 30;
+        for v in FIRST_VERSION..=latest {
+            assert!(manifest(v).commit(&store, "t").unwrap());
+        }
+
+        TableManifest::prune_old_versions(&store, "t", latest).unwrap();
+
+        let remaining = live_versions(&store, "t");
+        let cutoff = latest - VERSIONS_RETAINED;
+        assert!(remaining.iter().all(|&v| v >= cutoff), "no version below the cutoff survives");
+        assert_eq!(remaining.len() as u64, VERSIONS_RETAINED + 1);
+        assert_eq!(TableManifest::load(&store, "t").unwrap().version, latest);
+    }
+
+    /// With fewer versions than the retained tail, pruning deletes nothing.
+    #[test]
+    fn prune_below_retention_is_a_noop() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::new(dir.path());
+        for v in FIRST_VERSION..=3 {
+            manifest(v).commit(&store, "t").unwrap();
+        }
+
+        TableManifest::prune_old_versions(&store, "t", 3).unwrap();
+
+        assert_eq!(live_versions(&store, "t").len(), 3);
+    }
+
+    /// Pruning the same range twice (concurrent compacters, or a retry) is
+    /// harmless — a delete of an already-gone version is not an error.
+    #[test]
+    fn prune_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::new(dir.path());
+        let latest = 20;
+        for v in FIRST_VERSION..=latest {
+            manifest(v).commit(&store, "t").unwrap();
+        }
+
+        TableManifest::prune_old_versions(&store, "t", latest).unwrap();
+        TableManifest::prune_old_versions(&store, "t", latest).unwrap();
+
+        assert_eq!(live_versions(&store, "t").len() as u64, VERSIONS_RETAINED + 1);
     }
 }

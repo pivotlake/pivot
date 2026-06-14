@@ -156,12 +156,25 @@ impl CatalogTable {
     /// commit. Commits a new version whose file list is `latest − removed +
     /// added`, retrying past concurrent commits, so no reader ever sees the rows
     /// doubled or missing.
+    ///
+    /// Returns whether the swap was committed. It is **aborted** (`Ok(false)`,
+    /// nothing committed) if any of `removed` is no longer in the latest
+    /// version: that means another writer already swapped these inputs out, so
+    /// re-adding `added` (which holds their rows) would double-count. A
+    /// concurrent compacter that loses this race must discard its `added` files
+    /// as orphans and leave the inputs alone — they belong to the swap that won.
     pub fn replace_data_files(
         &mut self,
         removed: &[ObjectPath],
         added: &[FileRef],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         loop {
+            if !removed
+                .iter()
+                .all(|p| self.manifest.entries.iter().any(|e| &e.path == p))
+            {
+                return Ok(false);
+            }
             let mut entries: Vec<FileRef> = self
                 .manifest
                 .entries
@@ -171,7 +184,7 @@ impl CatalogTable {
                 .collect();
             entries.extend(added.iter().cloned());
             if self.try_commit(entries)? {
-                return Ok(());
+                return Ok(true);
             }
             self.refresh()?;
         }
@@ -192,6 +205,13 @@ impl CatalogTable {
         }
         self.manifest = manifest;
         self.sync_files_to_manifest()?;
+        // GC superseded versions. Best-effort: the commit already stands, so a
+        // prune failure is logged, not propagated.
+        if let Err(e) =
+            TableManifest::prune_old_versions(self.store.as_ref(), &self.name, self.manifest.version)
+        {
+            tracing::warn!(table = %self.name, error = %e, "pruning old manifest versions failed");
+        }
         Ok(true)
     }
 

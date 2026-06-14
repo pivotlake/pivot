@@ -404,7 +404,9 @@ fn table_handle_for_a_missing_table_is_none() {
 }
 
 /// Compaction's commit: the small files' row groups vanish, the merged file's
-/// appear, and indices are renumbered — one atomic version swap.
+/// appear, and indices are renumbered — one atomic version swap. And a *second*
+/// compacter that picked the same inputs must abort its swap (`Ok(false)`)
+/// rather than re-add its output on top, which would double-count the rows.
 #[test]
 fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let (dir, columns) = three_row_table();
@@ -422,11 +424,27 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         path: ObjectPath::new("merged.parquet"),
         size: merged_size,
     }];
-    catalog
-        .table_handle("t")
-        .unwrap()
-        .replace_data_files(&removed, &added)
-        .unwrap();
+    // A losing compacter clones the table out at the same version (inputs still
+    // present) before the winning swap lands.
+    let mut loser = catalog.table_handle("t").unwrap();
+    assert!(
+        catalog
+            .table_handle("t")
+            .unwrap()
+            .replace_data_files(&removed, &added)
+            .unwrap(),
+        "first swap commits"
+    );
+    // The loser only discovers the inputs are gone after its CAS conflict +
+    // refresh, and aborts — no footer read for its output, no double-count.
+    let loser_added = vec![goose::FileRef {
+        path: ObjectPath::new("merged-loser.parquet"),
+        size: merged_size,
+    }];
+    assert!(
+        !loser.replace_data_files(&removed, &loser_added).unwrap(),
+        "second swap aborts: its inputs were already swapped out"
+    );
 
     resolve(&catalog, "t");
     let table = catalog.binding("t").unwrap();

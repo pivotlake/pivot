@@ -34,7 +34,7 @@
 //! round reloads a table to its latest log version before scanning — rather
 //! than being woken by the ingest path; the sinks don't know it exists.
 //!
-//! [`replace_data_files`]: ParquetCatalog::replace_data_files
+//! [`replace_data_files`]: goose::CatalogTable::replace_data_files
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -232,9 +232,22 @@ impl CompactJob {
         // deletes leaves only orphan objects, never a double read.
         let removed: Vec<ObjectPath> = inputs.iter().map(|f| f.path.clone()).collect();
         let mut table = self.table;
-        table
+        let committed = table
             .replace_data_files(&removed, &added)
             .map_err(|e| format!("committing compaction swap: {e}"))?;
+        if !committed {
+            // Another writer (a second compacter over the same root) already
+            // swapped these inputs out. Our merged output was never committed —
+            // delete it so it doesn't linger as an orphan, and leave the inputs
+            // alone: they belong to the swap that won.
+            warn!(table = table.name(), "compaction: inputs already swapped by another writer; discarding merge");
+            for file in &added {
+                if let Err(e) = table.delete_data_file(&file.path) {
+                    warn!(error = %e, file = %file.path, "compaction: deleting discarded merge output failed (orphan left)");
+                }
+            }
+            return Ok(Vec::new());
+        }
         for input in &inputs {
             if let Err(e) = table.delete_data_file(&input.path) {
                 warn!(error = %e, file = %input.path, "compaction: deleting merged-away input failed (orphan left)");
