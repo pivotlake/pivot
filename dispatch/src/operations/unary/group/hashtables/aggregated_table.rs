@@ -26,7 +26,7 @@ use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    BatchRowSource, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
+    DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::values::AggregationSlot;
@@ -89,30 +89,6 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
     pub zero_hash_seen: bool,
 }
 
-/// [`BatchRowSource`] adapter for [`BaseHashTable::merge_batch`] (in-place phase).
-struct RowSrc<'r, 'b, K: KeyExtractor, V: ValueExtractor> {
-    key_reader: &'r K::Reader<'b>,
-    value_reader: V::Reader<'b>,
-    arena: &'r mut WorkerArena,
-}
-
-impl<K: KeyExtractor, V: ValueExtractor> BatchRowSource<K::Persisted, V::Value>
-    for RowSrc<'_, '_, K, V>
-{
-    #[inline(always)]
-    fn persisted(&mut self, i: usize) -> K::Persisted {
-        K::live_key(self.key_reader, i, &mut *self.arena).persist()
-    }
-    #[inline(always)]
-    fn key_eq(&mut self, i: usize, persisted: &K::Persisted) -> bool {
-        K::live_key(self.key_reader, i, &mut *self.arena).eq_persisted(persisted)
-    }
-    #[inline(always)]
-    fn value(&mut self, i: usize) -> V::Value {
-        V::value(&self.value_reader, i)
-    }
-}
-
 /// Per-worker aggregation state for the adaptive in-place → radix consume
 /// strategy (see the module docs). Holds the in-place table stack and, after a
 /// switch, the per-partition scatter buffers plus a distinct-count sketch.
@@ -130,15 +106,8 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     switched_to_radix: bool,
     /// The config of radix (when to switch, number of partitions)
     radix_cfg: RadixConfig,
-    /// Scratch buffer for hashes
+    /// Scratch buffer for the per-row hashes computed once per batch.
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
-    /// Scratch buffer for probe slots within the hashtable
-    probe_slots: Box<[usize; RECORD_BATCH_SIZE]>,
-    /// Scratch buffer for unresolved slots (slots that collided)
-    unresolved_slots: Box<[u32; RECORD_BATCH_SIZE]>,
-    /// Another scratch buffer for unresolved slots (slots that collided)- this is used in tangent
-    /// with the original `unresolved_slots` as a sort of ping-pong (see merge_batch)
-    next_unresolved_slots: Box<[u32; RECORD_BATCH_SIZE]>,
     /// `K::DEDUP_BY_HASH` only: a key whose bijective hash is exactly 0 collides
     /// with the empty-slot sentinel, so it is excluded from the table and recorded
     /// here. There is at most one such key (the hash is a bijection), so this
@@ -160,18 +129,6 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             switched_to_radix: false,
             radix_cfg: radix,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-            probe_slots: vec![0usize; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-            unresolved_slots: vec![0u32; RECORD_BATCH_SIZE]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-            next_unresolved_slots: vec![0u32; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
@@ -214,23 +171,13 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 
-        // For a keys-only exact COUNT(DISTINCT), a hash of 0 collides with the
-        // table's empty-slot sentinel and must be counted out of band rather than
-        // stored (see `consume_scalared`). The batched path can't do that — it
-        // remaps a 0 hash to 1 — so note whether the (rare) 0-hash key is present
-        // and, if so, take the scalar path. The check folds into the hash loop and
-        // is const-gated, so other group-bys pay nothing.
+        // Compute every row's hash once up front; the scalar probe reuses them.
         debug_assert!(
             !(K::DEDUP_BY_HASH && K::SUPPORTS_RADIX),
             "DEDUP_BY_HASH requires the in-place path (no radix scatter)"
         );
-        let mut has_zero_hash = false;
         for i in 0..length {
-            let h = K::hash(&key_reader, i, &self.hash_state);
-            self.hashes[i] = h;
-            if K::DEDUP_BY_HASH {
-                has_zero_hash |= h == 0;
-            }
+            self.hashes[i] = K::hash(&key_reader, i, &self.hash_state);
         }
 
         if self.switched_to_radix {
@@ -238,44 +185,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             return;
         }
 
-        // The batched path is safe iff the active table has room for the whole
-        // batch (no mid-batch overflow) and no 0-hash key needs skipping.
-        let free = {
-            let t = self.tables.last().unwrap();
-            t.capacity() - t.len()
-        };
-        if free > length && !has_zero_hash {
-            self.consume_batched(length, &key_reader, value_reader);
-        } else {
-            self.consume_scalared(length, &key_reader, &value_reader);
-        }
-    }
-
-    /// Batched multi-pass probe over the active table (it has room for the whole
-    /// batch). The whole batch is consumed before any grow/switch is considered.
-    #[inline(always)]
-    fn consume_batched<'b>(
-        &mut self,
-        length: usize,
-        key_reader: &K::Reader<'b>,
-        value_reader: V::Reader<'b>,
-    ) {
-        let mut src = RowSrc::<K, V> {
-            key_reader,
-            value_reader,
-            arena: &mut self.worker_arena,
-        };
-        self.tables.last_mut().unwrap().merge_batch(
-            length,
-            &mut self.hashes[..],
-            &mut self.probe_slots[..],
-            &mut self.unresolved_slots[..],
-            &mut self.next_unresolved_slots[..],
-            &mut src,
-        );
-        if self.tables.last().unwrap().undersized() {
-            self.grow_or_switch();
-        }
+        self.consume_scalared(length, &key_reader, &value_reader);
     }
 
     /// Row-by-row probe, switching tables (or to radix) when the active table

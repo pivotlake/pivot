@@ -40,7 +40,7 @@ impl ValueExtractor for DistinctValueExtractor {
     type SortKey = i64;
 
     #[inline(always)]
-    fn make_reader<'b>(_batch: &'b RecordBatch, _value_slots: &[AggregationSlot]) {}
+    fn make_reader(_batch: &RecordBatch, _value_slots: &[AggregationSlot]) {}
 
     #[inline(always)]
     fn value(_reader: &(), _idx: usize) -> DistinctValue {
