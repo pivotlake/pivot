@@ -11,9 +11,10 @@
 //! Durable state lives in two places, both in the store:
 //!
 //! - the [`manifest`] — which tables exist (name, declared schema, location);
-//! - the per-table [`table_log`] — *which Parquet files* each table consists
-//!   of, as an append-only sequence of versions committed with the store's
-//!   compare-and-swap. The highest version is the table's current file list.
+//! - the per-table [`TableManifest`](crate::manifest::TableManifest) — *which
+//!   Parquet files* each table consists of, as a sequence of versions committed
+//!   with the store's compare-and-swap. The highest version is the table's
+//!   current file list.
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version; the flattened scan view a query sees
@@ -83,7 +84,7 @@ impl From<Error> for CatalogError {
     }
 }
 
-/// What [`ParquetCatalog::register_data_file`] did with the file. The non-
+/// What [`CatalogTable::register_data_file`] did with the file. The non-
 /// `Registered` outcomes are not errors — a file can legitimately land before
 /// its table is created — but the caller (ingest) wants to log them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,15 +106,14 @@ pub enum RegisterOutcome {
 ///
 /// `CREATE TABLE` compiles to a single dataflow that reads every data file's
 /// footer **once** (in parallel over the worker pool) and, at its terminal
-/// stage, commits the table to the manifest, seeds its [`table_log`], and
-/// publishes the entry in this shared map. After that, the table evolves by
-/// log commits ([`register_data_file`](Self::register_data_file),
-/// [`replace_data_files`](Self::replace_data_files)) and every query resolve
-/// reloads the entry up to the latest committed version.
+/// stage, commits the table to the manifest and publishes the entry in this
+/// shared map. After that, the table evolves by manifest commits (per-file
+/// registration on [`CatalogTable`], [`replace_data_files`](Self::replace_data_files))
+/// and every query resolve reloads the entry up to the latest committed version.
 pub struct ParquetCatalog {
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    /// The database's object store — both the table [`manifest`]/[`table_log`]s
-    /// and the tables' Parquet data. A local directory by default ([`new`], an
+    /// The database's object store — both the table [`manifest`]s and the
+    /// tables' Parquet data. A local directory by default ([`new`], an
     /// ephemeral one under the temp dir), or the directory / S3 / GCS root a
     /// database is [`open`](Self::open)ed at. The catalog reads and writes a
     /// table's data through this one store: relative locations live under the
@@ -151,7 +151,7 @@ impl ParquetCatalog {
 
     /// Open a persisted database rooted at `uri` — a local directory (or
     /// `file://…`), or a remote `s3://…`/`gs://…` object store — reloading
-    /// every table the manifest records at its latest [`table_log`] version.
+    /// every table the manifest records at its latest version.
     /// A table without a log (created before logs existed) falls back to
     /// listing its data location; its first commit seeds the log.
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
@@ -199,8 +199,8 @@ impl ParquetCatalog {
 
     /// Compile a `CREATE TABLE` to the dataflow that runs it: read every Parquet
     /// footer under the table's location in parallel and, at the final stage,
-    /// record the table in the manifest, seed its [`table_log`] with the files
-    /// found, and publish it in the catalog map. Fetch and write are one spec —
+    /// record the table in the manifest with the files found, and publish it in
+    /// the catalog map. Fetch and write are one spec —
     /// the caller executes it; nothing happens here but the (cheap, read-only)
     /// directory listing.
     ///

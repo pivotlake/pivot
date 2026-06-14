@@ -41,12 +41,12 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// A table's data file: its name within the table's data location and its size
-/// in bytes. The single durable file identity — the [table log] records a
+/// in bytes. The single durable file identity — the [table manifest] records a
 /// `Vec<FileRef>`, [`ObjectStore::list`] returns these, and the catalog and
 /// compacter speak them. The size lets a reader locate a Parquet footer without
 /// a separate HEAD/`stat`.
 ///
-/// [table log]: crate::table_log
+/// [table manifest]: crate::manifest::TableManifest
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileRef {
     pub name: String,
@@ -117,8 +117,8 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn put(&self, key: &str, data: &[u8]) -> Result<()>;
 
     /// Create `key` with `data` only if it does not already exist — the
-    /// compare-and-swap the versioned [table log](crate::table_log) builds its
-    /// commits on. `Ok(true)` means this writer created the object; `Ok(false)`
+    /// compare-and-swap the versioned [table manifest](crate::manifest) builds
+    /// its commits on. `Ok(true)` means this writer created the object; `Ok(false)`
     /// means the key was already there (the caller lost the race: re-read the
     /// latest state and retry at the next version).
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool>;

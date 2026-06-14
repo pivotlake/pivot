@@ -1,8 +1,7 @@
-//! Terminal (write) stage: the fan-in side of the dataflow. Every worker's row
-//! groups arrive on worker 0, which accumulates them and — at `finish` —
-//! regroups them into the [`LoadedFiles`] and hands it to the `commit` closure.
-//! Workers `1..n` receive nothing (empty receiver, no commit) and no-op. Emits
-//! no rows.
+//! Terminal (write) stage: the fan-in side of the dataflow. Every worker's
+//! [`TableFile`]s arrive on worker 0, which accumulates them and — at `finish` —
+//! hands the `Vec<TableFile>` to the `commit` closure. Workers `1..n` receive
+//! nothing (empty receiver, no commit) and no-op. Emits no rows.
 
 use std::mem;
 use arrow_array::RecordBatch;

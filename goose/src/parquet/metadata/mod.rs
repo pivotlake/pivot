@@ -1,12 +1,14 @@
-//! Parallel row-group **metadata** fetch — the table-load pipeline, run once at
+//! Parallel **footer metadata** fetch — the table-load pipeline, run once at
 //! `CREATE`/`ATTACH` (the reading pipeline scans the row groups it produces).
-//! A small work-stealing dataflow with one module per stage:
+//! A small work-stealing dataflow with one module per stage, carrying one
+//! [`TableFile`] (a file's [`FileRef`](crate::store::FileRef) plus its row
+//! groups) per file end to end:
 //!
-//! - [`injector`] — the source: hands out the input files (with their indices).
+//! - [`injector`] — the source: hands out the input files.
 //! - [`fetcher`] — reads each file's footer (over the io_uring ring, through the
-//!   file cache) on whatever worker steals it, emitting its row groups.
-//! - [`writer`] — the terminal fan-in sink: gathers the row groups on one worker,
-//!   assembles the [`ParquetTable`], and commits it.
+//!   file cache) on whatever worker steals it, emitting one [`TableFile`].
+//! - [`writer`] — the terminal fan-in sink: gathers the [`TableFile`]s on one
+//!   worker and hands them to the `commit` closure.
 //!
 //! It is consumed two ways, both over the same fetch core
 //! ([`fetch_table_file_factories`]): [`load_table_files`] collects the

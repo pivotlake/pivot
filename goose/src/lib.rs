@@ -1,9 +1,8 @@
 //! goose: pivotdb's table layer over Parquet.
 //!
-//! - [`catalog`](ParquetCatalog) — the tables: durable definitions in the
-//!   [`manifest`], durable per-table file lists in the [`table_log`], live
-//!   row-group state in memory, reloaded up to the latest log version at
-//!   every query bind.
+//! - [`catalog`](ParquetCatalog) — the tables: durable definitions and per-table
+//!   file lists in the [`manifest`], live row-group state in memory, reloaded up
+//!   to the latest manifest version at every query bind.
 //! - [`parquet`] — the engines: the per-query scan pipeline and the
 //!   metadata-fetch (table load) pipeline, both dataflows over the dispatch
 //!   worker pool.

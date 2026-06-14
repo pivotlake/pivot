@@ -1,11 +1,11 @@
 //! Fetch stage: reads each file's Parquet footer — through the io_uring ring and
-//! the file cache, exactly like a column-chunk read — and emits the file's row
-//! groups. Like the column-chunk scan fetcher, it keeps many footer reads in
-//! flight, bounded per medium, and shares the same slot/routing/in-flight
-//! bookkeeping ([`RequestTracker`]). The footer-specific part is the per-file
-//! state machine ([`RowGroupMetadataRequest`]): read the tail probe window,
-//! parse the footer, and — if it overflowed the probe — read it exactly before
-//! parsing.
+//! the file cache, exactly like a column-chunk read — and emits one [`TableFile`]
+//! per file (its [`FileRef`] paired with its row groups). The footer-reading
+//! analog of the column-chunk scan fetcher: it keeps many footer reads in flight,
+//! bounded per medium, and shares the same slot/routing/in-flight bookkeeping
+//! ([`RequestTracker`]). The footer-specific part is the per-file state machine
+//! ([`FooterRead`]): read the tail probe window, parse the footer, and — if it
+//! overflowed the probe — read it exactly before parsing.
 
 use crate::parquet::request_tracker::{ReadRequest, PendingRequest, RequestTracker};
 use crate::parquet::types::metadata::RowGroupMetadata;
@@ -38,12 +38,12 @@ fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
     Ok(u32::from_le_bytes(len.try_into().unwrap()) as usize)
 }
 
-/// Reads files' footers and emits each file's row groups, keeping many reads in
-/// flight (bounded by [`MAX_DISK_IN_FLIGHT`]/[`MAX_HTTP_IN_FLIGHT`] via the
+/// Reads files' footers and emits one [`TableFile`] per file, keeping many reads
+/// in flight (bounded by [`MAX_DISK_IN_FLIGHT`]/[`MAX_HTTP_IN_FLIGHT`] via the
 /// shared [`RequestTracker`]).
 #[derive(Default)]
 pub(super) struct TableFileMetadataFetcher {
-    tracker: RequestTracker<RowGroupMetadataRequest>,
+    tracker: RequestTracker<FooterRead>,
 }
 
 impl TableFileMetadataFetcher {
@@ -92,14 +92,14 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
         // Open the file's transport. The size — which locates the footer's tail
         // window with no HEAD/suffix probe — is already carried by the data
         // file (`stat`ed at listing time for a local file, from the store
-        // listing for a remote one). The `file` ref rides through to the
-        // emitted `TableFile`.
-        let DataFile { file, source } = file;
-        let size = file.size as usize;
+        // listing for a remote one). The `file_ref` rides through to the emitted
+        // `TableFile`.
+        let DataFile { file: file_ref, source } = file;
+        let size = file_ref.size as usize;
         let location = match source {
             DataFileSource::Local(path) => {
-                let file = open_direct_read(&path).map_err(crate::parquet::op_err)?;
-                FileLocation::Local(Arc::new(file))
+                let fd = open_direct_read(&path).map_err(crate::parquet::op_err)?;
+                FileLocation::Local(Arc::new(fd))
             }
             DataFileSource::Remote(url) => {
                 let remote = Arc::new(RemoteFile::open(url).map_err(crate::parquet::op_err)?);
@@ -109,7 +109,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 
         let slot = self
             .tracker
-            .admit_request(RowGroupMetadataRequest::start(file, location, size));
+            .admit_request(FooterRead::start(file_ref, location, size));
         self.advance(slot, sender)
     }
 
@@ -165,7 +165,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 /// blocks still outstanding for the current region. Once a region's blocks have
 /// all landed, [`parse_region`](Self::parse_region) turns it into the file's row
 /// groups (or issues the exact re-read).
-struct RowGroupMetadataRequest {
+struct FooterRead {
     /// The file's durable identity, stamped onto the emitted [`TableFile`].
     file: FileRef,
     /// The open file (it keeps the handle alive, and travels into the row
@@ -184,7 +184,7 @@ struct RowGroupMetadataRequest {
     reading_exact: bool,
 }
 
-impl PendingRequest for RowGroupMetadataRequest {
+impl PendingRequest for FooterRead {
     fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
         &mut self.pending_fs
     }
@@ -194,7 +194,7 @@ impl PendingRequest for RowGroupMetadataRequest {
     }
 }
 
-impl RowGroupMetadataRequest {
+impl FooterRead {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
     fn start(file: FileRef, location: FileLocation, size: usize) -> Self {
