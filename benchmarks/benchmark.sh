@@ -31,9 +31,24 @@
 #   ./benchmark.sh --source ~/hits --restart-server    # isolate each query
 #   ./benchmark.sh --source ~/hits --skip-check        # don't verify pivot output
 #   ./benchmark.sh --source ~/hits --no-drop-caches    # skip the cache drop
+#   ./benchmark.sh --source ~/single --native ~/hits.db  # pivot parquet vs DuckDB native
+#   ./benchmark.sh --source ~/hits --duckdb-process single  # DuckDB engine-warm (symmetric)
 #
 # --source/--hits accepts a directory (globbed for *.parquet), a single
 # .parquet file, or an explicit glob.
+#
+# --native <db> switches the DuckDB side to query a persistent .db's native
+# `hits` table (ClickBench-native style) instead of parquet; pivot still reads
+# --source, so this compares pivot-on-parquet to DuckDB-on-native.
+#
+# --duckdb-process per-iteration|single  (default per-iteration) — only affects
+# the DuckDB side. per-iteration spawns a fresh duckdb process per iteration,
+# exactly how ClickBench measures embedded DuckDB (engine-cold each hot run).
+# ⚠️ That default is UNFAIR to DuckDB here: pivot's iterations run against ONE
+# warm, persistent server while DuckDB is forced engine-cold every iteration.
+# `single` runs a query's iterations in one duckdb process (engine-warm, like
+# pivot's server) for a symmetric comparison — but it is NOT how ClickBench
+# measures, and DuckDB looks far faster on light queries. See run-duckdb.sh.
 
 set -euo pipefail
 
@@ -41,21 +56,25 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 suite_dir="$here/clickbench"
 
 source_path=""
+native_db=""
 queries=""
 iterations=3
 drop_caches=1
 restart_server=0
 sleep_ms=0
 skip_check=0
+duckdb_process="per-iteration"
 
 usage() {
-    sed -n '3,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,51p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source|--hits)  source_path="$2"; shift 2 ;;
+        --native)         native_db="$2"; shift 2 ;;
+        --duckdb-process) duckdb_process="$2"; shift 2 ;;
         --query)          queries="$2"; shift 2 ;;
         --iterations)     iterations="$2"; shift 2 ;;
         --sleep)          sleep_ms="$2"; shift 2 ;;
@@ -120,14 +139,21 @@ pivot_invoke() {
 
 # Run DuckDB for one or more queries (comma-joined), raw output on stdout.
 # run-duckdb.sh prints "Run Time (s): real 0.008 ..." lines. Unless dropping is
-# disabled, let run-duckdb.sh flush the page cache before each query (it runs
-# each query's iterations in one process), matching pivot's per-query cold.
+# disabled, let run-duckdb.sh flush the page cache before each query (it drops
+# once, then runs each iteration in a fresh duckdb process — exactly the official
+# ClickBench harness), so iteration 1 is the cold read and the rest are hot.
 duck_invoke() {
     local IFS=,
     local duck_cache_flag="--no-drop-caches"
     [[ $drop_caches -eq 1 ]] && duck_cache_flag=""
-    "$here/run-duckdb.sh" --source "$source_path" --query "$*" \
-        --iterations "$iterations" --sleep "$sleep_ms" $duck_cache_flag 2>&1
+    # In native mode DuckDB reads its own .db storage (--native); otherwise the
+    # same parquet --source pivot reads. Pivot's source is unchanged either way,
+    # so native mode is pivot-on-parquet vs DuckDB-on-native by design.
+    local duck_source=(--source "$source_path")
+    [[ -n "$native_db" ]] && duck_source=(--native "$native_db")
+    "$here/run-duckdb.sh" "${duck_source[@]}" --query "$*" \
+        --iterations "$iterations" --sleep "$sleep_ms" \
+        --duckdb-process "$duckdb_process" $duck_cache_flag 2>&1
 }
 
 # Parse pivot output (any number of queries) into "id cold hot it1 it2 …"
@@ -282,9 +308,21 @@ collect() {
     print_results < "$out"
 }
 
+case "$duckdb_process" in
+    per-iteration|single) ;;
+    *) echo "error: --duckdb-process must be per-iteration|single (got '$duckdb_process')" >&2; usage 1 ;;
+esac
+
 mode=$([[ $restart_server -eq 1 ]] && echo "restart per query" || echo "one session")
 echo "queries: ${#ids[@]}, iterations: $iterations, mode: $mode, drop_caches: $drop_caches"
-echo "source: $source_path"
+dp_note=$([[ "$duckdb_process" == "per-iteration" ]] && echo "ClickBench-faithful; unfair to DuckDB" || echo "engine-warm; symmetric, non-ClickBench")
+echo "duckdb-process: $duckdb_process ($dp_note)"
+echo "pivot source:  $source_path"
+if [[ -n "$native_db" ]]; then
+    echo "duckdb source: native db $native_db (hits table)"
+else
+    echo "duckdb source: $source_path"
+fi
 echo
 collect pivot  pivot_invoke parse_pivot "$pivot_tsv"
 collect DuckDB duck_invoke  parse_duck  "$duck_tsv"
