@@ -9,7 +9,7 @@
 //! flush_secs = 10
 //!
 //! [logs]
-//! destination = "./otel/logs"   # local dir, or gs:// / s3:// (write-only)
+//! destination = "./otel/logs"   # local dir, or gs:// / s3:// under the db bucket
 //! columns = [
 //!   { name = "Timestamp",          field      = "time_unix_nano" },
 //!   { name = "ServiceName",        attr       = "resource:service.name" },

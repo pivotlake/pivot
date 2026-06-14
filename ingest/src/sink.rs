@@ -43,13 +43,11 @@ pub enum SinkDestination {
     /// A local directory. Files land flat in it, so the stream is queryable
     /// with `CREATE TABLE ... WITH (path = '<dir>')`.
     Local(PathBuf),
-    /// An object-store URL (`gs://bucket/prefix` or `s3://bucket/prefix`).
-    ///
-    /// **Write-only export**: the files are written through goose's store but
-    /// not registered with the catalog (the catalog's own database store, not
-    /// this sink's, is what reads a table — they only align for a local sink).
-    /// Credentials come from the environment (`GOOGLE_APPLICATION_CREDENTIALS`,
-    /// `AWS_*`, workload identity, …).
+    /// An object-store URL (`gs://bucket/prefix` or `s3://bucket/prefix`), read
+    /// back by the catalog the same as a local directory — so the stream is
+    /// queryable with `CREATE TABLE ... WITH (path = '<prefix>')` over the same
+    /// bucket the database is rooted at. Credentials come from the environment
+    /// (`GOOGLE_APPLICATION_CREDENTIALS`, `AWS_*`, workload identity, …).
     Remote(String),
 }
 
@@ -68,14 +66,12 @@ impl SinkDestination {
 
 /// The resolved write target for a sink: a goose [`ObjectStore`] rooted at the
 /// destination (a local dir, S3, or GCS — built once so misconfiguration
-/// surfaces at startup) plus a human-readable form for logs. The same store
-/// stack the catalog reads through, so a flushed file is written and registered
-/// through one mechanism. `registers` is set for a **local** destination (whose
-/// files the catalog can read back and so register for immediate visibility); a
-/// remote destination is a write-only export.
+/// surfaces at startup) plus a human-readable form for logs. It is the same
+/// store stack the catalog reads through, so a flushed file is written *and*
+/// registered through one mechanism — every destination is a queryable table
+/// location, local or remote alike.
 struct Backend {
     store: Arc<dyn ObjectStore>,
-    registers: bool,
     /// The destination, for log lines.
     display: String,
 }
@@ -85,23 +81,19 @@ impl Backend {
     /// directory or building/validating the remote client up front so
     /// misconfiguration is reported at startup.
     fn build(dest: &SinkDestination) -> std::io::Result<Self> {
-        let (uri, registers, display) = match dest {
+        let (uri, display) = match dest {
             SinkDestination::Local(dir) => {
                 // Create the directory now so a bad path is reported at startup.
                 std::fs::create_dir_all(dir)?;
                 let uri = dir.to_str().ok_or_else(|| {
                     std::io::Error::other(format!("non-UTF-8 sink path {}", dir.display()))
                 })?;
-                (uri.to_string(), true, dir.display().to_string())
+                (uri.to_string(), dir.display().to_string())
             }
-            SinkDestination::Remote(url) => (url.clone(), false, url.clone()),
+            SinkDestination::Remote(url) => (url.clone(), url.clone()),
         };
         let store: Arc<dyn ObjectStore> = open_store(&uri).map_err(std::io::Error::other)?.into();
-        Ok(Self {
-            store,
-            registers,
-            display,
-        })
+        Ok(Self { store, display })
     }
 
     /// Write `bytes` as `file_name` directly under the destination. goose's
@@ -137,11 +129,11 @@ pub struct ParquetSink<T> {
     /// Flush once the buffer holds at least this many rows.
     flush_rows: usize,
     dispatcher: DataFlowDispatcher,
-    /// Every locally-written file is registered with the table named
+    /// Every flushed file is registered with the table named
     /// [`name`](Self::name), so its rows are queryable immediately — no
-    /// re-`CREATE TABLE` needed. (Remote destinations are write-only exports
-    /// and skip registration; a missing table just defers visibility to its
-    /// `CREATE TABLE`.)
+    /// re-`CREATE TABLE` needed. A missing table just defers visibility to its
+    /// `CREATE TABLE`; a destination the catalog can't read back (e.g. a remote
+    /// sink outside the database's bucket) is a misconfiguration, logged.
     catalog: Arc<ParquetCatalog>,
     buffer: Mutex<Buffer<T>>,
     /// Monotonic file sequence, so two flushes in the same millisecond don't
@@ -267,9 +259,7 @@ impl<T: ToRecordBatch> ParquetSink<T> {
             match self.backend.put(&file_name, bytes).await {
                 Ok(()) => {
                     info!(sink = %self.name, dest = %self.backend.display, file = file_name, "flushed parquet");
-                    if self.backend.registers {
-                        self.register(&file_name).await;
-                    }
+                    self.register(&file_name).await;
                 }
                 Err(e) => {
                     error!(sink = %self.name, file = file_name, error = %e, "failed writing parquet")
