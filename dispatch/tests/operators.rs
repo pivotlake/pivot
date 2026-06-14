@@ -1,3 +1,8 @@
+//! Single-operator integration tests, fed from in-memory `RecordBatch`es via
+//! [`values_input`] rather than a Parquet scan: the batch is the source, so
+//! these exercise operator behavior (count/filter/project/order-by/group-by)
+//! without involving goose's reader.
+
 mod common;
 
 use std::sync::Arc;
@@ -8,22 +13,15 @@ use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{Contains, IntKeyExtractor, OrderBy, Projection, StringKeyExtractor};
-use goose::parquet::table_input;
+use dispatch::{Contains, IntKeyExtractor, OrderBy, StringKeyExtractor, values_input};
 
 #[test]
 fn count() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(
-            &["a", "b", "c", "d", "e"],
-            &[1, 2, 3, 4, 5],
-        )],
-        true,
-    );
+    let batch = strings_and_ints(&["a", "b", "c", "d", "e"], &[1, 2, 3, 4, 5]);
 
-    let results = table_input(&dispatch, &table, Projection::all(2), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .count()
         .collect()
         .unwrap();
@@ -34,16 +32,13 @@ fn count() {
 #[test]
 fn filter_string_contains() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(
-            &["alice", "bob", "alice", "dave", "alice"],
-            &[1, 2, 3, 4, 5],
-        )],
-        true,
+    let batch = strings_and_ints(
+        &["alice", "bob", "alice", "dave", "alice"],
+        &[1, 2, 3, 4, 5],
     );
 
-    let results = table_input(&dispatch, &table, Projection::columns([0]), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
             move |batch: &RecordBatch| {
@@ -66,13 +61,10 @@ fn filter_string_contains() {
 #[test]
 fn filter_no_matches_returns_zero() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(&["alice", "bob", "carol"], &[1, 2, 3])],
-        true,
-    );
+    let batch = strings_and_ints(&["alice", "bob", "carol"], &[1, 2, 3]);
 
-    let results = table_input(&dispatch, &table, Projection::columns([0]), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .filter(|| {
             let mut c = Contains::new("zzz_no_match");
             move |batch: &RecordBatch| {
@@ -95,16 +87,10 @@ fn filter_no_matches_returns_zero() {
 #[test]
 fn filter_integer_column() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(
-            &["a", "b", "c", "d", "e"],
-            &[5, 15, 25, 35, 45],
-        )],
-        true,
-    );
+    let batch = strings_and_ints(&["a", "b", "c", "d", "e"], &[5, 15, 25, 35, 45]);
 
-    let results = table_input(&dispatch, &table, Projection::all(2), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .filter(|| {
             move |batch: &RecordBatch| {
                 let col = batch
@@ -127,9 +113,10 @@ fn filter_integer_column() {
 #[test]
 fn project_selects_single_column() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(&dispatch, &[strings_and_ints(&["a", "b"], &[10, 20])], true);
+    let batch = strings_and_ints(&["a", "b"], &[10, 20]);
 
-    let results = table_input(&dispatch, &table, Projection::all(2), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .project(|| {
             let idx = vec![1];
             move |batch: RecordBatch| batch.project(&idx).unwrap()
@@ -146,16 +133,10 @@ fn project_selects_single_column() {
 #[test]
 fn order_by_ascending_with_limit() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(
-            &["e", "a", "d", "b", "c"],
-            &[50, 10, 40, 20, 30],
-        )],
-        true,
-    );
+    let batch = strings_and_ints(&["e", "a", "d", "b", "c"], &[50, 10, 40, 20, 30]);
 
-    let results = table_input(&dispatch, &table, Projection::all(2), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .order_by_limit(vec![OrderBy::new(1, false, false)], 3)
         .collect()
         .unwrap();
@@ -167,13 +148,10 @@ fn order_by_ascending_with_limit() {
 #[test]
 fn order_by_descending_with_limit() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(&["a", "b", "c", "d"], &[10, 40, 20, 30])],
-        true,
-    );
+    let batch = strings_and_ints(&["a", "b", "c", "d"], &[10, 40, 20, 30]);
 
-    let results = table_input(&dispatch, &table, Projection::all(2), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .order_by_limit(vec![OrderBy::new(1, true, false)], 2)
         .collect()
         .unwrap();
@@ -184,13 +162,10 @@ fn order_by_descending_with_limit() {
 #[test]
 fn order_by_limit_exceeds_row_count() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(&["c", "a", "b"], &[30, 10, 20])],
-        true,
-    );
+    let batch = strings_and_ints(&["c", "a", "b"], &[30, 10, 20]);
 
-    let results = table_input(&dispatch, &table, Projection::all(2), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .order_by_limit(vec![OrderBy::new(1, false, false)], 100)
         .collect()
         .unwrap();
@@ -201,16 +176,13 @@ fn order_by_limit_exceeds_row_count() {
 #[test]
 fn group_by_count_string_keys() {
     let dispatch = dispatch(1);
-    let (_dir, table) = parquet_table(
-        &dispatch,
-        &[strings_and_ints(
-            &["alice", "bob", "alice", "carol", "bob", "alice"],
-            &[1, 2, 3, 4, 5, 6],
-        )],
-        true,
+    let batch = strings_and_ints(
+        &["alice", "bob", "alice", "carol", "bob", "alice"],
+        &[1, 2, 3, 4, 5, 6],
     );
 
-    let results = table_input(&dispatch, &table, Projection::columns([0]), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .group_by_count::<StringKeyExtractor>(0)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()
@@ -228,9 +200,9 @@ fn group_by_count_int_keys() {
         vec![Arc::new(Int64Array::from(vec![1, 2, 1, 3, 2, 1, 3, 2]))],
     )
     .unwrap();
-    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
 
-    let results = table_input(&dispatch, &table, Projection::columns([0]), false)
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
         .group_by_count::<IntKeyExtractor<Int64Type>>(0)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()
