@@ -34,25 +34,25 @@ mod table;
 
 pub use binding::TableBinding;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::manifest::{self, CatalogManifestTableEntry};
-use crate::parquet::{ParquetTableError, RowGroupMetadata};
-use crate::store::{
-    self, DataFile, DataFileSource, FileRef, LocalStore, ObjectStore, location_key,
+use crate::manifest::{
+    self, CatalogManifest, CatalogManifestTableEntry, FIRST_VERSION, TableManifest,
 };
-use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
-pub use table::{CatalogTable};
+use crate::parquet::ParquetTableError;
+use crate::store::{
+    self, DataFile, FileRef, LocalStore, ObjectStore, location_key, open_store,
+};
+use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
+pub use table::CatalogTable;
 pub use table::TableFile;
 use planner::catalog::{
     Catalog, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
 };
 use thiserror::Error as ThisError;
-use tracing::warn;
-use crate::manifest::CatalogManifest;
 
 const PATH_OPTION: &str = "path";
 
@@ -72,6 +72,10 @@ pub enum Error {
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
     Store(#[from] store::StoreError),
+    #[error(transparent)]
+    Manifest(#[from] manifest::Error),
+    #[error("loading table footers: {0}")]
+    Load(#[from] DataFlowError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -123,7 +127,10 @@ pub struct ParquetCatalog {
     /// [`new`]: Self::new
     store: Arc<dyn ObjectStore>,
 
-    manifest: CatalogManifest,
+    /// The database manifest (which tables exist, and where), behind a lock so
+    /// `CREATE TABLE` can record a new entry through a shared `&self`. Writes are
+    /// rare; reads (resolve) don't touch it.
+    manifest: Arc<Mutex<CatalogManifest>>,
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
     dispatcher: DataFlowDispatcher,
@@ -146,19 +153,57 @@ impl ParquetCatalog {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("goose-{}-{}", std::process::id(), seq));
-        todo!()
+        Self {
+            tables: Arc::new(RwLock::new(HashMap::new())),
+            store: Arc::new(LocalStore::new(root)),
+            manifest: Arc::new(Mutex::new(CatalogManifest::default())),
+            dispatcher,
+        }
     }
 
     /// Open a persisted database rooted at `uri` — a local directory (or
-    /// `file://…`), or a remote `s3://…`/`gs://…` object store — reloading
-    /// every table the manifest records at its latest version.
-    /// A table without a log (created before logs existed) falls back to
-    /// listing its data location; its first commit seeds the log.
+    /// `file://…`), or a remote `s3://…`/`gs://…` object store — reloading every
+    /// table the manifest records at its latest version: read each table's
+    /// manifest (schema + file list) and fetch its files' footers, building the
+    /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
-        // TODO: Load or Create a CatalogManifest, then run per CatalogManifestTableEntry and create
-        // a CatalogTable (by getting last TableManifest)
-        todo!()
-        // Ok(catalog)
+        let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
+        let manifest = CatalogManifest::load(store.as_ref())?;
+
+        let mut tables = HashMap::new();
+        for entry in &manifest.tables {
+            let Some(table_manifest) = TableManifest::load(store.as_ref(), &entry.name)? else {
+                continue;
+            };
+            let table =
+                Self::load_table(dispatcher, &store, &entry.location, table_manifest)?;
+            tables.insert(entry.name.clone(), table);
+        }
+
+        Ok(Self {
+            tables: Arc::new(RwLock::new(tables)),
+            store,
+            manifest: Arc::new(Mutex::new(manifest)),
+            dispatcher: dispatcher.clone(),
+        })
+    }
+
+    /// Build the in-memory [`CatalogTable`] for one persisted table: locate its
+    /// committed files under `location` and fetch their footers over the pool.
+    fn load_table(
+        dispatcher: &DataFlowDispatcher,
+        store: &Arc<dyn ObjectStore>,
+        location: &str,
+        manifest: TableManifest,
+    ) -> Result<CatalogTable> {
+        let files = manifest
+            .entries
+            .iter()
+            .map(|f| store.data_file(&location_key(location, &f.name), f.size))
+            .collect::<store::Result<Vec<DataFile>>>()?;
+        let version = manifest.version;
+        let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
+        Ok(CatalogTable::new(manifest, version, table_files, store.clone()))
     }
 
     /// Resolve `name` to a fresh [`TableBinding`] (same semantics as
@@ -223,7 +268,8 @@ impl ParquetCatalog {
         }
 
         let location = Self::get_path_for_create_table(&request)?;
-        let manifest_entry = CatalogManifestTableEntry::new(request.name);
+        let name = request.name;
+        let columns = request.columns;
 
         // Locate every data file under the table's directory for reading, keeping
         // its `FileRef` identity so each footer's row groups land on the right
@@ -235,20 +281,39 @@ impl ParquetCatalog {
             .collect::<store::Result<Vec<DataFile>>>()?;
 
         // The commit runs on the dataflow's last worker once the footers are
-        // fetched: record the table durably (manifest + seed log version), then
-        // in the in-memory map (re-checking the name under the lock as a race
-        // backstop).
+        // fetched: write the table's durable state (its own manifest, then the
+        // database manifest) and publish it in the in-memory map — re-checking
+        // the name under the lock as a race backstop.
         let tables = self.tables.clone();
+        let store = self.store.clone();
+        let catalog_manifest = self.manifest.clone();
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
             &files,
-            move |_loaded: Vec<TableFile>| {
+            move |loaded: Vec<TableFile>| {
                 let mut map = tables.write().unwrap();
-                if map.contains_key(&manifest_entry.name) {
-                    return Err(Box::new(Error::TableExists(manifest_entry.name))
+                if map.contains_key(&name) {
+                    return Err(Box::new(Error::TableExists(name))
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
-                // todo: Create new CatalogTable from `_loaded`, update manifest.
+                let entries = loaded.iter().map(|tf| tf.file.clone()).collect();
+                let table_manifest = TableManifest {
+                    version: FIRST_VERSION,
+                    columns,
+                    entries,
+                };
+                // Durable first, then in-memory: the per-table manifest, then the
+                // database manifest pointing at it.
+                table_manifest.store(store.as_ref(), &name)?;
+                {
+                    let mut catalog_manifest = catalog_manifest.lock().unwrap();
+                    catalog_manifest
+                        .upsert(CatalogManifestTableEntry::new(name.clone(), location));
+                    catalog_manifest.store(store.as_ref())?;
+                }
+                let table =
+                    CatalogTable::new(table_manifest, FIRST_VERSION, loaded, store.clone());
+                map.insert(name, table);
                 Ok(())
             },
         ))

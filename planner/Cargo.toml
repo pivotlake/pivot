@@ -12,6 +12,9 @@ arrow = { path = "../arrow-rs/arrow" }
 duckdb-planner = { path = "../duckdb-planner" }
 dispatch = { path = "../dispatch" }
 thiserror = "2.0.18"
+# Column/Type derive serde so goose can persist a table's declared schema in its
+# manifest.
+serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 # The Parquet reader, for integration tests that plan over a real on-disk table.
