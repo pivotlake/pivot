@@ -35,7 +35,6 @@ mod table;
 pub use binding::TableBinding;
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -44,7 +43,7 @@ use crate::manifest::{
 };
 use crate::parquet::ParquetTableError;
 use crate::store::{
-    self, DataFile, FileRef, LocalStore, ObjectStore, location_key, open_store,
+    self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store,
 };
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 pub use table::CatalogTable;
@@ -200,7 +199,7 @@ impl ParquetCatalog {
         let files = manifest
             .entries
             .iter()
-            .map(|f| store.data_file(&location_key(&entry.location, &f.name), f.size))
+            .map(|f| store.data_file(&entry.location.join(&f.name), f.size))
             .collect::<store::Result<Vec<DataFile>>>()?;
         let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
         Ok(CatalogTable::new(
@@ -274,7 +273,7 @@ impl ParquetCatalog {
         let files = self
             .list_file_refs(&location)?
             .into_iter()
-            .map(|f| self.store.data_file(&location_key(&location, &f.name), f.size))
+            .map(|f| self.store.data_file(&location.join(&f.name), f.size))
             .collect::<store::Result<Vec<DataFile>>>()?;
 
         // The commit runs on the dataflow's last worker once the footers are
@@ -321,20 +320,20 @@ impl ParquetCatalog {
     /// root of the database's storage medium: on a local database, a directory
     /// on the server's filesystem; on a remote database, a key from the **bucket
     /// root** (ignoring the prefix the database was opened at).
-    fn get_path_for_create_table(request: &CreateTableRequest) -> Result<String> {
+    fn get_path_for_create_table(request: &CreateTableRequest) -> Result<ObjectPath> {
         let Some(path) = request.options.get(PATH_OPTION) else {
-            return Ok(request.name.clone());
+            return Ok(ObjectPath::new(request.name.clone()));
         };
         if path.contains("://") {
             return Err(Error::TablePathWithScheme(path.clone()));
         }
-        Ok(path.clone())
+        Ok(ObjectPath::new(path.clone()))
     }
 
     /// List the Parquet data files at `location` through the store. An
     /// empty/absent location yields no files. Used where the *listing* is the
-    /// source of truth: `CREATE TABLE`, and reloading a legacy table with no log.
-    fn list_file_refs(&self, location: &str) -> Result<Vec<FileRef>> {
+    /// source of truth: `CREATE TABLE`.
+    fn list_file_refs(&self, location: &ObjectPath) -> Result<Vec<FileRef>> {
         Ok(self
             .store
             .list(location)?
@@ -342,18 +341,6 @@ impl ParquetCatalog {
             .filter(|file| file.name.ends_with(".parquet"))
             .collect())
     }
-}
-
-
-/// Whether `file` sits directly in the table data directory `location`.
-/// Registration is a local-file operation, so this is a local-path check: only
-/// an absolute local location can be the home of a locally-written file (a
-/// store-relative or remote location is a store key, not a filesystem path, and
-/// `canonicalize`-style resolution would be meaningless there). `file`'s parent
-/// must be exactly `location`.
-fn file_in_table_dir(file: &Path, location: &str) -> bool {
-    let dir = Path::new(location);
-    dir.is_absolute() && file.parent() == Some(dir)
 }
 
 impl Catalog for ParquetCatalog {

@@ -8,7 +8,7 @@
 //! identity on Google compute). RS256 signing uses `ring`; everything is
 //! synchronous, no async runtime.
 
-use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError, object_key};
+use super::{DataFile, DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use base64::Engine;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -157,13 +157,13 @@ impl GcsStore {
     }
 
     /// `storage.googleapis.com` object path for a catalog-relative key.
-    fn object_path(&self, key: &str) -> String {
+    fn object_path(&self, key: &ObjectPath) -> String {
         percent_encode(&object_key(&self.prefix, key))
     }
 }
 
 impl ObjectStore for GcsStore {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         let token = self.bearer()?;
         let url = format!(
             "https://storage.googleapis.com/storage/v1/b/{}/o/{}?alt=media",
@@ -192,7 +192,7 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+    fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let token = self.bearer()?;
         let url = format!(
             "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
@@ -211,7 +211,7 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
         let token = self.bearer()?;
         // GCS conditional create: `ifGenerationMatch=0` only succeeds when no
         // live generation of the object exists; otherwise 412.
@@ -233,7 +233,7 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn delete(&self, key: &str) -> Result<()> {
+    fn delete(&self, key: &ObjectPath) -> Result<()> {
         let token = self.bearer()?;
         let url = format!(
             "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
@@ -252,7 +252,7 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
+    fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>> {
         let token = self.bearer()?;
         let object_prefix = object_key(&self.prefix, prefix);
         let url = format!(
@@ -286,10 +286,10 @@ impl ObjectStore for GcsStore {
             .collect()
     }
 
-    fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
+    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
         Ok(DataFile {
             file: FileRef {
-                name: super::key_name(key),
+                name: key.name().to_string(),
                 size,
             },
             source: DataFileSource::Remote(self.presign_get(key)?),
@@ -300,7 +300,7 @@ impl ObjectStore for GcsStore {
 impl GcsStore {
     /// A time-limited GET URL for `key`, V4-signed in the query string so the
     /// io_uring HTTP reader can range-read it with no auth headers.
-    fn presign_get(&self, key: &str) -> Result<url::Url> {
+    fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {
         // V4 signed URLs require RSA signing with a service-account private key;
         // the metadata-server / authorized-user token flows can't presign.
         let cred_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").map_err(|_| {

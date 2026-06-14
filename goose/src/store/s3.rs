@@ -6,7 +6,7 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError, object_key};
+use super::{DataFile, DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -146,7 +146,7 @@ impl S3Store {
 }
 
 impl ObjectStore for S3Store {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
         let signed = self.sign("GET", &url, &[], &[])?;
@@ -167,7 +167,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+    fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
         let signed = self.sign("PUT", &url, &[], data)?;
@@ -178,7 +178,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
         // S3 conditional write: `If-None-Match: *` fails the PUT with 412 when
@@ -193,7 +193,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn delete(&self, key: &str) -> Result<()> {
+    fn delete(&self, key: &ObjectPath) -> Result<()> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
         let signed = self.sign("DELETE", &url, &[], &[])?;
@@ -205,7 +205,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
+    fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>> {
         let object_prefix = object_key(&self.prefix, prefix);
         // ListObjectsV2, one level (delimiter=/), under the object prefix.
         let query = format!(
@@ -235,10 +235,10 @@ impl ObjectStore for S3Store {
             .collect())
     }
 
-    fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
+    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
         Ok(DataFile {
             file: FileRef {
-                name: super::key_name(key),
+                name: key.name().to_string(),
                 size,
             },
             source: DataFileSource::Remote(self.presign_get(key)?),
@@ -249,7 +249,7 @@ impl ObjectStore for S3Store {
 impl S3Store {
     /// A time-limited GET URL for `key`, signed in the query string so the
     /// io_uring HTTP reader can range-read it with no auth headers.
-    fn presign_get(&self, key: &str) -> Result<url::Url> {
+    fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
 

@@ -2,13 +2,12 @@
 //! content — the files at one manifest version.
 
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::catalog::TableBinding;
 use crate::manifest::{FIRST_VERSION, TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
-use crate::store::{self, DataFile, FileRef, ObjectStore, location_key};
+use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use dispatch::DataFlowDispatcher;
 use planner::catalog::Column;
 use crate::{Error, RegisterOutcome};
@@ -51,9 +50,8 @@ impl TableFile {
 #[derive(Clone)]
 pub struct CatalogTable {
     name: String,
-    /// Where the table's Parquet data lives (a store location — relative to the
-    /// database root, or an absolute store path).
-    location: String,
+    /// Where the table's Parquet data lives in the object store.
+    location: ObjectPath,
     pub(super) manifest: TableManifest,
     pub(super) files: Vec<TableFile>,
     store: Arc<dyn ObjectStore>,
@@ -68,7 +66,7 @@ impl CatalogTable {
     /// persist anything; the manifest it was loaded from is already durable.
     pub(super) fn new(
         name: String,
-        location: String,
+        location: ObjectPath,
         manifest: TableManifest,
         files: Vec<TableFile>,
         store: Arc<dyn ObjectStore>,
@@ -91,7 +89,7 @@ impl CatalogTable {
     /// first version. The `CREATE TABLE` commit path.
     pub(super) fn create_new(
         name: String,
-        location: String,
+        location: ObjectPath,
         files: Vec<TableFile>,
         columns: Vec<Column>,
         store: Arc<dyn ObjectStore>,
@@ -129,26 +127,28 @@ impl CatalogTable {
         Ok(true)
     }
 
-    /// Register one newly-written local Parquet data file: commit a new manifest
-    /// version whose file list is `latest + this file`, retrying past concurrent
-    /// commits. Registering a name the manifest already holds is a no-op
-    /// ([`RegisterOutcome::AlreadyRegistered`]), so a replayed notification can't
-    /// double-count rows.
+    /// Register one newly-written Parquet data file at object path `path`: commit
+    /// a new manifest version whose file list is `latest + this file`, retrying
+    /// past concurrent commits. Registering a name the manifest already holds is
+    /// a no-op ([`RegisterOutcome::AlreadyRegistered`]), so a replayed
+    /// notification can't double-count rows.
     ///
-    /// The file must sit directly in the table's data directory, which only an
-    /// absolute local location can be — a store-relative or remote location is
-    /// not where a locally-written file lands; otherwise
-    /// [`RegisterOutcome::LocationMismatch`] and nothing is committed.
-    pub fn register_data_file(&mut self, path: &Path) -> crate::Result<RegisterOutcome> {
-        if !super::file_in_table_dir(path, &self.location) {
+    /// The file must sit directly in the table's data location, and a `list`
+    /// there must actually find it (which is where its size comes from);
+    /// otherwise [`RegisterOutcome::LocationMismatch`] and nothing is committed.
+    pub fn register_data_file(&mut self, path: ObjectPath) -> crate::Result<RegisterOutcome> {
+        if path.parent().as_ref() != Some(&self.location) {
             return Ok(RegisterOutcome::LocationMismatch);
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        // Locate the file in the store to confirm it's there and learn its size.
+        let name = path.name();
+        let Some(new_file) = self
+            .store
+            .list(&self.location)?
+            .into_iter()
+            .find(|f| f.name == name)
+        else {
             return Ok(RegisterOutcome::LocationMismatch);
-        };
-        let new_file = FileRef {
-            name: name.to_string(),
-            size: std::fs::metadata(path)?.len(),
         };
 
         loop {
@@ -226,7 +226,7 @@ impl CatalogTable {
             .entries
             .iter()
             .filter(|e| !self.files.iter().any(|f| f.file.name == e.name))
-            .map(|e| self.store.data_file(&location_key(&self.location, &e.name), e.size))
+            .map(|e| self.store.data_file(&self.location.join(&e.name), e.size))
             .collect::<store::Result<_>>()?;
         Ok(crate::parquet::load_table_files(&self.dispatcher, &to_fetch)?)
     }

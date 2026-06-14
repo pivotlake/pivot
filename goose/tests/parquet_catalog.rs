@@ -10,6 +10,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
+use goose::store::ObjectPath;
 use goose::{ParquetCatalog, RegisterOutcome, TableBinding};
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
@@ -344,7 +345,7 @@ fn register(catalog: &ParquetCatalog, name: &str, path: &Path) -> RegisterOutcom
     catalog
         .table_handle(name)
         .expect("table exists")
-        .register_data_file(path)
+        .register_data_file(ObjectPath::new(path.to_string_lossy()))
         .unwrap()
 }
 

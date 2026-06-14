@@ -17,9 +17,11 @@ use std::path::PathBuf;
 
 mod gcs;
 mod local;
+mod object_path;
 mod s3;
 pub use gcs::GcsStore;
 pub use local::LocalStore;
+pub use object_path::ObjectPath;
 pub use s3::S3Store;
 
 #[derive(Debug, thiserror::Error)]
@@ -103,37 +105,37 @@ impl DataFile {
     }
 }
 
-/// A flat key→bytes object store rooted at one database. Keys are relative to
-/// that root, e.g. `_pivot_manifest.json` or `events/a.parquet`.
+/// A flat key→bytes object store rooted at one database. [`ObjectPath`] keys are
+/// relative to that root, e.g. `_pivot_manifest.json` or `events/a.parquet`.
 pub trait ObjectStore: Debug + Send + Sync {
     /// Fetch an object in full, or `None` if it does not exist.
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>>;
 
     /// Atomically replace `key` with `data` (overwriting any existing object).
-    /// Backs a small, rarely-written mutable control file like the table
+    /// Backs a small, rarely-written mutable control file like the database
     /// manifest; reads see either the old or the new object whole, never a torn
-    /// write. (Concurrent writers are last-writer-wins — fine for the manifest,
-    /// which a single server writes on the occasional `CREATE TABLE`.)
-    fn put(&self, key: &str, data: &[u8]) -> Result<()>;
+    /// write. (Concurrent writers are last-writer-wins — fine for the database
+    /// index, which a single server writes on the occasional `CREATE TABLE`.)
+    fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
 
     /// Create `key` with `data` only if it does not already exist — the
     /// compare-and-swap the versioned [table manifest](crate::manifest) builds
     /// its commits on. `Ok(true)` means this writer created the object; `Ok(false)`
     /// means the key was already there (the caller lost the race: re-read the
     /// latest state and retry at the next version).
-    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool>;
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool>;
 
     /// Delete `key`. Deleting an object that does not exist is not an error —
     /// the caller's goal (key absent) is already met.
-    fn delete(&self, key: &str) -> Result<()>;
+    fn delete(&self, key: &ObjectPath) -> Result<()>;
 
     /// List objects directly under `prefix` (one level, not recursive), as
     /// [`FileRef`]s (name within `prefix`, paired with size).
-    fn list(&self, prefix: &str) -> Result<Vec<FileRef>>;
+    fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>>;
 
     /// How the io_uring reader should fetch object `key` (`size` bytes): a local
     /// backend yields a filesystem path, a remote one a presigned GET URL.
-    fn data_file(&self, key: &str, size: u64) -> Result<DataFile>;
+    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile>;
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
@@ -149,48 +151,26 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     }
 }
 
-/// The final path segment of a store key — the object's name within its
-/// directory/prefix, as the table log records it.
+/// The final path segment of a raw object-store key string (a backend's listing
+/// response), as the manifest records the object's name.
 pub(crate) fn key_name(key: &str) -> String {
     key.rsplit('/').next().unwrap_or(key).to_string()
 }
 
-/// Join a relative key onto a (possibly empty) directory/prefix. Shared by the
-/// remote backends and the catalog's location handling.
-pub(crate) fn join_prefix(prefix: &str, key: &str) -> String {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        key.trim_start_matches('/').to_string()
-    } else {
-        format!("{prefix}/{}", key.trim_start_matches('/'))
-    }
-}
-
-/// The store key of a file `name` sitting directly in table-data location
-/// `location` — `location/name`, preserving `location`'s absoluteness (a leading
-/// `/` marks a location at the store's own root) so the store interprets
-/// relative-vs-absolute exactly as it does for any other key. The companion to
-/// [`join_prefix`] used where the *table's* data location, not the database
-/// prefix, is the directory.
-pub(crate) fn location_key(location: &str, name: &str) -> String {
-    let joined = join_prefix(location, name);
-    if location.starts_with('/') {
-        format!("/{joined}")
-    } else {
-        joined
-    }
-}
-
 /// The in-bucket object key a remote backend should address for a store key.
-/// A leading `/` marks an **absolute** key — taken from the bucket root,
+/// An [absolute](ObjectPath::is_absolute) key is taken from the bucket root,
 /// ignoring `prefix` (the database's own prefix within the bucket); any other
-/// key lives under `prefix`. The "absolute = the store's root" companion to
-/// [`join_prefix`].
-pub(crate) fn object_key(prefix: &str, key: &str) -> String {
-    if key.starts_with('/') {
-        key.trim_start_matches('/').to_string()
+/// key lives under `prefix`.
+pub(crate) fn object_key(prefix: &str, key: &ObjectPath) -> String {
+    if key.is_absolute() {
+        key.as_str().trim_start_matches('/').to_string()
     } else {
-        join_prefix(prefix, key)
+        let prefix = prefix.trim_matches('/');
+        if prefix.is_empty() {
+            key.as_str().to_string()
+        } else {
+            format!("{prefix}/{}", key.as_str())
+        }
     }
 }
 
@@ -202,31 +182,23 @@ mod tests {
     #[test]
     fn object_key_relative_lives_under_prefix_absolute_at_bucket_root() {
         // Relative keys hang under the database's own prefix in the bucket.
-        assert_eq!(object_key("mydb", "events/a.parquet"), "mydb/events/a.parquet");
+        assert_eq!(object_key("mydb", &ObjectPath::new("events/a.parquet")), "mydb/events/a.parquet");
         // An absolute key escapes the database prefix to the bucket root.
-        assert_eq!(object_key("mydb", "/shared/a.parquet"), "shared/a.parquet");
+        assert_eq!(object_key("mydb", &ObjectPath::new("/shared/a.parquet")), "shared/a.parquet");
         // Bucket root with no database prefix configured behaves the same.
-        assert_eq!(object_key("", "events/a.parquet"), "events/a.parquet");
-        assert_eq!(object_key("", "/shared/a.parquet"), "shared/a.parquet");
-    }
-
-    #[test]
-    fn location_key_preserves_absoluteness_for_the_store_to_interpret() {
-        // A relative table location yields a relative key (store prepends its prefix).
-        assert_eq!(location_key("events", "a.parquet"), "events/a.parquet");
-        // An absolute table location keeps its leading slash so the store reads
-        // it from the bucket root.
-        assert_eq!(location_key("/shared/events", "a.parquet"), "/shared/events/a.parquet");
+        assert_eq!(object_key("", &ObjectPath::new("events/a.parquet")), "events/a.parquet");
+        assert_eq!(object_key("", &ObjectPath::new("/shared/a.parquet")), "shared/a.parquet");
     }
 
     #[test]
     fn open_store_routes_local_and_file_uri() {
         let dir = tempfile::tempdir().unwrap();
         let store = open_store(dir.path().to_str().unwrap()).unwrap();
-        store.put("k", b"v").unwrap();
+        let key = ObjectPath::new("k");
+        store.put(&key, b"v").unwrap();
         // Reopening through a `file://` URI lands on the same root.
         let uri = format!("file://{}", dir.path().to_str().unwrap());
         let reopened = open_store(&uri).unwrap();
-        assert_eq!(reopened.get("k").unwrap().unwrap(), b"v");
+        assert_eq!(reopened.get(&key).unwrap().unwrap(), b"v");
     }
 }

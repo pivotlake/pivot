@@ -1,8 +1,8 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFile, DataFileSource, FileRef, ObjectStore, Result, StoreError};
-use std::path::{Path, PathBuf};
+use super::{DataFile, DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError};
+use std::path::PathBuf;
 
 /// The local-filesystem backend: keys are paths under `root`.
 #[derive(Debug)]
@@ -19,18 +19,17 @@ impl LocalStore {
     /// root; an **absolute** key is taken as-is — it names a location outside
     /// the root (an external data directory). Made explicit rather than relying
     /// on `Path::join`'s absolute-component behavior.
-    fn path_for(&self, key: &str) -> PathBuf {
-        let key = Path::new(key);
+    fn path_for(&self, key: &ObjectPath) -> PathBuf {
         if key.is_absolute() {
-            key.to_path_buf()
+            PathBuf::from(key.as_str())
         } else {
-            self.root.join(key)
+            self.root.join(key.as_str())
         }
     }
 }
 
 impl ObjectStore for LocalStore {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         match std::fs::read(self.path_for(key)) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -41,7 +40,7 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+    fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
@@ -62,7 +61,7 @@ impl ObjectStore for LocalStore {
         })
     }
 
-    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<bool> {
+    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
@@ -91,7 +90,7 @@ impl ObjectStore for LocalStore {
         created
     }
 
-    fn delete(&self, key: &str) -> Result<()> {
+    fn delete(&self, key: &ObjectPath) -> Result<()> {
         match std::fs::remove_file(self.path_for(key)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -102,7 +101,7 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<FileRef>> {
+    fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -139,10 +138,10 @@ impl ObjectStore for LocalStore {
         Ok(objects)
     }
 
-    fn data_file(&self, key: &str, size: u64) -> Result<DataFile> {
+    fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
         Ok(DataFile {
             file: FileRef {
-                name: super::key_name(key),
+                name: key.name().to_string(),
                 size,
             },
             source: DataFileSource::Local(self.path_for(key)),
@@ -154,40 +153,44 @@ impl ObjectStore for LocalStore {
 mod tests {
     use super::*;
 
+    fn p(key: &str) -> ObjectPath {
+        ObjectPath::new(key)
+    }
+
     #[test]
     fn put_overwrites_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path());
-        store.put("k", b"first").unwrap();
-        store.put("k", b"second").unwrap();
-        assert_eq!(store.get("k").unwrap().unwrap(), b"second");
+        store.put(&p("k"), b"first").unwrap();
+        store.put(&p("k"), b"second").unwrap();
+        assert_eq!(store.get(&p("k")).unwrap().unwrap(), b"second");
     }
 
     #[test]
     fn put_if_absent_creates_once() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path());
-        assert!(store.put_if_absent("v/1.json", b"first").unwrap());
-        assert!(!store.put_if_absent("v/1.json", b"second").unwrap());
+        assert!(store.put_if_absent(&p("v/1.json"), b"first").unwrap());
+        assert!(!store.put_if_absent(&p("v/1.json"), b"second").unwrap());
         // The loser's bytes never land.
-        assert_eq!(store.get("v/1.json").unwrap().unwrap(), b"first");
+        assert_eq!(store.get(&p("v/1.json")).unwrap().unwrap(), b"first");
     }
 
     #[test]
     fn delete_removes_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path());
-        store.put("k", b"v").unwrap();
-        store.delete("k").unwrap();
-        assert!(store.get("k").unwrap().is_none());
-        store.delete("k").unwrap();
+        store.put(&p("k"), b"v").unwrap();
+        store.delete(&p("k")).unwrap();
+        assert!(store.get(&p("k")).unwrap().is_none());
+        store.delete(&p("k")).unwrap();
     }
 
     #[test]
     fn get_missing_is_none_and_list_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path());
-        assert!(store.get("nope").unwrap().is_none());
-        assert!(store.list("_missing").unwrap().is_empty());
+        assert!(store.get(&p("nope")).unwrap().is_none());
+        assert!(store.list(&p("_missing")).unwrap().is_empty());
     }
 }

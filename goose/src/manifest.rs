@@ -18,7 +18,7 @@ use planner::catalog::Column;
 use serde::{Deserialize, Serialize};
 
 use crate::FileRef;
-use crate::store::ObjectStore;
+use crate::store::{ObjectPath, ObjectStore};
 
 /// Key of the [`CatalogManifest`] document within the database's object store.
 const MANIFEST_KEY: &str = "_pivot_manifest.json";
@@ -59,13 +59,13 @@ pub struct TableManifest {
 
 impl TableManifest {
     /// The directory holding table `name`'s manifest versions.
-    fn dir(name: &str) -> String {
-        format!("{TABLE_MANIFEST_DIR}/{name}")
+    fn dir(name: &str) -> ObjectPath {
+        ObjectPath::new(format!("{TABLE_MANIFEST_DIR}/{name}"))
     }
 
     /// The store key of one `version` of table `name`'s manifest.
-    fn key(name: &str, version: u64) -> String {
-        format!("{}/{version:0VERSION_DIGITS$}.json", Self::dir(name))
+    fn key(name: &str, version: u64) -> ObjectPath {
+        Self::dir(name).join(&format!("{version:0VERSION_DIGITS$}.json"))
     }
 
     /// Load table `name`'s latest committed manifest — one `list` of its version
@@ -94,17 +94,16 @@ impl TableManifest {
     }
 }
 
-/// One table's entry in the [`CatalogManifest`]: its name and the location its
-/// Parquet data lives at (relative to the database root, or an absolute store
-/// path).
+/// One table's entry in the [`CatalogManifest`]: its name and the
+/// [location](ObjectPath) its Parquet data lives at.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CatalogManifestTableEntry {
     pub(crate) name: String,
-    pub(crate) location: String,
+    pub(crate) location: ObjectPath,
 }
 
 impl CatalogManifestTableEntry {
-    pub fn new(name: String, location: String) -> Self {
+    pub fn new(name: String, location: ObjectPath) -> Self {
         Self { name, location }
     }
 }
@@ -121,7 +120,7 @@ pub struct CatalogManifest {
 impl CatalogManifest {
     /// Load the database manifest, or an empty one if the database is brand new.
     pub fn load(store: &dyn ObjectStore) -> Result<Self> {
-        match store.get(MANIFEST_KEY)? {
+        match store.get(&ObjectPath::new(MANIFEST_KEY))? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
             None => Ok(Self::default()),
         }
@@ -129,7 +128,7 @@ impl CatalogManifest {
 
     /// Write the database manifest, overwriting the previous version.
     pub fn store(&self, store: &dyn ObjectStore) -> Result<()> {
-        store.put(MANIFEST_KEY, &serde_json::to_vec(self)?)?;
+        store.put(&ObjectPath::new(MANIFEST_KEY), &serde_json::to_vec(self)?)?;
         Ok(())
     }
 
