@@ -336,6 +336,24 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
     path
 }
 
+/// Register `path` with table `name` through a cloned-out handle — the
+/// table-level API a writer (ingest) uses: it CAS-commits a new manifest version
+/// to the shared store. The catalog's own copy is not touched (a later `resolve`
+/// reconciles it).
+fn register(catalog: &ParquetCatalog, name: &str, path: &Path) -> RegisterOutcome {
+    catalog
+        .table_handle(name)
+        .expect("table exists")
+        .register_data_file(&dispatcher(), path)
+        .unwrap()
+}
+
+/// Resolve `name` through the planner trait — what a query does on bind — so the
+/// catalog refreshes its in-memory copy from the latest committed manifest.
+fn resolve(catalog: &ParquetCatalog, name: &str) {
+    let _ = PlannerCatalog::table(catalog, name);
+}
+
 /// A file flushed after `CREATE TABLE` becomes visible to new binds once
 /// registered, with global row-group indices kept sequential.
 #[test]
@@ -346,11 +364,9 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
-    assert_eq!(
-        catalog.register_data_file("t", &new_file).unwrap(),
-        RegisterOutcome::Registered
-    );
+    assert_eq!(register(&catalog, "t", &new_file), RegisterOutcome::Registered);
 
+    resolve(&catalog, "t");
     let table = catalog.binding("t").unwrap();
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 4);
@@ -358,7 +374,8 @@ fn register_data_file_makes_new_file_visible_to_new_binds() {
 }
 
 /// Registering the same path twice (a replayed flush notification) must not
-/// double-count its rows.
+/// double-count its rows. The second handle starts a version behind, so it CAS-
+/// conflicts, refreshes, and sees the file already present.
 #[test]
 fn register_data_file_is_idempotent_per_path() {
     let (dir, columns) = three_row_table();
@@ -366,30 +383,24 @@ fn register_data_file_is_idempotent_per_path() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40]);
+    assert_eq!(register(&catalog, "t", &new_file), RegisterOutcome::Registered);
     assert_eq!(
-        catalog.register_data_file("t", &new_file).unwrap(),
-        RegisterOutcome::Registered
-    );
-    assert_eq!(
-        catalog.register_data_file("t", &new_file).unwrap(),
+        register(&catalog, "t", &new_file),
         RegisterOutcome::AlreadyRegistered
     );
 
-    let table = catalog.binding("t").unwrap();
-    assert_eq!(table.parquet.row_groups().len(), 4);
+    resolve(&catalog, "t");
+    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
 }
 
-/// No table yet (ingest runs before `CREATE TABLE`): the registration reports
-/// `false` and the catalog is untouched.
+/// No table yet (ingest runs before `CREATE TABLE`): there is no handle to
+/// register against.
 #[test]
-fn register_data_file_without_table_returns_false() {
+fn register_data_file_without_table_is_unresolvable() {
     let dir = TempDir::new().unwrap();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    let new_file = write_ids(dir.path(), "later.parquet", &[1]);
-    assert_eq!(
-        catalog.register_data_file("missing", &new_file).unwrap(),
-        RegisterOutcome::NoSuchTable
-    );
+    let _new_file = write_ids(dir.path(), "later.parquet", &[1]);
+    assert!(catalog.table_handle("missing").is_none());
 }
 
 /// A file outside the table's data directory must not be appended to it.
@@ -402,24 +413,23 @@ fn register_data_file_refuses_foreign_directory() {
     let elsewhere = TempDir::new().unwrap();
     let foreign = write_ids(elsewhere.path(), "foreign.parquet", &[1]);
     assert_eq!(
-        catalog.register_data_file("t", &foreign).unwrap(),
+        register(&catalog, "t", &foreign),
         RegisterOutcome::LocationMismatch
     );
+    resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
 }
 
 /// Compaction's commit: the small files' row groups vanish, the merged file's
-/// appear, and indices are renumbered — one atomic swap of the master entry.
+/// appear, and indices are renumbered — one atomic version swap.
 #[test]
 fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let extra = write_ids(dir.path(), "extra.parquet", &[40]);
-    assert_eq!(
-        catalog.register_data_file("t", &extra).unwrap(),
-        RegisterOutcome::Registered
-    );
+    assert_eq!(register(&catalog, "t", &extra), RegisterOutcome::Registered);
+    resolve(&catalog, "t");
     assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
@@ -429,8 +439,13 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         name: "merged.parquet".to_string(),
         size: merged_size,
     }];
-    assert!(catalog.replace_data_files("t", &removed, &added).unwrap());
+    catalog
+        .table_handle("t")
+        .unwrap()
+        .replace_data_files(&dispatcher(), &removed, &added)
+        .unwrap();
 
+    resolve(&catalog, "t");
     let table = catalog.binding("t").unwrap();
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 1);
@@ -438,8 +453,8 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 }
 
 /// A second catalog over the same persisted root sees another instance's
-/// registration at its next bind: `Catalog::table` reloads from the table log,
-/// so cross-process commits surface without any re-`CREATE`.
+/// registration at its next bind: `Catalog::table` refreshes from the committed
+/// manifest, so cross-process commits surface without any re-`CREATE`.
 #[test]
 fn other_catalog_instance_sees_registration_at_next_bind() {
     let (data_dir, columns) = three_row_table();
@@ -448,15 +463,12 @@ fn other_catalog_instance_sees_registration_at_next_bind() {
         Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
     create_table(&writer, create_request("t", data_dir.path(), columns)).unwrap();
 
-    // The reader opens before the new file exists, at log version 1.
+    // The reader opens before the new file exists, at version 1.
     let reader = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     assert_eq!(reader.binding("t").unwrap().parquet.row_groups().len(), 3);
 
     let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
-    assert_eq!(
-        writer.register_data_file("t", &new_file).unwrap(),
-        RegisterOutcome::Registered
-    );
+    assert_eq!(register(&writer, "t", &new_file), RegisterOutcome::Registered);
 
     // Binding through the trait (what a query does) reloads to version 2.
     assert!(PlannerCatalog::table(&reader, "t").is_some());
@@ -472,8 +484,8 @@ fn other_catalog_instance_sees_registration_at_next_bind() {
     );
 }
 
-/// Restart reads the table log, not the directory: files registered after the
-/// `CREATE` survive a reopen.
+/// Restart reads the committed manifest, not the directory: files registered
+/// after the `CREATE` survive a reopen.
 #[test]
 fn reopened_database_restores_registered_files_from_log() {
     let (data_dir, columns) = three_row_table();
@@ -483,14 +495,14 @@ fn reopened_database_restores_registered_files_from_log() {
             Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
         create_table(&catalog, create_request("t", data_dir.path(), columns)).unwrap();
         let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
-        catalog.register_data_file("t", &new_file).unwrap();
+        register(&catalog, "t", &new_file);
     }
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let table = reopened.binding("t").unwrap();
     assert_eq!(table.parquet.row_groups().len(), 4);
 }
 
-/// Only log-committed files exist: after a compaction swap, a leftover input
+/// Only committed files exist: after a compaction swap, a leftover input
 /// (e.g. a crash before the unlink) is invisible to a reopen — no double-read.
 #[test]
 fn unlogged_leftover_file_is_invisible_after_swap() {
@@ -501,21 +513,21 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     create_table(&catalog, create_request("t", data_dir.path(), columns)).unwrap();
 
     // "Compact" data.parquet into merged.parquet but crash before deleting the
-    // input: both files are on disk, only merged is in the log.
+    // input: both files are on disk, only merged is in the manifest.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
     let added = vec![goose::FileRef {
         name: "merged.parquet".to_string(),
         size: std::fs::metadata(&merged).unwrap().len(),
     }];
-    assert!(
-        catalog
-            .replace_data_files("t", &["data.parquet".to_string()], &added)
-            .unwrap()
-    );
+    catalog
+        .table_handle("t")
+        .unwrap()
+        .replace_data_files(&dispatcher(), &["data.parquet".to_string()], &added)
+        .unwrap();
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let table = reopened.binding("t").unwrap();
     let groups = table.parquet.row_groups();
-    assert_eq!(groups.len(), 1, "only the logged merged file is read");
+    assert_eq!(groups.len(), 1, "only the committed merged file is read");
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);
 }

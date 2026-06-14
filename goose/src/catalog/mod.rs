@@ -37,7 +37,7 @@ pub use binding::TableBinding;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::manifest::{
     self, CatalogManifest, CatalogManifestTableEntry, TableManifest,
@@ -53,6 +53,7 @@ use planner::catalog::{
     Catalog, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
 };
 use thiserror::Error as ThisError;
+use tracing::warn;
 
 const PATH_OPTION: &str = "path";
 
@@ -74,6 +75,8 @@ pub enum Error {
     Store(#[from] store::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
+    #[error("data file `{0}` referenced by the manifest could not be loaded")]
+    MissingFile(String),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(transparent)]
@@ -110,27 +113,31 @@ pub enum RegisterOutcome {
 ///
 /// `CREATE TABLE` compiles to a single dataflow that reads every data file's
 /// footer **once** (in parallel over the worker pool) and, at its terminal
-/// stage, commits the table to the manifest and publishes the entry in this
-/// shared map. After that, the table evolves by manifest commits (per-file
-/// registration on [`CatalogTable`], [`replace_data_files`](Self::replace_data_files))
-/// and every query resolve reloads the entry up to the latest committed version.
+/// stage, commits the table (its manifest + the database index) and publishes
+/// the entry in this shared map. After that, a table evolves by manifest commits
+/// on a [`CatalogTable`] *copy* — a writer takes one with
+/// [`table_handle`](Self::table_handle) and calls
+/// [`register_data_file`](CatalogTable::register_data_file) /
+/// [`replace_data_files`](CatalogTable::replace_data_files), which CAS a new
+/// version into the store. Copies drift; every query resolve refreshes its copy
+/// to the latest committed version, so a commit by another process (or this one)
+/// becomes visible to the next query.
 pub struct ParquetCatalog {
+    /// The in-memory table set. The lock guards the *set* (add on `CREATE`,
+    /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
+    /// lock-free value that callers clone out and evolve independently.
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    /// The database's object store — both the table [`manifest`]s and the
-    /// tables' Parquet data. A local directory by default ([`new`], an
-    /// ephemeral one under the temp dir), or the directory / S3 / GCS root a
-    /// database is [`open`](Self::open)ed at. The catalog reads and writes a
-    /// table's data through this one store: relative locations live under the
-    /// database root, an absolute location at the store's own root (the
-    /// filesystem root, or the bucket root).
+    /// The database's object store — both the table manifests and the tables'
+    /// Parquet data. A local directory by default ([`new`], an ephemeral one
+    /// under the temp dir), or the directory / S3 / GCS root a database is
+    /// [`open`](Self::open)ed at. The catalog reads and writes a table's data
+    /// through this one store: relative locations live under the database root,
+    /// an absolute location at the store's own root (the filesystem root, or the
+    /// bucket root).
     ///
     /// [`new`]: Self::new
     store: Arc<dyn ObjectStore>,
 
-    /// The database manifest (which tables exist, and where), behind a lock so
-    /// `CREATE TABLE` can record a new entry through a shared `&self`. Writes are
-    /// rare; reads (resolve) don't touch it.
-    manifest: Arc<Mutex<CatalogManifest>>,
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
     dispatcher: DataFlowDispatcher,
@@ -156,7 +163,6 @@ impl ParquetCatalog {
         Self {
             tables: Arc::new(RwLock::new(HashMap::new())),
             store: Arc::new(LocalStore::new(root)),
-            manifest: Arc::new(Mutex::new(CatalogManifest::default())),
             dispatcher,
         }
     }
@@ -179,7 +185,6 @@ impl ParquetCatalog {
         Ok(Self {
             tables: Arc::new(RwLock::new(tables)),
             store,
-            manifest: Arc::new(Mutex::new(manifest)),
             dispatcher: dispatcher.clone(),
         })
     }
@@ -202,6 +207,7 @@ impl ParquetCatalog {
         let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
         Ok(CatalogTable::new(
             entry.name.clone(),
+            entry.location.clone(),
             manifest,
             table_files,
             store.clone(),
@@ -226,22 +232,14 @@ impl ParquetCatalog {
         &self.dispatcher
     }
 
-    /// Atomically swap a set of table `name`'s data files for another — the
-    /// compaction commit. Reads the `added` files' footers, commits a log
-    /// version whose list is `latest − removed + added` (retrying past CAS
-    /// conflicts), and swaps the in-memory entry. One version, so no binding
-    /// ever sees the rows doubled or missing; queries already bound keep
-    /// their snapshot (their open handles keep even a deleted file's bytes
-    /// readable until they finish). Returns `false` when no table named
-    /// `name` exists.
-    pub fn replace_data_files(
-        &self,
-        name: &str,
-        removed: &[String],
-        added: &[FileRef],
-    ) -> Result<bool> {
-        // TODO
-        Ok(true)
+    /// A clone of the named table's current state for a writer (ingest,
+    /// compaction) to evolve — [`register_data_file`](CatalogTable::register_data_file)
+    /// or [`replace_data_files`](CatalogTable::replace_data_files). Those commit
+    /// a new version by CAS to the shared store, so this catalog's own copy may
+    /// lag until its next resolve refreshes it (which is fine — the store is the
+    /// source of truth). `None` if no such table exists.
+    pub fn table_handle(&self, name: &str) -> Option<CatalogTable> {
+        self.tables.read().unwrap().get(name).cloned()
     }
 
     /// Compile a `CREATE TABLE` to the dataflow that runs it: read every Parquet
@@ -281,12 +279,12 @@ impl ParquetCatalog {
             .collect::<store::Result<Vec<DataFile>>>()?;
 
         // The commit runs on the dataflow's last worker once the footers are
-        // fetched: build and persist the table (its own manifest), record it in
-        // the database manifest, then publish it in the in-memory map — re-checking
-        // the name under the lock as a race backstop.
+        // fetched, under the table-set write lock (which serializes in-process
+        // creates): CAS-commit the table's own manifest, record it in the
+        // database index, then publish it in the in-memory map — re-checking the
+        // name as a race backstop.
         let tables = self.tables.clone();
         let store = self.store.clone();
-        let catalog_manifest = self.manifest.clone();
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
             &files,
@@ -298,16 +296,15 @@ impl ParquetCatalog {
                 }
                 let table = CatalogTable::create_new(
                     request.name.clone(),
+                    location.clone(),
                     loaded,
                     request.columns,
                     store.clone(),
                 )?;
-                {
-                    let mut catalog_manifest = catalog_manifest.lock().unwrap();
-                    catalog_manifest
-                        .upsert(CatalogManifestTableEntry::new(request.name.clone(), location));
-                    catalog_manifest.store(store.as_ref())?;
-                }
+                // Record name → location in the database index.
+                let mut index = CatalogManifest::load(store.as_ref())?;
+                index.upsert(CatalogManifestTableEntry::new(request.name.clone(), location));
+                index.store(store.as_ref())?;
                 map.insert(request.name, table);
                 Ok(())
             },
@@ -365,18 +362,28 @@ fn file_in_table_dir(file: &Path, location: &str) -> bool {
 
 impl Catalog for ParquetCatalog {
     /// Resolve `name` to a fresh, independently-mutable [`TableBinding`],
-    /// **reloading first**: the table log is checked (one LIST) and any newer
-    /// committed version is pulled in, so every query starts from the latest
-    /// file list. Each binding is its own value, so per-query filter pushdown
-    /// prunes its view without affecting the master entry or other concurrent
-    /// queries.
+    /// **reloading first**: a copy of the table is taken and refreshed (one LIST
+    /// to check the latest version; new files' footers fetched only if it
+    /// advanced), so every query starts from the latest committed file list — a
+    /// commit by ingest, a compaction, or another process becomes visible to the
+    /// next query. An advanced copy is swapped back into the map so the next
+    /// resolve starts current. Each binding is its own value, so per-query filter
+    /// pushdown prunes its view without affecting other concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        // if let Err(e) = self.refresh(name) {
-        //     // Serve the version we have rather than failing the query; the
-        //     // next bind retries the reload.
-        //     warn!(table = name, error = %e, "table reload failed; serving last known version");
-        // }
-        self.binding(name).map(|t| Box::new(t) as _)
+        let mut table = self.tables.read().unwrap().get(name)?.clone();
+        match table.refresh(&self.dispatcher) {
+            // Advanced — publish the reloaded copy for the next resolve.
+            Ok(true) => {
+                self.tables.write().unwrap().insert(name.to_string(), table.clone());
+            }
+            Ok(false) => {}
+            // Serve the version we have rather than failing the query; the next
+            // resolve retries the reload.
+            Err(e) => {
+                warn!(table = name, error = %e, "table refresh failed; serving last known version")
+            }
+        }
+        Some(Box::new(table.binding()))
     }
 
     fn create_table(

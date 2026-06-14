@@ -3,13 +3,16 @@
 //! Two documents, both folded out of what used to be a separate "table log":
 //!
 //! - the **database manifest** ([`CatalogManifest`], at [`MANIFEST_KEY`]) — the
-//!   index of which tables exist and where each one's Parquet data lives.
+//!   index of which tables exist and where each one's Parquet data lives. Written
+//!   with a plain `put` (the catalog control plane is single-writer).
 //! - a per-table **table manifest** ([`TableManifest`], under
 //!   [`TABLE_MANIFEST_DIR`]) — the table's declared schema plus its committed
-//!   file list, at one version.
-//!
-//! Both serialize as JSON and round-trip through plain `get`/`put`; the catalog
-//! holds the live copies in memory and rewrites them on a change.
+//!   file list. It is **versioned**: each commit writes a new
+//!   `_goose_tables/<name>/<version>.json` with `put_if_absent`, so a commit is a
+//!   compare-and-swap (it fails if that version already exists) and the latest
+//!   version a `list` finds is the table's current state. That is what lets two
+//!   processes register/replace files concurrently — and what a stale in-memory
+//!   copy reconciles against via `refresh`.
 
 use planner::catalog::Column;
 use serde::{Deserialize, Serialize};
@@ -19,11 +22,14 @@ use crate::store::ObjectStore;
 
 /// Key of the [`CatalogManifest`] document within the database's object store.
 const MANIFEST_KEY: &str = "_pivot_manifest.json";
-/// Directory the per-table [`TableManifest`] documents live under, keyed by
-/// table name (`_goose_tables/<name>.json`). Kept under the database root so a
+/// Directory the per-table [`TableManifest`] versions live under
+/// (`_goose_tables/<name>/<version>.json`). Kept under the database root so a
 /// table over an external data directory never has catalog metadata written
 /// into it.
 const TABLE_MANIFEST_DIR: &str = "_goose_tables";
+/// Version numbers are zero-padded to this width so a `list` returns them in
+/// numeric order and the lexicographic max is the latest.
+const VERSION_DIGITS: usize = 20;
 /// The version a table's first commit gets.
 pub const FIRST_VERSION: u64 = 1;
 
@@ -52,25 +58,55 @@ pub struct TableManifest {
 }
 
 impl TableManifest {
-    /// The store key of table `name`'s manifest document.
-    fn key(name: &str) -> String {
-        format!("{TABLE_MANIFEST_DIR}/{name}.json")
+    /// The directory holding table `name`'s manifest versions.
+    fn dir(name: &str) -> String {
+        format!("{TABLE_MANIFEST_DIR}/{name}")
     }
 
-    /// Load table `name`'s manifest. The database manifest is the index of which
-    /// tables exist, so a name listed there with no manifest is a corrupt
-    /// catalog — an error, not an absent table.
+    /// The store key of one `version` of table `name`'s manifest.
+    fn key(name: &str, version: u64) -> String {
+        format!("{}/{version:0VERSION_DIGITS$}.json", Self::dir(name))
+    }
+
+    /// The highest committed version of table `name`, or `None` if it has none
+    /// yet — one `list` of the table's manifest directory.
+    pub fn latest_version(store: &dyn ObjectStore, name: &str) -> Result<Option<u64>> {
+        let mut latest = None;
+        for file in store.list(&Self::dir(name))? {
+            if let Some(version) = file
+                .name
+                .strip_suffix(".json")
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                latest = Some(latest.map_or(version, |cur: u64| cur.max(version)));
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Load table `name`'s latest committed manifest. The database manifest is
+    /// the index of which tables exist, so a name listed there with no manifest
+    /// is a corrupt catalog — an error, not an absent table.
     pub fn load(store: &dyn ObjectStore, name: &str) -> Result<Self> {
+        let version = Self::latest_version(store, name)?
+            .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;
+        Self::load_version(store, name, version)
+    }
+
+    /// Load one specific `version` of table `name`'s manifest.
+    pub fn load_version(store: &dyn ObjectStore, name: &str, version: u64) -> Result<Self> {
         let bytes = store
-            .get(&Self::key(name))?
+            .get(&Self::key(name, version))?
             .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
-    /// Write table `name`'s manifest, overwriting any previous version.
-    pub fn store(&self, store: &dyn ObjectStore, name: &str) -> Result<()> {
-        store.put(&Self::key(name), &serde_json::to_vec(self)?)?;
-        Ok(())
+    /// Commit this manifest at its `version` via compare-and-swap: `Ok(true)` if
+    /// this writer created the version, `Ok(false)` if that version already
+    /// exists (a concurrent writer won — the caller should reload and retry on
+    /// top of the new latest).
+    pub fn commit(&self, store: &dyn ObjectStore, name: &str) -> Result<bool> {
+        Ok(store.put_if_absent(&Self::key(name, self.version), &serde_json::to_vec(self)?)?)
     }
 }
 

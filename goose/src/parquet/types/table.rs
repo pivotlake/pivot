@@ -17,7 +17,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dispatch::DataFlowDispatcher;
 use std::fmt::{Debug, Formatter};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
