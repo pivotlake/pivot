@@ -42,16 +42,17 @@ pub enum StoreError {
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 
-/// A table's data file: its name within the table's data location and its size
-/// in bytes. The single durable file identity — the [table manifest] records a
+/// A table's data file: its [`ObjectPath`] in the store and its size in bytes.
+/// The single durable file identity — the [table manifest] records a
 /// `Vec<FileRef>`, [`ObjectStore::list`] returns these, and the catalog and
-/// compacter speak them. The size lets a reader locate a Parquet footer without
-/// a separate HEAD/`stat`.
+/// compacter speak them. The path reads the file directly (no re-joining a
+/// location); the size lets a reader locate a Parquet footer without a separate
+/// HEAD/`stat`.
 ///
 /// [table manifest]: crate::manifest::TableManifest
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileRef {
-    pub name: String,
+    pub path: ObjectPath,
     pub size: u64,
 }
 
@@ -77,29 +78,27 @@ pub enum DataFileSource {
 }
 
 impl DataFile {
-    /// A data file on the local filesystem; its [`FileRef`] name is the path's
-    /// final component.
+    /// A data file on the local filesystem; its [`FileRef`] path is the
+    /// filesystem path (these constructors feed the whole-directory readers,
+    /// where the path is the file's identity directly).
     pub fn local(path: PathBuf, size: u64) -> Self {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         Self {
-            file: FileRef { name, size },
+            file: FileRef {
+                path: ObjectPath::new(path.to_string_lossy().into_owned()),
+                size,
+            },
             source: DataFileSource::Local(path),
         }
     }
 
     /// A data file at a concrete (already-presigned) remote URL; its [`FileRef`]
-    /// name is the URL path's final segment.
+    /// path is the URL's path component.
     pub fn remote(url: url::Url, size: u64) -> Self {
-        let name = url
-            .path_segments()
-            .and_then(|mut s| s.next_back())
-            .unwrap_or_default()
-            .to_string();
         Self {
-            file: FileRef { name, size },
+            file: FileRef {
+                path: ObjectPath::new(url.path()),
+                size,
+            },
             source: DataFileSource::Remote(url),
         }
     }
@@ -130,7 +129,8 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn delete(&self, key: &ObjectPath) -> Result<()>;
 
     /// List objects directly under `prefix` (one level, not recursive), as
-    /// [`FileRef`]s (name within `prefix`, paired with size).
+    /// [`FileRef`]s — each a full [`ObjectPath`] (`prefix` joined with the
+    /// object's name) paired with its size.
     fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>>;
 
     /// How the io_uring reader should fetch object `key` (`size` bytes): a local

@@ -76,7 +76,7 @@ impl TableManifest {
         let version = store
             .list(&Self::dir(name))?
             .iter()
-            .filter_map(|file| file.name.strip_suffix(".json").and_then(|v| v.parse::<u64>().ok()))
+            .filter_map(|file| file.path.name().strip_suffix(".json").and_then(|v| v.parse::<u64>().ok()))
             .max()
             .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;
         let bytes = store

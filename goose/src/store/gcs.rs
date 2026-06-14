@@ -274,7 +274,7 @@ impl ObjectStore for GcsStore {
             .into_iter()
             .map(|it| {
                 Ok(FileRef {
-                    name: super::key_name(&it.name),
+                    path: prefix.join(&super::key_name(&it.name)),
                     size: it.size.parse().map_err(|_| {
                         StoreError::Http(format!(
                             "GCS LIST: bad size `{}` for {}",
@@ -289,7 +289,7 @@ impl ObjectStore for GcsStore {
     fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
         Ok(DataFile {
             file: FileRef {
-                name: key.name().to_string(),
+                path: key.clone(),
                 size,
             },
             source: DataFileSource::Remote(self.presign_get(key)?),

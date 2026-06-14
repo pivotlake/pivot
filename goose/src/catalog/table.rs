@@ -141,18 +141,17 @@ impl CatalogTable {
             return Ok(RegisterOutcome::LocationMismatch);
         }
         // Locate the file in the store to confirm it's there and learn its size.
-        let name = path.name();
         let Some(new_file) = self
             .store
             .list(&self.location)?
             .into_iter()
-            .find(|f| f.name == name)
+            .find(|f| f.path == path)
         else {
             return Ok(RegisterOutcome::LocationMismatch);
         };
 
         loop {
-            if self.manifest.entries.iter().any(|e| e.name == new_file.name) {
+            if self.manifest.entries.iter().any(|e| e.path == new_file.path) {
                 return Ok(RegisterOutcome::AlreadyRegistered);
             }
             let mut entries = self.manifest.entries.clone();
@@ -171,7 +170,7 @@ impl CatalogTable {
     /// doubled or missing.
     pub fn replace_data_files(
         &mut self,
-        removed: &[String],
+        removed: &[ObjectPath],
         added: &[FileRef],
     ) -> crate::Result<()> {
         loop {
@@ -179,7 +178,7 @@ impl CatalogTable {
                 .manifest
                 .entries
                 .iter()
-                .filter(|e| !removed.contains(&e.name))
+                .filter(|e| !removed.contains(&e.path))
                 .cloned()
                 .collect();
             entries.extend(added.iter().cloned());
@@ -211,8 +210,8 @@ impl CatalogTable {
     /// Reconcile `files` to the current `manifest`: drop the files no longer in
     /// it, then fetch and append the ones not yet held.
     fn sync_files_to_manifest(&mut self) -> crate::Result<()> {
-        let kept: HashSet<&str> = self.manifest.entries.iter().map(|e| e.name.as_str()).collect();
-        self.files.retain(|f| kept.contains(f.file.name.as_str()));
+        let kept: HashSet<&str> = self.manifest.entries.iter().map(|e| e.path.as_str()).collect();
+        self.files.retain(|f| kept.contains(f.file.path.as_str()));
         let missing = self.retrieve_missing_table_files()?;
         self.files.extend(missing);
         Ok(())
@@ -225,8 +224,8 @@ impl CatalogTable {
             .manifest
             .entries
             .iter()
-            .filter(|e| !self.files.iter().any(|f| f.file.name == e.name))
-            .map(|e| self.store.data_file(&self.location.join(&e.name), e.size))
+            .filter(|e| !self.files.iter().any(|f| f.file.path == e.path))
+            .map(|e| self.store.data_file(&e.path, e.size))
             .collect::<store::Result<_>>()?;
         Ok(crate::parquet::load_table_files(&self.dispatcher, &to_fetch)?)
     }

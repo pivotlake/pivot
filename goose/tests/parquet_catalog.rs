@@ -355,6 +355,12 @@ fn resolve(catalog: &ParquetCatalog, name: &str) {
     let _ = PlannerCatalog::table(catalog, name);
 }
 
+/// The object path of `name` directly under `dir` — a local table's location, so
+/// the path is the file's absolute filesystem path.
+fn opath(dir: &Path, name: &str) -> ObjectPath {
+    ObjectPath::new(dir.join(name).to_string_lossy())
+}
+
 /// A file flushed after `CREATE TABLE` becomes visible to new binds once
 /// registered, with global row-group indices kept sequential.
 #[test]
@@ -435,9 +441,9 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
-    let removed = vec!["data.parquet".to_string(), "extra.parquet".to_string()];
+    let removed = vec![opath(dir.path(), "data.parquet"), opath(dir.path(), "extra.parquet")];
     let added = vec![goose::FileRef {
-        name: "merged.parquet".to_string(),
+        path: opath(dir.path(), "merged.parquet"),
         size: merged_size,
     }];
     catalog
@@ -517,13 +523,13 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     // input: both files are on disk, only merged is in the manifest.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
     let added = vec![goose::FileRef {
-        name: "merged.parquet".to_string(),
+        path: opath(data_dir.path(), "merged.parquet"),
         size: std::fs::metadata(&merged).unwrap().len(),
     }];
     catalog
         .table_handle("t")
         .unwrap()
-        .replace_data_files(&["data.parquet".to_string()], &added)
+        .replace_data_files(&[opath(data_dir.path(), "data.parquet")], &added)
         .unwrap();
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();

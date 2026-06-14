@@ -229,7 +229,7 @@ impl ObjectStore for S3Store {
             .contents
             .into_iter()
             .map(|c| FileRef {
-                name: super::key_name(&c.key),
+                path: prefix.join(&super::key_name(&c.key)),
                 size: c.size,
             })
             .collect())
@@ -238,7 +238,7 @@ impl ObjectStore for S3Store {
     fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
         Ok(DataFile {
             file: FileRef {
-                name: key.name().to_string(),
+                path: key.clone(),
                 size,
             },
             source: DataFileSource::Remote(self.presign_get(key)?),

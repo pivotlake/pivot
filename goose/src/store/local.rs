@@ -130,7 +130,7 @@ impl ObjectStore for LocalStore {
             }
             if let Some(name) = entry.file_name().to_str() {
                 objects.push(FileRef {
-                    name: name.to_string(),
+                    path: prefix.join(name),
                     size: meta.len(),
                 });
             }
@@ -141,7 +141,7 @@ impl ObjectStore for LocalStore {
     fn data_file(&self, key: &ObjectPath, size: u64) -> Result<DataFile> {
         Ok(DataFile {
             file: FileRef {
-                name: key.name().to_string(),
+                path: key.clone(),
                 size,
             },
             source: DataFileSource::Local(self.path_for(key)),

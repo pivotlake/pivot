@@ -199,7 +199,7 @@ impl ParquetCatalog {
         let files = manifest
             .entries
             .iter()
-            .map(|f| store.data_file(&entry.location.join(&f.name), f.size))
+            .map(|f| store.data_file(&f.path, f.size))
             .collect::<store::Result<Vec<DataFile>>>()?;
         let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
         Ok(CatalogTable::new(
@@ -273,7 +273,7 @@ impl ParquetCatalog {
         let files = self
             .list_file_refs(&location)?
             .into_iter()
-            .map(|f| self.store.data_file(&location.join(&f.name), f.size))
+            .map(|f| self.store.data_file(&f.path, f.size))
             .collect::<store::Result<Vec<DataFile>>>()?;
 
         // The commit runs on the dataflow's last worker once the footers are
@@ -338,7 +338,7 @@ impl ParquetCatalog {
             .store
             .list(location)?
             .into_iter()
-            .filter(|file| file.name.ends_with(".parquet"))
+            .filter(|file| file.path.as_str().ends_with(".parquet"))
             .collect())
     }
 }
