@@ -29,8 +29,8 @@ use dispatch::{
 };
 use fetcher::TableFileMetadataFetcher;
 use injector::FileInjectorFactory;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
 use writer::TableBuildSinkFactory;
 use crate::catalog::TableFile;
 
@@ -64,21 +64,19 @@ fn fetch_table_file_factories(
 
 /// Read every file's footer in parallel and collect the resulting
 /// [`TableFile`]s on the coordinator (file order is not preserved — the table's
-/// row groups are flattened across whichever order the workers finish in).
-/// Drives the dataflow, so it must run on the **coordinator**, not inside a
-/// `run_on_worker` closure.
+/// row groups are flattened across whichever order the workers finish in). The
+/// fetch stage already emits `TableFile`s, so the dataflow's typed `collect`
+/// drains them directly — no terminal sink. Drives the dataflow, so it must run
+/// on the **coordinator**, not inside a `run_on_worker` closure.
 pub(crate) fn load_table_files(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
 ) -> Result<Vec<TableFile>, dispatch::DataFlowError> {
-    let collected = Arc::new(Mutex::new(Vec::new()));
-    let sink = collected.clone();
-    create_load_and_commit_spec(dispatcher, files, move |loaded| {
-        *sink.lock().unwrap() = loaded;
-        Ok(())
-    })
-    .collect()?;
-    Ok(std::mem::take(&mut *collected.lock().unwrap()))
+    OperatorSpec::new(
+        dispatcher.clone(),
+        fetch_table_file_factories(files, dispatcher.worker_count()),
+    )
+    .collect()
 }
 
 

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::catalog::TableBinding;
-use crate::manifest::{TableManifest};
+use crate::manifest::{FIRST_VERSION, TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{FileRef, ObjectStore};
 use planner::catalog::Column;
@@ -32,36 +32,67 @@ impl TableFile {
     }
 }
 
-/// The catalog's master record of one table: its definition (name, declared
-/// columns, data location) and its current content — the per-file row groups at
-/// one log version. A change (a registered file, a compaction swap) replaces
-/// `version` + `files` whole via [`set_version`](Self::set_version); the scan
-/// view a query sees is derived from `files` on demand, so there is no cached
-/// copy to keep in sync.
+/// The catalog's master record of one table: its [`TableManifest`] (declared
+/// columns + committed file list, at one version) and its current content — the
+/// per-file row groups (`files`). The version lives in the manifest, not
+/// alongside it. A change (a registered file, a compaction swap) replaces the
+/// manifest + `files` whole; the scan view a query sees is derived from `files`
+/// on demand, so there is no cached copy to keep in sync. `store` and `name` are
+/// retained so the table can persist or reload itself.
 pub struct CatalogTable {
+    name: String,
     pub(super) manifest: TableManifest,
-    pub(super) version: u64,
     pub(super) files: Vec<TableFile>,
-    // todo: remove this comment, but this allows us to refresh in place
-    store: Arc<dyn ObjectStore>
+    store: Arc<dyn ObjectStore>,
 }
 
 impl CatalogTable {
-    /// Assemble the master record from a table's definition (`manifest`), the
-    /// manifest `version` those files were read at, and the per-file row groups
-    /// (`files`). `store` is retained so the entry can reload itself in place.
+    /// Reassemble a persisted table from its loaded `manifest` and the per-file
+    /// row groups (`files`) just fetched for it — the reopen path. Does not
+    /// persist anything; the manifest it was loaded from is already durable.
     pub(super) fn new(
+        name: String,
         manifest: TableManifest,
-        version: u64,
         files: Vec<TableFile>,
         store: Arc<dyn ObjectStore>,
     ) -> Self {
         Self {
+            name,
             manifest,
-            version,
             files,
             store,
         }
+    }
+
+    /// Create a brand-new table from freshly-read footers: build its
+    /// [`TableManifest`] (declared `columns` + the loaded files, at
+    /// [`FIRST_VERSION`]) and persist it. The `CREATE TABLE` commit path.
+    pub(super) fn create_new(
+        name: String,
+        files: Vec<TableFile>,
+        columns: Vec<Column>,
+        store: Arc<dyn ObjectStore>,
+    ) -> crate::Result<Self> {
+        let entries = files.iter().map(|f| f.file.clone()).collect();
+        let manifest = TableManifest {
+            version: FIRST_VERSION,
+            columns,
+            entries,
+        };
+        let table = Self {
+            name,
+            manifest,
+            files,
+            store,
+        };
+        table.save()?;
+        Ok(table)
+    }
+
+    /// Persist this table's manifest under its name.
+    fn save(&self) -> crate::Result<()> {
+        self.manifest.store(self.store.as_ref(), &self.name)?;
+        Ok(())
     }
 
 

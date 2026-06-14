@@ -33,6 +33,8 @@ pub enum Error {
     Store(#[from] crate::store::StoreError),
     #[error("manifest json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("table `{0}` is in the catalog manifest but its table manifest is missing")]
+    MissingTableManifest(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -55,12 +57,14 @@ impl TableManifest {
         format!("{TABLE_MANIFEST_DIR}/{name}.json")
     }
 
-    /// Load table `name`'s manifest, or `None` if it was never committed.
-    pub fn load(store: &dyn ObjectStore, name: &str) -> Result<Option<Self>> {
-        match store.get(&Self::key(name))? {
-            Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
-            None => Ok(None),
-        }
+    /// Load table `name`'s manifest. The database manifest is the index of which
+    /// tables exist, so a name listed there with no manifest is a corrupt
+    /// catalog — an error, not an absent table.
+    pub fn load(store: &dyn ObjectStore, name: &str) -> Result<Self> {
+        let bytes = store
+            .get(&Self::key(name))?
+            .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     /// Write table `name`'s manifest, overwriting any previous version.
