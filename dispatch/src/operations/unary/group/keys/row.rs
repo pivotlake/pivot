@@ -251,18 +251,17 @@ impl KeyExtractor for RowKeyExtractor {
     }
 
     #[inline(always)]
-    fn live_key<'a, 'b>(
-        reader: &Self::Reader<'b>,
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
         idx: usize,
         arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b> {
-        // The row slice borrows the worker scratch (via `&reader`); we extend it
-        // to the trait's `'b`. Sound: the scratch outlives the batch, the consume
-        // loop holds the reader (unmutated after `prepare_and_hash`) for as long
-        // as any live key it produced is alive, and a live key is always consumed
-        // — `eq_persisted` or `persist` — before the next row is read.
-        let value: &'b [u8] = unsafe { std::mem::transmute(reader.row(idx)) };
-        RowKey { arena, value }
+    ) -> Self::LiveKey<'a, 'r> {
+        // The row slice borrows the reader's scratch for exactly `'r`, the live
+        // key's own lifetime — so no transmute is needed.
+        RowKey {
+            arena,
+            value: reader.row(idx),
+        }
     }
 
     fn resolve_persisted(arena: &SharedArena, persisted: ArenaKey) -> ResolvedKey<'_> {

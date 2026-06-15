@@ -103,11 +103,11 @@ where
     }
 
     #[inline(always)]
-    fn live_key<'a, 'b>(
-        reader: &Self::Reader<'b>,
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
         idx: usize,
         _arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b> {
+    ) -> Self::LiveKey<'a, 'r> {
         reader.packed(idx)
     }
 

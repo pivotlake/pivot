@@ -52,11 +52,11 @@ impl KeyExtractor for StringKeyExtractor {
     }
 
     #[inline(always)]
-    fn live_key<'a, 'b>(
-        reader: &Self::Reader<'b>,
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
         idx: usize,
         arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b> {
+    ) -> Self::LiveKey<'a, 'r> {
         let val = unsafe { reader.value_unchecked(idx) };
         StringKey::new(arena, val)
     }

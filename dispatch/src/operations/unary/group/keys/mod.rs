@@ -101,11 +101,17 @@ pub trait KeyExtractor: Send + 'static {
     fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]);
 
     /// Extract a live key from row `idx` (may borrow the arena to persist).
-    fn live_key<'a, 'b>(
-        reader: &Self::Reader<'b>,
+    ///
+    /// The live key borrows the *reader* (lifetime `'r`), not the batch directly.
+    /// That covers both a key pointing into the input columns (string — whose
+    /// longer batch borrow simply shortens to `'r`) and one pointing into the
+    /// reader's own scratch (row). It is always consumed — `eq_persisted` or
+    /// `persist` — within the probe iteration, well inside `'r`.
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
         idx: usize,
         arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b>;
+    ) -> Self::LiveKey<'a, 'r>;
 
     /// Reconstruct a live key from a persisted key, borrowing from the shared arena.
     fn resolve_persisted(

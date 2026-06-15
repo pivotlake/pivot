@@ -86,11 +86,11 @@ where
     }
 
     #[inline(always)]
-    fn live_key<'a, 'b>(
-        _reader: &Self::Reader<'b>,
+    fn live_key<'a, 'r>(
+        _reader: &'r Self::Reader<'_>,
         _idx: usize,
         _arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b> {
+    ) -> Self::LiveKey<'a, 'r> {
     }
 
     fn resolve_persisted(_arena: &SharedArena, _persisted: ()) {}
