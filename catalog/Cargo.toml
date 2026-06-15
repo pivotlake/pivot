@@ -50,3 +50,11 @@ arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
 tempfile = "3"
 core_affinity = "0.8.3"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+# Parquet decompression/decoding microbenchmarks (`benches/decode.rs`).
+# `harness = false`: we drive Criterion from our own `main` so one `Dispatch`
+# (worker pool) + one synthetic parquet are built once and reused.
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bench]]
+name = "decode"
+harness = false
