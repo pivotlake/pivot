@@ -4,11 +4,11 @@
 //! Each expression *kind* lives in its own submodule co-locating the AST type,
 //! its `TryFrom` from the DuckDB expression, its `Display`, and (for the
 //! evaluable kinds) its `compile` impl producing an
-//! [`ExprFn`](crate::compile::ExprFn). This module holds the cross-cutting
+//! [`ExprFn`]. This module holds the cross-cutting
 //! pieces: the [`Expression`] / [`Function`] enums that tie the kinds together,
-//! the conversion [`Error`], the pushed-down [`TableFilter`], and the small
+//! the conversion [`enum@Error`], the pushed-down [`TableFilter`], and the small
 //! `Display`/constant helpers shared across kinds. The comparison-coercion
-//! helper used by more than one `compile` impl lives in [`shared`].
+//! helper used by more than one `compile` impl lives in the `shared` module.
 
 mod aggregate;
 mod arithmetic;
