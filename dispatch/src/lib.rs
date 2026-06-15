@@ -191,6 +191,25 @@ impl DataFlowDispatcher {
             .pop()
             .expect("OneShotNullary should have produced exactly one result"))
     }
+
+    /// Run `f` once on **every** worker thread and block until all have
+    /// finished. The fan-out sibling of [`run_on_worker`](Self::run_on_worker):
+    /// builds one [`OneShotNullary`](crate::operations::nullary::OneShotNullary)
+    /// per worker (each gets its own clone of `f`), so `f` executes on a thread
+    /// that has a live [`MemoryContext`] — e.g. to touch per-worker ring/free-pool
+    /// state such as [`memory_ctx().zero_dirty_buffers()`](crate::memory::MemoryContext::zero_dirty_buffers).
+    pub fn run_on_workers<F>(&self, f: F)
+    where
+        F: Fn() + Clone + Send + 'static,
+    {
+        let factories = (0..self.worker_count()).map(|_| {
+            let f = f.clone();
+            NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))
+        });
+        OperatorSpec::new(self.clone(), factories)
+            .collect()
+            .expect("run_on_workers dataflow failed");
+    }
 }
 
 /// Owns the worker threads and exposes a [`DataFlowDispatcher`] for sending work to them.
