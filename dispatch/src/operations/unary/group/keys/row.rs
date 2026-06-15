@@ -378,8 +378,19 @@ impl KeyColumns for RowKeyColumns {
         let raw_keys = ScalarBuffer::<u128>::new(self.keys.into_buffer(), 0, rows);
         let last = builders.len() - 1;
         let trailing_str = matches!(self.schema.types().last(), Some(DataType::Utf8View));
-        for &raw in raw_keys.iter() {
-            let key = ArenaKey::from_raw(raw);
+        // Keys are walked here in (hash) slot order, but their arena blobs were
+        // written in insertion order, so every non-inline `resolve` is a scattered
+        // cache miss. Prefetch the blob a few keys ahead to hide that latency; for
+        // an all-inline schema the `is_inline` guard skips it (no arena access).
+        const DECODE_PREFETCH: usize = 16;
+        for i in 0..rows {
+            if i + DECODE_PREFETCH < rows {
+                let ahead = ArenaKey::from_raw(raw_keys[i + DECODE_PREFETCH]);
+                if !ahead.is_inline() {
+                    arena.prefetch(ahead.buffer_index(), ahead.offset());
+                }
+            }
+            let key = ArenaKey::from_raw(raw_keys[i]);
             let full = key.resolve(arena);
             let mut blob = full;
             for (j, builder) in builders.iter_mut().enumerate() {
