@@ -80,8 +80,8 @@ pub(crate) fn load_table_files(
 }
 
 /// A `RecordBatchOperatorSpec` that, when executed, reads every file's footer in
-/// parallel and — at its terminal stage — regroups the [`LoadedFiles`] and
-/// hands it to `commit` (which runs once, on the worker that finishes last, and
+/// parallel and — at its terminal stage — regroups the [`TableFile`]s and
+/// hands them to `commit` (which runs once, on the worker that finishes last, and
 /// returns an error to fail the statement). Emits no rows. This is `CREATE TABLE`
 /// as a single dataflow: fetch, then commit (the `commit` records the table in
 /// the manifest, the table log, and the catalog map).

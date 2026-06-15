@@ -74,7 +74,7 @@ impl FileRef {
 
 /// A [`FileRef`] located for reading: its identity (`file`, whose size locates
 /// the footer without a `stat`/HEAD) plus where its bytes live (`source`).
-/// Produced transiently by [`ObjectStore::data_file`] and consumed straight by
+/// Produced transiently by [`FileRef::into_data_file`] and consumed straight by
 /// the metadata fetcher, which stamps the `file` onto the `TableFile` it emits —
 /// so the file's identity travels with its bytes through the load.
 #[derive(Clone, Debug)]
