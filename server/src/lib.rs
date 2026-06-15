@@ -9,7 +9,7 @@
 //! hops to `tokio::task::spawn_blocking` to drive the (non-`Send`) DuckDB
 //! planner; the planner is cached in a thread-local on each blocking-pool
 //! thread and reused across queries. When run as a binary, the default is to run with the default
-//! `goose::ParquetCatalog`.
+//! `catalog::ParquetCatalog`.
 //!
 //! The public interface: hand a bind address to [`Server::new`] together
 //! with a [`Dispatch`](dispatch::Dispatch) (from
@@ -26,18 +26,17 @@
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //!
-//! use goose::ParquetCatalog;
+//! use catalog::ParquetCatalog;
 //! use dispatch::Dispatch;
 //! use server::Server;
 //!
 //! # async fn run() -> Result<(), server::Error> {
 //! let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 //! let dispatch = Dispatch::spin_up(workers, 32);
-//! let catalog: Arc<dyn planner::catalog::Catalog> =
-//!     Arc::new(ParquetCatalog::new());
+//! let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
 //! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
-//! let server = Server::new(bind, dispatch, catalog, vec![]);
+//! let server = Server::new(bind, dispatch, catalog, vec![], 0);
 //! // Returns when ctrl_c fires, or earlier if a dispatch worker dies.
 //! server.serve(Box::pin(async {
 //!     let _ = tokio::signal::ctrl_c().await;

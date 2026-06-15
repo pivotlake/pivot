@@ -1,13 +1,14 @@
-//! Builds row groups out of a flush's items.
+//! Builds row groups out of a stream of record batches.
 //!
 //! A pipeline breaker (the [`OrderByLimit`](dispatch) shape): each worker
-//! flattens the items it steals and accumulates rows until it has a row group's
-//! worth, then emits that row group mid-stream (stamped with the id that keeps
-//! its pages together downstream). At finish, every worker sends its straddling
-//! remainder to worker 0 over a side `mpsc` channel; worker 0 combines them into
-//! the single final row group.
+//! accumulates the batches it steals until it has a row group's worth, then
+//! emits that row group mid-stream (stamped with the id that keeps its pages
+//! together downstream). At finish, every worker sends its straddling
+//! remainder to worker 0 over a side `mpsc` channel; worker 0 combines them
+//! into the single final row group. Batch-native: a flush's items are
+//! flattened by the upstream [`convert`](super::convert) stage, a compaction
+//! feeds the scan's decoded batches straight in.
 
-use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,22 +17,20 @@ use std::sync::mpsc::{self, Receiver, Sender as StdSender, TryRecvError};
 use arrow_array::RecordBatch;
 use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult};
 
-use super::ToRecordBatch;
 use super::types::RowGroupBatch;
 
 /// Factory for one worker's [`RowGroupBuilder`]. Only worker 0 receives the
 /// side-channel receiver (`leftover_rx`).
-pub(super) struct RowGroupBuilderFactory<T> {
+pub(super) struct RowGroupBuilderFactory {
     target_rows: usize,
     worker_count: usize,
     next_rg_id: Arc<AtomicU64>,
     leftover_tx: StdSender<Vec<RecordBatch>>,
     leftover_rx: Option<Receiver<Vec<RecordBatch>>>,
-    _item: PhantomData<fn() -> T>,
 }
 
-impl<T: ToRecordBatch> UnaryFactory<T, RowGroupBatch> for RowGroupBuilderFactory<T> {
-    type Unary = PipelineBreaker<T, RowGroupBatch, RowGroupBuilder<T>>;
+impl UnaryFactory<RecordBatch, RowGroupBatch> for RowGroupBuilderFactory {
+    type Unary = PipelineBreaker<RecordBatch, RowGroupBatch, RowGroupBuilder>;
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(RowGroupBuilder {
@@ -42,18 +41,17 @@ impl<T: ToRecordBatch> UnaryFactory<T, RowGroupBatch> for RowGroupBuilderFactory
             pending_rows: 0,
             leftover_tx: self.leftover_tx,
             leftover_rx: self.leftover_rx,
-            _item: PhantomData,
         })
     }
 }
 
 /// One factory per worker, sharing the row-group counter and the worker-0 side
 /// channel.
-pub(super) fn factories<T: ToRecordBatch>(
+pub(super) fn factories(
     target_rows: usize,
     worker_count: usize,
     next_rg_id: Arc<AtomicU64>,
-) -> Vec<RowGroupBuilderFactory<T>> {
+) -> Vec<RowGroupBuilderFactory> {
     let (tx, rx) = mpsc::channel();
     let mut rx = Some(rx);
     (0..worker_count)
@@ -63,14 +61,13 @@ pub(super) fn factories<T: ToRecordBatch>(
             next_rg_id: next_rg_id.clone(),
             leftover_tx: tx.clone(),
             leftover_rx: rx.take(),
-            _item: PhantomData,
         })
         .collect()
 }
 
-/// Per-worker consumer: flatten items and emit full row groups; hand the
+/// Per-worker consumer: accumulate batches and emit full row groups; hand the
 /// remainder to worker 0 at finish.
-pub(super) struct RowGroupBuilder<T> {
+pub(super) struct RowGroupBuilder {
     target_rows: usize,
     worker_count: usize,
     next_rg_id: Arc<AtomicU64>,
@@ -78,16 +75,16 @@ pub(super) struct RowGroupBuilder<T> {
     pending_rows: usize,
     leftover_tx: StdSender<Vec<RecordBatch>>,
     leftover_rx: Option<Receiver<Vec<RecordBatch>>>,
-    _item: PhantomData<fn() -> T>,
 }
 
-impl<T: ToRecordBatch> Consumer<T, RowGroupBatch> for RowGroupBuilder<T> {
+impl Consumer<RecordBatch, RowGroupBatch> for RowGroupBuilder {
     type Outputter = RowGroupBuilderOutputter;
 
-    fn consume<S: Sender<RowGroupBatch>>(&mut self, item: T, sender: &mut S) -> UnaryResult<()> {
-        let Some(batch) = item.to_record_batch()? else {
-            return Ok(());
-        };
+    fn consume<S: Sender<RowGroupBatch>>(
+        &mut self,
+        batch: RecordBatch,
+        sender: &mut S,
+    ) -> UnaryResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }

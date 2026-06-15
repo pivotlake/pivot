@@ -46,7 +46,7 @@ pub struct DynamicScanPredicate {
 }
 
 /// A single column in a [`Table`]'s schema: name plus Pivot [`Type`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Column {
     pub name: String,
     pub col_type: Type,

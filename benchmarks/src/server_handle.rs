@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dispatch::{BUFFER_SIZE, Dispatch};
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use server::Server;
 use tokio::sync::oneshot;
 
@@ -78,8 +78,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
         .expect("valid socket addr");
 
     let dispatch = Dispatch::spin_up(workers, total_memory_bytes() * 4 / 5 / BUFFER_SIZE);
-    let catalog: Arc<dyn planner::catalog::Catalog> =
-        Arc::new(ParquetCatalog::new());
+    let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -91,7 +90,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
                 .build()
                 .expect("build tokio runtime");
             rt.block_on(async move {
-                let server = Server::new(bind, dispatch, catalog, vec![]);
+                let server = Server::new(bind, dispatch, catalog, vec![], 0);
                 let _ = server
                     .serve(Box::pin(async move {
                         let _ = shutdown_rx.await;
