@@ -24,9 +24,10 @@
 
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
-use crate::data_flow::{DataFlow, DataFlowStatus, WorkStatus};
+use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
+use crate::operations::FinishStatus;
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -364,12 +365,12 @@ impl Worker {
         let mut to_remove = Vec::new();
         for (id, flow) in &mut self.data_flows {
             match flow.maybe_finish() {
-                DataFlowStatus::Finished => to_remove.push(*id),
+                FinishStatus::Done => to_remove.push(*id),
                 // An operator is still producing output: count it as work so we
                 // re-drive it via `run_cpu_work` next iteration instead of
                 // parking one stage short.
-                DataFlowStatus::Working => self.did_work_last_iteration = true,
-                DataFlowStatus::Idle => {}
+                FinishStatus::Working => self.did_work_last_iteration = true,
+                FinishStatus::Pending => {}
             }
         }
 

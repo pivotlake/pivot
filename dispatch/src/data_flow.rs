@@ -68,18 +68,6 @@ pub enum WorkStatus {
     Ran,
 }
 
-/// Outcome of a [`maybe_finish`](DataFlow::maybe_finish) pass over a dataflow.
-#[derive(PartialEq, Eq, Copy, Clone)]
-pub enum DataFlowStatus {
-    /// Every operator finished; the worker can drop the dataflow.
-    Finished,
-    /// An operator is still producing final output; the worker must keep
-    /// driving it (count it as work) rather than park.
-    Working,
-    /// Stalled waiting on input or a sibling; the worker may park.
-    Idle,
-}
-
 /// Directed graph of operators with precomputed roots and leaves.
 ///
 /// Each node has at most one downstream subscriber (`edges`) and zero or more
@@ -255,16 +243,18 @@ impl DataFlow {
         }
     }
 
-    /// Drive every operator's finish (root-to-leaf), reporting the dataflow's
-    /// overall [`DataFlowStatus`]: [`Finished`](DataFlowStatus::Finished) when
-    /// all operators are done (the worker drops it), [`Working`](DataFlowStatus::Working)
-    /// when one is still producing output (the worker must keep driving rather
-    /// than park), or [`Idle`](DataFlowStatus::Idle) when stalled on input/siblings.
+    /// Drive every operator's finish (root-to-leaf) and report the dataflow's
+    /// aggregate [`FinishStatus`]: [`Done`](FinishStatus::Done) when all
+    /// operators have finished (the worker drops the dataflow),
+    /// [`Working`](FinishStatus::Working) when one is still producing output
+    /// (the worker must keep driving rather than park), or
+    /// [`Pending`](FinishStatus::Pending) when stalled on input/siblings (the
+    /// worker may park).
     ///
     /// Operators that have reported [`FinishStatus::Done`] are latched via
     /// `OperatorNode::finished` and skipped on subsequent passes.
-    pub fn maybe_finish(&mut self) -> DataFlowStatus {
-        self.try_run_or(DataFlowStatus::Idle, |d| {
+    pub fn maybe_finish(&mut self) -> FinishStatus {
+        self.try_run_or(FinishStatus::Pending, |d| {
             let mut working = false;
             let completed = d.graph.traverse_forwards(|node| {
                 if !node.finished {
@@ -281,11 +271,11 @@ impl DataFlow {
                 })
             })?;
             Ok(if matches!(completed, ControlFlow::Continue(..)) {
-                DataFlowStatus::Finished
+                FinishStatus::Done
             } else if working {
-                DataFlowStatus::Working
+                FinishStatus::Working
             } else {
-                DataFlowStatus::Idle
+                FinishStatus::Pending
             })
         })
     }
