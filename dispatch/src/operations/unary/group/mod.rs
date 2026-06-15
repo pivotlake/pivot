@@ -916,4 +916,27 @@ mod tests {
             vec![(long.to_string(), 1, 40), ("y".to_string(), 2, 12)]
         );
     }
+
+    /// One worker, several batches: the encode scratch is reused between batches
+    /// and keys (inline and arena) are accumulated across them.
+    #[test]
+    fn row_key_scratch_reused_across_batches() {
+        let long = "a-string-well-over-twelve-bytes";
+        let b1 = mixed_key_batch(&[1, 1], &["a", long], &[10, 5]);
+        let b2 = mixed_key_batch(&[1, 1], &["a", long], &[3, 7]);
+        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
+
+        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+            vec![vec![b1, b2]],
+            vec![0, 1],
+            schema,
+            slots,
+        );
+
+        assert_eq!(
+            row_key_rows(&sender),
+            vec![(1, "a".to_string(), 13), (1, long.to_string(), 12)],
+        );
+    }
 }
