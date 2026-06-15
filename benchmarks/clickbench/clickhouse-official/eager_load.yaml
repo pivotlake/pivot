@@ -1,0 +1,8 @@
+# Force synchronous startup so cold-query timing doesn't catch part-loader and
+# lazy primary-key / column-size work that should be amortized into server start.
+# Verbatim from upstream ClickBench clickhouse/install. Place under
+# /etc/clickhouse-server/config.d/.
+async_load_databases: false
+merge_tree:
+  primary_key_lazy_load: 0
+  columns_and_secondary_indices_sizes_lazy_calculation: 0
