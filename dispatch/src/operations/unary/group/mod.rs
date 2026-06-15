@@ -884,4 +884,36 @@ mod tests {
             ]
         );
     }
+
+    /// `GROUP BY (Utf8View, Int64)` — a string in a *non-trailing* position, so
+    /// it keeps its `u32` length prefix while the trailing int does not. A string
+    /// longer than 12 bytes forces an arena (non-inline) blob, exercising
+    /// prefixed-string decode where a fixed-width field follows the string.
+    #[test]
+    fn row_key_string_not_trailing() {
+        let long = "a-string-well-over-twelve-bytes";
+        // GROUP BY (name, id), summing the value column.
+        let batch = mixed_key_batch(&[1, 2, 1, 2], &[long, "y", long, "y"], &[10, 5, 30, 7]);
+        let schema = RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]);
+        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
+        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+            vec![vec![batch]],
+            vec![1, 0], // name (col 1) then id (col 0)
+            schema,
+            slots,
+        );
+        // Output columns: k0 = name (str), k1 = id (i64), agg = sum.
+        let mut rows: Vec<(String, i64, i64)> = sender
+            .string_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .zip(sender.i64_column(2))
+            .map(|((name, id), v)| (name, id, v))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(long.to_string(), 1, 40), ("y".to_string(), 2, 12)]
+        );
+    }
 }

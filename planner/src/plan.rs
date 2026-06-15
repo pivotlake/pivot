@@ -66,28 +66,23 @@ impl fmt::Display for PlanNode {
 
 impl PlanNode {
     /// Detect `grouped Aggregate → (pass-through projections) → TopN(ORDER BY
-    /// <agg col> DESC [, …] LIMIT k)` and annotate the aggregate with `top_k`, so
-    /// the group operator emits only each partition's top-k rows instead of
-    /// every group (top-k is decomposable across partitions). Without it, a
+    /// <agg col> DESC LIMIT k)` and annotate the aggregate with `top_k`, so the
+    /// group operator emits only each partition's top-k rows instead of every
+    /// group (top-k is decomposable across partitions). Without it, a
     /// high-cardinality grouped `ORDER BY <agg> DESC LIMIT k` materialises,
     /// decodes, and fully sorts every group only to keep `k` — the dominant cost
     /// on such queries.
     ///
-    /// Driven by the *primary* (first) order key, which must be a DESC ref to an
-    /// aggregate column traced through column-ref-only projections. Any secondary
-    /// order keys (tiebreakers) are left to the surviving `TopN`, which re-sorts
-    /// the per-partition candidates under the full order. Exact whenever the
-    /// primary key has no ties at the limit boundary; with such ties it is
-    /// tie-approximate — the same class of approximation a single-key DESC LIMIT
-    /// pushdown already makes, additionally dropping secondary-key
-    /// disambiguation among the tied boundary group.
+    /// Restricted to a *single* order key: a DESC ref to an aggregate column
+    /// traced through column-ref-only projections. Multi-key orders are left to
+    /// the surviving `TopN` so the group-by stays a faithful full aggregation.
     pub(crate) fn annotate_group_topn(&mut self) {
         for child in &mut self.inputs {
             child.annotate_group_topn();
         }
 
         let (mut col, limit) = match &self.operator {
-            Operator::TopN(t) if !t.order_bys.is_empty() => {
+            Operator::TopN(t) if t.order_bys.len() == 1 => {
                 let ob = &t.order_bys[0];
                 match (&ob.direction, &ob.expression) {
                     (OrderByDirection::Desc, Expression::Ref(r)) => (r.column_idx, t.limit),

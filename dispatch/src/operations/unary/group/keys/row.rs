@@ -7,7 +7,11 @@
 //! contiguous byte string:
 //!
 //! - fixed-width integers as their little-endian bytes,
-//! - strings as a `u32` length prefix followed by the raw bytes.
+//! - strings as a `u32` length prefix followed by the raw bytes — except a
+//!   *trailing* string, whose bytes simply run to the end of the blob (its
+//!   length is the blob's remaining length, so the prefix is redundant). This
+//!   shaves 4 bytes off every such row and, more importantly, keeps many more
+//!   tuples within the 12-byte inline budget of [`ArenaKey`].
 //!
 //! Because the layout is canonical, key-tuple equality is exactly byte equality
 //! and one hash covers the whole tuple — so the hash table needs no per-shape
@@ -192,9 +196,22 @@ impl KeyExtractor for RowKeyExtractor {
         let mut bytes = Vec::with_capacity(rows * (fixed + 16));
         let mut offsets = Vec::with_capacity(rows + 1);
         offsets.push(0);
+        // A *trailing* string field needs no length prefix: its bytes run to the
+        // end of the row blob, whose length we recover from `offsets` (and, once
+        // persisted, from the key's own length). Encoding all but that last field
+        // normally and the tail raw shrinks every such row by 4 bytes — and, more
+        // importantly, lets many more tuples inline into the 12-byte `ArenaKey`
+        // instead of spilling to the arena, which speeds the probe and decode too.
+        let head = match cols.last() {
+            Some(KeyCol::Str(_)) => cols.len() - 1,
+            _ => cols.len(),
+        };
         for i in 0..rows {
-            for col in &cols {
+            for col in &cols[..head] {
                 col.encode(i, &mut bytes);
+            }
+            if let Some(KeyCol::Str(a)) = cols.get(head) {
+                bytes.extend_from_slice(unsafe { a.value_unchecked(i) }.as_bytes());
             }
             offsets.push(bytes.len() as u32);
         }
@@ -336,32 +353,39 @@ impl KeyColumns for RowKeyColumns {
             .collect();
 
         let raw_keys = ScalarBuffer::<u128>::new(self.keys.into_buffer(), 0, rows);
+        let last = builders.len() - 1;
+        let trailing_str = matches!(self.schema.types().last(), Some(DataType::Utf8View));
         for &raw in raw_keys.iter() {
             let key = ArenaKey::from_raw(raw);
             let full = key.resolve(arena);
             let mut blob = full;
-            for builder in builders.iter_mut() {
+            for (j, builder) in builders.iter_mut().enumerate() {
                 match builder {
-                    FieldBuilder::I8(b) => b.push(&pop_le!(&mut blob, i8), 1),
-                    FieldBuilder::I16(b) => b.push(&pop_le!(&mut blob, i16), 1),
-                    FieldBuilder::I32(b) => b.push(&pop_le!(&mut blob, i32), 1),
-                    FieldBuilder::I64(b) => b.push(&pop_le!(&mut blob, i64), 1),
-                    FieldBuilder::U8(b) => b.push(&pop_le!(&mut blob, u8), 1),
-                    FieldBuilder::U16(b) => b.push(&pop_le!(&mut blob, u16), 1),
-                    FieldBuilder::U32(b) => b.push(&pop_le!(&mut blob, u32), 1),
-                    FieldBuilder::U64(b) => b.push(&pop_le!(&mut blob, u64), 1),
+                    FieldBuilder::I8(b) => b.col.push(pop_le!(&mut blob, i8)),
+                    FieldBuilder::I16(b) => b.col.push(pop_le!(&mut blob, i16)),
+                    FieldBuilder::I32(b) => b.col.push(pop_le!(&mut blob, i32)),
+                    FieldBuilder::I64(b) => b.col.push(pop_le!(&mut blob, i64)),
+                    FieldBuilder::U8(b) => b.col.push(pop_le!(&mut blob, u8)),
+                    FieldBuilder::U16(b) => b.col.push(pop_le!(&mut blob, u16)),
+                    FieldBuilder::U32(b) => b.col.push(pop_le!(&mut blob, u32)),
+                    FieldBuilder::U64(b) => b.col.push(pop_le!(&mut blob, u64)),
                     FieldBuilder::Str(views) => {
-                        let len = pop_le!(&mut blob, u32) as usize;
-                        let (s, rest) = blob.split_at(len);
-                        blob = rest;
-                        // Byte offset of `s` within the key's arena buffer: how
-                        // far we've already consumed into the blob plus the
-                        // blob's own offset. Strings ≤ 12 bytes inline into the
-                        // view header, so the buffer/offset args only matter for
-                        // longer strings — and those live in a blob longer than
-                        // the string (length prefix + other fields), hence a
-                        // non-inline blob with valid arena coordinates.
-                        let pos_in_blob = (full.len() - blob.len() - len) as u32;
+                        // A trailing string carries no length prefix — it is the
+                        // rest of the blob; others are u32-length-prefixed.
+                        let s = if trailing_str && j == last {
+                            std::mem::take(&mut blob)
+                        } else {
+                            let len = pop_le!(&mut blob, u32) as usize;
+                            let (s, rest) = blob.split_at(len);
+                            blob = rest;
+                            s
+                        };
+                        // Byte offset of `s` within the key's arena buffer. Strings
+                        // ≤ 12 bytes inline into the view header, so the buffer/
+                        // offset args only matter for longer ones — and those live
+                        // in a blob longer than the string, hence a non-inline blob
+                        // with valid arena coordinates.
+                        let pos_in_blob = (full.len() - blob.len() - s.len()) as u32;
                         views.push(make_view(s, key.buffer_index(), key.offset() + pos_in_blob));
                     }
                 }
