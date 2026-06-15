@@ -1,0 +1,98 @@
+//! Row-encoded multi-column GROUP BY keys.
+//!
+//! The general-purpose key extractor: it covers every shape the specialised
+//! extractors don't — three or more keys, strings mixed with integers, and
+//! integer pairs outside the packed [`IntPairKeyExtractor`](super::IntPairKeyExtractor)
+//! set. Each row's key columns are serialised, in GROUP BY order, into one
+//! contiguous byte string:
+//!
+//! - fixed-width integers as their little-endian bytes,
+//! - strings as a `u32` length prefix followed by the raw bytes — except a
+//!   *trailing* string, whose bytes simply run to the end of the blob (its
+//!   length is the blob's remaining length, so the prefix is redundant). This
+//!   shaves 4 bytes off every such row and, more importantly, keeps many more
+//!   tuples within the 12-byte inline budget of [`ArenaKey`].
+//!
+//! Because the layout is canonical, key-tuple equality is exactly byte equality
+//! and one hash covers the whole tuple — so the hash table needs no per-shape
+//! logic. The persisted form is an [`ArenaKey`], identical to a single string
+//! key: a tuple of ≤ 12 encoded bytes inlines into the table entry, a longer one
+//! lives in the shared arena. Output decodes the blobs back into typed arrow
+//! columns, emitting string sub-keys as zero-copy views into the same arena
+//! bytes (nothing is copied on the string output path).
+//!
+//! The encoding is driven by a [`RowKeySchema`] (the key columns' arrow types),
+//! which the planner supplies as the extractor's `Config`. It is the one thing
+//! neither the per-batch reader nor the output decode can recover from the data
+//! alone — the reader needs it to know each column's width, and the decode needs
+//! it to rebuild typed columns.
+//!
+//! ## Module layout
+//!
+//! - [`schema`] — [`RowKeySchema`], the per-query key types.
+//! - [`reader`] — the encode side: [`RowReader`]/[`RowScratch`] turn a batch's
+//!   key columns into hashes + a contiguous blob buffer.
+//! - [`live_key`] — [`RowKey`], the transient key probed against the table.
+//! - [`columns`] — the decode side: [`RowKeyColumns`] rebuilds typed output
+//!   columns from the persisted blobs.
+
+mod columns;
+mod live_key;
+mod reader;
+mod schema;
+
+pub use columns::RowKeyColumns;
+pub use live_key::RowKey;
+pub use reader::{RowReader, RowScratch};
+pub use schema::RowKeySchema;
+
+use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
+use crate::operations::unary::group::keys::string::ResolvedKey;
+use crate::operations::unary::group::keys::{ArenaKey, KeyExtractor};
+use ahash::RandomState;
+use arrow_array::RecordBatch;
+
+/// `GROUP BY (k0, k1, …)` over any mix of integer and string key columns.
+pub struct RowKeyExtractor;
+
+impl KeyExtractor for RowKeyExtractor {
+    // Stays in-place like a single string key. The radix scatter persists every
+    // row's key before deduping, so a > 12-byte tuple would push one arena blob
+    // per *occurrence* rather than per distinct key — ballooning the arena at
+    // exactly the high cardinality the scatter is meant to relieve.
+    type Config = RowKeySchema;
+    type Persisted = ArenaKey;
+    type LiveKey<'a, 'b> = RowKey<'a, 'b>;
+    type PersistedLiveKey<'a> = ResolvedKey<'a>;
+    type Reader<'b> = RowReader<'b>;
+    type Columns = RowKeyColumns;
+    type Scratch = RowScratch;
+
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        config: &RowKeySchema,
+        scratch: &'b mut RowScratch,
+    ) -> RowReader<'b> {
+        RowReader::new(batch, key_cols, config, scratch)
+    }
+
+    fn prepare_and_hash(reader: &mut RowReader<'_>, state: &RandomState, hashes: &mut [u64]) {
+        reader.encode_and_hash(state, hashes);
+    }
+
+    #[inline(always)]
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
+        idx: usize,
+        arena: &'a mut WorkerArena,
+    ) -> Self::LiveKey<'a, 'r> {
+        // The row slice borrows the reader's scratch for exactly `'r`, the live
+        // key's own lifetime — so no transmute is needed.
+        RowKey::new(arena, reader.row(idx))
+    }
+
+    fn resolve_persisted(arena: &SharedArena, persisted: ArenaKey) -> ResolvedKey<'_> {
+        ResolvedKey::new(persisted, arena)
+    }
+}
