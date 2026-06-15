@@ -49,6 +49,14 @@ tempfile = "3"
 # Generate a self-signed cert so tests can stand up a loopback HTTPS server the
 # client trusts via an injected root store.
 rcgen = "0.13"
+# Operator microbenchmarks (`benches/operators.rs`). `harness = false` below: we
+# drive Criterion from our own `main` so a single `Dispatch` (worker pool) is
+# spun up once and reused across every scenario, instead of per bench group.
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[[bench]]
+name = "operators"
+harness = false
 
 [profile.profiling]
 inherits = "release"
