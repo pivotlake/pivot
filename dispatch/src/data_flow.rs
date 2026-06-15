@@ -22,7 +22,7 @@
 
 use crate::Identifier;
 use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
-use crate::operations::Operator;
+use crate::operations::{FinishStatus, Operator};
 use crate::worker::worker_waker;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -66,6 +66,18 @@ pub enum WorkStatus {
     Pending,
     /// The operator consumed or produced data.
     Ran,
+}
+
+/// Outcome of a [`maybe_finish`](DataFlow::maybe_finish) pass over a dataflow.
+#[derive(PartialEq, Eq, Copy, Clone)]
+pub enum DataFlowStatus {
+    /// Every operator finished; the worker can drop the dataflow.
+    Finished,
+    /// An operator is still producing final output; the worker must keep
+    /// driving it (count it as work) rather than park.
+    Working,
+    /// Stalled waiting on input or a sibling; the worker may park.
+    Idle,
 }
 
 /// Directed graph of operators with precomputed roots and leaves.
@@ -243,26 +255,38 @@ impl DataFlow {
         }
     }
 
-    /// Try to finish all operators (root-to-leaf). Returns `true` if every operator
-    /// has completed, meaning this dataflow can be removed from the worker.
+    /// Drive every operator's finish (root-to-leaf), reporting the dataflow's
+    /// overall [`DataFlowStatus`]: [`Finished`](DataFlowStatus::Finished) when
+    /// all operators are done (the worker drops it), [`Working`](DataFlowStatus::Working)
+    /// when one is still producing output (the worker must keep driving rather
+    /// than park), or [`Idle`](DataFlowStatus::Idle) when stalled on input/siblings.
     ///
-    /// Operators that have already reported `try_finish == true` are latched
-    /// via `OperatorNode::finished` and skipped on subsequent passes, so each
-    /// operator's `try_finish` is invoked at most once after it reports done.
-    pub fn maybe_finish(&mut self) -> bool {
-        self.try_run_or(false, |d| {
-            d.graph
-                .traverse_forwards(|node| {
-                    if !node.finished {
-                        node.finished = node.operator.try_finish()?;
+    /// Operators that have reported [`FinishStatus::Done`] are latched via
+    /// `OperatorNode::finished` and skipped on subsequent passes.
+    pub fn maybe_finish(&mut self) -> DataFlowStatus {
+        self.try_run_or(DataFlowStatus::Idle, |d| {
+            let mut working = false;
+            let completed = d.graph.traverse_forwards(|node| {
+                if !node.finished {
+                    match node.operator.try_finish()? {
+                        FinishStatus::Done => node.finished = true,
+                        FinishStatus::Working => working = true,
+                        FinishStatus::Pending => {}
                     }
-                    Ok(if node.finished {
-                        ControlFlow::Continue(())
-                    } else {
-                        ControlFlow::Break(())
-                    })
+                }
+                Ok(if node.finished {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
                 })
-                .map(|c| matches!(c, ControlFlow::Continue(..)))
+            })?;
+            Ok(if matches!(completed, ControlFlow::Continue(..)) {
+                DataFlowStatus::Finished
+            } else if working {
+                DataFlowStatus::Working
+            } else {
+                DataFlowStatus::Idle
+            })
         })
     }
 

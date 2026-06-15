@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
-use super::Operator;
+use super::{FinishStatus, Operator};
 use super::channels::{Receiver, Sender};
 use crate::worker::worker_waker;
 
@@ -234,9 +234,9 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
             .process_http_response(&mut self.sender, request)?)
     }
 
-    fn try_finish(&mut self) -> super::Result<bool> {
+    fn try_finish(&mut self) -> super::Result<FinishStatus> {
         if !self.receiver.is_empty() {
-            return Ok(false);
+            return Ok(FinishStatus::Pending);
         }
 
         let ready = if self.notified_finished {
@@ -261,20 +261,22 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
             if !self.receiver.is_empty() {
                 self.notified_finished = false;
                 self.siblings_left.fetch_add(1, Ordering::Relaxed);
-                return Ok(false);
+                return Ok(FinishStatus::Pending);
             }
 
-            let done = self.unary.finish(&mut self.sender)?;
-            if done {
-                // `finish` may have created new batches downstream (e.g.
-                // OrderByLimit flushing), so wake any parked peers
-                // to pick that work up rather than waiting out their park
-                // timeout.
+            if self.unary.finish(&mut self.sender)? {
+                // `finish` may have emitted final batches downstream, so wake
+                // any parked peers to pick that work up.
                 worker_waker().notify();
+                return Ok(FinishStatus::Done);
             }
-            return Ok(done);
+            // A pipeline breaker still draining its outputter. The worker re-
+            // drives it through `run` next iteration; reporting `Working` keeps
+            // the worker from parking in between (its finish pass doesn't set
+            // `did_work`). No notify — the output's own `send`s wake peers.
+            return Ok(FinishStatus::Working);
         }
-        Ok(false)
+        Ok(FinishStatus::Pending)
     }
 
     fn try_steal_work(&mut self) -> super::Result<WorkStatus> {

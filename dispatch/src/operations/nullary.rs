@@ -4,7 +4,7 @@
 //! side effects without receiving upstream input. It is driven directly by the
 //! worker event loop through [`Operator`].
 
-use super::Operator;
+use super::{FinishStatus, Operator};
 use crate::api::{Chain, OperatorFactory};
 use crate::data_flow::WorkStatus;
 use crate::io::{FsRequest, HttpRequest};
@@ -112,8 +112,15 @@ impl<O, N: Nullary<O>, S: Sender<O>> Operator for NullaryOperator<O, N, S> {
             .process_http_response(&mut self.sender, request)?)
     }
 
-    fn try_finish(&mut self) -> super::Result<bool> {
-        Ok(self.nullary.finish(&mut self.sender)?)
+    fn try_finish(&mut self) -> super::Result<FinishStatus> {
+        // A source has no outputter to drain: it's either done or still
+        // producing (driven by `run_cpu_work`, which sets `did_work`), so it
+        // never needs the `Working` re-drive.
+        Ok(if self.nullary.finish(&mut self.sender)? {
+            FinishStatus::Done
+        } else {
+            FinishStatus::Pending
+        })
     }
 }
 
@@ -240,6 +247,6 @@ mod tests {
             operator.run_cpu_work().unwrap(),
             WorkStatus::Pending
         ));
-        assert!(operator.try_finish().unwrap());
+        assert_eq!(operator.try_finish().unwrap(), FinishStatus::Done);
     }
 }

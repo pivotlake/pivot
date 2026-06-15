@@ -24,7 +24,7 @@
 
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
-use crate::data_flow::{DataFlow, WorkStatus};
+use crate::data_flow::{DataFlow, DataFlowStatus, WorkStatus};
 use crate::io::{Completion, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use core_affinity::CoreId;
@@ -363,9 +363,13 @@ impl Worker {
     fn try_finishing_dataflows(&mut self) {
         let mut to_remove = Vec::new();
         for (id, flow) in &mut self.data_flows {
-            if flow.maybe_finish() {
-                // If nobody broke out- everybody is finished!
-                to_remove.push(*id);
+            match flow.maybe_finish() {
+                DataFlowStatus::Finished => to_remove.push(*id),
+                // An operator is still producing output: count it as work so we
+                // re-drive it via `run_cpu_work` next iteration instead of
+                // parking one stage short.
+                DataFlowStatus::Working => self.did_work_last_iteration = true,
+                DataFlowStatus::Idle => {}
             }
         }
 
