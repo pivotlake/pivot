@@ -177,7 +177,15 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     // and their footers read by many workers, the row groups fan in to worker 0,
     // and only worker 0 runs the commit. Cover that shape (the other tests are
     // single-worker).
-    let dispatch = dispatch_with_buffers(4, 32);
+    //
+    // Tests run with eviction disabled (`PANIC_ON_EVICT` defaults to true), so a
+    // cached footer/row-group region pins its ring slot for the lifetime of the
+    // dispatch — nothing returns it to the free pool. The working set is therefore
+    // every distinct region read across this test (8 files × footer + column
+    // chunks, plus transient decompression buffers), which lands around ~32 slots
+    // and varies with worker timing. 32 was right on that edge and tipped into an
+    // "Evicting" panic under CI scheduling; 64 leaves comfortable headroom.
+    let dispatch = dispatch_with_buffers(4, 64);
     let db = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
     for i in 0..8i64 {

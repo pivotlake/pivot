@@ -11,7 +11,7 @@
 //! Durable state lives in two places, both in the store:
 //!
 //! - the [`manifest`] — which tables exist (name, declared schema, location);
-//! - the per-table [`TableManifest`](crate::manifest::TableManifest) — *which
+//! - the per-table [`TableManifest`] — *which
 //!   Parquet files* each table consists of, as a sequence of versions committed
 //!   with the store's compare-and-swap. The highest version is the table's
 //!   current file list.
