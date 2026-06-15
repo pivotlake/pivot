@@ -5,7 +5,7 @@ use arrow_buffer::BooleanBuffer;
 
 use common::*;
 use dispatch::{Contains, OrderBy, Projection, StringKeyExtractor};
-use goose::parquet::table_input;
+use catalog::parquet::table_input;
 
 #[test]
 fn filter_then_project() {

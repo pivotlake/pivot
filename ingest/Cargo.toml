@@ -10,7 +10,7 @@ thriftparquet = { path = "../thriftparquet" }
 # The catalog: each flushed Parquet file is registered with its table so new
 # rows are queryable immediately, and the compacter reads files back / swaps
 # them through it.
-goose = { path = "../goose" }
+catalog = { path = "../catalog" }
 
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }

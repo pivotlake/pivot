@@ -5,7 +5,7 @@ use arrow_buffer::BooleanBuffer;
 
 use common::*;
 use dispatch::Projection;
-use goose::parquet::table_input;
+use catalog::parquet::table_input;
 
 /// A panicking filter on every batch should surface as an error from
 /// `.collect()`, not a silent empty result.

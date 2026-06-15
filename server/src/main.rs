@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch};
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use ingest::{IngestConfig, OtelConfig, Signal};
 use server::{Error, Server};
 use tracing::{error, info};

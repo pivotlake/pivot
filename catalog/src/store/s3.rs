@@ -100,7 +100,7 @@ impl S3Store {
             &self.secret_key,
             self.session_token.clone(),
             None,
-            "goose-env",
+            "catalog-env",
         );
         let identity = creds.into();
 
@@ -252,7 +252,7 @@ impl S3Store {
             &self.secret_key,
             self.session_token.clone(),
             None,
-            "goose-env",
+            "catalog-env",
         );
         let identity = creds.into();
 

@@ -34,7 +34,7 @@ use dispatch::{
     Contains, DataFlowDispatcher, Dispatch, IntKeyExtractor, OrderBy, Projection,
     StringKeyExtractor,
 };
-use goose::parquet::{ParquetTable, materialize, table_input};
+use catalog::parquet::{ParquetTable, materialize, table_input};
 
 static SOURCE_DIRECTORY: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(std::env::var("SOURCE_DIRECTORY").unwrap()));

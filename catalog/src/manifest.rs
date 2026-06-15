@@ -8,7 +8,7 @@
 //! - a per-table **table manifest** ([`TableManifest`], under
 //!   [`TABLE_MANIFEST_DIR`]) — the table's declared schema plus its committed
 //!   file list. It is **versioned**: each commit writes a new
-//!   `_goose_tables/<name>/<version>.json` with `put_if_absent`, so a commit is a
+//!   `_pivot_tables/<name>/<version>.json` with `put_if_absent`, so a commit is a
 //!   compare-and-swap (it fails if that version already exists) and the latest
 //!   version a `list` finds is the table's current state. That is what lets two
 //!   processes register/replace files concurrently — and what a stale in-memory
@@ -23,10 +23,10 @@ use crate::store::{ObjectPath, ObjectStore};
 /// Key of the [`CatalogManifest`] document within the database's object store.
 const MANIFEST_KEY: &str = "_pivot_manifest.json";
 /// Directory the per-table [`TableManifest`] versions live under
-/// (`_goose_tables/<name>/<version>.json`). Kept under the database root so a
+/// (`_pivot_tables/<name>/<version>.json`). Kept under the database root so a
 /// table over an external data directory never has catalog metadata written
 /// into it.
-const TABLE_MANIFEST_DIR: &str = "_goose_tables";
+const TABLE_MANIFEST_DIR: &str = "_pivot_tables";
 /// Version numbers are zero-padded to this width so a `list` returns them in
 /// numeric order and the lexicographic max is the latest.
 const VERSION_DIGITS: usize = 20;

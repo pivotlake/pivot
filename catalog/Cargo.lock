@@ -776,6 +776,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "catalog"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "arrow 58.0.0",
+ "arrow-array 58.0.0",
+ "arrow-buffer 58.0.0",
+ "arrow-ord 58.0.0",
+ "arrow-schema 58.0.0",
+ "aws-credential-types",
+ "aws-sigv4",
+ "base64",
+ "bytes",
+ "core_affinity",
+ "crossbeam-deque",
+ "dispatch",
+ "parquet",
+ "planner",
+ "quick-xml",
+ "ring",
+ "serde",
+ "serde_json",
+ "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=1e20a92f7bcad208bf6869f5394101288850ee2e)",
+ "tempfile",
+ "thiserror 2.0.18",
+ "thriftparquet",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.61"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1341,39 +1374,6 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
-name = "goose"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "arrow 58.0.0",
- "arrow-array 58.0.0",
- "arrow-buffer 58.0.0",
- "arrow-ord 58.0.0",
- "arrow-schema 58.0.0",
- "aws-credential-types",
- "aws-sigv4",
- "base64",
- "bytes",
- "core_affinity",
- "crossbeam-deque",
- "dispatch",
- "parquet",
- "planner",
- "quick-xml",
- "ring",
- "serde",
- "serde_json",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=1e20a92f7bcad208bf6869f5394101288850ee2e)",
- "tempfile",
- "thiserror 2.0.18",
- "thriftparquet",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "url",
-]
 
 [[package]]
 name = "half"

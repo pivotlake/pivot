@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// A `/`-separated key in the object store — e.g. `events/a.parquet` or
-/// `_goose_tables/t/00000000000000000001.json`.
+/// `_pivot_tables/t/00000000000000000001.json`.
 ///
 /// A **leading `/` marks an absolute key**: addressed from the store's own root
 /// (the filesystem root, or the bucket root), ignoring any database prefix. Any

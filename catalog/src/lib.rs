@@ -1,4 +1,4 @@
-//! goose: pivotdb's table layer over Parquet.
+//! catalog: pivotdb's table layer over Parquet.
 //!
 //! - [`catalog`](ParquetCatalog) — the tables: durable definitions and per-table
 //!   file lists in the [`manifest`], live row-group state in memory, reloaded up

@@ -20,7 +20,7 @@
 
 use crate::query_handler::PivotHandlers;
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use ingest::{IngestConfig, Ingestor};
 use pgwire::tokio::process_socket;
 use std::io;

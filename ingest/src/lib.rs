@@ -46,7 +46,7 @@ mod sink;
 use std::sync::Arc;
 
 use dispatch::DataFlowDispatcher;
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -220,7 +220,7 @@ mod tests {
     use crate::sink::ParquetSink;
     use arrow_array::{Array, Int32Array, RecordBatch, StringViewArray};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, Projection};
-    use goose::parquet::{ParquetTable, table_input};
+    use catalog::parquet::{ParquetTable, table_input};
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -270,7 +270,7 @@ mod tests {
     /// Ensure the `otel_logs` table exists at `dir` (the sink only ever writes
     /// into an existing table), creating it if a fresh catalog was handed in.
     fn ensure_otel_logs(
-        catalog: &Arc<goose::ParquetCatalog>,
+        catalog: &Arc<catalog::ParquetCatalog>,
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
     ) {
@@ -285,7 +285,7 @@ mod tests {
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
         requests: &[ExportLogsServiceRequest],
-        catalog: Arc<goose::ParquetCatalog>,
+        catalog: Arc<catalog::ParquetCatalog>,
     ) {
         ensure_otel_logs(&catalog, dispatcher, dir);
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -309,7 +309,7 @@ mod tests {
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
         requests: &[ExportLogsServiceRequest],
-        catalog: Arc<goose::ParquetCatalog>,
+        catalog: Arc<catalog::ParquetCatalog>,
     ) {
         ensure_otel_logs(&catalog, dispatcher, dir);
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -329,7 +329,7 @@ mod tests {
     /// way the server would run it. The declared columns don't matter to these
     /// tests (they assert on the Parquet row groups, not the logical schema).
     fn create_catalog_table(
-        catalog: &Arc<goose::ParquetCatalog>,
+        catalog: &Arc<catalog::ParquetCatalog>,
         dispatcher: &DataFlowDispatcher,
         dir: &Path,
     ) {
@@ -340,7 +340,7 @@ mod tests {
     /// it: with an explicit absolute `path` option, or — when `dir` is `None`
     /// — at `<name>` under the database root (a store-relative table).
     fn create_table(
-        catalog: &Arc<goose::ParquetCatalog>,
+        catalog: &Arc<catalog::ParquetCatalog>,
         dispatcher: &DataFlowDispatcher,
         name: &str,
         dir: Option<&Path>,
@@ -374,7 +374,7 @@ mod tests {
     /// catalog refreshes its in-memory copy from the latest committed manifest
     /// (a writer evolves a cloned-out handle, so the catalog's own copy lags
     /// until a resolve), then return the typed binding.
-    fn fresh_binding(catalog: &goose::ParquetCatalog, name: &str) -> goose::TableBinding {
+    fn fresh_binding(catalog: &catalog::ParquetCatalog, name: &str) -> catalog::TableBinding {
         use planner::catalog::Catalog as _;
         let _ = catalog.table(name);
         catalog.binding(name).unwrap()
@@ -432,7 +432,7 @@ mod tests {
             dispatch.dispatcher(),
             dir.path(),
             &[log_request(3)],
-            Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone())),
+            Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone())),
         );
         let table = read_table(&dispatch, dir.path());
         let batches = table_input(
@@ -474,7 +474,7 @@ mod tests {
             dispatch.dispatcher(),
             dir.path(),
             &vec![log_request(2); 5],
-            Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone())),
+            Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone())),
         );
         let table = read_table(&dispatch, dir.path());
 
@@ -491,7 +491,7 @@ mod tests {
     fn flushed_file_is_registered_with_catalog_table() {
         let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
         let dir = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone()));
+        let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
         assert!(
             catalog
@@ -531,7 +531,7 @@ mod tests {
         // buffer each, however small the page) queue while workers encode.
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
         let dir = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(goose::ParquetCatalog::new(dispatch.dispatcher().clone()));
+        let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
 
         flush_each(
@@ -635,7 +635,7 @@ mod tests {
         }
 
         let catalog = Arc::new(
-            goose::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
+            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
                 .unwrap(),
         );
         // No `path` option: the table lives at `events` under the root.
@@ -694,7 +694,7 @@ mod tests {
 
         // "Server" process: creates the table and registers three flushes.
         let server_catalog = Arc::new(
-            goose::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
+            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
                 .unwrap(),
         );
         create_catalog_table(&server_catalog, dispatch.dispatcher(), data_dir.path());
@@ -708,7 +708,7 @@ mod tests {
         // "Compacter" process: a separate catalog over the same root. Its
         // poll round reloads the table from the log before scanning.
         let compacter_catalog = Arc::new(
-            goose::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
+            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
                 .unwrap(),
         );
         let total: u64 = server_catalog

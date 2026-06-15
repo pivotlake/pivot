@@ -138,7 +138,7 @@ impl ParquetCatalog {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let root =
-            std::env::temp_dir().join(format!("goose-{}-{}", std::process::id(), seq));
+            std::env::temp_dir().join(format!("catalog-{}-{}", std::process::id(), seq));
         Self {
             tables: Arc::new(RwLock::new(HashMap::new())),
             store: Arc::new(LocalStore::new(root)),

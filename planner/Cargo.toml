@@ -12,14 +12,14 @@ arrow = { path = "../arrow-rs/arrow" }
 duckdb-planner = { path = "../duckdb-planner" }
 dispatch = { path = "../dispatch" }
 thiserror = "2.0.18"
-# Column/Type derive serde so goose can persist a table's declared schema in its
+# Column/Type derive serde so catalog can persist a table's declared schema in its
 # manifest.
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 # The Parquet reader, for integration tests that plan over a real on-disk table.
 # A dev-dependency cycle (catalog depends on planner) — allowed by Cargo.
-goose = { path = "../goose" }
+catalog = { path = "../catalog" }
 parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
 arrow-json = { path = "../arrow-rs/arrow-json" }
 serde_json = "1.0"

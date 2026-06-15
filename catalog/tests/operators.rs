@@ -9,7 +9,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
 use dispatch::{Contains, IntKeyExtractor, OrderBy, Projection, StringKeyExtractor};
-use goose::parquet::table_input;
+use catalog::parquet::table_input;
 
 #[test]
 fn count() {

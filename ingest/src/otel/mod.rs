@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dispatch::DataFlowDispatcher;
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
     LogsService, LogsServiceServer,
 };

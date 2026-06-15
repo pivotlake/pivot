@@ -7,7 +7,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
 use dispatch::{Projection, RECORD_BATCH_SIZE};
-use goose::parquet::table_input;
+use catalog::parquet::table_input;
 
 #[test]
 fn subsequent_batches_reuse_write_buffer() {

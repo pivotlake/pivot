@@ -1,7 +1,7 @@
 //! [`ParquetSink<T>`]: buffer raw items for one logical stream and, once enough
 //! rows accumulate (or a timer fires), turn them into Parquet files and append
 //! each to the sink's **catalog table** (writing into the table's own data
-//! location, through goose's store), making the rows queryable at once.
+//! location, through catalog's store), making the rows queryable at once.
 //!
 //! The sink is signal-agnostic: it only knows `T: ToRecordBatch`. The receive
 //! path (a gRPC handler) does **no** conversion — it just `append`s a cheap,
@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dispatch::DataFlowDispatcher;
-use goose::ParquetCatalog;
-use goose::store::ObjectPath;
+use catalog::ParquetCatalog;
+use catalog::store::ObjectPath;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 

@@ -15,8 +15,8 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use dispatch::Projection;
-use goose::ParquetCatalog;
-use goose::parquet::table_input;
+use catalog::ParquetCatalog;
+use catalog::parquet::table_input;
 use planner::catalog::{Catalog, Column, CreateTableRequest, Result as CatalogResult};
 use planner::types::Type;
 

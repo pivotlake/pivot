@@ -13,7 +13,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use dispatch::{BUFFER_SIZE, Dispatch};
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use server::Server;
 use tokio::sync::oneshot;
 

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use common::{pick_free_port, wait_until_listening};
 use dispatch::Dispatch;
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use server::Server;
 use tokio::sync::oneshot;
 

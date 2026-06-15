@@ -34,16 +34,16 @@
 //! round reloads a table to its latest log version before scanning — rather
 //! than being woken by the ingest path; the sinks don't know it exists.
 //!
-//! [`replace_data_files`]: goose::CatalogTable::replace_data_files
+//! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dispatch::{DataFlowDispatcher, Projection};
-use goose::parquet::table_input;
-use goose::store::ObjectPath;
-use goose::{CatalogTable, FileRef, ParquetCatalog};
+use catalog::parquet::table_input;
+use catalog::store::ObjectPath;
+use catalog::{CatalogTable, FileRef, ParquetCatalog};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};

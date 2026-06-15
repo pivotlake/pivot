@@ -10,8 +10,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
-use goose::store::ObjectPath;
-use goose::{ParquetCatalog, TableBinding};
+use catalog::store::ObjectPath;
+use catalog::{ParquetCatalog, TableBinding};
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };
@@ -420,7 +420,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
     let removed = vec![ObjectPath::new("data.parquet"), ObjectPath::new("extra.parquet")];
-    let added = vec![goose::FileRef {
+    let added = vec![catalog::FileRef {
         path: ObjectPath::new("merged.parquet"),
         size: merged_size,
     }];
@@ -437,7 +437,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     );
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh, and aborts — no footer read for its output, no double-count.
-    let loser_added = vec![goose::FileRef {
+    let loser_added = vec![catalog::FileRef {
         path: ObjectPath::new("merged-loser.parquet"),
         size: merged_size,
     }];
@@ -516,7 +516,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     // "Compact" data.parquet into merged.parquet but crash before deleting the
     // input: both files are on disk, only merged is in the manifest.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![goose::FileRef {
+    let added = vec![catalog::FileRef {
         path: ObjectPath::new("merged.parquet"),
         size: std::fs::metadata(&merged).unwrap().len(),
     }];

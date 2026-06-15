@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use common::*;
 use dispatch::Projection;
-use goose::parquet::{ParquetTable, table_input};
+use catalog::parquet::{ParquetTable, table_input};
 
 #[test]
 fn scan_all_columns() {

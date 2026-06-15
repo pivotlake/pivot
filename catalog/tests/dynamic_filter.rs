@@ -18,15 +18,15 @@ use tempfile::TempDir;
 
 use common::*;
 use dispatch::Projection;
-use goose::parquet::table_input_with_filter;
-use goose::parquet::{RowGroupFilter, RowGroupMetadata};
+use catalog::parquet::table_input_with_filter;
+use catalog::parquet::{RowGroupFilter, RowGroupMetadata};
 
 /// Write a single Int64 column with one row group per three rows, so each row
 /// group carries distinct min/max statistics.
 fn row_group_per_three(
     dispatch: &DispatchGuard,
     rows: &[i64],
-) -> (TempDir, Arc<goose::parquet::ParquetTable>) {
+) -> (TempDir, Arc<catalog::parquet::ParquetTable>) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("data.parquet");
     let schema = Arc::new(Schema::new(vec![Field::new(

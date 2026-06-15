@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dispatch::Dispatch;
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use rstest::fixture;
 use server::Server;
 use tokio_postgres::{Client, NoTls};

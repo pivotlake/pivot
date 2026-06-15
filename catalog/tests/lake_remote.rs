@@ -1,5 +1,5 @@
 //! Remote-read end-to-end test: serve a Parquet file over a loopback HTTP server
-//! that honours byte-range requests, then read it through the goose pipeline —
+//! that honours byte-range requests, then read it through the catalog pipeline —
 //! footer and column chunks both via the io_uring ring — and check the rows come
 //! back. Plain HTTP (not TLS) so the worker's default requester needs no injected
 //! trust; the S3/GCS auth layer (presigned URLs) is orthogonal and exercised
@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use url::Url;
 
 use dispatch::Projection;
-use goose::parquet::{ParquetTable, table_input};
+use catalog::parquet::{ParquetTable, table_input};
 
 /// Serve `bytes` over loopback HTTP, answering `Range` requests with `206`.
 /// Returns the bound URL. The server thread is detached and lives for the

@@ -9,7 +9,7 @@
 //! hops to `tokio::task::spawn_blocking` to drive the (non-`Send`) DuckDB
 //! planner; the planner is cached in a thread-local on each blocking-pool
 //! thread and reused across queries. When run as a binary, the default is to run with the default
-//! `goose::ParquetCatalog`.
+//! `catalog::ParquetCatalog`.
 //!
 //! The public interface: hand a bind address to [`Server::new`] together
 //! with a [`Dispatch`](dispatch::Dispatch) (from
@@ -26,7 +26,7 @@
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //!
-//! use goose::ParquetCatalog;
+//! use catalog::ParquetCatalog;
 //! use dispatch::Dispatch;
 //! use server::Server;
 //!
