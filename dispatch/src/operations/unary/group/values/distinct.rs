@@ -22,12 +22,7 @@ use arrow_schema::Field;
 #[derive(Copy, Clone, Default)]
 pub struct DistinctValue;
 
-impl Value for DistinctValue {
-    #[inline(always)]
-    fn merge(self, _v: Self) -> Self {
-        self
-    }
-}
+impl Value for DistinctValue {}
 
 /// A [`ValueExtractor`] that stores nothing per group and emits no value
 /// columns — the group's output is its key column(s) only.
@@ -45,6 +40,12 @@ impl ValueExtractor for DistinctValueExtractor {
     #[inline(always)]
     fn value(_reader: &(), _idx: usize) -> DistinctValue {
         DistinctValue
+    }
+
+    #[inline(always)]
+    fn merge(a: DistinctValue, _b: DistinctValue, _slots: &[AggregationSlot]) -> DistinctValue {
+        // No accumulator — both sides are the same (distinct) key.
+        a
     }
 
     #[inline(always)]

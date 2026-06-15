@@ -46,15 +46,9 @@ impl<const N: usize, A: Accumulator> Default for AggregationRow<N, A> {
     }
 }
 
-impl<const N: usize, A: Accumulator> Value for AggregationRow<N, A> {
-    #[inline]
-    fn merge(mut self, v: Self) -> Self {
-        for i in 0..N {
-            self.0[i] += v.0[i];
-        }
-        self
-    }
-}
+// Pure storage — combining is the extractor's kind-aware
+// [`merge`](ValueExtractor::merge), not the value's concern.
+impl<const N: usize, A: Accumulator> Value for AggregationRow<N, A> {}
 
 /// The per-row input to a single output slot, resolved at runtime from the slot
 /// kind / column type. This is the fallback's dispatch table over the shared
@@ -104,18 +98,26 @@ impl<const N: usize, A: Accumulator> ValueExtractor for DynamicValueExtractor<N,
             let slot = value_slots[s];
             match slot.kind {
                 AggregationKind::CountStar | AggregationKind::Count => SlotValueReader::Count,
-                AggregationKind::Sum => match batch.column(slot.column).data_type() {
-                    DataType::Int16 => {
-                        SlotValueReader::Sum16(Sum::<Int16Type>::make_reader(batch, slot.column))
+                // SUM/MIN/MAX all read the same per-row value (the widened column
+                // value); only how they *combine* differs, and that's handled by
+                // `slot.kind.combine` in `merge`, not here.
+                AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
+                    match batch.column(slot.column).data_type() {
+                        DataType::Int16 => SlotValueReader::Sum16(Sum::<Int16Type>::make_reader(
+                            batch,
+                            slot.column,
+                        )),
+                        DataType::Int32 => SlotValueReader::Sum32(Sum::<Int32Type>::make_reader(
+                            batch,
+                            slot.column,
+                        )),
+                        DataType::Int64 => SlotValueReader::Sum64(Sum::<Int64Type>::make_reader(
+                            batch,
+                            slot.column,
+                        )),
+                        other => panic!("grouped SUM/MIN/MAX: unsupported column type {other:?}"),
                     }
-                    DataType::Int32 => {
-                        SlotValueReader::Sum32(Sum::<Int32Type>::make_reader(batch, slot.column))
-                    }
-                    DataType::Int64 => {
-                        SlotValueReader::Sum64(Sum::<Int64Type>::make_reader(batch, slot.column))
-                    }
-                    other => panic!("grouped SUM: unsupported column type {other:?}"),
-                },
+                }
             }
         });
         AggregationRowReader { slots }
@@ -124,6 +126,17 @@ impl<const N: usize, A: Accumulator> ValueExtractor for DynamicValueExtractor<N,
     #[inline(always)]
     fn value(reader: &AggregationRowReader<'_, N>, idx: usize) -> AggregationRow<N, A> {
         AggregationRow(std::array::from_fn(|s| A::from(reader.slots[s].at(idx))))
+    }
+
+    #[inline(always)]
+    fn merge(
+        a: AggregationRow<N, A>,
+        b: AggregationRow<N, A>,
+        slots: &[AggregationSlot],
+    ) -> AggregationRow<N, A> {
+        AggregationRow(std::array::from_fn(|s| {
+            slots[s].kind.combine(a.0[s], b.0[s])
+        }))
     }
 
     #[inline(always)]
@@ -195,8 +208,32 @@ mod tests {
         let reader = V::make_reader(&batch, &slots);
         let mut acc = AggregationRow::<1, i128>::default();
         for i in 0..3 {
-            acc = acc.merge(V::value(&reader, i));
+            acc = V::merge(acc, V::value(&reader, i), &slots);
         }
         assert_eq!(acc.0[0], 3 * i64::MAX as i128);
+    }
+
+    /// Grouped `MIN`/`MAX` over an i32 column: `merge` is kind-aware, so the same
+    /// row of values reduces to the extreme per slot.
+    #[test]
+    fn grouped_min_max_take_extremes() {
+        let col = arrow_array::Int32Array::from(vec![5i32, 2, 9, 2, 7]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("c", DataType::Int32, false)])),
+            vec![Arc::new(col)],
+        )
+        .unwrap();
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::Min, 0),
+            AggregationSlot::new(AggregationKind::Max, 0),
+        ];
+
+        type V = DynamicValueExtractor<2>;
+        let reader = V::make_reader(&batch, &slots);
+        let mut acc = V::value(&reader, 0);
+        for i in 1..5 {
+            acc = V::merge(acc, V::value(&reader, i), &slots);
+        }
+        assert_eq!(acc.0, [2, 9]); // min, max
     }
 }

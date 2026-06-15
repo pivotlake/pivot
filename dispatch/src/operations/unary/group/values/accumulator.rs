@@ -25,6 +25,15 @@ use std::sync::Arc;
 pub trait Accumulator:
     Copy + Default + Send + Sync + 'static + std::ops::AddAssign + Ord + From<i64> + Into<i128>
 {
+    /// This width's extremes — the identity elements for the order-statistic
+    /// aggregates: a running `MIN` starts at `MAX` (every value is `≤` it) and a
+    /// running `MAX` at `MIN`. (`SUM`/`COUNT` use the additive identity,
+    /// [`Default`]'s zero.) See [`AggregationKind::identity`].
+    ///
+    /// [`AggregationKind::identity`]: super::AggregationKind::identity
+    const MIN: Self;
+    const MAX: Self;
+
     /// The Arrow primitive backing this width's output column (`Int64Type` /
     /// `Decimal128Type`); its `Native` is the accumulator itself.
     type Arrow: ArrowPrimitiveType<Native = Self>;
@@ -36,6 +45,8 @@ pub trait Accumulator:
 }
 
 impl Accumulator for i64 {
+    const MIN: Self = i64::MIN;
+    const MAX: Self = i64::MAX;
     type Arrow = Int64Type;
     #[inline(always)]
     fn finalize(array: ArrayRef) -> ArrayRef {
@@ -44,6 +55,8 @@ impl Accumulator for i64 {
 }
 
 impl Accumulator for i128 {
+    const MIN: Self = i128::MIN;
+    const MAX: Self = i128::MAX;
     type Arrow = Decimal128Type;
     fn finalize(array: ArrayRef) -> ArrayRef {
         Arc::new(

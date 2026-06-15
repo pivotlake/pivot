@@ -177,7 +177,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
     ) -> Self {
         Self {
             key_cols,
-            value_slots,
+            value_slots: value_slots.clone(),
             key_config: key_config.clone(),
             outputter: GroupOutputter {
                 shared_arena: shared_arena.clone(),
@@ -185,6 +185,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 receiver,
                 partition_jobs_injected,
                 key_config,
+                value_slots,
                 top_k,
                 count_only,
                 output_allocator: None,
@@ -232,6 +233,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     key_config: K::Config,
+    /// The aggregate slot layout, threaded into each [`PartitionJob`] so the merge
+    /// folds existing entries with the kind-aware [`ValueExtractor::merge`].
+    value_slots: Vec<AggregationSlot>,
     top_k: Option<(usize, usize)>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
@@ -260,6 +264,8 @@ pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
     key_config: K::Config,
+    /// Per-slot aggregate kinds, for the merge's kind-aware entry fold.
+    value_slots: Vec<AggregationSlot>,
     top_k: Option<(usize, usize)>,
     count_only: bool,
 }
@@ -281,6 +287,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
             self.partition_capacity,
             self.num_partitions,
             &self.arena,
+            &self.value_slots,
         );
         if result_map.len() == 0 {
             return Ok(());
@@ -351,6 +358,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                     partition_capacity,
                     num_partitions,
                     key_config: self.key_config.clone(),
+                    value_slots: self.value_slots.clone(),
                     top_k: self.top_k,
                     count_only: self.count_only,
                 });

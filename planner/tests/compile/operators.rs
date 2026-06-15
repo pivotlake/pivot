@@ -655,6 +655,59 @@ fn global_sum_count_avg_together(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn global_min_max(mut testing_planner: TestingPlanner) {
+    // MIN/MAX fold the extreme over the whole column (no GROUP BY): over
+    // a=[1,2,3,4,5] and b=[10,20,30,40,50], min(a)=1 and max(b)=50.
+    let results = testing_planner
+        .planner
+        .plan("SELECT MIN(a), MAX(b) FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["min"], 1);
+    assert_eq!(rows[0]["max"], 50);
+}
+
+#[rstest]
+fn grouped_min_max(mut testing_planner: TestingPlanner) {
+    // Per-group extremes through the dynamic value extractor's MIN/MAX slots.
+    // g=1 -> v {10,40} (min 10, max 40); g=2 -> v {20,5} (min 5, max 20). The
+    // consume fold and the partition merge are both kind-aware.
+    testing_planner.add_table(
+        "gv",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2])),
+            ("v", Type::Int32, int_col(vec![10, 40, 20, 5])),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, MIN(v), MAX(v) FROM gv GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    // A single integer key goes through the row-encoded key extractor, whose key
+    // column is named `k0` (multi-key groups would add `k1`, …).
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["k0"], 1);
+    assert_eq!(rows[0]["v0"], 10); // min
+    assert_eq!(rows[0]["v1"], 40); // max
+    assert_eq!(rows[1]["k0"], 2);
+    assert_eq!(rows[1]["v0"], 5); // min
+    assert_eq!(rows[1]["v1"], 20); // max
+}
+
+#[rstest]
 fn filter_then_top_n(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .planner
@@ -792,8 +845,10 @@ fn create_table_passes_with_options_to_catalog() {
 
 #[rstest]
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
+    // `stddev` has no pivot lowering (unlike SUM/COUNT/MIN/MAX/AVG), so it must
+    // surface as a plan-conversion error rather than silently mis-aggregating.
     let result = testing_planner
         .planner
-        .plan("SELECT MIN(b) FROM example_table");
+        .plan("SELECT STDDEV(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }

@@ -37,6 +37,51 @@ pub enum AggregationKind {
     Count,
     /// `SUM(col)` — += the (widened) column value.
     Sum,
+    /// `MIN(col)` over an integer column — keep the smallest (widened) value.
+    Min,
+    /// `MAX(col)` over an integer column — keep the largest (widened) value.
+    Max,
+}
+
+impl AggregationKind {
+    /// Combine two accumulators of this kind. The op is associative, so the same
+    /// function folds a row's contribution into a group *and* merges two partial
+    /// groups: additive kinds add, the extremes take the min/max. This is the one
+    /// place the per-kind merge logic lives — `Compiled` calls it with a `const`
+    /// kind (folded away at compile time), the dynamic path with a runtime kind.
+    ///
+    /// Generic over the accumulator width so a wide (`i128`) sum combines at full
+    /// width; both `i64` and `i128` are `Copy + Ord + AddAssign` (the
+    /// [`Accumulator`](crate::operations::unary::group::values::Accumulator) bound).
+    #[inline(always)]
+    pub fn combine<A: Copy + Ord + std::ops::AddAssign>(self, mut a: A, b: A) -> A {
+        match self {
+            AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum => {
+                a += b;
+                a
+            }
+            AggregationKind::Min => a.min(b),
+            AggregationKind::Max => a.max(b),
+        }
+    }
+
+    /// The neutral element for this kind: combining it with any value `v` yields
+    /// `v`. Additive kinds start at `0`; a running `MIN` starts at the width's
+    /// maximum and a running `MAX` at its minimum. A fold seeds an accumulator
+    /// with this and then [`combine`](Self::combine)s each contribution, so the
+    /// first real value replaces the identity. (The grouped hash-table path never
+    /// needs it — a new entry stores the first row's value directly — but the
+    /// global fold over batches and the cross-worker partial merge both do.)
+    #[inline(always)]
+    pub fn identity<A: Accumulator>(self) -> A {
+        match self {
+            AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum => {
+                A::default()
+            }
+            AggregationKind::Min => A::MAX,
+            AggregationKind::Max => A::MIN,
+        }
+    }
 }
 
 /// One aggregate output slot: which aggregate, over which input column.
@@ -71,6 +116,14 @@ pub trait ValueExtractor: Send + 'static {
 
     /// Build the per-row aggregate value at row `idx`.
     fn value(reader: &Self::Reader<'_>, idx: usize) -> Self::Value;
+
+    /// Combine two group accumulators. The hash table calls this both to fold a
+    /// row's [`value`](Self::value) into an existing entry during consume and to
+    /// combine two partials in the partition merge (the op is associative). It is
+    /// the kind-aware replacement for the old blanket additive merge: additive
+    /// slots add, MIN/MAX slots take the extreme. `slots` carries the per-slot
+    /// kinds for the runtime path; [`Compiled`] ignores it (its ops are static).
+    fn merge(a: Self::Value, b: Self::Value, slots: &[AggregationSlot]) -> Self::Value;
 
     /// The value an `ORDER BY <slot> DESC LIMIT k` sorts on, pulled from an
     /// otherwise-opaque [`Value`]. Used only when the group feeds a top-k.

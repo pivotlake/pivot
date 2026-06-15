@@ -48,12 +48,11 @@ impl<P: PersistedKey + PartialEq> LiveKey for P {
 
 /// An aggregation value stored alongside each key in the hash table.
 ///
-/// Must be `Copy` + `Default` so entries can be zero-initialized and moved
-/// cheaply during resize.
-pub trait Value: Copy + Clone + Default {
-    /// Combine two values (e.g. sum counts).
-    fn merge(self, v: Self) -> Self;
-}
+/// Pure storage: `Copy` + `Default` so entries can be zero-initialized and moved
+/// cheaply during resize. *How* two values combine is kind-aware and lives on
+/// [`ValueExtractor::merge`](crate::operations::unary::group::values::ValueExtractor::merge);
+/// [`merge`](BaseHashTable::merge) takes that combiner as a closure.
+pub trait Value: Copy + Clone + Default {}
 
 /// A single slot in the hash table, storing the full hash, key, and value.
 ///
@@ -384,13 +383,23 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
     /// - Best case: O(1) - slot is empty or immediate match
     /// - Average case: O(1) - at 70% load, expected probe length is ~1.8
     /// - Worst case: O(n) - pathological hash collisions
+    ///
+    /// `combine(existing, incoming)` folds the row's value into an existing
+    /// entry; it is the kind-aware
+    /// [`ValueExtractor::merge`](crate::operations::unary::group::values::ValueExtractor::merge)
+    /// (the value type itself no longer knows how to combine). A new slot just
+    /// stores `value`.
     #[inline(always)]
-    pub fn merge<const COUNT_COLLISIONS: bool, L: LiveKey<Persisted = K>>(
+    pub fn merge<const COUNT_COLLISIONS: bool, L, F>(
         &mut self,
         mut hash: u64,
         key: L,
         value: V,
-    ) {
+        combine: F,
+    ) where
+        L: LiveKey<Persisted = K>,
+        F: Fn(V, V) -> V,
+    {
         // hash == 0 is our empty sentinel, so remap actual zero hashes to 1
         if hash == 0 {
             hash = 1;
@@ -414,8 +423,8 @@ impl<K: PersistedKey, V: Value, A: Index<usize, Output = Entry<K, V>> + IndexMut
             }
 
             if entry.hash == hash && key.eq_persisted(&entry.key) {
-                // Key exists - merge the values (e.g., add counts)
-                entry.value = entry.value.merge(value);
+                // Key exists — fold the row's value into it (kind-aware combine).
+                entry.value = combine(entry.value, value);
                 return;
             }
 
@@ -507,10 +516,12 @@ mod tests {
     #[derive(Copy, Clone, Default, Debug, PartialEq)]
     struct Count(usize);
 
-    impl Value for Count {
-        fn merge(self, v: Self) -> Self {
-            Count(self.0 + v.0)
-        }
+    impl Value for Count {}
+
+    /// The combiner passed to `merge` in these tests — sums counts, the way an
+    /// additive `ValueExtractor::merge` would.
+    fn add_counts(a: Count, b: Count) -> Count {
+        Count(a.0 + b.0)
     }
 
     type TestTable = BaseHashTable<u64, Count, Vec<Entry<u64, Count>>>;
@@ -533,7 +544,7 @@ mod tests {
     fn insert_single_entry() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 100u64, Count(1));
+        table.merge::<false, _, _>(42, 100u64, Count(1), add_counts);
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -545,9 +556,9 @@ mod tests {
     fn merge_duplicate_keys_sums_values() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 100u64, Count(1));
-        table.merge::<false, _>(42, 100u64, Count(1));
-        table.merge::<false, _>(42, 100u64, Count(1));
+        table.merge::<false, _, _>(42, 100u64, Count(1), add_counts);
+        table.merge::<false, _, _>(42, 100u64, Count(1), add_counts);
+        table.merge::<false, _, _>(42, 100u64, Count(1), add_counts);
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -558,8 +569,8 @@ mod tests {
     fn distinct_keys_same_hash_both_stored() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 1u64, Count(1));
-        table.merge::<false, _>(42, 2u64, Count(1));
+        table.merge::<false, _, _>(42, 1u64, Count(1), add_counts);
+        table.merge::<false, _, _>(42, 2u64, Count(1), add_counts);
 
         assert_eq!(table.len(), 2);
         let entries: Vec<_> = table.iter(0).collect();
@@ -572,7 +583,7 @@ mod tests {
     fn hash_zero_is_remapped_and_retrievable() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(0, 99u64, Count(1));
+        table.merge::<false, _, _>(0, 99u64, Count(1), add_counts);
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -586,11 +597,11 @@ mod tests {
         let max_load = (16.0 * MAX_LOAD_FACTOR).round() as usize;
 
         for i in 0..max_load {
-            table.merge::<false, _>(i as u64 + 1, i as u64, Count(1));
+            table.merge::<false, _, _>(i as u64 + 1, i as u64, Count(1), add_counts);
             assert!(!table.undersized());
         }
 
-        table.merge::<false, _>(max_load as u64 + 1, max_load as u64, Count(1));
+        table.merge::<false, _, _>(max_load as u64 + 1, max_load as u64, Count(1), add_counts);
 
         assert!(table.undersized());
     }
@@ -599,10 +610,10 @@ mod tests {
     fn collision_counting() {
         let mut table = new_table(16);
 
-        table.merge::<true, _>(42, 1u64, Count(1));
+        table.merge::<true, _, _>(42, 1u64, Count(1), add_counts);
         assert_eq!(table.collisions(), 0);
 
-        table.merge::<true, _>(42, 2u64, Count(1));
+        table.merge::<true, _, _>(42, 2u64, Count(1), add_counts);
         assert_eq!(table.collisions(), 1);
     }
 
@@ -610,8 +621,8 @@ mod tests {
     fn collision_counting_disabled() {
         let mut table = new_table(16);
 
-        table.merge::<false, _>(42, 1u64, Count(1));
-        table.merge::<false, _>(42, 2u64, Count(1));
+        table.merge::<false, _, _>(42, 1u64, Count(1), add_counts);
+        table.merge::<false, _, _>(42, 2u64, Count(1), add_counts);
 
         assert_eq!(table.collisions(), 0);
     }
@@ -620,8 +631,8 @@ mod tests {
     fn iter_skips_empty_slots() {
         let mut table = new_table(128);
 
-        table.merge::<false, _>(1, 10u64, Count(1));
-        table.merge::<false, _>(2, 20u64, Count(1));
+        table.merge::<false, _, _>(1, 10u64, Count(1), add_counts);
+        table.merge::<false, _, _>(2, 20u64, Count(1), add_counts);
 
         let entries: Vec<_> = table.iter(0).collect();
         assert_eq!(entries.len(), 2);
@@ -632,7 +643,7 @@ mod tests {
     fn resize_preserves_all_entries() {
         let mut table = new_table(16);
         for i in 0..8u64 {
-            table.merge::<false, _>(i + 1, i, Count(1));
+            table.merge::<false, _, _>(i + 1, i, Count(1), add_counts);
         }
 
         let new_buf = vec![Entry::default(); 32];
@@ -649,8 +660,8 @@ mod tests {
     #[test]
     fn resize_resets_collision_counter() {
         let mut table = new_table(16);
-        table.merge::<true, _>(42, 1u64, Count(1));
-        table.merge::<true, _>(42, 2u64, Count(1));
+        table.merge::<true, _, _>(42, 1u64, Count(1), add_counts);
+        table.merge::<true, _, _>(42, 2u64, Count(1), add_counts);
         let pre_resize_collisions = table.collisions();
         assert!(pre_resize_collisions > 0);
 
@@ -665,7 +676,7 @@ mod tests {
         let mut table = new_table(256);
 
         for i in 0..100u64 {
-            table.merge::<false, _>(i + 1, i, Count(1));
+            table.merge::<false, _, _>(i + 1, i, Count(1), add_counts);
         }
 
         assert_eq!(table.len(), 100);
@@ -680,9 +691,9 @@ mod tests {
         let mut table = new_table(16);
         let last_slot_hash = u64::MAX;
 
-        table.merge::<false, _>(last_slot_hash, 1u64, Count(1));
-        table.merge::<false, _>(last_slot_hash, 2u64, Count(1));
-        table.merge::<false, _>(last_slot_hash, 3u64, Count(1));
+        table.merge::<false, _, _>(last_slot_hash, 1u64, Count(1), add_counts);
+        table.merge::<false, _, _>(last_slot_hash, 2u64, Count(1), add_counts);
+        table.merge::<false, _, _>(last_slot_hash, 3u64, Count(1), add_counts);
 
         assert_eq!(table.len(), 3);
         let keys: Vec<u64> = table.iter(0).map(|e| *e.key()).collect();
@@ -703,13 +714,13 @@ mod tests {
     #[test]
     fn merge_after_resize() {
         let mut table = new_table(16);
-        table.merge::<false, _>(42, 1u64, Count(1));
-        table.merge::<false, _>(99, 2u64, Count(1));
+        table.merge::<false, _, _>(42, 1u64, Count(1), add_counts);
+        table.merge::<false, _, _>(99, 2u64, Count(1), add_counts);
 
         let new_buf = vec![Entry::default(); 32];
         table.resize_with(new_buf, 32);
-        table.merge::<false, _>(42, 1u64, Count(1));
-        table.merge::<false, _>(200, 3u64, Count(1));
+        table.merge::<false, _, _>(42, 1u64, Count(1), add_counts);
+        table.merge::<false, _, _>(200, 3u64, Count(1), add_counts);
 
         assert_eq!(table.len(), 3);
         let merged = table.iter(0).find(|e| *e.key() == 1).unwrap();
@@ -720,7 +731,7 @@ mod tests {
     #[test]
     fn entry_at_returns_correct_slot() {
         let mut table = new_table(16);
-        table.merge::<false, _>(42, 100u64, Count(1));
+        table.merge::<false, _, _>(42, 100u64, Count(1), add_counts);
 
         let occupied: Vec<usize> = (0..table.capacity())
             .filter(|&i| table.entry_at(i).hash() != 0)
@@ -734,7 +745,7 @@ mod tests {
     fn iter_with_start_offset() {
         let mut table = new_table(128);
         for i in 0..20u64 {
-            table.merge::<false, _>(i + 1, i, Count(1));
+            table.merge::<false, _, _>(i + 1, i, Count(1), add_counts);
         }
 
         let all_count = table.iter(0).count();

@@ -161,6 +161,12 @@ impl Aggregate {
                         Expression::AggregateFunc(AggregateFunc::Sum(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Sum, a.column.column_idx),
                         ),
+                        Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(
+                            AggregationSlot::new(AggregationKind::Min, a.column.column_idx),
+                        ),
+                        Expression::AggregateFunc(AggregateFunc::Max(a)) => Ok(
+                            AggregationSlot::new(AggregationKind::Max, a.column.column_idx),
+                        ),
                         Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Count, a.column.column_idx),
                         ),
@@ -551,6 +557,14 @@ impl Aggregate {
                     AggregationKind::Sum,
                     a.column.column_idx,
                 )),
+                Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(AggregationSlot::new(
+                    AggregationKind::Min,
+                    a.column.column_idx,
+                )),
+                Expression::AggregateFunc(AggregateFunc::Max(a)) => Ok(AggregationSlot::new(
+                    AggregationKind::Max,
+                    a.column.column_idx,
+                )),
                 Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(AggregationSlot::new(
                     AggregationKind::Count,
                     a.column.column_idx,
@@ -566,6 +580,11 @@ impl Aggregate {
         enum Sig {
             Count,
             Sum(Type),
+            /// MIN/MAX (and any other kind with no compiled specialisation). A
+            /// distinct variant so these never match a compiled Count/Sum shape
+            /// — doing so would monomorphise the wrong op and silently compute a
+            /// count/sum instead of the extreme. Always routes to the fallback.
+            Other,
         }
         let sig: Vec<Sig> = self
             .expressions
@@ -574,8 +593,11 @@ impl Aggregate {
                 Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
                     Sig::Sum(a.column.return_type.clone())
                 }
-                // CountStar / Count — validated above when building `slots`.
-                _ => Sig::Count,
+                Expression::AggregateFunc(
+                    AggregateFunc::CountStar(_) | AggregateFunc::Count(_),
+                ) => Sig::Count,
+                // MIN/MAX: no compiled shape yet → fallback (see `Sig::Other`).
+                _ => Sig::Other,
             })
             .collect();
 

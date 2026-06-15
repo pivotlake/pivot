@@ -57,6 +57,17 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
+            fn merge(
+                a: AggregationRow<$n, Acc>,
+                b: AggregationRow<$n, Acc>,
+                _slots: &[AggregationSlot],
+            ) -> AggregationRow<$n, Acc> {
+                // Each op's KIND is a const, so the combine match folds to a
+                // straight `+`/`min`/`max` per slot — no runtime branch.
+                AggregationRow([$( $Op::KIND.combine(a.0[$idx], b.0[$idx]), )+])
+            }
+
+            #[inline(always)]
             fn sort_key(value: &AggregationRow<$n, Acc>, slot: usize) -> Acc {
                 value.0[slot]
             }

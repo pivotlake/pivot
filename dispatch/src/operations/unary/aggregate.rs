@@ -91,7 +91,9 @@ impl<A: Accumulator> Aggregate<A> {
         sender: mpsc::Sender<Vec<A>>,
         receiver: Option<mpsc::Receiver<Vec<A>>>,
     ) -> Self {
-        let local = vec![A::default(); slots.len()];
+        // Seed each slot with its kind's identity (0 for SUM/COUNT, the width's
+        // extreme for MIN/MAX) so the first contribution combines cleanly.
+        let local = slots.iter().map(|s| s.kind.identity::<A>()).collect();
         Aggregate {
             slots,
             local,
@@ -101,29 +103,32 @@ impl<A: Accumulator> Aggregate<A> {
     }
 }
 
-/// Sum an integer primitive column into the accumulator `A`.
+/// Reduce one batch's integer column to a single partial of `kind` (`SUM`,
+/// `MIN` or `MAX`) in the accumulator width `A`.
 ///
 /// The per-row value read (downcast + widen to `i64`) is delegated to the GROUP
-/// BY [`Sum`] op — the single source of truth for what `SUM` contributes per
-/// row. The fold accumulates into `A`: `i64` for 16/32-bit columns (a full scan
-/// can't overflow it) and `i128` for a 64-bit column (whose values can approach
-/// `i64::MAX`), the width the planner picks.
-fn sum_column<A: Accumulator>(arr: &dyn Array) -> A {
-    macro_rules! sum_primitive {
+/// BY [`Sum`] op — the single source of truth for what a column-reading
+/// aggregate contributes per row; the values themselves are identical for `SUM`/
+/// `MIN`/`MAX`, only the fold differs ([`AggregationKind::combine`]). The fold
+/// accumulates into `A`: `i64` suffices for 16/32-bit sums (a full scan can't
+/// overflow it) and for every `MIN`/`MAX` (an extreme never grows past its
+/// inputs); `i128` is for a 64-bit `SUM`, the width the planner picks.
+fn reduce_column<A: Accumulator>(kind: AggregationKind, arr: &dyn Array) -> A {
+    macro_rules! reduce_primitive {
         ($ty:ty) => {{
             let a = arr.as_primitive::<$ty>();
-            let mut acc = A::default();
+            let mut acc = kind.identity::<A>();
             for i in 0..a.len() {
-                acc += A::from(Sum::<$ty>::contribution(&a, i));
+                acc = kind.combine(acc, A::from(Sum::<$ty>::contribution(&a, i)));
             }
             acc
         }};
     }
 
     match arr.data_type() {
-        DataType::Int16 => sum_primitive!(Int16Type),
-        DataType::Int32 => sum_primitive!(Int32Type),
-        DataType::Int64 => sum_primitive!(Int64Type),
+        DataType::Int16 => reduce_primitive!(Int16Type),
+        DataType::Int32 => reduce_primitive!(Int32Type),
+        DataType::Int64 => reduce_primitive!(Int64Type),
         other => panic!("aggregate: unsupported column type {other:?}"),
     }
 }
@@ -131,12 +136,19 @@ fn sum_column<A: Accumulator>(arr: &dyn Array) -> A {
 /// Build the single output column for one aggregate slot from its accumulator.
 fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, ArrayRef) {
     match kind {
-        // `Int64` or `Decimal128(38, 0)` per the accumulator width.
-        AggregationKind::Sum => {
+        // `Int64` or `Decimal128(38, 0)` per the accumulator width. `MIN`/`MAX`
+        // emit at the same accumulator width as `SUM` for now; op-owned narrow
+        // output (e.g. `MIN(int16)` → `Int16`) arrives with the string slice.
+        AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
             let array = A::finalize(Arc::new(PrimitiveArray::<A::Arrow>::from_iter_values([
                 value,
             ])));
-            (Field::new("sum", array.data_type().clone(), false), array)
+            let name = match kind {
+                AggregationKind::Min => "min",
+                AggregationKind::Max => "max",
+                _ => "sum",
+            };
+            (Field::new(name, array.data_type().clone(), false), array)
         }
         // A count can't exceed the row count, so it always fits i64; the checked
         // narrowing panics on the impossible overflow rather than truncating.
@@ -159,7 +171,10 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
         _output: &mut OP,
     ) -> unary::Result<()> {
         for (i, slot) in self.slots.iter().enumerate() {
-            self.local[i] += match slot.kind {
+            // This batch's partial for the slot, then folded into the running
+            // local with the kind's combine (add for SUM/COUNT, extreme for
+            // MIN/MAX) — additive kinds reduce to the old `+=`.
+            let contribution = match slot.kind {
                 // COUNT(*) counts every row and never reads a column.
                 AggregationKind::CountStar => A::from(batch.num_rows() as i64),
                 // COUNT(c) needs only the non-null count, not the values — read
@@ -168,8 +183,11 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
                     let col = batch.column(slot.column);
                     A::from((col.len() - col.null_count()) as i64)
                 }
-                AggregationKind::Sum => sum_column::<A>(batch.column(slot.column)),
+                AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
+                    reduce_column::<A>(slot.kind, batch.column(slot.column))
+                }
             };
+            self.local[i] = slot.kind.combine(self.local[i], contribution);
         }
         Ok(())
     }
@@ -184,7 +202,7 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
             .expect("aggregate collector dropped");
         worker_waker().notify();
 
-        let totals = vec![A::default(); self.slots.len()];
+        let totals = self.slots.iter().map(|s| s.kind.identity::<A>()).collect();
         Ok(self.receiver.map(|rx| AggregateOutputter {
             rx,
             slots: self.slots,
@@ -206,8 +224,10 @@ impl<A: Accumulator> Outputter<RecordBatch> for AggregateOutputter<A> {
         loop {
             match self.rx.try_recv() {
                 Ok(partial) => {
-                    for (total, p) in self.totals.iter_mut().zip(&partial) {
-                        *total += *p;
+                    // Fold each worker's partial with the slot's kind-aware
+                    // combine — additive for SUM/COUNT, the extreme for MIN/MAX.
+                    for (i, p) in partial.iter().enumerate() {
+                        self.totals[i] = self.slots[i].kind.combine(self.totals[i], *p);
                     }
                 }
                 // Some siblings haven't finished yet; resume when re-driven.
@@ -334,6 +354,44 @@ mod tests {
         let ops = build::<i64>(1, vec![slot(AggregationKind::CountStar, 0)]);
         let out = run_consumers(ops, vec![vec![make_batch(&[5, 6, 7]), make_batch(&[8])]]);
         assert_eq!(col_i64(&out.items[0], 0), 4);
+    }
+
+    #[test]
+    fn min_and_max_over_batches() {
+        // MIN/MAX fold the extreme across rows and across batches, not a sum.
+        let ops = build::<i64>(
+            1,
+            vec![slot(AggregationKind::Min, 0), slot(AggregationKind::Max, 0)],
+        );
+        let out = run_consumers(
+            ops,
+            vec![vec![make_batch(&[5, 2, 9]), make_batch(&[7, 1, 8])]],
+        );
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(col_i64(&out.items[0], 0), 1); // min
+        assert_eq!(col_i64(&out.items[0], 1), 9); // max
+    }
+
+    #[test]
+    fn min_max_merge_across_workers() {
+        // Each worker's partial extreme combines (not adds) at the collector, so
+        // the global MIN/MAX is the extreme of all workers' extremes — including
+        // negatives, which the MAX identity (i64::MIN) must not swallow.
+        let ops = build::<i64>(
+            3,
+            vec![slot(AggregationKind::Min, 0), slot(AggregationKind::Max, 0)],
+        );
+        let out = run_consumers(
+            ops,
+            vec![
+                vec![make_batch(&[10, 4])],
+                vec![make_batch(&[-3, 20])],
+                vec![make_batch(&[7])],
+            ],
+        );
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(col_i64(&out.items[0], 0), -3); // min
+        assert_eq!(col_i64(&out.items[0], 1), 20); // max
     }
 
     #[test]

@@ -203,7 +203,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             if self.switched_to_radix {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
-                self.consume_scalared(length, &key_reader, &value_reader);
+                self.consume_scalared(length, value_slots, &key_reader, &value_reader);
             }
         }
         self.scratch = scratch;
@@ -217,6 +217,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     fn consume_scalared<'b>(
         &mut self,
         length: usize,
+        value_slots: &[AggregationSlot],
         key_reader: &K::Reader<'b>,
         value_reader: &V::Reader<'b>,
     ) {
@@ -245,7 +246,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 }
                 let key = K::live_key(key_reader, i, &mut self.worker_arena);
                 let value = V::value(value_reader, i);
-                table.merge::<false, _>(hash, key, value);
+                table.merge::<false, _, _>(hash, key, value, |a, b| V::merge(a, b, value_slots));
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
