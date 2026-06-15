@@ -1,0 +1,9 @@
+# Container images the object-store integration tests pull via testcontainers.
+# CI caches these (keyed on this file's contents) and `docker load`s them so a
+# cache hit never pulls from Docker Hub. Keep in sync with the tags the tests
+# actually request, or a stale entry just causes a one-time miss (testcontainers
+# pulls the real tag itself):
+#   - MinIO: testcontainers-modules `MinIO` default tag (bump with that crate)
+#   - fake-gcs-server: the tag in catalog/src/test_support.rs
+minio/minio:RELEASE.2025-02-28T09-55-16Z
+fsouza/fake-gcs-server:1.52.2
