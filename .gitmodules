@@ -4,3 +4,4 @@
 [submodule "duckdb-planner/duckdb-sources"]
 	path = duckdb-planner/duckdb-sources
 	url = https://github.com/Epsio-Labs/duckdb.git
+	branch = pivot-main
