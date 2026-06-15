@@ -139,6 +139,24 @@ impl MemoryContext {
             .and_then(|i| memory_ctx().ring().try_write(i))
     }
 
+    /// Drain this worker's dirty buffers, zeroing each and returning it to the
+    /// zeroed pool. Equivalent to the engine's idle-time dirty-buffer cleanup,
+    /// but run eagerly to completion rather than opportunistically.
+    ///
+    /// Must run on the worker thread that owns this context (its `pop`/`push`
+    /// touch the per-worker free pool). Returns the number of buffers zeroed.
+    /// Intended for benchmarks: re-zeroing dirtied buffers between iterations is
+    /// allocation/setup work, so doing it eagerly (outside the timed region)
+    /// keeps the next query's hash-table allocation from re-zeroing inline.
+    pub fn zero_dirty_buffers(&self) -> usize {
+        let mut zeroed = 0;
+        while let Some(buf) = self.pop_dirty_buffer() {
+            buf.zero_out();
+            zeroed += 1;
+        }
+        zeroed
+    }
+
     /// Acquire a [`WriteBuffer`] from the free pool, falling back to eviction.
     ///
     /// When `prefer_zeroed` is true, tries the zeroed pool first — use this when the caller
