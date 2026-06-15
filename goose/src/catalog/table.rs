@@ -205,14 +205,18 @@ impl CatalogTable {
         }
         self.manifest = manifest;
         self.sync_files_to_manifest()?;
-        // GC superseded versions. Best-effort: the commit already stands, so a
-        // prune failure is logged, not propagated.
-        if let Err(e) =
-            TableManifest::prune_old_versions(self.store.as_ref(), &self.name, self.manifest.version)
-        {
-            tracing::warn!(table = %self.name, error = %e, "pruning old manifest versions failed");
-        }
         Ok(true)
+    }
+
+    /// Garbage-collect this table's superseded manifest versions, keeping only a
+    /// recent tail (see [`TableManifest::prune_old_versions`]). Each commit
+    /// leaves a new version file behind; this reclaims the old ones so a busy
+    /// table's version directory stays small and the `list` every bind does
+    /// stays cheap. The compacter drives it — it's the background sweep that
+    /// already polls every table.
+    pub fn prune_old_versions(&self) -> crate::Result<()> {
+        TableManifest::prune_old_versions(self.store.as_ref(), &self.name, self.manifest.version)?;
+        Ok(())
     }
 
     /// Reconcile `files` to the current `manifest`: drop the files no longer in

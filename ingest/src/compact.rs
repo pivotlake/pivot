@@ -149,6 +149,12 @@ impl Compacter {
                 }
             }
         }
+        // Reclaim the manifest versions left behind by this round's swaps (and
+        // by any appends since the last sweep). Best-effort: a failure here just
+        // leaves the old version files for the next round.
+        if let Err(e) = table.prune_old_versions() {
+            warn!(table = table.name(), error = %e, "compaction: pruning old manifest versions failed");
+        }
     }
 
     /// The next batch of `table`'s files to merge, straight from its current

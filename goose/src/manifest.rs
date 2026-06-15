@@ -99,10 +99,11 @@ impl TableManifest {
         Ok(store.put_if_absent(&Self::key(name, self.version), &serde_json::to_vec(self)?)?)
     }
 
-    /// Best-effort GC of superseded versions: delete every committed version of
-    /// table `name` older than the [`VERSIONS_RETAINED`] most recent. Called
-    /// after a commit; safe to fail (the commit stands either way) and safe to
-    /// run concurrently — a double delete of the same key is harmless.
+    /// GC of superseded versions: delete every committed version of table
+    /// `name` older than the [`VERSIONS_RETAINED`] most recent. Driven by the
+    /// compacter's background sweep, not by commit — and safe to run
+    /// concurrently with commits and other sweeps, since a double delete of the
+    /// same key is harmless.
     pub fn prune_old_versions(store: &dyn ObjectStore, name: &str, latest: u64) -> Result<()> {
         let cutoff = latest.saturating_sub(VERSIONS_RETAINED);
         if cutoff == 0 {
