@@ -70,6 +70,21 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Outcome of an operator's [`try_finish`](Operator::try_finish).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum FinishStatus {
+    /// Fully finished. The worker latches this and stops calling `try_finish`.
+    Done,
+    /// Still producing final output and needs to be re-driven — e.g. a pipeline
+    /// breaker draining its outputter over several calls. The worker keeps
+    /// driving it (via `run_cpu_work`) rather than parking; it doesn't wake
+    /// peers, because the output's own downstream `send`s already do.
+    Working,
+    /// Not ready to finish: input still draining, or waiting on a sibling to
+    /// catch up. The worker may park — a sibling's finish will wake it.
+    Pending,
+}
+
 /// A single node in a `DataFlow`.
 ///
 /// Each operator lives for the full lifetime of the dataflow on one worker thread.
@@ -107,9 +122,10 @@ pub trait Operator {
     /// cache. Called by the worker when the read finishes.
     fn process_http_response(&mut self, request: HttpRequest) -> Result<()>;
 
-    /// Attempt to finish, return whether the operator is ready to finish. Regardless of whether it
-    /// is, this function may be called many times.
-    fn try_finish(&mut self) -> Result<bool>;
+    /// Attempt to finish. Returns a [`FinishStatus`] telling the worker whether
+    /// the operator is done, still working (re-drive, don't park), or not yet
+    /// ready. May be called many times until it reports [`FinishStatus::Done`].
+    fn try_finish(&mut self) -> Result<FinishStatus>;
 
     /// Try to steal work from a peer worker's channel. Default: no stealing.
     fn try_steal_work(&mut self) -> Result<WorkStatus> {

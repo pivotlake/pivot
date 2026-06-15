@@ -22,7 +22,7 @@
 
 use crate::Identifier;
 use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
-use crate::operations::Operator;
+use crate::operations::{FinishStatus, Operator};
 use crate::worker::worker_waker;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -243,26 +243,40 @@ impl DataFlow {
         }
     }
 
-    /// Try to finish all operators (root-to-leaf). Returns `true` if every operator
-    /// has completed, meaning this dataflow can be removed from the worker.
+    /// Drive every operator's finish (root-to-leaf) and report the dataflow's
+    /// aggregate [`FinishStatus`]: [`Done`](FinishStatus::Done) when all
+    /// operators have finished (the worker drops the dataflow),
+    /// [`Working`](FinishStatus::Working) when one is still producing output
+    /// (the worker must keep driving rather than park), or
+    /// [`Pending`](FinishStatus::Pending) when stalled on input/siblings (the
+    /// worker may park).
     ///
-    /// Operators that have already reported `try_finish == true` are latched
-    /// via `OperatorNode::finished` and skipped on subsequent passes, so each
-    /// operator's `try_finish` is invoked at most once after it reports done.
-    pub fn maybe_finish(&mut self) -> bool {
-        self.try_run_or(false, |d| {
-            d.graph
-                .traverse_forwards(|node| {
-                    if !node.finished {
-                        node.finished = node.operator.try_finish()?;
+    /// Operators that have reported [`FinishStatus::Done`] are latched via
+    /// `OperatorNode::finished` and skipped on subsequent passes.
+    pub fn maybe_finish(&mut self) -> FinishStatus {
+        self.try_run_or(FinishStatus::Pending, |d| {
+            let mut working = false;
+            let completed = d.graph.traverse_forwards(|node| {
+                if !node.finished {
+                    match node.operator.try_finish()? {
+                        FinishStatus::Done => node.finished = true,
+                        FinishStatus::Working => working = true,
+                        FinishStatus::Pending => {}
                     }
-                    Ok(if node.finished {
-                        ControlFlow::Continue(())
-                    } else {
-                        ControlFlow::Break(())
-                    })
+                }
+                Ok(if node.finished {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(())
                 })
-                .map(|c| matches!(c, ControlFlow::Continue(..)))
+            })?;
+            Ok(if matches!(completed, ControlFlow::Continue(..)) {
+                FinishStatus::Done
+            } else if working {
+                FinishStatus::Working
+            } else {
+                FinishStatus::Pending
+            })
         })
     }
 
