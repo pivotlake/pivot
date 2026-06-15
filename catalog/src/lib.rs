@@ -19,6 +19,11 @@ mod catalog;
 mod manifest;
 pub mod parquet;
 pub mod store;
+/// A Docker-backed object-store test harness (MinIO / fake-gcs-server). Gated
+/// behind the `test-support` feature so it — and its heavy testcontainers deps —
+/// never enter a normal build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use catalog::{CatalogTable, Error, ParquetCatalog, Result, TableBinding};
 pub use store::FileRef;

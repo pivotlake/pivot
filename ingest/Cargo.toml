@@ -46,3 +46,15 @@ planner = { path = "../planner" }
 # Strict, spec-compliant reader used only as a test oracle: if arrow-rs's
 # reader accepts our hand-rolled files, other engines (DuckDB, etc.) will too.
 parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+# The OTLP-over-gRPC end-to-end test drives a running `Ingestor` from outside:
+# `dispatch`/`catalog` to set up the engine + table and read rows back, and a
+# `tonic` OTLP client (built from `opentelemetry-proto`'s gen-tonic code) to
+# send telemetry over the wire. (All already resolved as normal dependencies.)
+dispatch = { path = "../dispatch" }
+catalog = { path = "../catalog" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+tonic = { version = "0.14", features = ["transport"] }
+opentelemetry-proto = { version = "0.31", default-features = false, features = [
+    "gen-tonic",
+    "logs",
+] }

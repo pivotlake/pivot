@@ -143,7 +143,7 @@ mod blocking_engine {
         /// returning the connection for re-pooling on success.
         fn do_request(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
             let request = proto::build_range_get(
-                read.remote.host(),
+                read.remote.host_header(),
                 read.remote.request_target(),
                 read.offset,
                 read.len,
@@ -570,7 +570,7 @@ mod uring_engine {
             };
 
             let request_bytes = proto::build_range_get(
-                read.remote.host(),
+                read.remote.host_header(),
                 read.remote.request_target(),
                 read.offset,
                 read.len,
@@ -689,7 +689,7 @@ mod uring_engine {
         conn.dest = read.dest;
         conn.req_len = read.len;
         conn.request_bytes = proto::build_range_get(
-            read.remote.host(),
+            read.remote.host_header(),
             read.remote.request_target(),
             read.offset,
             read.len,

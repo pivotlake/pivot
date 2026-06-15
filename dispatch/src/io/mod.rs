@@ -112,8 +112,15 @@ pub struct RemoteFile {
     id: u32,
     /// `IP:port`, resolved once at construction (the port lives here too).
     addr: SocketAddr,
-    /// Host for the `Host:` header and TLS SNI — `addr` only carries the IP.
+    /// Bare hostname for TLS SNI — `addr` only carries the IP, and SNI must not
+    /// include a port.
     host: String,
+    /// Value for the `Host:` request header: the bare host, plus the port when
+    /// the URL carries a non-default one. A presigned URL's SigV4 signature
+    /// covers this exact `host` header, so an S3-compatible endpoint on a custom
+    /// port (e.g. MinIO at `localhost:9000`) rejects the request as a signature
+    /// mismatch if the port is dropped.
+    host_header: String,
     /// Origin-form request target (path + query) for the HTTP request line.
     request_target: String,
     is_https: bool,
@@ -159,10 +166,18 @@ impl RemoteFile {
             request_target.push_str(query);
         }
 
+        // `Url::port()` is `Some` only for an explicit, non-default port — the
+        // same condition under which the catalog's presign signs `host:port`.
+        let host_header = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.clone(),
+        };
+
         Ok(Self {
             id: NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed),
             addr,
             host,
+            host_header,
             request_target,
             is_https,
         })
@@ -170,6 +185,12 @@ impl RemoteFile {
 
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// The `Host:` request-header value (host plus a non-default port). Distinct
+    /// from [`host`](Self::host), which is the bare hostname for TLS SNI.
+    pub fn host_header(&self) -> &str {
+        &self.host_header
     }
     pub fn port(&self) -> u16 {
         self.addr.port()

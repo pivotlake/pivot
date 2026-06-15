@@ -32,3 +32,6 @@ tempfile = "3"
 parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
 core_affinity = "0.8.3"
 rstest = "0.26"
+# Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
+# the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
+catalog = { path = "../catalog", features = ["test-support"] }
