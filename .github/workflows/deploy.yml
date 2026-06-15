@@ -1,4 +1,4 @@
-name: Deploy Server (ARM)
+name: Deploy Server
 
 on:
   workflow_dispatch:
@@ -18,10 +18,19 @@ env:
 
 jobs:
   deploy:
-    name: Build aarch64 release + upload to GCS
-    # Native ARM64 GitHub-hosted runner — no emulation. Free for public repos;
-    # private repos need a Team/Enterprise plan or a self-hosted arm64 runner.
-    runs-on: ubuntu-24.04-arm
+    name: Build ${{ matrix.arch }} release + upload to GCS
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners per arch — no emulation. The arm64 hosted runner is
+          # free for public repos; private repos need a Team/Enterprise plan or
+          # a self-hosted arm64 runner.
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +52,7 @@ jobs:
         with:
           workspaces: server
 
-      - name: Build release binary (aarch64)
+      - name: Build release binary (${{ matrix.arch }})
         working-directory: server
         run: cargo build --release --bin pivotdb-server
 
@@ -58,6 +67,7 @@ jobs:
         env:
           BUCKET: ${{ inputs.bucket != '' && inputs.bucket || vars.DEPLOY_GCS_BUCKET }}
           SHA: ${{ github.sha }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           if [ -z "$BUCKET" ]; then
@@ -69,9 +79,9 @@ jobs:
           BIN=server/target/release/pivotdb-server
 
           # Upload an immutable, SHA-pinned copy plus a moving `latest` pointer.
-          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-aarch64-$SHA"
-          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-aarch64-latest"
+          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-$ARCH-$SHA"
+          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-$ARCH-latest"
 
           echo "Uploaded to:"
-          echo "  $BUCKET/pivotdb-server-aarch64-$SHA"
-          echo "  $BUCKET/pivotdb-server-aarch64-latest"
+          echo "  $BUCKET/pivotdb-server-$ARCH-$SHA"
+          echo "  $BUCKET/pivotdb-server-$ARCH-latest"
