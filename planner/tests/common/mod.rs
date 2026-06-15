@@ -11,8 +11,8 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
+use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
-use goose::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use planner::Planner;
 use planner::catalog::{Catalog, Column, DynamicScanPredicate, Table};
 use planner::types::Type;
@@ -97,7 +97,7 @@ impl Table for TestTable {
         input: RecordBatchOperatorSpec,
         projection: Projection,
     ) -> RecordBatchOperatorSpec {
-        goose::parquet::materialize(input, self.parquet_table.clone(), projection)
+        catalog::parquet::materialize(input, self.parquet_table.clone(), projection)
     }
 }
 

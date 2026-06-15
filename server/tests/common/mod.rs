@@ -12,7 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dispatch::Dispatch;
-use goose::ParquetCatalog;
+use catalog::ParquetCatalog;
 use rstest::fixture;
 use server::Server;
 use tokio_postgres::{Client, NoTls};
@@ -54,13 +54,13 @@ pub fn server_port() -> u16 {
 
         thread::spawn(move || {
             let dispatch = Dispatch::spin_up(workers, 32);
-            let catalog: Arc<dyn planner::catalog::Catalog> = Arc::new(ParquetCatalog::new());
+            let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let server = Server::new(bind, dispatch, catalog, vec![]);
+                let server = Server::new(bind, dispatch, catalog, vec![], 0);
                 let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
             });
         });

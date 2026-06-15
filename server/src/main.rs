@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch};
-use goose::ParquetCatalog;
-use ingest::{IngestConfig, OtelConfig, Signal, SinkDestination};
+use catalog::ParquetCatalog;
+use ingest::{IngestConfig, OtelConfig, Signal};
 use server::{Error, Server};
 use tracing::{error, info};
 
@@ -55,6 +55,12 @@ struct Args {
     /// for the file format.
     #[arg(long = "otel-config", value_name = "PATH")]
     otel_config: Vec<OtelFileSpec>,
+
+    /// Run the bundled compacter: any table's Parquet files smaller than this
+    /// are merged into one (CPU on the dispatch pool) once they amount to it.
+    /// `0` disables it — e.g. when a dedicated compacter process owns the job.
+    #[arg(long, default_value_t = ingest::DEFAULT_COMPACT_BYTES)]
+    compact_bytes: u64,
 }
 
 impl Args {
@@ -91,35 +97,40 @@ impl std::str::FromStr for OtelSpec {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut addr: Option<SocketAddr> = None;
-        let mut logs = None;
-        let mut traces = None;
-        let mut metrics = None;
+        let mut logs = false;
+        let mut traces = false;
+        let mut metrics = false;
         let mut flush_rows = None;
         let mut flush_secs = None;
 
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let (key, value) = part
-                .split_once('=')
-                .ok_or_else(|| format!("expected `key=value`, got `{part}`"))?;
-            let value = value.trim();
-            match key.trim() {
-                "addr" => addr = Some(value.parse().map_err(|e| format!("addr `{value}`: {e}"))?),
-                "logs" => logs = Some(SinkDestination::parse(value)),
-                "traces" => traces = Some(SinkDestination::parse(value)),
-                "metrics" => metrics = Some(SinkDestination::parse(value)),
+            let (key, value) = match part.split_once('=') {
+                Some((k, v)) => (k.trim(), Some(v.trim())),
+                None => (part, None),
+            };
+            match key {
+                "addr" => {
+                    let v = value.ok_or("`addr` expects `addr=<host:port>`")?;
+                    addr = Some(v.parse().map_err(|e| format!("addr `{v}`: {e}"))?);
+                }
                 "flush_rows" => {
-                    flush_rows = Some(
-                        value
-                            .parse()
-                            .map_err(|e| format!("flush_rows `{value}`: {e}"))?,
-                    )
+                    let v = value.ok_or("`flush_rows` expects `flush_rows=<n>`")?;
+                    flush_rows = Some(v.parse().map_err(|e| format!("flush_rows `{v}`: {e}"))?);
                 }
                 "flush_secs" => {
-                    flush_secs = Some(
-                        value
-                            .parse()
-                            .map_err(|e| format!("flush_secs `{value}`: {e}"))?,
-                    )
+                    let v = value.ok_or("`flush_secs` expects `flush_secs=<n>`")?;
+                    flush_secs = Some(v.parse().map_err(|e| format!("flush_secs `{v}`: {e}"))?);
+                }
+                // Signals are flags: each appends to its `otel_<signal>` table
+                // (which must already exist). Custom tables/columns go through
+                // `--otel-config`.
+                "logs" if value.is_none() => logs = true,
+                "traces" if value.is_none() => traces = true,
+                "metrics" if value.is_none() => metrics = true,
+                "logs" | "traces" | "metrics" => {
+                    return Err(format!(
+                        "`{key}` is a flag (it appends to the `otel_{key}` table); use --otel-config for a custom table"
+                    ));
                 }
                 other => return Err(format!("unknown key `{other}` in --otel spec")),
             }
@@ -136,16 +147,15 @@ impl std::str::FromStr for OtelSpec {
         if let Some(secs) = flush_secs {
             cfg.flush_interval = Duration::from_secs(secs);
         }
-        // The inline spec uses the built-in default column mapping for each
-        // enabled signal; `--otel-config` is the route to custom columns.
-        for (signal, dest) in [
+        // The inline spec uses the built-in default column mapping and table for
+        // each enabled signal; `--otel-config` is the route to custom columns.
+        for (signal, enabled) in [
             (Signal::Logs, logs),
             (Signal::Traces, traces),
             (Signal::Metrics, metrics),
         ] {
-            if let Some(dest) = dest {
-                cfg.enable_default(signal, dest)
-                    .map_err(|e| e.to_string())?;
+            if enabled {
+                cfg.enable_default(signal).map_err(|e| e.to_string())?;
             }
         }
         Ok(OtelSpec(cfg))
@@ -197,11 +207,11 @@ fn main() -> Result<(), Error> {
                 }),
             )
         }
-        None => Arc::new(ParquetCatalog::new()),
+        None => Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone())),
     };
 
     rt.block_on(async move {
-        let server = Server::new(args.bind, dispatch, catalog, ingests);
+        let server = Server::new(args.bind, dispatch, catalog, ingests, args.compact_bytes);
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;
         });

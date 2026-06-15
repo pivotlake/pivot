@@ -3,6 +3,7 @@ use crate::io::backend::IOBackend;
 use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
 use crate::io::{Completion, DataFlowRequest, FsRequest, HttpRequest};
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -76,7 +77,7 @@ impl IORequester {
     /// the read even if the issuing query is cancelled meanwhile.
     pub fn request(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
         self.backend.submit_read(
-            request.request.fd,
+            request.request.file.as_raw_fd(),
             request.request.block.file_offset() as u64,
             request.request.block.dest(),
             request.request.block.len(),

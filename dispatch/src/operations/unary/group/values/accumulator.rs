@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 /// An aggregate slot's accumulator integer: `i64` (narrow) or `i128` (wide).
 ///
-/// A width is just an integer that combines by addition ([`AddAssign`]), is
+/// A width is just an integer that combines by addition ([`core::ops::AddAssign`]), is
 /// built from a per-row `i64` contribution ([`From<i64>`]), widens losslessly to
 /// `i128` ([`Into<i128>`], for narrowing `COUNT` columns through a checked
 /// `i64::try_from`), is comparable ([`Ord`], for top-k sort keys), and maps to

@@ -20,9 +20,9 @@
 
 use crate::query_handler::PivotHandlers;
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
+use catalog::ParquetCatalog;
 use ingest::{IngestConfig, Ingestor};
 use pgwire::tokio::process_socket;
-use planner::catalog::Catalog;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,8 +59,14 @@ pub struct Server {
     /// Cloned dispatcher handed to the ingest sources so their Parquet encodes
     /// run on the same worker pool as queries.
     dispatcher: DataFlowDispatcher,
+    /// The concrete catalog, kept so the ingest sources can register (and
+    /// compact) the Parquet files they write. The query handlers hold it as a
+    /// `dyn Catalog`.
+    catalog: Arc<ParquetCatalog>,
     /// Ingest sources to start when [`serve`](Self::serve) runs.
     ingests: Vec<IngestConfig>,
+    /// Target size for the bundled compacter (`0` = don't run one).
+    compact_bytes: u64,
 }
 
 impl Server {
@@ -73,8 +79,9 @@ impl Server {
     pub fn new(
         bind: SocketAddr,
         dispatch: Dispatch,
-        catalog: Arc<dyn Catalog>,
+        catalog: Arc<ParquetCatalog>,
         ingests: Vec<IngestConfig>,
+        compact_bytes: u64,
     ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
         // handler needs it to compile every plan, and the ingest sources need
@@ -89,9 +96,11 @@ impl Server {
             bind,
             shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(catalog, dispatcher.clone())),
+            handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher.clone())),
             dispatcher,
+            catalog,
             ingests,
+            compact_bytes,
         }
     }
 
@@ -113,9 +122,13 @@ impl Server {
         // encode Parquet on the dispatch workers, so they must be drained
         // before the workers stop. `Option` so the two terminal arms below can
         // each take ownership without the borrow checker tripping over the loop.
+        // The catalog lets each sink register (and compact) the files it
+        // writes, so ingested rows are queryable as they land.
         let mut ingestor = Some(Ingestor::start(
             std::mem::take(&mut self.ingests),
             self.dispatcher.clone(),
+            self.catalog.clone(),
+            self.compact_bytes,
         )?);
 
         loop {
@@ -195,42 +208,24 @@ fn format_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use planner::catalog::{
-        Catalog as PlannerCatalog, CreateTableRequest, Result as CatalogResult, Table,
-    };
     use tokio::sync::oneshot;
-
-    /// Minimal `Catalog` impl: `Server::serve` never touches the catalog
-    /// (it's only consulted on incoming queries, which these tests don't drive),
-    /// so every method is unreachable. Avoids pulling `ParquetCatalog` in.
-    #[derive(Debug)]
-    struct StubCatalog;
-
-    impl PlannerCatalog for StubCatalog {
-        fn table(&self, _name: &str) -> Option<Box<dyn Table>> {
-            None
-        }
-        fn create_table(
-            &self,
-            _request: CreateTableRequest,
-            _dispatcher: &dispatch::DataFlowDispatcher,
-        ) -> CatalogResult<dispatch::RecordBatchOperatorSpec> {
-            unreachable!("Server::serve never compiles a CREATE TABLE")
-        }
-    }
 
     fn bind() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
     }
 
-    fn catalog() -> Arc<dyn PlannerCatalog> {
-        Arc::new(StubCatalog)
+    /// An empty in-memory catalog: `Server::serve` only consults it on
+    /// incoming queries, which these tests don't drive.
+    fn catalog(dispatch: &Dispatch) -> Arc<ParquetCatalog> {
+        Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()))
     }
 
     #[tokio::test]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
-        let server = Server::new(bind(), Dispatch::spin_up(1, 32), catalog(), vec![]);
+        let dispatch = Dispatch::spin_up(1, 32);
+        let catalog = catalog(&dispatch);
+        let server = Server::new(bind(), dispatch, catalog, vec![], 0);
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;
