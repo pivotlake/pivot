@@ -82,12 +82,13 @@ where
     type PersistedLiveKey<'a> = u128;
     type Reader<'b> = PairReader<'b, A, B>;
     type Columns = IntPairKeyColumns<A, B>;
+    type Scratch = ();
 
     fn make_reader<'b>(
         batch: &'b RecordBatch,
         key_cols: &[usize],
         _config: &(),
-        _state: &RandomState,
+        _scratch: &'b mut (),
     ) -> Self::Reader<'b> {
         let a = batch.column(key_cols[0]).as_primitive::<A>();
         let b = batch.column(key_cols[1]).as_primitive::<B>();
@@ -95,8 +96,10 @@ where
     }
 
     #[inline(always)]
-    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64 {
-        state.hash_one(reader.packed(idx))
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]) {
+        for (i, h) in hashes.iter_mut().enumerate() {
+            *h = state.hash_one(reader.packed(i));
+        }
     }
 
     #[inline(always)]

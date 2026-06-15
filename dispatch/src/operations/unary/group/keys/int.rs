@@ -45,12 +45,13 @@ where
     type PersistedLiveKey<'a> = T::Native;
     type Reader<'b> = &'b PrimitiveArray<T>;
     type Columns = IntKeyColumn<T>;
+    type Scratch = ();
 
     fn make_reader<'b>(
         batch: &'b RecordBatch,
         key_cols: &[usize],
         _config: &(),
-        _state: &RandomState,
+        _scratch: &'b mut (),
     ) -> Self::Reader<'b> {
         batch
             .column(key_cols[0])
@@ -60,8 +61,10 @@ where
     }
 
     #[inline(always)]
-    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64 {
-        state.hash_one(unsafe { reader.value_unchecked(idx) })
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]) {
+        for (i, h) in hashes.iter_mut().enumerate() {
+            *h = state.hash_one(unsafe { reader.value_unchecked(i) });
+        }
     }
 
     #[inline(always)]

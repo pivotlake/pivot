@@ -108,6 +108,10 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     radix_cfg: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    /// Per-worker reusable key-extraction scratch (e.g. the row extractor's
+    /// encode buffers). Lent to the reader each batch and reused, never
+    /// reallocated. `()` for extractors that read columns directly.
+    scratch: K::Scratch,
     /// `K::DEDUP_BY_HASH` only: a key whose bijective hash is exactly 0 collides
     /// with the empty-slot sentinel, so it is excluded from the table and recorded
     /// here. There is at most one such key (the hash is a bijection), so this
@@ -132,6 +136,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
+            scratch: K::Scratch::default(),
             zero_hash_seen: false,
         }
     }
@@ -169,25 +174,39 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
     ) {
-        let key_reader = K::make_reader(batch, key_cols, key_config, &self.hash_state);
-        let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
-
-        // Compute every row's hash once up front; the scalar probe reuses them.
         debug_assert!(
             !(K::DEDUP_BY_HASH && K::SUPPORTS_RADIX),
             "DEDUP_BY_HASH requires the in-place path (no radix scatter)"
         );
-        for i in 0..length {
-            self.hashes[i] = K::hash(&key_reader, i, &self.hash_state);
-        }
 
-        if self.switched_to_radix {
-            self.scatter_range(0, length, &key_reader, &value_reader);
-            return;
-        }
+        // Lend the reusable scratch to the reader for this batch. Taking it out of
+        // `self` (it goes back at the end) means the reader borrows a local, not
+        // `self`, so the probe below still has `&mut self`. The buffers' capacity
+        // persists across batches — nothing is reallocated. The readers live in
+        // an inner scope so their borrow of `scratch`/`batch` ends before we hand
+        // the buffers back.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        {
+            let mut key_reader = K::make_reader(batch, key_cols, key_config, &mut scratch);
+            let value_reader = V::make_reader(batch, value_slots);
 
-        self.consume_scalared(length, &key_reader, &value_reader);
+            // Fill every row's hash once up front (the row extractor also encodes
+            // its keys here); the scalar probe then reuses `self.hashes` and can
+            // prefetch ahead.
+            K::prepare_and_hash(
+                &mut key_reader,
+                &self.hash_state,
+                &mut self.hashes[..length],
+            );
+
+            if self.switched_to_radix {
+                self.scatter_range(0, length, &key_reader, &value_reader);
+            } else {
+                self.consume_scalared(length, &key_reader, &value_reader);
+            }
+        }
+        self.scratch = scratch;
     }
 
     /// Row-by-row probe, switching tables (or to radix) when the active table

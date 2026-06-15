@@ -9,9 +9,10 @@
 //! ## Reader-based consume
 //!
 //! Extraction is driven through a per-batch [`Reader`](KeyExtractor::Reader):
-//! [`make_reader`](KeyExtractor::make_reader) downcasts the key columns once,
-//! then [`hash`](KeyExtractor::hash) and [`live_key`](KeyExtractor::live_key)
-//! read row `idx` cheaply.
+//! [`make_reader`](KeyExtractor::make_reader) binds the key columns,
+//! [`prepare_and_hash`](KeyExtractor::prepare_and_hash) fills the batch's hash
+//! buffer (and materialises keys, for the row extractor), then
+//! [`live_key`](KeyExtractor::live_key) reads row `idx` cheaply during the probe.
 //!
 //! ## Live vs Persisted keys
 //!
@@ -72,26 +73,32 @@ pub trait KeyExtractor: Send + 'static {
     /// A live key reconstructed from an already-persisted key (used during merge).
     type PersistedLiveKey<'a>: LiveKey<Persisted = Self::Persisted>;
     /// Per-batch reader holding downcast key-column accessors (or, for the row
-    /// extractor, the batch's pre-encoded key rows).
+    /// extractor, a borrow of the worker [`Scratch`](Self::Scratch) it encodes
+    /// into).
     type Reader<'b>;
     /// Accumulates persisted keys into the result's leading key column(s).
     type Columns: KeyColumns<Key = Self::Persisted, Config = Self::Config>;
+    /// Per-worker reusable scratch, owned by the table and reused across batches.
+    /// `()` for extractors that read columns directly; the row extractor uses it
+    /// to hold the batch's encoded key bytes so nothing is reallocated per batch.
+    type Scratch: Default + Send;
 
-    /// Build a reader over `batch` for the given key columns.
-    ///
-    /// `state` is the table's hasher. Most extractors ignore it and hash lazily
-    /// in [`hash`](Self::hash); an extractor that pre-encodes keys (e.g. the row
-    /// extractor) may instead hash each key here, while its bytes are still hot
-    /// from encoding, and have [`hash`](Self::hash) return the cached value.
+    /// Bind `batch`'s key columns into a reader. Cheap and side-effect-free —
+    /// just downcasts (and, for the row extractor, casts) the columns and borrows
+    /// `scratch`. The actual per-batch work happens in
+    /// [`prepare_and_hash`](Self::prepare_and_hash).
     fn make_reader<'b>(
         batch: &'b RecordBatch,
         key_cols: &[usize],
         config: &Self::Config,
-        state: &RandomState,
+        scratch: &'b mut Self::Scratch,
     ) -> Self::Reader<'b>;
 
-    /// Hash the key at row `idx`.
-    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64;
+    /// Process one batch: write each row's hash into `hashes` (which the caller
+    /// sized to the batch length). An extractor that materialises keys (the row
+    /// extractor) also encodes them into its scratch here, hashing each as it is
+    /// written; the others hash straight from the columns.
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]);
 
     /// Extract a live key from row `idx` (may borrow the arena to persist).
     fn live_key<'a, 'b>(

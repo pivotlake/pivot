@@ -65,21 +65,24 @@ where
     type PersistedLiveKey<'a> = ();
     type Reader<'b> = &'b PrimitiveArray<T>;
     type Columns = NoKeyColumns;
+    type Scratch = ();
 
     fn make_reader<'b>(
         batch: &'b RecordBatch,
         key_cols: &[usize],
         _config: &(),
-        _state: &RandomState,
+        _scratch: &'b mut (),
     ) -> Self::Reader<'b> {
         batch.column(key_cols[0]).as_primitive::<T>()
     }
 
     #[inline(always)]
-    fn hash(reader: &Self::Reader<'_>, idx: usize, _state: &RandomState) -> u64 {
-        // Fixed bijective mix (not the keyed RandomState): consistency across
-        // workers and exact dedup both require the same 1:1 function everywhere.
-        mix64(unsafe { reader.value_unchecked(idx) }.to_u64())
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, _state: &RandomState, hashes: &mut [u64]) {
+        for (i, h) in hashes.iter_mut().enumerate() {
+            // Fixed bijective mix (not the keyed RandomState): consistency across
+            // workers and exact dedup both require the same 1:1 function everywhere.
+            *h = mix64(unsafe { reader.value_unchecked(i) }.to_u64());
+        }
     }
 
     #[inline(always)]

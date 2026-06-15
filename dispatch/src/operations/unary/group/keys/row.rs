@@ -142,23 +142,31 @@ impl<'b> KeyCol<'b> {
     }
 }
 
-/// Per-batch reader: every row's key tuple pre-encoded once into a single
-/// buffer, so hashing and probing just slice it (no row is encoded twice).
-pub struct RowReader {
+/// Per-worker reusable encode buffers. Cleared and refilled by
+/// [`prepare_and_hash`](RowKeyExtractor::prepare_and_hash) each batch; the
+/// capacity persists across batches, so nothing is reallocated per batch.
+#[derive(Default)]
+pub struct RowScratch {
     /// Encoded key tuples, back to back.
     bytes: Vec<u8>,
     /// Row `i` occupies `bytes[offsets[i]..offsets[i + 1]]`.
     offsets: Vec<u32>,
-    /// Row `i`'s hash, computed in [`make_reader`](RowKeyExtractor::make_reader)
-    /// the moment its blob is encoded — while those bytes are still hot in cache,
-    /// rather than re-reading the whole buffer in a later hashing pass.
-    hashes: Vec<u64>,
 }
 
-impl RowReader {
+/// Per-batch reader: the (possibly cast) key columns plus a borrow of the worker
+/// scratch the keys encode into. [`make_reader`](RowKeyExtractor::make_reader)
+/// only binds these; [`prepare_and_hash`](RowKeyExtractor::prepare_and_hash)
+/// fills the scratch, after which `row(i)` slices it.
+pub struct RowReader<'b> {
+    casted: Vec<ArrayRef>,
+    scratch: &'b mut RowScratch,
+}
+
+impl RowReader<'_> {
     #[inline(always)]
     fn row(&self, idx: usize) -> &[u8] {
-        &self.bytes[self.offsets[idx] as usize..self.offsets[idx + 1] as usize]
+        let off = &self.scratch.offsets;
+        &self.scratch.bytes[off[idx] as usize..off[idx + 1] as usize]
     }
 }
 
@@ -174,18 +182,19 @@ impl KeyExtractor for RowKeyExtractor {
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = RowKey<'a, 'b>;
     type PersistedLiveKey<'a> = ResolvedKey<'a>;
-    type Reader<'b> = RowReader;
+    type Reader<'b> = RowReader<'b>;
     type Columns = RowKeyColumns;
+    type Scratch = RowScratch;
 
-    fn make_reader(
-        batch: &RecordBatch,
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
         key_cols: &[usize],
         config: &RowKeySchema,
-        state: &RandomState,
-    ) -> RowReader {
+        scratch: &'b mut RowScratch,
+    ) -> RowReader<'b> {
         // A column whose runtime type differs from the schema (e.g. a DATE that
         // arrives with its parquet-physical type) is cast once per batch; the
-        // owned results outlive the encode loop in `casted`.
+        // owned results live in the reader until `prepare_and_hash` encodes them.
         let casted: Vec<ArrayRef> = key_cols
             .iter()
             .zip(config.types())
@@ -198,14 +207,19 @@ impl KeyExtractor for RowKeyExtractor {
                 }
             })
             .collect();
-        let cols: Vec<KeyCol> = casted.iter().map(KeyCol::new).collect();
+        RowReader { casted, scratch }
+    }
 
-        let rows = batch.num_rows();
-        let fixed: usize = config.types().iter().filter_map(encoded_width).sum();
-        let mut bytes = Vec::with_capacity(rows * (fixed + 16));
-        let mut offsets = Vec::with_capacity(rows + 1);
-        let mut hashes = Vec::with_capacity(rows);
-        offsets.push(0);
+    fn prepare_and_hash(reader: &mut RowReader<'_>, state: &RandomState, hashes: &mut [u64]) {
+        let cols: Vec<KeyCol> = reader.casted.iter().map(KeyCol::new).collect();
+        let scratch = &mut *reader.scratch;
+        scratch.bytes.clear();
+        scratch.offsets.clear();
+        // Reserve once; from the second batch on the cleared buffers already have
+        // the capacity, so this is a no-op and nothing reallocates.
+        scratch.bytes.reserve(hashes.len() * 16);
+        scratch.offsets.reserve(hashes.len() + 1);
+        scratch.offsets.push(0);
         // A *trailing* string field needs no length prefix: its bytes run to the
         // end of the row blob, whose length we recover from `offsets` (and, once
         // persisted, from the key's own length). Encoding all but that last field
@@ -217,48 +231,36 @@ impl KeyExtractor for RowKeyExtractor {
             _ => cols.len(),
         };
         let mut start = 0usize;
-        for i in 0..rows {
+        for (i, slot) in hashes.iter_mut().enumerate() {
             for col in &cols[..head] {
-                col.encode(i, &mut bytes);
+                col.encode(i, &mut scratch.bytes);
             }
             if let Some(KeyCol::Str(a)) = cols.get(head) {
-                bytes.extend_from_slice(unsafe { a.value_unchecked(i) }.as_bytes());
+                scratch
+                    .bytes
+                    .extend_from_slice(unsafe { a.value_unchecked(i) }.as_bytes());
             }
-            let end = bytes.len();
-            // Hash the blob now, while it is still hot from being written, and
-            // cache it — the probe loop would otherwise re-read the whole buffer
-            // from L2 in a separate hashing pass. Identical to hashing the slice
-            // returned by `row(i)`, so the value matches the table's hasher.
-            hashes.push(state.hash_one(&bytes[start..end]));
-            offsets.push(end as u32);
+            let end = scratch.bytes.len();
+            // Hash each blob the moment it is written — still hot from encoding —
+            // so the probe never re-reads the buffer just to hash. Identical to
+            // hashing the slice `row(i)` returns, so it matches the table's hasher.
+            *slot = state.hash_one(&scratch.bytes[start..end]);
+            scratch.offsets.push(end as u32);
             start = end;
         }
-        RowReader {
-            bytes,
-            offsets,
-            hashes,
-        }
-    }
-
-    #[inline(always)]
-    fn hash(reader: &RowReader, idx: usize, _state: &RandomState) -> u64 {
-        // Pre-computed in `make_reader` while the blob was hot.
-        reader.hashes[idx]
     }
 
     #[inline(always)]
     fn live_key<'a, 'b>(
-        reader: &RowReader,
+        reader: &Self::Reader<'b>,
         idx: usize,
         arena: &'a mut WorkerArena,
-    ) -> RowKey<'a, 'b> {
-        // The trait's `'b` is the input batch's lifetime, but `RowReader` owns
-        // its encoded rows rather than borrowing the batch, so the row slice is
-        // really tied to the `&reader` borrow. Extending it to `'b` is sound:
-        // the consume loop holds the reader (and never mutates it after
-        // `make_reader`) for as long as any live key it produced is alive, and a
-        // live key is always consumed — `eq_persisted` or `persist` — before the
-        // next row is read.
+    ) -> Self::LiveKey<'a, 'b> {
+        // The row slice borrows the worker scratch (via `&reader`); we extend it
+        // to the trait's `'b`. Sound: the scratch outlives the batch, the consume
+        // loop holds the reader (unmutated after `prepare_and_hash`) for as long
+        // as any live key it produced is alive, and a live key is always consumed
+        // — `eq_persisted` or `persist` — before the next row is read.
         let value: &'b [u8] = unsafe { std::mem::transmute(reader.row(idx)) };
         RowKey { arena, value }
     }
