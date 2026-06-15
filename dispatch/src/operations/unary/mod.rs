@@ -62,8 +62,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
-use super::{FinishStatus, Operator};
 use super::channels::{Receiver, Sender};
+use super::{FinishStatus, Operator};
 use crate::worker::worker_waker;
 
 mod pipeline_breaker;
