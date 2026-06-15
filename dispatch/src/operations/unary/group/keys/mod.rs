@@ -78,10 +78,16 @@ pub trait KeyExtractor: Send + 'static {
     type Columns: KeyColumns<Key = Self::Persisted, Config = Self::Config>;
 
     /// Build a reader over `batch` for the given key columns.
+    ///
+    /// `state` is the table's hasher. Most extractors ignore it and hash lazily
+    /// in [`hash`](Self::hash); an extractor that pre-encodes keys (e.g. the row
+    /// extractor) may instead hash each key here, while its bytes are still hot
+    /// from encoding, and have [`hash`](Self::hash) return the cached value.
     fn make_reader<'b>(
         batch: &'b RecordBatch,
         key_cols: &[usize],
         config: &Self::Config,
+        state: &RandomState,
     ) -> Self::Reader<'b>;
 
     /// Hash the key at row `idx`.

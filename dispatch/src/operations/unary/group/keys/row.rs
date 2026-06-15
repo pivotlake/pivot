@@ -149,6 +149,10 @@ pub struct RowReader {
     bytes: Vec<u8>,
     /// Row `i` occupies `bytes[offsets[i]..offsets[i + 1]]`.
     offsets: Vec<u32>,
+    /// Row `i`'s hash, computed in [`make_reader`](RowKeyExtractor::make_reader)
+    /// the moment its blob is encoded — while those bytes are still hot in cache,
+    /// rather than re-reading the whole buffer in a later hashing pass.
+    hashes: Vec<u64>,
 }
 
 impl RowReader {
@@ -173,7 +177,12 @@ impl KeyExtractor for RowKeyExtractor {
     type Reader<'b> = RowReader;
     type Columns = RowKeyColumns;
 
-    fn make_reader(batch: &RecordBatch, key_cols: &[usize], config: &RowKeySchema) -> RowReader {
+    fn make_reader(
+        batch: &RecordBatch,
+        key_cols: &[usize],
+        config: &RowKeySchema,
+        state: &RandomState,
+    ) -> RowReader {
         // A column whose runtime type differs from the schema (e.g. a DATE that
         // arrives with its parquet-physical type) is cast once per batch; the
         // owned results outlive the encode loop in `casted`.
@@ -195,6 +204,7 @@ impl KeyExtractor for RowKeyExtractor {
         let fixed: usize = config.types().iter().filter_map(encoded_width).sum();
         let mut bytes = Vec::with_capacity(rows * (fixed + 16));
         let mut offsets = Vec::with_capacity(rows + 1);
+        let mut hashes = Vec::with_capacity(rows);
         offsets.push(0);
         // A *trailing* string field needs no length prefix: its bytes run to the
         // end of the row blob, whose length we recover from `offsets` (and, once
@@ -206,6 +216,7 @@ impl KeyExtractor for RowKeyExtractor {
             Some(KeyCol::Str(_)) => cols.len() - 1,
             _ => cols.len(),
         };
+        let mut start = 0usize;
         for i in 0..rows {
             for col in &cols[..head] {
                 col.encode(i, &mut bytes);
@@ -213,14 +224,26 @@ impl KeyExtractor for RowKeyExtractor {
             if let Some(KeyCol::Str(a)) = cols.get(head) {
                 bytes.extend_from_slice(unsafe { a.value_unchecked(i) }.as_bytes());
             }
-            offsets.push(bytes.len() as u32);
+            let end = bytes.len();
+            // Hash the blob now, while it is still hot from being written, and
+            // cache it — the probe loop would otherwise re-read the whole buffer
+            // from L2 in a separate hashing pass. Identical to hashing the slice
+            // returned by `row(i)`, so the value matches the table's hasher.
+            hashes.push(state.hash_one(&bytes[start..end]));
+            offsets.push(end as u32);
+            start = end;
         }
-        RowReader { bytes, offsets }
+        RowReader {
+            bytes,
+            offsets,
+            hashes,
+        }
     }
 
     #[inline(always)]
-    fn hash(reader: &RowReader, idx: usize, state: &RandomState) -> u64 {
-        state.hash_one(reader.row(idx))
+    fn hash(reader: &RowReader, idx: usize, _state: &RandomState) -> u64 {
+        // Pre-computed in `make_reader` while the blob was hot.
+        reader.hashes[idx]
     }
 
     #[inline(always)]

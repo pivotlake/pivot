@@ -169,7 +169,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
     ) {
-        let key_reader = K::make_reader(batch, key_cols, key_config);
+        let key_reader = K::make_reader(batch, key_cols, key_config, &self.hash_state);
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 

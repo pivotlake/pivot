@@ -50,6 +50,7 @@ where
         batch: &'b RecordBatch,
         key_cols: &[usize],
         _config: &(),
+        _state: &RandomState,
     ) -> Self::Reader<'b> {
         batch
             .column(key_cols[0])

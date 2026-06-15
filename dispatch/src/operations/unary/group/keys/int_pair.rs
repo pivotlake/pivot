@@ -87,6 +87,7 @@ where
         batch: &'b RecordBatch,
         key_cols: &[usize],
         _config: &(),
+        _state: &RandomState,
     ) -> Self::Reader<'b> {
         let a = batch.column(key_cols[0]).as_primitive::<A>();
         let b = batch.column(key_cols[1]).as_primitive::<B>();
