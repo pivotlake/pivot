@@ -39,8 +39,24 @@ ring = "0.17"
 base64 = "0.22"
 # Build/parse the concrete URLs handed to the io_uring HTTP reader.
 url = "2"
+# Optional, behind the `test-support` feature: the in-Docker object-store test
+# harness exposed as `catalog::test_support`. testcontainers brings up MinIO and
+# fake-gcs-server; tempfile backs the local() backend. (The harness's other
+# needs — ureq, aws-sigv4, aws-credential-types, url — are already deps above.)
+testcontainers = { version = "0.24", features = ["blocking"], optional = true }
+testcontainers-modules = { version = "0.12", features = ["minio"], optional = true }
+tempfile = { version = "3", optional = true }
+
+[features]
+# Exposes `catalog::test_support`, a MinIO/fake-gcs object-store harness used by
+# this crate's object-store integration tests and by downstream crates (e.g.
+# `server`) that want to run a catalog rooted in a real bucket.
+test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
 
 [dev-dependencies]
+# Self-dependency to turn on `test-support` for this crate's own integration
+# tests (so they can use `catalog::test_support`).
+catalog = { path = ".", features = ["test-support"] }
 # `test-util` exposes dispatch's single-operator test harness for the moved
 # Parquet reader unit/integration tests.
 dispatch = { path = "../dispatch", features = ["test-util"] }

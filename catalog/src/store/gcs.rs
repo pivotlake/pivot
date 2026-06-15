@@ -17,6 +17,10 @@ const TOKEN_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write
 const OAUTH_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const METADATA_TOKEN_URI: &str =
     "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+/// The real GCS JSON API origin. Tests point at an emulator instead via
+/// `STORAGE_EMULATOR_HOST` (the convention `fake-gcs-server` and the Google
+/// client libraries share).
+const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 
 #[derive(Debug)]
 pub struct GcsStore {
@@ -24,6 +28,13 @@ pub struct GcsStore {
     prefix: String,
     agent: ureq::Agent,
     token: Mutex<Option<CachedToken>>,
+    /// JSON API origin (scheme + host[:port], no trailing slash). The real
+    /// service by default; an emulator when `STORAGE_EMULATOR_HOST` is set.
+    endpoint: String,
+    /// Whether `endpoint` is an emulator: it ignores credentials, so we skip
+    /// minting OAuth tokens and hand the ring a plain media URL (an emulator has
+    /// no signing keys to presign with).
+    emulated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -34,22 +45,43 @@ struct CachedToken {
 }
 
 impl GcsStore {
-    /// Parse `gs://bucket/prefix`.
+    /// Parse `gs://bucket/prefix`. Honors `STORAGE_EMULATOR_HOST` (e.g.
+    /// `http://localhost:4443`) to target a `fake-gcs-server` emulator instead
+    /// of the real service — the scheme is optional and defaults to `http`.
     pub fn from_uri(uri: &str) -> Result<Self> {
         let rest = uri
             .strip_prefix("gs://")
             .ok_or_else(|| StoreError::UnsupportedUri(uri.to_string()))?;
         let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+        let (endpoint, emulated) = match std::env::var("STORAGE_EMULATOR_HOST") {
+            Ok(host) if !host.is_empty() => {
+                let host = host.trim_end_matches('/');
+                let endpoint = if host.contains("://") {
+                    host.to_string()
+                } else {
+                    format!("http://{host}")
+                };
+                (endpoint, true)
+            }
+            _ => (DEFAULT_ENDPOINT.to_string(), false),
+        };
         Ok(Self {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             agent: ureq::AgentBuilder::new().build(),
             token: Mutex::new(None),
+            endpoint,
+            emulated,
         })
     }
 
     /// A valid bearer token, minting and caching a fresh one when needed.
     fn bearer(&self) -> Result<String> {
+        // An emulator ignores `Authorization`; never try to mint a real token
+        // (there are no credentials in a test environment).
+        if self.emulated {
+            return Ok("emulator".to_string());
+        }
         let now = unix_now();
         {
             let cache = self.token.lock().unwrap();
@@ -166,7 +198,8 @@ impl ObjectStore for GcsStore {
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         let token = self.bearer()?;
         let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}?alt=media",
+            "{}/storage/v1/b/{}/o/{}?alt=media",
+            self.endpoint,
             self.bucket,
             self.object_path(key)
         );
@@ -195,7 +228,8 @@ impl ObjectStore for GcsStore {
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let token = self.bearer()?;
         let url = format!(
-            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            self.endpoint,
             self.bucket,
             self.object_path(key)
         );
@@ -216,7 +250,8 @@ impl ObjectStore for GcsStore {
         // GCS conditional create: `ifGenerationMatch=0` only succeeds when no
         // live generation of the object exists; otherwise 412.
         let url = format!(
-            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}&ifGenerationMatch=0",
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}&ifGenerationMatch=0",
+            self.endpoint,
             self.bucket,
             self.object_path(key)
         );
@@ -236,7 +271,8 @@ impl ObjectStore for GcsStore {
     fn delete(&self, key: &ObjectPath) -> Result<()> {
         let token = self.bearer()?;
         let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}",
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
             self.bucket,
             self.object_path(key)
         );
@@ -256,7 +292,8 @@ impl ObjectStore for GcsStore {
         let token = self.bearer()?;
         let object_prefix = object_key(&self.prefix, prefix);
         let url = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o?prefix={}%2F&delimiter=%2F",
+            "{}/storage/v1/b/{}/o?prefix={}%2F&delimiter=%2F",
+            self.endpoint,
             self.bucket,
             percent_encode(&object_prefix)
         );
@@ -287,6 +324,20 @@ impl ObjectStore for GcsStore {
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
+        if self.emulated {
+            // An emulator can't presign (no signing key) but also needs no auth:
+            // its media endpoint serves the bytes — honoring `Range` — straight
+            // to the ring.
+            let url = format!(
+                "{}/storage/v1/b/{}/o/{}?alt=media",
+                self.endpoint,
+                self.bucket,
+                self.object_path(key)
+            );
+            return url::Url::parse(&url)
+                .map(DataFileSource::Remote)
+                .map_err(|e| StoreError::Config(format!("building emulator media url: {e}")));
+        }
         Ok(DataFileSource::Remote(self.presign_get(key)?))
     }
 }
