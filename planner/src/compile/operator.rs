@@ -526,7 +526,7 @@ impl Aggregate {
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
             AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
-            IntPairKeyExtractor, Sum,
+            IntPairKeyExtractor, RowKeyExtractor, Sum,
         };
 
         let key_refs: Vec<&crate::expression::Ref> = self
@@ -558,10 +558,6 @@ impl Aggregate {
                 expr => Err(Error::UnsupportedAggregateExpression(expr.clone())),
             })
             .collect::<Result<_, _>>()?;
-
-        if key_cols.len() != 2 {
-            return Err(Error::UnsupportedAggregateGroupAmount(key_cols.len()));
-        }
 
         // Per-slot signature (kind + the `SUM` column's type), used to pick a
         // compiled, monomorphised value extractor when the signature matches one
@@ -653,16 +649,85 @@ impl Aggregate {
             };
         }
 
-        match (&key_refs[0].return_type, &key_refs[1].return_type) {
-            (Type::Int64, Type::Int32) => by_keys!(Int64Type, Int32Type),
-            (Type::Int32, Type::Int32) => by_keys!(Int32Type, Int32Type),
-            (Type::Int16, Type::Int32) => by_keys!(Int16Type, Int32Type),
-            (Type::Int16, Type::Int16) => by_keys!(Int16Type, Int16Type),
-            (Type::Int64, Type::Int64) => by_keys!(Int64Type, Int64Type),
-            (Type::Int32, Type::Int64) => by_keys!(Int32Type, Int64Type),
-            (a, _) => Err(Error::DataTypeNotSupportedForGroupBy(a.clone())),
+        // The general fallback: encode the whole key tuple into one byte blob.
+        // Handles any shape the specialised extractors don't — a string key, 3+
+        // keys, or an integer pair we haven't monomorphised.
+        macro_rules! row_fallback {
+            ($acc:ty) => {{
+                let Some(schema) = row_key_schema(&key_refs) else {
+                    return Err(Error::DataTypeNotSupportedForGroupBy(
+                        key_refs[0].return_type.clone(),
+                    ));
+                };
+                macro_rules! by_n {
+                    ($n:literal) => {{
+                        type V = AggregationRowValueExtractor<$n, $acc>;
+                        Ok(input.group_by_aggregate_config::<RowKeyExtractor, V>(
+                            key_cols, slots, top_k, schema,
+                        ))
+                    }};
+                }
+                match slots.len() {
+                    1 => by_n!(1),
+                    2 => by_n!(2),
+                    3 => by_n!(3),
+                    4 => by_n!(4),
+                    5 => by_n!(5),
+                    6 => by_n!(6),
+                    n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                }
+            }};
+        }
+
+        // Two integer keys pack into the specialised u128 pair extractor; every
+        // other shape falls back to the row-encoded extractor. `input` is
+        // consumed exactly once, in whichever branch runs.
+        let int_pair = key_cols.len() == 2
+            && matches!(
+                (&key_refs[0].return_type, &key_refs[1].return_type),
+                (Type::Int64, Type::Int32)
+                    | (Type::Int32, Type::Int32)
+                    | (Type::Int16, Type::Int32)
+                    | (Type::Int16, Type::Int16)
+                    | (Type::Int64, Type::Int64)
+                    | (Type::Int32, Type::Int64)
+            );
+        if int_pair {
+            match (&key_refs[0].return_type, &key_refs[1].return_type) {
+                (Type::Int64, Type::Int32) => by_keys!(Int64Type, Int32Type),
+                (Type::Int32, Type::Int32) => by_keys!(Int32Type, Int32Type),
+                (Type::Int16, Type::Int32) => by_keys!(Int16Type, Int32Type),
+                (Type::Int16, Type::Int16) => by_keys!(Int16Type, Int16Type),
+                (Type::Int64, Type::Int64) => by_keys!(Int64Type, Int64Type),
+                (Type::Int32, Type::Int64) => by_keys!(Int32Type, Int64Type),
+                _ => unreachable!("int_pair guard restricts to these arms"),
+            }
+        } else if wide {
+            row_fallback!(i128)
+        } else {
+            row_fallback!(i64)
         }
     }
+}
+
+/// Map the GROUP BY key columns' planner types to the arrow types the
+/// [`dispatch::RowKeyExtractor`] encodes, in key order. Returns `None` if any
+/// key column has a type the row encoding doesn't support, so the caller can
+/// report it unsupported rather than panicking in `RowKeySchema::new`.
+fn row_key_schema(key_refs: &[&crate::expression::Ref]) -> Option<dispatch::RowKeySchema> {
+    use arrow_schema::DataType;
+    let types = key_refs
+        .iter()
+        .map(|r| match r.return_type {
+            Type::Int8 => Some(DataType::Int8),
+            Type::Int16 => Some(DataType::Int16),
+            Type::Int32 => Some(DataType::Int32),
+            Type::Int64 => Some(DataType::Int64),
+            Type::Utf8 => Some(DataType::Utf8View),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(dispatch::RowKeySchema::new(types))
 }
 
 impl Input {

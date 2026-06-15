@@ -31,6 +31,13 @@ impl ArenaKey {
         Self(make_view(data, buffer_index, offset))
     }
 
+    /// Reconstruct a key from the raw `u128` bit pattern returned by
+    /// [`as_u128`](Self::as_u128) (e.g. when read back out of a `SlabColumn`).
+    #[inline]
+    pub fn from_raw(raw: u128) -> Self {
+        Self(raw)
+    }
+
     #[inline]
     /// Returns `true` if the key data is stored inline (≤ 12 bytes).
     pub fn is_inline(&self) -> bool {
@@ -50,13 +57,15 @@ impl ArenaKey {
         unsafe { std::slice::from_raw_parts(ptr.add(4), self.len() as usize) }
     }
 
+    /// Arena buffer index of a non-inline key (meaningless for inline keys).
     #[inline]
-    fn buffer_index(&self) -> u32 {
+    pub fn buffer_index(&self) -> u32 {
         (self.0 >> 64) as u32
     }
 
+    /// Byte offset within the arena buffer of a non-inline key.
     #[inline]
-    fn offset(&self) -> u32 {
+    pub fn offset(&self) -> u32 {
         (self.0 >> 96) as u32
     }
 

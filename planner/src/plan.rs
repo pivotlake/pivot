@@ -66,17 +66,28 @@ impl fmt::Display for PlanNode {
 
 impl PlanNode {
     /// Detect `grouped Aggregate → (pass-through projections) → TopN(ORDER BY
-    /// <agg col> DESC LIMIT k)` and annotate the aggregate with `top_k`, so the
-    /// group operator emits only each partition's top-k rows instead of every
-    /// group (top-k is decomposable across partitions). Only handles DESC with
-    /// a single ref order key traced through column-ref-only projections.
+    /// <agg col> DESC [, …] LIMIT k)` and annotate the aggregate with `top_k`, so
+    /// the group operator emits only each partition's top-k rows instead of every
+    /// group (top-k is decomposable across partitions). Without it, a
+    /// high-cardinality grouped `ORDER BY <agg> DESC LIMIT k` materialises,
+    /// decodes, and fully sorts every group only to keep `k` — the dominant cost
+    /// on such queries.
+    ///
+    /// Driven by the *primary* (first) order key, which must be a DESC ref to an
+    /// aggregate column traced through column-ref-only projections. Secondary
+    /// order keys (tiebreakers) are left to the surviving `TopN`, which re-sorts
+    /// the per-partition candidates under the full order. Exact when the primary
+    /// key has no ties at the limit boundary; with such ties it is tie-approximate
+    /// — the same class of approximation a single-key DESC LIMIT pushdown already
+    /// makes, additionally dropping secondary-key disambiguation among the tied
+    /// boundary group.
     pub(crate) fn annotate_group_topn(&mut self) {
         for child in &mut self.inputs {
             child.annotate_group_topn();
         }
 
         let (mut col, limit) = match &self.operator {
-            Operator::TopN(t) if t.order_bys.len() == 1 => {
+            Operator::TopN(t) if !t.order_bys.is_empty() => {
                 let ob = &t.order_bys[0];
                 match (&ob.direction, &ob.expression) {
                     (OrderByDirection::Desc, Expression::Ref(r)) => (r.column_idx, t.limit),

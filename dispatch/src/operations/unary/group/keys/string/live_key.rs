@@ -49,6 +49,12 @@ pub struct ResolvedKey<'a> {
     pub arena: &'a SharedArena,
 }
 
+impl<'a> ResolvedKey<'a> {
+    pub fn new(key: ArenaKey, arena: &'a SharedArena) -> Self {
+        Self { key, arena }
+    }
+}
+
 impl Hash for ResolvedKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.key.resolve(self.arena).hash(state);

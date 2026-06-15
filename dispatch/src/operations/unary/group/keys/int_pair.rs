@@ -76,29 +76,38 @@ where
     B::Native: IntBits,
 {
     const SUPPORTS_RADIX: bool = true;
+    type Config = ();
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
     type PersistedLiveKey<'a> = u128;
     type Reader<'b> = PairReader<'b, A, B>;
     type Columns = IntPairKeyColumns<A, B>;
+    type Scratch = ();
 
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _config: &(),
+        _scratch: &'b mut (),
+    ) -> Self::Reader<'b> {
         let a = batch.column(key_cols[0]).as_primitive::<A>();
         let b = batch.column(key_cols[1]).as_primitive::<B>();
         PairReader { a, b }
     }
 
     #[inline(always)]
-    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64 {
-        state.hash_one(reader.packed(idx))
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]) {
+        for (i, h) in hashes.iter_mut().enumerate() {
+            *h = state.hash_one(reader.packed(i));
+        }
     }
 
     #[inline(always)]
-    fn live_key<'a, 'b>(
-        reader: &Self::Reader<'b>,
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
         idx: usize,
         _arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b> {
+    ) -> Self::LiveKey<'a, 'r> {
         reader.packed(idx)
     }
 
@@ -123,8 +132,9 @@ where
     B::Native: IntBits,
 {
     type Key = u128;
+    type Config = ();
 
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, _config: &()) -> Self {
         Self {
             a: PrimitiveBuilder::<A>::with_capacity(allocator, rows),
             b: PrimitiveBuilder::<B>::with_capacity(allocator, rows),
@@ -138,7 +148,11 @@ where
         self.b.push(&B::Native::from_u64(packed as u64), 1);
     }
 
-    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        _arena: &Arc<SharedArena>,
+        _allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![
             Field::new("k0", A::DATA_TYPE, false),
             Field::new("k1", B::DATA_TYPE, false),

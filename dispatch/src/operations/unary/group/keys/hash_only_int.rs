@@ -59,29 +59,38 @@ where
     // in-place (no radix) — the out-of-band count lives on the in-place table.
     const DEDUP_BY_HASH: bool = true;
 
+    type Config = ();
     type Persisted = ();
     type LiveKey<'a, 'b> = ();
     type PersistedLiveKey<'a> = ();
     type Reader<'b> = &'b PrimitiveArray<T>;
     type Columns = NoKeyColumns;
+    type Scratch = ();
 
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _config: &(),
+        _scratch: &'b mut (),
+    ) -> Self::Reader<'b> {
         batch.column(key_cols[0]).as_primitive::<T>()
     }
 
     #[inline(always)]
-    fn hash(reader: &Self::Reader<'_>, idx: usize, _state: &RandomState) -> u64 {
-        // Fixed bijective mix (not the keyed RandomState): consistency across
-        // workers and exact dedup both require the same 1:1 function everywhere.
-        mix64(unsafe { reader.value_unchecked(idx) }.to_u64())
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, _state: &RandomState, hashes: &mut [u64]) {
+        for (i, h) in hashes.iter_mut().enumerate() {
+            // Fixed bijective mix (not the keyed RandomState): consistency across
+            // workers and exact dedup both require the same 1:1 function everywhere.
+            *h = mix64(unsafe { reader.value_unchecked(i) }.to_u64());
+        }
     }
 
     #[inline(always)]
-    fn live_key<'a, 'b>(
-        _reader: &Self::Reader<'b>,
+    fn live_key<'a, 'r>(
+        _reader: &'r Self::Reader<'_>,
         _idx: usize,
         _arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b> {
+    ) -> Self::LiveKey<'a, 'r> {
     }
 
     fn resolve_persisted(_arena: &SharedArena, _persisted: ()) {}
@@ -93,15 +102,20 @@ pub struct NoKeyColumns;
 
 impl KeyColumns for NoKeyColumns {
     type Key = ();
+    type Config = ();
 
-    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _config: &()) -> Self {
         NoKeyColumns
     }
 
     #[inline(always)]
     fn push(&mut self, _key: &()) {}
 
-    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        _arena: &Arc<SharedArena>,
+        _allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
     }
 }

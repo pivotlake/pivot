@@ -312,6 +312,7 @@ mod tests {
             &batch,
             &[0],
             &[AggregationSlot::new(AggregationKind::CountStar, 0)],
+            &(),
         );
         // The test data is low-cardinality, so the worker never switches to radix:
         // `buffers` is None and the full result is in the in-place stack.
@@ -501,6 +502,7 @@ mod tests {
                 &batch,
                 &[0],
                 &[AggregationSlot::new(AggregationKind::CountStar, 0)],
+                &(),
             );
         }
         agg.flush()
