@@ -1,0 +1,77 @@
+name: Deploy Server (ARM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bucket:
+        description: "Destination GCS bucket (overrides the DEPLOY_GCS_BUCKET repo variable). e.g. gs://my-bucket/path"
+        required: false
+        default: ""
+
+# Required secrets:
+#   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
+# Required repository variables (unless overridden via the `bucket` input):
+#   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  deploy:
+    name: Build aarch64 release + upload to GCS
+    # Native ARM64 GitHub-hosted runner — no emulation. Free for public repos;
+    # private repos need a Team/Enterprise plan or a self-hosted arm64 runner.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # C toolchain for the duckdb / arrow-rs native deps (mirrors the bench
+      # Dockerfile's build stage).
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang libclang-dev pkg-config git ca-certificates
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Build release binary (aarch64)
+        working-directory: server
+        run: cargo build --release --bin pivotdb-server
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload binary to GCS
+        env:
+          BUCKET: ${{ inputs.bucket != '' && inputs.bucket || vars.DEPLOY_GCS_BUCKET }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BUCKET" ]; then
+            echo "::error::No destination bucket. Set the DEPLOY_GCS_BUCKET repo variable or pass the 'bucket' input."
+            exit 1
+          fi
+          # Strip any trailing slash so we control the joins below.
+          BUCKET="${BUCKET%/}"
+          BIN=server/target/release/pivotdb-server
+
+          # Upload an immutable, SHA-pinned copy plus a moving `latest` pointer.
+          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-aarch64-$SHA"
+          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-aarch64-latest"
+
+          echo "Uploaded to:"
+          echo "  $BUCKET/pivotdb-server-aarch64-$SHA"
+          echo "  $BUCKET/pivotdb-server-aarch64-latest"
