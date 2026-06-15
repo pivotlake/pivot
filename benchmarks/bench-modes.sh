@@ -63,10 +63,10 @@ run_mode() {
     case "$mode" in
         single)
             [[ -e "$single_dir/hits.parquet" ]] || { echo "  missing $single_dir/hits.parquet — run prep-modes-data.sh" >&2; return 1; }
-            "$here/benchmark.sh" --source "$single_dir" "${passthrough[@]}" ;;
+            "$here/benchmark.sh" --source "$single_dir" --duckdb "${passthrough[@]}" ;;
         partitioned)
             [[ -d "$part_dir" ]] || { echo "  missing $part_dir — run prep-modes-data.sh" >&2; return 1; }
-            "$here/benchmark.sh" --source "$part_dir" "${passthrough[@]}" ;;
+            "$here/benchmark.sh" --source "$part_dir" --duckdb "${passthrough[@]}" ;;
         native)
             [[ -f "$native_db" ]] || { echo "  missing $native_db — run prep-modes-data.sh" >&2; return 1; }
             "$here/benchmark.sh" --source "$native_pivot_dir" --native "$native_db" "${passthrough[@]}" ;;
