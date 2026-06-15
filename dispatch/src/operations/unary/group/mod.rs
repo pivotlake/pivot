@@ -203,8 +203,12 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
         batch: RecordBatch,
         _sender: &mut S,
     ) -> unary::Result<()> {
-        self.aggregated_table
-            .consume_batch(&batch, &self.key_cols, &self.value_slots, &self.key_config);
+        self.aggregated_table.consume_batch(
+            &batch,
+            &self.key_cols,
+            &self.value_slots,
+            &self.key_config,
+        );
         Ok(())
     }
 

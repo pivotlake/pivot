@@ -660,12 +660,12 @@ impl Aggregate {
                     ));
                 };
                 macro_rules! by_n {
-                    ($n:literal) => {
-                        Ok(input.group_by_aggregate_config::<
-                            RowKeyExtractor,
-                            AggregationRowValueExtractor<$n, $acc>,
-                        >(key_cols, slots, top_k, schema))
-                    };
+                    ($n:literal) => {{
+                        type V = AggregationRowValueExtractor<$n, $acc>;
+                        Ok(input.group_by_aggregate_config::<RowKeyExtractor, V>(
+                            key_cols, slots, top_k, schema,
+                        ))
+                    }};
                 }
                 match slots.len() {
                     1 => by_n!(1),

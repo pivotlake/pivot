@@ -169,11 +169,7 @@ impl KeyExtractor for RowKeyExtractor {
     type Reader<'b> = RowReader;
     type Columns = RowKeyColumns;
 
-    fn make_reader<'b>(
-        batch: &'b RecordBatch,
-        key_cols: &[usize],
-        config: &RowKeySchema,
-    ) -> RowReader {
+    fn make_reader(batch: &RecordBatch, key_cols: &[usize], config: &RowKeySchema) -> RowReader {
         // A column whose runtime type differs from the schema (e.g. a DATE that
         // arrives with its parquet-physical type) is cast once per batch; the
         // owned results outlive the encode loop in `casted`.

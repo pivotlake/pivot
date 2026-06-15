@@ -193,7 +193,14 @@ where
         Some((slot, limit)) if limit < table.len() => {
             let rows = top_k_rows::<K, V, S>(&table, slot, limit);
             let total = rows.len();
-            emit_chunks::<K, V, Snd, _>(rows.into_iter(), total, arena, allocator, key_config, sender)
+            emit_chunks::<K, V, Snd, _>(
+                rows.into_iter(),
+                total,
+                arena,
+                allocator,
+                key_config,
+                sender,
+            )
         }
         _ => {
             let total = table.len();
