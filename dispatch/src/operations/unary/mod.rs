@@ -43,8 +43,8 @@
 
 mod group;
 pub use group::{
-    Accumulator, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
-    DistinctValueExtractor, GroupFactory, HashOnlyIntKeyExtractor, IntKeyExtractor,
+    Accumulator, AggregationKind, AggregationSlot, Compiled, Count, DistinctValueExtractor,
+    DynamicValueExtractor, GroupFactory, HashOnlyIntKeyExtractor, IntKeyExtractor,
     IntPairKeyExtractor, KeyExtractor, RowKeyExtractor, RowKeySchema, StringKeyExtractor, Sum,
     ValueExtractor,
 };

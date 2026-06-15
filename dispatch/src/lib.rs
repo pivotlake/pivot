@@ -97,8 +97,8 @@ pub use operations::channels::{
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
-    Accumulator, AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
-    DistinctValueExtractor, DynamicFilterSlot, HashOnlyIntKeyExtractor, IntKeyExtractor,
+    Accumulator, AggregationKind, AggregationSlot, Compiled, Count, DistinctValueExtractor,
+    DynamicFilterSlot, DynamicValueExtractor, HashOnlyIntKeyExtractor, IntKeyExtractor,
     IntPairKeyExtractor, Nullary, NullaryFactory, NullaryOperatorFactory, Operator, OrderBy,
     Result as OperatorResult, RowKeyExtractor, RowKeySchema, StringKeyExtractor, Sum,
     ValueExtractor,

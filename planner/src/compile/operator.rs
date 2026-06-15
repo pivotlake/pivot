@@ -374,7 +374,7 @@ impl Aggregate {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
         use dispatch::{
-            AggregationKind, AggregationRowValueExtractor, AggregationSlot, IntPairKeyExtractor,
+            AggregationKind, AggregationSlot, DynamicValueExtractor, IntPairKeyExtractor,
         };
 
         if self.groups.len() != 1 {
@@ -461,24 +461,24 @@ impl Aggregate {
             ($spec:expr, $K:ty, $cols:expr, $slots:expr) => {{
                 let slots = $slots;
                 match slots.len() {
-                    1 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<1>>(
-                        $cols, slots, None,
-                    ),
-                    2 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<2>>(
-                        $cols, slots, None,
-                    ),
-                    3 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<3>>(
-                        $cols, slots, None,
-                    ),
-                    4 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<4>>(
-                        $cols, slots, None,
-                    ),
-                    5 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<5>>(
-                        $cols, slots, None,
-                    ),
-                    6 => $spec.group_by_aggregate::<$K, AggregationRowValueExtractor<6>>(
-                        $cols, slots, None,
-                    ),
+                    1 => {
+                        $spec.group_by_aggregate::<$K, DynamicValueExtractor<1>>($cols, slots, None)
+                    }
+                    2 => {
+                        $spec.group_by_aggregate::<$K, DynamicValueExtractor<2>>($cols, slots, None)
+                    }
+                    3 => {
+                        $spec.group_by_aggregate::<$K, DynamicValueExtractor<3>>($cols, slots, None)
+                    }
+                    4 => {
+                        $spec.group_by_aggregate::<$K, DynamicValueExtractor<4>>($cols, slots, None)
+                    }
+                    5 => {
+                        $spec.group_by_aggregate::<$K, DynamicValueExtractor<5>>($cols, slots, None)
+                    }
+                    6 => {
+                        $spec.group_by_aggregate::<$K, DynamicValueExtractor<6>>($cols, slots, None)
+                    }
                     n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             }};
@@ -525,7 +525,7 @@ impl Aggregate {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
-            AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Count,
+            AggregationKind, AggregationSlot, Compiled, Count, DynamicValueExtractor,
             IntPairKeyExtractor, RowKeyExtractor, Sum,
         };
 
@@ -562,7 +562,7 @@ impl Aggregate {
         // Per-slot signature (kind + the `SUM` column's type), used to pick a
         // compiled, monomorphised value extractor when the signature matches one
         // we've specialised; any other signature falls back to the generic enum
-        // extractor (`AggregationRowValueExtractor<N>`) below.
+        // extractor (`DynamicValueExtractor<N>`) below.
         enum Sig {
             Count,
             Sum(Type),
@@ -607,33 +607,35 @@ impl Aggregate {
                         Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
                     }
                     // Fallback: the generic enum extractor, monomorphised by arity.
-                    _ => match slots.len() {
-                        1 => Ok(input
-                            .group_by_aggregate::<Key, AggregationRowValueExtractor<1, $acc>>(
-                                key_cols, slots, top_k,
-                            )),
-                        2 => Ok(input
-                            .group_by_aggregate::<Key, AggregationRowValueExtractor<2, $acc>>(
-                                key_cols, slots, top_k,
-                            )),
-                        3 => Ok(input
-                            .group_by_aggregate::<Key, AggregationRowValueExtractor<3, $acc>>(
-                                key_cols, slots, top_k,
-                            )),
-                        4 => Ok(input
-                            .group_by_aggregate::<Key, AggregationRowValueExtractor<4, $acc>>(
-                                key_cols, slots, top_k,
-                            )),
-                        5 => Ok(input
-                            .group_by_aggregate::<Key, AggregationRowValueExtractor<5, $acc>>(
-                                key_cols, slots, top_k,
-                            )),
-                        6 => Ok(input
-                            .group_by_aggregate::<Key, AggregationRowValueExtractor<6, $acc>>(
-                                key_cols, slots, top_k,
-                            )),
-                        n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
-                    },
+                    _ => {
+                        match slots.len() {
+                            1 => Ok(input
+                                .group_by_aggregate::<Key, DynamicValueExtractor<1, $acc>>(
+                                    key_cols, slots, top_k,
+                                )),
+                            2 => Ok(input
+                                .group_by_aggregate::<Key, DynamicValueExtractor<2, $acc>>(
+                                    key_cols, slots, top_k,
+                                )),
+                            3 => Ok(input
+                                .group_by_aggregate::<Key, DynamicValueExtractor<3, $acc>>(
+                                    key_cols, slots, top_k,
+                                )),
+                            4 => Ok(input
+                                .group_by_aggregate::<Key, DynamicValueExtractor<4, $acc>>(
+                                    key_cols, slots, top_k,
+                                )),
+                            5 => Ok(input
+                                .group_by_aggregate::<Key, DynamicValueExtractor<5, $acc>>(
+                                    key_cols, slots, top_k,
+                                )),
+                            6 => Ok(input
+                                .group_by_aggregate::<Key, DynamicValueExtractor<6, $acc>>(
+                                    key_cols, slots, top_k,
+                                )),
+                            n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                        }
+                    }
                 }
             }};
         }
@@ -661,7 +663,7 @@ impl Aggregate {
                 };
                 macro_rules! by_n {
                     ($n:literal) => {{
-                        type V = AggregationRowValueExtractor<$n, $acc>;
+                        type V = DynamicValueExtractor<$n, $acc>;
                         Ok(input.group_by_aggregate_config::<RowKeyExtractor, V>(
                             key_cols, slots, top_k, schema,
                         ))

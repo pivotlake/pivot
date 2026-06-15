@@ -20,7 +20,7 @@ mod distinct;
 
 pub use accumulator::Accumulator;
 pub use aggregate::{Aggregate, Count, Sum};
-pub use aggregation_row::AggregationRowValueExtractor;
+pub use aggregation_row::DynamicValueExtractor;
 pub use compiled::Compiled;
 pub use distinct::DistinctValueExtractor;
 

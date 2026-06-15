@@ -5,7 +5,7 @@
 //! ways:
 //! - [`Compiled`](super::compiled::Compiled) monomorphises over a *tuple* of
 //!   them for a fixed signature (straight-line, no per-row branch);
-//! - [`AggregationRowValueExtractor`](super::AggregationRowValueExtractor) (the runtime
+//! - [`DynamicValueExtractor`](super::DynamicValueExtractor) (the runtime
 //!   fallback) wraps them in a small enum and dispatches per row.
 //!
 //! Either way the per-row logic lives here once; accumulating the contributions

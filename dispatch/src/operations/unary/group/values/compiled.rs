@@ -1,6 +1,6 @@
 //! Compiled (monomorphised) GROUP BY aggregations.
 //!
-//! [`AggregationRowValueExtractor`](super::AggregationRowValueExtractor) dispatches each slot
+//! [`DynamicValueExtractor`](super::DynamicValueExtractor) dispatches each slot
 //! through a runtime enum (`SlotValueReader`) on every row. These specialise a
 //! *fixed* aggregate signature into straight-line code instead: each output slot
 //! is a zero-sized [`Aggregate`] op, and the value extractor is monomorphised
@@ -12,7 +12,7 @@
 //! - a new query shape is one tuple type (e.g.
 //!   `Compiled<(Count, Sum<Int16Type>, Count)>`), selected in the planner.
 //!
-//! The enum [`AggregationRowValueExtractor`](super::AggregationRowValueExtractor) stays as the
+//! The enum [`DynamicValueExtractor`](super::DynamicValueExtractor) stays as the
 //! fallback for any signature we haven't compiled, so arbitrary queries still
 //! run (just with the per-row dispatch).
 

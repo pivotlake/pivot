@@ -81,17 +81,15 @@ impl SlotValueReader<'_> {
 }
 
 /// Per-batch reader: one [`SlotValueReader`] per output slot, sized to `N` so the
-/// per-row [`value`](AggregationRowValueExtractor::value) loop unrolls.
+/// per-row [`value`](DynamicValueExtractor::value) loop unrolls.
 pub struct AggregationRowReader<'b, const N: usize> {
     slots: [SlotValueReader<'b>; N],
 }
 
 /// A [`ValueExtractor`] producing an [`AggregationRow<N, A>`] of `N` count/sum slots.
-pub struct AggregationRowValueExtractor<const N: usize, A: Accumulator = i64>(
-    std::marker::PhantomData<A>,
-);
+pub struct DynamicValueExtractor<const N: usize, A: Accumulator = i64>(std::marker::PhantomData<A>);
 
-impl<const N: usize, A: Accumulator> ValueExtractor for AggregationRowValueExtractor<N, A> {
+impl<const N: usize, A: Accumulator> ValueExtractor for DynamicValueExtractor<N, A> {
     type Value = AggregationRow<N, A>;
     type Reader<'b> = AggregationRowReader<'b, N>;
     type Columns = AggregationRowColumns<N, A>;
@@ -193,7 +191,7 @@ mod tests {
         .unwrap();
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 0)];
 
-        type V = AggregationRowValueExtractor<1, i128>;
+        type V = DynamicValueExtractor<1, i128>;
         let reader = V::make_reader(&batch, &slots);
         let mut acc = AggregationRow::<1, i128>::default();
         for i in 0..3 {
