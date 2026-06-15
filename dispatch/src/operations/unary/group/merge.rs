@@ -81,7 +81,7 @@ fn resize_if_needed<K: KeyExtractor, V: ValueExtractor>(
 /// we round-robin through the source tables, the target region stays in
 /// cache. Each batch also prefetches [`PREFETCH_DISTANCE`] slots ahead.
 #[allow(clippy::too_many_arguments)]
-fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
+fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>, C>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -89,8 +89,10 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
-    value_slots: &[AggregationSlot],
-) {
+    combine: C,
+) where
+    C: Fn(V::Value, V::Value) -> V::Value + Copy,
+{
     let partition_shift = u64::BITS - partition_bits;
     let start = (partition * slot_count) >> partition_bits;
     let end = ((partition + 1) * slot_count) >> partition_bits;
@@ -119,7 +121,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
                         h,
                         K::resolve_persisted(arena, *entry.key()),
                         *entry.value(),
-                        |a, b| V::merge(a, b, value_slots),
+                        combine,
                     );
                     resize_if_needed::<K, V>(allocator, target);
                 }
@@ -136,7 +138,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
 /// partition this means wrapping around to slot 0. We follow each source
 /// table's probe chain until hitting an empty slot (`hash == 0`).
 #[allow(clippy::too_many_arguments)]
-fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
+fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>, C>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -144,8 +146,10 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
-    value_slots: &[AggregationSlot],
-) {
+    combine: C,
+) where
+    C: Fn(V::Value, V::Value) -> V::Value + Copy,
+{
     let partition_shift = u64::BITS - partition_bits;
     let end = ((partition + 1) * slot_count) >> partition_bits;
     let mask = slot_count - 1;
@@ -163,7 +167,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
                     h,
                     K::resolve_persisted(arena, *entry.key()),
                     *entry.value(),
-                    |a, b| V::merge(a, b, value_slots),
+                    combine,
                 );
                 resize_if_needed::<K, V>(allocator, target);
             }
@@ -174,7 +178,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
 
 /// Merge entries from `tables` that belong to `partition` into `target`.
 #[allow(clippy::too_many_arguments)]
-fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
+fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>, C>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -182,9 +186,11 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
     tables: Vec<&Table<K, V, S>>,
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
-    value_slots: &[AggregationSlot],
-) {
-    merge_within_partition_bounds::<K, V, S>(
+    combine: C,
+) where
+    C: Fn(V::Value, V::Value) -> V::Value + Copy,
+{
+    merge_within_partition_bounds::<K, V, S, C>(
         allocator,
         arena,
         partition,
@@ -192,9 +198,9 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
         &tables,
         target,
         partition_bits,
-        value_slots,
+        combine,
     );
-    merge_past_partition_bounds::<K, V, S>(
+    merge_past_partition_bounds::<K, V, S, C>(
         allocator,
         arena,
         partition,
@@ -202,7 +208,7 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
         &tables,
         target,
         partition_bits,
-        value_slots,
+        combine,
     );
 }
 
@@ -225,6 +231,46 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
     arena: &SharedArena,
     value_slots: &[AggregationSlot],
 ) -> MultiSlabTable<K, V> {
+    // Pick the merge fold once, out of the hot loops: the capture-free additive
+    // fast path for the common all-SUM/COUNT case (so the merge is byte-identical
+    // to a pure-count aggregation), or the kind-aware fold when a MIN/MAX slot is
+    // present.
+    if V::is_additive(value_slots) {
+        merge_combined_with::<K, V, _>(
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            arena,
+            |a, b| V::add(a, b),
+        )
+    } else {
+        merge_combined_with::<K, V, _>(
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            arena,
+            |a, b| V::merge(a, b, value_slots),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_combined_with<K: KeyExtractor, V: ValueExtractor, C>(
+    partition: usize,
+    buffers: &[PartitionBuffers<K, V>],
+    tables: &[MultiSlabTable<K, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    arena: &SharedArena,
+    combine: C,
+) -> MultiSlabTable<K, V>
+where
+    C: Fn(V::Value, V::Value) -> V::Value + Copy,
+{
     let partition_bits = num_partitions.trailing_zeros();
     let mut allocator = SlabAllocator::new(true);
     let mut cap = partition_capacity.max(DEFAULT_CAPACITY);
@@ -238,7 +284,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
         wb.0[partition].for_each(|(hash, key, value)| {
             grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
             let live = K::resolve_persisted(arena, key);
-            target.merge::<false, _, _>(hash, live, value, |a, b| V::merge(a, b, value_slots));
+            target.merge::<false, _, _>(hash, live, value, combine);
         });
     }
 
@@ -256,7 +302,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
         }
     }
     for (slot_count, group) in by_size.into_iter() {
-        merge_into_partition::<K, V, _>(
+        merge_into_partition::<K, V, _, C>(
             &mut allocator,
             arena,
             partition,
@@ -264,7 +310,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
             group,
             &mut target,
             partition_bits,
-            value_slots,
+            combine,
         );
     }
     target

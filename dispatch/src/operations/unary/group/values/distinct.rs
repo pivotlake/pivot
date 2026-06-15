@@ -49,6 +49,17 @@ impl ValueExtractor for DistinctValueExtractor {
     }
 
     #[inline(always)]
+    fn add(a: DistinctValue, _b: DistinctValue) -> DistinctValue {
+        a
+    }
+
+    #[inline(always)]
+    fn is_additive(_slots: &[AggregationSlot]) -> bool {
+        // No accumulator to take an extreme of — the additive (no-op) path fits.
+        true
+    }
+
+    #[inline(always)]
     fn sort_key(_value: &DistinctValue, _slot: usize) -> i64 {
         // A keys-only group never feeds an ORDER BY <agg> top-k.
         0

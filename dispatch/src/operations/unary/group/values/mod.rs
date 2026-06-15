@@ -117,13 +117,26 @@ pub trait ValueExtractor: Send + 'static {
     /// Build the per-row aggregate value at row `idx`.
     fn value(reader: &Self::Reader<'_>, idx: usize) -> Self::Value;
 
-    /// Combine two group accumulators. The hash table calls this both to fold a
-    /// row's [`value`](Self::value) into an existing entry during consume and to
-    /// combine two partials in the partition merge (the op is associative). It is
-    /// the kind-aware replacement for the old blanket additive merge: additive
-    /// slots add, MIN/MAX slots take the extreme. `slots` carries the per-slot
-    /// kinds for the runtime path; [`Compiled`] ignores it (its ops are static).
+    /// Combine two group accumulators, kind-aware: additive slots add, MIN/MAX
+    /// slots take the extreme. `slots` carries the per-slot kinds for the runtime
+    /// path; [`Compiled`] ignores it (its ops are static). Used as the merge fold
+    /// (consume + partition merge) **only when a MIN/MAX slot is present** — see
+    /// [`is_additive`](Self::is_additive); the all-additive case uses the cheaper
+    /// [`add`](Self::add) instead.
     fn merge(a: Self::Value, b: Self::Value, slots: &[AggregationSlot]) -> Self::Value;
+
+    /// The blind elementwise-additive fold — the fast path for the (overwhelmingly
+    /// common) all-`SUM`/`COUNT` query. It needs no per-slot kind dispatch and
+    /// captures nothing, so the hot merge loop is byte-identical to a pure-count
+    /// or pure-sum aggregation. The caller selects it over [`merge`](Self::merge)
+    /// via [`is_additive`](Self::is_additive). (For MIN/MAX-free signatures it is
+    /// numerically equal to `merge`, just without the dispatch.)
+    fn add(a: Self::Value, b: Self::Value) -> Self::Value;
+
+    /// Whether every slot folds additively (no MIN/MAX), so [`add`](Self::add) is
+    /// a sound, cheaper substitute for [`merge`](Self::merge) for these `slots`.
+    /// Evaluated once per consume batch / partition merge (out of the hot loop).
+    fn is_additive(slots: &[AggregationSlot]) -> bool;
 
     /// The value an `ORDER BY <slot> DESC LIMIT k` sorts on, pulled from an
     /// otherwise-opaque [`Value`]. Used only when the group feeds a top-k.

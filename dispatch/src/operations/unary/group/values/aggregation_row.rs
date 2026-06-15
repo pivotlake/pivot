@@ -140,6 +140,22 @@ impl<const N: usize, A: Accumulator> ValueExtractor for DynamicValueExtractor<N,
     }
 
     #[inline(always)]
+    fn add(a: AggregationRow<N, A>, b: AggregationRow<N, A>) -> AggregationRow<N, A> {
+        AggregationRow(std::array::from_fn(|s| {
+            let mut x = a.0[s];
+            x += b.0[s];
+            x
+        }))
+    }
+
+    #[inline(always)]
+    fn is_additive(slots: &[AggregationSlot]) -> bool {
+        slots
+            .iter()
+            .all(|s| !matches!(s.kind, AggregationKind::Min | AggregationKind::Max))
+    }
+
+    #[inline(always)]
     fn sort_key(value: &AggregationRow<N, A>, slot: usize) -> A {
         value.0[slot]
     }

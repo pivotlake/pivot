@@ -25,7 +25,7 @@ use crate::operations::unary::group::values::aggregate::Aggregate;
 use crate::operations::unary::group::values::aggregation_row::{
     AggregationRow, AggregationRowColumns,
 };
-use crate::operations::unary::group::values::{AggregationSlot, ValueExtractor};
+use crate::operations::unary::group::values::{AggregationKind, AggregationSlot, ValueExtractor};
 
 /// A [`ValueExtractor`] monomorphised over a tuple of [`Aggregate`] ops — one per
 /// output slot — and the accumulator width `A`. `value()` is straight-line typed
@@ -65,6 +65,20 @@ macro_rules! impl_compiled {
                 // Each op's KIND is a const, so the combine match folds to a
                 // straight `+`/`min`/`max` per slot — no runtime branch.
                 AggregationRow([$( $Op::KIND.combine(a.0[$idx], b.0[$idx]), )+])
+            }
+
+            #[inline(always)]
+            fn add(
+                a: AggregationRow<$n, Acc>,
+                b: AggregationRow<$n, Acc>,
+            ) -> AggregationRow<$n, Acc> {
+                AggregationRow([$( { let mut x = a.0[$idx]; x += b.0[$idx]; x }, )+])
+            }
+
+            #[inline(always)]
+            fn is_additive(_slots: &[AggregationSlot]) -> bool {
+                // The ops are static: additive iff none is an extreme. Const-folds.
+                true $( && !matches!($Op::KIND, AggregationKind::Min | AggregationKind::Max) )+
             }
 
             #[inline(always)]

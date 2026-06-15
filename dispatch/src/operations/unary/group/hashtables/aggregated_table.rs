@@ -202,8 +202,15 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
 
             if self.switched_to_radix {
                 self.scatter_range(0, length, &key_reader, &value_reader);
+            } else if V::is_additive(value_slots) {
+                // Common case (all SUM/COUNT): a capture-free blind additive fold,
+                // so the probe loop is byte-identical to a pure-count aggregation.
+                self.consume_scalared(length, &key_reader, &value_reader, |a, b| V::add(a, b));
             } else {
-                self.consume_scalared(length, value_slots, &key_reader, &value_reader);
+                // A MIN/MAX slot is present: fold kind-aware (reads slots per slot).
+                self.consume_scalared(length, &key_reader, &value_reader, |a, b| {
+                    V::merge(a, b, value_slots)
+                });
             }
         }
         self.scratch = scratch;
@@ -214,12 +221,12 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     /// two-level software prefetch (DRAM→L2 far, L2→L1 near) hides the per-row
     /// probe latency on the large in-place tables this path handles.
     #[inline(always)]
-    fn consume_scalared<'b>(
+    fn consume_scalared<'b, C: Fn(V::Value, V::Value) -> V::Value + Copy>(
         &mut self,
         length: usize,
-        value_slots: &[AggregationSlot],
         key_reader: &K::Reader<'b>,
         value_reader: &V::Reader<'b>,
+        combine: C,
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
@@ -246,7 +253,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 }
                 let key = K::live_key(key_reader, i, &mut self.worker_arena);
                 let value = V::value(value_reader, i);
-                table.merge::<false, _, _>(hash, key, value, |a, b| V::merge(a, b, value_slots));
+                table.merge::<false, _, _>(hash, key, value, combine);
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
