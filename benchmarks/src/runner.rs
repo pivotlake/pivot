@@ -80,8 +80,13 @@ pub fn discover_suite(name: &str, suite_dir: &Path) -> Result<Suite> {
         if path.extension().and_then(|e| e.to_str()) != Some("sql") {
             continue;
         }
+        // Skip setup.sql and the `*-duckdb.sql` overrides — those carry
+        // DuckDB-only query text (e.g. q42-duckdb.sql wraps EventTime in
+        // ClickHouse's toDateTime); pivot runs the matching shared `qNN.sql`.
+        // Without this, a no-`--query` run (e.g. `just pgo-gen`) would try to
+        // plan them and abort.
         let stem = match path.file_stem().and_then(|s| s.to_str()) {
-            Some(s) if s != "setup" => s.to_string(),
+            Some(s) if s != "setup" && !s.ends_with("-duckdb") => s.to_string(),
             _ => continue,
         };
         queries.push(Query {
