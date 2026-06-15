@@ -16,8 +16,10 @@ impl RowKeySchema {
     pub fn new(types: impl Into<Arc<[DataType]>>) -> Self {
         let types = types.into();
         for t in types.iter() {
+            // The extractor encodes the eight fixed-width integer types
+            // (`is_integer`) and `Utf8View`; the planner must only route those.
             assert!(
-                encoded_width(t).is_some() || *t == DataType::Utf8View,
+                t.is_integer() || *t == DataType::Utf8View,
                 "row key column type not supported: {t}"
             );
         }
@@ -27,16 +29,4 @@ impl RowKeySchema {
     pub(super) fn types(&self) -> &[DataType] {
         &self.0
     }
-}
-
-/// Encoded byte width of a fixed-width integer type; `None` for variable-width
-/// (string) columns.
-fn encoded_width(dt: &DataType) -> Option<usize> {
-    Some(match dt {
-        DataType::Int8 | DataType::UInt8 => 1,
-        DataType::Int16 | DataType::UInt16 => 2,
-        DataType::Int32 | DataType::UInt32 => 4,
-        DataType::Int64 | DataType::UInt64 => 8,
-        _ => return None,
-    })
 }
