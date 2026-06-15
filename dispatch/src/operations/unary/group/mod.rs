@@ -99,7 +99,7 @@ mod hashtables;
 
 pub use keys::{
     ArenaKey, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor,
-    StringKeyExtractor,
+    RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
     Accumulator, Aggregate, AggregationKind, AggregationRowValueExtractor, AggregationSlot,
@@ -152,6 +152,7 @@ const RADIX_PARTITIONS: usize = 4096;
 pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     key_cols: Vec<usize>,
     value_slots: Vec<AggregationSlot>,
+    key_config: K::Config,
 
     aggregated_table: AggregatedTable<K, V>,
     sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
@@ -166,6 +167,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         injector: Arc<Injector<PartitionJob<K, V>>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
+        key_config: K::Config,
         top_k: Option<(usize, usize)>,
         count_only: bool,
         sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
@@ -176,11 +178,13 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         Self {
             key_cols,
             value_slots,
+            key_config: key_config.clone(),
             outputter: GroupOutputter {
                 shared_arena: shared_arena.clone(),
                 injector,
                 receiver,
                 partition_jobs_injected,
+                key_config,
                 top_k,
                 count_only,
                 output_allocator: None,
@@ -200,7 +204,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
         _sender: &mut S,
     ) -> unary::Result<()> {
         self.aggregated_table
-            .consume_batch(&batch, &self.key_cols, &self.value_slots);
+            .consume_batch(&batch, &self.key_cols, &self.value_slots, &self.key_config);
         Ok(())
     }
 
@@ -223,6 +227,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
     injector: Arc<Injector<PartitionJob<K, V>>>,
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
+    key_config: K::Config,
     top_k: Option<(usize, usize)>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
@@ -250,6 +255,7 @@ pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
     partition_capacity: usize,
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
+    key_config: K::Config,
     top_k: Option<(usize, usize)>,
     count_only: bool,
 }
@@ -279,6 +285,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
             result_map,
             &self.arena,
             allocator,
+            &self.key_config,
             self.top_k,
             self.count_only,
             sender,
@@ -339,6 +346,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                     arena: self.shared_arena.clone(),
                     partition_capacity,
                     num_partitions,
+                    key_config: self.key_config.clone(),
                     top_k: self.top_k,
                     count_only: self.count_only,
                 });
@@ -476,7 +484,7 @@ mod tests {
     /// General harness: choose the key/value extractors, key columns, aggregates,
     /// LIMIT pushdown, and radix config. The common-case wrappers above cover
     /// `Int32` keys + `COUNT(*)`.
-    fn run_group_full<K: KeyExtractor, V: ValueExtractor>(
+    fn run_group_full<K: KeyExtractor<Config: Default>, V: ValueExtractor>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
@@ -500,6 +508,7 @@ mod tests {
                     injector.clone(),
                     key_cols.clone(),
                     value_slots.clone(),
+                    K::Config::default(),
                     top_k,
                     false,
                     tx.clone(),
@@ -737,6 +746,138 @@ mod tests {
         assert!(
             pairs.iter().all(|&(k, c)| k == 0 || c == 1),
             "every survivor is its partition's max"
+        );
+    }
+
+    // ---- Row-encoded multi-column keys (`RowKeyExtractor`) ----
+
+    /// A mixed-key batch: an `Int64` key, a `Utf8View` key, and an `Int32` value.
+    fn mixed_key_batch(ids: &[i64], names: &[&str], vals: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+        let id: ArrayRef = Arc::new(arrow_array::Int64Array::from(ids.to_vec()));
+        let name: ArrayRef = Arc::new(StringViewArray::from(names.to_vec()));
+        let val: ArrayRef = Arc::new(Int32Array::from(vals.to_vec()));
+        RecordBatch::try_new(schema, vec![id, name, val]).unwrap()
+    }
+
+    fn run_row_key_group<V: ValueExtractor>(
+        worker_batches: Vec<Vec<RecordBatch>>,
+        key_cols: Vec<usize>,
+        schema: RowKeySchema,
+        value_slots: Vec<AggregationSlot>,
+    ) -> CollectSender {
+        init_test_free_pool(64);
+        let worker_count = worker_batches.len();
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let injector = Arc::new(Injector::new());
+        let partition_jobs_injected = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut rx_opt = Some(rx);
+        let groups: Vec<_> = (0..worker_count)
+            .map(|_| {
+                Group::<RowKeyExtractor, V>::new(
+                    arena.clone(),
+                    state.clone(),
+                    injector.clone(),
+                    key_cols.clone(),
+                    value_slots.clone(),
+                    schema.clone(),
+                    None,
+                    false,
+                    tx.clone(),
+                    rx_opt.take(),
+                    partition_jobs_injected.clone(),
+                    RadixConfig::DEFAULT,
+                )
+            })
+            .collect();
+        drop(tx);
+        run_consumers(groups, worker_batches)
+    }
+
+    /// Read the `(id, name, value)` output rows of a row-key group-by, sorted.
+    fn row_key_rows(sender: &CollectSender) -> Vec<(i64, String, i64)> {
+        let mut rows: Vec<(i64, String, i64)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.i64_column(2))
+            .map(|((id, name), v)| (id, name, v))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// `GROUP BY (Int64, Utf8View)` — each distinct tuple is one group, counted.
+    #[test]
+    fn row_key_mixed_int_string_counts() {
+        let batch = mixed_key_batch(&[1, 1, 1, 2, 2], &["a", "b", "a", "a", "a"], &[0; 5]);
+        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let sender = run_row_key_group::<Compiled<(Count,)>>(
+            vec![vec![batch]],
+            vec![0, 1],
+            schema,
+            count_slots(),
+        );
+        assert_eq!(
+            row_key_rows(&sender),
+            vec![
+                (1, "a".to_string(), 2),
+                (1, "b".to_string(), 1),
+                (2, "a".to_string(), 2),
+            ]
+        );
+    }
+
+    /// Row-key SUM: each distinct `(id, name)` sums its value column. Includes a
+    /// > 12-byte string to exercise the arena (non-inline) path on output.
+    #[test]
+    fn row_key_sums_per_group() {
+        let long = "a-string-well-over-twelve-bytes";
+        let batch = mixed_key_batch(&[1, 2, 1, 2], &["x", long, "x", "y"], &[10, 5, 30, 7]);
+        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
+        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+            vec![vec![batch]],
+            vec![0, 1],
+            schema,
+            slots,
+        );
+        assert_eq!(
+            row_key_rows(&sender),
+            vec![
+                (1, "x".to_string(), 40),
+                (2, long.to_string(), 5),
+                (2, "y".to_string(), 7),
+            ]
+        );
+    }
+
+    /// Keys split across two workers must merge into the same groups.
+    #[test]
+    fn row_key_two_workers_merge() {
+        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let sender = run_row_key_group::<Compiled<(Count,)>>(
+            vec![
+                vec![mixed_key_batch(&[1, 2], &["a", "a"], &[0; 2])],
+                vec![mixed_key_batch(&[1, 1], &["a", "b"], &[0; 2])],
+            ],
+            vec![0, 1],
+            schema,
+            count_slots(),
+        );
+        assert_eq!(
+            row_key_rows(&sender),
+            vec![
+                (1, "a".to_string(), 2),
+                (1, "b".to_string(), 1),
+                (2, "a".to_string(), 1),
+            ]
         );
     }
 }

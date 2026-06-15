@@ -147,16 +147,17 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         batch: &RecordBatch,
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
+        key_config: &K::Config,
     ) {
         let total = batch.num_rows();
         if total <= RECORD_BATCH_SIZE {
-            self.consume_window(batch, key_cols, value_slots);
+            self.consume_window(batch, key_cols, value_slots, key_config);
             return;
         }
         let mut start = 0;
         while start < total {
             let len = (total - start).min(RECORD_BATCH_SIZE);
-            self.consume_window(&batch.slice(start, len), key_cols, value_slots);
+            self.consume_window(&batch.slice(start, len), key_cols, value_slots, key_config);
             start += len;
         }
     }
@@ -166,8 +167,9 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         batch: &RecordBatch,
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
+        key_config: &K::Config,
     ) {
-        let key_reader = K::make_reader(batch, key_cols);
+        let key_reader = K::make_reader(batch, key_cols, key_config);
         let value_reader = V::make_reader(batch, value_slots);
         let length = batch.num_rows();
 

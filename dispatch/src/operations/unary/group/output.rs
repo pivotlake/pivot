@@ -105,6 +105,7 @@ fn emit<K, V, Snd>(
     keys: K::Columns,
     values: V::Columns,
     arena: &Arc<SharedArena>,
+    allocator: &mut SlabAllocator,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -112,7 +113,7 @@ where
     V: ValueExtractor,
     Snd: Sender<RecordBatch>,
 {
-    let (mut fields, mut columns) = keys.finish(arena);
+    let (mut fields, mut columns) = keys.finish(arena, allocator);
     let (value_fields, value_columns) = values.finish();
     fields.extend(value_fields);
     columns.extend(value_columns);
@@ -128,6 +129,7 @@ fn emit_chunks<K, V, Snd, I>(
     total: usize,
     arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
+    key_config: &K::Config,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -139,14 +141,14 @@ where
     let mut remaining = total;
     while remaining > 0 {
         let chunk = remaining.min(OUTPUT_CHUNK_ROWS);
-        let mut keys = K::Columns::with_capacity(allocator, chunk);
+        let mut keys = K::Columns::with_capacity(allocator, chunk, key_config);
         let mut values = V::Columns::with_capacity(allocator, chunk);
         for _ in 0..chunk {
             let (key, value) = rows.next().expect("iterator yields `total` items");
             keys.push(&key);
             values.push(&value);
         }
-        emit::<K, V, Snd>(keys, values, arena, sender)?;
+        emit::<K, V, Snd>(keys, values, arena, allocator, sender)?;
         remaining -= chunk;
     }
     Ok(())
@@ -162,6 +164,7 @@ pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
     arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
+    key_config: &K::Config,
     top_k: Option<(usize, usize)>,
     count_only: bool,
     sender: &mut Snd,
@@ -190,12 +193,12 @@ where
         Some((slot, limit)) if limit < table.len() => {
             let rows = top_k_rows::<K, V, S>(&table, slot, limit);
             let total = rows.len();
-            emit_chunks::<K, V, Snd, _>(rows.into_iter(), total, arena, allocator, sender)
+            emit_chunks::<K, V, Snd, _>(rows.into_iter(), total, arena, allocator, key_config, sender)
         }
         _ => {
             let total = table.len();
             let rows = table.iter(0).map(|e| (*e.key(), *e.value()));
-            emit_chunks::<K, V, Snd, _>(rows, total, arena, allocator, sender)
+            emit_chunks::<K, V, Snd, _>(rows, total, arena, allocator, key_config, sender)
         }
     }
 }

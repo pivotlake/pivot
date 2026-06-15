@@ -545,7 +545,7 @@ impl RecordBatchOperatorSpec {
     /// spec.group_by_count::<StringKeyExtractor>(0)
     /// # ;
     /// ```
-    pub fn group_by_count<K: KeyExtractor>(self, group_column: usize) -> Self {
+    pub fn group_by_count<K: KeyExtractor<Config: Default>>(self, group_column: usize) -> Self {
         // `COUNT(*)` is one aggregate slot whose column is unused.
         self.group_by_aggregate::<K, Compiled<(Count,)>>(
             vec![group_column],
@@ -558,7 +558,7 @@ impl RecordBatchOperatorSpec {
     /// distinct key (the key column(s) only, no value column). Backs the dedup
     /// stage of `COUNT(DISTINCT x)`: the per-entry value is zero-sized, so the
     /// hash-table entry is just hash + key.
-    pub fn group_by_distinct<K: KeyExtractor>(self, key_cols: Vec<usize>) -> Self {
+    pub fn group_by_distinct<K: KeyExtractor<Config: Default>>(self, key_cols: Vec<usize>) -> Self {
         self.group_by_aggregate::<K, crate::operations::DistinctValueExtractor>(
             key_cols,
             Vec::new(),
@@ -572,13 +572,17 @@ impl RecordBatchOperatorSpec {
     /// those rows yields the total — without materialising the (potentially huge)
     /// key column. Pair with a keys-only extractor (e.g. `HashOnlyIntKeyExtractor`)
     /// for an 8-byte entry.
-    pub fn group_by_distinct_count<K: KeyExtractor>(self, key_cols: Vec<usize>) -> Self {
+    pub fn group_by_distinct_count<K: KeyExtractor<Config: Default>>(
+        self,
+        key_cols: Vec<usize>,
+    ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
         self.unary(
             GroupFactory::<K, crate::operations::DistinctValueExtractor>::create_for_workers(
                 key_cols,
                 Vec::new(),
+                K::Config::default(),
                 None,
                 true,
                 worker_count,
@@ -590,17 +594,32 @@ impl RecordBatchOperatorSpec {
     /// GROUP BY one or more key columns computing one or more aggregate value
     /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key
     /// shape, `V` the aggregate shape (e.g. its arity).
-    pub fn group_by_aggregate<K: KeyExtractor, V: ValueExtractor>(
+    pub fn group_by_aggregate<K: KeyExtractor<Config: Default>, V: ValueExtractor>(
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         top_k: Option<(usize, usize)>,
+    ) -> Self {
+        self.group_by_aggregate_config::<K, V>(key_cols, value_slots, top_k, K::Config::default())
+    }
+
+    /// [`group_by_aggregate`](Self::group_by_aggregate) with an explicit key
+    /// extractor configuration (e.g. a [`RowKeySchema`](crate::RowKeySchema)).
+    /// Extractors whose key shape is fully determined by their type use the
+    /// config-free form above.
+    pub fn group_by_aggregate_config<K: KeyExtractor, V: ValueExtractor>(
+        self,
+        key_cols: Vec<usize>,
+        value_slots: Vec<AggregationSlot>,
+        top_k: Option<(usize, usize)>,
+        key_config: K::Config,
     ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K, V>::create_for_workers(
             key_cols,
             value_slots,
+            key_config,
             top_k,
             false,
             worker_count,
