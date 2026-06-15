@@ -33,9 +33,18 @@
 #   ./benchmark.sh --source ~/hits --no-drop-caches    # skip the cache drop
 #   ./benchmark.sh --source ~/single --native ~/hits.db  # pivot parquet vs DuckDB native
 #   ./benchmark.sh --source ~/hits --duckdb-process single  # DuckDB engine-warm (symmetric)
+#   ./benchmark.sh --source ~/hits --clickhouse ~/clickhouse  # add ClickHouse-over-parquet
 #
 # --source/--hits accepts a directory (globbed for *.parquet), a single
 # .parquet file, or an explicit glob.
+#
+# --clickhouse <binary> adds ClickHouse as a third engine. By default it reads
+# the parquet --source via the official clickhouse-parquet method (clickhouse-local
+# over File(Parquet, ...)). With --clickhouse-native it instead queries the running
+# ClickHouse server's native MergeTree `hits` table (the official clickhouse method;
+# set it up first with prep-clickhouse-native.sh) — a persistent warm server, like
+# pivot. Either way the table gains clickh(c)/clickh(h) columns and the score a
+# clickhouse row. See run-clickhouse.sh.
 #
 # --native <db> switches the DuckDB side to query a persistent .db's native
 # `hits` table (ClickBench-native style) instead of parquet; pivot still reads
@@ -64,9 +73,11 @@ restart_server=0
 sleep_ms=0
 skip_check=0
 duckdb_process="per-iteration"
+clickhouse_bin=""
+clickhouse_native=0
 
 usage() {
-    sed -n '3,51p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -75,6 +86,8 @@ while [[ $# -gt 0 ]]; do
         --source|--hits)  source_path="$2"; shift 2 ;;
         --native)         native_db="$2"; shift 2 ;;
         --duckdb-process) duckdb_process="$2"; shift 2 ;;
+        --clickhouse)     clickhouse_bin="$2"; shift 2 ;;
+        --clickhouse-native) clickhouse_native=1; shift ;;
         --query)          queries="$2"; shift 2 ;;
         --iterations)     iterations="$2"; shift 2 ;;
         --sleep)          sleep_ms="$2"; shift 2 ;;
@@ -156,6 +169,23 @@ duck_invoke() {
         --duckdb-process "$duckdb_process" $duck_cache_flag 2>&1
 }
 
+# Run ClickHouse-over-parquet for one or more queries. ClickHouse always reads
+# the parquet --source (the upstream clickhouse-parquet method), even in --native
+# mode (where DuckDB reads its native .db) — so it's pivot/DuckDB vs ClickHouse
+# all on the same parquet. run-clickhouse.sh prints the same "Run Time" lines.
+ch_invoke() {
+    local IFS=,
+    local ch_cache_flag="--no-drop-caches"
+    [[ $drop_caches -eq 1 ]] && ch_cache_flag=""
+    # --clickhouse-native: query the running ClickHouse server's MergeTree (the
+    # official native engine); otherwise clickhouse-local over the parquet --source.
+    local ch_src=(--source "$source_path")
+    [[ $clickhouse_native -eq 1 ]] && ch_src=(--native)
+    "$here/run-clickhouse.sh" "${ch_src[@]}" --query "$*" \
+        --iterations "$iterations" --sleep "$sleep_ms" \
+        --clickhouse "$clickhouse_bin" $ch_cache_flag 2>&1
+}
+
 # Parse pivot output (any number of queries) into "id cold hot it1 it2 …"
 # lines: cold is iteration 1, hot is the min of the rest ("-" if there is no
 # rest), then every per-iteration ms value. ClickBench's hot metric is the
@@ -206,9 +236,12 @@ parse_duck() {
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then color=1; else color=0; fi
 if [[ -t 1 ]]; then tty=1; else tty=0; fi
 
-pivot_tsv="$(mktemp)"; duck_tsv="$(mktemp)"
+pivot_tsv="$(mktemp)"; duck_tsv="$(mktemp)"; ch_tsv="$(mktemp)"
 data="$(mktemp)"; spin_out="$(mktemp)"
-trap 'rm -f "$pivot_tsv" "$duck_tsv" "$data" "$spin_out"' EXIT
+trap 'rm -f "$pivot_tsv" "$duck_tsv" "$ch_tsv" "$data" "$spin_out"' EXIT
+# ClickHouse is an optional 3rd engine (always over parquet, like upstream
+# clickhouse-parquet). Enabled by --clickhouse; ch_tsv stays empty otherwise.
+ch_enabled=0; [[ -n "$clickhouse_bin" ]] && ch_enabled=1
 
 # Run a command in the background while animating a one-line spinner, then wait
 # for it. The command's stdout lands in $spin_out for the caller to read; its
@@ -323,28 +356,70 @@ if [[ -n "$native_db" ]]; then
 else
     echo "duckdb source: $source_path"
 fi
-echo
-collect pivot  pivot_invoke parse_pivot "$pivot_tsv"
-collect DuckDB duck_invoke  parse_duck  "$duck_tsv"
+if [[ $ch_enabled -eq 1 ]]; then
+    if [[ $clickhouse_native -eq 1 ]]; then
+        echo "clickhouse:    $clickhouse_bin NATIVE MergeTree server (official clickhouse)"
+    else
+        echo "clickhouse:    $clickhouse_bin over $source_path/*.parquet (official clickhouse-parquet)"
+    fi
+fi
+[[ $clickhouse_native -eq 1 ]] && echo "isolation:     ClickHouse server stopped while pivot/DuckDB run (started only for its own phase)"
 echo
 
-# Merge the two result sets by query id, in the canonical query order, filling
-# "ERR" for any query an engine failed to produce. Columns: id dc dh pc ph.
-awk -v order="$(IFS=,; echo "${ids[*]}")" '
-FNR == NR { dc[$1] = $2; dh[$1] = $3; next }   # first file: duckdb
-          { pc[$1] = $2; ph[$1] = $3 }         # second file: pivot
+# ISOLATION: a persistent ClickHouse server (native mode) must NOT be resident
+# while pivot/DuckDB are measured — its memory footprint and post-load background
+# merges contaminate their cold and hot numbers. So with --clickhouse-native we
+# stop the CH server before pivot/DuckDB and start it only for ClickHouse's own
+# phase (ClickBench measures each engine in isolation). ClickHouse-parquet
+# (clickhouse-local) has no resident server, so there is nothing to manage there.
+ch_server() {   # ch_server start|stop  — no-op unless --clickhouse-native
+    [[ $clickhouse_native -eq 1 ]] || return 0
+    if [[ "$1" == stop ]]; then
+        sudo clickhouse stop >/dev/null 2>&1 || true
+    else
+        sudo clickhouse start >/dev/null 2>&1 || true
+        local i; for i in $(seq 1 60); do
+            "$clickhouse_bin" client --query "SELECT 1" >/dev/null 2>&1 && return 0; sleep 1
+        done
+        echo "  warning: clickhouse server did not come up for its phase" >&2
+    fi
+}
+
+ch_server stop                  # ensure the CH server is down while pivot/DuckDB run
+collect pivot  pivot_invoke parse_pivot "$pivot_tsv"
+collect DuckDB duck_invoke  parse_duck  "$duck_tsv"
+if [[ $ch_enabled -eq 1 ]]; then
+    ch_server start             # bring CH up ONLY for its own measurement
+    # parse_duck reads the shared "=== qNN ===" / "Run Time (s): real X" format.
+    collect ClickHouse ch_invoke parse_duck "$ch_tsv"
+    ch_server stop              # leave it down so it never contends with a later run
+fi
+echo
+
+# Merge the result sets by query id, in the canonical query order, filling "ERR"
+# for any query the required engines (duckdb/pivot) failed to produce and "-" for
+# absent ClickHouse. Columns: id dc dh pc ph cc chh (ch cold/hot). ch_tsv is
+# empty when --clickhouse is off, so cc/chh default to "-".
+awk -v order="$(IFS=,; echo "${ids[*]}")" \
+    -v df="$duck_tsv" -v pf="$pivot_tsv" -v cf="$ch_tsv" '
+FILENAME == df { dc[$1] = $2; dh[$1] = $3; next }
+FILENAME == pf { pc[$1] = $2; ph[$1] = $3; next }
+FILENAME == cf { cc[$1] = $2; chh[$1] = $3; next }
 END {
     n = split(order, o, ",")
     for (i = 1; i <= n; i++) {
         k = o[i]
-        printf "%s %s %s %s %s\n", k, \
+        printf "%s %s %s %s %s %s %s\n", k, \
             (k in dc ? dc[k] : "ERR"), (k in dh ? dh[k] : "ERR"), \
-            (k in pc ? pc[k] : "ERR"), (k in ph ? ph[k] : "ERR")
+            (k in pc ? pc[k] : "ERR"), (k in ph ? ph[k] : "ERR"), \
+            (k in cc ? cc[k] : "-"),   (k in chh ? chh[k] : "-")
     }
-}' "$duck_tsv" "$pivot_tsv" > "$data"
+}' "$duck_tsv" "$pivot_tsv" "$ch_tsv" > "$data"
 
-# Render the comparison table. Speedup = duckdb / pivot (>1 means pivot faster).
-awk -v color="$color" '
+# Render the comparison table. Speedup = duckdb / pivot (>1 means pivot faster);
+# when --clickhouse is on, a clickhouse(c)/clickhouse(h) column is shown too (the
+# speedup column stays the duckdb-vs-pivot ratio — ClickHouse is informational).
+awk -v color="$color" -v ch="$ch_enabled" '
 function speed(duck, piv,   r) {
     if (duck == "ERR" || piv == "ERR" || duck == "-" || piv == "-") return "-"
     if (piv + 0 <= 0) return ">99x"          # pivot too fast to measure at ms granularity
@@ -365,52 +440,71 @@ BEGIN {
     green = color ? "\033[32m" : ""
     red   = color ? "\033[31m" : ""
     rst   = color ? "\033[0m"  : ""
-    printf "%-6s %11s %11s %9s   %11s %11s %9s\n", \
-        "query", "duckdb(c)", "pivot(c)", "cold", "duckdb(h)", "pivot(h)", "hot"
-    printf "%s\n", "-----------------------------------------------------------------------------"
+    if (ch) {
+        printf "%-6s %11s %11s %11s %9s   %11s %11s %11s %9s\n", \
+            "query", "duckdb(c)", "pivot(c)", "clickh(c)", "cold", \
+                     "duckdb(h)", "pivot(h)", "clickh(h)", "hot"
+        printf "%s\n", "-------------------------------------------------------------------------------------------------------"
+    } else {
+        printf "%-6s %11s %11s %9s   %11s %11s %9s\n", \
+            "query", "duckdb(c)", "pivot(c)", "cold", "duckdb(h)", "pivot(h)", "hot"
+        printf "%s\n", "-----------------------------------------------------------------------------"
+    }
 }
 {
-    id=$1; dc=$2; dh=$3; pc=$4; ph=$5
+    id=$1; dc=$2; dh=$3; pc=$4; ph=$5; cc=$6; chh=$7
     cs = speed(dc, pc); hs = speed(dh, ph)
-    printf "%-6s %s %s %s   %s %s %s\n", \
-        id, tm(dc), tm(pc), colored(cs, dc, pc), tm(dh), tm(ph), colored(hs, dh, ph)
+    if (ch)
+        printf "%-6s %s %s %s %s   %s %s %s %s\n", \
+            id, tm(dc), tm(pc), tm(cc), colored(cs, dc, pc), \
+                tm(dh), tm(ph), tm(chh), colored(hs, dh, ph)
+    else
+        printf "%-6s %s %s %s   %s %s %s\n", \
+            id, tm(dc), tm(pc), colored(cs, dc, pc), tm(dh), tm(ph), colored(hs, dh, ph)
 }
 ' "$data"
 
 # ClickBench-style weighted score: the geometric mean over queries of
 # (t + 10ms) / (best_for_that_query + 10ms) — ClickBench's summary metric. The
 # +10ms regularises near-zero queries; lower is better and 1.00 means fastest
-# on every scored query. With two engines the per-query baseline is the faster
-# of the two. Computed over our cold and hot numbers; a query is skipped for a
-# metric when either engine has no timing there (ERR or single-iteration "-").
-awk -v color="$color" '
+# on every scored query. The per-query baseline is the fastest engine present.
+# So all engines stay comparable, a query is scored only when EVERY active engine
+# has a timing there (intersection); ERR / single-iteration "-" drop it for all.
+awk -v color="$color" -v ch="$ch_enabled" '
 function isnum(x) { return x ~ /^[0-9]+(\.[0-9]+)?$/ }
 function gm(logsum, n) { return n ? exp(logsum / n) : 0 }
-function cell(mine, other, n,   s) {
+function cell(mine, best, n,   s) {
     if (!n) return sprintf("%8s", "-")
     s = sprintf("%.2f", mine)
-    if (color && mine <= other) return sprintf("%s%8s%s", grn, s, rst)
+    if (color && mine <= best + 1e-9) return sprintf("%s%8s%s", grn, s, rst)
     return sprintf("%8s", s)
 }
 BEGIN { grn = color ? "\033[32m" : ""; rst = color ? "\033[0m" : "" }
 {
-    dc = $2; dh = $3; pc = $4; ph = $5
-    if (isnum(dc) && isnum(pc)) {
-        b = dc < pc ? dc : pc
+    dc = $2; dh = $3; pc = $4; ph = $5; cc = $6; chh = $7
+    if (isnum(dc) && isnum(pc) && (!ch || isnum(cc))) {
+        b = dc; if (pc < b) b = pc; if (ch && cc < b) b = cc
         ldc += log((dc + 10) / (b + 10)); lpc += log((pc + 10) / (b + 10)); nc++
+        if (ch) lcc += log((cc + 10) / (b + 10))
     }
-    if (isnum(dh) && isnum(ph)) {
-        b = dh < ph ? dh : ph
+    if (isnum(dh) && isnum(ph) && (!ch || isnum(chh))) {
+        b = dh; if (ph < b) b = ph; if (ch && chh < b) b = chh
         ldh += log((dh + 10) / (b + 10)); lph += log((ph + 10) / (b + 10)); nh++
+        if (ch) lch += log((chh + 10) / (b + 10))
     }
 }
 END {
+    gpc = gm(lpc,nc); gdc = gm(ldc,nc); gcc = gm(lcc,nc)
+    gph = gm(lph,nh); gdh = gm(ldh,nh); gch = gm(lch,nh)
+    bc = gpc; if (gdc < bc) bc = gdc; if (ch && gcc < bc) bc = gcc
+    bh = gph; if (gdh < bh) bh = gdh; if (ch && gch < bh) bh = gch
     print ""
     print "ClickBench score — geomean of (t+10ms)/(best+10ms) per query, lower is better"
     print "(1.00 = fastest on every scored query):"
-    printf "  %-7s %8s %8s\n", "", "cold", "hot"
-    printf "  %-7s %s %s\n", "pivot",  cell(gm(lpc,nc), gm(ldc,nc), nc), cell(gm(lph,nh), gm(ldh,nh), nh)
-    printf "  %-7s %s %s\n", "duckdb", cell(gm(ldc,nc), gm(lpc,nc), nc), cell(gm(ldh,nh), gm(lph,nh), nh)
+    printf "  %-11s %8s %8s\n", "", "cold", "hot"
+    printf "  %-11s %s %s\n", "pivot",  cell(gpc, bc, nc), cell(gph, bh, nh)
+    printf "  %-11s %s %s\n", "duckdb", cell(gdc, bc, nc), cell(gdh, bh, nh)
+    if (ch) printf "  %-11s %s %s\n", "clickhouse", cell(gcc, bc, nc), cell(gch, bh, nh)
     printf "  scored %d/%d queries (cold/hot)\n", nc, nh
 }
 ' "$data"
