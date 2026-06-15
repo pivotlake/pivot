@@ -39,13 +39,20 @@ where
     T::Native: PersistedKey + Hash + Eq,
 {
     const SUPPORTS_RADIX: bool = true;
+    type Config = ();
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;
     type PersistedLiveKey<'a> = T::Native;
     type Reader<'b> = &'b PrimitiveArray<T>;
     type Columns = IntKeyColumn<T>;
+    type Scratch = ();
 
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b> {
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        _config: &(),
+        _scratch: &'b mut (),
+    ) -> Self::Reader<'b> {
         batch
             .column(key_cols[0])
             .as_any()
@@ -54,16 +61,18 @@ where
     }
 
     #[inline(always)]
-    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64 {
-        state.hash_one(unsafe { reader.value_unchecked(idx) })
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]) {
+        for (i, h) in hashes.iter_mut().enumerate() {
+            *h = state.hash_one(unsafe { reader.value_unchecked(i) });
+        }
     }
 
     #[inline(always)]
-    fn live_key<'a, 'b>(
-        reader: &Self::Reader<'b>,
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
         idx: usize,
         _arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b> {
+    ) -> Self::LiveKey<'a, 'r> {
         unsafe { reader.value_unchecked(idx) }
     }
 
@@ -77,8 +86,9 @@ pub struct IntKeyColumn<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
 
 impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumn<T> {
     type Key = T::Native;
+    type Config = ();
 
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, _config: &()) -> Self {
         Self(PrimitiveBuilder::<T>::with_capacity(allocator, rows))
     }
 
@@ -87,7 +97,11 @@ impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumn<T> {
         self.0.push(key, 1);
     }
 
-    fn finish(self, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(
+        self,
+        _arena: &Arc<SharedArena>,
+        _allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![Field::new("key", T::DATA_TYPE, false)];
         (fields, vec![self.0.into_array(None)])
     }

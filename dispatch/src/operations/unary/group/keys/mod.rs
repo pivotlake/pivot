@@ -9,9 +9,10 @@
 //! ## Reader-based consume
 //!
 //! Extraction is driven through a per-batch [`Reader`](KeyExtractor::Reader):
-//! [`make_reader`](KeyExtractor::make_reader) downcasts the key columns once,
-//! then [`hash`](KeyExtractor::hash) and [`live_key`](KeyExtractor::live_key)
-//! read row `idx` cheaply.
+//! [`make_reader`](KeyExtractor::make_reader) binds the key columns,
+//! [`prepare_and_hash`](KeyExtractor::prepare_and_hash) fills the batch's hash
+//! buffer (and materialises keys, for the row extractor), then
+//! [`live_key`](KeyExtractor::live_key) reads row `idx` cheaply during the probe.
 //!
 //! ## Live vs Persisted keys
 //!
@@ -40,6 +41,9 @@ pub use hash_only_int::HashOnlyIntKeyExtractor;
 mod string;
 pub use string::{ArenaKey, StringKeyExtractor};
 
+mod row;
+pub use row::{RowKeyExtractor, RowKeySchema};
+
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
 pub trait KeyExtractor: Send + 'static {
@@ -56,29 +60,58 @@ pub trait KeyExtractor: Send + 'static {
     /// `!SUPPORTS_RADIX` (the radix scatter path has no such out-of-band count).
     const DEDUP_BY_HASH: bool = false;
 
+    /// Runtime configuration threaded from the operator spec to the per-batch
+    /// reader and the output columns. Most extractors are fully determined by
+    /// their type and use `()`; [`RowKeyExtractor`] carries its key schema here
+    /// — the one thing neither the reader nor the output decode can recover on
+    /// their own.
+    type Config: Clone + Send + Sync + 'static;
     /// The `Copy` key representation stored inside hash table entries.
     type Persisted: PersistedKey;
     /// A transient key that borrows from the input batch and/or the worker arena.
     type LiveKey<'a, 'b>: LiveKey<Persisted = Self::Persisted>;
     /// A live key reconstructed from an already-persisted key (used during merge).
     type PersistedLiveKey<'a>: LiveKey<Persisted = Self::Persisted>;
-    /// Per-batch reader holding downcast key-column accessors.
+    /// Per-batch reader holding downcast key-column accessors (or, for the row
+    /// extractor, a borrow of the worker [`Scratch`](Self::Scratch) it encodes
+    /// into).
     type Reader<'b>;
     /// Accumulates persisted keys into the result's leading key column(s).
-    type Columns: KeyColumns<Key = Self::Persisted>;
+    type Columns: KeyColumns<Key = Self::Persisted, Config = Self::Config>;
+    /// Per-worker reusable scratch, owned by the table and reused across batches.
+    /// `()` for extractors that read columns directly; the row extractor uses it
+    /// to hold the batch's encoded key bytes so nothing is reallocated per batch.
+    type Scratch: Default + Send;
 
-    /// Build a reader over `batch` for the given key columns.
-    fn make_reader<'b>(batch: &'b RecordBatch, key_cols: &[usize]) -> Self::Reader<'b>;
+    /// Bind `batch`'s key columns into a reader. Cheap and side-effect-free —
+    /// just downcasts (and, for the row extractor, casts) the columns and borrows
+    /// `scratch`. The actual per-batch work happens in
+    /// [`prepare_and_hash`](Self::prepare_and_hash).
+    fn make_reader<'b>(
+        batch: &'b RecordBatch,
+        key_cols: &[usize],
+        config: &Self::Config,
+        scratch: &'b mut Self::Scratch,
+    ) -> Self::Reader<'b>;
 
-    /// Hash the key at row `idx`.
-    fn hash(reader: &Self::Reader<'_>, idx: usize, state: &RandomState) -> u64;
+    /// Process one batch: write each row's hash into `hashes` (which the caller
+    /// sized to the batch length). An extractor that materialises keys (the row
+    /// extractor) also encodes them into its scratch here, hashing each as it is
+    /// written; the others hash straight from the columns.
+    fn prepare_and_hash(reader: &mut Self::Reader<'_>, state: &RandomState, hashes: &mut [u64]);
 
     /// Extract a live key from row `idx` (may borrow the arena to persist).
-    fn live_key<'a, 'b>(
-        reader: &Self::Reader<'b>,
+    ///
+    /// The live key borrows the *reader* (lifetime `'r`), not the batch directly.
+    /// That covers both a key pointing into the input columns (string — whose
+    /// longer batch borrow simply shortens to `'r`) and one pointing into the
+    /// reader's own scratch (row). It is always consumed — `eq_persisted` or
+    /// `persist` — within the probe iteration, well inside `'r`.
+    fn live_key<'a, 'r>(
+        reader: &'r Self::Reader<'_>,
         idx: usize,
         arena: &'a mut WorkerArena,
-    ) -> Self::LiveKey<'a, 'b>;
+    ) -> Self::LiveKey<'a, 'r>;
 
     /// Reconstruct a live key from a persisted key, borrowing from the shared arena.
     fn resolve_persisted(
@@ -95,11 +128,20 @@ pub trait KeyExtractor: Send + 'static {
 /// the ring buffers; non-arena keys ignore it.
 pub trait KeyColumns {
     type Key;
+    /// The owning extractor's runtime configuration (see [`KeyExtractor::Config`]).
+    type Config;
 
     /// Allocate key-column builders over engine memory, sized for `rows` (one
     /// output chunk; must fit a single 2MB slab). Arena-backed keys (strings)
     /// ignore the allocator and pull their data from the shared arena at finish.
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self;
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, config: &Self::Config) -> Self;
     fn push(&mut self, key: &Self::Key);
-    fn finish(self, arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>);
+    /// Materialise the key columns. Takes the arena (for zero-copy string views)
+    /// and the chunk's allocator (for builders whose size is only known at
+    /// decode time, e.g. the row extractor's per-field decoded columns).
+    fn finish(
+        self,
+        arena: &Arc<SharedArena>,
+        allocator: &mut SlabAllocator,
+    ) -> (Vec<Field>, Vec<ArrayRef>);
 }

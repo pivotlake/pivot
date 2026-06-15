@@ -65,6 +65,26 @@ impl SharedArena {
         unsafe { std::slice::from_raw_parts(ptr.add(offset as usize), len as usize) }
     }
 
+    /// Prefetch into L1 the cache line backing a non-inline key's bytes — a hint
+    /// used by the row-key output decode to hide the scattered arena reads while
+    /// it walks keys in (hash) slot order. A no-op hint, so the index/offset need
+    /// only be valid, not currently mapped.
+    #[inline(always)]
+    pub fn prefetch(&self, buffer_index: u32, offset: u32) {
+        let ptr = unsafe { (*self.ptrs[buffer_index as usize].get()).add(offset as usize) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+        }
+        #[cfg(target_arch = "aarch64")]
+        #[allow(clippy::pointers_in_nomem_asm_block)]
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = ptr;
+    }
+
     /// Convert all registered buffers into Arrow Buffers for zero-copy StringViewArray output.
     /// The `Arc<SharedArena>` keeps ring memory alive as long as any Arrow Buffer exists.
     pub fn to_arrow_buffers(self: &Arc<Self>) -> Vec<Buffer> {
@@ -125,7 +145,15 @@ impl WorkerArena {
     /// Push a string into the arena and return its ArenaKey (inline or view).
     #[inline]
     pub fn push(&mut self, s: &str) -> ArenaKey {
-        let data = s.as_bytes();
+        self.push_bytes(s.as_bytes())
+    }
+
+    /// Push arbitrary bytes into the arena and return their ArenaKey (inline or
+    /// view). The bytes need not be valid UTF-8 — an `ArenaKey`/StringView is
+    /// just length-prefixed bytes — so the row-encoded composite key uses this
+    /// to store a packed key tuple.
+    #[inline]
+    pub fn push_bytes(&mut self, data: &[u8]) -> ArenaKey {
         if data.len() <= MAX_INLINE_STRING_VIEW {
             return ArenaKey::inline(data);
         }
