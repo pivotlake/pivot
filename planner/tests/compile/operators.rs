@@ -671,6 +671,65 @@ fn filter_then_top_n(mut testing_planner: TestingPlanner) {
     assert_eq!(rows[1]["a"], 4);
 }
 
+/// Build a single-column `events` table whose group sizes are all distinct, so
+/// `COUNT(*)` orderings are unambiguous: g=1 -> 4, g=2 -> 3, g=3 -> 2, g=4 -> 1.
+fn add_events_table(testing_planner: &TestingPlanner) {
+    testing_planner.add_table(
+        "events",
+        &[(
+            "g",
+            Type::Int32,
+            int_col(vec![1, 1, 1, 1, 2, 2, 2, 3, 3, 4]),
+        )],
+    );
+}
+
+// `GROUP BY … ORDER BY COUNT(*) DESC LIMIT k OFFSET m`: the `OFFSET` window must
+// survive the group → Top-N pipeline. DESC by count is g=1,2,3,4; skipping the
+// top 2 and taking 2 leaves g=3 then g=4.
+#[rstest]
+fn group_order_by_count_desc_with_offset(mut testing_planner: TestingPlanner) {
+    add_events_table(&testing_planner);
+    let results = testing_planner
+        .planner
+        .plan(
+            "SELECT g, COUNT(*) FROM events \
+             GROUP BY g ORDER BY COUNT(*) DESC LIMIT 2 OFFSET 2",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    let keys: Vec<i64> = rows.iter().map(|r| r["key"].as_i64().unwrap()).collect();
+    assert_eq!(keys, vec![3, 4]);
+}
+
+// `GROUP BY … ORDER BY <group key> ASC LIMIT k OFFSET m`: ordering by the group
+// key (not an aggregate) with an `OFFSET`. Keys ascending are 1,2,3,4; skipping
+// 1 and taking 2 leaves g=2 then g=3.
+#[rstest]
+fn group_order_by_key_asc_with_offset(mut testing_planner: TestingPlanner) {
+    add_events_table(&testing_planner);
+    let results = testing_planner
+        .planner
+        .plan(
+            "SELECT g, COUNT(*) FROM events \
+             GROUP BY g ORDER BY g ASC LIMIT 2 OFFSET 1",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    let keys: Vec<i64> = rows.iter().map(|r| r["key"].as_i64().unwrap()).collect();
+    assert_eq!(keys, vec![2, 3]);
+}
+
 #[derive(Debug, Default)]
 struct RecordingCatalog {
     created_tables: Mutex<Vec<CreateTableRequest>>,
