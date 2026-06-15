@@ -28,7 +28,7 @@ use thiserror::Error;
 /// Each variant maps 1-1 to an arrow array kind in the executor, and
 /// bidirectionally to a [`LogicalTypeId`] in DuckDB via the
 /// `type_conversions!` macro below.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Boolean,
     Int8,

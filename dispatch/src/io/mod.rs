@@ -30,7 +30,7 @@ use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::os::fd::RawFd;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -41,24 +41,28 @@ pub use requester::{Error as IORequesterError, IORequester};
 
 pub mod http;
 
-/// Where the bytes behind a cached region live: a local file descriptor, or a
-/// remote HTTP(S) object fetched via range requests.
+/// An open file the engine can read: a local file (the `Arc<File>` keeps the
+/// descriptor alive for as long as anything — a table, an in-flight request, a
+/// cached region — still references it), or a remote HTTP(S) object fetched
+/// via range requests.
 ///
-/// This is the key the [`FileCache`](crate::memory::file_cache::FileCache) uses
-/// to bucket 2 MB regions, so it must be cheap to `Hash`/`Eq` — the cache's
-/// pin re-check runs on every hit. `Local` compares an `i32`; `Remote` carries
-/// an [`Arc<RemoteFile>`] whose `Hash`/`Eq` delegate to a single interned id
-/// (never the URL string).
+/// This is also the key the [`FileCache`](crate::memory::file_cache::FileCache)
+/// uses to bucket 2 MB regions, so it must be cheap to `Hash`/`Eq` — the
+/// cache's pin re-check runs on every hit. `Local` compares the raw fd (an
+/// `i32`; stable while the `Arc<File>` is held, and holding it in the key means
+/// a cached file's fd can never be closed and reused under the cache); `Remote`
+/// carries an [`Arc<RemoteFile>`] whose `Hash`/`Eq` delegate to a single
+/// interned id (never the URL string).
 #[derive(Clone)]
 pub enum FileLocation {
-    Local(RawFd),
+    Local(Arc<File>),
     Remote(Arc<RemoteFile>),
 }
 
 impl PartialEq for FileLocation {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (FileLocation::Local(a), FileLocation::Local(b)) => a == b,
+            (FileLocation::Local(a), FileLocation::Local(b)) => a.as_raw_fd() == b.as_raw_fd(),
             // RemoteFile's Eq compares the interned id, not the URL.
             (FileLocation::Remote(a), FileLocation::Remote(b)) => a == b,
             _ => false,
@@ -71,9 +75,9 @@ impl Eq for FileLocation {}
 impl Hash for FileLocation {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            FileLocation::Local(fd) => {
+            FileLocation::Local(file) => {
                 0u8.hash(state);
-                fd.hash(state);
+                file.as_raw_fd().hash(state);
             }
             FileLocation::Remote(remote) => {
                 1u8.hash(state);
@@ -86,7 +90,7 @@ impl Hash for FileLocation {
 impl Debug for FileLocation {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileLocation::Local(fd) => write!(f, "Local({fd})"),
+            FileLocation::Local(file) => write!(f, "Local({})", file.as_raw_fd()),
             FileLocation::Remote(r) => write!(f, "Remote({})", r.display_url()),
         }
     }
@@ -208,15 +212,17 @@ impl Hash for RemoteFile {
     }
 }
 
-/// A filesystem read request: read `block` from local descriptor `fd` into its
-/// pinned cache slot. This is what an operator's
+/// A filesystem read request: read `block` from `file` into its pinned cache
+/// slot. This is what an operator's
 /// [`next_fs_requests`](crate::operations::Operator::next_fs_requests) yields —
 /// by construction it can only describe a local read, never a remote one — what
 /// the requester submits and completes, and what comes back to the operator's
 /// [`process_fs_response`](crate::operations::Operator::process_fs_response);
-/// the transport stays a type-level fact the whole way.
+/// the transport stays a type-level fact the whole way. Owning the `Arc<File>`
+/// (the way [`HttpRequest`] owns its `Arc<RemoteFile>`) keeps the descriptor
+/// alive for the read's whole flight.
 pub struct FsRequest {
-    pub fd: RawFd,
+    pub file: Arc<File>,
     pub block: MissingBlock,
 }
 
