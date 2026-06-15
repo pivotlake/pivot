@@ -12,12 +12,11 @@ use crate::catalog::TableFile;
 /// the `commit` (the rest are `None`).
 pub(super) struct TableBuildSinkFactory<C> {
     commit: Option<C>,
-    file_count: usize,
 }
 
 impl<C> TableBuildSinkFactory<C> {
-    pub(super) fn new(commit: Option<C>, file_count: usize) -> Self {
-        Self { commit, file_count }
+    pub(super) fn new(commit: Option<C>) -> Self {
+        Self { commit }
     }
 }
 

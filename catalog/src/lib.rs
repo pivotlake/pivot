@@ -17,7 +17,6 @@
 
 mod catalog;
 pub mod parquet;
-mod sql_type;
 pub mod store;
 mod manifest;
 

@@ -96,7 +96,6 @@ where
         + Send
         + 'static,
 {
-    let file_count = files.len();
     let fetch = OperatorSpec::new(dispatcher.clone(), fetch_table_file_factories(files, dispatcher.worker_count()));
 
     // `fan_in` funnels every worker's row groups to worker 0; only worker 0 gets
@@ -104,7 +103,7 @@ where
     // shared state — the channel closing is the "all fetched" signal.
     let mut commit = Some(commit);
     let sinks: Vec<_> = (0..dispatcher.worker_count())
-        .map(|_| TableBuildSinkFactory::new(commit.take(), file_count))
+        .map(|_| TableBuildSinkFactory::new(commit.take()))
         .collect();
     RecordBatchOperatorSpec::from_spec(fetch.chain(fan_in::<TableFile>(dispatcher.worker_count()), sinks))
 }
