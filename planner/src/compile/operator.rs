@@ -161,6 +161,13 @@ impl Aggregate {
                         Expression::AggregateFunc(AggregateFunc::Sum(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Sum, a.column.column_idx),
                         ),
+                        // Global MIN/MAX is the numeric global operator; a global
+                        // string extreme isn't supported yet (only grouped is).
+                        Expression::AggregateFunc(
+                            AggregateFunc::Min(a) | AggregateFunc::Max(a),
+                        ) if a.column.return_type == Type::Utf8 => {
+                            Err(Error::UnsupportedAggregateExpression(e.clone()))
+                        }
                         Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Min, a.column.column_idx),
                         ),
@@ -522,16 +529,19 @@ impl Aggregate {
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
             Add, AggregationKind, AggregationSlot, CompiledMixed, Count, DynamicMixed,
-            IntPairKeyExtractor, Max, Min, Mono, RowKeyExtractor, Sum,
+            IntPairKeyExtractor, Max, Min, Mono, RowKeyExtractor, StringExtreme, Sum,
         };
 
-        // The value type's fold is fixed at plan time: a homogeneous signature uses
-        // the branch-free `Mono<F>` (the common all-additive case is `Mono<Add>`),
-        // a mix of additive and extreme slots uses `DynamicMixed` (per-slot kind
-        // dispatch). Aliases so every value type is `<N, A>` for the arity macro.
+        // The value type's fold is fixed at plan time: a homogeneous numeric
+        // signature uses the branch-free `Mono<F>` (the common all-additive case is
+        // `Mono<Add>`), a homogeneous *string* MIN/MAX uses `StringExtreme<F>`, and
+        // any mix uses `DynamicMixed` (per-slot kind dispatch). Aliases so the
+        // numeric value types are `<N, A>` and the string ones `<N>` for the macros.
         type AddVal<const N: usize, A> = Mono<Add, N, A>;
         type MinVal<const N: usize, A> = Mono<Min, N, A>;
         type MaxVal<const N: usize, A> = Mono<Max, N, A>;
+        type StrMinVal<const N: usize> = StringExtreme<Min, N>;
+        type StrMaxVal<const N: usize> = StringExtreme<Max, N>;
 
         let key_refs: Vec<&crate::expression::Ref> = self
             .groups
@@ -608,14 +618,26 @@ impl Aggregate {
         // than silently overflowing the slot.
         let wide = sum_reads_wide_column(&self.expressions);
 
-        // The fold shape: homogeneous additive / all-MIN / all-MAX use a
-        // branch-free `Mono<F>`; anything mixed uses `DynamicMixed`.
+        // The fold shape: homogeneous additive / all-MIN / all-MAX over integers
+        // use a branch-free `Mono<F>`; homogeneous MIN/MAX over *string* columns
+        // use `StringExtreme<F>`; anything mixed uses `DynamicMixed`.
         enum Shape {
             Additive,
             AllMin,
             AllMax,
+            StrMin,
+            StrMax,
             Mixed,
         }
+        // Whether every MIN/MAX slot reads a string (`Utf8`) column — true only for
+        // a homogeneous string-extreme signature (no additive slots interleaved).
+        let extreme_cols_utf8 = self.expressions.iter().all(|e| {
+            matches!(
+                e,
+                Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a))
+                    if a.column.return_type == Type::Utf8
+            )
+        });
         let shape = if slots.iter().all(|s| {
             matches!(
                 s.kind,
@@ -624,12 +646,41 @@ impl Aggregate {
         }) {
             Shape::Additive
         } else if slots.iter().all(|s| s.kind == AggregationKind::Min) {
-            Shape::AllMin
+            if extreme_cols_utf8 {
+                Shape::StrMin
+            } else {
+                Shape::AllMin
+            }
         } else if slots.iter().all(|s| s.kind == AggregationKind::Max) {
-            Shape::AllMax
+            if extreme_cols_utf8 {
+                Shape::StrMax
+            } else {
+                Shape::AllMax
+            }
         } else {
             Shape::Mixed
         };
+
+        // A string MIN/MAX is only supported homogeneously (all slots MIN, or all
+        // MAX, over string columns) — `StringExtreme<F>` has one direction and an
+        // ArenaKey cell. Reject any other signature that contains a string extreme
+        // (mixed MIN+MAX strings, a string extreme alongside SUM/COUNT, or string
+        // mixed with integer extremes) rather than routing it to a numeric value
+        // type that would mis-read the `Utf8` column.
+        let unsupported_string_extreme = self
+            .expressions
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a))
+                        if a.column.return_type == Type::Utf8
+                )
+            })
+            .filter(|_| !matches!(shape, Shape::StrMin | Shape::StrMax));
+        if let Some(e) = unsupported_string_extreme {
+            return Err(Error::UnsupportedAggregateExpression(e.clone()));
+        }
 
         // Dispatch the value type by arity (N). `$Vt<N, $acc>` is the chosen value
         // (`AddVal`/`MinVal`/`MaxVal`/`DynamicMixed`). One arm runs, so it consumes
@@ -648,6 +699,19 @@ impl Aggregate {
             };
         }
 
+        // Same, for the string-extreme value types (which are `<N>`, no width).
+        macro_rules! str_arity {
+            ($Key:ty, $Vt:ident) => {
+                match slots.len() {
+                    1 => Ok(input.group_by_aggregate::<$Key, $Vt<1>>(key_cols, slots, top_k)),
+                    2 => Ok(input.group_by_aggregate::<$Key, $Vt<2>>(key_cols, slots, top_k)),
+                    3 => Ok(input.group_by_aggregate::<$Key, $Vt<3>>(key_cols, slots, top_k)),
+                    4 => Ok(input.group_by_aggregate::<$Key, $Vt<4>>(key_cols, slots, top_k)),
+                    n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                }
+            };
+        }
+
         // Pick the value type from the fold shape, then dispatch by arity.
         macro_rules! by_shape {
             ($Key:ty, $acc:ty) => {
@@ -655,6 +719,8 @@ impl Aggregate {
                     Shape::Additive => arity!($Key, AddVal, $acc),
                     Shape::AllMin => arity!($Key, MinVal, $acc),
                     Shape::AllMax => arity!($Key, MaxVal, $acc),
+                    Shape::StrMin => str_arity!($Key, StrMinVal),
+                    Shape::StrMax => str_arity!($Key, StrMaxVal),
                     Shape::Mixed => arity!($Key, DynamicMixed, $acc),
                 }
             };
@@ -739,10 +805,32 @@ impl Aggregate {
                         }
                     };
                 }
+                // String-extreme value types are `<N>` (no width).
+                macro_rules! str_row_arity {
+                    ($Vt:ident) => {
+                        match slots.len() {
+                            1 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<1>>(
+                                key_cols, slots, top_k, schema,
+                            )),
+                            2 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<2>>(
+                                key_cols, slots, top_k, schema,
+                            )),
+                            3 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<3>>(
+                                key_cols, slots, top_k, schema,
+                            )),
+                            4 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<4>>(
+                                key_cols, slots, top_k, schema,
+                            )),
+                            n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                        }
+                    };
+                }
                 match shape {
                     Shape::Additive => row_arity!(AddVal),
                     Shape::AllMin => row_arity!(MinVal),
                     Shape::AllMax => row_arity!(MaxVal),
+                    Shape::StrMin => str_row_arity!(StrMinVal),
+                    Shape::StrMax => str_row_arity!(StrMaxVal),
                     Shape::Mixed => row_arity!(DynamicMixed),
                 }
             }};

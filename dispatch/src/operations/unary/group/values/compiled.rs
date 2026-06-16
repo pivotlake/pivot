@@ -13,10 +13,11 @@ use super::columns::RowColumns;
 use super::row::AggregationRow;
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::arena::WorkerArena;
+use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// `N` cells of width `A` filled and folded by a fixed op tuple `Ops` (`N` is the
 /// tuple arity; stable Rust can't derive it, so the planner passes both).
@@ -53,7 +54,7 @@ macro_rules! impl_compiled {
             type SortKey = Acc;
 
             #[inline(always)]
-            fn merge_config(_slots: &[AggregationSlot]) {}
+            fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
 
             #[inline(always)]
             fn make_reader<'b>(
@@ -98,7 +99,7 @@ macro_rules! impl_compiled {
                 cols.push_row(&self.row);
             }
 
-            fn finish_columns(cols: RowColumns<$n, Acc>) -> (Vec<Field>, Vec<ArrayRef>) {
+            fn finish_columns(cols: RowColumns<$n, Acc>, _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
                 cols.finish()
             }
         }

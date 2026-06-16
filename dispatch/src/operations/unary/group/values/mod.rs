@@ -18,9 +18,10 @@
 //!   a tuple of [`Aggregate`] ops (straight-line, no per-row dispatch).
 
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::arena::WorkerArena;
+use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
+use std::sync::Arc;
 
 mod aggregate;
 mod cell;
@@ -32,6 +33,7 @@ mod fold;
 mod mono;
 mod reader;
 mod row;
+mod string;
 
 pub use aggregate::{Aggregate, Count, Sum};
 pub use cell::Cell;
@@ -40,6 +42,7 @@ pub use distinct::Distinct;
 pub use dynamic::DynamicMixed;
 pub use fold::{Add, Max, Min};
 pub use mono::Mono;
+pub use string::StringExtreme;
 
 /// Which per-group aggregate a value slot accumulates during the consume phase.
 ///
@@ -131,8 +134,9 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
 
     /// Build the [`MergeConfig`](Self::MergeConfig) for these `slots`, once, at
     /// `Group` creation. Homogeneous/compiled values need nothing (`()`); the
-    /// dynamic one keeps the slot kinds.
-    fn merge_config(slots: &[AggregationSlot]) -> Self::MergeConfig;
+    /// dynamic one keeps the slot kinds; a string extreme keeps `arena` (it must
+    /// resolve `ArenaKey`s to compare them during the partition merge).
+    fn merge_config(slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Self::MergeConfig;
 
     /// Bind `batch`'s value columns for the configured `slots`.
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
@@ -167,6 +171,8 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     fn new_columns(allocator: &mut SlabAllocator, rows: usize) -> Self::Columns;
     /// Append this group to the columns.
     fn push_to(&self, cols: &mut Self::Columns);
-    /// Materialise the columns and their fields.
-    fn finish_columns(cols: Self::Columns) -> (Vec<Field>, Vec<ArrayRef>);
+    /// Materialise the columns and their fields. `arena` backs the zero-copy
+    /// `StringView` output of a string extreme; numeric columns ignore it.
+    fn finish_columns(cols: Self::Columns, arena: &Arc<SharedArena>)
+    -> (Vec<Field>, Vec<ArrayRef>);
 }

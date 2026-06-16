@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
 use dispatch::Dispatch;
 
 use crate::common::*;
@@ -12,6 +12,10 @@ use rstest::rstest;
 
 fn int_col(values: Vec<i32>) -> ArrayRef {
     Arc::new(Int32Array::from(values))
+}
+
+fn str_col(values: Vec<&'static str>) -> ArrayRef {
+    Arc::new(StringViewArray::from(values))
 }
 
 #[rstest]
@@ -705,6 +709,67 @@ fn grouped_min_max(mut testing_planner: TestingPlanner) {
     assert_eq!(rows[1]["k0"], 2);
     assert_eq!(rows[1]["v0"], 5); // min
     assert_eq!(rows[1]["v1"], 20); // max
+}
+
+#[rstest]
+fn grouped_string_min_and_max(mut testing_planner: TestingPlanner) {
+    // Per-group string extremes via StringExtreme (lazy arena persist + zero-copy
+    // StringView output). Homogeneous direction only, so MIN and MAX are separate
+    // queries. g=1 -> {"banana","apple"}; g=2 -> {"cherry","date"}.
+    testing_planner.add_table(
+        "gs",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2])),
+            (
+                "s",
+                Type::Utf8,
+                str_col(vec!["banana", "apple", "cherry", "date"]),
+            ),
+        ],
+    );
+
+    let run = |p: &mut TestingPlanner, sql: &str| {
+        let results = p
+            .planner
+            .plan(sql)
+            .unwrap()
+            .compile(p.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap();
+        let mut rows = batches_to_json(&results);
+        rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+        rows
+    };
+
+    let mins = run(&mut testing_planner, "SELECT g, MIN(s) FROM gs GROUP BY g");
+    assert_eq!(mins[0]["v0"], "apple");
+    assert_eq!(mins[1]["v0"], "cherry");
+
+    let maxes = run(&mut testing_planner, "SELECT g, MAX(s) FROM gs GROUP BY g");
+    assert_eq!(maxes[0]["v0"], "banana");
+    assert_eq!(maxes[1]["v0"], "date");
+}
+
+/// A string extreme mixed with another aggregate (or mixed MIN+MAX directions)
+/// isn't supported yet — it must error, not mis-read the column.
+#[rstest]
+fn mixed_string_extreme_is_unsupported(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "gs2",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 2])),
+            ("s", Type::Utf8, str_col(vec!["a", "b"])),
+        ],
+    );
+    // MIN/MAX are valid functions, so `plan` succeeds; the string-extreme combo
+    // is rejected at `compile` time.
+    let compiled = testing_planner
+        .planner
+        .plan("SELECT g, MIN(s), MAX(s) FROM gs2 GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher());
+    assert!(compiled.is_err());
 }
 
 #[rstest]

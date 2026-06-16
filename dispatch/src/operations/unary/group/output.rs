@@ -110,7 +110,7 @@ where
     Snd: Sender<RecordBatch>,
 {
     let (mut fields, mut columns) = keys.finish(arena, allocator);
-    let (value_fields, value_columns) = V::finish_columns(values);
+    let (value_fields, value_columns) = V::finish_columns(values, arena);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;

@@ -100,7 +100,8 @@ pub use operations::{
     Add, AggregationKind, AggregationSlot, AggregationValue, Cell, CompiledMixed, Count, Distinct,
     DynamicFilterSlot, DynamicMixed, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor,
     Max, Min, Mono, Nullary, NullaryFactory, NullaryOperatorFactory, Operator, OrderBy,
-    Result as OperatorResult, RowKeyExtractor, RowKeySchema, StringKeyExtractor, Sum,
+    Result as OperatorResult, RowKeyExtractor, RowKeySchema, StringExtreme, StringKeyExtractor,
+    Sum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,

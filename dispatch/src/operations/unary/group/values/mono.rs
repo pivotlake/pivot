@@ -7,10 +7,11 @@ use super::reader::RowReader;
 use super::row::AggregationRow;
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::arena::WorkerArena;
+use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// `N` cells of width `A`, all folded by `F` ([`Add`](super::Add)/[`Min`](super::Min)/
 /// [`Max`](super::Max)). The common all-`SUM`/`COUNT` query is `Mono<Add>`; a
@@ -44,7 +45,7 @@ impl<F: CellFold<A>, const N: usize, A: Cell> AggregationValue for Mono<F, N, A>
     type SortKey = A;
 
     #[inline(always)]
-    fn merge_config(_slots: &[AggregationSlot]) {}
+    fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
 
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> RowReader<'b, N> {
         RowReader::new(batch, slots)
@@ -80,7 +81,10 @@ impl<F: CellFold<A>, const N: usize, A: Cell> AggregationValue for Mono<F, N, A>
         cols.push_row(&self.row);
     }
 
-    fn finish_columns(cols: RowColumns<N, A>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish_columns(
+        cols: RowColumns<N, A>,
+        _arena: &Arc<SharedArena>,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         cols.finish()
     }
 }

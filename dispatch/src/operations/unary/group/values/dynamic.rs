@@ -7,7 +7,7 @@ use super::reader::RowReader;
 use super::row::AggregationRow;
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::arena::WorkerArena;
+use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
@@ -42,7 +42,10 @@ impl<const N: usize, A: Cell> AggregationValue for DynamicMixed<N, A> {
     type Columns = RowColumns<N, A>;
     type SortKey = A;
 
-    fn merge_config(slots: &[AggregationSlot]) -> Arc<[AggregationSlot]> {
+    fn merge_config(
+        slots: &[AggregationSlot],
+        _arena: &Arc<SharedArena>,
+    ) -> Arc<[AggregationSlot]> {
         Arc::from(slots)
     }
 
@@ -80,7 +83,10 @@ impl<const N: usize, A: Cell> AggregationValue for DynamicMixed<N, A> {
         cols.push_row(&self.row);
     }
 
-    fn finish_columns(cols: RowColumns<N, A>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish_columns(
+        cols: RowColumns<N, A>,
+        _arena: &Arc<SharedArena>,
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         cols.finish()
     }
 }

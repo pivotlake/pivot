@@ -532,10 +532,11 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::unary::group::arena::WorkerArena;
+    use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
     use crate::operations::unary::group::values::AggregationSlot;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::Field;
+    use std::sync::Arc;
 
     /// A minimal additive [`AggregationValue`] for exercising the probe mechanics:
     /// merging two of these sums their counts.
@@ -547,7 +548,7 @@ mod tests {
         type MergeConfig = ();
         type Columns = ();
         type SortKey = i64;
-        fn merge_config(_slots: &[AggregationSlot]) {}
+        fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
         fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
         fn value(_reader: &(), _idx: usize, _arena: &mut WorkerArena) -> Self {
             Count(1)
@@ -560,7 +561,7 @@ mod tests {
         }
         fn new_columns(_allocator: &mut SlabAllocator, _rows: usize) {}
         fn push_to(&self, _cols: &mut ()) {}
-        fn finish_columns(_cols: ()) -> (Vec<Field>, Vec<ArrayRef>) {
+        fn finish_columns(_cols: (), _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
             (Vec::new(), Vec::new())
         }
     }

@@ -103,7 +103,7 @@ pub use keys::{
 };
 pub use values::{
     Add, Aggregate, AggregationKind, AggregationSlot, AggregationValue, Cell, CompiledMixed, Count,
-    Distinct, DynamicMixed, Max, Min, Mono, Sum,
+    Distinct, DynamicMixed, Max, Min, Mono, StringExtreme, Sum,
 };
 
 use crate::memory::SlabAllocator;
@@ -178,7 +178,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
-        let merge_config = V::merge_config(&value_slots);
+        let merge_config = V::merge_config(&value_slots, &shared_arena);
         Self {
             key_cols,
             value_slots,
