@@ -296,7 +296,7 @@ mod tests {
     };
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
-        AggregationKind, AggregationSlot, AggregationValue, CompiledMixed, Count,
+        Add, AggregationKind, AggregationSlot, AggregationValue, Mono,
     };
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
@@ -305,7 +305,8 @@ mod tests {
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = CompiledMixed<(Count,), 1>;
+    // `Mono<Add, 1>` (a single COUNT/SUM slot), whose `MergeConfig` is `()`.
+    type CountValue = Mono<Add, 1>;
 
     fn make_worker_tables(
         state: &RandomState,

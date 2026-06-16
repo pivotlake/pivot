@@ -93,7 +93,7 @@ impl Projection {
 }
 
 /// Pick the aggregate accumulator width by column type — the single rule shared
-/// by the global and grouped paths: `i128` only when a `SUM` reads a 64-bit
+/// by the global and grouped paths: `u128` only when a `SUM` reads a 64-bit
 /// column (whose total can overflow `i64`), else `i64`.
 fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
     use crate::expression::AggregateFunc;
@@ -185,10 +185,10 @@ impl Aggregate {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
             // Pick the accumulator width by column type, the same rule the
-            // grouped path uses: i128 only when a SUM reads a 64-bit column
+            // grouped path uses: u128 only when a SUM reads a 64-bit column
             // (whose total can overflow i64), else i64.
             return Ok(if sum_reads_wide_column(&self.expressions) {
-                input.aggregate::<i128>(slots)
+                input.aggregate::<u128>(slots)
             } else {
                 input.aggregate::<i64>(slots)
             });
@@ -528,20 +528,22 @@ impl Aggregate {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
-            Add, AggregationKind, AggregationSlot, CompiledMixed, Count, DynamicMixed,
-            IntPairKeyExtractor, Max, Min, Mono, RowKeyExtractor, StringExtreme, Sum,
+            Add, AggregationKind, AggregationSlot, Compiled, Count, Dynamic, IntPairKeyExtractor,
+            Max, Min, Mono, RowKeyExtractor, StrMax, StrMin, Sum,
         };
 
         // The value type's fold is fixed at plan time: a homogeneous numeric
         // signature uses the branch-free `Mono<F>` (the common all-additive case is
-        // `Mono<Add>`), a homogeneous *string* MIN/MAX uses `StringExtreme<F>`, and
-        // any mix uses `DynamicMixed` (per-slot kind dispatch). Aliases so the
-        // numeric value types are `<N, A>` and the string ones `<N>` for the macros.
+        // `Mono<Add>`), a homogeneous *string* MIN/MAX uses `Mono<StrMin/StrMax,
+        // u128>` (the cell is an ArenaKey), a fixed string+numeric mix a
+        // `Compiled` tuple of op atoms, and any other mix `Dynamic` (per-slot
+        // kind). Aliases so the numeric value types are `<N, A>` and the string
+        // ones `<N>` for the macros.
         type AddVal<const N: usize, A> = Mono<Add, N, A>;
         type MinVal<const N: usize, A> = Mono<Min, N, A>;
         type MaxVal<const N: usize, A> = Mono<Max, N, A>;
-        type StrMinVal<const N: usize> = StringExtreme<Min, N>;
-        type StrMaxVal<const N: usize> = StringExtreme<Max, N>;
+        type StrMinVal<const N: usize> = Mono<StrMin, N, u128>;
+        type StrMaxVal<const N: usize> = Mono<StrMax, N, u128>;
 
         let key_refs: Vec<&crate::expression::Ref> = self
             .groups
@@ -584,7 +586,7 @@ impl Aggregate {
         // Per-slot signature (kind + the `SUM` column's type), used to pick a
         // compiled, monomorphised value extractor when the signature matches one
         // we've specialised; any other signature falls back to the generic enum
-        // value (`Mono<Add>`/`Mono<Min>`/`Mono<Max>`/`DynamicMixed`) below.
+        // value (`Mono<Add>`/`Mono<Min>`/`Mono<Max>`/`Dynamic`) below.
         enum Sig {
             Count,
             Sum(Type),
@@ -612,15 +614,15 @@ impl Aggregate {
         let top_k = self.top_k;
 
         // Cell width, by the same column-type rule as the global path:
-        // i128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
+        // u128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
         // Grouped sums are almost always over narrow columns, so this is i64
-        // in practice; the i128 arm keeps a wide grouped sum correct rather
+        // in practice; the u128 arm keeps a wide grouped sum correct rather
         // than silently overflowing the slot.
         let wide = sum_reads_wide_column(&self.expressions);
 
         // The fold shape: homogeneous additive / all-MIN / all-MAX over integers
         // use a branch-free `Mono<F>`; homogeneous MIN/MAX over *string* columns
-        // use `StringExtreme<F>`; anything mixed uses `DynamicMixed`.
+        // use `Mono<StrMin/StrMax>`; anything mixed uses `Dynamic`.
         enum Shape {
             Additive,
             AllMin,
@@ -662,7 +664,7 @@ impl Aggregate {
         };
 
         // A string MIN/MAX is only supported homogeneously (all slots MIN, or all
-        // MAX, over string columns) — `StringExtreme<F>` has one direction and an
+        // MAX, over string columns) — `Mono<StrMin/StrMax>` has one direction and an
         // ArenaKey cell. Reject any other signature that contains a string extreme
         // (mixed MIN+MAX strings, a string extreme alongside SUM/COUNT, or string
         // mixed with integer extremes) rather than routing it to a numeric value
@@ -683,7 +685,7 @@ impl Aggregate {
         }
 
         // Dispatch the value type by arity (N). `$Vt<N, $acc>` is the chosen value
-        // (`AddVal`/`MinVal`/`MaxVal`/`DynamicMixed`). One arm runs, so it consumes
+        // (`AddVal`/`MinVal`/`MaxVal`/`Dynamic`). One arm runs, so it consumes
         // `input`/`key_cols`/`slots` exactly once.
         macro_rules! arity {
             ($Key:ty, $Vt:ident, $acc:ty) => {
@@ -721,7 +723,7 @@ impl Aggregate {
                     Shape::AllMax => arity!($Key, MaxVal, $acc),
                     Shape::StrMin => str_arity!($Key, StrMinVal),
                     Shape::StrMax => str_arity!($Key, StrMaxVal),
-                    Shape::Mixed => arity!($Key, DynamicMixed, $acc),
+                    Shape::Mixed => arity!($Key, Dynamic, $acc),
                 }
             };
         }
@@ -743,7 +745,7 @@ impl Aggregate {
                         Sig::Count,
                     ]
                 ) {
-                    type V = CompiledMixed<(Count, Sum<Int16Type>, Sum<Int16Type>, Count), 4>;
+                    type V = Compiled<(Count, Sum<Int16Type>, Sum<Int16Type>, Count)>;
                     Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
                 } else {
                     by_shape!(Key, $acc)
@@ -755,7 +757,7 @@ impl Aggregate {
         macro_rules! by_keys {
             ($a:ty, $b:ty) => {
                 if wide {
-                    by_arity!($a, $b, i128)
+                    by_arity!($a, $b, u128)
                 } else {
                     by_arity!($a, $b, i64)
                 }
@@ -831,7 +833,7 @@ impl Aggregate {
                     Shape::AllMax => row_arity!(MaxVal),
                     Shape::StrMin => str_row_arity!(StrMinVal),
                     Shape::StrMax => str_row_arity!(StrMaxVal),
-                    Shape::Mixed => row_arity!(DynamicMixed),
+                    Shape::Mixed => row_arity!(Dynamic),
                 }
             }};
         }
@@ -860,7 +862,7 @@ impl Aggregate {
                 _ => unreachable!("int_pair guard restricts to these arms"),
             }
         } else if wide {
-            row_fallback!(i128)
+            row_fallback!(u128)
         } else {
             row_fallback!(i64)
         }

@@ -263,19 +263,20 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     table.prefetch(self.hashes[i + L1_DISTANCE]);
                 }
                 // Probe and fold in one pass. The live key persists into the key
-                // arena; the fold then reads the row into the value arena (a new
-                // key materialises, an existing one folds the row in — a string
-                // extreme persists only if it wins). Separate arenas keep the
-                // key's borrow and the value's borrow disjoint.
+                // arena; the value arena is handed to whichever arm runs — `seed`
+                // materialises a new group's value, `update` folds the row into an
+                // existing one (a string extreme persists only if it wins).
+                // Separate arenas keep the key's borrow and the value's disjoint.
                 let key = K::live_key(key_reader, i, &mut self.key_arena);
-                let value_arena = &mut self.value_arena;
-                table.probe_fold::<false, _, _>(hash, key, |cell, is_new| {
-                    *cell = if is_new {
-                        V::value(value_reader, i, value_arena)
-                    } else {
-                        cell.update_from_reader(value_reader, i, value_arena, merge_config)
-                    };
-                });
+                table.probe_fold::<false, _, _, _, _>(
+                    hash,
+                    key,
+                    &mut self.value_arena,
+                    |arena, cell| *cell = V::value(value_reader, i, arena),
+                    |arena, cell| {
+                        *cell = cell.update_from_reader(value_reader, i, arena, merge_config)
+                    },
+                );
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
