@@ -36,9 +36,17 @@ fn free_port() -> u16 {
 /// An OTLP logs request of `n` records, each `severity_number = 9`,
 /// `service.name = "svc"`.
 fn log_request(n: usize) -> ExportLogsServiceRequest {
+    log_request_for("svc", n)
+}
+
+/// An OTLP logs request of `n` records for `service`, severities/timestamps
+/// descending in record order (so a `sort_by = Timestamp` has work to do), with
+/// `service.name = service` as a resource attribute.
+fn log_request_for(service: &str, n: usize) -> ExportLogsServiceRequest {
     let records = (0..n)
         .map(|i| LogRecord {
-            time_unix_nano: 1_000 + i as u64,
+            // Descending timestamps so the writer's sort reorders them.
+            time_unix_nano: (1_000 - i) as u64,
             severity_number: 9,
             severity_text: "INFO".into(),
             body: Some(AnyValue {
@@ -53,7 +61,7 @@ fn log_request(n: usize) -> ExportLogsServiceRequest {
                 attributes: vec![KeyValue {
                     key: "service.name".into(),
                     value: Some(AnyValue {
-                        value: Some(Value::StringValue("svc".into())),
+                        value: Some(Value::StringValue(service.into())),
                     }),
                 }],
                 ..Default::default()
@@ -78,6 +86,44 @@ fn create_otel_logs(catalog: &ParquetCatalog, d: &DataFlowDispatcher, dir: &std:
             col_type: planner::types::Type::Int64,
         }],
         options: HashMap::from([("path".to_string(), dir.to_str().unwrap().to_string())]),
+        if_not_exists: false,
+    };
+    catalog
+        .create_table(request, d)
+        .unwrap()
+        .execute()
+        .collect()
+        .unwrap();
+}
+
+/// `CREATE TABLE otel_logs (ServiceName, Timestamp) WITH (path, partition_by =
+/// ServiceName, sort_by = Timestamp)`. The partition/sort columns must be
+/// declared (they're validated against the declared columns), and they match the
+/// default logs mapping the sink writes.
+fn create_partitioned_otel_logs(
+    catalog: &ParquetCatalog,
+    d: &DataFlowDispatcher,
+    dir: &std::path::Path,
+) {
+    use planner::catalog::{Catalog as _, Column, CreateTableRequest};
+    use planner::types::Type;
+    let request = CreateTableRequest {
+        name: "otel_logs".to_string(),
+        columns: vec![
+            Column {
+                name: "ServiceName".to_string(),
+                col_type: Type::Utf8,
+            },
+            Column {
+                name: "Timestamp".to_string(),
+                col_type: Type::Int64,
+            },
+        ],
+        options: HashMap::from([
+            ("path".to_string(), dir.to_str().unwrap().to_string()),
+            ("partition_by".to_string(), "ServiceName".to_string()),
+            ("sort_by".to_string(), "Timestamp".to_string()),
+        ]),
         if_not_exists: false,
     };
     catalog
@@ -194,5 +240,75 @@ async fn flush_timer_makes_logs_queryable_without_shutdown() {
     assert_eq!(rows, 3);
 
     ingestor.shutdown().await;
+    dispatch.exit();
+}
+
+/// A partitioned + sorted table: logs from two services flushed together land in
+/// one file per service, each tagged with its partition tuple in the manifest.
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_logs_land_one_file_per_service() {
+    let port = free_port();
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+    let data = tempfile::tempdir().unwrap();
+    let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
+    create_partitioned_otel_logs(&catalog, dispatch.dispatcher(), data.path());
+    let ingestor = start_logs_ingestor(port, &dispatch, &catalog, Duration::from_secs(3600));
+
+    let mut client = logs_client(port).await;
+    client.export(log_request_for("svc-a", 2)).await.unwrap();
+    client.export(log_request_for("svc-b", 3)).await.unwrap();
+    ingestor.shutdown().await;
+
+    // One file per service, each tagged with its partition tuple; 5 rows total.
+    let mut table = catalog.table_handle("otel_logs").unwrap();
+    table.refresh().unwrap();
+    let mut services: Vec<String> = table
+        .file_partitions()
+        .into_iter()
+        .map(|(_, p)| {
+            p.expect("file has a partition tuple")["ServiceName"]
+                .as_str()
+                .expect("ServiceName string")
+                .to_string()
+        })
+        .collect();
+    services.sort();
+
+    assert_eq!(services, vec!["svc-a", "svc-b"]);
+    assert_eq!(table_rows(&catalog), 5);
+
+    // Each file records its sort-key (Timestamp) bounds, min <= max.
+    for (_, bounds) in table.file_sort_bounds() {
+        let b = bounds.expect("file has sort bounds");
+        let min = b.min["Timestamp"].as_i64().expect("min Timestamp");
+        let max = b.max["Timestamp"].as_i64().expect("max Timestamp");
+        assert!(min <= max, "sort bounds: {min} <= {max}");
+    }
+
+    // The written files carry real Parquet statistics for the sort column, so a
+    // strict external reader (arrow-rs, our DuckDB-readability proxy) sees them —
+    // i.e. row-group pruning works on pivot-written files. `Timestamp` is column
+    // 0 of the default logs schema.
+    for path in std::fs::read_dir(data.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+    {
+        if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+            continue;
+        }
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            std::fs::File::open(&path).unwrap(),
+        )
+        .unwrap();
+        let meta = reader.metadata();
+        for rg in 0..meta.num_row_groups() {
+            assert!(
+                meta.row_group(rg).column(0).statistics().is_some(),
+                "Timestamp column has footer statistics in {path:?}"
+            );
+        }
+    }
+
     dispatch.exit();
 }

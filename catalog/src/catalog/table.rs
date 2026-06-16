@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::Error;
 use crate::catalog::TableBinding;
-use crate::manifest::{FIRST_VERSION, TableManifest};
+use crate::manifest::{FIRST_VERSION, ManifestEntry, SortBounds, TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use dispatch::DataFlowDispatcher;
@@ -87,18 +87,29 @@ impl CatalogTable {
     /// [`FIRST_VERSION`]) and commit it. The compare-and-swap fails with
     /// [`Error::TableExists`] if another writer already committed this table's
     /// first version. The `CREATE TABLE` commit path.
+    #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn create_new(
         name: String,
         location: ObjectPath,
         files: Vec<TableFile>,
         columns: Vec<Column>,
+        partition_by: Vec<String>,
+        sort_by: Vec<String>,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
     ) -> crate::Result<Self> {
-        let entries = files.iter().map(|f| f.file.clone()).collect();
+        // Files discovered at CREATE TABLE carry no partition metadata (opaque
+        // paths, footers not parsed for it); the partitioning sink records it on
+        // the files it appends later.
+        let entries = files
+            .iter()
+            .map(|f| ManifestEntry::new(f.file.clone()))
+            .collect();
         let manifest = TableManifest {
             version: FIRST_VERSION,
             columns,
+            partition_by,
+            sort_by,
             entries,
         };
         if !manifest.commit(store.as_ref(), &name)? {
@@ -130,21 +141,43 @@ impl CatalogTable {
     /// Write `bytes` as a new data file at `path` (under the table's location)
     /// and commit it into the table — the ingest sink's append, one call for the
     /// write and the manifest commit. Idempotent on `path`.
-    pub fn append_data_file(&mut self, path: ObjectPath, bytes: &[u8]) -> crate::Result<()> {
+    pub fn append_data_file(
+        &mut self,
+        path: ObjectPath,
+        bytes: &[u8],
+        partition: Option<serde_json::Value>,
+        sort_bounds: Option<SortBounds>,
+    ) -> crate::Result<()> {
         let file = self.write_data_file(path, bytes)?;
-        self.commit_added_file(file)
+        self.commit_added_file(file, partition, sort_bounds)
     }
 
     /// CAS-commit one already-written file into the manifest, retrying past a
     /// concurrent writer (refresh + retry). A file the manifest already holds is
     /// an idempotent no-op, so a replayed append can't double-count rows.
-    fn commit_added_file(&mut self, file: FileRef) -> crate::Result<()> {
+    /// `partition`/`sort_bounds` are the file's partition tuple and sort-key range
+    /// (a partitioning/sorting sink's), each `None` when not recorded.
+    fn commit_added_file(
+        &mut self,
+        file: FileRef,
+        partition: Option<serde_json::Value>,
+        sort_bounds: Option<SortBounds>,
+    ) -> crate::Result<()> {
         loop {
-            if self.manifest.entries.iter().any(|e| e.path == file.path) {
+            if self
+                .manifest
+                .entries
+                .iter()
+                .any(|e| e.file.path == file.path)
+            {
                 return Ok(());
             }
             let mut entries = self.manifest.entries.clone();
-            entries.push(file.clone());
+            entries.push(ManifestEntry {
+                file: file.clone(),
+                partition: partition.clone(),
+                sort_bounds: sort_bounds.clone(),
+            });
             if self.try_commit(entries)? {
                 return Ok(());
             }
@@ -166,22 +199,24 @@ impl CatalogTable {
     pub fn replace_data_files(
         &mut self,
         removed: &[ObjectPath],
-        added: &[FileRef],
+        added: &[ManifestEntry],
     ) -> crate::Result<bool> {
         loop {
             if !removed
                 .iter()
-                .all(|p| self.manifest.entries.iter().any(|e| &e.path == p))
+                .all(|p| self.manifest.entries.iter().any(|e| &e.file.path == p))
             {
                 return Ok(false);
             }
-            let mut entries: Vec<FileRef> = self
+            let mut entries: Vec<ManifestEntry> = self
                 .manifest
                 .entries
                 .iter()
-                .filter(|e| !removed.contains(&e.path))
+                .filter(|e| !removed.contains(&e.file.path))
                 .cloned()
                 .collect();
+            // The merged files keep the partition tuple / sort bounds the caller
+            // recorded for them (compaction merges within one partition).
             entries.extend(added.iter().cloned());
             if self.try_commit(entries)? {
                 return Ok(true);
@@ -194,10 +229,12 @@ impl CatalogTable {
     /// success, swaps in the new manifest + files (fetching only the new footers)
     /// and returns `true`; on a CAS conflict returns `false` without touching
     /// this copy.
-    fn try_commit(&mut self, entries: Vec<FileRef>) -> crate::Result<bool> {
+    fn try_commit(&mut self, entries: Vec<ManifestEntry>) -> crate::Result<bool> {
         let manifest = TableManifest {
             version: self.manifest.version + 1,
             columns: self.manifest.columns.clone(),
+            partition_by: self.manifest.partition_by.clone(),
+            sort_by: self.manifest.sort_by.clone(),
             entries,
         };
         if !manifest.commit(self.store.as_ref(), &self.name)? {
@@ -226,7 +263,7 @@ impl CatalogTable {
             .manifest
             .entries
             .iter()
-            .map(|e| e.path.as_str())
+            .map(|e| e.file.path.as_str())
             .collect();
         self.files.retain(|f| kept.contains(f.file.path.as_str()));
         let missing = self.retrieve_missing_table_files()?;
@@ -241,9 +278,10 @@ impl CatalogTable {
             .manifest
             .entries
             .iter()
-            .filter(|e| !self.files.iter().any(|f| f.file.path == e.path))
+            .filter(|e| !self.files.iter().any(|f| f.file.path == e.file.path))
             .map(|e| {
-                e.clone()
+                e.file
+                    .clone()
                     .into_data_file(self.store.as_ref(), &self.location)
             })
             .collect::<store::Result<_>>()?;
@@ -262,10 +300,43 @@ impl CatalogTable {
         &self.name
     }
 
+    /// The table's partition columns, in order (empty = unpartitioned). A
+    /// partitioning writer routes each row to a file by these columns' values.
+    pub fn partition_by(&self) -> &[String] {
+        &self.manifest.partition_by
+    }
+
+    /// The table's sort columns, in order (empty = unsorted). A writer sorts each
+    /// file's rows by these before encoding.
+    pub fn sort_by(&self) -> &[String] {
+        &self.manifest.sort_by
+    }
+
     /// The table's current files as [`FileRef`]s — what a compacter scans to pick
     /// merge candidates, and names in a [`replace_data_files`](Self::replace_data_files) swap.
     pub fn file_refs(&self) -> Vec<FileRef> {
         self.files.iter().map(|f| f.file.clone()).collect()
+    }
+
+    /// Each committed file paired with the partition tuple recorded for it (the
+    /// one-row arrow-json object a partitioning writer stamped, or `None`). Reads
+    /// the manifest, so it reflects the current committed version.
+    pub fn file_partitions(&self) -> Vec<(ObjectPath, Option<serde_json::Value>)> {
+        self.manifest
+            .entries
+            .iter()
+            .map(|e| (e.file.path.clone(), e.partition.clone()))
+            .collect()
+    }
+
+    /// Each committed file paired with its recorded sort-key bounds (the
+    /// `sort_by` columns at the file's first/last row, or `None`).
+    pub fn file_sort_bounds(&self) -> Vec<(ObjectPath, Option<SortBounds>)> {
+        self.manifest
+            .entries
+            .iter()
+            .map(|e| (e.file.path.clone(), e.sort_bounds.clone()))
+            .collect()
     }
 
     /// A scannable [`ParquetTable`] over just the `wanted` files (matched by

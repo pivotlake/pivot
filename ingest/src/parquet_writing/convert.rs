@@ -4,8 +4,7 @@
 //! it runs here — inside the dataflow — never on the receive path.
 //!
 //! Compaction skips this stage entirely: its input is the scan dataflow, which
-//! already emits `RecordBatch`es straight into the
-//! [`builder`](super::builder).
+//! already emits `RecordBatch`es straight into the [`partition`](super::partition) stage.
 
 use std::marker::PhantomData;
 

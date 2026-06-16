@@ -336,6 +336,42 @@ mod tests {
         create_table(catalog, dispatcher, "otel_logs", Some(dir));
     }
 
+    /// An `otel_logs` table partitioned by `ServiceName` and sorted by
+    /// `Timestamp` — the sink records each flushed file's partition tuple and
+    /// sort bounds, and compaction must preserve them.
+    fn create_partitioned_catalog_table(
+        catalog: &Arc<catalog::ParquetCatalog>,
+        dispatcher: &DataFlowDispatcher,
+        dir: &Path,
+    ) {
+        use planner::catalog::{Catalog as _, Column, CreateTableRequest};
+        let request = CreateTableRequest {
+            name: "otel_logs".to_string(),
+            columns: vec![
+                Column {
+                    name: "ServiceName".to_string(),
+                    col_type: planner::types::Type::Utf8,
+                },
+                Column {
+                    name: "Timestamp".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+            ],
+            options: std::collections::HashMap::from([
+                ("path".to_string(), dir.to_str().unwrap().to_string()),
+                ("partition_by".to_string(), "ServiceName".to_string()),
+                ("sort_by".to_string(), "Timestamp".to_string()),
+            ]),
+            if_not_exists: false,
+        };
+        catalog
+            .create_table(request, dispatcher)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+    }
+
     /// `CREATE TABLE <name>` against `catalog` the way the server would run
     /// it: with an explicit absolute `path` option, or — when `dir` is `None`
     /// — at `<name>` under the database root (a store-relative table).
@@ -596,6 +632,62 @@ mod tests {
 
         dispatch.exit();
     }
+
+    /// Compacting a partitioned + sorted table preserves each merged file's
+    /// partition tuple and recomputes its sort bounds — it merges within one
+    /// partition and re-applies the table's spec, rather than dropping the
+    /// metadata.
+    #[test]
+    fn compaction_preserves_partition_and_sort_metadata() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
+        create_partitioned_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
+
+        // Three flushes, all service "svc" → three files in the one partition.
+        flush_each(
+            dispatch.dispatcher(),
+            dir.path(),
+            &[log_request(3), log_request(2), log_request(4)],
+            catalog.clone(),
+        );
+        assert_eq!(parquet_file_count(dir.path()), 3);
+
+        let total: u64 = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), catalog.clone());
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(compacter.compact_all());
+
+        // The three merged into one file that still carries the "svc" partition
+        // tuple and has recomputed (non-empty) sort bounds.
+        assert_eq!(parquet_file_count(dir.path()), 1);
+        let mut table = catalog.table_handle("otel_logs").unwrap();
+        table.refresh().unwrap();
+        let partitions = table.file_partitions();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(
+            partitions[0]
+                .1
+                .as_ref()
+                .expect("merged file keeps a partition tuple")["ServiceName"],
+            "svc"
+        );
+        assert!(
+            table.file_sort_bounds()[0].1.is_some(),
+            "merged file keeps recomputed sort bounds"
+        );
+
+        dispatch.exit();
+    }
+
     /// Compaction is location-agnostic: a **store-relative** table (data under
     /// the database root, resolved through the store — the same path a remote
     /// `s3://` root takes) compacts through the exact same code, with writes

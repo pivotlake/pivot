@@ -51,6 +51,10 @@ use thiserror::Error as ThisError;
 use tracing::warn;
 
 const PATH_OPTION: &str = "path";
+/// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
+const PARTITION_BY_OPTION: &str = "partition_by";
+/// `WITH (sort_by = 'a, b')` — ordered, comma-separated sort columns.
+const SORT_BY_OPTION: &str = "sort_by";
 
 #[derive(Debug, ThisError)]
 pub enum Error {
@@ -58,6 +62,8 @@ pub enum Error {
         "table path `{0}` must be a plain path, not a URL — a table's storage is the database's, so the path carries no scheme"
     )]
     TablePathWithScheme(String),
+    #[error("`{option}` column `{column}` is not a declared column of the table")]
+    UnknownSpecColumn { option: String, column: String },
     #[error("`IF NOT EXISTS` is not supported")]
     IfNotExistsUnsupported,
     #[error(transparent)]
@@ -176,7 +182,11 @@ impl ParquetCatalog {
         let files = manifest
             .entries
             .iter()
-            .map(|f| f.clone().into_data_file(store.as_ref(), &entry.location))
+            .map(|f| {
+                f.file
+                    .clone()
+                    .into_data_file(store.as_ref(), &entry.location)
+            })
             .collect::<store::Result<Vec<DataFile>>>()?;
         let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
         Ok(CatalogTable::new(
@@ -264,6 +274,8 @@ impl ParquetCatalog {
         }
 
         let location = Self::get_path_for_create_table(&request)?;
+        let partition_by = Self::parse_spec_columns(&request, PARTITION_BY_OPTION)?;
+        let sort_by = Self::parse_spec_columns(&request, SORT_BY_OPTION)?;
 
         // Locate every data file under the table's directory for reading, keeping
         // its `FileRef` identity so each footer's row groups land on the right
@@ -296,6 +308,8 @@ impl ParquetCatalog {
                     location.clone(),
                     loaded,
                     request.columns,
+                    partition_by,
+                    sort_by,
                     store.clone(),
                     pool,
                 )?;
@@ -329,6 +343,29 @@ impl ParquetCatalog {
             return Err(Error::TablePathWithScheme(path.clone()));
         }
         Ok(ObjectPath::new(path.clone()))
+    }
+
+    /// Parse a comma-separated column-list option (`partition_by` / `sort_by`)
+    /// into an ordered `Vec<String>`, validating each name is a declared column.
+    /// Absent or empty → no columns.
+    fn parse_spec_columns(request: &CreateTableRequest, option: &str) -> Result<Vec<String>> {
+        let Some(raw) = request.options.get(option) else {
+            return Ok(Vec::new());
+        };
+        raw.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|name| {
+                if request.columns.iter().any(|c| c.name == name) {
+                    Ok(name.to_string())
+                } else {
+                    Err(Error::UnknownSpecColumn {
+                        option: option.to_string(),
+                        column: name.to_string(),
+                    })
+                }
+            })
+            .collect()
     }
 
     /// List the Parquet data files at `location` through the store. An

@@ -354,7 +354,7 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
     catalog
         .table_handle(name)
         .expect("table exists")
-        .append_data_file(relative, &bytes)
+        .append_data_file(relative, &bytes, None, None)
         .unwrap()
 }
 
@@ -429,10 +429,10 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         ObjectPath::new("data.parquet"),
         ObjectPath::new("extra.parquet"),
     ];
-    let added = vec![catalog::FileRef {
+    let added = vec![catalog::ManifestEntry::new(catalog::FileRef {
         path: ObjectPath::new("merged.parquet"),
         size: merged_size,
-    }];
+    })];
     // A losing compacter clones the table out at the same version (inputs still
     // present) before the winning swap lands.
     let mut loser = catalog.table_handle("t").unwrap();
@@ -446,10 +446,10 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     );
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh, and aborts — no footer read for its output, no double-count.
-    let loser_added = vec![catalog::FileRef {
+    let loser_added = vec![catalog::ManifestEntry::new(catalog::FileRef {
         path: ObjectPath::new("merged-loser.parquet"),
         size: merged_size,
-    }];
+    })];
     assert!(
         !loser.replace_data_files(&removed, &loser_added).unwrap(),
         "second swap aborts: its inputs were already swapped out"
@@ -525,10 +525,10 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     // "Compact" data.parquet into merged.parquet but crash before deleting the
     // input: both files are on disk, only merged is in the manifest.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![catalog::FileRef {
+    let added = vec![catalog::ManifestEntry::new(catalog::FileRef {
         path: ObjectPath::new("merged.parquet"),
         size: std::fs::metadata(&merged).unwrap().len(),
-    }];
+    })];
     catalog
         .table_handle("t")
         .unwrap()
