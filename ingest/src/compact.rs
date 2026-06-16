@@ -15,7 +15,7 @@
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups and the write pipeline's encode stages
-//! consume those batches directly ([`parquet_writing::encode`]) — the data
+//! consume those batches directly ([`parquet_writing::encode_record_batches`]) — the data
 //! never leaves the pool until finished files stream out. The compacter's own
 //! task only drives that dataflow (from a blocking thread) and does the
 //! log/store bookkeeping.
@@ -36,20 +36,31 @@
 //!
 //! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use catalog::parquet::table_input;
 use catalog::store::ObjectPath;
-use catalog::{CatalogTable, FileRef, ParquetCatalog};
-use dispatch::{DataFlowDispatcher, Projection};
+use catalog::{CatalogTable, FileRef, ManifestEntry, ParquetCatalog};
+use dispatch::{DataFlowDispatcher, DataFlowError, Projection};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::parquet_writing;
 use crate::sink::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
+
+/// Why one compaction merge failed: either the scan→encode dataflow, or a
+/// catalog write/swap/delete. Both already carry typed causes.
+#[derive(Debug, thiserror::Error)]
+enum CompactError {
+    #[error("compaction scan/encode: {0}")]
+    Encode(#[from] DataFlowError),
+    #[error(transparent)]
+    Catalog(#[from] catalog::Error),
+}
 
 /// Default compaction target: files smaller than this are merge candidates,
 /// and a merge runs once their combined size reaches it.
@@ -144,7 +155,7 @@ impl Compacter {
                     }
                 }
                 Ok(Err(e)) => {
-                    error!(table = table.name(), error = e, "compaction merge failed");
+                    error!(table = table.name(), error = %e, "compaction merge failed");
                     return;
                 }
                 Err(e) => {
@@ -168,32 +179,42 @@ impl Compacter {
     /// full output yet — merging earlier would just rewrite the same rows
     /// again on the next flush).
     fn next_batch(&self, table: &CatalogTable) -> Option<Vec<FileRef>> {
-        let mut small: Vec<FileRef> = table
-            .file_refs()
-            .into_iter()
-            .filter(|f| f.size < self.target_bytes)
-            .collect();
-        if small.len() < 2 {
-            return None;
+        // Compaction merges within a single partition: across partitions it
+        // couldn't stamp the merged file with one tuple, and the write pipeline
+        // would just re-split it back out, making no progress. So group the small
+        // files by partition (keyed by the tuple's JSON, `""` for unpartitioned)
+        // and fill a batch from one group.
+        let partition_of: HashMap<ObjectPath, _> = table.file_partitions().into_iter().collect();
+        let mut by_partition: BTreeMap<String, Vec<FileRef>> = BTreeMap::new();
+        for file in table.file_refs() {
+            if file.size >= self.target_bytes {
+                continue;
+            }
+            let key = partition_of
+                .get(&file.path)
+                .and_then(|p| p.as_ref())
+                .map(|tuple| tuple.to_string())
+                .unwrap_or_default();
+            by_partition.entry(key).or_default().push(file);
         }
-        // Oldest first (sink file names embed a timestamp + sequence),
-        // stopping once the batch fills one output.
-        small.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
-        let mut total = 0u64;
-        let mut batch = Vec::new();
-        for file in small {
-            total += file.size;
-            batch.push(file);
-            if total >= self.target_bytes {
-                return Some(batch);
+
+        for mut files in by_partition.into_values() {
+            if files.len() < 2 {
+                continue;
+            }
+            // Oldest first (sink file names embed a timestamp + sequence),
+            // stopping once the batch fills one output.
+            files.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+            let mut total = 0u64;
+            let mut batch = Vec::new();
+            for file in files {
+                total += file.size;
+                batch.push(file);
+                if total >= self.target_bytes {
+                    return Some(batch);
+                }
             }
         }
-        debug!(
-            table = table.name(),
-            files = batch.len(),
-            bytes = total,
-            "small files below compaction threshold; waiting for more"
-        );
         None
     }
 }
@@ -211,29 +232,43 @@ impl CompactJob {
     /// groups — a single scan→encode dataflow — then commit: write the merged
     /// file(s), swap them for the inputs in one manifest version, delete the
     /// inputs. Returns the merged files written.
-    fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, String> {
+    fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, CompactError> {
         // Scan just the input files and re-encode their rows into target-sized
-        // merged files — one scan→encode dataflow on the worker pool.
+        // merged files — one scan→encode dataflow on the worker pool. The inputs
+        // share one partition (see `next_batch`), so re-applying the table's
+        // partition/sort spec reproduces that partition tuple and recomputes the
+        // merged file's sort bounds.
         let parquet = self.table.parquet_table_for(&inputs);
         let columns = parquet.schema().fields().len();
         let scan = table_input(&self.dispatcher, &parquet, Projection::all(columns), false);
-        let merged_bytes = parquet_writing::encode(scan, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE)
-            .collect()
-            .map_err(|e| format!("compaction encode: {e}"))?;
+        let merged = parquet_writing::encode_record_batches(
+            scan,
+            Arc::from(self.table.partition_by()),
+            Arc::from(self.table.sort_by()),
+            ROW_GROUP_ROWS,
+            ROW_GROUPS_PER_FILE,
+        );
 
-        // Write each merged file into the table's data location.
+        // Write each merged file into the table's data location as it streams out
+        // — so we never hold them all in memory at once — keeping the partition
+        // tuple and sort bounds the pipeline recorded for it. Only the lightweight
+        // manifest entries are gathered, for the one atomic swap below.
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let mut added = Vec::with_capacity(merged_bytes.len());
-        for (i, bytes) in merged_bytes.into_iter().enumerate() {
+        let mut added = Vec::new();
+        for (i, encoded) in merged.enumerate() {
+            let encoded = encoded?;
             let name = format!("compacted-{millis}-{:06}-{i}.parquet", self.seq);
             let file = self
                 .table
-                .write_data_file(ObjectPath::new(name), &bytes)
-                .map_err(|e| format!("writing merged file: {e}"))?;
-            added.push(file);
+                .write_data_file(ObjectPath::new(name), &encoded.bytes)?;
+            added.push(ManifestEntry {
+                file,
+                partition: encoded.partition,
+                sort_bounds: encoded.sort_bounds,
+            });
         }
 
         // Commit the swap (one manifest version: inputs out, merged in), then
@@ -242,9 +277,7 @@ impl CompactJob {
         // deletes leaves only orphan objects, never a double read.
         let removed: Vec<ObjectPath> = inputs.iter().map(|f| f.path.clone()).collect();
         let mut table = self.table;
-        let committed = table
-            .replace_data_files(&removed, &added)
-            .map_err(|e| format!("committing compaction swap: {e}"))?;
+        let committed = table.replace_data_files(&removed, &added)?;
         if !committed {
             // Another writer (a second compacter over the same root) already
             // swapped these inputs out. Our merged output was never committed —
@@ -254,9 +287,9 @@ impl CompactJob {
                 table = table.name(),
                 "compaction: inputs already swapped by another writer; discarding merge"
             );
-            for file in &added {
-                if let Err(e) = table.delete_data_file(&file.path) {
-                    warn!(error = %e, file = %file.path, "compaction: deleting discarded merge output failed (orphan left)");
+            for entry in &added {
+                if let Err(e) = table.delete_data_file(&entry.file.path) {
+                    warn!(error = %e, file = %entry.file.path, "compaction: deleting discarded merge output failed (orphan left)");
                 }
             }
             return Ok(Vec::new());
@@ -266,6 +299,6 @@ impl CompactJob {
                 warn!(error = %e, file = %input.path, "compaction: deleting merged-away input failed (orphan left)");
             }
         }
-        Ok(added)
+        Ok(added.into_iter().map(|entry| entry.file).collect())
     }
 }

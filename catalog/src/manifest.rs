@@ -51,16 +51,59 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// One table's durable record: its declared schema (`columns`) and its committed
-/// file list (`entries`) at `version`. Mirrors the live [`CatalogTable`] state
-/// the catalog keeps in memory.
+/// The sort key's range within one file: the `sort_by` columns at the file's
+/// first and last row (the file is sorted, so these bound every row). Each is a
+/// one-row arrow-json object, e.g. `{"Timestamp": 100}`. Lets a reader prune a
+/// file on a sort-key range predicate without fetching its footer.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SortBounds {
+    pub min: serde_json::Value,
+    pub max: serde_json::Value,
+}
+
+/// One file in a table manifest: its store identity ([`FileRef`]) plus the
+/// optional partition tuple and sort-key bounds the partitioning/sorting ingest
+/// sink stamps on it. Both are `None` for files written without that metadata
+/// (an unpartitioned/unsorted table, or compaction output today).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ManifestEntry {
+    #[serde(flatten)]
+    pub file: FileRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_bounds: Option<SortBounds>,
+}
+
+impl ManifestEntry {
+    /// An entry with no partition/sort metadata (unpartitioned + unsorted table,
+    /// or a writer that doesn't record it).
+    pub fn new(file: FileRef) -> Self {
+        Self {
+            file,
+            partition: None,
+            sort_bounds: None,
+        }
+    }
+}
+
+/// One table's durable record: its declared schema (`columns`), its partition and
+/// sort specs (column names; either may be empty), and its committed file list
+/// (`entries`) at `version`. Mirrors the live [`CatalogTable`] state the catalog
+/// keeps in memory.
 ///
 /// [`CatalogTable`]: crate::catalog::CatalogTable
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TableManifest {
     pub version: u64,
     pub columns: Vec<Column>,
-    pub entries: Vec<FileRef>,
+    /// Partition columns, in order (identity partitioning); empty = unpartitioned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partition_by: Vec<String>,
+    /// Sort columns, in order; empty = unsorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sort_by: Vec<String>,
+    pub entries: Vec<ManifestEntry>,
 }
 
 impl TableManifest {
@@ -188,6 +231,8 @@ mod tests {
         TableManifest {
             version,
             columns: vec![],
+            partition_by: vec![],
+            sort_by: vec![],
             entries: vec![],
         }
     }

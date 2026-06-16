@@ -2362,8 +2362,13 @@ checksum = "bfa799dd5ed20a7e349f3b4639aa80d74549c81716d9ec4f994c9b5815598306"
 name = "ingest"
 version = "0.1.0"
 dependencies = [
+ "arrow-arith 58.0.0",
  "arrow-array 58.0.0",
+ "arrow-cast 58.0.0",
+ "arrow-json 58.0.0",
+ "arrow-ord 58.0.0",
  "arrow-schema 58.0.0",
+ "arrow-select 58.0.0",
  "catalog",
  "dispatch",
  "opentelemetry-proto",
@@ -2377,6 +2382,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4804,6 +4810,7 @@ version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
+ "getrandom 0.4.2",
  "js-sys",
  "wasm-bindgen",
 ]

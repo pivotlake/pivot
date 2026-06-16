@@ -144,7 +144,7 @@ mod bodies {
 
         cat.table_handle("events")
             .unwrap()
-            .append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]))
+            .append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]), None, None)
             .unwrap();
 
         assert_eq!(scan(&d, &cat, "events"), vec![1, 2, 3, 4, 5, 6]);
@@ -165,10 +165,10 @@ mod bodies {
             .unwrap()
             .replace_data_files(
                 &[ObjectPath::new("p1.parquet"), ObjectPath::new("p2.parquet")],
-                &[FileRef {
+                &[catalog::ManifestEntry::new(FileRef {
                     path: ObjectPath::new("merged.parquet"),
                     size: merged.len() as u64,
-                }],
+                })],
             )
             .unwrap();
 

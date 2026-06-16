@@ -21,16 +21,14 @@
 //! *writes into* a table, it never creates one.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use catalog::ParquetCatalog;
 use catalog::store::ObjectPath;
-use dispatch::DataFlowDispatcher;
+use dispatch::{DataFlowDispatcher, DataFlowError};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::parquet_writing::{self, ToRecordBatch};
+use crate::parquet_writing::{self, EncodedFile, ToRecordBatch};
 
 /// Rows per Parquet row group. A flush's items are cut into row groups of about
 /// this many rows as they stream through the write pipeline.
@@ -38,6 +36,9 @@ pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Row groups per Parquet file. Once this many accumulate, a file is emitted and
 /// written; the flush's remainder lands in a final, smaller file.
 pub(crate) const ROW_GROUPS_PER_FILE: usize = 8;
+/// Finished files buffered between the encode pipeline and the writer: small, so
+/// it bounds in-flight files and backpressures the pipeline onto the writer.
+const IN_FLIGHT_FILES: usize = 4;
 
 /// Object-safe view of a sink for the lifecycle paths (flush timer, shutdown
 /// drain), which don't care about the concrete item type. `tonic::async_trait`
@@ -63,9 +64,6 @@ pub struct ParquetSink<T> {
     /// it never creates the table (existence is checked when the sink is built).
     catalog: Arc<ParquetCatalog>,
     buffer: Mutex<Buffer<T>>,
-    /// Monotonic file sequence, so two flushes in the same millisecond don't
-    /// collide on a filename.
-    seq: AtomicU64,
 }
 
 struct Buffer<T> {
@@ -99,7 +97,6 @@ impl<T> ParquetSink<T> {
             dispatcher,
             catalog,
             buffer: Mutex::new(Buffer::default()),
-            seq: AtomicU64::new(0),
         }
     }
 }
@@ -148,41 +145,54 @@ impl<T: ToRecordBatch> ParquetSink<T> {
     /// Run `items` through the write pipeline and write each Parquet file it
     /// produces.
     ///
-    /// The pipeline (see [`parquet_writing`]) flattens items, cuts row groups,
-    /// and encodes pages across the dispatch worker pool, streaming finished
-    /// file buffers out as they complete. Iterating that stream blocks, so it
-    /// runs on a blocking thread; each finished file is handed to the async
-    /// runtime, which writes/uploads it (I/O) while the pipeline keeps working.
+    /// The pipeline (see [`parquet_writing`]) flattens items into Arrow batches,
+    /// then partitions, encodes, and assembles them into Parquet files across the
+    /// dispatch worker pool, streaming finished files out as they complete.
+    /// Iterating that stream blocks, so it runs on a blocking thread; each
+    /// finished file is handed to the async runtime, which writes/uploads it (I/O)
+    /// while the pipeline keeps working.
     /// A failed pipeline run or write is logged and dropped rather than blocking
     /// — the drop-under-pressure stance OTLP exporters expect.
     async fn write(&self, items: Vec<T>) {
-        let dispatcher = self.dispatcher.clone();
-        // Small buffer: bounds how many finished files sit in memory ahead of
-        // the writer, applying backpressure to the pipeline's blocking drainer.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        // The table carries the partition/sort spec; read it per flush (the table
+        // may have been dropped out from under us).
+        let (partition_by, sort_by) = match self.catalog.table_handle(&self.name) {
+            Some(table) => (table.partition_by().to_vec(), table.sort_by().to_vec()),
+            None => {
+                warn!(sink = %self.name, "table no longer exists; dropping flush");
+                return;
+            }
+        };
 
-        let pipeline = tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let files =
-                parquet_writing::run(&dispatcher, items, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE);
-            for file in files {
-                let bytes = file.map_err(|e| format!("write pipeline failed: {e}"))?;
-                // Receiver gone (shouldn't happen) — stop draining.
-                if tx.blocking_send(bytes).is_err() {
-                    break;
+        let dispatcher = self.dispatcher.clone();
+        // Each finished file streams out as an `EncodedFile` (bytes + the metadata
+        // to record).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<EncodedFile>(IN_FLIGHT_FILES);
+
+        // One pipeline, parameterised by the table's spec: it splits by partition,
+        // files per partition, and tags each `EncodedFile` with its tuple +
+        // sort_bounds (both `None` when the spec is empty).
+        let pipeline = tokio::task::spawn_blocking(move || -> Result<(), DataFlowError> {
+            for file in parquet_writing::encode_items(
+                &dispatcher,
+                items,
+                partition_by.into(),
+                sort_by.into(),
+                ROW_GROUP_ROWS,
+                ROW_GROUPS_PER_FILE,
+            ) {
+                if tx.blocking_send(file?).is_err() {
+                    return Ok(());
                 }
             }
             Ok(())
         });
 
-        // Write each file as it streams out.
-        while let Some(bytes) = rx.recv().await {
-            let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-            let millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0);
-            let file_name = format!("{}-{}-{:06}.parquet", self.name, millis, seq);
-            self.write_file(file_name, bytes).await;
+        // Write each file as it streams out, under an opaque uuid name so
+        // concurrent ingestors never collide.
+        while let Some(encoded) = rx.recv().await {
+            let file_name = format!("pivot-{}.parquet", uuid::Uuid::new_v4());
+            self.write_file(file_name, encoded).await;
         }
 
         match pipeline.await {
@@ -199,14 +209,19 @@ impl<T: ToRecordBatch> ParquetSink<T> {
     /// both block. Failures are logged, never propagated (the drop-under-pressure
     /// stance OTLP exporters expect); a `None` means the table was dropped while
     /// ingest is running.
-    async fn write_file(&self, file_name: String, bytes: Vec<u8>) {
+    async fn write_file(&self, file_name: String, encoded: EncodedFile) {
         let catalog = self.catalog.clone();
         let table = self.name.clone();
         let path = ObjectPath::new(file_name.clone());
         let appended = tokio::task::spawn_blocking(move || {
-            catalog
-                .table_handle(&table)
-                .map(|mut handle| handle.append_data_file(path, &bytes))
+            catalog.table_handle(&table).map(|mut handle| {
+                handle.append_data_file(
+                    path,
+                    &encoded.bytes,
+                    encoded.partition,
+                    encoded.sort_bounds,
+                )
+            })
         })
         .await;
         match appended {
