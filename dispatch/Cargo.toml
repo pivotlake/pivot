@@ -29,12 +29,8 @@ libc = "0.2.178"
 # (no cmake/C toolchain); roots are the bundled Mozilla set (no platform calls).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
-# Sans-IO HTTP/1.1 core (see io::http::http1): `http` for the typed message model
-# (Request/Response/StatusCode/HeaderMap — methods/statuses/headers beyond range
-# GETs), `httparse` for byte-level head and chunk-size parsing. These are the same
-# crates hyper is built on; we drive them from our own io_uring transport rather
-# than adopting hyper's IO-coupled runtime.
-http = "1"
+# Byte-level HTTP/1.1 head parsing for the sans-IO range-read helpers
+# (io::http::http1), driven from our own io_uring transport.
 httparse = "1.9"
 url = "2.5"
 

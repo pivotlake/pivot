@@ -182,41 +182,28 @@ mod blocking_engine {
             // no intermediate buffer. `decode` first absorbs any body bytes that
             // arrived alongside the head, and would transparently handle a chunked
             // body too were the range policy ever relaxed.
-            let mut body = http1::BodyDecoder::new(http1::Framing::Length(head.content_length));
+            let mut body = http1::BodyDecoder::new(head.content_length);
             let mut written = 0usize;
             let leftover = &acc[head.head_len..];
             body.decode(leftover, |bytes| {
                 dest[written..written + bytes.len()].copy_from_slice(bytes);
                 written += bytes.len();
-            })?;
+            });
 
             while !body.is_complete() {
-                let eof = || {
-                    Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "connection closed before response body completed",
-                    ))
-                };
                 match body.read_plan() {
                     http1::ReadPlan::Done => break,
                     http1::ReadPlan::Direct { max } => {
                         let cap = (max as usize).min(dest.len() - written);
                         let n = conn.read(&mut dest[written..written + cap])?;
                         if n == 0 {
-                            return Err(eof());
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "connection closed before response body completed",
+                            )));
                         }
                         written += n;
                         body.consumed(n as u64)?;
-                    }
-                    http1::ReadPlan::Chunked => {
-                        let n = conn.read(&mut chunk)?;
-                        if n == 0 {
-                            return Err(eof());
-                        }
-                        body.decode(&chunk[..n], |bytes| {
-                            dest[written..written + bytes.len()].copy_from_slice(bytes);
-                            written += bytes.len();
-                        })?;
                     }
                 }
             }
@@ -396,9 +383,6 @@ mod uring_engine {
                                 let remaining = match decoder.read_plan() {
                                     http1::ReadPlan::Direct { max } => max as usize,
                                     http1::ReadPlan::Done => 0,
-                                    http1::ReadPlan::Chunked => {
-                                        unreachable!("range body is identity-framed")
-                                    }
                                 };
                                 if remaining == 0 {
                                     break;
@@ -473,7 +457,7 @@ mod uring_engine {
     ) -> Result<()> {
         head_acc.extend_from_slice(chunk);
         if let proto::HeadParse::Complete(h) = proto::parse_response_head(head_acc, req_len)? {
-            let mut decoder = http1::BodyDecoder::new(http1::Framing::Length(h.content_length));
+            let mut decoder = http1::BodyDecoder::new(h.content_length);
             // The body bytes that arrived alongside the head — the one copy (out of
             // the shared recv scratch into the slot) the identity path needs; the
             // rest of the body never passes through scratch.
@@ -489,7 +473,7 @@ mod uring_engine {
                     );
                 }
                 *body_written += bytes.len();
-            })?;
+            });
             *body = Some(decoder);
         }
         Ok(())
@@ -707,7 +691,7 @@ mod uring_engine {
                         // unfinished, so this is always > 0 here.
                         let remaining = match conn.body.as_ref().unwrap().read_plan() {
                             http1::ReadPlan::Direct { max } => max as usize,
-                            _ => 0,
+                            http1::ReadPlan::Done => 0,
                         };
                         conn.recv_in_dest = true;
                         // SAFETY: pinned, currently-invalid slot region; remaining

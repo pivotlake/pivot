@@ -67,23 +67,19 @@ pub enum HeadParse {
 /// is present and no larger than `requested_len` — range responses are never
 /// chunked and must fit the destination slot region.
 pub fn parse_response_head(buf: &[u8], requested_len: usize) -> Result<HeadParse, ProtoError> {
-    let head = match http1::parse_response_head(buf, &http::Method::GET)? {
+    let head = match http1::parse_response_head(buf)? {
         http1::HeadStatus::Incomplete => return Ok(HeadParse::Incomplete),
         http1::HeadStatus::Complete(head) => head,
     };
 
-    let status = head.parts.status.as_u16();
-    if status != 206 {
-        return Err(ProtoError::UnexpectedStatus(status));
+    if head.status != 206 {
+        return Err(ProtoError::UnexpectedStatus(head.status));
     }
 
     // A range response is always identity-framed (we send `Accept-Encoding:
-    // identity` and don't request multipart). Anything else — chunked, or no
-    // length at all — means we can't size the body against the slot.
-    let content_length = match head.framing {
-        http1::Framing::Length(n) => n,
-        _ => return Err(ProtoError::MissingContentLength),
-    };
+    // identity` and don't request multipart), so it must carry a Content-Length
+    // — the body size we land in the slot.
+    let content_length = head.content_length.ok_or(ProtoError::MissingContentLength)?;
 
     if content_length > requested_len as u64 {
         return Err(ProtoError::BodyTooLarge {
