@@ -31,7 +31,8 @@ use std::sync::{Arc, mpsc};
 /// Only the first worker receives the channel receiver; it will drain
 /// the channel and inject partition jobs during the output phase.
 pub struct GroupFactory<K: KeyExtractor, V: AggregationValue> {
-    shared_arena: Arc<SharedArena>,
+    key_arena: Arc<SharedArena>,
+    value_arena: Arc<SharedArena>,
     key_cols: Vec<usize>,
     value_slots: Vec<AggregationSlot>,
     key_config: K::Config,
@@ -59,7 +60,8 @@ impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
         worker_count: usize,
         buffers: usize,
     ) -> impl IntoIterator<Item = GroupFactory<K, V>> {
-        let shared_arena = SharedArena::new(buffers);
+        let key_arena = SharedArena::new(buffers);
+        let value_arena = SharedArena::new(buffers);
         let hash_state = RandomState::new();
         let injector = Arc::new(Injector::new());
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
@@ -67,7 +69,8 @@ impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
         let mut rx_opt = Some(rx);
 
         (0..worker_count).map(move |_| GroupFactory {
-            shared_arena: shared_arena.clone(),
+            key_arena: key_arena.clone(),
+            value_arena: value_arena.clone(),
             key_cols: key_cols.clone(),
             value_slots: value_slots.clone(),
             key_config: key_config.clone(),
@@ -89,7 +92,8 @@ impl<K: KeyExtractor, V: AggregationValue> UnaryFactory<RecordBatch, RecordBatch
 
     fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>> {
         PipelineBreaker::Consuming(Group::new(
-            self.shared_arena,
+            self.key_arena,
+            self.value_arena,
             self.hash_state,
             self.injector,
             self.key_cols,

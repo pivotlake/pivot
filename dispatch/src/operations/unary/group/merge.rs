@@ -221,7 +221,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     tables: &[MultiSlabTable<K, V>],
     partition_capacity: usize,
     num_partitions: usize,
-    arena: &SharedArena,
+    key_arena: &SharedArena,
     cfg: &V::MergeConfig,
 ) -> MultiSlabTable<K, V> {
     let partition_bits = num_partitions.trailing_zeros();
@@ -236,7 +236,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     for wb in buffers {
         wb.0[partition].for_each(|(hash, key, value)| {
             grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
-            let live = K::resolve_persisted(arena, key);
+            let live = K::resolve_persisted(key_arena, key);
             target.merge::<false, _>(hash, live, value, cfg);
         });
     }
@@ -257,7 +257,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     for (slot_count, group) in by_size.into_iter() {
         merge_into_partition::<K, V, _>(
             &mut allocator,
-            arena,
+            key_arena,
             partition,
             slot_count,
             group,
@@ -314,6 +314,7 @@ mod tests {
     ) -> Vec<MultiSlabTable<IntExtractor, CountValue>> {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
+            arena.clone(),
             arena.clone(),
             RadixConfig::DEFAULT,
         );
@@ -505,6 +506,7 @@ mod tests {
     ) -> AggregatedTableOutput<IntExtractor, CountValue> {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
+            arena.clone(),
             arena.clone(),
             RadixConfig::DEFAULT,
         );

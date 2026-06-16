@@ -382,66 +382,44 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     ///
     /// A new entry just stores the value; an existing one folds via the value's
     /// own [`merge`](AggregationValue::merge) (so two finished partials combine —
-    /// the partition-merge and radix paths). For folding input *rows* into a group
-    /// the consume path uses [`probe_insert`](Self::probe_insert) +
-    /// [`value_mut`](Self::value_mut) instead, so a string extreme can persist a
-    /// row lazily; here the value is already materialised, so this fuses the probe
-    /// and the fold into one pass (no separate slot re-index).
+    /// the partition-merge and radix paths). Thin wrapper over
+    /// [`probe_fold`](Self::probe_fold) with an already-materialised value.
     #[inline(always)]
     pub fn merge<const COUNT_COLLISIONS: bool, L>(
         &mut self,
-        mut hash: u64,
+        hash: u64,
         key: L,
         value: V,
         cfg: &V::MergeConfig,
     ) where
         L: LiveKey<Persisted = K>,
     {
-        // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
-        if hash == 0 {
-            hash = 1;
-        }
-        let mut idx = self.slot_for(hash);
-        loop {
-            let entry = &mut self.buffer[idx];
-            if entry.hash == 0 {
-                let persisted = key.persist();
-                self.buffer[idx] = Entry {
-                    hash,
-                    value,
-                    key: persisted,
-                };
-                self.length += 1;
-                return;
-            }
-            if entry.hash == hash && key.eq_persisted(&entry.key) {
-                entry.value = entry.value.merge(value, cfg);
-                return;
-            }
-            if COUNT_COLLISIONS {
-                self.collisions += 1;
-            }
-            idx = (idx + 1) & self.mask;
-        }
+        self.probe_fold::<COUNT_COLLISIONS, L, _>(hash, key, |cell, is_new| {
+            *cell = if is_new {
+                value
+            } else {
+                cell.merge(value, cfg)
+            };
+        });
     }
 
-    /// Probe for `hash`/`key`, inserting the (persisted) key at the first empty
-    /// slot. Returns the slot index and whether it was newly inserted; the caller
-    /// fills the value via [`value_mut`](Self::value_mut). A freshly inserted
-    /// slot's value is `Default` until then.
+    /// Probe for `hash`/`key`, then fold the value at the matched (or freshly
+    /// inserted) slot via `fold`, which receives `(&mut value, is_new)`. One
+    /// probe-and-fold pass: the value reference comes straight from the matched
+    /// entry, with no second slot lookup.
     ///
-    /// The consume path uses this (rather than passing a pre-built value) so the
-    /// live key's `&mut WorkerArena` borrow is released here, before the *value* is
-    /// read into the same arena — a string `MIN` key and a string `MIN` value can
-    /// then share one worker arena without a borrow clash.
+    /// This is the single primitive behind both phases. The merge phase passes a
+    /// closure that folds an already-materialised partial in ([`merge`](Self::merge));
+    /// the consume path passes one that reads the row from the batch and, for a
+    /// string extreme, persists it lazily into the *value* arena. `fold` runs
+    /// after the live key has been persisted here, so the key's arena borrow is
+    /// already released — and with keys and values in separate arenas, the
+    /// closure's value-arena borrow never aliases the key's.
     #[inline(always)]
-    pub fn probe_insert<const COUNT_COLLISIONS: bool, L>(
-        &mut self,
-        mut hash: u64,
-        key: L,
-    ) -> (usize, bool)
+    pub fn probe_fold<const COUNT_COLLISIONS: bool, L, F>(&mut self, mut hash: u64, key: L, fold: F)
     where
         L: LiveKey<Persisted = K>,
+        F: FnOnce(&mut V, bool),
     {
         // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
         if hash == 0 {
@@ -454,24 +432,18 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
                 entry.hash = hash;
                 entry.key = key.persist();
                 self.length += 1;
-                return (idx, true);
+                fold(&mut entry.value, true);
+                return;
             }
             if entry.hash == hash && key.eq_persisted(&entry.key) {
-                return (idx, false);
+                fold(&mut entry.value, false);
+                return;
             }
             if COUNT_COLLISIONS {
                 self.collisions += 1;
             }
             idx = (idx + 1) & self.mask;
         }
-    }
-
-    /// Mutable access to slot `idx`'s value — used by the consume path to fill a
-    /// freshly [`probe_insert`](Self::probe_insert)ed slot, or fold a row into an
-    /// existing one, after the key's arena borrow is released.
-    #[inline(always)]
-    pub fn value_mut(&mut self, idx: usize) -> &mut V {
-        &mut self.buffer[idx].value
     }
 
     /// Rehash all entries into a new buffer of `new_size` slots.

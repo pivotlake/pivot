@@ -100,7 +100,8 @@ where
 fn emit<K, V, Snd>(
     keys: K::Columns,
     values: V::Columns,
-    arena: &Arc<SharedArena>,
+    key_arena: &Arc<SharedArena>,
+    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     sender: &mut Snd,
 ) -> Result<()>
@@ -109,8 +110,8 @@ where
     V: AggregationValue,
     Snd: Sender<RecordBatch>,
 {
-    let (mut fields, mut columns) = keys.finish(arena, allocator);
-    let (value_fields, value_columns) = V::finish_columns(values, arena);
+    let (mut fields, mut columns) = keys.finish(key_arena, allocator);
+    let (value_fields, value_columns) = V::finish_columns(values, value_arena);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -120,10 +121,12 @@ where
 
 /// Build `total` `(key, value)` pairs from `rows` into output `RecordBatch`es —
 /// one per [`OUTPUT_CHUNK_ROWS`]-row chunk, on `allocator`'s slab memory.
+#[allow(clippy::too_many_arguments)]
 fn emit_chunks<K, V, Snd, I>(
     mut rows: I,
     total: usize,
-    arena: &Arc<SharedArena>,
+    key_arena: &Arc<SharedArena>,
+    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
     sender: &mut Snd,
@@ -144,7 +147,7 @@ where
             keys.push(&key);
             value.push_to(&mut values);
         }
-        emit::<K, V, Snd>(keys, values, arena, allocator, sender)?;
+        emit::<K, V, Snd>(keys, values, key_arena, value_arena, allocator, sender)?;
         remaining -= chunk;
     }
     Ok(())
@@ -156,9 +159,11 @@ where
 /// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
 /// `ORDER BY <value_slot> DESC LIMIT limit`; only this partition's top-`limit`
 /// rows are emitted in that case.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
-    arena: &Arc<SharedArena>,
+    key_arena: &Arc<SharedArena>,
+    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
     top_k: Option<(usize, usize)>,
@@ -192,7 +197,8 @@ where
             emit_chunks::<K, V, Snd, _>(
                 rows.into_iter(),
                 total,
-                arena,
+                key_arena,
+                value_arena,
                 allocator,
                 key_config,
                 sender,
@@ -201,7 +207,15 @@ where
         _ => {
             let total = table.len();
             let rows = table.iter(0).map(|e| (*e.key(), *e.value()));
-            emit_chunks::<K, V, Snd, _>(rows, total, arena, allocator, key_config, sender)
+            emit_chunks::<K, V, Snd, _>(
+                rows,
+                total,
+                key_arena,
+                value_arena,
+                allocator,
+                key_config,
+                sender,
+            )
         }
     }
 }

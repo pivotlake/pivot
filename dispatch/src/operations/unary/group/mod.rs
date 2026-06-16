@@ -165,7 +165,8 @@ pub struct Group<K: KeyExtractor, V: AggregationValue> {
 impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        shared_arena: Arc<SharedArena>,
+        key_arena: Arc<SharedArena>,
+        value_arena: Arc<SharedArena>,
         state: RandomState,
         injector: Arc<Injector<PartitionJob<K, V>>>,
         key_cols: Vec<usize>,
@@ -178,14 +179,15 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
-        let merge_config = V::merge_config(&value_slots, &shared_arena);
+        let merge_config = V::merge_config(&value_slots, &value_arena);
         Self {
             key_cols,
             value_slots,
             merge_config: merge_config.clone(),
             key_config: key_config.clone(),
             outputter: GroupOutputter {
-                shared_arena: shared_arena.clone(),
+                key_arena: key_arena.clone(),
+                value_arena: value_arena.clone(),
                 injector,
                 receiver,
                 partition_jobs_injected,
@@ -196,7 +198,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
                 output_allocator: None,
             },
             sender,
-            aggregated_table: AggregatedTable::new(state, shared_arena, radix),
+            aggregated_table: AggregatedTable::new(state, key_arena, value_arena, radix),
         }
     }
 }
@@ -234,7 +236,11 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
 pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
-    shared_arena: Arc<SharedArena>,
+    /// String *key* storage; backs the leading key column(s) at output.
+    key_arena: Arc<SharedArena>,
+    /// String *value* storage (a string `MIN`/`MAX`); backs trailing value
+    /// column(s) and resolves extremes during the partition merge.
+    value_arena: Arc<SharedArena>,
     injector: Arc<Injector<PartitionJob<K, V>>>,
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
@@ -265,7 +271,8 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     /// non-switched workers' full stacks. Slot-range-merged at `num_partitions`.
     tables: Arc<Vec<MultiSlabTable<K, V>>>,
     index: usize,
-    arena: Arc<SharedArena>,
+    key_arena: Arc<SharedArena>,
+    value_arena: Arc<SharedArena>,
     partition_capacity: usize,
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
@@ -292,7 +299,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
             &self.tables,
             self.partition_capacity,
             self.num_partitions,
-            &self.arena,
+            &self.key_arena,
             &self.merge_config,
         );
         if result_map.len() == 0 {
@@ -300,7 +307,8 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
         }
         output::build_and_send::<K, V, _, _>(
             result_map,
-            &self.arena,
+            &self.key_arena,
+            &self.value_arena,
             allocator,
             &self.key_config,
             self.top_k,
@@ -360,7 +368,8 @@ impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutpu
                     buffers: buffers.clone(),
                     tables: tables.clone(),
                     index: i,
-                    arena: self.shared_arena.clone(),
+                    key_arena: self.key_arena.clone(),
+                    value_arena: self.value_arena.clone(),
                     partition_capacity,
                     num_partitions,
                     key_config: self.key_config.clone(),
@@ -511,7 +520,8 @@ mod tests {
     ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
-        let arena = SharedArena::new(64);
+        let key_arena = SharedArena::new(64);
+        let value_arena = SharedArena::new(64);
         let state = RandomState::new();
         let injector = Arc::new(Injector::new());
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
@@ -521,7 +531,8 @@ mod tests {
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<K, V>::new(
-                    arena.clone(),
+                    key_arena.clone(),
+                    value_arena.clone(),
                     state.clone(),
                     injector.clone(),
                     key_cols.clone(),
@@ -790,7 +801,8 @@ mod tests {
     ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
-        let arena = SharedArena::new(64);
+        let key_arena = SharedArena::new(64);
+        let value_arena = SharedArena::new(64);
         let state = RandomState::new();
         let injector = Arc::new(Injector::new());
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
@@ -799,7 +811,8 @@ mod tests {
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<RowKeyExtractor, V>::new(
-                    arena.clone(),
+                    key_arena.clone(),
+                    value_arena.clone(),
                     state.clone(),
                     injector.clone(),
                     key_cols.clone(),
