@@ -7,6 +7,7 @@ use super::reader::RowReader;
 use super::row::AggregationRow;
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
+use crate::operations::unary::group::arena::WorkerArena;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
@@ -50,7 +51,7 @@ impl<F: CellFold<A>, const N: usize, A: Cell> AggregationValue for Mono<F, N, A>
     }
 
     #[inline(always)]
-    fn value(reader: &RowReader<'_, N>, idx: usize) -> Self {
+    fn value(reader: &RowReader<'_, N>, idx: usize, _arena: &mut WorkerArena) -> Self {
         Self {
             row: reader.read(idx),
             _fold: PhantomData,
@@ -87,6 +88,8 @@ impl<F: CellFold<A>, const N: usize, A: Cell> AggregationValue for Mono<F, N, A>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::values::{Add, AggregationKind, AggregationSlot, Min};
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Schema};
@@ -100,25 +103,33 @@ mod tests {
         .unwrap()
     }
 
+    // Numeric values ignore the arena, but `value`/`update_from_reader` take one.
+    fn test_arena() -> WorkerArena {
+        init_test_free_pool(8);
+        WorkerArena::new(SharedArena::new(8))
+    }
+
     #[test]
     fn mono_add_sums_the_column() {
         let b = int_batch(&[5, 2, 9]);
+        let mut a = test_arena();
         let slots = [AggregationSlot::new(AggregationKind::Sum, 0)];
         let r = Mono::<Add, 1>::make_reader(&b, &slots);
-        let acc = Mono::<Add, 1>::value(&r, 0)
-            .update_from_reader(&r, 1, &())
-            .update_from_reader(&r, 2, &());
+        let acc = Mono::<Add, 1>::value(&r, 0, &mut a)
+            .update_from_reader(&r, 1, &mut a, &())
+            .update_from_reader(&r, 2, &mut a, &());
         assert_eq!(acc.sort_key(0), 16);
     }
 
     #[test]
     fn mono_min_keeps_the_smallest() {
         let b = int_batch(&[5, 2, 9]);
+        let mut a = test_arena();
         let slots = [AggregationSlot::new(AggregationKind::Min, 0)];
         let r = Mono::<Min, 1>::make_reader(&b, &slots);
-        let mut acc = Mono::<Min, 1>::value(&r, 0);
+        let mut acc = Mono::<Min, 1>::value(&r, 0, &mut a);
         for i in 1..3 {
-            acc = acc.update_from_reader(&r, i, &());
+            acc = acc.update_from_reader(&r, i, &mut a, &());
         }
         assert_eq!(acc.sort_key(0), 2);
     }

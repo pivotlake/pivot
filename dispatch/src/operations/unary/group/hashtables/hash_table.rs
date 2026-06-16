@@ -395,7 +395,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     ) where
         L: LiveKey<Persisted = K>,
     {
-        let (idx, is_new) = self.slot::<COUNT_COLLISIONS, L>(hash, key);
+        let (idx, is_new) = self.probe_insert::<COUNT_COLLISIONS, L>(hash, key);
         let entry = &mut self.buffer[idx];
         entry.value = if is_new {
             value
@@ -404,37 +404,21 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         };
     }
 
-    /// Fold input row `row` (read through `reader`) into its group: a new key
-    /// materialises with [`value`](AggregationValue::value), an existing one folds
-    /// with [`update_from_reader`](AggregationValue::update_from_reader). The value
-    /// is built only on the new-key path or inside `update_from_reader`, so a row
-    /// that doesn't change its group's value (e.g. a string `MIN` that doesn't win)
-    /// is never persisted.
-    #[inline(always)]
-    pub fn consume<const COUNT_COLLISIONS: bool, L>(
-        &mut self,
-        hash: u64,
-        key: L,
-        reader: &V::Reader<'_>,
-        row: usize,
-        cfg: &V::MergeConfig,
-    ) where
-        L: LiveKey<Persisted = K>,
-    {
-        let (idx, is_new) = self.slot::<COUNT_COLLISIONS, L>(hash, key);
-        let entry = &mut self.buffer[idx];
-        entry.value = if is_new {
-            V::value(reader, row)
-        } else {
-            entry.value.update_from_reader(reader, row, cfg)
-        };
-    }
-
     /// Probe for `hash`/`key`, inserting the (persisted) key at the first empty
     /// slot. Returns the slot index and whether it was newly inserted; the caller
-    /// fills the value. A freshly inserted slot's value is `Default` until then.
+    /// fills the value via [`value_mut`](Self::value_mut). A freshly inserted
+    /// slot's value is `Default` until then.
+    ///
+    /// The consume path uses this (rather than passing a pre-built value) so the
+    /// live key's `&mut WorkerArena` borrow is released here, before the *value* is
+    /// read into the same arena — a string `MIN` key and a string `MIN` value can
+    /// then share one worker arena without a borrow clash.
     #[inline(always)]
-    fn slot<const COUNT_COLLISIONS: bool, L>(&mut self, mut hash: u64, key: L) -> (usize, bool)
+    pub fn probe_insert<const COUNT_COLLISIONS: bool, L>(
+        &mut self,
+        mut hash: u64,
+        key: L,
+    ) -> (usize, bool)
     where
         L: LiveKey<Persisted = K>,
     {
@@ -459,6 +443,14 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
             }
             idx = (idx + 1) & self.mask;
         }
+    }
+
+    /// Mutable access to slot `idx`'s value — used by the consume path to fill a
+    /// freshly [`probe_insert`](Self::probe_insert)ed slot, or fold a row into an
+    /// existing one, after the key's arena borrow is released.
+    #[inline(always)]
+    pub fn value_mut(&mut self, idx: usize) -> &mut V {
+        &mut self.buffer[idx].value
     }
 
     /// Rehash all entries into a new buffer of `new_size` slots.
@@ -540,6 +532,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::unary::group::arena::WorkerArena;
     use crate::operations::unary::group::values::AggregationSlot;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::Field;
@@ -556,7 +549,7 @@ mod tests {
         type SortKey = i64;
         fn merge_config(_slots: &[AggregationSlot]) {}
         fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
-        fn value(_reader: &(), _idx: usize) -> Self {
+        fn value(_reader: &(), _idx: usize, _arena: &mut WorkerArena) -> Self {
             Count(1)
         }
         fn merge(self, other: Self, _cfg: &()) -> Self {

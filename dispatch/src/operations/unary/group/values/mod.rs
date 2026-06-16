@@ -18,6 +18,7 @@
 //!   a tuple of [`Aggregate`] ops (straight-line, no per-row dispatch).
 
 use crate::memory::SlabAllocator;
+use crate::operations::unary::group::arena::WorkerArena;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 
@@ -137,20 +138,22 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
 
     /// Materialise a brand-new group from row `idx` — the consume path's new-key
-    /// case, and the radix scatter.
-    fn value(reader: &Self::Reader<'_>, idx: usize) -> Self;
+    /// case, and the radix scatter. `arena` is the worker arena a string extreme
+    /// persists its winning string into; numeric cells ignore it.
+    fn value(reader: &Self::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> Self;
 
     /// Fold row `idx` into this (existing) group. Defaults to merging the row's
-    /// [`value`](Self::value) in; a string extreme overrides it to read the cell
-    /// lazily and persist only when it beats the current extreme.
+    /// [`value`](Self::value) in; a string extreme overrides it to compare against
+    /// the current extreme (resolved via `arena`) and persist only when it wins.
     #[inline(always)]
     fn update_from_reader(
         self,
         reader: &Self::Reader<'_>,
         idx: usize,
+        arena: &mut WorkerArena,
         cfg: &Self::MergeConfig,
     ) -> Self {
-        self.merge(Self::value(reader, idx), cfg)
+        self.merge(Self::value(reader, idx, arena), cfg)
     }
 
     /// Combine two partial group values — the partition merge and the radix fold.

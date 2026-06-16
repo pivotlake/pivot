@@ -7,6 +7,7 @@ use super::reader::RowReader;
 use super::row::AggregationRow;
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
+use crate::operations::unary::group::arena::WorkerArena;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
@@ -50,7 +51,7 @@ impl<const N: usize, A: Cell> AggregationValue for DynamicMixed<N, A> {
     }
 
     #[inline(always)]
-    fn value(reader: &RowReader<'_, N>, idx: usize) -> Self {
+    fn value(reader: &RowReader<'_, N>, idx: usize, _arena: &mut WorkerArena) -> Self {
         Self {
             row: reader.read(idx),
         }
@@ -87,9 +88,17 @@ impl<const N: usize, A: Cell> AggregationValue for DynamicMixed<N, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::values::{AggregationKind, AggregationSlot};
     use arrow_array::{Int32Array, Int64Array};
     use arrow_schema::{DataType, Schema};
+
+    // Numeric values ignore the arena, but `value` takes one.
+    fn test_arena() -> WorkerArena {
+        init_test_free_pool(8);
+        WorkerArena::new(SharedArena::new(8))
+    }
 
     /// A heterogeneous signature — COUNT(*) + MIN(c) — folds each slot by its kind.
     #[test]
@@ -106,10 +115,11 @@ mod tests {
             ]
             .as_slice(),
         );
+        let mut a = test_arena();
         let r = DynamicMixed::<2>::make_reader(&b, &slots);
-        let mut acc = DynamicMixed::<2>::value(&r, 0);
+        let mut acc = DynamicMixed::<2>::value(&r, 0, &mut a);
         for i in 1..3 {
-            acc = acc.update_from_reader(&r, i, &slots);
+            acc = acc.update_from_reader(&r, i, &mut a, &slots);
         }
         assert_eq!(acc.sort_key(0), 3); // count
         assert_eq!(acc.sort_key(1), 2); // min
@@ -129,10 +139,11 @@ mod tests {
         .unwrap();
         let slots: Arc<[AggregationSlot]> =
             Arc::from([AggregationSlot::new(AggregationKind::Sum, 0)].as_slice());
+        let mut a = test_arena();
         let r = DynamicMixed::<1, i128>::make_reader(&b, &slots);
-        let acc = DynamicMixed::<1, i128>::value(&r, 0)
-            .merge(DynamicMixed::<1, i128>::value(&r, 1), &slots)
-            .merge(DynamicMixed::<1, i128>::value(&r, 2), &slots);
+        let acc = DynamicMixed::<1, i128>::value(&r, 0, &mut a)
+            .merge(DynamicMixed::<1, i128>::value(&r, 1, &mut a), &slots)
+            .merge(DynamicMixed::<1, i128>::value(&r, 2, &mut a), &slots);
         assert_eq!(acc.sort_key(0), 3 * i64::MAX as i128);
     }
 }

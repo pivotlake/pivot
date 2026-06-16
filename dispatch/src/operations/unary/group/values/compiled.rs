@@ -13,6 +13,7 @@ use super::columns::RowColumns;
 use super::row::AggregationRow;
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
+use crate::operations::unary::group::arena::WorkerArena;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
@@ -64,7 +65,7 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
-            fn value(reader: &Self::Reader<'_>, idx: usize) -> Self {
+            fn value(reader: &Self::Reader<'_>, idx: usize, _arena: &mut WorkerArena) -> Self {
                 Self {
                     row: AggregationRow([$( Acc::from($Op::contribution(&reader.$idx, idx)), )+]),
                     _ops: PhantomData,
@@ -114,6 +115,8 @@ impl_compiled!(6; A 0, B 1, C 2, D 3, E 4, F 5);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::values::aggregate::{Count, Sum};
     use crate::operations::unary::group::values::{AggregationKind, AggregationSlot};
     use arrow_array::Int16Array;
@@ -139,10 +142,12 @@ mod tests {
             AggregationSlot::new(AggregationKind::Count, 0),
         ];
 
+        init_test_free_pool(8);
+        let mut arena = WorkerArena::new(SharedArena::new(8));
         type V = CompiledMixed<(Count, Sum<Int16Type>, Sum<Int16Type>, Count), 4>;
         let reader = V::make_reader(&batch, &slots);
         // Fold rows 0 and 1 into one group: counts add, sums add.
-        let acc = V::value(&reader, 0).merge(V::value(&reader, 1), &());
+        let acc = V::value(&reader, 0, &mut arena).merge(V::value(&reader, 1, &mut arena), &());
         assert_eq!(acc.row.0, [2, 3, 30, 2]);
         assert_eq!(acc.sort_key(2), 30);
     }

@@ -8,6 +8,7 @@
 
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
+use crate::operations::unary::group::arena::WorkerArena;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 
@@ -29,7 +30,7 @@ impl AggregationValue for Distinct {
     fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
 
     #[inline(always)]
-    fn value(_reader: &(), _idx: usize) -> Self {
+    fn value(_reader: &(), _idx: usize, _arena: &mut WorkerArena) -> Self {
         Distinct
     }
 

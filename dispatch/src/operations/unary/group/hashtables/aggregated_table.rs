@@ -250,8 +250,20 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 if i + L1_DISTANCE < length {
                     table.prefetch(self.hashes[i + L1_DISTANCE]);
                 }
-                let key = K::live_key(key_reader, i, &mut self.worker_arena);
-                table.consume::<false, _>(hash, key, value_reader, i, merge_config);
+                // Probe with a scoped live key: the key persists (into the arena
+                // for strings) here, releasing its arena borrow before the value
+                // reads into the same arena. New key -> materialise; existing ->
+                // fold the row in (a string extreme persists only if it wins).
+                let (slot, is_new) = {
+                    let key = K::live_key(key_reader, i, &mut self.worker_arena);
+                    table.probe_insert::<false, _>(hash, key)
+                };
+                let cell = table.value_mut(slot);
+                *cell = if is_new {
+                    V::value(value_reader, i, &mut self.worker_arena)
+                } else {
+                    cell.update_from_reader(value_reader, i, &mut self.worker_arena, merge_config)
+                };
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
@@ -307,7 +319,9 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             hll.add(hash);
             let p = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, worker_arena).persist();
-            let value = V::value(value_reader, i);
+            // Radix is integer-key-only and strings never radix, so the value
+            // here is always numeric (ignores the arena).
+            let value = V::value(value_reader, i, worker_arena);
             buffers[p].push(allocator, (hash, key, value));
         }
     }
