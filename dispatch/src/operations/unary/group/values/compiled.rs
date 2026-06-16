@@ -7,8 +7,8 @@
 //! selected in the planner. Anything not specialised falls back to
 //! [`Mono`](super::Mono) / [`DynamicMixed`](super::DynamicMixed).
 
-use super::accumulator::Accumulator;
 use super::aggregate::Aggregate;
+use super::cell::Cell;
 use super::columns::RowColumns;
 use super::row::AggregationRow;
 use super::{AggregationSlot, AggregationValue};
@@ -19,18 +19,18 @@ use std::marker::PhantomData;
 
 /// `N` cells of width `A` filled and folded by a fixed op tuple `Ops` (`N` is the
 /// tuple arity; stable Rust can't derive it, so the planner passes both).
-pub struct CompiledMixed<Ops, const N: usize, A: Accumulator = i64> {
+pub struct CompiledMixed<Ops, const N: usize, A: Cell = i64> {
     row: AggregationRow<N, A>,
     _ops: PhantomData<Ops>,
 }
 
-impl<Ops, const N: usize, A: Accumulator> Copy for CompiledMixed<Ops, N, A> {}
-impl<Ops, const N: usize, A: Accumulator> Clone for CompiledMixed<Ops, N, A> {
+impl<Ops, const N: usize, A: Cell> Copy for CompiledMixed<Ops, N, A> {}
+impl<Ops, const N: usize, A: Cell> Clone for CompiledMixed<Ops, N, A> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<Ops, const N: usize, A: Accumulator> Default for CompiledMixed<Ops, N, A> {
+impl<Ops, const N: usize, A: Cell> Default for CompiledMixed<Ops, N, A> {
     fn default() -> Self {
         Self {
             row: AggregationRow::default(),
@@ -43,7 +43,7 @@ impl<Ops, const N: usize, A: Accumulator> Default for CompiledMixed<Ops, N, A> {
 /// given arity. `$idx` are the tuple field indices, which also index the slots.
 macro_rules! impl_compiled {
     ($n:literal; $($Op:ident $idx:tt),+) => {
-        impl<Acc: Accumulator, $($Op: Aggregate + Send + Sync + 'static),+> AggregationValue
+        impl<Acc: Cell, $($Op: Aggregate + Send + Sync + 'static),+> AggregationValue
             for CompiledMixed<($($Op,)+), $n, Acc>
         {
             type Reader<'b> = ($($Op::Reader<'b>,)+);

@@ -102,8 +102,8 @@ pub use keys::{
     RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
-    Accumulator, Add, Aggregate, AggregationKind, AggregationSlot, AggregationValue, CompiledMixed,
-    Count, Distinct, DynamicMixed, Max, Min, Mono, Sum,
+    Add, Aggregate, AggregationKind, AggregationSlot, AggregationValue, Cell, CompiledMixed, Count,
+    Distinct, DynamicMixed, Max, Min, Mono, Sum,
 };
 
 use crate::memory::SlabAllocator;

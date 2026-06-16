@@ -5,7 +5,7 @@
 //! `i128`) — so it lives here once. A value pushes its own row in via
 //! [`push_row`](RowColumns::push_row).
 
-use super::accumulator::Accumulator;
+use super::cell::Cell;
 use super::row::AggregationRow;
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
@@ -13,11 +13,11 @@ use arrow_array::ArrayRef;
 use arrow_schema::Field;
 
 /// One engine-slab column builder per slot.
-pub struct RowColumns<const N: usize, A: Accumulator = i64> {
+pub struct RowColumns<const N: usize, A: Cell = i64> {
     cols: [PrimitiveBuilder<A::Arrow>; N],
 }
 
-impl<const N: usize, A: Accumulator> RowColumns<N, A> {
+impl<const N: usize, A: Cell> RowColumns<N, A> {
     pub fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
         Self {
             cols: std::array::from_fn(|_| PrimitiveBuilder::with_capacity(allocator, rows)),

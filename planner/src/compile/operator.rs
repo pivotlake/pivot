@@ -601,7 +601,7 @@ impl Aggregate {
 
         let top_k = self.top_k;
 
-        // Accumulator width, by the same column-type rule as the global path:
+        // Cell width, by the same column-type rule as the global path:
         // i128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
         // Grouped sums are almost always over narrow columns, so this is i64
         // in practice; the i128 arm keeps a wide grouped sum correct rather

@@ -21,8 +21,8 @@ use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 
-mod accumulator;
 mod aggregate;
+mod cell;
 mod columns;
 mod compiled;
 mod distinct;
@@ -32,8 +32,8 @@ mod mono;
 mod reader;
 mod row;
 
-pub use accumulator::Accumulator;
 pub use aggregate::{Aggregate, Count, Sum};
+pub use cell::Cell;
 pub use compiled::CompiledMixed;
 pub use distinct::Distinct;
 pub use dynamic::DynamicMixed;
@@ -82,7 +82,7 @@ impl AggregationKind {
     /// never needs it (a new entry stores the first row's value directly), but the
     /// global fold over batches and the cross-worker partial merge both do.
     #[inline(always)]
-    pub fn identity<A: Accumulator>(self) -> A {
+    pub fn identity<A: Cell>(self) -> A {
         match self {
             AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum => {
                 A::default()

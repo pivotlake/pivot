@@ -1,6 +1,6 @@
 //! [`Mono`] — a homogeneous aggregation value: every cell folds the same way.
 
-use super::accumulator::Accumulator;
+use super::cell::Cell;
 use super::columns::RowColumns;
 use super::fold::CellFold;
 use super::reader::RowReader;
@@ -15,19 +15,19 @@ use std::marker::PhantomData;
 /// [`Max`](super::Max)). The common all-`SUM`/`COUNT` query is `Mono<Add>`; a
 /// pure-`MIN`/`MAX` query is `Mono<Min>`/`Mono<Max>`. The fold is branch-free and
 /// carries no config — mixed signatures use [`DynamicMixed`](super::DynamicMixed).
-pub struct Mono<F, const N: usize, A: Accumulator = i64> {
+pub struct Mono<F, const N: usize, A: Cell = i64> {
     row: AggregationRow<N, A>,
     _fold: PhantomData<F>,
 }
 
 // Manual impls so `F` needn't be Copy/Clone/Default (it's a zero-sized marker).
-impl<F, const N: usize, A: Accumulator> Copy for Mono<F, N, A> {}
-impl<F, const N: usize, A: Accumulator> Clone for Mono<F, N, A> {
+impl<F, const N: usize, A: Cell> Copy for Mono<F, N, A> {}
+impl<F, const N: usize, A: Cell> Clone for Mono<F, N, A> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<F, const N: usize, A: Accumulator> Default for Mono<F, N, A> {
+impl<F, const N: usize, A: Cell> Default for Mono<F, N, A> {
     fn default() -> Self {
         Self {
             row: AggregationRow::default(),
@@ -36,7 +36,7 @@ impl<F, const N: usize, A: Accumulator> Default for Mono<F, N, A> {
     }
 }
 
-impl<F: CellFold<A>, const N: usize, A: Accumulator> AggregationValue for Mono<F, N, A> {
+impl<F: CellFold<A>, const N: usize, A: Cell> AggregationValue for Mono<F, N, A> {
     type Reader<'b> = RowReader<'b, N>;
     type MergeConfig = ();
     type Columns = RowColumns<N, A>;

@@ -1,6 +1,6 @@
 //! The raw aggregation cell array — the storage every aggregation value wraps.
 
-use super::accumulator::Accumulator;
+use super::cell::Cell;
 
 /// `N` accumulator cells of width `A` — the in-table payload of one group.
 ///
@@ -11,15 +11,15 @@ use super::accumulator::Accumulator;
 /// (query arity) and `A` (`i64`, or `u128` once string extremes share a cell) — is
 /// monomorphised to exactly what the query needs.
 #[derive(Clone, Copy)]
-pub struct AggregationRow<const N: usize, A: Accumulator = i64>(pub [A; N]);
+pub struct AggregationRow<const N: usize, A: Cell = i64>(pub [A; N]);
 
-impl<const N: usize, A: Accumulator> Default for AggregationRow<N, A> {
+impl<const N: usize, A: Cell> Default for AggregationRow<N, A> {
     fn default() -> Self {
         Self([A::default(); N])
     }
 }
 
-impl<const N: usize, A: Accumulator> AggregationRow<N, A> {
+impl<const N: usize, A: Cell> AggregationRow<N, A> {
     /// Combine cell-wise with `other` under `f`.
     #[inline(always)]
     pub fn zip(self, other: Self, f: impl Fn(A, A) -> A) -> Self {

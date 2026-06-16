@@ -12,7 +12,7 @@
 //!
 //! The aggregate *kind* and per-row contribution are the group module's
 //! [`AggregationSlot`] / [`Aggregate`](RowAggregate) ops — the single source of
-//! truth shared with GROUP BY — and so is the accumulator width [`A`](Accumulator):
+//! truth shared with GROUP BY — and so is the accumulator width [`A`](Cell):
 //! the operator is generic over `i64`/`i128`, chosen by the same column-width rule
 //! as the grouped path (`i128` only when a sum reads a 64-bit column).
 //! `Sum` emits `Int64` or `Decimal128(38, 0)` accordingly (the
@@ -23,7 +23,7 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
-    Accumulator, Aggregate as RowAggregate, AggregationKind, AggregationSlot, Sum,
+    Aggregate as RowAggregate, AggregationKind, AggregationSlot, Cell, Sum,
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
@@ -40,13 +40,13 @@ use std::sync::mpsc;
 /// flow to a single collector (the same wiring as [`OrderByLimitFactory`]).
 ///
 /// [`OrderByLimitFactory`]: super::order_by_limit
-pub struct AggregateFactory<A: Accumulator> {
+pub struct AggregateFactory<A: Cell> {
     slots: Arc<Vec<AggregationSlot>>,
     sender: mpsc::Sender<Vec<A>>,
     receiver: Option<mpsc::Receiver<Vec<A>>>,
 }
 
-impl<A: Accumulator> AggregateFactory<A> {
+impl<A: Cell> AggregateFactory<A> {
     /// Create one factory per worker, all sharing the same partials channel.
     pub fn create_for_workers(
         slots: Vec<AggregationSlot>,
@@ -64,7 +64,7 @@ impl<A: Accumulator> AggregateFactory<A> {
     }
 }
 
-impl<A: Accumulator> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
+impl<A: Cell> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate<A>>;
 
     fn build_unary(mut self) -> Self::Unary {
@@ -78,14 +78,14 @@ impl<A: Accumulator> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory
 
 /// Per-worker aggregate consumer. Accumulates local partials, then sends them
 /// down the shared channel on finalization.
-pub struct Aggregate<A: Accumulator> {
+pub struct Aggregate<A: Cell> {
     slots: Arc<Vec<AggregationSlot>>,
     local: Vec<A>,
     sender: mpsc::Sender<Vec<A>>,
     receiver: Option<mpsc::Receiver<Vec<A>>>,
 }
 
-impl<A: Accumulator> Aggregate<A> {
+impl<A: Cell> Aggregate<A> {
     fn new(
         slots: Arc<Vec<AggregationSlot>>,
         sender: mpsc::Sender<Vec<A>>,
@@ -113,7 +113,7 @@ impl<A: Accumulator> Aggregate<A> {
 /// accumulates into `A`: `i64` suffices for 16/32-bit sums (a full scan can't
 /// overflow it) and for every `MIN`/`MAX` (an extreme never grows past its
 /// inputs); `i128` is for a 64-bit `SUM`, the width the planner picks.
-fn reduce_column<A: Accumulator>(kind: AggregationKind, arr: &dyn Array) -> A {
+fn reduce_column<A: Cell>(kind: AggregationKind, arr: &dyn Array) -> A {
     macro_rules! reduce_primitive {
         ($ty:ty) => {{
             let a = arr.as_primitive::<$ty>();
@@ -134,7 +134,7 @@ fn reduce_column<A: Accumulator>(kind: AggregationKind, arr: &dyn Array) -> A {
 }
 
 /// Build the single output column for one aggregate slot from its accumulator.
-fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, ArrayRef) {
+fn result_column<A: Cell>(kind: AggregationKind, value: A) -> (Field, ArrayRef) {
     match kind {
         // `Int64` or `Decimal128(38, 0)` per the accumulator width. `MIN`/`MAX`
         // emit at the same accumulator width as `SUM` for now; op-owned narrow
@@ -162,7 +162,7 @@ fn result_column<A: Accumulator>(kind: AggregationKind, value: A) -> (Field, Arr
     }
 }
 
-impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
+impl<A: Cell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
     type Outputter = AggregateOutputter<A>;
 
     fn consume<OP: Sender<RecordBatch>>(
@@ -213,13 +213,13 @@ impl<A: Accumulator> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
 
 /// Output phase (one worker only): drains every sibling's partials from the
 /// channel, sums them, then emits the single-row result.
-pub struct AggregateOutputter<A: Accumulator> {
+pub struct AggregateOutputter<A: Cell> {
     rx: mpsc::Receiver<Vec<A>>,
     slots: Arc<Vec<AggregationSlot>>,
     totals: Vec<A>,
 }
 
-impl<A: Accumulator> Outputter<RecordBatch> for AggregateOutputter<A> {
+impl<A: Cell> Outputter<RecordBatch> for AggregateOutputter<A> {
     fn output<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
         loop {
             match self.rx.try_recv() {
@@ -266,7 +266,7 @@ mod tests {
 
     /// Build `n` channel-wired aggregate consumers sharing one partials channel
     /// (the first holds the receiver), mirroring the factory's wiring.
-    fn build<A: Accumulator>(n: usize, slots: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
+    fn build<A: Cell>(n: usize, slots: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
         let slots = Arc::new(slots);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);

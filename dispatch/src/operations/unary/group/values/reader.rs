@@ -5,8 +5,8 @@
 //! the read cells later *combine*. So the read lives here once; the value types
 //! ([`Mono`](super::Mono) etc.) call [`RowReader::read`] and wrap the result.
 
-use super::accumulator::Accumulator;
 use super::aggregate::{Aggregate, Count, Sum};
+use super::cell::Cell;
 use super::row::AggregationRow;
 use super::{AggregationKind, AggregationSlot};
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
@@ -73,7 +73,7 @@ impl<'b, const N: usize> RowReader<'b, N> {
 
     /// Read row `idx` into a fresh accumulator row of width `A`.
     #[inline(always)]
-    pub fn read<A: Accumulator>(&self, idx: usize) -> AggregationRow<N, A> {
+    pub fn read<A: Cell>(&self, idx: usize) -> AggregationRow<N, A> {
         AggregationRow(std::array::from_fn(|s| A::from(self.slots[s].at(idx))))
     }
 }

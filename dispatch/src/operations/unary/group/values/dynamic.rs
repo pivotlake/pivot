@@ -1,7 +1,7 @@
 //! [`DynamicMixed`] — the fallback aggregation value for a heterogeneous
 //! signature (e.g. `COUNT(*), MIN(x)`), folding each slot on its runtime kind.
 
-use super::accumulator::Accumulator;
+use super::cell::Cell;
 use super::columns::RowColumns;
 use super::reader::RowReader;
 use super::row::AggregationRow;
@@ -17,17 +17,17 @@ use std::sync::Arc;
 /// and [`merge`](AggregationValue::merge) dispatches on them.
 ///
 /// [`CellFold`]: super::CellFold
-pub struct DynamicMixed<const N: usize, A: Accumulator = i64> {
+pub struct DynamicMixed<const N: usize, A: Cell = i64> {
     row: AggregationRow<N, A>,
 }
 
-impl<const N: usize, A: Accumulator> Copy for DynamicMixed<N, A> {}
-impl<const N: usize, A: Accumulator> Clone for DynamicMixed<N, A> {
+impl<const N: usize, A: Cell> Copy for DynamicMixed<N, A> {}
+impl<const N: usize, A: Cell> Clone for DynamicMixed<N, A> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<const N: usize, A: Accumulator> Default for DynamicMixed<N, A> {
+impl<const N: usize, A: Cell> Default for DynamicMixed<N, A> {
     fn default() -> Self {
         Self {
             row: AggregationRow::default(),
@@ -35,7 +35,7 @@ impl<const N: usize, A: Accumulator> Default for DynamicMixed<N, A> {
     }
 }
 
-impl<const N: usize, A: Accumulator> AggregationValue for DynamicMixed<N, A> {
+impl<const N: usize, A: Cell> AggregationValue for DynamicMixed<N, A> {
     type Reader<'b> = RowReader<'b, N>;
     type MergeConfig = Arc<[AggregationSlot]>;
     type Columns = RowColumns<N, A>;
