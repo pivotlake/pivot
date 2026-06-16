@@ -43,7 +43,7 @@
 //!    the batched, prefetched merge strategy).
 //! 3. Converts the result table into an Arrow [`RecordBatch`] via the
 //!    [`output`] combinator — key columns from the [`KeyExtractor`], value
-//!    columns from the [`ValueExtractor`] — and sends it downstream.
+//!    columns from the [`AggregationValue`] — and sends it downstream.
 //!
 //! When any worker switched to radix, the same machinery runs at
 //! [`RADIX_PARTITIONS`] granularity, and each job additionally aggregates its
@@ -76,7 +76,7 @@
 //! - [`keys`] — the [`KeyExtractor`] trait and implementations
 //!   ([`IntKeyExtractor`], [`StringKeyExtractor`]), each co-located with its key
 //!   type (e.g. `keys::string` owns [`ArenaKey`])
-//! - [`values`] — the [`ValueExtractor`] trait and implementations, each
+//! - [`values`] — the [`AggregationValue`] trait and implementations, each
 //!   co-located with its value/aggregate type (`Count`, `AggregationRow`) plus
 //!   [`AggregationKind`]/[`AggregationSlot`]
 //! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
@@ -102,8 +102,8 @@ pub use keys::{
     RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
-    Accumulator, Aggregate, AggregationKind, AggregationSlot, Compiled, Count,
-    DistinctValueExtractor, DynamicValueExtractor, Sum, ValueExtractor,
+    Accumulator, Add, Aggregate, AggregationKind, AggregationSlot, AggregationValue, CompiledMixed,
+    Count, Distinct, DynamicMixed, Max, Min, Mono, Sum,
 };
 
 use crate::memory::SlabAllocator;
@@ -149,9 +149,12 @@ const RADIX_PARTITIONS: usize = 4096;
 /// rows and inserts them into its local [`AggregatedTable`]. When consumption
 /// finishes, the accumulated tables are sent to a shared channel and the
 /// `Group` transitions into a [`GroupOutputter`] for the merge phase.
-pub struct Group<K: KeyExtractor, V: ValueExtractor> {
+pub struct Group<K: KeyExtractor, V: AggregationValue> {
     key_cols: Vec<usize>,
+    /// Slots drive the per-batch value reader (which column / `COUNT` vs `SUM`).
     value_slots: Vec<AggregationSlot>,
+    /// The value's merge-time config, built once from the slots (like `key_config`).
+    merge_config: V::MergeConfig,
     key_config: K::Config,
 
     aggregated_table: AggregatedTable<K, V>,
@@ -159,7 +162,7 @@ pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     outputter: GroupOutputter<K, V>,
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         shared_arena: Arc<SharedArena>,
@@ -175,9 +178,11 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
+        let merge_config = V::merge_config(&value_slots);
         Self {
             key_cols,
-            value_slots: value_slots.clone(),
+            value_slots,
+            merge_config: merge_config.clone(),
             key_config: key_config.clone(),
             outputter: GroupOutputter {
                 shared_arena: shared_arena.clone(),
@@ -185,7 +190,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
                 receiver,
                 partition_jobs_injected,
                 key_config,
-                value_slots,
+                merge_config,
                 top_k,
                 count_only,
                 output_allocator: None,
@@ -196,7 +201,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> for Group<K, V> {
     type Outputter = GroupOutputter<K, V>;
 
     fn consume<S: Sender<RecordBatch>>(
@@ -209,6 +214,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
             &self.key_cols,
             &self.value_slots,
             &self.key_config,
+            &self.merge_config,
         );
         Ok(())
     }
@@ -227,15 +233,15 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
 /// tables, and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
-pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
+pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     shared_arena: Arc<SharedArena>,
     injector: Arc<Injector<PartitionJob<K, V>>>,
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     key_config: K::Config,
-    /// The aggregate slot layout, threaded into each [`PartitionJob`] so the merge
-    /// folds existing entries with the kind-aware [`ValueExtractor::merge`].
-    value_slots: Vec<AggregationSlot>,
+    /// The value's merge config, threaded into each [`PartitionJob`] so the merge
+    /// folds existing entries via [`AggregationValue::merge`].
+    merge_config: V::MergeConfig,
     top_k: Option<(usize, usize)>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
@@ -252,7 +258,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
 /// shared [`Injector`] for work-stealing execution. Each job merges all
 /// source tables for partition `index` into one result table and sends the
 /// output as a [`RecordBatch`].
-pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
+pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     /// Switched workers' scatter buffers (empty Vec in the all-in-place case).
     buffers: Arc<Vec<PartitionBuffers<K, V>>>,
     /// Every worker's in-place stack: switched workers' pre-switch tables and
@@ -264,15 +270,15 @@ pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
     key_config: K::Config,
-    /// Per-slot aggregate kinds, for the merge's kind-aware entry fold.
-    value_slots: Vec<AggregationSlot>,
+    /// The value's merge config, for the partition merge's entry fold.
+    merge_config: V::MergeConfig,
     top_k: Option<(usize, usize)>,
     count_only: bool,
 }
 
-unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionJob<K, V> {}
 
-impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
     /// Merge this partition's scatter buffers and in-place stacks into one result
     /// table and send the output batches, building columns into `allocator`.
     pub fn run<S: Sender<RecordBatch>>(
@@ -287,7 +293,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
             self.partition_capacity,
             self.num_partitions,
             &self.arena,
-            &self.value_slots,
+            &self.merge_config,
         );
         if result_map.len() == 0 {
             return Ok(());
@@ -304,7 +310,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputter<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutputter<K, V> {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             let mut all_tables = Vec::new();
@@ -358,7 +364,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                     partition_capacity,
                     num_partitions,
                     key_config: self.key_config.clone(),
-                    value_slots: self.value_slots.clone(),
+                    merge_config: self.merge_config.clone(),
                     top_k: self.top_k,
                     count_only: self.count_only,
                 });
@@ -419,8 +425,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = Compiled<(Count,)>;
-    type SumValue = Compiled<(Sum<Int32Type>,)>;
+    type CountValue = CompiledMixed<(Count,), 1>;
+    type SumValue = CompiledMixed<(Sum<Int32Type>,), 1>;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -496,7 +502,7 @@ mod tests {
     /// General harness: choose the key/value extractors, key columns, aggregates,
     /// LIMIT pushdown, and radix config. The common-case wrappers above cover
     /// `Int32` keys + `COUNT(*)`.
-    fn run_group_full<K: KeyExtractor<Config: Default>, V: ValueExtractor>(
+    fn run_group_full<K: KeyExtractor<Config: Default>, V: AggregationValue>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
@@ -776,7 +782,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![id, name, val]).unwrap()
     }
 
-    fn run_row_key_group<V: ValueExtractor>(
+    fn run_row_key_group<V: AggregationValue>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         schema: RowKeySchema,
@@ -830,7 +836,7 @@ mod tests {
     fn row_key_mixed_int_string_counts() {
         let batch = mixed_key_batch(&[1, 1, 1, 2, 2], &["a", "b", "a", "a", "a"], &[0; 5]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<Compiled<(Count,)>>(
+        let sender = run_row_key_group::<CompiledMixed<(Count,), 1>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -854,7 +860,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &["x", long, "x", "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<CompiledMixed<(Sum<Int32Type>,), 1>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -874,7 +880,7 @@ mod tests {
     #[test]
     fn row_key_two_workers_merge() {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<Compiled<(Count,)>>(
+        let sender = run_row_key_group::<CompiledMixed<(Count,), 1>>(
             vec![
                 vec![mixed_key_batch(&[1, 2], &["a", "a"], &[0; 2])],
                 vec![mixed_key_batch(&[1, 1], &["a", "b"], &[0; 2])],
@@ -904,7 +910,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &[long, "y", long, "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<CompiledMixed<(Sum<Int32Type>,), 1>>(
             vec![vec![batch]],
             vec![1, 0], // name (col 1) then id (col 0)
             schema,
@@ -935,7 +941,7 @@ mod tests {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
 
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<CompiledMixed<(Sum<Int32Type>,), 1>>(
             vec![vec![b1, b2]],
             vec![0, 1],
             schema,

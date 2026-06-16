@@ -10,7 +10,7 @@ use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::RadixConfig;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTableOutput, KeyExtractor, ValueExtractor,
+    AggregatedTableOutput, AggregationValue, KeyExtractor,
 };
 use crate::operations::unary::group::{AggregationSlot, Group, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
@@ -30,7 +30,7 @@ use std::sync::{Arc, mpsc};
 ///
 /// Only the first worker receives the channel receiver; it will drain
 /// the channel and inject partition jobs during the output phase.
-pub struct GroupFactory<K: KeyExtractor, V: ValueExtractor> {
+pub struct GroupFactory<K: KeyExtractor, V: AggregationValue> {
     shared_arena: Arc<SharedArena>,
     key_cols: Vec<usize>,
     value_slots: Vec<AggregationSlot>,
@@ -45,7 +45,7 @@ pub struct GroupFactory<K: KeyExtractor, V: ValueExtractor> {
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
     /// Create `worker_count` factories that share the same arena, hash state,
     /// and synchronization primitives. `key_cols` are the GROUP BY column
     /// indices; `value_slots` configure the per-group aggregates.
@@ -82,7 +82,7 @@ impl<K: KeyExtractor, V: ValueExtractor> GroupFactory<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> UnaryFactory<RecordBatch, RecordBatch>
+impl<K: KeyExtractor, V: AggregationValue> UnaryFactory<RecordBatch, RecordBatch>
     for GroupFactory<K, V>
 {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>;

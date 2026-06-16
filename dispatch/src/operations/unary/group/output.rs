@@ -1,7 +1,7 @@
 //! Assembles a merged partition table into output [`RecordBatch`]es.
 //!
 //! This is the one place the key and value sides meet on the output path: the
-//! [`KeyExtractor`] emits the leading key column(s) and the [`ValueExtractor`]
+//! [`KeyExtractor`] emits the leading key column(s) and the [`AggregationValue`]
 //! the trailing value column(s), and a single combinator zips them — so neither
 //! extractor has to know about the other.
 //!
@@ -22,7 +22,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::values::{ValueColumns, ValueExtractor};
+use crate::operations::unary::group::values::AggregationValue;
 
 use super::Result;
 
@@ -65,21 +65,17 @@ impl<P, Val, S: Ord> Ord for TopK<P, Val, S> {
 /// (instead of every group) lets a downstream `ORDER BY … DESC LIMIT` discard
 /// nothing it would otherwise have to materialise — at very large group counts that is the
 /// difference between emitting every group and emitting `limit` of them.
-fn top_k_rows<K, V, S>(
-    table: &Table<K, V, S>,
-    slot: usize,
-    limit: usize,
-) -> Vec<(K::Persisted, V::Value)>
+fn top_k_rows<K, V, S>(table: &Table<K, V, S>, slot: usize, limit: usize) -> Vec<(K::Persisted, V)>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     S: TableStorage<K, V>,
 {
     // Size-`limit` min-heap (via `Reverse`) keyed by the sort scalar; keeps the
     // `limit` largest entries seen.
     let mut heap = BinaryHeap::with_capacity(limit + 1);
     for entry in table.iter(0) {
-        let sort = V::sort_key(entry.value(), slot);
+        let sort = entry.value().sort_key(slot);
         if heap.len() < limit {
             heap.push(Reverse(TopK {
                 sort,
@@ -110,11 +106,11 @@ fn emit<K, V, Snd>(
 ) -> Result<()>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     Snd: Sender<RecordBatch>,
 {
     let (mut fields, mut columns) = keys.finish(arena, allocator);
-    let (value_fields, value_columns) = values.finish();
+    let (value_fields, value_columns) = V::finish_columns(values);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -134,19 +130,19 @@ fn emit_chunks<K, V, Snd, I>(
 ) -> Result<()>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     Snd: Sender<RecordBatch>,
-    I: Iterator<Item = (K::Persisted, V::Value)>,
+    I: Iterator<Item = (K::Persisted, V)>,
 {
     let mut remaining = total;
     while remaining > 0 {
         let chunk = remaining.min(OUTPUT_CHUNK_ROWS);
         let mut keys = K::Columns::with_capacity(allocator, chunk, key_config);
-        let mut values = V::Columns::with_capacity(allocator, chunk);
+        let mut values = V::new_columns(allocator, chunk);
         for _ in 0..chunk {
             let (key, value) = rows.next().expect("iterator yields `total` items");
             keys.push(&key);
-            values.push(&value);
+            value.push_to(&mut values);
         }
         emit::<K, V, Snd>(keys, values, arena, allocator, sender)?;
         remaining -= chunk;
@@ -171,7 +167,7 @@ pub(crate) fn build_and_send<K, V, S, Snd>(
 ) -> Result<()>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     S: TableStorage<K, V>,
     Snd: Sender<RecordBatch>,
 {

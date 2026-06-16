@@ -1,28 +1,44 @@
-//! Value extraction strategies for GROUP BY aggregation.
+//! Aggregation values for GROUP BY.
 //!
-//! A [`ValueExtractor`] is the value-side counterpart to a
-//! [`KeyExtractor`](super::keys::KeyExtractor): it reads the per-row aggregate
-//! value(s) from an input batch and emits the trailing value columns of the
-//! result. Splitting it from the key extractor lets any key shape pair with any
-//! aggregate shape (e.g. `COUNT(*)` or a multi-slot `SUM`) without an
-//! `O(keys × values)` explosion of monolithic extractors.
+//! An [`AggregationValue`] is the value-side counterpart to a
+//! [`KeyExtractor`](super::keys::KeyExtractor): it *is* the per-group payload
+//! stored in the hash table, and it knows how to be read from an input batch,
+//! folded with another row or partial, and emitted as the result's trailing value
+//! column(s). Any key shape pairs with any aggregation value.
+//!
+//! There are three shapes, chosen by the planner:
+//! - [`Mono<F, N, A>`](Mono) — every slot folds the same way (`F` = [`Add`]/
+//!   [`Min`]/[`Max`]); the common all-`SUM`/`COUNT` query is `Mono<Add>`. Its
+//!   [`MergeConfig`](AggregationValue::MergeConfig) is `()`, so the fold is
+//!   branch-free with nothing to carry.
+//! - [`DynamicMixed<N, A>`](DynamicMixed) — a heterogeneous signature (e.g.
+//!   `COUNT(*), MIN(x)`); folds per slot on the runtime kind, carried in its
+//!   `MergeConfig`.
+//! - [`CompiledMixed<Ops>`](CompiledMixed) — a fixed signature monomorphised over
+//!   a tuple of [`Aggregate`] ops (straight-line, no per-row dispatch).
 
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::hashtables::Value;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 
 mod accumulator;
 mod aggregate;
-mod aggregation_row;
+mod columns;
 mod compiled;
 mod distinct;
+mod dynamic;
+mod fold;
+mod mono;
+mod reader;
+mod row;
 
 pub use accumulator::Accumulator;
 pub use aggregate::{Aggregate, Count, Sum};
-pub use aggregation_row::DynamicValueExtractor;
-pub use compiled::Compiled;
-pub use distinct::DistinctValueExtractor;
+pub use compiled::CompiledMixed;
+pub use distinct::Distinct;
+pub use dynamic::DynamicMixed;
+pub use fold::{Add, Max, Min};
+pub use mono::Mono;
 
 /// Which per-group aggregate a value slot accumulates during the consume phase.
 ///
@@ -46,13 +62,8 @@ pub enum AggregationKind {
 impl AggregationKind {
     /// Combine two accumulators of this kind. The op is associative, so the same
     /// function folds a row's contribution into a group *and* merges two partial
-    /// groups: additive kinds add, the extremes take the min/max. This is the one
-    /// place the per-kind merge logic lives — `Compiled` calls it with a `const`
-    /// kind (folded away at compile time), the dynamic path with a runtime kind.
-    ///
-    /// Generic over the accumulator width so a wide (`i128`) sum combines at full
-    /// width; both `i64` and `i128` are `Copy + Ord + AddAssign` (the
-    /// [`Accumulator`](crate::operations::unary::group::values::Accumulator) bound).
+    /// groups: additive kinds add, the extremes take the min/max. Used by
+    /// [`DynamicMixed`] (per-slot) and the global aggregate operator.
     #[inline(always)]
     pub fn combine<A: Copy + Ord + std::ops::AddAssign>(self, mut a: A, b: A) -> A {
         match self {
@@ -67,11 +78,9 @@ impl AggregationKind {
 
     /// The neutral element for this kind: combining it with any value `v` yields
     /// `v`. Additive kinds start at `0`; a running `MIN` starts at the width's
-    /// maximum and a running `MAX` at its minimum. A fold seeds an accumulator
-    /// with this and then [`combine`](Self::combine)s each contribution, so the
-    /// first real value replaces the identity. (The grouped hash-table path never
-    /// needs it — a new entry stores the first row's value directly — but the
-    /// global fold over batches and the cross-worker partial merge both do.)
+    /// maximum and a running `MAX` at its minimum. The grouped hash-table path
+    /// never needs it (a new entry stores the first row's value directly), but the
+    /// global fold over batches and the cross-worker partial merge both do.
     #[inline(always)]
     pub fn identity<A: Accumulator>(self) -> A {
         match self {
@@ -97,65 +106,64 @@ impl AggregationSlot {
     }
 }
 
-/// Reads the per-row aggregate value for a GROUP BY and emits the value columns.
-pub trait ValueExtractor: Send + 'static {
-    /// The aggregation value stored alongside each key in the hash table.
-    type Value: Value + Send;
-    /// Per-batch reader holding downcast value-column accessors.
+/// The per-group value stored in a GROUP BY hash table — read from input rows,
+/// folded with other rows and partials, and emitted as the result's value columns.
+///
+/// Reading and folding are separate so a string extreme can persist lazily: a new
+/// group materialises with [`value`](Self::value), an existing group folds the
+/// next row with [`update_from_reader`](Self::update_from_reader) (which can skip
+/// persisting a row that doesn't win), and two finished partials combine with
+/// [`merge`](Self::merge) (no new materialisation). For integers all three are the
+/// same elementwise fold, so `update_from_reader` defaults to merging the row in.
+pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
+    /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
-    /// Accumulates per-group values into the result's value column(s).
-    type Columns: ValueColumns<Value = Self::Value>;
+    /// Runtime data [`merge`](Self::merge) needs that the type can't carry (the
+    /// slot kinds for [`DynamicMixed`]; `()` otherwise). Built once at `Group`
+    /// creation, like [`KeyExtractor::Config`](super::keys::KeyExtractor::Config).
+    type MergeConfig: Clone + Send + Sync + 'static;
+    /// The result value columns under construction.
+    type Columns;
     /// The scalar an `ORDER BY <slot> DESC LIMIT k` sorts on — the slot's own
-    /// accumulator type, so a wide (`i128`) sum is compared at full width with no
-    /// lossy narrowing.
+    /// width, so a wide (`i128`) sum compares at full precision.
     type SortKey: Ord + Copy;
 
-    /// Build a reader over `batch` for the configured aggregate `value_slots`.
-    fn make_reader<'b>(batch: &'b RecordBatch, value_slots: &[AggregationSlot])
-    -> Self::Reader<'b>;
+    /// Build the [`MergeConfig`](Self::MergeConfig) for these `slots`, once, at
+    /// `Group` creation. Homogeneous/compiled values need nothing (`()`); the
+    /// dynamic one keeps the slot kinds.
+    fn merge_config(slots: &[AggregationSlot]) -> Self::MergeConfig;
 
-    /// Build the per-row aggregate value at row `idx`.
-    fn value(reader: &Self::Reader<'_>, idx: usize) -> Self::Value;
+    /// Bind `batch`'s value columns for the configured `slots`.
+    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
 
-    /// Combine two group accumulators, kind-aware: additive slots add, MIN/MAX
-    /// slots take the extreme. `slots` carries the per-slot kinds for the runtime
-    /// path; [`Compiled`] ignores it (its ops are static). Used as the merge fold
-    /// (consume + partition merge) **only when a MIN/MAX slot is present** — see
-    /// [`is_additive`](Self::is_additive); the all-additive case uses the cheaper
-    /// [`add`](Self::add) instead.
-    fn merge(a: Self::Value, b: Self::Value, slots: &[AggregationSlot]) -> Self::Value;
+    /// Materialise a brand-new group from row `idx` — the consume path's new-key
+    /// case, and the radix scatter.
+    fn value(reader: &Self::Reader<'_>, idx: usize) -> Self;
 
-    /// The blind elementwise-additive fold — the fast path for the (overwhelmingly
-    /// common) all-`SUM`/`COUNT` query. It needs no per-slot kind dispatch and
-    /// captures nothing, so the hot merge loop is byte-identical to a pure-count
-    /// or pure-sum aggregation. The caller selects it over [`merge`](Self::merge)
-    /// via [`is_additive`](Self::is_additive). (For MIN/MAX-free signatures it is
-    /// numerically equal to `merge`, just without the dispatch.)
-    fn add(a: Self::Value, b: Self::Value) -> Self::Value;
+    /// Fold row `idx` into this (existing) group. Defaults to merging the row's
+    /// [`value`](Self::value) in; a string extreme overrides it to read the cell
+    /// lazily and persist only when it beats the current extreme.
+    #[inline(always)]
+    fn update_from_reader(
+        self,
+        reader: &Self::Reader<'_>,
+        idx: usize,
+        cfg: &Self::MergeConfig,
+    ) -> Self {
+        self.merge(Self::value(reader, idx), cfg)
+    }
 
-    /// Whether every slot folds additively (no MIN/MAX), so [`add`](Self::add) is
-    /// a sound, cheaper substitute for [`merge`](Self::merge) for these `slots`.
-    /// Evaluated once per consume batch / partition merge (out of the hot loop).
-    fn is_additive(slots: &[AggregationSlot]) -> bool;
+    /// Combine two partial group values — the partition merge and the radix fold.
+    fn merge(self, other: Self, cfg: &Self::MergeConfig) -> Self;
 
-    /// The value an `ORDER BY <slot> DESC LIMIT k` sorts on, pulled from an
-    /// otherwise-opaque [`Value`]. Used only when the group feeds a top-k.
-    fn sort_key(value: &Self::Value, slot: usize) -> Self::SortKey;
-}
+    /// This group's value for slot `slot`, as an `ORDER BY` sort key.
+    fn sort_key(&self, slot: usize) -> Self::SortKey;
 
-/// Builds the trailing value column(s) of a GROUP BY result, one group at a time.
-///
-/// The value-side analog of
-/// [`KeyColumns`](super::keys::KeyColumns): the output combinator
-/// pushes each surviving group's value, then `finish` materialises the Arrow
-/// columns and their fields.
-pub trait ValueColumns {
-    type Value;
-
-    /// Allocate column builders over engine memory, sized for `rows` (one
-    /// output chunk; must fit a single 2MB slab — callers chunk to
-    /// `RECORD_BATCH_SIZE`).
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self;
-    fn push(&mut self, value: &Self::Value);
-    fn finish(self) -> (Vec<Field>, Vec<ArrayRef>);
+    /// Allocate the result value columns over engine memory, sized for `rows`
+    /// (one output chunk; must fit a single 2 MB slab).
+    fn new_columns(allocator: &mut SlabAllocator, rows: usize) -> Self::Columns;
+    /// Append this group to the columns.
+    fn push_to(&self, cols: &mut Self::Columns);
+    /// Materialise the columns and their fields.
+    fn finish_columns(cols: Self::Columns) -> (Vec<Field>, Vec<ArrayRef>);
 }

@@ -4,8 +4,8 @@
 //! bits in the high 64, second's in the low 64),
 //! which is `Copy`/`Hash`/`Eq` and needs no arena. The aggregate value is the
 //! separate concern of a
-//! [`ValueExtractor`](crate::operations::unary::group::values::ValueExtractor)
-//! (typically [`DynamicValueExtractor`](crate::operations::unary::group::values::DynamicValueExtractor)).
+//! [`AggregationValue`](crate::operations::unary::group::values::AggregationValue)
+//! (typically [`DynamicMixed`](crate::operations::unary::group::values::DynamicMixed)).
 
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;

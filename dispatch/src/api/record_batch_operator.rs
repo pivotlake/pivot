@@ -57,10 +57,10 @@ use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::{
-    Accumulator, AggregateFactory, AggregationKind, AggregationSlot, Compiled, CopyOutFactory,
-    Count, CountFactory, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory,
-    NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory,
-    UnaryOperator, UnaryOperatorFactory, ValueExtractor,
+    Accumulator, AggregateFactory, AggregationKind, AggregationSlot, AggregationValue,
+    CompiledMixed, CopyOutFactory, Count, CountFactory, Distinct, DynamicFilterSlot, FilterFactory,
+    GroupFactory, KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    OrderByLimitFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -547,7 +547,7 @@ impl RecordBatchOperatorSpec {
     /// ```
     pub fn group_by_count<K: KeyExtractor<Config: Default>>(self, group_column: usize) -> Self {
         // `COUNT(*)` is one aggregate slot whose column is unused.
-        self.group_by_aggregate::<K, Compiled<(Count,)>>(
+        self.group_by_aggregate::<K, CompiledMixed<(Count,), 1>>(
             vec![group_column],
             vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
             None,
@@ -559,11 +559,7 @@ impl RecordBatchOperatorSpec {
     /// stage of `COUNT(DISTINCT x)`: the per-entry value is zero-sized, so the
     /// hash-table entry is just hash + key.
     pub fn group_by_distinct<K: KeyExtractor<Config: Default>>(self, key_cols: Vec<usize>) -> Self {
-        self.group_by_aggregate::<K, crate::operations::DistinctValueExtractor>(
-            key_cols,
-            Vec::new(),
-            None,
-        )
+        self.group_by_aggregate::<K, Distinct>(key_cols, Vec::new(), None)
     }
 
     /// Global `COUNT(DISTINCT x)`: GROUP BY `key_cols` with no aggregate, emitting
@@ -578,23 +574,21 @@ impl RecordBatchOperatorSpec {
     ) -> Self {
         let worker_count = self.worker_count();
         let buffers = self.dispatcher.buffers;
-        self.unary(
-            GroupFactory::<K, crate::operations::DistinctValueExtractor>::create_for_workers(
-                key_cols,
-                Vec::new(),
-                K::Config::default(),
-                None,
-                true,
-                worker_count,
-                buffers,
-            ),
-        )
+        self.unary(GroupFactory::<K, Distinct>::create_for_workers(
+            key_cols,
+            Vec::new(),
+            K::Config::default(),
+            None,
+            true,
+            worker_count,
+            buffers,
+        ))
     }
 
     /// GROUP BY one or more key columns computing one or more aggregate value
     /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key
     /// shape, `V` the aggregate shape (e.g. its arity).
-    pub fn group_by_aggregate<K: KeyExtractor<Config: Default>, V: ValueExtractor>(
+    pub fn group_by_aggregate<K: KeyExtractor<Config: Default>, V: AggregationValue>(
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
@@ -607,7 +601,7 @@ impl RecordBatchOperatorSpec {
     /// extractor configuration (e.g. a [`RowKeySchema`](crate::RowKeySchema)).
     /// Extractors whose key shape is fully determined by their type use the
     /// config-free form above.
-    pub fn group_by_aggregate_config<K: KeyExtractor, V: ValueExtractor>(
+    pub fn group_by_aggregate_config<K: KeyExtractor, V: AggregationValue>(
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,

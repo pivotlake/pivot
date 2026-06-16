@@ -1,85 +1,56 @@
-//! Keys-only GROUP BY value extractor (DISTINCT / count-distinct dedup).
+//! [`Distinct`] — the keys-only aggregation value (DISTINCT / count-distinct dedup).
 //!
-//! A [`ValueExtractor`] that carries no aggregate: the per-entry value is a
-//! zero-sized type, so a hash-table `Entry` shrinks to just hash + key (e.g.
-//! 24→16 bytes for an `Int64` key, 48→32 for a `u128` pair key). That is one
-//! third less memory to write, zero, and merge per group — which matters for
-//! high-cardinality grouping where the table build and the page-zeroing of its
-//! slabs dominate.
-//!
-//! Used for the dedup stage of `COUNT(DISTINCT x)` (and, in future, `SELECT
-//! DISTINCT`): only the *set* of distinct keys matters, no per-group
-//! accumulator. Emits no value columns — the output is the key column(s) alone.
+//! A zero-sized value: a hash-table `Entry` shrinks to just hash + key (e.g.
+//! 24→16 bytes for an `Int64` key), which is a third less memory to write, zero,
+//! and merge per group — and that build cost dominates high-cardinality grouping.
+//! Used for the dedup stage of `COUNT(DISTINCT x)` (and, later, `SELECT DISTINCT`):
+//! only the *set* of distinct keys matters, so it emits no value columns.
 
+use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::hashtables::Value;
-use crate::operations::unary::group::values::{AggregationSlot, ValueColumns, ValueExtractor};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 
-/// Zero-sized per-entry value: distinctness needs no accumulator, so merging two
-/// occurrences of the same key is a no-op.
-#[derive(Copy, Clone, Default)]
-pub struct DistinctValue;
+/// Zero-sized keys-only value: distinctness needs no accumulator, so merging two
+/// occurrences of the same key is a no-op and the result has no value columns.
+#[derive(Clone, Copy, Default)]
+pub struct Distinct;
 
-impl Value for DistinctValue {}
-
-/// A [`ValueExtractor`] that stores nothing per group and emits no value
-/// columns — the group's output is its key column(s) only.
-pub struct DistinctValueExtractor;
-
-impl ValueExtractor for DistinctValueExtractor {
-    type Value = DistinctValue;
+impl AggregationValue for Distinct {
     type Reader<'b> = ();
-    type Columns = DistinctValueColumns;
+    type MergeConfig = ();
+    type Columns = ();
     type SortKey = i64;
 
     #[inline(always)]
-    fn make_reader(_batch: &RecordBatch, _value_slots: &[AggregationSlot]) {}
+    fn merge_config(_slots: &[AggregationSlot]) {}
 
     #[inline(always)]
-    fn value(_reader: &(), _idx: usize) -> DistinctValue {
-        DistinctValue
+    fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
+
+    #[inline(always)]
+    fn value(_reader: &(), _idx: usize) -> Self {
+        Distinct
     }
 
     #[inline(always)]
-    fn merge(a: DistinctValue, _b: DistinctValue, _slots: &[AggregationSlot]) -> DistinctValue {
+    fn merge(self, _other: Self, _cfg: &()) -> Self {
         // No accumulator — both sides are the same (distinct) key.
-        a
+        self
     }
 
     #[inline(always)]
-    fn add(a: DistinctValue, _b: DistinctValue) -> DistinctValue {
-        a
-    }
-
-    #[inline(always)]
-    fn is_additive(_slots: &[AggregationSlot]) -> bool {
-        // No accumulator to take an extreme of — the additive (no-op) path fits.
-        true
-    }
-
-    #[inline(always)]
-    fn sort_key(_value: &DistinctValue, _slot: usize) -> i64 {
+    fn sort_key(&self, _slot: usize) -> i64 {
         // A keys-only group never feeds an ORDER BY <agg> top-k.
         0
     }
-}
 
-/// The value-side of a keys-only group: contributes no columns to the output.
-pub struct DistinctValueColumns;
-
-impl ValueColumns for DistinctValueColumns {
-    type Value = DistinctValue;
-
-    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
-        DistinctValueColumns
-    }
+    fn new_columns(_allocator: &mut SlabAllocator, _rows: usize) {}
 
     #[inline(always)]
-    fn push(&mut self, _value: &DistinctValue) {}
+    fn push_to(&self, _cols: &mut ()) {}
 
-    fn finish(self) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish_columns(_cols: ()) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
     }
 }

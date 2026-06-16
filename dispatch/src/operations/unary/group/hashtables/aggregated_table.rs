@@ -26,7 +26,7 @@ use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::values::AggregationSlot;
@@ -62,21 +62,17 @@ impl RadixConfig {
 }
 
 /// One scattered row: `(hash, persisted key, per-row value contribution)`.
-pub type RadixRow<K, V> = (
-    u64,
-    <K as KeyExtractor>::Persisted,
-    <V as ValueExtractor>::Value,
-);
+pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, V);
 
 /// A worker's scatter output: one engine-backed buffer of raw rows per partition.
-pub struct PartitionBuffers<K: KeyExtractor, V: ValueExtractor>(pub Vec<SlabVec<RadixRow<K, V>>>);
-unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionBuffers<K, V> {}
+pub struct PartitionBuffers<K: KeyExtractor, V: AggregationValue>(pub Vec<SlabVec<RadixRow<K, V>>>);
+unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionBuffers<K, V> {}
 
 /// What a worker hands the merge phase: its in-place stack (always), the radix
 /// scatter buffers (only if it switched), and its distinct-count sketch. The
 /// merge slot-range-combines the stack and the buffers by the same top hash bits,
 /// so a switched worker's pre-switch stack needs no pre-fold into the buffers.
-pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
+pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue> {
     /// In-place table stack: the full result if the worker never switched,
     /// otherwise its pre-switch tables.
     pub tables: Vec<MultiSlabTable<K, V>>,
@@ -92,7 +88,7 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
 /// Per-worker aggregation state for the adaptive in-place → radix consume
 /// strategy (see the module docs). Holds the in-place table stack and, after a
 /// switch, the per-partition scatter buffers plus a distinct-count sketch.
-pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
+pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     hash_state: RandomState,
     worker_arena: WorkerArena,
     allocator: SlabAllocator,
@@ -119,7 +115,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     zero_hash_seen: bool,
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     pub fn new(state: RandomState, shared_arena: Arc<SharedArena>, radix: RadixConfig) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::multi_slab(&mut allocator, DEFAULT_CAPACITY, 0);
@@ -153,16 +149,23 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
+        merge_config: &V::MergeConfig,
     ) {
         let total = batch.num_rows();
         if total <= RECORD_BATCH_SIZE {
-            self.consume_window(batch, key_cols, value_slots, key_config);
+            self.consume_window(batch, key_cols, value_slots, key_config, merge_config);
             return;
         }
         let mut start = 0;
         while start < total {
             let len = (total - start).min(RECORD_BATCH_SIZE);
-            self.consume_window(&batch.slice(start, len), key_cols, value_slots, key_config);
+            self.consume_window(
+                &batch.slice(start, len),
+                key_cols,
+                value_slots,
+                key_config,
+                merge_config,
+            );
             start += len;
         }
     }
@@ -173,6 +176,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
+        merge_config: &V::MergeConfig,
     ) {
         let length = batch.num_rows();
         debug_assert!(
@@ -202,15 +206,10 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
 
             if self.switched_to_radix {
                 self.scatter_range(0, length, &key_reader, &value_reader);
-            } else if V::is_additive(value_slots) {
-                // Common case (all SUM/COUNT): a capture-free blind additive fold,
-                // so the probe loop is byte-identical to a pure-count aggregation.
-                self.consume_scalared(length, &key_reader, &value_reader, |a, b| V::add(a, b));
             } else {
-                // A MIN/MAX slot is present: fold kind-aware (reads slots per slot).
-                self.consume_scalared(length, &key_reader, &value_reader, |a, b| {
-                    V::merge(a, b, value_slots)
-                });
+                // The value type fixes the fold (Mono is branch-free, DynamicMixed
+                // dispatches per slot via `merge_config`); the probe just consumes.
+                self.consume_scalared(length, &key_reader, &value_reader, merge_config);
             }
         }
         self.scratch = scratch;
@@ -221,12 +220,12 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     /// two-level software prefetch (DRAM→L2 far, L2→L1 near) hides the per-row
     /// probe latency on the large in-place tables this path handles.
     #[inline(always)]
-    fn consume_scalared<'b, C: Fn(V::Value, V::Value) -> V::Value + Copy>(
+    fn consume_scalared<'b>(
         &mut self,
         length: usize,
         key_reader: &K::Reader<'b>,
         value_reader: &V::Reader<'b>,
-        combine: C,
+        merge_config: &V::MergeConfig,
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
@@ -252,8 +251,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                     table.prefetch(self.hashes[i + L1_DISTANCE]);
                 }
                 let key = K::live_key(key_reader, i, &mut self.worker_arena);
-                let value = V::value(value_reader, i);
-                table.merge::<false, _, _>(hash, key, value, combine);
+                table.consume::<false, _>(hash, key, value_reader, i, merge_config);
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
