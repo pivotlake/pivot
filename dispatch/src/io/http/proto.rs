@@ -1,13 +1,11 @@
-//! Object-store range-read **policy** over the sans-IO HTTP/1.1 core
+//! Object-store range-read **policy** over the sans-IO HTTP/1.1 helpers
 //! ([`super::http1`]).
 //!
-//! The core is general (any method, any status, any body framing); this layer
-//! pins it to what the cache's remote reads require: a `Range` GET, a `206
-//! Partial Content` response, and an identity body no larger than the requested
-//! range (so it lands exactly in the destination slot). Keeping this policy out
-//! of the core means the core stays reusable for future `PUT`s, non-`206`
-//! responses, and chunked bodies — and that both platform backends share
-//! identical, socket-free, unit-testable logic.
+//! `http1` parses a response head and tracks an identity body; this layer adds
+//! the range-read policy on top: build the `Range` GET, and accept only a `206
+//! Partial Content` response whose `Content-Length` body fits the requested slot.
+//! Keeping the policy here (rather than in `http1`) means both platform backends
+//! share identical, socket-free, unit-testable logic.
 
 use super::http1;
 use thiserror::Error;
@@ -79,7 +77,9 @@ pub fn parse_response_head(buf: &[u8], requested_len: usize) -> Result<HeadParse
     // A range response is always identity-framed (we send `Accept-Encoding:
     // identity` and don't request multipart), so it must carry a Content-Length
     // — the body size we land in the slot.
-    let content_length = head.content_length.ok_or(ProtoError::MissingContentLength)?;
+    let content_length = head
+        .content_length
+        .ok_or(ProtoError::MissingContentLength)?;
 
     if content_length > requested_len as u64 {
         return Err(ProtoError::BodyTooLarge {
