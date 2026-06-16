@@ -382,26 +382,47 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     ///
     /// A new entry just stores the value; an existing one folds via the value's
     /// own [`merge`](AggregationValue::merge) (so two finished partials combine —
-    /// the partition-merge and radix paths). For folding *rows* into a group, use
-    /// [`consume`](Self::consume), which never materialises a value for a row that
-    /// loses.
+    /// the partition-merge and radix paths). For folding input *rows* into a group
+    /// the consume path uses [`probe_insert`](Self::probe_insert) +
+    /// [`value_mut`](Self::value_mut) instead, so a string extreme can persist a
+    /// row lazily; here the value is already materialised, so this fuses the probe
+    /// and the fold into one pass (no separate slot re-index).
     #[inline(always)]
     pub fn merge<const COUNT_COLLISIONS: bool, L>(
         &mut self,
-        hash: u64,
+        mut hash: u64,
         key: L,
         value: V,
         cfg: &V::MergeConfig,
     ) where
         L: LiveKey<Persisted = K>,
     {
-        let (idx, is_new) = self.probe_insert::<COUNT_COLLISIONS, L>(hash, key);
-        let entry = &mut self.buffer[idx];
-        entry.value = if is_new {
-            value
-        } else {
-            entry.value.merge(value, cfg)
-        };
+        // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
+        if hash == 0 {
+            hash = 1;
+        }
+        let mut idx = self.slot_for(hash);
+        loop {
+            let entry = &mut self.buffer[idx];
+            if entry.hash == 0 {
+                let persisted = key.persist();
+                self.buffer[idx] = Entry {
+                    hash,
+                    value,
+                    key: persisted,
+                };
+                self.length += 1;
+                return;
+            }
+            if entry.hash == hash && key.eq_persisted(&entry.key) {
+                entry.value = entry.value.merge(value, cfg);
+                return;
+            }
+            if COUNT_COLLISIONS {
+                self.collisions += 1;
+            }
+            idx = (idx + 1) & self.mask;
+        }
     }
 
     /// Probe for `hash`/`key`, inserting the (persisted) key at the first empty
