@@ -6,17 +6,14 @@
 //! partials, and emitted as the result's trailing value column(s). Any key shape
 //! pairs with any aggregation value.
 //!
-//! It is built from two orthogonal axes and three containers:
+//! It is built from one trait and two containers:
 //!
-//! - **[`read`]** — what a slot pulls from a row ([`One`](read::One) /
-//!   [`Col<T>`](read::Col) / [`Str`](read::Str)).
-//! - **[`fold`]** — how cells combine and render ([`Add`](fold::Add) /
-//!   [`Min`](fold::Min) / [`Max`](fold::Max) / [`StrMin`](fold::StrMin) /
-//!   [`StrMax`](fold::StrMax)).
-//! - an **[`op`] atom** = a read paired with a fold ([`Op<R, F, A>`](op::Op);
-//!   aliases [`Count`](op::Count), [`Sum<T>`](op::Sum), …).
-//! - **containers** ([`Mono`](container::Mono) / [`Compiled`](container::Compiled)
-//!   / [`Dynamic`](container::Dynamic)) — three ways to assemble `N` slots.
+//! - an **[`Aggregation`]** op — fully typed to its own input array and cell
+//!   ([`Count`], [`Sum<T>`](Sum), [`Min<T>`](Min), [`Max<T>`](Max), [`StrMin`],
+//!   [`StrMax`]).
+//! - **containers** — [`Compiled`](container::Compiled) (a fixed tuple of ops,
+//!   any mix, branch-free) and [`Dynamic`](container::Dynamic) (a runtime numeric
+//!   signature folded per slot, generic over the width).
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
@@ -24,29 +21,20 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
 
+pub mod aggregation;
 pub mod cell;
 pub mod container;
 pub mod distinct;
-pub mod fold;
-pub mod op;
-pub mod read;
 
-pub use cell::{Cell, NumericCell};
-pub use container::{Compiled, Dynamic, Mono, OpTuple};
+pub use aggregation::{Aggregation, Count, Max, Min, StrMax, StrMin, Sum, WideSum};
+pub use cell::{Cell, Numeric, NumericArrow};
+pub use container::{Compiled, Dynamic, OpTuple};
 pub use distinct::Distinct;
-pub use fold::{Add, Max, Min, StrMax, StrMin};
-pub use op::{Aggregate, Op};
-// Op atoms, suffixed where they would clash with the same-named fold (the planner
-// uses the folds for `Mono`, the atoms for `Compiled`).
-pub use op::{
-    Count, Max as MaxOp, Min as MinOp, StrMax as StrMaxOp, StrMin as StrMinOp, Sum, WideSum,
-};
 
 /// Which per-group aggregate a value slot computes during consume — a pure
-/// descriptor the planner attaches to each slot. It tells [`SlotReader`](read::SlotReader)
-/// what to read (a `COUNT` reads no column; everything else reads its column,
-/// numeric or string by the column's type) and the numeric [`Dynamic`](container::Dynamic)
-/// fallback how to fold.
+/// descriptor the planner attaches to each slot. It tells the numeric
+/// [`Dynamic`](container::Dynamic) fallback what to read (a `COUNT` reads no
+/// column; everything else reads its column) and how to fold.
 ///
 /// `Avg` is not represented: `AVG(c)` is lowered to `sum(c)` + `count(c)` with a
 /// divide projection, so a grouped average arrives as a `Sum` slot plus a `Count`
@@ -66,33 +54,18 @@ pub enum AggregationKind {
 }
 
 impl AggregationKind {
-    /// Combine two numeric cells of this kind. Associative, so it folds a row's
-    /// contribution into a group *and* merges two partial groups: additive kinds
-    /// add, the extremes take the min/max. Used by [`Dynamic`](container::Dynamic)
-    /// (per slot) and the global aggregate operator.
+    /// Combine two numeric cells of this kind, with plain std ops. Associative,
+    /// so it folds a row's contribution into a group *and* merges two partial
+    /// groups: additive kinds add, the extremes take the min/max. Used by
+    /// [`Dynamic`](container::Dynamic) (per slot) and the global aggregate.
     #[inline(always)]
-    pub fn combine<A: NumericCell>(self, acc: A, incoming: A) -> A {
+    pub fn combine<A: Numeric>(self, acc: A, incoming: A) -> A {
         match self {
             AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum => {
-                acc.add(incoming)
+                acc + incoming
             }
-            AggregationKind::Min => acc.min(incoming),
-            AggregationKind::Max => acc.max(incoming),
-        }
-    }
-
-    /// The neutral seed for this kind: additive kinds start at `0`, a running
-    /// `MIN` at the width's `MAX`, a running `MAX` at its `MIN`. Only the global
-    /// aggregate needs it (it folds from nothing); the grouped path stores a new
-    /// group's first row directly.
-    #[inline(always)]
-    pub fn identity<A: NumericCell>(self) -> A {
-        match self {
-            AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum => {
-                A::default()
-            }
-            AggregationKind::Min => A::MAX,
-            AggregationKind::Max => A::MIN,
+            AggregationKind::Min => Ord::min(acc, incoming),
+            AggregationKind::Max => Ord::max(acc, incoming),
         }
     }
 }

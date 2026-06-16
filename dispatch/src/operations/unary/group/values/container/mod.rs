@@ -1,16 +1,13 @@
-//! The three [`AggregationValue`](super::AggregationValue) containers, each a way
-//! of composing the [`read`](super::read) × [`fold`](super::fold) axes:
+//! The two [`AggregationValue`](super::AggregationValue) containers built on the
+//! [`Aggregation`](super::aggregation::Aggregation) ops:
 //!
-//! - [`Mono`] — one fold, per-slot read; the homogeneous fast path (and string
-//!   `MIN`/`MAX`).
-//! - [`Compiled`] — a tuple of whole [`Op`](super::op::Op) atoms; branch-free, any
-//!   mix (including string + numeric).
-//! - [`Dynamic`] — runtime per-slot kind dispatch; the numeric fallback.
+//! - [`Compiled`] — a fixed tuple of ops; branch-free, any mix (numeric and/or
+//!   string), each slot reading its own typed array.
+//! - [`Dynamic`] — a runtime numeric signature folded per-slot by kind, generic
+//!   over the accumulator width.
 
 mod compiled;
 mod dynamic;
-mod mono;
 
 pub use compiled::{Compiled, OpTuple};
 pub use dynamic::Dynamic;
-pub use mono::Mono;

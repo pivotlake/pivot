@@ -22,7 +22,7 @@
 //! and a `Count` slot.
 
 use crate::operations::channels::Sender;
-use crate::operations::unary::group::{AggregationKind, AggregationSlot, NumericCell};
+use crate::operations::unary::group::{AggregationKind, AggregationSlot, Numeric};
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
@@ -38,13 +38,13 @@ use std::sync::mpsc;
 /// flow to a single collector (the same wiring as [`OrderByLimitFactory`]).
 ///
 /// [`OrderByLimitFactory`]: super::order_by_limit
-pub struct AggregateFactory<A: NumericCell> {
+pub struct AggregateFactory<A: Numeric> {
     slots: Arc<Vec<AggregationSlot>>,
-    sender: mpsc::Sender<Vec<A>>,
-    receiver: Option<mpsc::Receiver<Vec<A>>>,
+    sender: mpsc::Sender<Vec<Option<A>>>,
+    receiver: Option<mpsc::Receiver<Vec<Option<A>>>>,
 }
 
-impl<A: NumericCell> AggregateFactory<A> {
+impl<A: Numeric> AggregateFactory<A> {
     /// Create one factory per worker, all sharing the same partials channel.
     pub fn create_for_workers(
         slots: Vec<AggregationSlot>,
@@ -62,7 +62,7 @@ impl<A: NumericCell> AggregateFactory<A> {
     }
 }
 
-impl<A: NumericCell> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
+impl<A: Numeric> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate<A>>;
 
     fn build_unary(mut self) -> Self::Unary {
@@ -76,22 +76,23 @@ impl<A: NumericCell> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory
 
 /// Per-worker aggregate consumer. Accumulates local partials, then sends them
 /// down the shared channel on finalization.
-pub struct Aggregate<A: NumericCell> {
+pub struct Aggregate<A: Numeric> {
     slots: Arc<Vec<AggregationSlot>>,
-    local: Vec<A>,
-    sender: mpsc::Sender<Vec<A>>,
-    receiver: Option<mpsc::Receiver<Vec<A>>>,
+    local: Vec<Option<A>>,
+    sender: mpsc::Sender<Vec<Option<A>>>,
+    receiver: Option<mpsc::Receiver<Vec<Option<A>>>>,
 }
 
-impl<A: NumericCell> Aggregate<A> {
+impl<A: Numeric> Aggregate<A> {
     fn new(
         slots: Arc<Vec<AggregationSlot>>,
-        sender: mpsc::Sender<Vec<A>>,
-        receiver: Option<mpsc::Receiver<Vec<A>>>,
+        sender: mpsc::Sender<Vec<Option<A>>>,
+        receiver: Option<mpsc::Receiver<Vec<Option<A>>>>,
     ) -> Self {
-        // Seed each slot with its kind's identity (0 for SUM/COUNT, the width's
-        // extreme for MIN/MAX) so the first contribution combines cleanly.
-        let local = slots.iter().map(|s| s.kind.identity::<A>()).collect();
+        // No identity seed — each slot takes its first contribution (`None` until
+        // a row is seen), so an aggregate over zero rows is a SQL `NULL` rather
+        // than a fabricated `0`/bound, and `MIN`/`MAX` need no width extreme.
+        let local = vec![None; slots.len()];
         Aggregate {
             slots,
             local,
@@ -101,21 +102,28 @@ impl<A: NumericCell> Aggregate<A> {
     }
 }
 
-/// Reduce one batch's integer column to a single partial of `kind` (`SUM`,
-/// `MIN` or `MAX`) in the accumulator width `A`.
-///
-/// `SUM`/`MIN`/`MAX` read the column identically (the widened value); only the
-/// fold differs ([`AggregationKind::combine`]). The fold accumulates into `A`:
-/// `i64` suffices for 16/32-bit sums (a full scan can't overflow it) and for
-/// every `MIN`/`MAX` (an extreme never grows past its inputs); `u128` carries a
-/// 64-bit `SUM`, the width the planner picks.
-fn reduce_column<A: NumericCell>(kind: AggregationKind, arr: &dyn Array) -> A {
+/// Fold a fresh contribution into a running (possibly empty) accumulator —
+/// take-first: the first value seeds, the rest fold via the kind's combine.
+#[inline(always)]
+fn fold_in<A: Numeric>(kind: AggregationKind, acc: Option<A>, c: Option<A>) -> Option<A> {
+    match (acc, c) {
+        (Some(a), Some(b)) => Some(kind.combine(a, b)),
+        (Some(a), None) => Some(a),
+        (None, c) => c,
+    }
+}
+
+/// Reduce one batch's integer column to a partial of `kind` (`SUM`/`MIN`/`MAX`),
+/// or `None` if the column is empty. `SUM`/`MIN`/`MAX` read the column identically
+/// (the widened value); only the fold differs ([`AggregationKind::combine`]).
+fn reduce_column<A: Numeric>(kind: AggregationKind, arr: &dyn Array) -> Option<A> {
     macro_rules! reduce_primitive {
         ($ty:ty) => {{
             let a = arr.as_primitive::<$ty>();
-            let mut acc = kind.identity::<A>();
+            let mut acc: Option<A> = None;
             for i in 0..a.len() {
-                acc = kind.combine(acc, A::from_i64(unsafe { a.value_unchecked(i) } as i64));
+                let v = A::from(unsafe { a.value_unchecked(i) } as i64);
+                acc = fold_in(kind, acc, Some(v));
             }
             acc
         }};
@@ -130,10 +138,12 @@ fn reduce_column<A: NumericCell>(kind: AggregationKind, arr: &dyn Array) -> A {
 }
 
 /// Build the single output column for one aggregate slot from its accumulator.
-fn result_column<A: NumericCell>(kind: AggregationKind, value: A) -> (Field, ArrayRef) {
+/// `None` means zero rows were aggregated: a SQL `NULL` for `SUM`/`MIN`/`MAX`,
+/// `0` for `COUNT`.
+fn result_column<A: Numeric>(kind: AggregationKind, total: Option<A>) -> (Field, ArrayRef) {
     match kind {
-        // `Int64` or `Decimal128(38, 0)` per the accumulator width. `MIN`/`MAX`
-        // emit at the same accumulator width as `SUM` (an integer extreme).
+        // `Int64` or `Decimal128(38, 0)` per the accumulator width; nullable, so
+        // an empty input emits `NULL` (DuckDB's `SUM`/`MIN`/`MAX` of nothing).
         AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
             let name = match kind {
                 AggregationKind::Min => "min",
@@ -141,14 +151,16 @@ fn result_column<A: NumericCell>(kind: AggregationKind, value: A) -> (Field, Arr
                 _ => "sum",
             };
             (
-                Field::new(name, A::data_type(), false),
-                A::scalar_array(value),
+                Field::new(name, A::data_type(), true),
+                A::scalar_array(total),
             )
         }
-        // A count can't exceed the row count, so it always fits i64; the checked
+        // A count is `0` over zero rows (never NULL) and fits i64; the checked
         // narrowing panics on the impossible overflow rather than truncating.
         AggregationKind::Count | AggregationKind::CountStar => {
-            let count = i64::try_from(value.to_i128()).expect("count exceeds i64::MAX");
+            let count = total
+                .map(|v| i64::try_from(v.into()).expect("count exceeds i64::MAX"))
+                .unwrap_or(0);
             (
                 Field::new("count", DataType::Int64, false),
                 Arc::new(Int64Array::from(vec![count])),
@@ -157,7 +169,7 @@ fn result_column<A: NumericCell>(kind: AggregationKind, value: A) -> (Field, Arr
     }
 }
 
-impl<A: NumericCell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
+impl<A: Numeric> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
     type Outputter = AggregateOutputter<A>;
 
     fn consume<OP: Sender<RecordBatch>>(
@@ -166,23 +178,23 @@ impl<A: NumericCell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
         _output: &mut OP,
     ) -> unary::Result<()> {
         for (i, slot) in self.slots.iter().enumerate() {
-            // This batch's partial for the slot, then folded into the running
-            // local with the kind's combine (add for SUM/COUNT, extreme for
-            // MIN/MAX) — additive kinds reduce to the old `+=`.
+            // This batch's partial for the slot (`None` if it contributes
+            // nothing — an empty SUM/MIN/MAX column), folded into the running
+            // local by take-first.
             let contribution = match slot.kind {
                 // COUNT(*) counts every row and never reads a column.
-                AggregationKind::CountStar => A::from_i64(batch.num_rows() as i64),
+                AggregationKind::CountStar => Some(A::from(batch.num_rows() as i64)),
                 // COUNT(c) needs only the non-null count, not the values — read
                 // it straight off the null bitmap instead of summing the column.
                 AggregationKind::Count => {
                     let col = batch.column(slot.column);
-                    A::from_i64((col.len() - col.null_count()) as i64)
+                    Some(A::from((col.len() - col.null_count()) as i64))
                 }
                 AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
                     reduce_column::<A>(slot.kind, batch.column(slot.column))
                 }
             };
-            self.local[i] = slot.kind.combine(self.local[i], contribution);
+            self.local[i] = fold_in(slot.kind, self.local[i], contribution);
         }
         Ok(())
     }
@@ -197,7 +209,7 @@ impl<A: NumericCell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
             .expect("aggregate collector dropped");
         worker_waker().notify();
 
-        let totals = self.slots.iter().map(|s| s.kind.identity::<A>()).collect();
+        let totals = vec![None; self.slots.len()];
         Ok(self.receiver.map(|rx| AggregateOutputter {
             rx,
             slots: self.slots,
@@ -208,13 +220,13 @@ impl<A: NumericCell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
 
 /// Output phase (one worker only): drains every sibling's partials from the
 /// channel, sums them, then emits the single-row result.
-pub struct AggregateOutputter<A: NumericCell> {
-    rx: mpsc::Receiver<Vec<A>>,
+pub struct AggregateOutputter<A: Numeric> {
+    rx: mpsc::Receiver<Vec<Option<A>>>,
     slots: Arc<Vec<AggregationSlot>>,
-    totals: Vec<A>,
+    totals: Vec<Option<A>>,
 }
 
-impl<A: NumericCell> Outputter<RecordBatch> for AggregateOutputter<A> {
+impl<A: Numeric> Outputter<RecordBatch> for AggregateOutputter<A> {
     fn output<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
         loop {
             match self.rx.try_recv() {
@@ -222,7 +234,7 @@ impl<A: NumericCell> Outputter<RecordBatch> for AggregateOutputter<A> {
                     // Fold each worker's partial with the slot's kind-aware
                     // combine — additive for SUM/COUNT, the extreme for MIN/MAX.
                     for (i, p) in partial.iter().enumerate() {
-                        self.totals[i] = self.slots[i].kind.combine(self.totals[i], *p);
+                        self.totals[i] = fold_in(self.slots[i].kind, self.totals[i], *p);
                     }
                 }
                 // Some siblings haven't finished yet; resume when re-driven.
@@ -261,7 +273,7 @@ mod tests {
 
     /// Build `n` channel-wired aggregate consumers sharing one partials channel
     /// (the first holds the receiver), mirroring the factory's wiring.
-    fn build<A: NumericCell>(n: usize, slots: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
+    fn build<A: Numeric>(n: usize, slots: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
         let slots = Arc::new(slots);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
@@ -339,7 +351,7 @@ mod tests {
             ]))],
         )
         .unwrap();
-        let ops = build::<u128>(1, vec![slot(AggregationKind::Sum, 0)]);
+        let ops = build::<i128>(1, vec![slot(AggregationKind::Sum, 0)]);
         let out = run_consumers(ops, vec![vec![batch]]);
         assert_eq!(col_i128(&out.items[0], 0), 3 * i64::MAX as i128);
     }

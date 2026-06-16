@@ -1,33 +1,72 @@
 //! [`Dynamic`] — the numeric fallback for a heterogeneous *numeric* signature
-//! (e.g. `COUNT(*), MIN(x), SUM(y)`), folding each slot on its runtime kind.
+//! (e.g. `COUNT(*), MIN(x), SUM(y)`), folding each slot by its runtime kind.
 //!
-//! One monomorph per width `A`. Strings don't go here — a string `MIN`/`MAX` is
-//! homogeneous ([`Mono`](super::Mono)) or, mixed with other aggregates, a fixed
-//! [`Compiled`](super::Compiled) shape; `Dynamic` keeps the per-slot dispatch to a
-//! single numeric `combine`.
+//! Generic over the accumulator width `A` (`i64` narrow / `i128` wide), so a
+//! numeric mix stays as narrow as a `Compiled` shape — no wider cells. Its
+//! per-slot reader is numeric only (`COUNT` or an integer column, by width), so
+//! it has no string arm and no `unreachable!`. Strings never come here: a string
+//! extreme is always a fixed [`Compiled`](super::Compiled) tuple.
 
-use super::super::cell::NumericCell;
-use super::super::read::SlotReader;
+use super::super::cell::Numeric;
 use super::super::{AggregationSlot, AggregationValue};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::Field;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Int16Type, Int32Type, Int64Type};
+use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch};
+use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
+/// One slot's numeric read: a `COUNT` (`One`) or an integer column by width.
+/// Public only because it surfaces in [`Dynamic`]'s `Reader` associated type.
+pub enum NumInput<'b> {
+    One,
+    Col16(&'b PrimitiveArray<Int16Type>),
+    Col32(&'b PrimitiveArray<Int32Type>),
+    Col64(&'b PrimitiveArray<Int64Type>),
+}
+
+impl<'b> NumInput<'b> {
+    fn new(batch: &'b RecordBatch, slot: &AggregationSlot) -> Self {
+        use super::super::AggregationKind::*;
+        match slot.kind {
+            CountStar | Count => NumInput::One,
+            Sum | Min | Max => {
+                let col = batch.column(slot.column);
+                match col.data_type() {
+                    DataType::Int16 => NumInput::Col16(col.as_primitive::<Int16Type>()),
+                    DataType::Int32 => NumInput::Col32(col.as_primitive::<Int32Type>()),
+                    DataType::Int64 => NumInput::Col64(col.as_primitive::<Int64Type>()),
+                    other => panic!("numeric aggregate over unsupported column type {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn read<A: Numeric>(&self, idx: usize) -> A {
+        match self {
+            NumInput::One => A::from(1),
+            NumInput::Col16(a) => A::from(unsafe { a.value_unchecked(idx) } as i64),
+            NumInput::Col32(a) => A::from(unsafe { a.value_unchecked(idx) } as i64),
+            NumInput::Col64(a) => A::from(unsafe { a.value_unchecked(idx) }),
+        }
+    }
+}
+
 /// `N` numeric cells of width `A`, each folded by its own slot kind.
-pub struct Dynamic<const N: usize, A: NumericCell = i64> {
+pub struct Dynamic<const N: usize, A: Numeric = i64> {
     cells: [A; N],
 }
 
-impl<const N: usize, A: NumericCell> Copy for Dynamic<N, A> {}
-impl<const N: usize, A: NumericCell> Clone for Dynamic<N, A> {
+impl<const N: usize, A: Numeric> Copy for Dynamic<N, A> {}
+impl<const N: usize, A: Numeric> Clone for Dynamic<N, A> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<const N: usize, A: NumericCell> Default for Dynamic<N, A> {
+impl<const N: usize, A: Numeric> Default for Dynamic<N, A> {
     fn default() -> Self {
         Self {
             cells: [A::default(); N],
@@ -35,8 +74,8 @@ impl<const N: usize, A: NumericCell> Default for Dynamic<N, A> {
     }
 }
 
-impl<const N: usize, A: NumericCell> AggregationValue for Dynamic<N, A> {
-    type Reader<'b> = [SlotReader<'b>; N];
+impl<const N: usize, A: Numeric> AggregationValue for Dynamic<N, A> {
+    type Reader<'b> = [NumInput<'b>; N];
     type MergeConfig = Arc<[AggregationSlot]>;
     type Columns = [SlabColumn<A>; N];
     type SortKey = i128;
@@ -48,22 +87,22 @@ impl<const N: usize, A: NumericCell> AggregationValue for Dynamic<N, A> {
         Arc::from(slots)
     }
 
-    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> [SlotReader<'b>; N] {
+    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> [NumInput<'b>; N] {
         assert_eq!(slots.len(), N, "slot count must match N");
-        std::array::from_fn(|s| SlotReader::new(batch, &slots[s]))
+        std::array::from_fn(|s| NumInput::new(batch, &slots[s]))
     }
 
     #[inline(always)]
-    fn value(reader: &[SlotReader<'_>; N], idx: usize, _arena: &mut WorkerArena) -> Self {
+    fn value(reader: &[NumInput<'_>; N], idx: usize, _arena: &mut WorkerArena) -> Self {
         Self {
-            cells: std::array::from_fn(|s| reader[s].read_num::<A>(idx)),
+            cells: std::array::from_fn(|s| reader[s].read::<A>(idx)),
         }
     }
 
     #[inline(always)]
     fn update_from_reader(
         mut self,
-        reader: &[SlotReader<'_>; N],
+        reader: &[NumInput<'_>; N],
         idx: usize,
         _arena: &mut WorkerArena,
         slots: &Arc<[AggregationSlot]>,
@@ -73,7 +112,7 @@ impl<const N: usize, A: NumericCell> AggregationValue for Dynamic<N, A> {
         for s in 0..N {
             self.cells[s] = slots[s]
                 .kind
-                .combine(self.cells[s], reader[s].read_num::<A>(idx));
+                .combine(self.cells[s], reader[s].read::<A>(idx));
         }
         self
     }
@@ -87,7 +126,7 @@ impl<const N: usize, A: NumericCell> AggregationValue for Dynamic<N, A> {
 
     #[inline(always)]
     fn sort_key(&self, slot: usize) -> i128 {
-        self.cells[slot].to_i128()
+        self.cells[slot].into()
     }
 
     fn new_columns(allocator: &mut SlabAllocator, rows: usize) -> [SlabColumn<A>; N] {

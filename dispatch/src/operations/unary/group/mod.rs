@@ -102,9 +102,8 @@ pub use keys::{
     RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
-    Add, Aggregate, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count,
-    Distinct, Dynamic, Max, MaxOp, Min, MinOp, Mono, NumericCell, Op, StrMax, StrMaxOp, StrMin,
-    StrMinOp, Sum, WideSum,
+    Aggregation, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count,
+    Distinct, Dynamic, Max, Min, Numeric, NumericArrow, OpTuple, StrMax, StrMin, Sum, WideSum,
 };
 
 use crate::memory::SlabAllocator;
@@ -986,7 +985,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1), // MIN(name) — string
             AggregationSlot::new(AggregationKind::Max, 2), // MAX(v)    — int
         ];
-        type Mix = Compiled<(StrMinOp, MaxOp<Int32Type>)>;
+        type Mix = Compiled<(StrMin, Max<Int32Type>)>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],

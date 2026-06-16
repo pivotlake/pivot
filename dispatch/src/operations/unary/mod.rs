@@ -43,10 +43,10 @@
 
 mod group;
 pub use group::{
-    Add, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, Distinct,
-    Dynamic, GroupFactory, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor,
-    KeyExtractor, Max, MaxOp, Min, MinOp, Mono, NumericCell, Op, RowKeyExtractor, RowKeySchema,
-    StrMax, StrMaxOp, StrMin, StrMinOp, StringKeyExtractor, Sum, WideSum,
+    Aggregation, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count,
+    Distinct, Dynamic, GroupFactory, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor,
+    KeyExtractor, Max, Min, Numeric, NumericArrow, OpTuple, RowKeyExtractor, RowKeySchema, StrMax,
+    StrMin, StringKeyExtractor, Sum, WideSum,
 };
 
 #[cfg(any(test, feature = "test-util"))]

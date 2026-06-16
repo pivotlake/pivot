@@ -1,16 +1,17 @@
-//! [`Compiled`] — a fixed signature monomorphised over a tuple of [`Aggregate`]
-//! atoms, straight-line with no per-row dispatch.
+//! [`Compiled`] — a fixed signature monomorphised over a tuple of
+//! [`Aggregation`] ops, straight-line with no per-row dispatch.
 //!
-//! Each slot is a whole atom with its own cell type, so a `Compiled` shape stores
-//! a heterogeneous tuple of cells and mixes families freely — including a string
-//! extreme beside an integer one (`Compiled<(StrMin, Max<Int32Type>)>`), which is
-//! exactly the `MIN(str), MAX(int)` case. The planner instantiates the tuple it
-//! needs; everything else routes to [`Mono`](super::Mono)/[`Dynamic`](super::Dynamic).
+//! Each slot is a whole op with its own input array and cell, so a `Compiled`
+//! shape mixes families freely — a string extreme beside an integer one
+//! (`Compiled<(StrMin, Max<Int32Type>)>`) — each reading its *own typed array*.
+//! That's what keeps string extremes lazy and removes every int/str special case.
+//! The planner instantiates the tuple it needs; numeric runtime signatures fall
+//! back to [`Dynamic`](super::Dynamic).
 //!
-//! The per-arity [`OpTuple`] impls below carry all the tuple plumbing, so the
-//! [`AggregationValue`] impl for [`Compiled`] is a single thin delegation.
+//! The per-arity [`OpTuple`] impls carry the tuple plumbing, so the
+//! [`AggregationValue`] impl for [`Compiled`] is one thin delegation.
 
-use super::super::op::SlotOp;
+use super::super::aggregation::Aggregation;
 use super::super::{AggregationSlot, AggregationValue};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
@@ -19,21 +20,22 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
 
-/// A tuple of [`Aggregate`] atoms, with the per-slot plumbing the container needs.
+/// A tuple of [`Aggregation`] ops, with the per-slot plumbing the container needs.
 /// Implemented for tuples of arity 1–6 by the macro below.
 pub trait OpTuple: Send + Sync + 'static {
     /// The heterogeneous cell tuple — one cell per op, each its own width.
     type Accs: Copy + Default + Send + Sync + 'static;
-    type Reader<'b>;
+    /// The bound input arrays, one per op.
+    type Inputs<'b>;
     type Cfg: Clone + Send + Sync + 'static;
     type Columns;
 
     fn cfg(arena: &Arc<SharedArena>) -> Self::Cfg;
-    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
-    fn seed(reader: &Self::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> Self::Accs;
+    fn bind<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Inputs<'b>;
+    fn seed(inputs: &Self::Inputs<'_>, idx: usize, arena: &mut WorkerArena) -> Self::Accs;
     fn update(
         accs: Self::Accs,
-        reader: &Self::Reader<'_>,
+        inputs: &Self::Inputs<'_>,
         idx: usize,
         arena: &mut WorkerArena,
         cfg: &Self::Cfg,
@@ -47,9 +49,9 @@ pub trait OpTuple: Send + Sync + 'static {
 
 macro_rules! impl_optuple {
     ($($O:ident $idx:tt),+) => {
-        impl<$($O: SlotOp),+> OpTuple for ($($O,)+) {
+        impl<$($O: Aggregation),+> OpTuple for ($($O,)+) {
             type Accs = ($($O::Acc,)+);
-            type Reader<'b> = ($($O::Reader<'b>,)+);
+            type Inputs<'b> = ($($O::Input<'b>,)+);
             type Cfg = ($($O::Cfg,)+);
             type Columns = ($(SlabColumn<$O::Acc>,)+);
 
@@ -58,25 +60,22 @@ macro_rules! impl_optuple {
                 ($($O::cfg(arena),)+)
             }
             #[inline(always)]
-            fn make_reader<'b>(
-                batch: &'b RecordBatch,
-                slots: &[AggregationSlot],
-            ) -> Self::Reader<'b> {
-                ($($O::make_reader(batch, slots[$idx].column),)+)
+            fn bind<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Inputs<'b> {
+                ($($O::bind(batch, slots[$idx].column),)+)
             }
             #[inline(always)]
-            fn seed(reader: &Self::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> Self::Accs {
-                ($($O::seed(&reader.$idx, idx, arena),)+)
+            fn seed(inputs: &Self::Inputs<'_>, idx: usize, arena: &mut WorkerArena) -> Self::Accs {
+                ($($O::seed(&inputs.$idx, idx, arena),)+)
             }
             #[inline(always)]
             fn update(
                 accs: Self::Accs,
-                reader: &Self::Reader<'_>,
+                inputs: &Self::Inputs<'_>,
                 idx: usize,
                 arena: &mut WorkerArena,
                 cfg: &Self::Cfg,
             ) -> Self::Accs {
-                ($($O::update(accs.$idx, &reader.$idx, idx, arena, &cfg.$idx),)+)
+                ($($O::update(accs.$idx, &inputs.$idx, idx, arena, &cfg.$idx),)+)
             }
             #[inline(always)]
             fn merge(a: Self::Accs, b: Self::Accs, cfg: &Self::Cfg) -> Self::Accs {
@@ -117,9 +116,8 @@ impl_optuple!(O0 0, O1 1, O2 2, O3 3);
 impl_optuple!(O0 0, O1 1, O2 2, O3 3, O4 4);
 impl_optuple!(O0 0, O1 1, O2 2, O3 3, O4 4, O5 5);
 
-/// A fixed aggregate signature: `N` slots given by the op tuple `Ops`, each its
-/// own cell. The cells live in `Ops::Accs`; everything else delegates to
-/// [`OpTuple`].
+/// A fixed aggregate signature: the slots given by the op tuple `Ops`, each its
+/// own cell. The cells live in `Ops::Accs`; everything else delegates to [`OpTuple`].
 pub struct Compiled<Ops: OpTuple> {
     accs: Ops::Accs,
 }
@@ -139,7 +137,7 @@ impl<Ops: OpTuple> Default for Compiled<Ops> {
 }
 
 impl<Ops: OpTuple> AggregationValue for Compiled<Ops> {
-    type Reader<'b> = Ops::Reader<'b>;
+    type Reader<'b> = Ops::Inputs<'b>;
     type MergeConfig = Ops::Cfg;
     type Columns = Ops::Columns;
     type SortKey = i128;
@@ -148,11 +146,11 @@ impl<Ops: OpTuple> AggregationValue for Compiled<Ops> {
     fn merge_config(_slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Ops::Cfg {
         Ops::cfg(arena)
     }
-    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Ops::Reader<'b> {
-        Ops::make_reader(batch, slots)
+    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Ops::Inputs<'b> {
+        Ops::bind(batch, slots)
     }
     #[inline(always)]
-    fn value(reader: &Ops::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> Self {
+    fn value(reader: &Ops::Inputs<'_>, idx: usize, arena: &mut WorkerArena) -> Self {
         Self {
             accs: Ops::seed(reader, idx, arena),
         }
@@ -160,7 +158,7 @@ impl<Ops: OpTuple> AggregationValue for Compiled<Ops> {
     #[inline(always)]
     fn update_from_reader(
         self,
-        reader: &Ops::Reader<'_>,
+        reader: &Ops::Inputs<'_>,
         idx: usize,
         arena: &mut WorkerArena,
         cfg: &Ops::Cfg,

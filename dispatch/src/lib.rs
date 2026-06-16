@@ -97,11 +97,11 @@ pub use operations::channels::{
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
-    Add, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, Distinct,
-    Dynamic, DynamicFilterSlot, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, Max,
-    MaxOp, Min, MinOp, Mono, Nullary, NullaryFactory, NullaryOperatorFactory, NumericCell, Op,
-    Operator, OrderBy, Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMaxOp,
-    StrMin, StrMinOp, StringKeyExtractor, Sum, WideSum,
+    Aggregation, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count,
+    Distinct, Dynamic, DynamicFilterSlot, HashOnlyIntKeyExtractor, IntKeyExtractor,
+    IntPairKeyExtractor, Max, Min, Nullary, NullaryFactory, NullaryOperatorFactory, Numeric,
+    NumericArrow, OpTuple, Operator, OrderBy, Result as OperatorResult, RowKeyExtractor,
+    RowKeySchema, StrMax, StrMin, StringKeyExtractor, Sum, WideSum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
