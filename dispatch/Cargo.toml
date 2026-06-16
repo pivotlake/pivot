@@ -29,6 +29,12 @@ libc = "0.2.178"
 # (no cmake/C toolchain); roots are the bundled Mozilla set (no platform calls).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
+# Sans-IO HTTP/1.1 core (see io::http::http1): `http` for the typed message model
+# (Request/Response/StatusCode/HeaderMap — methods/statuses/headers beyond range
+# GETs), `httparse` for byte-level head and chunk-size parsing. These are the same
+# crates hyper is built on; we drive them from our own io_uring transport rather
+# than adopting hyper's IO-coupled runtime.
+http = "1"
 httparse = "1.9"
 url = "2.5"
 
@@ -57,6 +63,14 @@ criterion = { version = "0.5", default-features = false, features = ["plotters",
 [[bench]]
 name = "operators"
 harness = false
+
+# HTTP(S) range-read throughput (`benches/http_range.rs`): stands up a loopback
+# backend and drives the HTTP engine via a standalone `IORequester`. Needs
+# `test-util` for `init_test_free_pool` (the out-of-crate single-worker context).
+[[bench]]
+name = "http_range"
+harness = false
+required-features = ["test-util"]
 
 [profile.profiling]
 inherits = "release"

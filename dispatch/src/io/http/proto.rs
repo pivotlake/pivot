@@ -1,18 +1,21 @@
-//! Sans-IO HTTP/1.1 helpers shared by both http backends.
+//! Object-store range-read **policy** over the sans-IO HTTP/1.1 core
+//! ([`super::http1`]).
 //!
-//! Keeping request formatting and response-header parsing here (independent of
-//! the socket transport) lets the platform backends — io_uring on Linux, blocking
-//! `std::net` elsewhere — share identical protocol logic, and lets it be unit
-//! tested without a socket.
+//! The core is general (any method, any status, any body framing); this layer
+//! pins it to what the cache's remote reads require: a `Range` GET, a `206
+//! Partial Content` response, and an identity body no larger than the requested
+//! range (so it lands exactly in the destination slot). Keeping this policy out
+//! of the core means the core stays reusable for future `PUT`s, non-`206`
+//! responses, and chunked bodies — and that both platform backends share
+//! identical, socket-free, unit-testable logic.
 
+use super::http1;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
-    #[error("malformed http response: {0}")]
-    Parse(#[from] httparse::Error),
-    #[error("http response missing status code")]
-    MissingStatus,
+    #[error("{0}")]
+    Http1(#[from] http1::Http1Error),
     #[error("unexpected http status {0} (expected 206 Partial Content)")]
     UnexpectedStatus(u16),
     #[error("range response missing Content-Length")]
@@ -64,25 +67,23 @@ pub enum HeadParse {
 /// is present and no larger than `requested_len` — range responses are never
 /// chunked and must fit the destination slot region.
 pub fn parse_response_head(buf: &[u8], requested_len: usize) -> Result<HeadParse, ProtoError> {
-    let mut headers = [httparse::EMPTY_HEADER; 32];
-    let mut resp = httparse::Response::new(&mut headers);
-    let head_len = match resp.parse(buf)? {
-        httparse::Status::Partial => return Ok(HeadParse::Incomplete),
-        httparse::Status::Complete(n) => n,
+    let head = match http1::parse_response_head(buf, &http::Method::GET)? {
+        http1::HeadStatus::Incomplete => return Ok(HeadParse::Incomplete),
+        http1::HeadStatus::Complete(head) => head,
     };
 
-    let status = resp.code.ok_or(ProtoError::MissingStatus)?;
+    let status = head.parts.status.as_u16();
     if status != 206 {
         return Err(ProtoError::UnexpectedStatus(status));
     }
 
-    let content_length = resp
-        .headers
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-        .and_then(|h| std::str::from_utf8(h.value).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .ok_or(ProtoError::MissingContentLength)?;
+    // A range response is always identity-framed (we send `Accept-Encoding:
+    // identity` and don't request multipart). Anything else — chunked, or no
+    // length at all — means we can't size the body against the slot.
+    let content_length = match head.framing {
+        http1::Framing::Length(n) => n,
+        _ => return Err(ProtoError::MissingContentLength),
+    };
 
     if content_length > requested_len as u64 {
         return Err(ProtoError::BodyTooLarge {
@@ -92,7 +93,7 @@ pub fn parse_response_head(buf: &[u8], requested_len: usize) -> Result<HeadParse
     }
 
     Ok(HeadParse::Complete(ResponseHead {
-        head_len,
+        head_len: head.head_len,
         content_length,
     }))
 }
