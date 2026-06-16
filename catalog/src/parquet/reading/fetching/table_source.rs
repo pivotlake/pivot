@@ -159,3 +159,85 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         }
     }
 }
+
+/// Like [`RowGroupInjectorFactory`], but its workers steal bare
+/// [`QueryRowGroupMetadata`] rather than fully-staged [`RowGroupRequest`]s. The
+/// dict-prefetch stage sits between this source and the fetcher: it decides per
+/// row group whether to read the dictionary first (to prune) or to build the
+/// full request straight away, so it must control read staging itself rather
+/// than receive a request whose reads were already computed (and cache slots
+/// allocated) at steal time.
+#[derive(Clone)]
+pub struct RowGroupMetadataInjectorFactory {
+    row_groups: Arc<Injector<QueryRowGroupMetadata>>,
+    filter: Option<RowGroupFilter>,
+}
+
+impl RowGroupMetadataInjectorFactory {
+    /// Pushes every row group of `table` into a shared work-stealing queue, in
+    /// `scan_order` key order when given (else file order) — the same ordering
+    /// [`RowGroupInjectorFactory`] uses.
+    pub fn new(
+        table: &Arc<ParquetTable>,
+        filter: Option<RowGroupFilter>,
+        scan_order: Option<ScanOrder>,
+    ) -> Self {
+        let injector = Arc::new(Injector::new());
+        let order = match scan_order {
+            Some(order) => steal_order(table, order),
+            None => (0..table.row_groups.len()).collect(),
+        };
+        for row_group_idx in order {
+            injector.push(QueryRowGroupMetadata::new(table, row_group_idx, None));
+        }
+        Self {
+            row_groups: injector,
+            filter,
+        }
+    }
+}
+
+impl RootChannelFactory<QueryRowGroupMetadata> for RowGroupMetadataInjectorFactory {
+    type Receiver = RowGroupMetadataInjector;
+
+    fn build(self) -> Self::Receiver {
+        RowGroupMetadataInjector {
+            row_groups: self.row_groups,
+            filter: self.filter,
+        }
+    }
+}
+
+/// A [`Receiver`] that steals bare row-group metadata from the shared queue.
+/// Like [`RowGroupInjector`], work is only consumed through [`steal`](Self::steal).
+pub struct RowGroupMetadataInjector {
+    row_groups: Arc<Injector<QueryRowGroupMetadata>>,
+    filter: Option<RowGroupFilter>,
+}
+
+impl Receiver<QueryRowGroupMetadata> for RowGroupMetadataInjector {
+    fn is_empty(&self) -> bool {
+        self.row_groups.is_empty()
+    }
+
+    fn try_recv(&self) -> Option<QueryRowGroupMetadata> {
+        None
+    }
+
+    fn steal(&self) -> Option<QueryRowGroupMetadata> {
+        loop {
+            match self.row_groups.steal() {
+                Steal::Empty => return None,
+                Steal::Retry => continue,
+                Steal::Success(s) => {
+                    if let Some(filter) = &self.filter
+                        && !filter(s.get_metadata())
+                    {
+                        continue;
+                    }
+                    return Some(s);
+                }
+            }
+        }
+    }
+}

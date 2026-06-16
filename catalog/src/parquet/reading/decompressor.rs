@@ -50,7 +50,10 @@ impl Default for Decompressor {
 }
 
 impl Decompressor {
-    fn decompress(&mut self, page: CompressedPage) -> Result<DecompressedPage> {
+    /// Decompress a single compressed page. Exposed so the dict-prefetch stage
+    /// can decompress a dictionary page in isolation to evaluate equality
+    /// pushdown before the row group's data pages are fetched.
+    pub(crate) fn decompress(&mut self, page: CompressedPage) -> Result<DecompressedPage> {
         let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
 
         let uncompressed_size = page.header.uncompressed_page_size as usize;

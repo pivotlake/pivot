@@ -18,9 +18,10 @@ use dispatch::{
 };
 
 use crate::parquet::{
-    CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
+    CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, DictPrefetcherFactory,
+    IndexerFactory, MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
+    RowGroupInjectorFactory, RowGroupMetadataInjectorFactory, RowGroupRequest,
+    ScanEqualityPredicate, ScanOrder,
 };
 
 /// Append the index → decompress → decode stages onto a source of
@@ -114,6 +115,47 @@ pub fn table_input_with_filter_and_eq_predicates(
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
+
+    // With pushed-down equality predicates, prepend a dict-prefetch stage: it
+    // reads many row groups' dictionary pages at once, prunes those whose
+    // dictionary excludes the constant, and only forwards survivors to the
+    // fetcher — so a high-cardinality point-lookup doesn't read the data pages
+    // of row groups it will discard. Without eq predicates the source is the
+    // single-stage fetcher, unchanged.
+    if !eq_predicates.is_empty() {
+        let metadata_injector = RowGroupMetadataInjectorFactory::new(table, filter, scan_order);
+        let siblings_prefetch = Arc::new(AtomicUsize::new(n));
+        let siblings_fetcher = Arc::new(AtomicUsize::new(n));
+        let factories: Vec<_> = stealable::<RowGroupRequest>(n)
+            .into_iter()
+            .map(|rq_ch| {
+                UnaryOperatorFactory::new(
+                    RootUnaryOperatorFactory::new(
+                        DictPrefetcherFactory::new(
+                            table.clone(),
+                            projection.clone(),
+                            eq_predicates.clone(),
+                        ),
+                        metadata_injector.clone(),
+                        siblings_prefetch.clone(),
+                    ),
+                    RowGroupFetcherFactory::new(),
+                    rq_ch,
+                    siblings_fetcher.clone(),
+                )
+            })
+            .collect();
+        let input = OperatorSpec::new(dispatcher.clone(), factories);
+        return read_parquet(
+            input,
+            table,
+            projection,
+            RECORD_BATCH_SIZE,
+            add_row_group_metadata,
+            eq_predicates,
+        );
+    }
+
     let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
     let siblings = Arc::new(AtomicUsize::new(n));
     // One fetcher handles disk and HTTP row groups, bounding each medium's

@@ -12,7 +12,10 @@
 //! pipeline produced at `CREATE`/`ATTACH` time.
 
 mod fetching;
-pub use fetching::{RowGroupFetcherFactory, RowGroupInjectorFactory};
+pub use fetching::{
+    DictPrefetcherFactory, RowGroupFetcherFactory, RowGroupInjectorFactory,
+    RowGroupMetadataInjectorFactory,
+};
 
 mod indexer;
 pub use indexer::IndexerFactory;

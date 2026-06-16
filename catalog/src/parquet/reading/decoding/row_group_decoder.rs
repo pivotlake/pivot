@@ -83,6 +83,30 @@ fn column_decoder_for_type(
     }
 }
 
+/// Whether a column chunk's dictionary provably excludes a pushed-down equality
+/// constant, so the whole row group can be pruned without decoding its data
+/// pages. Used by the dict-prefetch stage: it decompresses just the dictionary
+/// page (`dict_page`) and runs the same membership scan the row-group decoder
+/// would, building a throwaway typed decoder for `data_type`.
+///
+/// Returns `false` (don't prune — always sound) when the type is unsupported,
+/// the constant doesn't match the column's native type, or the dictionary
+/// doesn't yield a decision (e.g. a bytes column whose `contains` defaults to
+/// "present").
+pub(crate) fn dictionary_excludes_constant(
+    data_type: &DataType,
+    max_def_level: i16,
+    eq_value: &Scalar<ArrayRef>,
+    dict_page: DecompressedPage,
+    allocator: &mut SlabAllocator,
+) -> bool {
+    let Ok(mut decoder) = column_decoder_for_type(data_type, max_def_level, Some(eq_value)) else {
+        return false;
+    };
+    decoder.insert_page(dict_page, allocator);
+    decoder.dict_excludes_constant() == Some(true)
+}
+
 /// Decodes pages for a single row group into [`RecordBatch`]es.
 ///
 /// Pages are inserted out-of-order via [`insert_page`](Self::insert_page).
@@ -254,5 +278,84 @@ impl RowGroupDecoder {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dictionary_excludes_constant;
+    use crate::parquet::types::page::{DecompressedPage, DecompressedPageType};
+    use crate::parquet::types::thrift::headers::PageHeader;
+    use crate::parquet::test_utils::dummy_metadata;
+    use arrow_array::{ArrayRef, Int64Array, Scalar};
+    use arrow_schema::DataType;
+    use bytes::Bytes;
+    use dispatch::memory::{SlabAllocator, init_test_free_pool};
+    use std::sync::Arc;
+
+    fn i64_scalar(v: i64) -> Scalar<ArrayRef> {
+        Scalar::new(Arc::new(Int64Array::from(vec![v])) as ArrayRef)
+    }
+
+    fn i64_dict_page(values: &[i64]) -> DecompressedPage {
+        let header = PageHeader::for_dict_page(values.len() as i32);
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(None),
+            column_idx: 0,
+            idx: 0,
+            data: DecompressedPageType::Dict {
+                header: header.dictionary_page_header.unwrap(),
+                data: vec![Bytes::from(bytes)],
+            },
+        }
+    }
+
+    /// Constant absent from the dictionary → prunable (the dict-prefetch stage
+    /// drops the row group without reading its data pages).
+    #[test]
+    fn excludes_when_constant_absent() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        assert!(dictionary_excludes_constant(
+            &DataType::Int64,
+            0,
+            &i64_scalar(99),
+            i64_dict_page(&[10, 20, 30]),
+            &mut alloc,
+        ));
+    }
+
+    /// Constant present → not prunable (the row group must be read & decoded).
+    #[test]
+    fn keeps_when_constant_present() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        assert!(!dictionary_excludes_constant(
+            &DataType::Int64,
+            0,
+            &i64_scalar(20),
+            i64_dict_page(&[10, 20, 30]),
+            &mut alloc,
+        ));
+    }
+
+    /// A constant whose Arrow type doesn't match the column's native type yields
+    /// no decision → never prune (always sound; the upstream filter still runs).
+    #[test]
+    fn keeps_on_type_mismatch() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        // i32 constant against an Int64 column: the native downcast fails, so no
+        // pruning decision is made.
+        let mismatched = Scalar::new(Arc::new(arrow_array::Int32Array::from(vec![20])) as ArrayRef);
+        assert!(!dictionary_excludes_constant(
+            &DataType::Int64,
+            0,
+            &mismatched,
+            i64_dict_page(&[10, 20, 30]),
+            &mut alloc,
+        ));
     }
 }
