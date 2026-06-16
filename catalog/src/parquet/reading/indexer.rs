@@ -44,7 +44,11 @@ pub struct Indexer {}
 /// [`MultiBufferReader::copy_out_buffers`] (zero-copy).
 /// For data pages with filtered indices, a [`FilterMask`] scoped to the page's
 /// row range is attached.
-fn create_compressed_pages(
+///
+/// Exposed to the dict-prefetch stage, which parses a single dictionary page
+/// out of a dict-only column buffer to evaluate equality pushdown before
+/// fetching the row group's data pages.
+pub(crate) fn create_compressed_pages(
     col_idx: usize,
     query_row_group_metadata: QueryRowGroupMetadata,
     buffers: &[Bytes],

@@ -21,9 +21,10 @@ mod request_tracker;
 
 mod reading;
 pub use reading::{
-    DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory, MaterializerFactory,
-    RowGroupDecoderError, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    DecoderFactory, DecompressorError, DecompressorFactory, DictPrefetcherFactory, IndexerFactory,
+    MaterializerFactory, RowGroupDecoderError, RowGroupFetcherFactory, RowGroupInjectorFactory,
+    RowGroupMetadataInjectorFactory, ScanEqualityPredicate, materialize, table_input,
+    table_input_with_filter, table_input_with_filter_and_eq_predicates,
 };
 
 mod metadata;

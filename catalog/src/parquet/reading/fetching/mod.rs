@@ -19,7 +19,9 @@
 pub type RowGroupFetcherFactory = DefaultUnaryFactory<RowGroupFetcher>;
 mod fetcher;
 
+mod dict_prefetcher;
 mod table_source;
 use crate::parquet::reading::fetching::fetcher::RowGroupFetcher;
 use dispatch::DefaultUnaryFactory;
-pub use table_source::RowGroupInjectorFactory;
+pub use dict_prefetcher::DictPrefetcherFactory;
+pub use table_source::{RowGroupInjectorFactory, RowGroupMetadataInjectorFactory};
