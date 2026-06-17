@@ -528,8 +528,8 @@ impl Aggregate {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
-            AggregationKind, AggregationSlot, Compiled, Count, Dynamic, IntPairKeyExtractor,
-            RowKeyExtractor, StrMax, StrMin, Sum,
+            AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, IntPairKeyExtractor,
+            RowKeyExtractor, StrMaxSlot, StrMinSlot, SumSlot,
         };
 
         // The value type is fixed at plan time. A homogeneous *string* MIN/MAX
@@ -715,8 +715,8 @@ impl Aggregate {
             ($Key:ty, $acc:ty) => {
                 match shape {
                     Shape::Numeric => num_arity!($Key, $acc),
-                    Shape::StrMin => str_arity!($Key, StrMin),
-                    Shape::StrMax => str_arity!($Key, StrMax),
+                    Shape::StrMin => str_arity!($Key, StrMinSlot),
+                    Shape::StrMax => str_arity!($Key, StrMaxSlot),
                 }
             };
         }
@@ -737,10 +737,10 @@ impl Aggregate {
                         Sig::Count,
                     ]
                 ) {
-                    type V = Compiled<(Count, Sum<Int16Type>, Sum<Int16Type>, Count)>;
+                    type V = Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>;
                     Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
                 } else if matches!(sig.as_slice(), [Sig::Count]) {
-                    Ok(input.group_by_aggregate::<Key, Compiled<(Count,)>>(key_cols, slots, top_k))
+                    Ok(input.group_by_aggregate::<Key, Compiled<(CountSlot,)>>(key_cols, slots, top_k))
                 } else {
                     by_shape!(Key, $acc)
                 }
@@ -796,8 +796,8 @@ impl Aggregate {
                 }
                 match shape {
                     Shape::Numeric => row_num_arity!(),
-                    Shape::StrMin => row_str_arity!(StrMin),
-                    Shape::StrMax => row_str_arity!(StrMax),
+                    Shape::StrMin => row_str_arity!(StrMinSlot),
+                    Shape::StrMax => row_str_arity!(StrMaxSlot),
                 }
             }};
         }
