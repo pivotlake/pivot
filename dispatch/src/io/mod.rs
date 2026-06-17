@@ -287,6 +287,19 @@ pub enum Completion {
     Http(DataFlowRequest<HttpRequest>),
 }
 
+/// A read that failed transport-side — an HTTP read that exhausted its retries
+/// (or hit a non-retryable error), or a disk read whose CQE came back negative.
+/// Carries the dataflow/operator that issued it so the worker can cancel just
+/// that dataflow, plus the error to report. Surfaced as the `Err` arm of a
+/// per-read result from [`IORequester::completions`], so one failed read never
+/// aborts the whole completion drain or tears down the worker. The block is
+/// left uncommitted.
+pub struct FailedRead {
+    pub data_flow_id: Identifier,
+    pub operator_idx: Identifier,
+    pub error: IORequesterError,
+}
+
 /// Opens a file for direct (uncached) reads.
 ///
 /// - **Linux**: uses `O_DIRECT`.
