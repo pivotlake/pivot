@@ -102,8 +102,9 @@ pub use keys::{
     RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
-    Aggregation, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count,
-    Distinct, Dynamic, Max, Min, Numeric, NumericArrow, OpTuple, StrMax, StrMin, Sum, WideSum,
+    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
+    Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, NoRead, Numeric, NumericArrow, OpTuple,
+    Read, Slot, StrMax, StrMaxSlot, StrMin, StrMinSlot, StrRead, Sum, SumSlot, WideSum,
 };
 
 use crate::memory::SlabAllocator;
@@ -444,8 +445,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = Compiled<(Count,)>;
-    type SumValue = Compiled<(Sum<Int32Type>,)>;
+    type CountValue = Compiled<(CountSlot,)>;
+    type SumValue = Compiled<(SumSlot<Int32Type>,)>;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -859,7 +860,7 @@ mod tests {
     fn row_key_mixed_int_string_counts() {
         let batch = mixed_key_batch(&[1, 1, 1, 2, 2], &["a", "b", "a", "a", "a"], &[0; 5]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<Compiled<(Count,)>>(
+        let sender = run_row_key_group::<Compiled<(CountSlot,)>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -883,7 +884,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &["x", long, "x", "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -903,7 +904,7 @@ mod tests {
     #[test]
     fn row_key_two_workers_merge() {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<Compiled<(Count,)>>(
+        let sender = run_row_key_group::<Compiled<(CountSlot,)>>(
             vec![
                 vec![mixed_key_batch(&[1, 2], &["a", "a"], &[0; 2])],
                 vec![mixed_key_batch(&[1, 1], &["a", "b"], &[0; 2])],
@@ -933,7 +934,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &[long, "y", long, "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![batch]],
             vec![1, 0], // name (col 1) then id (col 0)
             schema,
@@ -964,7 +965,7 @@ mod tests {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
 
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![b1, b2]],
             vec![0, 1],
             schema,
@@ -995,7 +996,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1), // MIN(name) — string
             AggregationSlot::new(AggregationKind::Max, 2), // MAX(v)    — int
         ];
-        type Mix = Compiled<(StrMin, Max<Int32Type>)>;
+        type Mix = Compiled<(StrMinSlot, MaxSlot<Int32Type>)>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],

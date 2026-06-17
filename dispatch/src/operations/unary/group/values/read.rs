@@ -37,9 +37,9 @@ pub trait Read: Send + Sync + 'static {
 /// Reads an integer column of width `T`, widened to `i64`. The single place a
 /// column width appears — every numeric fold (`Sum`/`Min`/`Max`) consumes the
 /// `i64` this yields, so none of them is monomorphised per width.
-pub struct IntRead<T>(PhantomData<fn() -> T>);
+pub struct IntRead<T>(PhantomData<T>);
 
-impl<T: ArrowPrimitiveType> Read for IntRead<T>
+impl<T: ArrowPrimitiveType + Send + Sync> Read for IntRead<T>
 where
     T::Native: Into<i64>,
 {

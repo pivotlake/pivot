@@ -1,22 +1,23 @@
-//! [`Dynamic`] — the runtime-signature value: each slot folded by its own
-//! [`Aggregation`] op, over a uniform cell width `A`.
+//! [`Dynamic`] — the runtime-signature value: `N` cells of a uniform width `A`,
+//! each folded by its slot's op.
 //!
-//! Where [`Compiled`](super::Compiled) names its ops in the type (so it never
-//! branches), `Dynamic` resolves them at runtime: `make_reader` binds each slot
-//! to a [`BoundSlot`] — one flat variant per (op, column width) — and the fold
-//! then calls that op's [`seed`](Aggregation::seed)/[`update`](Aggregation::update)
-//! directly. The op owns the fold; `Dynamic` only selects it. The enum is
-//! exhaustive, so the dispatch holds no `unreachable!` and re-implements nothing;
-//! the per-width variants are the explicit cost of resolving the column type at
-//! runtime rather than in the type (as `Compiled` does).
+//! Where [`Compiled`](super::Compiled) names its `(`[`Read`]`, `[`Fold`]`)` slots
+//! in the type, `Dynamic` resolves them at runtime: [`make_reader`](AggregationValue::make_reader)
+//! binds each slot to a [`BoundSlot`] (one variant *per op*, the column width a
+//! [`NumReader`] payload — so the variants are `ops`, not `ops × widths`), and the
+//! fold drives every slot through the *same* `Op::<A>::update(cell, read, arena,
+//! cfg)`. The cell is `A` in and `A` out for every op — a string extreme's
+//! `ArenaKey` is just the 128 bits of `A` (`= i128`), viewed as a key *inside*
+//! [`StrMin`]/[`StrMax`] (via [`StringCell`]), so the container never reinterprets
+//! and never branches string-vs-int.
 //!
-//! Generic over the accumulator width `A` (`i64` narrow / `i128` wide). A string
-//! extreme rides the *wide* (`i128`) instantiation: its `ArenaKey` is a 128-bit
-//! `StringView` header, stored in the cell via [`StringCell`] (the `i64` arms are
-//! the fail-out — the planner always widens a string signature to `i128`).
+//! Generic over `A` (`i64` narrow / `i128` wide). A string extreme rides the wide
+//! (`i128`) instantiation; the `i64` [`StringCell`] arms are the fail-out (the
+//! planner always widens a string signature to `i128`).
 
-use super::super::aggregation::Aggregation;
+use super::super::aggregation::{Fold, FoldAcc};
 use super::super::cell::{Numeric, StringCell};
+use super::super::read::{IntRead, Read, StrRead};
 use super::super::{
     AggregationKind, AggregationSlot, AggregationValue, Count, Max, Min, StrMax, StrMin, Sum,
 };
@@ -29,52 +30,61 @@ use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
-/// One slot's bound op and downcast input for a batch: the runtime counterpart
-/// to a `Compiled` tuple element, one variant per (op, column width). Built once
-/// per batch by [`bind`](BoundSlot::bind).
+/// An integer column bound at one of the three widths, read as `i64`. The width
+/// is a *payload* here, not a cross-product with the op: adding a width is one
+/// more variant in this enum, shared by every numeric op.
+pub enum NumReader<'b> {
+    I16(&'b PrimitiveArray<Int16Type>),
+    I32(&'b PrimitiveArray<Int32Type>),
+    I64(&'b PrimitiveArray<Int64Type>),
+}
+
+impl<'b> NumReader<'b> {
+    fn bind(batch: &'b RecordBatch, column: usize) -> Self {
+        let col = batch.column(column);
+        match col.data_type() {
+            DataType::Int16 => NumReader::I16(col.as_primitive::<Int16Type>()),
+            DataType::Int32 => NumReader::I32(col.as_primitive::<Int32Type>()),
+            DataType::Int64 => NumReader::I64(col.as_primitive::<Int64Type>()),
+            other => panic!("numeric aggregate over unsupported column type {other:?}"),
+        }
+    }
+    #[inline(always)]
+    fn read(&self, idx: usize) -> i64 {
+        match self {
+            NumReader::I16(a) => IntRead::<Int16Type>::read(a, idx),
+            NumReader::I32(a) => IntRead::<Int32Type>::read(a, idx),
+            NumReader::I64(a) => IntRead::<Int64Type>::read(a, idx),
+        }
+    }
+}
+
+/// One slot's bound reader for a batch — one variant *per op*, the numeric column
+/// width carried inside [`NumReader`]. Built once per batch by [`bind`](BoundSlot::bind).
 pub enum BoundSlot<'b> {
     Count,
-    SumI16(&'b PrimitiveArray<Int16Type>),
-    SumI32(&'b PrimitiveArray<Int32Type>),
-    SumI64(&'b PrimitiveArray<Int64Type>),
-    MinI16(&'b PrimitiveArray<Int16Type>),
-    MinI32(&'b PrimitiveArray<Int32Type>),
-    MinI64(&'b PrimitiveArray<Int64Type>),
-    MaxI16(&'b PrimitiveArray<Int16Type>),
-    MaxI32(&'b PrimitiveArray<Int32Type>),
-    MaxI64(&'b PrimitiveArray<Int64Type>),
+    Sum(NumReader<'b>),
+    Min(NumReader<'b>),
+    Max(NumReader<'b>),
     StrMin(&'b StringViewArray),
     StrMax(&'b StringViewArray),
 }
 
 impl<'b> BoundSlot<'b> {
     fn bind(batch: &'b RecordBatch, slot: &AggregationSlot) -> Self {
-        // Downcast the slot's column to one of the three integer widths, tagging
-        // it with the op (`$i16`/`$i32`/`$i64` are the matching variants).
-        macro_rules! by_width {
-            ($i16:ident, $i32:ident, $i64:ident) => {{
-                let col = batch.column(slot.column);
-                match col.data_type() {
-                    DataType::Int16 => BoundSlot::$i16(col.as_primitive::<Int16Type>()),
-                    DataType::Int32 => BoundSlot::$i32(col.as_primitive::<Int32Type>()),
-                    DataType::Int64 => BoundSlot::$i64(col.as_primitive::<Int64Type>()),
-                    other => panic!("numeric aggregate over unsupported column type {other:?}"),
-                }
-            }};
-        }
         use AggregationKind::*;
         match slot.kind {
             CountStar | Count => BoundSlot::Count,
-            Sum => by_width!(SumI16, SumI32, SumI64),
-            Min => by_width!(MinI16, MinI32, MinI64),
-            Max => by_width!(MaxI16, MaxI32, MaxI64),
-            StrMin => BoundSlot::StrMin(batch.column(slot.column).as_string_view()),
-            StrMax => BoundSlot::StrMax(batch.column(slot.column).as_string_view()),
+            Sum => BoundSlot::Sum(NumReader::bind(batch, slot.column)),
+            Min => BoundSlot::Min(NumReader::bind(batch, slot.column)),
+            Max => BoundSlot::Max(NumReader::bind(batch, slot.column)),
+            StrMin => BoundSlot::StrMin(StrRead::bind(batch, slot.column)),
+            StrMax => BoundSlot::StrMax(StrRead::bind(batch, slot.column)),
         }
     }
 }
 
-/// `N` cells of width `A`, each folded by its own slot op.
+/// `N` cells of width `A`, each folded by its slot op.
 pub struct Dynamic<const N: usize, A: Numeric + StringCell = i64> {
     cells: [A; N],
 }
@@ -95,8 +105,8 @@ impl<const N: usize, A: Numeric + StringCell> Default for Dynamic<N, A> {
 
 impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A> {
     type Reader<'b> = [BoundSlot<'b>; N];
-    /// The per-slot kinds (which op merges each cell) and the value arena (which a
-    /// string extreme resolves its `ArenaKey`s through during the partition merge).
+    /// The per-slot kinds (which op merges/renders each cell) and the value arena
+    /// (which a string extreme resolves its keys through).
     type MergeConfig = (Arc<[AggregationSlot]>, Arc<SharedArena>);
     type Columns = [SlabColumn<A>; N];
     type SortKey = i128;
@@ -114,18 +124,12 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
     fn value(reader: &[BoundSlot<'_>; N], idx: usize, arena: &mut WorkerArena) -> Self {
         Self {
             cells: std::array::from_fn(|s| match &reader[s] {
-                BoundSlot::Count => Count::<A>::seed(&(), idx, arena),
-                BoundSlot::SumI16(a) => Sum::<Int16Type, A>::seed(a, idx, arena),
-                BoundSlot::SumI32(a) => Sum::<Int32Type, A>::seed(a, idx, arena),
-                BoundSlot::SumI64(a) => Sum::<Int64Type, A>::seed(a, idx, arena),
-                BoundSlot::MinI16(a) => Min::<Int16Type, A>::seed(a, idx, arena),
-                BoundSlot::MinI32(a) => Min::<Int32Type, A>::seed(a, idx, arena),
-                BoundSlot::MinI64(a) => Min::<Int64Type, A>::seed(a, idx, arena),
-                BoundSlot::MaxI16(a) => Max::<Int16Type, A>::seed(a, idx, arena),
-                BoundSlot::MaxI32(a) => Max::<Int32Type, A>::seed(a, idx, arena),
-                BoundSlot::MaxI64(a) => Max::<Int64Type, A>::seed(a, idx, arena),
-                BoundSlot::StrMin(a) => A::from_key(StrMin::seed(a, idx, arena)),
-                BoundSlot::StrMax(a) => A::from_key(StrMax::seed(a, idx, arena)),
+                BoundSlot::Count => Count::<A>::seed((), arena),
+                BoundSlot::Sum(r) => Sum::<A>::seed(r.read(idx), arena),
+                BoundSlot::Min(r) => Min::<A>::seed(r.read(idx), arena),
+                BoundSlot::Max(r) => Max::<A>::seed(r.read(idx), arena),
+                BoundSlot::StrMin(a) => StrMin::<A>::seed(StrRead::read(a, idx), arena),
+                BoundSlot::StrMax(a) => StrMax::<A>::seed(StrRead::read(a, idx), arena),
             }),
         }
     }
@@ -139,27 +143,20 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
         cfg: &Self::MergeConfig,
     ) -> Self {
         let (_, shared) = cfg;
-        // Indexes the parallel cells / reader arrays by slot.
+        // Every arm is `Op::<A>::update(c, <read>, arena, <cfg>)`: cell `A` in, `A`
+        // out, for numeric and string alike. The read value and the cfg differ by
+        // op (each declares its own `Read::Val` / `Fold::Cfg`); the container does
+        // not — no reinterpret, no string branch.
         #[allow(clippy::needless_range_loop)]
         for s in 0..N {
             let c = self.cells[s];
             self.cells[s] = match &reader[s] {
-                BoundSlot::Count => Count::<A>::update(c, &(), idx, arena, &()),
-                BoundSlot::SumI16(a) => Sum::<Int16Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::SumI32(a) => Sum::<Int32Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::SumI64(a) => Sum::<Int64Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::MinI16(a) => Min::<Int16Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::MinI32(a) => Min::<Int32Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::MinI64(a) => Min::<Int64Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::MaxI16(a) => Max::<Int16Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::MaxI32(a) => Max::<Int32Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::MaxI64(a) => Max::<Int64Type, A>::update(c, a, idx, arena, &()),
-                BoundSlot::StrMin(a) => {
-                    A::from_key(StrMin::update(c.into_key(), a, idx, arena, shared))
-                }
-                BoundSlot::StrMax(a) => {
-                    A::from_key(StrMax::update(c.into_key(), a, idx, arena, shared))
-                }
+                BoundSlot::Count => Count::<A>::update(c, (), arena, &()),
+                BoundSlot::Sum(r) => Sum::<A>::update(c, r.read(idx), arena, &()),
+                BoundSlot::Min(r) => Min::<A>::update(c, r.read(idx), arena, &()),
+                BoundSlot::Max(r) => Max::<A>::update(c, r.read(idx), arena, &()),
+                BoundSlot::StrMin(a) => StrMin::<A>::update(c, StrRead::read(a, idx), arena, shared),
+                BoundSlot::StrMax(a) => StrMax::<A>::update(c, StrRead::read(a, idx), arena, shared),
             };
         }
         self
@@ -169,27 +166,19 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
     fn merge(self, other: Self, cfg: &Self::MergeConfig) -> Self {
         let (slots, shared) = cfg;
         Self {
+            // Each slot combines via its op's own `merge` (no column reader). Same
+            // uniform shape as the consume fold — `Op::<A>::merge(a, b, cfg)`.
             cells: std::array::from_fn(|s| {
                 let (a, b) = (self.cells[s], other.cells[s]);
-                // Combine two finished cells via each op's own `merge` — the same
-                // ops the consume path folds with. The partition merge has no
-                // column reader, but a numeric op's `merge` is width-independent
-                // (it folds two already-materialised `A`s), so the integer ops are
-                // named at an arbitrary width; a string extreme resolves both keys
-                // through the value arena.
                 match slots[s].kind {
                     AggregationKind::CountStar | AggregationKind::Count => {
                         Count::<A>::merge(a, b, &())
                     }
-                    AggregationKind::Sum => Sum::<Int64Type, A>::merge(a, b, &()),
-                    AggregationKind::Min => Min::<Int64Type, A>::merge(a, b, &()),
-                    AggregationKind::Max => Max::<Int64Type, A>::merge(a, b, &()),
-                    AggregationKind::StrMin => {
-                        A::from_key(StrMin::merge(a.into_key(), b.into_key(), shared))
-                    }
-                    AggregationKind::StrMax => {
-                        A::from_key(StrMax::merge(a.into_key(), b.into_key(), shared))
-                    }
+                    AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
+                    AggregationKind::Min => Min::<A>::merge(a, b, &()),
+                    AggregationKind::Max => Max::<A>::merge(a, b, &()),
+                    AggregationKind::StrMin => StrMin::<A>::merge(a, b, shared),
+                    AggregationKind::StrMax => StrMax::<A>::merge(a, b, shared),
                 }
             }),
         }
@@ -197,9 +186,8 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
 
     #[inline(always)]
     fn sort_key(&self, slot: usize) -> i128 {
-        // Numeric cells widen to their `ORDER BY` key. A string extreme never
-        // feeds a top-k (the planner doesn't push one), so its raw view bits here
-        // are inert — never compared.
+        // Numeric cells widen to their `ORDER BY` key. A string extreme never feeds
+        // a top-k (the planner doesn't push one), so its raw bits here are inert.
         self.cells[slot].into()
     }
 
@@ -224,10 +212,17 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
         let mut arrays = Vec::with_capacity(N);
         for (s, col) in cols.into_iter().enumerate() {
             let name = format!("v{s}");
-            let (f, a) = if slots[s].kind.is_string_extreme() {
-                A::finish_strings(&name, col, arena)
-            } else {
-                A::finish(&name, col)
+            // Each op renders its own column (numeric → its width's Arrow type,
+            // string → `Utf8View`) — same `Op::<A>::finish` shape.
+            let (f, a) = match slots[s].kind {
+                AggregationKind::CountStar | AggregationKind::Count => {
+                    Count::<A>::finish(&name, col, arena)
+                }
+                AggregationKind::Sum => Sum::<A>::finish(&name, col, arena),
+                AggregationKind::Min => Min::<A>::finish(&name, col, arena),
+                AggregationKind::Max => Max::<A>::finish(&name, col, arena),
+                AggregationKind::StrMin => StrMin::<A>::finish(&name, col, arena),
+                AggregationKind::StrMax => StrMax::<A>::finish(&name, col, arena),
             };
             fields.push(f);
             arrays.push(a);

@@ -52,6 +52,9 @@
 // `KeyExtractor` impl links to the trait). That's intentional here — we're not
 // a published API — so allow public docs to reference private items.
 #![allow(rustdoc::private_intra_doc_links)]
+// Slot types are `(Read, Fold)` tuples, so a `Compiled<…>` signature nests one
+// level deeper than before; bump the monomorphisation recursion limit to suit.
+#![recursion_limit = "256"]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
@@ -97,11 +100,12 @@ pub use operations::channels::{
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
-    Aggregation, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count,
-    Distinct, Dynamic, DynamicFilterSlot, HashOnlyIntKeyExtractor, IntKeyExtractor,
-    IntPairKeyExtractor, Max, Min, Nullary, NullaryFactory, NullaryOperatorFactory, Numeric,
-    NumericArrow, OpTuple, Operator, OrderBy, Result as OperatorResult, RowKeyExtractor,
-    RowKeySchema, StrMax, StrMin, StringKeyExtractor, Sum, WideSum,
+    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
+    Dynamic, DynamicFilterSlot, Fold, FoldAcc, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor,
+    IntRead, Max, MaxSlot, Min, MinSlot, NoRead, Nullary, NullaryFactory, NullaryOperatorFactory,
+    Numeric, NumericArrow, OpTuple, Operator, OrderBy, Read, Result as OperatorResult,
+    RowKeyExtractor, RowKeySchema, Slot, StrMax, StrMaxSlot, StrMin, StrMinSlot, StrRead,
+    StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,

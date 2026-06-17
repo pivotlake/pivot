@@ -120,12 +120,12 @@ fn fold_in<A: Numeric>(kind: AggregationKind, acc: Option<A>, c: Option<A>) -> O
 /// planning, so it never reaches here.
 #[inline(always)]
 fn merge_pair<A: Numeric>(kind: AggregationKind, a: A, b: A) -> A {
-    use crate::operations::unary::group::{Aggregation, Count, Max, Min, Sum};
+    use crate::operations::unary::group::{Count, FoldAcc, Max, Min, Sum};
     match kind {
         AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b, &()),
-        AggregationKind::Sum => Sum::<Int64Type, A>::merge(a, b, &()),
-        AggregationKind::Min => Min::<Int64Type, A>::merge(a, b, &()),
-        AggregationKind::Max => Max::<Int64Type, A>::merge(a, b, &()),
+        AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
+        AggregationKind::Min => Min::<A>::merge(a, b, &()),
+        AggregationKind::Max => Max::<A>::merge(a, b, &()),
         AggregationKind::StrMin | AggregationKind::StrMax => {
             unreachable!("global string extreme is rejected during planning")
         }

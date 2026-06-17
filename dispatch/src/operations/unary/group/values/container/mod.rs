@@ -12,4 +12,6 @@ mod slot;
 
 pub use compiled::{Compiled, OpTuple};
 pub use dynamic::Dynamic;
-pub use slot::Slot;
+pub use slot::{
+    CountSlot, MaxSlot, MinSlot, Slot, StrMaxSlot, StrMinSlot, SumSlot,
+};

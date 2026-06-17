@@ -27,9 +27,11 @@ pub mod container;
 pub mod distinct;
 pub mod read;
 
-pub use aggregation::{Count, Fold, Max, Min, StrMax, StrMin, Sum, WideSum};
+pub use aggregation::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
 pub use cell::{Cell, Numeric, NumericArrow};
-pub use container::{Compiled, Dynamic, OpTuple};
+pub use container::{
+    Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, Slot, StrMaxSlot, StrMinSlot, SumSlot,
+};
 pub use distinct::Distinct;
 pub use read::{IntRead, NoRead, Read, StrRead};
 

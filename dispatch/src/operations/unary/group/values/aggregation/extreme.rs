@@ -2,7 +2,7 @@
 //! [`Read`](super::super::read) yields. They fold exactly as [`Sum`](super::Sum)
 //! reads and differ only in the keep (`Ord::min` / `Ord::max`).
 
-use super::Fold;
+use super::{Fold, FoldAcc};
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::values::cell::Numeric;
@@ -12,27 +12,18 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// `MIN`, accumulating in width `A`.
-pub struct Min<A = i64>(PhantomData<fn() -> A>);
+pub struct Min<A = i64>(PhantomData<A>);
 /// `MAX`, accumulating in width `A`.
-pub struct Max<A = i64>(PhantomData<fn() -> A>);
+pub struct Max<A = i64>(PhantomData<A>);
 
 macro_rules! int_extreme {
     ($Op:ident, $keep:ident) => {
-        impl<A: Numeric> Fold<i64> for $Op<A> {
+        impl<A: Numeric> FoldAcc for $Op<A> {
             type Acc = A;
             type Cfg = ();
 
             #[inline(always)]
             fn cfg(_arena: &Arc<SharedArena>) {}
-
-            #[inline(always)]
-            fn seed(v: i64, _arena: &mut WorkerArena) -> A {
-                A::from(v)
-            }
-            #[inline(always)]
-            fn update(acc: A, v: i64, _arena: &mut WorkerArena, _cfg: &()) -> A {
-                Ord::$keep(acc, A::from(v))
-            }
             #[inline(always)]
             fn merge(a: A, b: A, _cfg: &()) -> A {
                 Ord::$keep(a, b)
@@ -47,6 +38,17 @@ macro_rules! int_extreme {
                 _arena: &Arc<SharedArena>,
             ) -> (Field, ArrayRef) {
                 A::finish(name, col)
+            }
+        }
+
+        impl<A: Numeric> Fold<i64> for $Op<A> {
+            #[inline(always)]
+            fn seed(v: i64, _arena: &mut WorkerArena) -> A {
+                A::from(v)
+            }
+            #[inline(always)]
+            fn update(acc: A, v: i64, _arena: &mut WorkerArena, _cfg: &()) -> A {
+                Ord::$keep(acc, A::from(v))
             }
         }
     };

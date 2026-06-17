@@ -1,77 +1,76 @@
-//! [`StrMin`] / [`StrMax`] — string extremes, folding the `&str` their
-//! [`Read`](super::super::read::StrRead) *borrows* from the column. Because the
-//! fold holds the real `&str`, it compares *before* persisting and only a winner
-//! ever touches the value arena (lazy). The cell is an [`ArenaKey`]; `finish`
-//! emits a zero-copy `Utf8View` array into the arena's ring buffers.
+//! [`StrMin<A>`](StrMin) / [`StrMax<A>`](StrMax) — string extremes, folding the
+//! `&str` their [`Read`](super::super::read::StrRead) *borrows* from the column.
+//!
+//! The accumulator is the plain cell width `A`: an [`ArenaKey`] is just a 128-bit
+//! value, so a string extreme rides the same `A` (`= i128`) cell a numeric slot
+//! uses — no separate cell type, no container reinterpret. Viewing those 128 bits
+//! as a key is *this op's* business, via [`StringCell`] (the identity for `i128`,
+//! the fail-out for `i64`). Because the fold holds the real `&str`, it compares
+//! *before* persisting, so only a winner ever touches the value arena (lazy).
 
-use super::Fold;
+use super::{Fold, FoldAcc};
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::keys::ArenaKey;
-use arrow_array::{ArrayRef, StringViewArray};
-use arrow_buffer::ScalarBuffer;
-use arrow_schema::{DataType, Field};
+use crate::operations::unary::group::values::cell::StringCell;
+use arrow_array::ArrayRef;
+use arrow_schema::Field;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// `MIN` over a string column.
-pub struct StrMin;
+/// `MIN` over a string column, the winning key held in cell width `A`.
+pub struct StrMin<A = i128>(PhantomData<A>);
 /// `MAX` over a string column.
-pub struct StrMax;
+pub struct StrMax<A = i128>(PhantomData<A>);
 
 macro_rules! str_extreme {
     ($Op:ident, $wins:tt) => {
-        impl<'b> Fold<&'b str> for $Op {
-            type Acc = ArenaKey;
+        // Lifetime-free: a container names `StrMin`'s `Acc`/`Cfg`/`merge` without
+        // touching the borrowed-`&str` `Fold` bound below.
+        impl<A: StringCell> FoldAcc for $Op<A> {
+            type Acc = A;
             type Cfg = Arc<SharedArena>;
 
             #[inline(always)]
             fn cfg(arena: &Arc<SharedArena>) -> Arc<SharedArena> {
                 arena.clone()
             }
-
             #[inline(always)]
-            fn seed(v: &str, arena: &mut WorkerArena) -> ArenaKey {
-                arena.push(v)
-            }
-            #[inline(always)]
-            fn update(
-                acc: ArenaKey,
-                v: &str,
-                arena: &mut WorkerArena,
-                cfg: &Arc<SharedArena>,
-            ) -> ArenaKey {
-                // Raw bytes vs the current extreme; persist only a winner.
-                if v.as_bytes() $wins acc.resolve(cfg) {
-                    arena.push(v)
+            fn merge(a: A, b: A, cfg: &Arc<SharedArena>) -> A {
+                if b.into_key().resolve(cfg) $wins a.into_key().resolve(cfg) {
+                    b
                 } else {
-                    acc
+                    a
                 }
             }
             #[inline(always)]
-            fn merge(a: ArenaKey, b: ArenaKey, cfg: &Arc<SharedArena>) -> ArenaKey {
-                if b.resolve(cfg) $wins a.resolve(cfg) { b } else { a }
-            }
-            #[inline(always)]
-            fn sort_key(acc: ArenaKey) -> i128 {
+            fn sort_key(acc: A) -> i128 {
                 // Raw view bits, not lexicographic — a string extreme never feeds
                 // an `ORDER BY <agg>` top-k (the planner doesn't push one).
-                acc.as_u128() as i128
+                acc.into_key().as_u128() as i128
             }
             fn finish(
                 name: &str,
-                col: SlabColumn<ArenaKey>,
+                col: SlabColumn<A>,
                 arena: &Arc<SharedArena>,
             ) -> (Field, ArrayRef) {
-                let len = col.len();
-                // `ArenaKey` is a transparent `u128`; reinterpret the slab as
-                // StringView headers (zero-copy) over the arena's ring buffers.
-                let views = ScalarBuffer::<u128>::new(col.into_buffer(), 0, len);
-                let buffers = arena.to_arrow_buffers();
-                // Safety: the views are valid ArenaKeys and the arena (Arc-held in
-                // each Buffer) outlives the array — same contract as string keys.
-                let arr: ArrayRef =
-                    Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
-                (Field::new(name, DataType::Utf8View, false), arr)
+                A::finish_strings(name, col, arena)
+            }
+        }
+
+        impl<'b, A: StringCell> Fold<&'b str> for $Op<A> {
+            #[inline(always)]
+            fn seed(v: &str, arena: &mut WorkerArena) -> A {
+                A::from_key(arena.push(v))
+            }
+            #[inline(always)]
+            fn update(acc: A, v: &str, arena: &mut WorkerArena, cfg: &Arc<SharedArena>) -> A {
+                // Raw bytes vs the current extreme (the cell viewed as a key);
+                // persist only a winner.
+                if v.as_bytes() $wins acc.into_key().resolve(cfg) {
+                    A::from_key(arena.push(v))
+                } else {
+                    acc
+                }
             }
         }
     };

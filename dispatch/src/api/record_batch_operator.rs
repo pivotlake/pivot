@@ -58,7 +58,8 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationKind, AggregationSlot, AggregationValue, Compiled, CopyOutFactory,
-    Count, CountFactory, Distinct, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor,
+    CountFactory, CountSlot, Distinct, DynamicFilterSlot, FilterFactory, GroupFactory,
+    KeyExtractor,
     MapFactory, NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory,
     UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
@@ -547,7 +548,7 @@ impl RecordBatchOperatorSpec {
     /// ```
     pub fn group_by_count<K: KeyExtractor<Config: Default>>(self, group_column: usize) -> Self {
         // `COUNT(*)` is one aggregate slot whose column is unused.
-        self.group_by_aggregate::<K, Compiled<(Count,)>>(
+        self.group_by_aggregate::<K, Compiled<(CountSlot,)>>(
             vec![group_column],
             vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
             None,

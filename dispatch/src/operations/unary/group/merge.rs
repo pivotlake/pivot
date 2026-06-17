@@ -296,7 +296,7 @@ mod tests {
     };
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
-        AggregationKind, AggregationSlot, AggregationValue, Compiled, Count,
+        AggregationKind, AggregationSlot, AggregationValue, Compiled, CountSlot,
     };
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
@@ -306,7 +306,7 @@ mod tests {
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
     // A single `COUNT` slot. Its `MergeConfig` is `((),)` (the op tuple's cfgs).
-    type CountValue = Compiled<(Count,)>;
+    type CountValue = Compiled<(CountSlot,)>;
     // The `CountValue` merge config: a 1-tuple of the `Count` op's unit cfg.
     const COUNT_CFG: <CountValue as AggregationValue>::MergeConfig = ((),);
 

@@ -6,14 +6,31 @@
 //! method is the same `F::_(R::read(input, idx), …)`. The `(R, F)` product is
 //! formed here, once, by the blanket impl — not enumerated per (op, width).
 
-use super::super::aggregation::Fold;
+use super::super::aggregation::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum};
 use super::super::cell::Cell;
-use super::super::read::Read;
+use super::super::read::{IntRead, NoRead, Read, StrRead};
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
+use std::marker::PhantomData;
 use std::sync::Arc;
+
+/// A `(Read, Fold)` pair as one *nominal* type. A bare `(R, F)` tuple would do,
+/// but nesting tuples inside a `Compiled<…>` signature blows the monomorphisation
+/// collector when that value flows through the top-k heap; a named struct keeps
+/// the type shallow.
+pub struct Pair<R, F>(PhantomData<R>, PhantomData<F>);
+
+/// Slot aliases — a [`Pair`] named by what it computes, so signatures read
+/// `Compiled<(SumSlot<Int32Type>, CountSlot)>` instead of the raw pairs.
+pub type CountSlot<A = i64> = Pair<NoRead, Count<A>>;
+/// `SUM(col: T)` accumulating in `A` (`SumSlot<T, i128>` is the wide sum).
+pub type SumSlot<T, A = i64> = Pair<IntRead<T>, Sum<A>>;
+pub type MinSlot<T, A = i64> = Pair<IntRead<T>, Min<A>>;
+pub type MaxSlot<T, A = i64> = Pair<IntRead<T>, Max<A>>;
+pub type StrMinSlot<A = i128> = Pair<StrRead, StrMin<A>>;
+pub type StrMaxSlot<A = i128> = Pair<StrRead, StrMax<A>>;
 
 /// The bundled per-slot interface a container drives. One impl: the blanket over
 /// `(R, F)` below. A container never names `Read`/`Fold` directly — it folds
@@ -42,52 +59,50 @@ pub trait Slot: Send + Sync + 'static {
     ) -> (Field, ArrayRef);
 }
 
-/// Any read paired with any fold over the value it yields. `Acc`/`Cfg` are impl
-/// params constrained by the higher-ranked bound, which also *asserts* they don't
-/// depend on the read's lifetime (the `Acc = Acc, Cfg = Cfg` equalities hold
-/// `for<'b>`), so a container can name them lifetime-free.
-impl<R, F, Acc, Cfg> Slot for (R, F)
+/// Any read paired with any fold over the value it yields. `Acc`/`Cfg`/`merge`/
+/// `finish` come from [`FoldAcc`] — lifetime-free, so naming them never touches
+/// the `for<'b> Fold<…>` bound a borrowed read value forces. Only `seed`/`update`
+/// (which actually consume the read value) go through [`Fold`].
+impl<R, F> Slot for Pair<R, F>
 where
     R: Read,
-    Acc: Cell,
-    Cfg: Clone + Send + Sync + 'static,
-    F: for<'b> Fold<R::Val<'b>, Acc = Acc, Cfg = Cfg>,
+    F: FoldAcc + for<'b> Fold<R::Val<'b>>,
 {
-    type Acc = Acc;
+    type Acc = F::Acc;
     type Input<'b> = R::Input<'b>;
-    type Cfg = Cfg;
+    type Cfg = F::Cfg;
 
     #[inline(always)]
-    fn cfg(arena: &Arc<SharedArena>) -> Cfg {
-        <F as Fold<R::Val<'static>>>::cfg(arena)
+    fn cfg(arena: &Arc<SharedArena>) -> F::Cfg {
+        F::cfg(arena)
     }
     #[inline(always)]
     fn bind(batch: &RecordBatch, column: usize) -> R::Input<'_> {
         R::bind(batch, column)
     }
     #[inline(always)]
-    fn seed(input: &R::Input<'_>, idx: usize, arena: &mut WorkerArena) -> Acc {
+    fn seed(input: &R::Input<'_>, idx: usize, arena: &mut WorkerArena) -> F::Acc {
         F::seed(R::read(input, idx), arena)
     }
     #[inline(always)]
     fn update(
-        acc: Acc,
+        acc: F::Acc,
         input: &R::Input<'_>,
         idx: usize,
         arena: &mut WorkerArena,
-        cfg: &Cfg,
-    ) -> Acc {
+        cfg: &F::Cfg,
+    ) -> F::Acc {
         F::update(acc, R::read(input, idx), arena, cfg)
     }
     #[inline(always)]
-    fn merge(a: Acc, b: Acc, cfg: &Cfg) -> Acc {
-        <F as Fold<R::Val<'static>>>::merge(a, b, cfg)
+    fn merge(a: F::Acc, b: F::Acc, cfg: &F::Cfg) -> F::Acc {
+        F::merge(a, b, cfg)
     }
     #[inline(always)]
-    fn sort_key(acc: Acc) -> i128 {
-        <F as Fold<R::Val<'static>>>::sort_key(acc)
+    fn sort_key(acc: F::Acc) -> i128 {
+        F::sort_key(acc)
     }
-    fn finish(name: &str, col: SlabColumn<Acc>, arena: &Arc<SharedArena>) -> (Field, ArrayRef) {
-        <F as Fold<R::Val<'static>>>::finish(name, col, arena)
+    fn finish(name: &str, col: SlabColumn<F::Acc>, arena: &Arc<SharedArena>) -> (Field, ArrayRef) {
+        F::finish(name, col, arena)
     }
 }
