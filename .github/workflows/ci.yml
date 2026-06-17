@@ -18,8 +18,9 @@ env:
 
 # The self-hosted runners live on the suspended `ci-runner-x86` GCP VM
 # (pivot-ci / me-west1-c) and advertise the `gcp-builder` label. Opting in
-# (workflow_dispatch with use_gcp_runner=true) resumes the VM, routes the matrix
-# there, then suspends it again. Every other trigger (push, PR) stays on
+# (workflow_dispatch with use_gcp_runner=true) resumes the VM and routes the
+# matrix there; the box's own hourly suspend-if-unused cron suspends it again once
+# no ci/deploy run is active. Every other trigger (push, PR) stays on
 # GitHub-hosted `ubuntu-latest` and skips the GCP jobs entirely.
 jobs:
   # Resume the GCP VM so its runners come online before the matrix dispatches.
@@ -117,23 +118,7 @@ jobs:
 
       - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
 
-  # Suspend the VM again once the matrix finishes (success or failure), so an
-  # opt-in run doesn't leave it billing. Only runs when we actually started it.
-  stop-ci:
-    name: Stop GCP runner
-    needs: [start-ci, check]
-    if: ${{ always() && inputs.use_gcp_runner }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: pivot-ci
-      - name: Suspend ci-runner-x86
-        run: |
-          gcloud compute instances suspend ci-runner-x86 \
-            --project=pivot-ci \
-            --zone=me-west1-c
+  # NOTE: we deliberately do NOT suspend the VM here. ci-runner-x86 runs an hourly
+  # `suspend-if-unused` cron that suspends it only when no ci/deploy run is active
+  # (across pivotdb + epsio). An unconditional stop job here would suspend the box
+  # out from under a *concurrent* ci/deploy run still using it.
