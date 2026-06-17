@@ -115,7 +115,18 @@ jobs:
             fi
           done
 
-      - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
+      # The self-hosted GCP runner ships a tiny RLIMIT_MEMLOCK (64KB). The dispatch
+      # workers register io_uring fixed buffers (tens of MB) during startup, which
+      # fails under that cap — the worker dies before its readiness barrier and the
+      # engine hangs forever in Dispatch::spin_up. Lift the limit in-place for this
+      # step (root via sudo can raise the hard cap); ./ci.sh and the test binaries it
+      # spawns inherit it. Skipped on GitHub-hosted runners, which already allow it.
+      - name: Run ${{ matrix.check }} (${{ matrix.crate }})
+        run: |
+          if [ "${{ needs.matrix.outputs.runner }}" = "gcp-builder" ]; then
+            sudo prlimit --memlock=unlimited:unlimited --pid $$
+          fi
+          ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
 
   # Suspend the VM again once the matrix finishes (success or failure), so an
   # opt-in run doesn't leave it billing. Only runs when we actually started it.

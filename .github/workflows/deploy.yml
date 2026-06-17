@@ -7,9 +7,15 @@ on:
         description: "Destination GCS bucket (overrides the DEPLOY_GCS_BUCKET repo variable). e.g. gs://my-bucket/path"
         required: false
         default: ""
+      use_gcp_runner:
+        description: "Build the x86_64 binary on the self-hosted GCP runner (ci-runner-x86) instead of a GitHub-hosted runner. The aarch64 build always uses a hosted arm64 runner."
+        type: boolean
+        default: false
 
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
+#                 For use_gcp_runner it also needs compute resume/suspend on
+#                 ci-runner-x86 (instance-scoped compute.instanceAdmin.v1 is enough).
 # Required repository variables (unless overridden via the `bucket` input):
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
 
@@ -17,9 +23,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Resume the self-hosted GCP VM (ci-runner-x86) when opted in, so its gcp-builder
+  # runners are online for the x86_64 build. Only the x86_64 leg can use it (the
+  # box is X64); the aarch64 leg always builds on a hosted arm64 runner.
+  start-ci:
+    name: Start GCP runner
+    if: ${{ inputs.use_gcp_runner }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: pivot-ci
+      - name: Resume ci-runner-x86
+        run: |
+          gcloud compute instances resume ci-runner-x86 \
+            --project=pivot-ci --zone=me-west1-c
+
   deploy:
+    needs: start-ci
+    # start-ci is skipped unless opted in, so accept its skipped result.
+    if: ${{ always() && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
     name: Build ${{ matrix.arch }} release + upload to GCS
-    runs-on: ${{ matrix.runner }}
+    # x86_64 can run on the self-hosted gcp-builder when opted in; aarch64 always
+    # uses a hosted arm64 runner (the box is X64-only).
+    runs-on: ${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' && 'gcp-builder' || matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -85,3 +116,23 @@ jobs:
           echo "Uploaded to:"
           echo "  $BUCKET/pivotdb-server-$ARCH-$SHA"
           echo "  $BUCKET/pivotdb-server-$ARCH-latest"
+
+  # Suspend the VM again once the build finishes (success or failure), but only
+  # when we actually started it.
+  stop-ci:
+    name: Stop GCP runner
+    needs: [start-ci, deploy]
+    if: ${{ always() && inputs.use_gcp_runner }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: pivot-ci
+      - name: Suspend ci-runner-x86
+        run: |
+          gcloud compute instances suspend ci-runner-x86 \
+            --project=pivot-ci --zone=me-west1-c
