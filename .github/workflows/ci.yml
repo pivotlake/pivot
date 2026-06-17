@@ -5,32 +5,75 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      use_gcp_runner:
+        description: "Run the check matrix on the self-hosted GCP runner (ci-runner-x86) instead of GitHub-hosted runners."
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
 
+# The self-hosted runners live on the suspended `ci-runner-x86` GCP VM
+# (pivot-ci / me-west1-c) and advertise the `gcp-builder` label. Opting in
+# (workflow_dispatch with use_gcp_runner=true) resumes the VM, routes the matrix
+# there, then suspends it again. Every other trigger (push, PR) stays on
+# GitHub-hosted `ubuntu-latest` and skips the GCP jobs entirely.
 jobs:
+  # Resume the GCP VM so its runners come online before the matrix dispatches.
+  # Jobs targeting `gcp-builder` queue until a runner connects, so we only need
+  # to kick the VM awake here — no SSH/readiness wait required.
+  start-ci:
+    name: Start GCP runner
+    if: ${{ inputs.use_gcp_runner }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: pivot-ci
+      - name: Resume ci-runner-x86
+        run: |
+          gcloud compute instances resume ci-runner-x86 \
+            --project=pivot-ci \
+            --zone=me-west1-c
+
   # Derive the check×crate matrix from ci.sh so the crate/check lists live in
-  # exactly one place (shared with local `./ci.sh` runs).
+  # exactly one place (shared with local `./ci.sh` runs). Also resolve which
+  # runner label the matrix should target, based on the opt-in input.
   matrix:
     name: Matrix
     runs-on: ubuntu-latest
     outputs:
       cells: ${{ steps.gen.outputs.cells }}
+      runner: ${{ steps.runner.outputs.label }}
     steps:
       - uses: actions/checkout@v4
       - id: gen
         run: echo "cells=$(./ci.sh --matrix)" >> "$GITHUB_OUTPUT"
+      - id: runner
+        run: |
+          if [ "${{ inputs.use_gcp_runner }}" = "true" ]; then
+            echo "label=gcp-builder" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          fi
 
   # One job per (check, crate) cell — each runs the same ./ci.sh used locally,
   # but shows up separately in the UI (e.g. "clippy (planner)") so a failure
   # points at the exact check and crate.
   check:
-    needs: matrix
+    needs: [matrix, start-ci]
+    # Run once the matrix is computed and the VM is up — but `start-ci` is
+    # skipped on push/PR, so accept its skipped result too.
+    if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
     name: ${{ matrix.check }} (${{ matrix.crate }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ needs.matrix.outputs.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,3 +116,24 @@ jobs:
           done
 
       - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
+
+  # Suspend the VM again once the matrix finishes (success or failure), so an
+  # opt-in run doesn't leave it billing. Only runs when we actually started it.
+  stop-ci:
+    name: Stop GCP runner
+    needs: [start-ci, check]
+    if: ${{ always() && inputs.use_gcp_runner }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: pivot-ci
+      - name: Suspend ci-runner-x86
+        run: |
+          gcloud compute instances suspend ci-runner-x86 \
+            --project=pivot-ci \
+            --zone=me-west1-c
