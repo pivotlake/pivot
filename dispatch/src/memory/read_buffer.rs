@@ -61,14 +61,47 @@ impl Drop for ReadBuffer {
 ///
 /// The `WriteBuffer` is forgotten (its `Drop` is skipped) and the slot's `used`
 /// count is set to 1 (one reader). The pointer is reused as-is — no copy occurs.
+///
+/// The slot is also marked **not zeroed**: a buffer only becomes a `ReadBuffer`
+/// once it has been (or is about to be) filled with data, so its `zeroed` flag
+/// must no longer claim it holds zeros. Skipping this leaks a stale `zeroed=true`
+/// onto a data-bearing slot; when that slot is later evicted and reused as a
+/// "pre-zeroed" write buffer (e.g. a group-by hash table that relies on
+/// `hash == 0` empty slots), the allocator trusts the flag, skips zeroing, and
+/// hands out uninitialized memory — defeating the empty-slot sentinel and
+/// sending the linear probe into an infinite loop.
 impl From<WriteBuffer> for ReadBuffer {
     fn from(value: WriteBuffer) -> Self {
         let ptr = value.ptr;
         let slot_idx = value.slot_idx;
         std::mem::forget(value);
-        memory_ctx()
-            .ring()
-            .set_slot_used(slot_idx, 1, Ordering::Release);
+        let ring = memory_ctx().ring();
+        ring.set_slot_zeroed(slot_idx, false);
+        ring.set_slot_used(slot_idx, 1, Ordering::Release);
         Self { ptr, slot_idx }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReadBuffer;
+    use crate::memory::init_test_free_pool;
+    use crate::memory_ctx;
+
+    /// A slot that has been filled and handed out for reading must no longer
+    /// claim to be zeroed — otherwise the next caller that re-acquires it as a
+    /// "pre-zeroed" buffer (e.g. a group-by hash table relying on `hash == 0`
+    /// empty slots) gets uninitialized memory.
+    #[test]
+    fn slot_is_not_marked_zeroed_after_becoming_a_read_buffer() {
+        init_test_free_pool(1);
+        memory_ctx().get_write_buffer(false).zero_out();
+        let write = memory_ctx().get_write_buffer(true);
+        let slot = write.slot_idx;
+        assert!(write.zeroed, "precondition: started from a zeroed slot");
+
+        drop(ReadBuffer::from(write));
+
+        assert!(!memory_ctx().ring().try_write(slot).unwrap().zeroed);
     }
 }
