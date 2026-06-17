@@ -103,6 +103,7 @@ fn emit<K, V, Snd>(
     key_arena: &Arc<SharedArena>,
     value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
+    merge_config: &V::MergeConfig,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -111,7 +112,7 @@ where
     Snd: Sender<RecordBatch>,
 {
     let (mut fields, mut columns) = keys.finish(key_arena, allocator);
-    let (value_fields, value_columns) = V::finish_columns(values, value_arena);
+    let (value_fields, value_columns) = V::finish_columns(values, value_arena, merge_config);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -129,6 +130,7 @@ fn emit_chunks<K, V, Snd, I>(
     value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
+    merge_config: &V::MergeConfig,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -147,7 +149,15 @@ where
             keys.push(&key);
             value.push_to(&mut values);
         }
-        emit::<K, V, Snd>(keys, values, key_arena, value_arena, allocator, sender)?;
+        emit::<K, V, Snd>(
+            keys,
+            values,
+            key_arena,
+            value_arena,
+            allocator,
+            merge_config,
+            sender,
+        )?;
         remaining -= chunk;
     }
     Ok(())
@@ -166,6 +176,7 @@ pub(crate) fn build_and_send<K, V, S, Snd>(
     value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
+    merge_config: &V::MergeConfig,
     top_k: Option<(usize, usize)>,
     count_only: bool,
     sender: &mut Snd,
@@ -201,6 +212,7 @@ where
                 value_arena,
                 allocator,
                 key_config,
+                merge_config,
                 sender,
             )
         }
@@ -214,6 +226,7 @@ where
                 value_arena,
                 allocator,
                 key_config,
+                merge_config,
                 sender,
             )
         }

@@ -57,9 +57,9 @@ use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::{
-    AggregateFactory, AggregationKind, AggregationSlot, AggregationValue, Cell, CompiledMixed,
-    CopyOutFactory, Count, CountFactory, Distinct, DynamicFilterSlot, FilterFactory, GroupFactory,
-    KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
+    AggregateFactory, AggregationKind, AggregationSlot, AggregationValue, Compiled, CopyOutFactory,
+    Count, CountFactory, Distinct, DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor,
+    MapFactory, NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory,
     UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle};
@@ -473,7 +473,7 @@ impl RecordBatchOperatorSpec {
     /// columns, computed in a single pass. Emits one single-row output column
     /// per slot (`Decimal128(38, 0)` for SUM, `Int64` for COUNT). `AVG` arrives
     /// pre-lowered to a SUM slot + a COUNT slot with a downstream divide.
-    pub fn aggregate<A: Cell>(self, slots: Vec<AggregationSlot>) -> Self {
+    pub fn aggregate<A: Numeric>(self, slots: Vec<AggregationSlot>) -> Self {
         let worker_count = self.worker_count();
         self.unary(AggregateFactory::<A>::create_for_workers(
             slots,
@@ -547,7 +547,7 @@ impl RecordBatchOperatorSpec {
     /// ```
     pub fn group_by_count<K: KeyExtractor<Config: Default>>(self, group_column: usize) -> Self {
         // `COUNT(*)` is one aggregate slot whose column is unused.
-        self.group_by_aggregate::<K, CompiledMixed<(Count,), 1>>(
+        self.group_by_aggregate::<K, Compiled<(Count,)>>(
             vec![group_column],
             vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
             None,

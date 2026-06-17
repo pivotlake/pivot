@@ -52,7 +52,11 @@ impl AggregationValue for Distinct {
     #[inline(always)]
     fn push_to(&self, _cols: &mut ()) {}
 
-    fn finish_columns(_cols: (), _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish_columns(
+        _cols: (),
+        _arena: &Arc<SharedArena>,
+        _cfg: &(),
+    ) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
     }
 }

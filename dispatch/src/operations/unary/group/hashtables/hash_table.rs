@@ -383,7 +383,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     /// A new entry just stores the value; an existing one folds via the value's
     /// own [`merge`](AggregationValue::merge) (so two finished partials combine —
     /// the partition-merge and radix paths). Thin wrapper over
-    /// [`probe_fold`](Self::probe_fold) with an already-materialised value.
+    /// [`probe_fold`](Self::probe_fold), carrying the value in as the context.
     #[inline(always)]
     pub fn merge<const COUNT_COLLISIONS: bool, L>(
         &mut self,
@@ -394,32 +394,40 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     ) where
         L: LiveKey<Persisted = K>,
     {
-        self.probe_fold::<COUNT_COLLISIONS, L, _>(hash, key, |cell, is_new| {
-            *cell = if is_new {
-                value
-            } else {
-                cell.merge(value, cfg)
-            };
-        });
+        self.probe_fold::<COUNT_COLLISIONS, L, V, _, _>(
+            hash,
+            key,
+            value,
+            |value, cell| *cell = value,
+            |value, cell| *cell = cell.merge(value, cfg),
+        );
     }
 
-    /// Probe for `hash`/`key`, then fold the value at the matched (or freshly
-    /// inserted) slot via `fold`, which receives `(&mut value, is_new)`. One
-    /// probe-and-fold pass: the value reference comes straight from the matched
-    /// entry, with no second slot lookup.
+    /// Probe for `hash`/`key`, then initialise or fold the value at the matched
+    /// slot — one probe-and-fold pass, the value reference handed straight from
+    /// the matched entry (no second slot lookup). A freshly inserted slot calls
+    /// `seed` (its value is `Default` until then); an existing one calls `update`.
+    /// Splitting the two avoids a per-row `is_new` branch and lets each do only
+    /// its own work (a string extreme's `update` can skip persisting a loser).
     ///
-    /// This is the single primitive behind both phases. The merge phase passes a
-    /// closure that folds an already-materialised partial in ([`merge`](Self::merge));
-    /// the consume path passes one that reads the row from the batch and, for a
-    /// string extreme, persists it lazily into the *value* arena. `fold` runs
-    /// after the live key has been persisted here, so the key's arena borrow is
-    /// already released — and with keys and values in separate arenas, the
-    /// closure's value-arena borrow never aliases the key's.
+    /// `ctx` is the one per-call value both arms might need — moved into whichever
+    /// arm runs, so they needn't both capture it: the merge phase passes the
+    /// already-materialised value; the consume path passes `&mut value_arena`.
+    /// Because the key is persisted here before either arm runs, and keys/values
+    /// live in separate arenas, the closure's value-arena borrow never aliases the
+    /// key's.
     #[inline(always)]
-    pub fn probe_fold<const COUNT_COLLISIONS: bool, L, F>(&mut self, mut hash: u64, key: L, fold: F)
-    where
+    pub fn probe_fold<const COUNT_COLLISIONS: bool, L, X, S, U>(
+        &mut self,
+        mut hash: u64,
+        key: L,
+        ctx: X,
+        seed: S,
+        update: U,
+    ) where
         L: LiveKey<Persisted = K>,
-        F: FnOnce(&mut V, bool),
+        S: FnOnce(X, &mut V),
+        U: FnOnce(X, &mut V),
     {
         // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
         if hash == 0 {
@@ -432,11 +440,11 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
                 entry.hash = hash;
                 entry.key = key.persist();
                 self.length += 1;
-                fold(&mut entry.value, true);
+                seed(ctx, &mut entry.value);
                 return;
             }
             if entry.hash == hash && key.eq_persisted(&entry.key) {
-                fold(&mut entry.value, false);
+                update(ctx, &mut entry.value);
                 return;
             }
             if COUNT_COLLISIONS {
@@ -554,7 +562,11 @@ mod tests {
         }
         fn new_columns(_allocator: &mut SlabAllocator, _rows: usize) {}
         fn push_to(&self, _cols: &mut ()) {}
-        fn finish_columns(_cols: (), _arena: &Arc<SharedArena>) -> (Vec<Field>, Vec<ArrayRef>) {
+        fn finish_columns(
+            _cols: (),
+            _arena: &Arc<SharedArena>,
+            _cfg: &(),
+        ) -> (Vec<Field>, Vec<ArrayRef>) {
             (Vec::new(), Vec::new())
         }
     }

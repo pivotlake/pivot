@@ -386,11 +386,11 @@ impl Aggregate {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
-        use dispatch::{Add, AggregationKind, AggregationSlot, IntPairKeyExtractor, Mono};
+        use dispatch::{AggregationKind, AggregationSlot, Dynamic, IntPairKeyExtractor};
 
         // The two-level COUNT(DISTINCT) aggregation is all additive (dedup counts
-        // and re-summed partials), so both levels use the branch-free `Mono<Add>`.
-        type AddVal<const N: usize> = Mono<Add, N>;
+        // and re-summed partials), so both levels use the numeric `Dynamic`.
+        type AddVal<const N: usize> = Dynamic<N>;
 
         if self.groups.len() != 1 {
             return Err(Error::UnsupportedAggregateGroupAmount(self.groups.len()));
@@ -528,20 +528,19 @@ impl Aggregate {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
-            Add, AggregationKind, AggregationSlot, CompiledMixed, Count, DynamicMixed,
-            IntPairKeyExtractor, Max, Min, Mono, RowKeyExtractor, StringExtreme, Sum,
+            AggregationKind, AggregationSlot, Compiled, Count, Dynamic, IntPairKeyExtractor,
+            RowKeyExtractor, StrMax, StrMin, Sum,
         };
 
-        // The value type's fold is fixed at plan time: a homogeneous numeric
-        // signature uses the branch-free `Mono<F>` (the common all-additive case is
-        // `Mono<Add>`), a homogeneous *string* MIN/MAX uses `StringExtreme<F>`, and
-        // any mix uses `DynamicMixed` (per-slot kind dispatch). Aliases so the
-        // numeric value types are `<N, A>` and the string ones `<N>` for the macros.
-        type AddVal<const N: usize, A> = Mono<Add, N, A>;
-        type MinVal<const N: usize, A> = Mono<Min, N, A>;
-        type MaxVal<const N: usize, A> = Mono<Max, N, A>;
-        type StrMinVal<const N: usize> = StringExtreme<Min, N>;
-        type StrMaxVal<const N: usize> = StringExtreme<Max, N>;
+        // The value type is fixed at plan time. A homogeneous *string* MIN/MAX
+        // (every slot the same direction over a `Utf8` column) is a `Compiled`
+        // tuple of the `StrMin`/`StrMax` op. Everything else — any numeric
+        // signature, or a string extreme mixed with integer extremes / SUM /
+        // COUNT / the opposite string direction — folds each slot by its kind in
+        // `Dynamic<N, A>` (widened to `i128` when a string extreme is present, so
+        // its `ArenaKey` cell fits). Two numeric shapes are specialised to a
+        // branch-free `Compiled` below: a single `COUNT`, and q32's
+        // `count/sum/sum/count`.
 
         let key_refs: Vec<&crate::expression::Ref> = self
             .groups
@@ -565,12 +564,23 @@ impl Aggregate {
                     AggregationKind::Sum,
                     a.column.column_idx,
                 )),
+                // A `Utf8` extreme is stamped `StrMin`/`StrMax` so the value
+                // container folds it through its arena path (an `ArenaKey` cell);
+                // an integer extreme stays numeric.
                 Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(AggregationSlot::new(
-                    AggregationKind::Min,
+                    if a.column.return_type == Type::Utf8 {
+                        AggregationKind::StrMin
+                    } else {
+                        AggregationKind::Min
+                    },
                     a.column.column_idx,
                 )),
                 Expression::AggregateFunc(AggregateFunc::Max(a)) => Ok(AggregationSlot::new(
-                    AggregationKind::Max,
+                    if a.column.return_type == Type::Utf8 {
+                        AggregationKind::StrMax
+                    } else {
+                        AggregationKind::Max
+                    },
                     a.column.column_idx,
                 )),
                 Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(AggregationSlot::new(
@@ -584,7 +594,7 @@ impl Aggregate {
         // Per-slot signature (kind + the `SUM` column's type), used to pick a
         // compiled, monomorphised value extractor when the signature matches one
         // we've specialised; any other signature falls back to the generic enum
-        // value (`Mono<Add>`/`Mono<Min>`/`Mono<Max>`/`DynamicMixed`) below.
+        // value (`Dynamic`, or a `Compiled` tuple for a string extreme) below.
         enum Sig {
             Count,
             Sum(Type),
@@ -611,129 +621,113 @@ impl Aggregate {
 
         let top_k = self.top_k;
 
+        // Whether any slot is a string extreme — its `ArenaKey` cell is 128-bit,
+        // so the signature must use the wide (`i128`) cell. A string extreme's
+        // `StringCell` conversion fails out on a narrow cell, so the width choice
+        // below must widen whenever one is present.
+        let has_string_extreme = slots.iter().any(|s| s.kind.is_string_extreme());
+
         // Cell width, by the same column-type rule as the global path:
         // i128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
-        // Grouped sums are almost always over narrow columns, so this is i64
-        // in practice; the i128 arm keeps a wide grouped sum correct rather
-        // than silently overflowing the slot.
-        let wide = sum_reads_wide_column(&self.expressions);
+        // Grouped sums are almost always over narrow columns, so this is i64 in
+        // practice; the i128 arm keeps a wide grouped sum correct, and is forced
+        // whenever a string extreme is present (its key needs 128-bit storage).
+        let wide = has_string_extreme || sum_reads_wide_column(&self.expressions);
 
-        // The fold shape: homogeneous additive / all-MIN / all-MAX over integers
-        // use a branch-free `Mono<F>`; homogeneous MIN/MAX over *string* columns
-        // use `StringExtreme<F>`; anything mixed uses `DynamicMixed`.
+        // The value shape. A *homogeneous* string signature — every slot the same
+        // direction over a `Utf8` column — is a branch-free `Compiled` tuple of
+        // `StrMin`/`StrMax`. Every other signature, numeric or string-mixed
+        // (string + integer extremes, string MIN + string MAX, a string extreme
+        // beside SUM/COUNT), folds each slot by its kind in `Dynamic<N, i128>`.
         enum Shape {
-            Additive,
-            AllMin,
-            AllMax,
+            Numeric,
             StrMin,
             StrMax,
-            Mixed,
         }
-        // Whether every MIN/MAX slot reads a string (`Utf8`) column — true only for
-        // a homogeneous string-extreme signature (no additive slots interleaved).
-        let extreme_cols_utf8 = self.expressions.iter().all(|e| {
-            matches!(
-                e,
-                Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a))
-                    if a.column.return_type == Type::Utf8
-            )
-        });
-        let shape = if slots.iter().all(|s| {
-            matches!(
-                s.kind,
-                AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
-            )
-        }) {
-            Shape::Additive
-        } else if slots.iter().all(|s| s.kind == AggregationKind::Min) {
-            if extreme_cols_utf8 {
-                Shape::StrMin
-            } else {
-                Shape::AllMin
-            }
-        } else if slots.iter().all(|s| s.kind == AggregationKind::Max) {
-            if extreme_cols_utf8 {
-                Shape::StrMax
-            } else {
-                Shape::AllMax
-            }
+        let shape = if slots.iter().all(|s| s.kind == AggregationKind::StrMin) {
+            Shape::StrMin
+        } else if slots.iter().all(|s| s.kind == AggregationKind::StrMax) {
+            Shape::StrMax
         } else {
-            Shape::Mixed
+            Shape::Numeric
         };
 
-        // A string MIN/MAX is only supported homogeneously (all slots MIN, or all
-        // MAX, over string columns) — `StringExtreme<F>` has one direction and an
-        // ArenaKey cell. Reject any other signature that contains a string extreme
-        // (mixed MIN+MAX strings, a string extreme alongside SUM/COUNT, or string
-        // mixed with integer extremes) rather than routing it to a numeric value
-        // type that would mis-read the `Utf8` column.
-        let unsupported_string_extreme = self
-            .expressions
-            .iter()
-            .find(|e| {
-                matches!(
-                    e,
-                    Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a))
-                        if a.column.return_type == Type::Utf8
-                )
-            })
-            .filter(|_| !matches!(shape, Shape::StrMin | Shape::StrMax));
-        if let Some(e) = unsupported_string_extreme {
-            return Err(Error::UnsupportedAggregateExpression(e.clone()));
-        }
-
-        // Dispatch the value type by arity (N). `$Vt<N, $acc>` is the chosen value
-        // (`AddVal`/`MinVal`/`MaxVal`/`DynamicMixed`). One arm runs, so it consumes
-        // `input`/`key_cols`/`slots` exactly once.
-        macro_rules! arity {
-            ($Key:ty, $Vt:ident, $acc:ty) => {
+        // Numeric value: `Dynamic<N, acc>`, folding each slot by its kind,
+        // dispatched by arity. One arm runs, so it consumes `input`/`key_cols`/
+        // `slots` exactly once.
+        macro_rules! num_arity {
+            ($Key:ty, $acc:ty) => {
                 match slots.len() {
-                    1 => Ok(input.group_by_aggregate::<$Key, $Vt<1, $acc>>(key_cols, slots, top_k)),
-                    2 => Ok(input.group_by_aggregate::<$Key, $Vt<2, $acc>>(key_cols, slots, top_k)),
-                    3 => Ok(input.group_by_aggregate::<$Key, $Vt<3, $acc>>(key_cols, slots, top_k)),
-                    4 => Ok(input.group_by_aggregate::<$Key, $Vt<4, $acc>>(key_cols, slots, top_k)),
-                    5 => Ok(input.group_by_aggregate::<$Key, $Vt<5, $acc>>(key_cols, slots, top_k)),
-                    6 => Ok(input.group_by_aggregate::<$Key, $Vt<6, $acc>>(key_cols, slots, top_k)),
+                    1 => {
+                        Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<1, $acc>>(key_cols, slots, top_k))
+                    }
+                    2 => {
+                        Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<2, $acc>>(key_cols, slots, top_k))
+                    }
+                    3 => {
+                        Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<3, $acc>>(key_cols, slots, top_k))
+                    }
+                    4 => {
+                        Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<4, $acc>>(key_cols, slots, top_k))
+                    }
+                    5 => {
+                        Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<5, $acc>>(key_cols, slots, top_k))
+                    }
+                    6 => {
+                        Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<6, $acc>>(key_cols, slots, top_k))
+                    }
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             };
         }
 
-        // Same, for the string-extreme value types (which are `<N>`, no width).
+        // Homogeneous string MIN/MAX: a `Compiled` tuple of the `$Op` op, by arity.
         macro_rules! str_arity {
-            ($Key:ty, $Vt:ident) => {
+            ($Key:ty, $Op:ty) => {
                 match slots.len() {
-                    1 => Ok(input.group_by_aggregate::<$Key, $Vt<1>>(key_cols, slots, top_k)),
-                    2 => Ok(input.group_by_aggregate::<$Key, $Vt<2>>(key_cols, slots, top_k)),
-                    3 => Ok(input.group_by_aggregate::<$Key, $Vt<3>>(key_cols, slots, top_k)),
-                    4 => Ok(input.group_by_aggregate::<$Key, $Vt<4>>(key_cols, slots, top_k)),
+                    1 => {
+                        Ok(input
+                            .group_by_aggregate::<$Key, Compiled<($Op,)>>(key_cols, slots, top_k))
+                    }
+                    2 => Ok(input
+                        .group_by_aggregate::<$Key, Compiled<($Op, $Op)>>(key_cols, slots, top_k)),
+                    3 => Ok(input.group_by_aggregate::<$Key, Compiled<($Op, $Op, $Op)>>(
+                        key_cols, slots, top_k,
+                    )),
+                    4 => Ok(
+                        input.group_by_aggregate::<$Key, Compiled<($Op, $Op, $Op, $Op)>>(
+                            key_cols, slots, top_k,
+                        ),
+                    ),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             };
         }
 
-        // Pick the value type from the fold shape, then dispatch by arity.
+        // Pick the value type from the shape, then dispatch by arity.
         macro_rules! by_shape {
             ($Key:ty, $acc:ty) => {
                 match shape {
-                    Shape::Additive => arity!($Key, AddVal, $acc),
-                    Shape::AllMin => arity!($Key, MinVal, $acc),
-                    Shape::AllMax => arity!($Key, MaxVal, $acc),
-                    Shape::StrMin => str_arity!($Key, StrMinVal),
-                    Shape::StrMax => str_arity!($Key, StrMaxVal),
-                    Shape::Mixed => arity!($Key, DynamicMixed, $acc),
+                    Shape::Numeric => num_arity!($Key, $acc),
+                    Shape::StrMin => str_arity!($Key, StrMin),
+                    Shape::StrMax => str_arity!($Key, StrMax),
                 }
             };
         }
 
         // Monomorphise over the two key types, the slot arity (N), and the
-        // accumulator width ($acc). The compiled q32 shape is i16-only (never
-        // wide); every other signature routes by fold shape.
+        // accumulator width ($acc). Two numeric signatures are specialised to a
+        // branch-free `Compiled`: q32's `count/sum16/sum16/count`, and a lone
+        // `COUNT`; every other numeric signature is `Dynamic`.
         macro_rules! by_arity {
             ($a:ty, $b:ty, $acc:ty) => {{
                 type Key = IntPairKeyExtractor<$a, $b>;
-                // COUNT(*), SUM(i16), SUM(i16), COUNT — compiled to straight-line
-                // code with no per-row enum dispatch. (q32: count + sum + avg.)
                 if matches!(
                     sig.as_slice(),
                     [
@@ -743,8 +737,10 @@ impl Aggregate {
                         Sig::Count,
                     ]
                 ) {
-                    type V = CompiledMixed<(Count, Sum<Int16Type>, Sum<Int16Type>, Count), 4>;
+                    type V = Compiled<(Count, Sum<Int16Type>, Sum<Int16Type>, Count)>;
                     Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
+                } else if matches!(sig.as_slice(), [Sig::Count]) {
+                    Ok(input.group_by_aggregate::<Key, Compiled<(Count,)>>(key_cols, slots, top_k))
                 } else {
                     by_shape!(Key, $acc)
                 }
@@ -763,8 +759,8 @@ impl Aggregate {
         }
 
         // The general fallback: encode the whole key tuple into one byte blob.
-        // Handles any shape the specialised extractors don't — a string key, 3+
-        // keys, or an integer pair we haven't monomorphised.
+        // Handles any shape the specialised extractors don't — a string key, a
+        // single key, 3+ keys, or an integer pair we haven't monomorphised.
         macro_rules! row_fallback {
             ($acc:ty) => {{
                 let Some(schema) = row_key_schema(&key_refs) else {
@@ -772,66 +768,36 @@ impl Aggregate {
                         key_refs[0].return_type.clone(),
                     ));
                 };
-                // Same fold-shape → arity dispatch as the int-pair path, but with
-                // the row-encoded key extractor and its schema config.
-                macro_rules! row_arity {
-                    ($Vt:ident) => {
+                // Same shape → arity dispatch as the int-pair path, but with the
+                // row-encoded key extractor and its schema config.
+                macro_rules! row_num_arity {
+                    () => {
                         match slots.len() {
-                            1 => Ok(input
-                                .group_by_aggregate_config::<RowKeyExtractor, $Vt<1, $acc>>(
-                                    key_cols, slots, top_k, schema,
-                                )),
-                            2 => Ok(input
-                                .group_by_aggregate_config::<RowKeyExtractor, $Vt<2, $acc>>(
-                                    key_cols, slots, top_k, schema,
-                                )),
-                            3 => Ok(input
-                                .group_by_aggregate_config::<RowKeyExtractor, $Vt<3, $acc>>(
-                                    key_cols, slots, top_k, schema,
-                                )),
-                            4 => Ok(input
-                                .group_by_aggregate_config::<RowKeyExtractor, $Vt<4, $acc>>(
-                                    key_cols, slots, top_k, schema,
-                                )),
-                            5 => Ok(input
-                                .group_by_aggregate_config::<RowKeyExtractor, $Vt<5, $acc>>(
-                                    key_cols, slots, top_k, schema,
-                                )),
-                            6 => Ok(input
-                                .group_by_aggregate_config::<RowKeyExtractor, $Vt<6, $acc>>(
-                                    key_cols, slots, top_k, schema,
-                                )),
+                            1 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<1, $acc>>(key_cols, slots, top_k, schema)),
+                            2 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<2, $acc>>(key_cols, slots, top_k, schema)),
+                            3 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<3, $acc>>(key_cols, slots, top_k, schema)),
+                            4 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<4, $acc>>(key_cols, slots, top_k, schema)),
+                            5 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<5, $acc>>(key_cols, slots, top_k, schema)),
+                            6 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<6, $acc>>(key_cols, slots, top_k, schema)),
                             n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                         }
                     };
                 }
-                // String-extreme value types are `<N>` (no width).
-                macro_rules! str_row_arity {
-                    ($Vt:ident) => {
+                macro_rules! row_str_arity {
+                    ($Op:ty) => {
                         match slots.len() {
-                            1 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<1>>(
-                                key_cols, slots, top_k, schema,
-                            )),
-                            2 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<2>>(
-                                key_cols, slots, top_k, schema,
-                            )),
-                            3 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<3>>(
-                                key_cols, slots, top_k, schema,
-                            )),
-                            4 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, $Vt<4>>(
-                                key_cols, slots, top_k, schema,
-                            )),
+                            1 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Compiled<($Op,)>>(key_cols, slots, top_k, schema)),
+                            2 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Compiled<($Op, $Op)>>(key_cols, slots, top_k, schema)),
+                            3 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Compiled<($Op, $Op, $Op)>>(key_cols, slots, top_k, schema)),
+                            4 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Compiled<($Op, $Op, $Op, $Op)>>(key_cols, slots, top_k, schema)),
                             n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                         }
                     };
                 }
                 match shape {
-                    Shape::Additive => row_arity!(AddVal),
-                    Shape::AllMin => row_arity!(MinVal),
-                    Shape::AllMax => row_arity!(MaxVal),
-                    Shape::StrMin => str_row_arity!(StrMinVal),
-                    Shape::StrMax => str_row_arity!(StrMaxVal),
-                    Shape::Mixed => row_arity!(DynamicMixed),
+                    Shape::Numeric => row_num_arity!(),
+                    Shape::StrMin => row_str_arity!(StrMin),
+                    Shape::StrMax => row_str_arity!(StrMax),
                 }
             }};
         }

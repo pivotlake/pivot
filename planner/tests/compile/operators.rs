@@ -751,25 +751,57 @@ fn grouped_string_min_and_max(mut testing_planner: TestingPlanner) {
     assert_eq!(maxes[1]["v0"], "date");
 }
 
-/// A string extreme mixed with another aggregate (or mixed MIN+MAX directions)
-/// isn't supported yet — it must error, not mis-read the column.
+/// A string extreme mixed with the opposite direction (or with integer
+/// aggregates) routes to the runtime `Dynamic` value (widened to `i128` so the
+/// `ArenaKey` cell fits) rather than the homogeneous `Compiled` tuple. Both the
+/// string MIN+MAX mix and a string-extreme-beside-an-integer-extreme mix must
+/// compile and return the right per-group values.
 #[rstest]
-fn mixed_string_extreme_is_unsupported(mut testing_planner: TestingPlanner) {
+fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
     testing_planner.add_table(
         "gs2",
         &[
-            ("g", Type::Int32, int_col(vec![1, 2])),
-            ("s", Type::Utf8, str_col(vec!["a", "b"])),
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2])),
+            (
+                "s",
+                Type::Utf8,
+                str_col(vec!["banana", "apple", "cherry", "date"]),
+            ),
+            ("v", Type::Int32, int_col(vec![10, 30, 5, 20])),
         ],
     );
-    // MIN/MAX are valid functions, so `plan` succeeds; the string-extreme combo
-    // is rejected at `compile` time.
-    let compiled = testing_planner
+
+    // MIN(s) + MAX(s): a string mix of opposite directions in one value.
+    let results = testing_planner
         .planner
         .plan("SELECT g, MIN(s), MAX(s) FROM gs2 GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher());
-    assert!(compiled.is_err());
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    assert_eq!(rows[0]["v0"], "apple"); // g=1 min
+    assert_eq!(rows[0]["v1"], "banana"); // g=1 max
+    assert_eq!(rows[1]["v0"], "cherry"); // g=2 min
+    assert_eq!(rows[1]["v1"], "date"); // g=2 max
+
+    // MIN(s) (string) + MAX(v) (integer): a string extreme beside a numeric one.
+    let mixed = testing_planner
+        .planner
+        .plan("SELECT g, MIN(s), MAX(v) FROM gs2 GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let mut mixed_rows = batches_to_json(&mixed);
+    mixed_rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    assert_eq!(mixed_rows[0]["v0"], "apple"); // g=1 min(s)
+    assert_eq!(mixed_rows[0]["v1"], 30); // g=1 max(v)
+    assert_eq!(mixed_rows[1]["v0"], "cherry"); // g=2 min(s)
+    assert_eq!(mixed_rows[1]["v1"], 20); // g=2 max(v)
 }
 
 #[rstest]

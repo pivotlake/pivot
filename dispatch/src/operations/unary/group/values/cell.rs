@@ -1,72 +1,168 @@
-//! The numeric cell type for aggregate slots — the `i64`/`i128` a slot's value is
-//! stored and emitted as. The single width knob shared by the global
-//! ([`aggregate`](crate::operations::unary::aggregate)) and grouped
-//! ([`group`](crate::operations::unary::group)) paths.
+//! What a slot's value is *stored* as.
 //!
-//! The width is decided the same way in both paths from the summed column's type:
-//! `i64` is enough for counts and for sums over 16/32-bit columns (a whole-table
-//! scan can't overflow it), but a sum over a 64-bit column whose total can far
-//! exceed `i64::MAX` needs `i128`. `i64` is the default because it keeps a grouped
-//! hash table entry half as wide; `i128` is opt-in for the wide-sum case.
-//!
-//! Not every aggregation cell is a [`Cell`]: a string `MIN`/`MAX` stores an
-//! [`ArenaKey`](crate::operations::unary::group::ArenaKey) instead. This is only
-//! the *numeric* width.
+//! [`Cell`] is a bare marker — any `Copy` value can sit in a slot, so it's a
+//! blanket bound with nothing to implement. *How* cells combine is the
+//! [`Fold`](super::fold)'s job (plain `Ord::min` / `+` for the numeric folds, an
+//! arena compare for the string ones) — never the cell's. The only thing a
+//! numeric width owns is how it renders to Arrow ([`NumericArrow`]), since that
+//! genuinely depends on the width (`i64 → Int64`, `i128 → Decimal128`). The
+//! [`Numeric`] bound alias bundles that with the std arithmetic the numeric folds
+//! lean on, so a fold can just say `A: Numeric`.
 
-use arrow_array::ArrayRef;
-use arrow_array::cast::AsArray;
+use crate::arrays::SlabColumn;
+use crate::operations::unary::group::arena::SharedArena;
+use crate::operations::unary::group::keys::ArenaKey;
 use arrow_array::types::{ArrowPrimitiveType, Decimal128Type, Int64Type};
+use arrow_array::{ArrayRef, Decimal128Array, Int64Array, StringViewArray};
+use arrow_buffer::ScalarBuffer;
+use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
-/// A numeric aggregation cell: `i64` (narrow) or `i128` (wide).
-///
-/// It bundles the small set of capabilities a numeric slot needs — combine by
-/// addition ([`AddAssign`]), build from a per-row `i64` contribution
-/// ([`From<i64>`]), widen losslessly to `i128` ([`Into<i128>`], for narrowing
-/// `COUNT` through a checked `i64::try_from`), compare ([`Ord`], for top-k sort
-/// keys and the extremes), the extreme seeds ([`MIN`](Cell::MIN)/[`MAX`](Cell::MAX)),
-/// and the one Arrow column it emits as ([`Arrow`](Cell::Arrow)). *How* cells fold
-/// is not here — that's the slot's [`CellFold`](super::CellFold) / kind.
-pub trait Cell:
-    Copy + Default + Send + Sync + 'static + std::ops::AddAssign + Ord + From<i64> + Into<i128>
-{
-    /// This width's extremes — the identity seeds for the order statistics: a
-    /// running `MIN` starts at `MAX` (every value is `≤` it) and a running `MAX`
-    /// at `MIN`. (`SUM`/`COUNT` use the additive identity, [`Default`]'s zero.)
-    const MIN: Self;
-    const MAX: Self;
+/// The bare requirement to live in an aggregate slot: a plain `Copy` value. Held
+/// by every cell type (`i64`, `i128`, `ArenaKey`, the `u128` union), so it's a
+/// blanket marker — the per-aggregate behaviour is the [`Read`](super::read) /
+/// [`Fold`](super::fold), never the cell.
+pub trait Cell: Copy + Default + Send + Sync + 'static {}
+impl<T: Copy + Default + Send + Sync + 'static> Cell for T {}
 
-    /// The Arrow primitive backing this width's output column (`Int64Type` /
-    /// `Decimal128Type`); its `Native` is the cell itself.
+/// How a numeric width renders its finished column to Arrow. `i64 → Int64`,
+/// `i128 → Decimal128(38, 0)` (matching DuckDB's `HUGEINT`). This is the one
+/// irreducible width fact — there's no std reverse-map from a native type to its
+/// Arrow `PrimitiveType` — so it lives here; the *arithmetic* does not.
+pub trait NumericArrow: Cell {
+    /// The Arrow primitive whose `Native` is this width.
     type Arrow: ArrowPrimitiveType<Native = Self>;
-
-    /// Finish a freshly built `Self::Arrow` column into its output array:
-    /// identity for `Int64`, sets precision/scale `(38, 0)` for `Decimal128`
-    /// (whose default scale is 10) so it matches DuckDB's `HUGEINT`.
-    fn finalize(array: ArrayRef) -> ArrayRef;
+    /// Render a finished grouped column, handing the engine slab to Arrow zero-copy.
+    fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef);
+    /// This width's Arrow data type.
+    fn data_type() -> DataType;
+    /// A single-row array — the global (no-GROUP-BY) output. `None` is a SQL NULL
+    /// (an aggregate over zero rows), so the column is nullable.
+    fn scalar_array(value: Option<Self>) -> ArrayRef;
 }
 
-impl Cell for i64 {
-    const MIN: Self = i64::MIN;
-    const MAX: Self = i64::MAX;
+impl NumericArrow for i64 {
     type Arrow = Int64Type;
-    #[inline(always)]
-    fn finalize(array: ArrayRef) -> ArrayRef {
-        array
+    fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+        let len = col.len();
+        let values = ScalarBuffer::<i64>::new(col.into_buffer(), 0, len);
+        (
+            Field::new(name, DataType::Int64, false),
+            Arc::new(Int64Array::new(values, None)),
+        )
+    }
+    fn data_type() -> DataType {
+        DataType::Int64
+    }
+    fn scalar_array(value: Option<Self>) -> ArrayRef {
+        Arc::new(Int64Array::from(vec![value]))
     }
 }
 
-impl Cell for i128 {
-    const MIN: Self = i128::MIN;
-    const MAX: Self = i128::MAX;
+impl NumericArrow for i128 {
     type Arrow = Decimal128Type;
-    fn finalize(array: ArrayRef) -> ArrayRef {
-        Arc::new(
-            array
-                .as_primitive::<Decimal128Type>()
-                .clone()
-                .with_precision_and_scale(38, 0)
-                .unwrap(),
+    fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+        let len = col.len();
+        let values = ScalarBuffer::<i128>::new(col.into_buffer(), 0, len);
+        let arr = Decimal128Array::new(values, None)
+            .with_precision_and_scale(38, 0)
+            .expect("(38, 0) is a valid decimal128 precision/scale");
+        (
+            Field::new(name, DataType::Decimal128(38, 0), false),
+            Arc::new(arr),
         )
+    }
+    fn data_type() -> DataType {
+        DataType::Decimal128(38, 0)
+    }
+    fn scalar_array(value: Option<Self>) -> ArrayRef {
+        Arc::new(
+            Decimal128Array::from(vec![value])
+                .with_precision_and_scale(38, 0)
+                .expect("(38, 0) is a valid decimal128 precision/scale"),
+        )
+    }
+}
+
+/// A numeric aggregate cell (`i64` narrow / `i128` wide): a [`Cell`] that adds
+/// (`+`), orders (`Ord`), builds from a per-row `i64` and widens to `i128`, and
+/// renders to Arrow ([`NumericArrow`]). A bound alias — no methods of its own, so
+/// the numeric folds combine with std ops, not cell methods.
+pub trait Numeric:
+    Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<i128> + NumericArrow
+{
+}
+impl<T> Numeric for T where
+    T: Cell + Ord + std::ops::Add<Output = T> + From<i64> + Into<i128> + NumericArrow
+{
+}
+
+/// Storing a string extreme's [`ArenaKey`] in a numeric value cell.
+///
+/// A grouped string `MIN`/`MAX` keeps its winning `ArenaKey` — a 128-bit Arrow
+/// `StringView` header — in the very slot a numeric aggregate would use, so a
+/// `Dynamic` value can mix a string extreme with integer ones without a second
+/// storage path. Only the 128-bit cell (`i128`) can hold the key; `i64` is the
+/// fail-out, since the planner always widens a signature containing a string
+/// extreme to `i128`. The `i64` methods therefore panic: reaching them means the
+/// planner handed a string slot to a narrow cell, which is a bug, not a runtime
+/// condition.
+pub trait StringCell: Cell {
+    /// Pack a winning `ArenaKey` into the cell.
+    fn from_key(key: ArenaKey) -> Self;
+    /// Read the cell back as the `ArenaKey` a string slot stored in it.
+    fn into_key(self) -> ArenaKey;
+    /// Render a finished column of string-extreme cells as a zero-copy
+    /// `Utf8View` array over the value arena's ring buffers.
+    fn finish_strings(
+        name: &str,
+        col: SlabColumn<Self>,
+        arena: &Arc<SharedArena>,
+    ) -> (Field, ArrayRef);
+}
+
+/// The fail-out: a string extreme requires 128-bit storage, so the planner must
+/// widen its signature to `i128`. Any `i64` arm being hit is a planning bug.
+const NARROW_STRING_CELL: &str = "string aggregate requires 128-bit (i128) storage; the planner must widen — reaching i64 is a bug";
+
+impl StringCell for i64 {
+    fn from_key(_: ArenaKey) -> Self {
+        panic!("{NARROW_STRING_CELL}")
+    }
+    fn into_key(self) -> ArenaKey {
+        panic!("{NARROW_STRING_CELL}")
+    }
+    fn finish_strings(_: &str, _: SlabColumn<Self>, _: &Arc<SharedArena>) -> (Field, ArrayRef) {
+        panic!("{NARROW_STRING_CELL}")
+    }
+}
+
+impl StringCell for i128 {
+    #[inline(always)]
+    fn from_key(key: ArenaKey) -> Self {
+        // `ArenaKey` is a transparent `u128` (a StringView header); the cell holds
+        // its raw bits, reinterpreted back on read. The numeric reading is never
+        // applied to a string slot, so this bit-punning never crosses families.
+        key.as_u128() as i128
+    }
+    #[inline(always)]
+    fn into_key(self) -> ArenaKey {
+        ArenaKey::from_raw(self as u128)
+    }
+    fn finish_strings(
+        name: &str,
+        col: SlabColumn<Self>,
+        arena: &Arc<SharedArena>,
+    ) -> (Field, ArrayRef) {
+        let len = col.len();
+        // The cells are valid `ArenaKey`s (StringView headers); reinterpret the
+        // slab as `u128` views (zero-copy) over the arena's ring buffers.
+        let views = ScalarBuffer::<u128>::new(col.into_buffer(), 0, len);
+        let buffers = arena.to_arrow_buffers();
+        // Safety: the views are valid ArenaKeys and the arena (Arc-held in each
+        // Buffer) outlives the array — the same contract as string keys.
+        let arr: ArrayRef =
+            Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
+        (Field::new(name, DataType::Utf8View, false), arr)
     }
 }

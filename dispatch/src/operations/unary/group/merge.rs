@@ -296,7 +296,7 @@ mod tests {
     };
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
-        AggregationKind, AggregationSlot, AggregationValue, CompiledMixed, Count,
+        AggregationKind, AggregationSlot, AggregationValue, Compiled, Count,
     };
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
@@ -305,7 +305,10 @@ mod tests {
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = CompiledMixed<(Count,), 1>;
+    // A single `COUNT` slot. Its `MergeConfig` is `((),)` (the op tuple's cfgs).
+    type CountValue = Compiled<(Count,)>;
+    // The `CountValue` merge config: a 1-tuple of the `Count` op's unit cfg.
+    const COUNT_CFG: <CountValue as AggregationValue>::MergeConfig = ((),);
 
     fn make_worker_tables(
         state: &RandomState,
@@ -326,7 +329,7 @@ mod tests {
             &[0],
             &[AggregationSlot::new(AggregationKind::CountStar, 0)],
             &(),
-            &(),
+            &COUNT_CFG,
         );
         // The test data is low-cardinality, so the worker never switches to radix:
         // `buffers` is None and the full result is in the in-place stack.
@@ -351,7 +354,7 @@ mod tests {
                 partition_cap,
                 PARTITIONS,
                 arena,
-                &(),
+                &COUNT_CFG,
             );
             for entry in result.iter(0) {
                 all_entries.push((*entry.key(), entry.value().sort_key(0) as usize));
@@ -456,7 +459,7 @@ mod tests {
                 partition_cap,
                 PARTITIONS,
                 &arena,
-                &(),
+                &COUNT_CFG,
             );
             total += result.iter(0).count();
         }
@@ -520,7 +523,7 @@ mod tests {
                 &[0],
                 &[AggregationSlot::new(AggregationKind::CountStar, 0)],
                 &(),
-                &(),
+                &COUNT_CFG,
             );
         }
         agg.flush()
@@ -558,7 +561,7 @@ mod tests {
                 DEFAULT_CAPACITY,
                 num_partitions,
                 &arena,
-                &(),
+                &COUNT_CFG,
             );
             for entry in result.iter(0) {
                 occurrences[*entry.key() as usize] += 1;

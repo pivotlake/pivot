@@ -102,8 +102,8 @@ pub use keys::{
     RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
-    Add, Aggregate, AggregationKind, AggregationSlot, AggregationValue, Cell, CompiledMixed, Count,
-    Distinct, DynamicMixed, Max, Min, Mono, StringExtreme, Sum,
+    Aggregation, AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count,
+    Distinct, Dynamic, Max, Min, Numeric, NumericArrow, OpTuple, StrMax, StrMin, Sum, WideSum,
 };
 
 use crate::memory::SlabAllocator;
@@ -180,6 +180,15 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         radix: RadixConfig,
     ) -> Self {
         let merge_config = V::merge_config(&value_slots, &value_arena);
+        // A string extreme persists its winner lazily during the in-place fold, so
+        // it must not take the radix scatter path (which materialises — and thus
+        // persists — every row's string before any comparison). Disable the switch
+        // when any value slot is a string extreme; numeric signatures keep radix.
+        let radix = if value_slots.iter().any(|s| s.kind.is_string_extreme()) {
+            radix.without_radix()
+        } else {
+            radix
+        };
         Self {
             key_cols,
             value_slots,
@@ -311,6 +320,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
             &self.value_arena,
             allocator,
             &self.key_config,
+            &self.merge_config,
             self.top_k,
             self.count_only,
             sender,
@@ -434,8 +444,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = CompiledMixed<(Count,), 1>;
-    type SumValue = CompiledMixed<(Sum<Int32Type>,), 1>;
+    type CountValue = Compiled<(Count,)>;
+    type SumValue = Compiled<(Sum<Int32Type>,)>;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -849,7 +859,7 @@ mod tests {
     fn row_key_mixed_int_string_counts() {
         let batch = mixed_key_batch(&[1, 1, 1, 2, 2], &["a", "b", "a", "a", "a"], &[0; 5]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<CompiledMixed<(Count,), 1>>(
+        let sender = run_row_key_group::<Compiled<(Count,)>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -873,7 +883,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &["x", long, "x", "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<CompiledMixed<(Sum<Int32Type>,), 1>>(
+        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -893,7 +903,7 @@ mod tests {
     #[test]
     fn row_key_two_workers_merge() {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<CompiledMixed<(Count,), 1>>(
+        let sender = run_row_key_group::<Compiled<(Count,)>>(
             vec![
                 vec![mixed_key_batch(&[1, 2], &["a", "a"], &[0; 2])],
                 vec![mixed_key_batch(&[1, 1], &["a", "b"], &[0; 2])],
@@ -923,7 +933,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &[long, "y", long, "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<CompiledMixed<(Sum<Int32Type>,), 1>>(
+        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
             vec![vec![batch]],
             vec![1, 0], // name (col 1) then id (col 0)
             schema,
@@ -954,7 +964,7 @@ mod tests {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
 
-        let sender = run_row_key_group::<CompiledMixed<(Sum<Int32Type>,), 1>>(
+        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
             vec![vec![b1, b2]],
             vec![0, 1],
             schema,
@@ -965,5 +975,209 @@ mod tests {
             row_key_rows(&sender),
             vec![(1, "a".to_string(), 13), (1, long.to_string(), 12)],
         );
+    }
+
+    // ---- Mixed string + integer aggregates (`Compiled` per-op atoms) ----
+
+    /// `GROUP BY id` computing `MIN(name)` (string) and `MAX(v)` (int) in one
+    /// value — the heterogeneous mix the per-op `Compiled` tuple unlocks. Each
+    /// slot keeps its own cell (`ArenaKey` for the string, `i64` for the int) and
+    /// emits its own column type (`Utf8View`, `Int64`), with no per-row dispatch.
+    #[test]
+    fn mixed_string_min_int_max() {
+        // (id, name, v): id 1 -> min name "ant", max v 30; id 2 -> "fig", 7.
+        let batch = mixed_key_batch(
+            &[1, 2, 1, 2, 1],
+            &["cat", "fig", "ant", "bee", "dog"],
+            &[10, 7, 30, 5, 20],
+        );
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::Min, 1), // MIN(name) — string
+            AggregationSlot::new(AggregationKind::Max, 2), // MAX(v)    — int
+        ];
+        type Mix = Compiled<(StrMin, Max<Int32Type>)>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let mut rows: Vec<(i64, String, i64)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.i64_column(2))
+            .map(|((id, name), v)| (id, name, v))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, "ant".to_string(), 30), (2, "bee".to_string(), 7)]
+        );
+    }
+
+    // ---- Mixed string + integer aggregates via the runtime `Dynamic` ----
+
+    /// The same `MIN(name)` (string) + `MAX(v)` (int) mix, but folded by the
+    /// runtime [`Dynamic`] instead of a `Compiled` tuple — the path the planner
+    /// now takes for a heterogeneous string signature. The wide (`i128`) cell
+    /// holds the string slot's `ArenaKey` and the int slot's value, so the int
+    /// extreme renders as `Decimal128` (every numeric slot in a wide value does).
+    #[test]
+    fn dynamic_string_min_int_max() {
+        let batch = mixed_key_batch(
+            &[1, 2, 1, 2, 1],
+            &["cat", "fig", "ant", "bee", "dog"],
+            &[10, 7, 30, 5, 20],
+        );
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1), // MIN(name) — string
+            AggregationSlot::new(AggregationKind::Max, 2),    // MAX(v)    — int
+        ];
+        type Mix = Dynamic<2, i128>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let mut rows: Vec<(i64, String, i128)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.decimal128_column(2))
+            .map(|((id, name), v)| (id, name, v))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, "ant".to_string(), 30), (2, "bee".to_string(), 7)]
+        );
+    }
+
+    /// `MIN(name)` and `MAX(name)` over the *same* string column — a string mix
+    /// of opposite directions (rejected by the old `Compiled`-only routing). Each
+    /// slot keeps its own `ArenaKey` cell and folds its own direction.
+    #[test]
+    fn dynamic_string_min_and_max() {
+        let batch = mixed_key_batch(
+            &[1, 2, 1, 2, 1],
+            &["cat", "fig", "ant", "bee", "dog"],
+            &[10, 7, 30, 5, 20],
+        );
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1), // MIN(name)
+            AggregationSlot::new(AggregationKind::StrMax, 1), // MAX(name)
+        ];
+        type Mix = Dynamic<2, i128>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let mut rows: Vec<(i64, String, String)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.string_column(2))
+            .map(|((id, min), max)| (id, min, max))
+            .collect();
+        rows.sort();
+        // id 1 -> names {cat, ant, dog}: min "ant", max "dog".
+        // id 2 -> names {fig, bee}:      min "bee", max "fig".
+        assert_eq!(
+            rows,
+            vec![
+                (1, "ant".to_string(), "dog".to_string()),
+                (2, "bee".to_string(), "fig".to_string()),
+            ]
+        );
+    }
+
+    /// Two workers each see part of every group, so the string extremes must
+    /// survive the partition merge (which resolves both `ArenaKey`s through the
+    /// shared value arena) and a long string (> 12 bytes, a non-inline view) must
+    /// round-trip through the arena rather than the inline header.
+    #[test]
+    fn dynamic_string_extreme_merges_across_workers() {
+        let long_a = "alpha-aardvark-antelope"; // > 12 bytes, non-inline view
+        let long_z = "zeta-zebra-zephyr-zenith";
+        let w0 = mixed_key_batch(&[1, 1], &["mango", long_z], &[1, 2]);
+        let w1 = mixed_key_batch(&[1, 1], &[long_a, "mint"], &[3, 4]);
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1),
+            AggregationSlot::new(AggregationKind::StrMax, 1),
+        ];
+        type Mix = Dynamic<2, i128>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![w0], vec![w1]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let ids = sender.i64_column(0);
+        let mins = sender.string_column(1);
+        let maxes = sender.string_column(2);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(mins, vec![long_a.to_string()]);
+        assert_eq!(maxes, vec![long_z.to_string()]);
+    }
+
+    /// High cardinality with an aggressive `switch_threshold` a *numeric* value
+    /// would cross and scatter on. A string value must stay on the in-place fold
+    /// (radix is disabled for it, since scatter would eagerly persist every row's
+    /// string), so this exercises in-place stack growth with string cells and
+    /// confirms every group's `MIN`/`MAX(name)` is still correct.
+    #[test]
+    fn dynamic_string_high_cardinality_stays_correct() {
+        const N: i64 = 400;
+        let ids: Vec<i64> = (0..N).chain(0..N).collect();
+        // Group k sees "a{k}" then "z{k}": MIN is the "a" form, MAX the "z" form.
+        let lows: Vec<String> = (0..N).map(|k| format!("a{k:04}")).collect();
+        let highs: Vec<String> = (0..N).map(|k| format!("z{k:04}")).collect();
+        let names: Vec<&str> = lows
+            .iter()
+            .chain(highs.iter())
+            .map(String::as_str)
+            .collect();
+        let vals: Vec<i32> = vec![0; (2 * N) as usize];
+        let batch = mixed_key_batch(&ids, &names, &vals);
+
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1),
+            AggregationSlot::new(AggregationKind::StrMax, 1),
+        ];
+        type Mix = Dynamic<2, i128>;
+        // A threshold the in-place table crosses well before N groups — a numeric
+        // value would switch to radix here; the string value's override must not.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            radix,
+        );
+
+        let mut rows: Vec<(i64, String, String)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.string_column(2))
+            .map(|((id, min), max)| (id, min, max))
+            .collect();
+        rows.sort();
+        let expected: Vec<(i64, String, String)> = (0..N)
+            .map(|k| (k, format!("a{k:04}"), format!("z{k:04}")))
+            .collect();
+        assert_eq!(rows, expected);
     }
 }
