@@ -65,6 +65,56 @@ fn aggregate(mut planner: PlannerContext) {
 }
 
 #[rstest]
+fn derived_groups_removed(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT score, score - 1, score - 2, COUNT(*) AS c FROM users GROUP BY score, score - 1, score - 2 ORDER BY c DESC LIMIT 10")
+        .unwrap()
+        .to_string();
+
+    // `score - 1` and `score - 2` are functions of `score`: the aggregate keeps the single grouping
+    // key, and the derived keys are recomputed in a projection above it.
+    assert_snapshot!(plan, @"
+    TopN(limit: 10, offset: 0, order: #3:BIGINT DESC)
+      Projection(#0:INTEGER, #1:INTEGER, #2:INTEGER, #3:BIGINT)
+        Projection(#0:INTEGER, -(#0:INTEGER, 1:INTEGER) -> INTEGER, -(#0:INTEGER, 2:INTEGER) -> INTEGER, #1:BIGINT)
+          Aggregate(groups: [#0:INTEGER], exprs: [count_star() -> BIGINT])
+            Input([#2:INTEGER])
+    ");
+}
+
+#[rstest]
+fn derived_groups_removed_from_multiple_determinants(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT score, age, score + age, score - age, score + 1, age + 1, COUNT(*) FROM users GROUP BY score, age, score + age, score - age, score + 1, age + 1")
+        .unwrap()
+        .to_string();
+
+    // `score` and `age` determine all four remaining keys, so the aggregate groups by just the two of
+    // them and the rest are recomputed in the projection.
+    assert_snapshot!(plan, @"
+    Projection(#0:INTEGER, #1:INTEGER, #2:INTEGER, #3:INTEGER, #4:INTEGER, #5:INTEGER, #6:BIGINT)
+      Projection(#0:INTEGER, #1:INTEGER, +(#0:INTEGER, #1:INTEGER) -> INTEGER, -(#0:INTEGER, #1:INTEGER) -> INTEGER, +(#0:INTEGER, 1:INTEGER) -> INTEGER, +(#1:INTEGER, 1:INTEGER) -> INTEGER, #2:BIGINT)
+        Aggregate(groups: [#0:INTEGER, #1:INTEGER], exprs: [count_star() -> BIGINT])
+          Input([#2:INTEGER, #3:INTEGER])
+    ");
+}
+
+#[rstest]
+fn derived_groups_kept_when_independent(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("SELECT score, age, COUNT(*) AS c FROM users GROUP BY score, age")
+        .unwrap()
+        .to_string();
+
+    // `score` and `age` are independent, so both remain grouping keys.
+    assert_snapshot!(plan, @"
+    Projection(#0:INTEGER, #1:INTEGER, #2:BIGINT)
+      Aggregate(groups: [#0:INTEGER, #1:INTEGER], exprs: [count_star() -> BIGINT])
+        Input([#2:INTEGER, #3:INTEGER])
+    ");
+}
+
+#[rstest]
 fn order_by(mut planner: PlannerContext) {
     let plan = planner
         .plan("SELECT * FROM users ORDER BY age DESC")
