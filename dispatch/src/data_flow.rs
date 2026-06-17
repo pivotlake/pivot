@@ -215,6 +215,15 @@ impl DataFlow {
         worker_waker().notify();
     }
 
+    /// Fail this dataflow from outside its own execution — e.g. a transport
+    /// read the worker submitted on its behalf failed terminally. Cancels the
+    /// dataflow across all workers and reports the error to the client, exactly
+    /// like an error raised inside [`try_run`](Self::try_run), without
+    /// disturbing any other query.
+    pub fn fail(&self, err: Error) {
+        self.bail_and_cancel(err);
+    }
+
     /// Try running a function within the dataflow- this will gracefully catch any errors/panics and
     /// send them via `err_tx`, along with setting `cancelled` to true across all workers (thus
     /// causing the dataflow to stop processing).

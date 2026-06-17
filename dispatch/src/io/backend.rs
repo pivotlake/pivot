@@ -85,19 +85,19 @@ mod uring_backend {
             self.ring.submit_and_wait(want)
         }
 
-        /// Drains the completion queue, returning `(bytes_read, request_id)` pairs.
-        pub fn completions(&mut self) -> io::Result<Vec<(usize, Identifier)>> {
-            self.ring
+        /// Drains the completion queue, returning the raw `(result, request_id)`
+        /// pairs. `result` is the kernel's signed CQE value: `>= 0` is the byte
+        /// count, `< 0` is `-errno`. We deliberately do **not** collapse a
+        /// negative result into an error here — that would discard the
+        /// `request_id`, so a transient socket error (e.g. `ECONNRESET` on an
+        /// HTTP range read) could not be mapped back to its connection and
+        /// retried. The caller interprets the sign per request instead.
+        pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
+            Ok(self
+                .ring
                 .completion()
-                .map(|cqe| {
-                    let res = cqe.result();
-                    if res < 0 {
-                        Err(std::io::Error::from_raw_os_error(-res))
-                    } else {
-                        Ok((cqe.result() as usize, cqe.user_data() as Identifier))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()
+                .map(|cqe| (cqe.result(), cqe.user_data() as Identifier))
+                .collect())
         }
     }
 }
@@ -183,7 +183,7 @@ mod pread_backend {
             Ok(count)
         }
 
-        pub fn completions(&mut self) -> io::Result<Vec<(usize, Identifier)>> {
+        pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
             Ok(self.completed.drain(..).map(|i| (0, i)).collect())
         }
     }
