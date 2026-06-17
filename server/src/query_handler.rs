@@ -242,6 +242,7 @@ impl SimpleQueryHandler for PivotQueryHandler {
             warn!(error = %e, sql = %query, "query failed");
             e.into_pgwire()
         })?;
+        info!(sql = %query, "query succeeded");
         Ok(vec![res])
     }
 }
