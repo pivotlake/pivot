@@ -262,13 +262,14 @@ impl Worker {
         waker: Arc<WorkerWaker>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
-            // Worker startup (io_uring + memory-context setup) can fail. If it
-            // panics here the worker never reaches `ready_barrier`, leaving
-            // `Dispatch::spin_up` deadlocked on the barrier forever. Run startup
-            // under `catch_unwind` and turn any panic into a loud, fatal abort: a
-            // worker that can't start means the engine can't run, and crashing with
-            // the real cause beats hanging silently.
-            let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Worker startup (io_uring + memory-context setup) can fail. Every worker
+            // must reach `ready_barrier` or `Dispatch::spin_up` deadlocks on it forever,
+            // so run startup under `catch_unwind`: on failure we still trip the barrier
+            // below (letting spin_up return its handles) and then re-raise the panic.
+            // It surfaces through this worker's `JoinHandle`, which the owner watches
+            // (e.g. the server's worker-watcher, which then shuts the pool down) — a
+            // startup failure becomes a normal, catchable worker exit, not a hang.
+            let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 WORKER_IDX.set(idx);
                 NUM_WORKERS.set(num_workers);
                 let last_seen_wake_count = waker.wake_count();
@@ -291,22 +292,15 @@ impl Worker {
                 core_affinity::set_for_current(core);
                 worker
             }));
-            let mut worker = match setup {
-                Ok(worker) => worker,
-                Err(_) => {
-                    // The panic message (the real cause) was already printed by the
-                    // default panic hook; add context and take the process down so
-                    // spin_up's barrier can't hang.
-                    eprintln!(
-                        "FATAL: dispatch worker {} failed to start; aborting instead of \
-                         hanging Dispatch::spin_up (see the panic above for the cause).",
-                        idx
-                    );
-                    std::process::abort();
-                }
-            };
             debug!("Waiting for barrier for worker {:?}", idx);
             ready_barrier.wait();
+            let mut worker = match started {
+                Ok(worker) => worker,
+                // Re-raise now that spin_up has been released by the barrier; the
+                // panic (already logged by the default hook) propagates through this
+                // thread's JoinHandle to whoever joins it.
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
             debug!("Starting worker {:?}", idx);
             worker.run().expect("Worker failed!");
         })
