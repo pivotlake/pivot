@@ -85,7 +85,14 @@ jobs:
 
       - name: Build release binary (${{ matrix.arch }})
         working-directory: server
-        run: cargo build --release --bin pivotdb-server
+        run: |
+          # ci-runner-x86 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
+          # (GCC bug 95189). Build the C/C++ deps with clang there; GitHub-hosted
+          # runners have a newer, unaffected gcc, so leave them on the default.
+          if [ "${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' }}" = "true" ]; then
+            export CC=clang CXX=clang++
+          fi
+          cargo build --release --bin pivotdb-server
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
