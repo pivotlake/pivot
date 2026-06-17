@@ -45,9 +45,18 @@ mod uring_backend {
 
     impl IOBackend {
         pub fn new(ring_size: u32) -> io::Result<Self> {
-            Ok(Self {
-                ring: IoUring::builder().setup_coop_taskrun().build(ring_size)?,
-            })
+            // `IORING_SETUP_COOP_TASKRUN` (kernel >= 5.19) lets the kernel skip an
+            // IPI when completing work on the submitting task — a latency win. On
+            // older kernels `io_uring_setup` rejects the unknown flag with EINVAL;
+            // fall back to a plain ring rather than failing to start the engine.
+            let ring = match IoUring::builder().setup_coop_taskrun().build(ring_size) {
+                Ok(ring) => ring,
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    IoUring::builder().build(ring_size)?
+                }
+                Err(e) => return Err(e),
+            };
+            Ok(Self { ring })
         }
 
         /// Pushes a read of `length` bytes into `dest` onto the submission queue
