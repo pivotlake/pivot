@@ -353,22 +353,22 @@ impl Worker {
     fn process_io_completions(&mut self) -> Result<()> {
         for completion in self.io.completions()? {
             match completion {
-                Completion::Fs(r) => {
+                Ok(Completion::Fs(r)) => {
                     let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
                     data_flow.process_fs(r.operator_idx, r.request);
                 }
-                Completion::Http(r) => {
+                Ok(Completion::Http(r)) => {
                     let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
                     data_flow.process_http(r.operator_idx, r.request);
                 }
-                Completion::HttpError { request, error } => {
-                    // A remote read failed terminally (the engine already retried
-                    // transient drops). Fail just the owning dataflow — the query
-                    // errors out to its client while the worker and every other
-                    // query keep running. The dataflow may already be gone if the
-                    // query was cancelled meanwhile.
-                    if let Some(data_flow) = self.data_flows.get_mut(&request.data_flow_id) {
-                        data_flow.bail_and_cancel(error.into());
+                Err(failed) => {
+                    // A read failed terminally (an HTTP read past its retries, or
+                    // a disk read whose CQE came back negative). Cancel just the
+                    // owning dataflow — its query errors out to the client while
+                    // the worker and every other query keep running. The dataflow
+                    // may already be gone if the query was cancelled meanwhile.
+                    if let Some(data_flow) = self.data_flows.get_mut(&failed.data_flow_id) {
+                        data_flow.bail_and_cancel(failed.error.into());
                     }
                 }
             }
