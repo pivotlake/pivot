@@ -42,6 +42,7 @@ fn host_key(remote: &crate::io::RemoteFile) -> String {
 mod blocking_engine {
     use super::*;
     use crate::Identifier;
+    use crate::io::http::http1;
     use crate::io::http::{Error, Result};
     use rustls::{ClientConnection, StreamOwned};
     use std::collections::HashMap;
@@ -175,21 +176,36 @@ mod blocking_engine {
             // block length (validated in parse_response_head).
             let dest = unsafe { std::slice::from_raw_parts_mut(read.dest, body_len) };
 
-            // Body bytes already pulled in alongside the head.
+            // Drive the body through the sans-IO decoder. The range policy
+            // guarantees an identity (`Content-Length`) body, so the Direct path
+            // applies: read straight into the cache slot and report the count —
+            // no intermediate buffer. `decode` first absorbs any body bytes that
+            // arrived alongside the head, and would transparently handle a chunked
+            // body too were the range policy ever relaxed.
+            let mut body = http1::BodyDecoder::new(head.content_length);
+            let mut written = 0usize;
             let leftover = &acc[head.head_len..];
-            let take = leftover.len().min(body_len);
-            dest[..take].copy_from_slice(&leftover[..take]);
-            let mut written = take;
+            body.decode(leftover, |bytes| {
+                dest[written..written + bytes.len()].copy_from_slice(bytes);
+                written += bytes.len();
+            });
 
-            while written < body_len {
-                let n = conn.read(&mut dest[written..])?;
-                if n == 0 {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "connection closed before response body completed",
-                    )));
+            while !body.is_complete() {
+                match body.read_plan() {
+                    http1::ReadPlan::Done => break,
+                    http1::ReadPlan::Direct { max } => {
+                        let cap = (max as usize).min(dest.len() - written);
+                        let n = conn.read(&mut dest[written..written + cap])?;
+                        if n == 0 {
+                            return Err(Error::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "connection closed before response body completed",
+                            )));
+                        }
+                        written += n;
+                        body.consumed(n as u64)?;
+                    }
                 }
-                written += n;
             }
 
             Ok(conn)
@@ -205,6 +221,7 @@ mod blocking_engine {
 mod uring_engine {
     use super::*;
     use crate::Identifier;
+    use crate::io::http::http1;
     use crate::io::http::{Error, Result};
     use io_uring::{IoUring, opcode, squeue, types};
     use rustls::ClientConnection;
@@ -253,9 +270,12 @@ mod uring_engine {
         // only read that. Plaintext bodies skip it entirely (recv'd into `dest`).
         in_buf: Vec<u8>,
 
-        // Response assembly.
+        // Response assembly. `head_acc` accumulates header bytes until the head
+        // parses; `body` is then the sans-IO decoder that tracks body progress and
+        // completion (`None` until the head is in). `body_written` is the write
+        // cursor into `dest`.
         head_acc: Vec<u8>,
-        head: Option<proto::ResponseHead>,
+        body: Option<http1::BodyDecoder>,
         body_written: usize,
         /// True when the last recv was posted to read straight into `dest` (a
         /// plaintext body, zero-copy) rather than into `in_buf`.
@@ -277,7 +297,7 @@ mod uring_engine {
             self.out_pos = 0;
             // `in_buf` is reused as-is (not cleared); recv overwrites what it needs.
             self.head_acc.clear();
-            self.head = None;
+            self.body = None;
             self.body_written = 0;
             self.recv_in_dest = false;
         }
@@ -325,7 +345,7 @@ mod uring_engine {
                 transport,
                 in_buf,
                 head_acc,
-                head,
+                body,
                 dest,
                 req_len,
                 body_written,
@@ -339,7 +359,7 @@ mod uring_engine {
                 // recvs the body straight into `dest`, so plaintext bodies never
                 // pass through here.
                 Transport::Plain => {
-                    route_header(head_acc, head, dest, req_len, body_written, &in_buf[..n])
+                    parse_head(head_acc, body, dest, req_len, body_written, &in_buf[..n])
                 }
                 Transport::Tls(tls) => {
                     // `read_tls` only accepts as much ciphertext as fits rustls's
@@ -354,9 +374,16 @@ mod uring_engine {
                         tls.process_new_packets().map_err(Error::Tls)?;
                         let mut drained = 0usize;
                         loop {
-                            if let Some(h) = head.as_ref() {
+                            if let Some(decoder) = body.as_mut() {
                                 // Body phase: decrypt straight into the cache slot.
-                                let remaining = h.content_length as usize - *body_written;
+                                // A range body is identity-framed (the `proto`
+                                // policy enforces `Content-Length`), so the decoder
+                                // hands back a Direct plan whose `max` is the bytes
+                                // still expected — exactly the room to decrypt into.
+                                let remaining = match decoder.read_plan() {
+                                    http1::ReadPlan::Direct { max } => max as usize,
+                                    http1::ReadPlan::Done => 0,
+                                };
                                 if remaining == 0 {
                                     break;
                                 }
@@ -372,6 +399,7 @@ mod uring_engine {
                                 match tls.reader().read(dst) {
                                     Ok(0) => break,
                                     Ok(m) => {
+                                        decoder.consumed(m as u64)?;
                                         *body_written += m;
                                         drained += m;
                                     }
@@ -384,9 +412,9 @@ mod uring_engine {
                                     Ok(0) => break,
                                     Ok(m) => {
                                         drained += m;
-                                        route_header(
+                                        parse_head(
                                             head_acc,
-                                            head,
+                                            body,
                                             dest,
                                             req_len,
                                             body_written,
@@ -411,16 +439,17 @@ mod uring_engine {
         }
 
         fn request_complete(&self) -> bool {
-            matches!(self.head, Some(h) if self.body_written == h.content_length as usize)
+            self.body.as_ref().is_some_and(|b| b.is_complete())
         }
     }
 
-    /// Route a header-phase plaintext chunk: accumulate into `head_acc` until the
-    /// response head parses, then copy any body bytes that arrived alongside it
-    /// into `dest`. (Subsequent body bytes are read/recv'd straight into `dest`.)
-    fn route_header(
+    /// Feed a header-phase (plaintext) chunk: accumulate into `head_acc` until the
+    /// response head parses, then install the body decoder and copy any body bytes
+    /// that arrived in the same packet as the head into `dest`. (Subsequent body
+    /// bytes are recv'd/decrypted straight into `dest`, zero-copy.)
+    fn parse_head(
         head_acc: &mut Vec<u8>,
-        head: &mut Option<proto::ResponseHead>,
+        body: &mut Option<http1::BodyDecoder>,
         dest: *mut u8,
         req_len: usize,
         body_written: &mut usize,
@@ -428,14 +457,24 @@ mod uring_engine {
     ) -> Result<()> {
         head_acc.extend_from_slice(chunk);
         if let proto::HeadParse::Complete(h) = proto::parse_response_head(head_acc, req_len)? {
-            *head = Some(h);
-            let body = &head_acc[h.head_len..];
-            let take = body.len().min(h.content_length as usize - *body_written);
-            // SAFETY: as in consume_received — pinned, currently-invalid slot region.
-            unsafe {
-                std::ptr::copy_nonoverlapping(body.as_ptr(), dest.add(*body_written), take);
-            }
-            *body_written += take;
+            let mut decoder = http1::BodyDecoder::new(h.content_length);
+            // The body bytes that arrived alongside the head — the one copy (out of
+            // the shared recv scratch into the slot) the identity path needs; the
+            // rest of the body never passes through scratch.
+            let leftover = &head_acc[h.head_len..];
+            decoder.decode(leftover, |bytes| {
+                // SAFETY: as in consume_received — pinned, currently-invalid slot
+                // region; total body (content_length) <= req_len == block length.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        dest.add(*body_written),
+                        bytes.len(),
+                    );
+                }
+                *body_written += bytes.len();
+            });
+            *body = Some(decoder);
         }
         Ok(())
     }
@@ -520,8 +559,13 @@ mod uring_engine {
                             )));
                         }
                         if conn.recv_in_dest {
-                            // Plaintext body recv'd straight into the cache slot —
-                            // nothing to copy or parse, just count it.
+                            // Plaintext body recv'd straight into the cache slot
+                            // (zero-copy) — nothing to copy or parse, just advance
+                            // the decoder and the write cursor.
+                            conn.body
+                                .as_mut()
+                                .expect("body decoder set before a Direct recv")
+                                .consumed(size as u64)?;
                             conn.body_written += size;
                         } else {
                             conn.consume_received(size)?;
@@ -592,7 +636,7 @@ mod uring_engine {
                 // Allocated once; reused (never re-zeroed) for every recv.
                 in_buf: vec![0u8; RECV_CHUNK],
                 head_acc: Vec::new(),
-                head: None,
+                body: None,
                 body_written: 0,
                 recv_in_dest: false,
                 state: State::Connecting,
@@ -640,10 +684,15 @@ mod uring_engine {
                     // (zero-copy). Otherwise recv into the scratch `in_buf` — TLS
                     // ciphertext, or the response headers (for either scheme).
                     let plain_body =
-                        matches!(conn.transport, Transport::Plain) && conn.head.is_some();
+                        matches!(conn.transport, Transport::Plain) && conn.body.is_some();
                     if plain_body {
-                        let remaining =
-                            conn.head.as_ref().unwrap().content_length as usize - conn.body_written;
+                        // Identity body: the decoder's Direct plan gives the bytes
+                        // still expected. `pump` only runs while the request is
+                        // unfinished, so this is always > 0 here.
+                        let remaining = match conn.body.as_ref().unwrap().read_plan() {
+                            http1::ReadPlan::Direct { max } => max as usize,
+                            http1::ReadPlan::Done => 0,
+                        };
                         conn.recv_in_dest = true;
                         // SAFETY: pinned, currently-invalid slot region; remaining
                         // bytes are within the block (content_length <= req_len).
@@ -699,7 +748,7 @@ mod uring_engine {
         conn.out_pos = 0;
         // `in_buf` is reused as-is (not cleared); recv overwrites what it needs.
         conn.head_acc.clear();
-        conn.head = None;
+        conn.body = None;
         conn.body_written = 0;
         conn.recv_in_dest = false;
         conn.state = State::Sending;

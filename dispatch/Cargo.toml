@@ -29,6 +29,8 @@ libc = "0.2.178"
 # (no cmake/C toolchain); roots are the bundled Mozilla set (no platform calls).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
+# Byte-level HTTP/1.1 head parsing for the sans-IO range-read helpers
+# (io::http::http1), driven from our own io_uring transport.
 httparse = "1.9"
 url = "2.5"
 
@@ -57,6 +59,14 @@ criterion = { version = "0.5", default-features = false, features = ["plotters",
 [[bench]]
 name = "operators"
 harness = false
+
+# HTTP(S) range-read throughput (`benches/http_range.rs`): stands up a loopback
+# backend and drives the HTTP engine via a standalone `IORequester`. Needs
+# `test-util` for `init_test_free_pool` (the out-of-crate single-worker context).
+[[bench]]
+name = "http_range"
+harness = false
+required-features = ["test-util"]
 
 [profile.profiling]
 inherits = "release"
