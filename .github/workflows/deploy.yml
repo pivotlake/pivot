@@ -7,6 +7,14 @@ on:
         description: "Destination GCS bucket (overrides the DEPLOY_GCS_BUCKET repo variable). e.g. gs://my-bucket/path"
         required: false
         default: ""
+      build_x86_64:
+        description: "Build & deploy the x86_64 binary"
+        type: boolean
+        default: true
+      build_aarch64:
+        description: "Build & deploy the aarch64 binary"
+        type: boolean
+        default: true
       use_gcp_runner:
         description: "Build the x86_64 binary on the self-hosted GCP runner (ci-runner2) instead of a GitHub-hosted runner. The aarch64 build always uses a hosted arm64 runner."
         type: boolean
@@ -14,8 +22,8 @@ on:
 
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
-#                 For use_gcp_runner it also needs compute resume/suspend on
-#                 ci-runner2 (instance-scoped compute.instanceAdmin.v1 is enough).
+#                 For use_gcp_runner it also needs to resume ci-runner2
+#                 (instance-scoped compute.instanceAdmin.v1 is enough).
 # Required repository variables (unless overridden via the `bucket` input):
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
 
@@ -28,7 +36,9 @@ jobs:
   # box is X64); the aarch64 leg always builds on a hosted arm64 runner.
   start-ci:
     name: Start GCP runner
-    if: ${{ inputs.use_gcp_runner }}
+    # Only the x86_64 build can use the box, so only resume it when that build is
+    # both selected and routed to the self-hosted runner.
+    if: ${{ inputs.use_gcp_runner && inputs.build_x86_64 }}
     runs-on: ubuntu-latest
     steps:
       - name: Authenticate to Google Cloud
@@ -45,8 +55,14 @@ jobs:
 
   deploy:
     needs: start-ci
-    # start-ci is skipped unless opted in, so accept its skipped result.
-    if: ${{ always() && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
+    # Run the arches the checkboxes selected. start-ci is skipped unless opted in,
+    # so accept its skipped result too. (matrix context is available in job `if`,
+    # so each arch leg is included/skipped independently.)
+    if: >-
+      ${{ always()
+          && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped')
+          && ((matrix.arch == 'x86_64' && inputs.build_x86_64)
+              || (matrix.arch == 'aarch64' && inputs.build_aarch64)) }}
     name: Build ${{ matrix.arch }} release + upload to GCS
     # x86_64 can run on the self-hosted gcp-builder when opted in; aarch64 always
     # uses a hosted arm64 runner (the box is X64-only).
@@ -124,22 +140,6 @@ jobs:
           echo "  $BUCKET/pivotdb-server-$ARCH-$SHA"
           echo "  $BUCKET/pivotdb-server-$ARCH-latest"
 
-  # Suspend the VM again once the build finishes (success or failure), but only
-  # when we actually started it.
-  stop-ci:
-    name: Stop GCP runner
-    needs: [start-ci, deploy]
-    if: ${{ always() && inputs.use_gcp_runner }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: staging-404314
-      - name: Suspend ci-runner2
-        run: |
-          gcloud compute instances suspend ci-runner2 \
-            --project=staging-404314 --zone=me-west1-c
+  # NOTE: no stop job here. ci-runner2's hourly suspend-if-unused cron suspends
+  # the box only when no ci/deploy run is active, so it can't be killed out from
+  # under a concurrent run — which an unconditional suspend job here would do.
