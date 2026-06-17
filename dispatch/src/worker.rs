@@ -262,28 +262,40 @@ impl Worker {
         waker: Arc<WorkerWaker>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
-            WORKER_IDX.set(idx);
-            NUM_WORKERS.set(num_workers);
-            let last_seen_wake_count = waker.wake_count();
-            debug!("Initializing worker waker {:?}", idx);
-            init_worker_waker(&waker);
-            let mut worker = Self {
-                io: IORequester::new(),
-                id: core.id,
-                data_flows: HashMap::new(),
-                data_flow_queue: receiver,
-                did_work_last_iteration: false,
-                should_exit,
-                waker,
-                last_seen_wake_count,
-            };
-            debug!("Initializing memory context for worker {:?}", idx);
-            init_memory_context(memory_context_factory.create_memory_ctx());
-            debug!("Pre-faulting for worker {:?}", idx);
-            memory_ctx().prefault_buffers();
-            core_affinity::set_for_current(core);
+            // Worker startup (io_uring + memory-context setup) can fail. Every worker
+            // must reach `ready_barrier` or `Dispatch::spin_up` deadlocks on it forever,
+            // so run startup under `catch_unwind`: on failure we still trip the barrier
+            // below (letting spin_up return its handles) and then re-raise the panic.
+            let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                WORKER_IDX.set(idx);
+                NUM_WORKERS.set(num_workers);
+                let last_seen_wake_count = waker.wake_count();
+                debug!("Initializing worker waker {:?}", idx);
+                init_worker_waker(&waker);
+                let worker = Self {
+                    io: IORequester::new(),
+                    id: core.id,
+                    data_flows: HashMap::new(),
+                    data_flow_queue: receiver,
+                    did_work_last_iteration: false,
+                    should_exit,
+                    waker,
+                    last_seen_wake_count,
+                };
+                debug!("Initializing memory context for worker {:?}", idx);
+                init_memory_context(memory_context_factory.create_memory_ctx());
+                debug!("Pre-faulting for worker {:?}", idx);
+                memory_ctx().prefault_buffers();
+                core_affinity::set_for_current(core);
+                worker
+            }));
             debug!("Waiting for barrier for worker {:?}", idx);
             ready_barrier.wait();
+            let mut worker = match started {
+                Ok(worker) => worker,
+                // Re-raise now that spin_up has been released by the barrier
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
             debug!("Starting worker {:?}", idx);
             worker.run().expect("Worker failed!");
         })
