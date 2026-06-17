@@ -325,7 +325,7 @@ impl Worker {
                     // setup). Fail just this dataflow rather than propagating —
                     // that would panic the worker and take the whole server down.
                     if let Err(e) = self.io.request_http(r) {
-                        flow.fail(e.into());
+                        flow.bail_and_cancel(e.into());
                         continue 'flows;
                     }
                 }
@@ -368,7 +368,7 @@ impl Worker {
                     // query keep running. The dataflow may already be gone if the
                     // query was cancelled meanwhile.
                     if let Some(data_flow) = self.data_flows.get_mut(&request.data_flow_id) {
-                        data_flow.fail(error.into());
+                        data_flow.bail_and_cancel(error.into());
                     }
                 }
             }

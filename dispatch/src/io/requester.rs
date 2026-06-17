@@ -144,7 +144,8 @@ impl IORequester {
         #[cfg(target_os = "linux")]
         for &(result, ud) in &raw {
             if (ud as u64) & HTTP_TAG != 0 {
-                self.http.on_cqe(&mut self.backend.ring, ud as u64, result)?;
+                self.http
+                    .on_cqe(&mut self.backend.ring, ud as u64, result)?;
             }
         }
 
