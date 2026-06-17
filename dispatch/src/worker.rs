@@ -314,14 +314,20 @@ impl Worker {
     /// transport is busy or no more requests remain. Gated on HTTP activity only
     /// (not disk) so the two queues fill independently.
     fn saturate_http(&mut self) -> Result<()> {
-        for flow in self.data_flows.values_mut() {
+        'flows: for flow in self.data_flows.values_mut() {
             if self.io.has_http_pending() {
                 break;
             }
 
             while let Some(requests) = flow.get_next_http_request() {
                 for r in requests {
-                    self.io.request_http(r)?;
+                    // Submitting a remote read can fail (socket exhaustion, TLS
+                    // setup). Fail just this dataflow rather than propagating —
+                    // that would panic the worker and take the whole server down.
+                    if let Err(e) = self.io.request_http(r) {
+                        flow.bail_and_cancel(e.into());
+                        continue 'flows;
+                    }
                 }
 
                 if self.io.has_http_pending() {
@@ -347,13 +353,23 @@ impl Worker {
     fn process_io_completions(&mut self) -> Result<()> {
         for completion in self.io.completions()? {
             match completion {
-                Completion::Fs(r) => {
+                Ok(Completion::Fs(r)) => {
                     let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
                     data_flow.process_fs(r.operator_idx, r.request);
                 }
-                Completion::Http(r) => {
+                Ok(Completion::Http(r)) => {
                     let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
                     data_flow.process_http(r.operator_idx, r.request);
+                }
+                Err(failed) => {
+                    // A read failed terminally (an HTTP read past its retries, or
+                    // a disk read whose CQE came back negative). Cancel just the
+                    // owning dataflow — its query errors out to the client while
+                    // the worker and every other query keep running. The dataflow
+                    // may already be gone if the query was cancelled meanwhile.
+                    if let Some(data_flow) = self.data_flows.get_mut(&failed.data_flow_id) {
+                        data_flow.bail_and_cancel(failed.error.into());
+                    }
                 }
             }
         }

@@ -1,7 +1,7 @@
 use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
-use crate::io::{Completion, DataFlowRequest, FsRequest, HttpRequest};
+use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -127,46 +127,71 @@ impl IORequester {
         self.http.has_active()
     }
 
-    /// Drain completed reads. Each block's bytes have already landed in its cache
-    /// slot, so we [`commit`](crate::memory::file_cache::MissingBlock::commit) it
-    /// and yield the originating request as a [`Completion`] — the transport kind
-    /// (fs or http) preserved in the type. Disk completions come straight off the
-    /// ring; HTTP completions are routed through the [`HttpEngine`] (which may
-    /// submit follow-up SQEs) before the finished ones are harvested.
-    pub fn completions(&mut self) -> Result<impl Iterator<Item = Completion> + '_> {
+    /// Drain finished reads, one per-read result each. The outer `Result` is for
+    /// genuine ring-machinery failures; each inner result is `Ok` for a read
+    /// whose bytes landed (block committed, request yielded as a [`Completion`]
+    /// with the transport kind preserved) or `Err` for one that failed terminally
+    /// (a [`FailedRead`] carrying the issuing dataflow and the error). A single
+    /// failed read therefore never aborts the drain or tears down the worker —
+    /// the worker cancels just the owning dataflow.
+    ///
+    /// Disk completions come straight off the ring; HTTP completions are routed
+    /// through the [`HttpEngine`] (which may submit follow-up SQEs, including
+    /// transparent reconnect-and-retry) before the finished ones are harvested.
+    pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedRead>>> {
         let raw = self.backend.completions()?;
 
-        // HTTP CQEs drive the engine (and may submit follow-up SQEs) — route them
-        // now so `?` still propagates and `take_completed` sees the finished ones.
-        // On non-Linux the ring is disk-only, so there are no HTTP CQEs here.
+        // HTTP socket CQEs drive the engine first: they may submit follow-up
+        // SQEs and populate the engine's completed/failed lists. A transient
+        // transport error is retried inside the engine; a terminal one lands in
+        // `take_failed` below. On non-Linux the ring is disk-only, so none here.
         #[cfg(target_os = "linux")]
-        for &(size, ud) in &raw {
+        for &(result, ud) in &raw {
             if (ud as u64) & HTTP_TAG != 0 {
-                self.http.on_cqe(&mut self.backend.ring, ud as u64, size)?;
+                self.http
+                    .on_cqe(&mut self.backend.ring, ud as u64, result)?;
             }
         }
-        let http_ids = self.http.take_completed();
 
-        // Yield each finished request lazily, committing its cache block as it
-        // goes: disk reads (the non-HTTP CQEs; the routed HTTP CQEs are dropped)
-        // then the HTTP reads the engine just finished. Each arm drains its own
-        // pending map (disjoint field borrows).
-        let fs_pending = &mut self.pending_io_requests;
-        let http_pending = &mut self.http_pending;
-        let fs = raw
-            .into_iter()
-            .filter_map(|(_size, ud)| disk_completion(ud).then_some(ud))
-            .map(move |id| {
-                let request = fs_pending.remove(&id).unwrap();
+        let mut out = Vec::new();
+
+        // Disk reads: one CQE each. A negative result is a failed read — surface
+        // it as an `Err` for just that dataflow rather than aborting the drain.
+        for &(result, ud) in &raw {
+            if !disk_completion(ud) {
+                continue;
+            }
+            let request = self.pending_io_requests.remove(&ud).unwrap();
+            if result < 0 {
+                out.push(Err(FailedRead {
+                    data_flow_id: request.data_flow_id,
+                    operator_idx: request.operator_idx,
+                    error: std::io::Error::from_raw_os_error(-result).into(),
+                }));
+            } else {
                 request.request.block.commit();
-                Completion::Fs(request)
-            });
-        let http = http_ids.into_iter().map(move |id| {
-            let request = http_pending.remove(&id).unwrap();
+                out.push(Ok(Completion::Fs(request)));
+            }
+        }
+
+        // HTTP reads whose body fully landed this pass.
+        for id in self.http.take_completed() {
+            let request = self.http_pending.remove(&id).unwrap();
             request.request.block.commit();
-            Completion::Http(request)
-        });
-        Ok(fs.chain(http))
+            out.push(Ok(Completion::Http(request)));
+        }
+        // HTTP reads that failed terminally (retries exhausted / non-retryable).
+        // The block is left uncommitted.
+        for (id, error) in self.http.take_failed() {
+            let request = self.http_pending.remove(&id).unwrap();
+            out.push(Err(FailedRead {
+                data_flow_id: request.data_flow_id,
+                operator_idx: request.operator_idx,
+                error: error.into(),
+            }));
+        }
+
+        Ok(out)
     }
 
     /// Blocks until at least one pending read (disk or HTTP) makes progress.
@@ -269,13 +294,12 @@ mod tests {
         Arc::new(config)
     }
 
-    /// Spawn a loopback HTTPS server that serves `num_requests` range GETs on a
-    /// single keep-alive connection, returning the bound port.
-    fn spawn_server(num_requests: usize) -> u16 {
+    /// A self-signed TLS server config for the loopback test server.
+    fn server_tls_config() -> Arc<rustls::ServerConfig> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = cert.cert.der().clone();
         let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
@@ -286,8 +310,30 @@ mod tests {
             rustls::pki_types::PrivateKeyDer::Pkcs8(key_der),
         )
         .unwrap();
-        let server_config = Arc::new(server_config);
+        Arc::new(config)
+    }
 
+    /// Read one range request and write back its `206` response body.
+    fn serve_one_range<S: Read + Write>(tls: &mut S) {
+        let head = read_head(tls);
+        let (start, end) = parse_range(&head);
+        let len = end - start + 1;
+        let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
+        let resp = format!(
+            "HTTP/1.1 206 Partial Content\r\n\
+             Content-Length: {len}\r\n\
+             Content-Range: bytes {start}-{end}/1000000\r\n\
+             Connection: keep-alive\r\n\r\n"
+        );
+        tls.write_all(resp.as_bytes()).unwrap();
+        tls.write_all(&body).unwrap();
+        tls.flush().unwrap();
+    }
+
+    /// Spawn a loopback HTTPS server that serves `num_requests` range GETs on a
+    /// single keep-alive connection, returning the bound port.
+    fn spawn_server(num_requests: usize) -> u16 {
+        let server_config = server_tls_config();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -296,19 +342,30 @@ mod tests {
             let conn = rustls::ServerConnection::new(server_config).unwrap();
             let mut tls = rustls::StreamOwned::new(conn, tcp);
             for _ in 0..num_requests {
-                let head = read_head(&mut tls);
-                let (start, end) = parse_range(&head);
-                let len = end - start + 1;
-                let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
-                let resp = format!(
-                    "HTTP/1.1 206 Partial Content\r\n\
-                     Content-Length: {len}\r\n\
-                     Content-Range: bytes {start}-{end}/1000000\r\n\
-                     Connection: keep-alive\r\n\r\n"
-                );
-                tls.write_all(resp.as_bytes()).unwrap();
-                tls.write_all(&body).unwrap();
-                tls.flush().unwrap();
+                serve_one_range(&mut tls);
+            }
+        });
+
+        port
+    }
+
+    /// Spawn a server that serves one range GET, drops the connection (as a
+    /// keep-alive idle timeout would), then accepts a second connection and
+    /// serves one more. The pooled connection the client cached from the first
+    /// read is therefore dead by the time it's reused.
+    fn spawn_stale_pool_server() -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().unwrap();
+                let conn = rustls::ServerConnection::new(server_config.clone()).unwrap();
+                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                serve_one_range(&mut tls);
+                // `tls` drops here: close_notify + FIN retire the connection, so
+                // the client's pooled copy is stale on the next read.
             }
         });
 
@@ -374,7 +431,7 @@ mod tests {
             if requester.has_pending() {
                 requester.wait().unwrap();
             }
-            completed += requester.completions().unwrap().count();
+            completed += requester.completions().unwrap().len();
         }
         // Keep the lookups' pins alive until after the reads committed.
         drop(lookups);
@@ -413,5 +470,28 @@ mod tests {
         // connection (the server only accepts one TCP connection).
         fetch(&mut requester, &loc, 4096, 2 * 4096);
         assert_cached(&loc, 4096, 2 * 4096);
+    }
+
+    #[test]
+    fn stale_pooled_connection_is_retried_on_a_fresh_one() {
+        init_test_free_pool(16);
+        let port = spawn_stale_pool_server();
+
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
+        let remote = Arc::new(RemoteFile::open(url).unwrap());
+        let loc = FileLocation::Remote(remote);
+        memory_ctx().file_cache().open_entry(loc.clone());
+
+        let mut requester = IORequester::with_http_config(client_config());
+
+        // First read primes the keep-alive pool with connection #1.
+        fetch(&mut requester, &loc, 0, 4096);
+        assert_cached(&loc, 0, 4096);
+
+        // The server has since closed connection #1. Reusing the now-stale
+        // pooled connection fails mid-exchange; the engine must reconnect and
+        // re-issue the (idempotent) range read rather than surfacing an error.
+        fetch(&mut requester, &loc, 4096, 4096);
+        assert_cached(&loc, 4096, 4096);
     }
 }

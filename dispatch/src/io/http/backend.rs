@@ -123,6 +123,13 @@ mod blocking_engine {
             std::mem::take(&mut self.completed)
         }
 
+        /// API parity with the uring engine: the blocking engine reports failures
+        /// synchronously through `start`'s `Result` (the requester fails the
+        /// dataflow there), so it never has deferred failures to hand back.
+        pub fn take_failed(&mut self) -> Vec<(Identifier, Error)> {
+            Vec::new()
+        }
+
         pub fn has_active(&self) -> bool {
             !self.completed.is_empty()
         }
@@ -233,6 +240,33 @@ mod uring_engine {
 
     const RECV_CHUNK: usize = 16 * 1024;
 
+    /// How many times a single range read is re-issued on a fresh connection
+    /// before it's reported as failed. Covers the common case — a pooled
+    /// keep-alive connection the server closed on its idle timeout — plus a few
+    /// genuinely flaky reconnects, without spinning forever on a real outage.
+    const MAX_HTTP_RETRIES: u32 = 3;
+
+    /// Whether a transport error is worth retrying on a fresh connection. Socket
+    /// teardown (a closed keep-alive, a reset, a refused reconnect) is transient;
+    /// a TLS/protocol/DNS error is not — retrying would just fail the same way.
+    fn is_retryable(err: &Error) -> bool {
+        use std::io::ErrorKind::*;
+        match err {
+            Error::Io(e) => matches!(
+                e.kind(),
+                UnexpectedEof
+                    | ConnectionReset
+                    | ConnectionAborted
+                    | ConnectionRefused
+                    | BrokenPipe
+                    | NotConnected
+                    | TimedOut
+                    | Interrupted
+            ),
+            _ => false,
+        }
+    }
+
     /// What the connection's last in-flight SQE was, so its CQE can be interpreted.
     enum State {
         Connecting,
@@ -261,6 +295,12 @@ mod uring_engine {
         req_len: usize,
         request_bytes: Vec<u8>,
         request_queued: bool,
+        /// The originating read, kept so a transient transport failure can
+        /// rebuild a fresh connection and re-issue it (the GET is idempotent).
+        read: RemoteRead,
+        /// How many times this request has already been retried on a fresh
+        /// connection; bounded by [`MAX_HTTP_RETRIES`].
+        retries: u32,
 
         // Bytes pending send (ciphertext for TLS, the request for plain).
         out_buf: Vec<u8>,
@@ -493,6 +533,9 @@ mod uring_engine {
         active: usize,
         /// Ids whose body fully landed during the last completion routing pass.
         completed: Vec<Identifier>,
+        /// Ids whose transport failed terminally (retries exhausted or a
+        /// non-retryable error), paired with the error to report to the dataflow.
+        failed: Vec<(Identifier, Error)>,
     }
 
     impl HttpEngine {
@@ -504,6 +547,7 @@ mod uring_engine {
                 pool: HashMap::new(),
                 active: 0,
                 completed: Vec::new(),
+                failed: Vec::new(),
             })
         }
 
@@ -513,6 +557,10 @@ mod uring_engine {
 
         pub fn take_completed(&mut self) -> Vec<Identifier> {
             std::mem::take(&mut self.completed)
+        }
+
+        pub fn take_failed(&mut self) -> Vec<(Identifier, Error)> {
+            std::mem::take(&mut self.failed)
         }
 
         /// Begin a range read: bind it to a pooled or fresh connection and submit
@@ -539,40 +587,27 @@ mod uring_engine {
         }
 
         /// Advance the connection identified by a tagged `user_data` after its SQE
-        /// completed with `size` bytes.
-        pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, size: usize) -> Result<()> {
+        /// completed with kernel result `result` (`>= 0` byte count, `< 0` is
+        /// `-errno`).
+        ///
+        /// A transport error — a negative result, an EOF mid-response, or an
+        /// error surfaced while parsing — does not propagate out (which would
+        /// panic the worker). Instead the read is retried on a fresh connection
+        /// or, once that's exhausted, recorded in `failed` so the requester can
+        /// fail just the owning dataflow.
+        pub fn on_cqe(&mut self, ring: &mut IoUring, user_data: u64, result: i32) -> Result<()> {
             let idx = (user_data & !HTTP_TAG) as usize;
 
-            let finished = {
-                let conn = self.conns[idx].as_mut().unwrap();
-                match conn.state {
-                    State::Connecting => false, // connected; pump below starts the exchange
-                    State::Sending => {
-                        conn.out_pos += size;
-                        false
-                    }
-                    State::Receiving => {
-                        if size == 0 {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "connection closed mid-response",
-                            )));
-                        }
-                        if conn.recv_in_dest {
-                            // Plaintext body recv'd straight into the cache slot
-                            // (zero-copy) — nothing to copy or parse, just advance
-                            // the decoder and the write cursor.
-                            conn.body
-                                .as_mut()
-                                .expect("body decoder set before a Direct recv")
-                                .consumed(size as u64)?;
-                            conn.body_written += size;
-                        } else {
-                            conn.consume_received(size)?;
-                        }
-                        conn.request_complete()
-                    }
-                }
+            // Negative result = socket-level error (connect refused, reset,
+            // broken pipe, ...). The connection is dead; retry or fail.
+            if result < 0 {
+                let err = Error::Io(std::io::Error::from_raw_os_error(-result));
+                return self.retry_or_fail(ring, idx, err);
+            }
+
+            let finished = match self.advance(idx, result as usize) {
+                Ok(f) => f,
+                Err(e) => return self.retry_or_fail(ring, idx, e),
             };
 
             if finished {
@@ -587,6 +622,79 @@ mod uring_engine {
             }
 
             self.pump(ring, idx)
+        }
+
+        /// Fold `size` freshly transferred bytes into the connection's request
+        /// state, returning whether the response body is now complete. Errors
+        /// (an EOF mid-body, a parse failure) are surfaced to [`on_cqe`], which
+        /// turns them into a retry or a recorded failure.
+        fn advance(&mut self, idx: usize, size: usize) -> Result<bool> {
+            let conn = self.conns[idx].as_mut().unwrap();
+            Ok(match conn.state {
+                State::Connecting => false, // connected; pump starts the exchange
+                State::Sending => {
+                    conn.out_pos += size;
+                    false
+                }
+                State::Receiving => {
+                    if size == 0 {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "connection closed mid-response",
+                        )));
+                    }
+                    if conn.recv_in_dest {
+                        // Plaintext body recv'd straight into the cache slot
+                        // (zero-copy) — nothing to copy or parse, just advance
+                        // the decoder and the write cursor.
+                        conn.body
+                            .as_mut()
+                            .expect("body decoder set before a Direct recv")
+                            .consumed(size as u64)?;
+                        conn.body_written += size;
+                    } else {
+                        conn.consume_received(size)?;
+                    }
+                    conn.request_complete()
+                }
+            })
+        }
+
+        /// Handle a dead connection for the request at slot `idx`: tear it down
+        /// and either re-issue the (idempotent) read on a fresh connection — the
+        /// common stale-keep-alive case — or, if the error isn't retryable or the
+        /// retry budget is spent, record the failure for the requester to surface.
+        fn retry_or_fail(&mut self, ring: &mut IoUring, idx: usize, err: Error) -> Result<()> {
+            // Take the dead connection out of the slab; dropping it closes the
+            // socket. It was in-flight (popped from the pool at `start`), so it
+            // leaves no stale pool entry behind.
+            let dead = self.conns[idx].take().expect("cqe for a live connection");
+            self.free_slots.push(idx);
+            let id = dead.id;
+            let retries = dead.retries;
+            let key = dead.host_key.clone();
+            let read = dead.read.clone();
+            drop(dead);
+
+            if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
+                match self.new_conn(key, &read, id) {
+                    Ok(mut fresh) => {
+                        fresh.retries = retries + 1;
+                        let new_idx = self.alloc_slot(fresh);
+                        return self.start_connect(ring, new_idx);
+                    }
+                    // Couldn't even build the socket — treat as a terminal failure.
+                    Err(e) => {
+                        self.active -= 1;
+                        self.failed.push((id, e));
+                        return Ok(());
+                    }
+                }
+            }
+
+            self.active -= 1;
+            self.failed.push((id, err));
+            Ok(())
         }
 
         fn new_conn(&self, key: String, read: &RemoteRead, id: Identifier) -> Result<Conn> {
@@ -631,6 +739,8 @@ mod uring_engine {
                 req_len: read.len,
                 request_bytes,
                 request_queued: false,
+                read: read.clone(),
+                retries: 0,
                 out_buf: Vec::new(),
                 out_pos: 0,
                 // Allocated once; reused (never re-zeroed) for every recv.
@@ -743,6 +853,10 @@ mod uring_engine {
             read.offset,
             read.len,
         );
+        // Fresh request on a healthy pooled connection: reset the retry budget
+        // and keep the read so a later transport failure can re-issue it.
+        conn.read = read.clone();
+        conn.retries = 0;
         conn.request_queued = false;
         conn.out_buf.clear();
         conn.out_pos = 0;
