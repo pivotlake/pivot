@@ -205,20 +205,6 @@ impl AsRef<[u8]> for SlotPin {
     }
 }
 
-/// A CLOCK-eviction region cache over the shared [`Ring`](super::Ring).
-///
-/// Regions are bucketed by [`FileLocation`], so the same cache serves both local
-/// files and remote HTTP objects — only the transport that fills a missing block
-/// differs.
-pub struct FileCache {
-    file_maps: RwLock<HashMap<FileLocation, RwLock<HashMap<usize, FileCacheEntry>>>>,
-    entries: Box<[UnsafeCell<Entry>]>,
-    hand: AtomicUsize,
-}
-
-unsafe impl Send for FileCache {}
-unsafe impl Sync for FileCache {}
-
 /// A slot's validity bitmap: bit `sub_block` set means sub-block `sub_block`
 /// (a 4 KB span of the slot) has been read into it. Keeps all the word/bit
 /// indexing — and the memory ordering that makes the in-place fill sound — in one place.
@@ -259,6 +245,20 @@ struct Entry {
     region: Option<(FileLocation, usize)>,
     valid: ValidBitmap,
 }
+
+/// A CLOCK-eviction region cache over the shared [`Ring`](super::Ring).
+///
+/// Regions are bucketed by [`FileLocation`], so the same cache serves both local
+/// files and remote HTTP objects — only the transport that fills a missing block
+/// differs.
+pub struct FileCache {
+    file_maps: RwLock<HashMap<FileLocation, RwLock<HashMap<usize, FileCacheEntry>>>>,
+    entries: Box<[UnsafeCell<Entry>]>,
+    hand: AtomicUsize,
+}
+
+unsafe impl Send for FileCache {}
+unsafe impl Sync for FileCache {}
 
 impl FileCache {
     pub fn new(capacity: usize) -> Self {
