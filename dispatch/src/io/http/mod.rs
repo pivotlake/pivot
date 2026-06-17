@@ -48,6 +48,11 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 /// A single remote range read: fetch `[offset, offset + len)` of `remote` into
 /// `dest` (a pointer into the pinned cache slot, kept alive by the issuing
 /// [`MissingBlock`](crate::memory::file_cache::MissingBlock)'s pin).
+///
+/// `Clone` so a transient transport failure can re-issue the same read on a
+/// fresh connection (see the engine's retry path); the clone aliases the same
+/// pinned `dest`, which is sound because only one attempt is ever in flight.
+#[derive(Clone)]
 pub(crate) struct RemoteRead {
     pub remote: Arc<RemoteFile>,
     pub offset: u64,

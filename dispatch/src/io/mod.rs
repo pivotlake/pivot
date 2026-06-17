@@ -285,6 +285,13 @@ impl<R> DataFlowRequest<R> {
 pub enum Completion {
     Fs(DataFlowRequest<FsRequest>),
     Http(DataFlowRequest<HttpRequest>),
+    /// An HTTP read that failed transport-side after exhausting retries (or hit
+    /// a non-retryable error). The block is **not** committed; the worker fails
+    /// just the owning dataflow rather than tearing down the whole server.
+    HttpError {
+        request: DataFlowRequest<HttpRequest>,
+        error: IORequesterError,
+    },
 }
 
 /// Opens a file for direct (uncached) reads.

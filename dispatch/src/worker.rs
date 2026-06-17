@@ -314,14 +314,20 @@ impl Worker {
     /// transport is busy or no more requests remain. Gated on HTTP activity only
     /// (not disk) so the two queues fill independently.
     fn saturate_http(&mut self) -> Result<()> {
-        for flow in self.data_flows.values_mut() {
+        'flows: for flow in self.data_flows.values_mut() {
             if self.io.has_http_pending() {
                 break;
             }
 
             while let Some(requests) = flow.get_next_http_request() {
                 for r in requests {
-                    self.io.request_http(r)?;
+                    // Submitting a remote read can fail (socket exhaustion, TLS
+                    // setup). Fail just this dataflow rather than propagating —
+                    // that would panic the worker and take the whole server down.
+                    if let Err(e) = self.io.request_http(r) {
+                        flow.fail(e.into());
+                        continue 'flows;
+                    }
                 }
 
                 if self.io.has_http_pending() {
@@ -354,6 +360,16 @@ impl Worker {
                 Completion::Http(r) => {
                     let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
                     data_flow.process_http(r.operator_idx, r.request);
+                }
+                Completion::HttpError { request, error } => {
+                    // A remote read failed terminally (the engine already retried
+                    // transient drops). Fail just the owning dataflow — the query
+                    // errors out to its client while the worker and every other
+                    // query keep running. The dataflow may already be gone if the
+                    // query was cancelled meanwhile.
+                    if let Some(data_flow) = self.data_flows.get_mut(&request.data_flow_id) {
+                        data_flow.fail(error.into());
+                    }
                 }
             }
         }
