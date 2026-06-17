@@ -1,7 +1,7 @@
 use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
-use crate::io::{Completion, DataFlowRequest, FsRequest, HttpRequest};
+use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -127,20 +127,24 @@ impl IORequester {
         self.http.has_active()
     }
 
-    /// Drain completed reads. Each block's bytes have already landed in its cache
-    /// slot, so we [`commit`](crate::memory::file_cache::MissingBlock::commit) it
-    /// and yield the originating request as a [`Completion`] — the transport kind
-    /// (fs or http) preserved in the type. Disk completions come straight off the
-    /// ring; HTTP completions are routed through the [`HttpEngine`] (which may
-    /// submit follow-up SQEs) before the finished ones are harvested.
-    pub fn completions(&mut self) -> Result<Vec<Completion>> {
+    /// Drain finished reads, one per-read result each. The outer `Result` is for
+    /// genuine ring-machinery failures; each inner result is `Ok` for a read
+    /// whose bytes landed (block committed, request yielded as a [`Completion`]
+    /// with the transport kind preserved) or `Err` for one that failed terminally
+    /// (a [`FailedRead`] carrying the issuing dataflow and the error). A single
+    /// failed read therefore never aborts the drain or tears down the worker —
+    /// the worker cancels just the owning dataflow.
+    ///
+    /// Disk completions come straight off the ring; HTTP completions are routed
+    /// through the [`HttpEngine`] (which may submit follow-up SQEs, including
+    /// transparent reconnect-and-retry) before the finished ones are harvested.
+    pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedRead>>> {
         let raw = self.backend.completions()?;
 
         // HTTP socket CQEs drive the engine first: they may submit follow-up
-        // SQEs (including transparent reconnect-and-retry) and populate the
-        // engine's completed/failed lists. A transient transport error is
-        // handled inside the engine, not surfaced here — so it never tears down
-        // the worker. On non-Linux the ring is disk-only, so there are none.
+        // SQEs and populate the engine's completed/failed lists. A transient
+        // transport error is retried inside the engine; a terminal one lands in
+        // `take_failed` below. On non-Linux the ring is disk-only, so none here.
         #[cfg(target_os = "linux")]
         for &(result, ud) in &raw {
             if (ud as u64) & HTTP_TAG != 0 {
@@ -151,36 +155,40 @@ impl IORequester {
 
         let mut out = Vec::new();
 
-        // Disk reads: one CQE each. A negative result is a genuine disk failure
-        // (not the transient-network class the HTTP engine retries), so surface
-        // it as before.
+        // Disk reads: one CQE each. A negative result is a failed read — surface
+        // it as an `Err` for just that dataflow rather than aborting the drain.
         for &(result, ud) in &raw {
             if !disk_completion(ud) {
                 continue;
             }
-            if result < 0 {
-                return Err(std::io::Error::from_raw_os_error(-result).into());
-            }
             let request = self.pending_io_requests.remove(&ud).unwrap();
-            request.request.block.commit();
-            out.push(Completion::Fs(request));
+            if result < 0 {
+                out.push(Err(FailedRead {
+                    data_flow_id: request.data_flow_id,
+                    operator_idx: request.operator_idx,
+                    error: std::io::Error::from_raw_os_error(-result).into(),
+                }));
+            } else {
+                request.request.block.commit();
+                out.push(Ok(Completion::Fs(request)));
+            }
         }
 
         // HTTP reads whose body fully landed this pass.
         for id in self.http.take_completed() {
             let request = self.http_pending.remove(&id).unwrap();
             request.request.block.commit();
-            out.push(Completion::Http(request));
+            out.push(Ok(Completion::Http(request)));
         }
         // HTTP reads that failed terminally (retries exhausted / non-retryable).
-        // The block is left uncommitted; the worker fails just the owning
-        // dataflow.
+        // The block is left uncommitted.
         for (id, error) in self.http.take_failed() {
             let request = self.http_pending.remove(&id).unwrap();
-            out.push(Completion::HttpError {
-                request,
+            out.push(Err(FailedRead {
+                data_flow_id: request.data_flow_id,
+                operator_idx: request.operator_idx,
                 error: error.into(),
-            });
+            }));
         }
 
         Ok(out)
