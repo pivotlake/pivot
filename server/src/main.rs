@@ -3,6 +3,7 @@
 //! This internally plans & compiles queries using the `planner` crate (internally based on DuckDB's,
 //! planner) with the `ParquetCatalog` and runs queries on `dispatch`
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -165,7 +166,14 @@ impl std::str::FromStr for OtelSpec {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Only emit ANSI colour codes to an interactive terminal; when stdout (the
+    // fmt subscriber's default writer) is redirected to a log file the escape
+    // sequences are just noise that breaks grep/awk and bloats the file.
+    let ansi = std::io::stdout().is_terminal();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(ansi)
+        .init();
 }
 
 /// Returns the total physical memory of the machine in bytes.
