@@ -11,7 +11,7 @@
 //! The per-arity [`OpTuple`] impls carry the tuple plumbing, so the
 //! [`AggregationValue`] impl for [`Compiled`] is one thin delegation.
 
-use super::super::aggregation::Aggregation;
+use super::slot::Slot;
 use super::super::{AggregationSlot, AggregationValue};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
@@ -20,8 +20,8 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
 
-/// A tuple of [`Aggregation`] ops, with the per-slot plumbing the container needs.
-/// Implemented for tuples of arity 1–6 by the macro below.
+/// A tuple of [`Slot`]s (each a `(Read, Fold)` pair), with the per-slot plumbing
+/// the container needs. Implemented for tuples of arity 1–6 by the macro below.
 pub trait OpTuple: Send + Sync + 'static {
     /// The heterogeneous cell tuple — one cell per op, each its own width.
     type Accs: Copy + Default + Send + Sync + 'static;
@@ -49,7 +49,7 @@ pub trait OpTuple: Send + Sync + 'static {
 
 macro_rules! impl_optuple {
     ($($O:ident $idx:tt),+) => {
-        impl<$($O: Aggregation),+> OpTuple for ($($O,)+) {
+        impl<$($O: Slot),+> OpTuple for ($($O,)+) {
             type Accs = ($($O::Acc,)+);
             type Inputs<'b> = ($($O::Input<'b>,)+);
             type Cfg = ($($O::Cfg,)+);

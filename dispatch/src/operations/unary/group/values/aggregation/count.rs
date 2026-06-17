@@ -1,10 +1,11 @@
-//! [`Count`] — `COUNT(*)` / `COUNT(col)`: `+1` per row, reads no column.
+//! [`Count`] — `COUNT(*)` / `COUNT(col)`: `+1` per row. Folds `()` — it reads no
+//! column (its [`Read`](super::super::read::NoRead) yields nothing).
 
-use super::Aggregation;
+use super::Fold;
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::values::cell::Numeric;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -15,22 +16,19 @@ use std::sync::Arc;
 /// numeric extremes use; `Compiled` instantiates the default `Count<i64>`.
 pub struct Count<A = i64>(PhantomData<fn() -> A>);
 
-impl<A: Numeric> Aggregation for Count<A> {
+impl<A: Numeric> Fold<()> for Count<A> {
     type Acc = A;
-    type Input<'b> = ();
     type Cfg = ();
 
-    #[inline(always)]
-    fn bind(_batch: &RecordBatch, _column: usize) {}
     #[inline(always)]
     fn cfg(_arena: &Arc<SharedArena>) {}
 
     #[inline(always)]
-    fn seed(_input: &(), _idx: usize, _arena: &mut WorkerArena) -> A {
+    fn seed(_v: (), _arena: &mut WorkerArena) -> A {
         A::from(1)
     }
     #[inline(always)]
-    fn update(acc: A, _input: &(), _idx: usize, _arena: &mut WorkerArena, _cfg: &()) -> A {
+    fn update(acc: A, _v: (), _arena: &mut WorkerArena, _cfg: &()) -> A {
         acc + A::from(1)
     }
     #[inline(always)]

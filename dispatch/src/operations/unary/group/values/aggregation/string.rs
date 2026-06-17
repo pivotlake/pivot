@@ -1,14 +1,14 @@
-//! [`StrMin`] / [`StrMax`] — string extremes over a `StringViewArray`, with an
-//! [`ArenaKey`] cell. `update` holds the real `&str`, so it compares *before*
-//! persisting and only a winner ever touches the value arena (lazy). `finish`
+//! [`StrMin`] / [`StrMax`] — string extremes, folding the `&str` their
+//! [`Read`](super::super::read::StrRead) *borrows* from the column. Because the
+//! fold holds the real `&str`, it compares *before* persisting and only a winner
+//! ever touches the value arena (lazy). The cell is an [`ArenaKey`]; `finish`
 //! emits a zero-copy `Utf8View` array into the arena's ring buffers.
 
-use super::Aggregation;
+use super::Fold;
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::keys::ArenaKey;
-use arrow_array::cast::AsArray;
-use arrow_array::{ArrayRef, RecordBatch, StringViewArray};
+use arrow_array::{ArrayRef, StringViewArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
@@ -20,36 +20,29 @@ pub struct StrMax;
 
 macro_rules! str_extreme {
     ($Op:ident, $wins:tt) => {
-        impl Aggregation for $Op {
+        impl<'b> Fold<&'b str> for $Op {
             type Acc = ArenaKey;
-            type Input<'b> = &'b StringViewArray;
             type Cfg = Arc<SharedArena>;
 
-            #[inline(always)]
-            fn bind(batch: &RecordBatch, column: usize) -> &StringViewArray {
-                batch.column(column).as_string_view()
-            }
             #[inline(always)]
             fn cfg(arena: &Arc<SharedArena>) -> Arc<SharedArena> {
                 arena.clone()
             }
 
             #[inline(always)]
-            fn seed(input: &&StringViewArray, idx: usize, arena: &mut WorkerArena) -> ArenaKey {
-                arena.push(input.value(idx))
+            fn seed(v: &str, arena: &mut WorkerArena) -> ArenaKey {
+                arena.push(v)
             }
             #[inline(always)]
             fn update(
                 acc: ArenaKey,
-                input: &&StringViewArray,
-                idx: usize,
+                v: &str,
                 arena: &mut WorkerArena,
                 cfg: &Arc<SharedArena>,
             ) -> ArenaKey {
                 // Raw bytes vs the current extreme; persist only a winner.
-                let incoming = input.value(idx);
-                if incoming.as_bytes() $wins acc.resolve(cfg) {
-                    arena.push(incoming)
+                if v.as_bytes() $wins acc.resolve(cfg) {
+                    arena.push(v)
                 } else {
                     acc
                 }

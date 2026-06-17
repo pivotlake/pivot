@@ -25,11 +25,13 @@ pub mod aggregation;
 pub mod cell;
 pub mod container;
 pub mod distinct;
+pub mod read;
 
-pub use aggregation::{Aggregation, Count, Max, Min, StrMax, StrMin, Sum, WideSum};
+pub use aggregation::{Count, Fold, Max, Min, StrMax, StrMin, Sum, WideSum};
 pub use cell::{Cell, Numeric, NumericArrow};
 pub use container::{Compiled, Dynamic, OpTuple};
 pub use distinct::Distinct;
+pub use read::{IntRead, NoRead, Read, StrRead};
 
 /// Which per-group aggregate a value slot computes during consume — a pure
 /// descriptor the planner attaches to each slot. It tells the numeric
