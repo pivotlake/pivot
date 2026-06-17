@@ -262,26 +262,49 @@ impl Worker {
         waker: Arc<WorkerWaker>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
-            WORKER_IDX.set(idx);
-            NUM_WORKERS.set(num_workers);
-            let last_seen_wake_count = waker.wake_count();
-            debug!("Initializing worker waker {:?}", idx);
-            init_worker_waker(&waker);
-            let mut worker = Self {
-                io: IORequester::new(),
-                id: core.id,
-                data_flows: HashMap::new(),
-                data_flow_queue: receiver,
-                did_work_last_iteration: false,
-                should_exit,
-                waker,
-                last_seen_wake_count,
+            // Worker startup (io_uring + memory-context setup) can fail. If it
+            // panics here the worker never reaches `ready_barrier`, leaving
+            // `Dispatch::spin_up` deadlocked on the barrier forever. Run startup
+            // under `catch_unwind` and turn any panic into a loud, fatal abort: a
+            // worker that can't start means the engine can't run, and crashing with
+            // the real cause beats hanging silently.
+            let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                WORKER_IDX.set(idx);
+                NUM_WORKERS.set(num_workers);
+                let last_seen_wake_count = waker.wake_count();
+                debug!("Initializing worker waker {:?}", idx);
+                init_worker_waker(&waker);
+                let worker = Self {
+                    io: IORequester::new(),
+                    id: core.id,
+                    data_flows: HashMap::new(),
+                    data_flow_queue: receiver,
+                    did_work_last_iteration: false,
+                    should_exit,
+                    waker,
+                    last_seen_wake_count,
+                };
+                debug!("Initializing memory context for worker {:?}", idx);
+                init_memory_context(memory_context_factory.create_memory_ctx());
+                debug!("Pre-faulting for worker {:?}", idx);
+                memory_ctx().prefault_buffers();
+                core_affinity::set_for_current(core);
+                worker
+            }));
+            let mut worker = match setup {
+                Ok(worker) => worker,
+                Err(_) => {
+                    // The panic message (the real cause) was already printed by the
+                    // default panic hook; add context and take the process down so
+                    // spin_up's barrier can't hang.
+                    eprintln!(
+                        "FATAL: dispatch worker {} failed to start; aborting instead of \
+                         hanging Dispatch::spin_up (see the panic above for the cause).",
+                        idx
+                    );
+                    std::process::abort();
+                }
             };
-            debug!("Initializing memory context for worker {:?}", idx);
-            init_memory_context(memory_context_factory.create_memory_ctx());
-            debug!("Pre-faulting for worker {:?}", idx);
-            memory_ctx().prefault_buffers();
-            core_affinity::set_for_current(core);
             debug!("Waiting for barrier for worker {:?}", idx);
             ready_barrier.wait();
             debug!("Starting worker {:?}", idx);
