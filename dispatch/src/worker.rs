@@ -48,7 +48,7 @@ use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::{result, thread};
 use thiserror::Error;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 thread_local! {
     pub static WORKER_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -375,7 +375,7 @@ impl Worker {
         }
 
         for id in to_remove {
-            info!("Finished data flow {:?}", id);
+            debug!("Finished data flow {:?}", id);
             self.data_flows.remove(&id);
         }
     }
@@ -443,7 +443,7 @@ impl Worker {
 
     fn try_receiving_new_dataflow(&mut self) {
         if let Ok(builder) = self.data_flow_queue.try_recv() {
-            info!("Received data flow...");
+            debug!("Received data flow...");
             match builder.build() {
                 Ok(data_flow) => {
                     self.data_flows.insert(data_flow.id(), data_flow);
