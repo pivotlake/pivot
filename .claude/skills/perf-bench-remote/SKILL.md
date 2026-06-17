@@ -6,9 +6,9 @@ description: SSH to the pivotdb benchmark box and run ClickBench performance com
 # Remote performance benchmarking (pivotdb vs DuckDB)
 
 ## The box
-- `ssh ubuntu@84.32.220.15` (key-based; no password).
-- `duckdb` is at `~/.duckdb/cli/1.5.1/duckdb` — **NOT on the default non-interactive PATH**. `cargo` is at `~/.cargo/bin`. Always export both:
-  `export PATH=$PATH:$HOME/.duckdb/cli/1.5.1:$HOME/.cargo/bin`
+- Find a stopped perf machine (it should be named perf-x) in aws (using aws cli) and start it.
+- `duckdb` is at `~/.duckdb/cli/1.5.3/duckdb` — **NOT on the default non-interactive PATH**. `cargo` is at `~/.cargo/bin`. Always export both:
+  `export PATH=$PATH:$HOME/.duckdb/cli/1.5.3:$HOME/.cargo/bin`
 - Repo: `~/pivotdb` (no `.git` on the box — edit locally and `scp`, or edit in place). Data: `~/hits/*.parquet` (~100M-row ClickBench `hits`). Box has 125GB RAM, 16 cores.
 - Real ClickBench query texts: `~/ClickBench/*/queries.sql` (use these verbatim; don't invent queries).
 
@@ -16,7 +16,40 @@ description: SSH to the pivotdb benchmark box and run ClickBench performance com
 The link **times out and kills foreground commands** that run more than ~1-2 min (builds, instrumented PGO runs, full benchmarks). For anything long:
 1. Write a script, `scp` it to `/tmp/run.sh`, launch detached: `setsid /tmp/run.sh >/tmp/run.log 2>&1 </dev/null &`
 2. Poll until done from a fresh ssh (use `-o ServerAliveInterval=20`), e.g. `until grep -q DONE /tmp/run.log; do sleep 5; done; cat /tmp/run.log`.
-Echo a sentinel (`=== BENCH COMPLETE ===`) at the end so the poll has something to match.
+   Echo a sentinel (`=== BENCH COMPLETE ===`) at the end so the poll has something to match.
+
+
+## ⚠️ SSH drops on long commands
+The link **times out and kills foreground commands** that run more than ~1-2 min (builds, instrumented PGO runs, full benchmarks). For anything long, run it detached and poll for a sentinel — but the sentinel must fire on **every** exit path, or an early failure leaves no marker and the poll hangs forever.
+
+1. Write a script that records its PID and emits the sentinel via an `EXIT` trap (so it fires on success, on `set -e` failure, and on normal exit), including the real exit code:
+```bash
+   #!/usr/bin/env bash
+   set -euo pipefail
+   echo $$ >/tmp/run.pid
+   trap 'echo "=== BENCH COMPLETE exit=$? ==="' EXIT
+
+   # ... your build / PGO run / benchmark here ...
+```
+
+2. `scp` it to `/tmp/run.sh`, then launch detached: `setsid /tmp/run.sh >/tmp/run.log 2>&1 </dev/null &`
+3. Poll from a fresh ssh (use `-o ServerAliveInterval=20`). Match the sentinel, **and** watch the PID so an un-trappable SIGKILL (OOM on the EPYC box) also ends the poll instead of hanging:
+
+```bash
+   pid=$(cat /tmp/run.pid)
+   while ! grep -q 'BENCH COMPLETE' /tmp/run.log; do
+     if ! kill -0 "$pid" 2>/dev/null; then
+       echo "process gone without sentinel — likely OOM/SIGKILL"
+       tail -n 30 /tmp/run.log; exit 1
+     fi
+     sleep 5
+   done
+   tail -n 20 /tmp/run.log   # exit=0 → success; anything else → it failed, reason is above
+```
+
+**Why the trap, not a trailing `echo`:** a plain `echo "=== BENCH COMPLETE ==="` at the end only runs on the happy path, so any early failure (build error, missing file, non-zero exit) leaves no marker and the poll spins forever. The `EXIT` trap fires regardless, and `$?` inside it is the true exit status.
+
+**Why `echo $$` inside the script, not `echo $!` after `setsid`:** `setsid` forks and the parent exits, so `$!` is the wrong PID. Capturing `$$` from inside is the reliable handle for `kill -0`. SIGKILL can't be trapped, so the PID liveness check is what covers OOM/`kill -9`.
 
 ## Running benchmarks
 The suite lives in `~/pivotdb/benchmarks`. Query/oracle pairs are `clickbench/qNN.sql` + `qNN.tsv` (drop in two files to add a query; IDs match ClickBench numbering, e.g. q02, q32).
@@ -26,14 +59,14 @@ The suite lives in `~/pivotdb/benchmarks`. Query/oracle pairs are `clickbench/qN
   Prints `[i/N] Query qNN — Xms`. `--update-results` writes the `.tsv` (pivot grading itself) — needed when adding/changing a query or its result isn't a stable oracle.
 - **DuckDB only:** `./run-duckdb.sh --source ~/hits --query 32 --iterations 4 --no-drop-caches` → `Run Time (s): real 0.xxx`.
 - **Side-by-side table (pivot vs DuckDB, cold + hot + speedup):**
-  `./benchmark.sh --source ~/hits --query 32 --iterations 6 --no-drop-caches`
+  `./benchmark.sh --source ~/hits --query 32 --iterations 6`
   `benchmark.sh` drives pivot via `just pgo-use run` (**needs a PGO profile first**, see below) and DuckDB via `run-duckdb.sh`.
 
 ## PGO build (what `benchmark.sh` expects)
-Generate the merged profile once with a representative workload, then `benchmark.sh` / `just pgo-use` reuse it:
+Generate the merged profile once with a representative workload, then `benchmark.sh` / `just pgo-use` reuse it. The representative workload is at ~/hits-pgo-subset. NEVER use that directory for ACTUAL perf numbers, only for creating a pgo build.
 ```
-cd ~/pivotdb/benchmarks && rm -rf /tmp/benchmarks-pgo
-just pgo-gen run --release -- --source ~/hits --query q32,q02 --iterations 1 --update-results   # instrumented = ~80x slower, slow!
+cd ~/pivotdb/benchmarks
+just pgo-gen run --release -- --source ~/hits-pgo-subset --iterations 1 --update-results   # instrumented = ~80x slower, slow!
 # then:
 ./benchmark.sh --source ~/hits --query 32 --iterations 6 --no-drop-caches
 ```
@@ -46,6 +79,8 @@ PGO is the user's expected default for `benchmark.sh` numbers. (Note: PGO someti
 
 ## Profiling (perf is available, `perf_event_paranoid=-1`)
 ```
+Note that for perf to work, you must make sure mem lock limit is high! the default is too low and it hangs.
+
 perf record -g -F 499 -o /tmp/p.data -- ./target/release/pivot-bench --source ~/hits --query q32 --iterations 4 --update-results >/dev/null 2>&1
 perf report -i /tmp/p.data --stdio --no-children | grep -vE '^#' | head -20
 perf diff /tmp/a.data /tmp/b.data        # compare two builds/queries
