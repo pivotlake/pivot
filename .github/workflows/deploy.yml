@@ -31,6 +31,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Resolve which arch legs to build from the checkbox inputs. A deselected arch
+  # is simply left out of the matrix here — the `matrix` context isn't available
+  # in a job-level `if`, so legs can't be filtered there.
+  matrix:
+    name: Resolve arch matrix
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.gen.outputs.include }}
+    steps:
+      - id: gen
+        run: |
+          legs=()
+          if [ "${{ inputs.build_x86_64 }}" = "true" ]; then
+            legs+=('{"arch":"x86_64","runner":"ubuntu-24.04"}')
+          fi
+          if [ "${{ inputs.build_aarch64 }}" = "true" ]; then
+            legs+=('{"arch":"aarch64","runner":"ubuntu-24.04-arm"}')
+          fi
+          if [ ${#legs[@]} -eq 0 ]; then
+            echo "::error::Select at least one architecture (build_x86_64 / build_aarch64)."
+            exit 1
+          fi
+          include=$(IFS=,; echo "[${legs[*]}]")
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+          echo "Building: $include"
+
   # Resume the self-hosted GCP VM (ci-runner2) when opted in, so its gcp-builder
   # runners are online for the x86_64 build. Only the x86_64 leg can use it (the
   # box is X64); the aarch64 leg always builds on a hosted arm64 runner.
@@ -54,30 +80,18 @@ jobs:
             --project=staging-404314 --zone=me-west1-c
 
   deploy:
-    needs: start-ci
-    # Run the arches the checkboxes selected. start-ci is skipped unless opted in,
-    # so accept its skipped result too. (matrix context is available in job `if`,
-    # so each arch leg is included/skipped independently.)
-    if: >-
-      ${{ always()
-          && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped')
-          && ((matrix.arch == 'x86_64' && inputs.build_x86_64)
-              || (matrix.arch == 'aarch64' && inputs.build_aarch64)) }}
+    needs: [matrix, start-ci]
+    # start-ci is skipped unless opted in, so accept its skipped result too.
+    if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
     name: Build ${{ matrix.arch }} release + upload to GCS
     # x86_64 can run on the self-hosted gcp-builder when opted in; aarch64 always
-    # uses a hosted arm64 runner (the box is X64-only).
+    # uses a hosted arm64 runner (the box is X64-only). Native runners per arch —
+    # no emulation.
     runs-on: ${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' && 'gcp-builder' || matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Native runners per arch — no emulation. The arm64 hosted runner is
-          # free for public repos; private repos need a Team/Enterprise plan or
-          # a self-hosted arm64 runner.
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
 
     steps:
       - uses: actions/checkout@v4
