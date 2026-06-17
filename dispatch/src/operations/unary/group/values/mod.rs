@@ -30,7 +30,7 @@ pub mod read;
 pub use aggregation::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
 pub use cell::{Cell, Numeric, NumericArrow};
 pub use container::{
-    Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, Slot, StrMaxSlot, StrMinSlot, SumSlot,
+    Compiled, CountSlot, Dynamic, Mono, MaxSlot, MinSlot, OpTuple, Slot, StrMaxSlot, StrMinSlot, SumSlot,
 };
 pub use distinct::Distinct;
 pub use read::{IntRead, NoRead, Read, StrRead};

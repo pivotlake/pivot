@@ -40,7 +40,7 @@ pub enum NumReader<'b> {
 }
 
 impl<'b> NumReader<'b> {
-    fn bind(batch: &'b RecordBatch, column: usize) -> Self {
+    pub(crate) fn bind(batch: &'b RecordBatch, column: usize) -> Self {
         let col = batch.column(column);
         match col.data_type() {
             DataType::Int16 => NumReader::I16(col.as_primitive::<Int16Type>()),
@@ -50,7 +50,7 @@ impl<'b> NumReader<'b> {
         }
     }
     #[inline(always)]
-    fn read(&self, idx: usize) -> i64 {
+    pub(crate) fn read(&self, idx: usize) -> i64 {
         match self {
             NumReader::I16(a) => IntRead::<Int16Type>::read(a, idx),
             NumReader::I32(a) => IntRead::<Int32Type>::read(a, idx),
@@ -122,16 +122,23 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
 
     #[inline(always)]
     fn value(reader: &[BoundSlot<'_>; N], idx: usize, arena: &mut WorkerArena) -> Self {
-        Self {
-            cells: std::array::from_fn(|s| match &reader[s] {
+        // A plain loop, not `std::array::from_fn`: the per-slot match is large, so
+        // as a `from_fn` closure it exceeds the inline threshold and is emitted
+        // out-of-line through the `Wrapped`/try-trait machinery — measured at ~40%
+        // of a q09 merge regression. The loop keeps the op `seed`s inlined.
+        let mut cells = [A::default(); N];
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..N {
+            cells[s] = match &reader[s] {
                 BoundSlot::Count => Count::<A>::seed((), arena),
                 BoundSlot::Sum(r) => Sum::<A>::seed(r.read(idx), arena),
                 BoundSlot::Min(r) => Min::<A>::seed(r.read(idx), arena),
                 BoundSlot::Max(r) => Max::<A>::seed(r.read(idx), arena),
                 BoundSlot::StrMin(a) => StrMin::<A>::seed(StrRead::read(a, idx), arena),
                 BoundSlot::StrMax(a) => StrMax::<A>::seed(StrRead::read(a, idx), arena),
-            }),
+            };
         }
+        Self { cells }
     }
 
     #[inline(always)]
@@ -165,23 +172,24 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
     #[inline(always)]
     fn merge(self, other: Self, cfg: &Self::MergeConfig) -> Self {
         let (slots, shared) = cfg;
-        Self {
-            // Each slot combines via its op's own `merge` (no column reader). Same
-            // uniform shape as the consume fold — `Op::<A>::merge(a, b, cfg)`.
-            cells: std::array::from_fn(|s| {
-                let (a, b) = (self.cells[s], other.cells[s]);
-                match slots[s].kind {
-                    AggregationKind::CountStar | AggregationKind::Count => {
-                        Count::<A>::merge(a, b, &())
-                    }
-                    AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
-                    AggregationKind::Min => Min::<A>::merge(a, b, &()),
-                    AggregationKind::Max => Max::<A>::merge(a, b, &()),
-                    AggregationKind::StrMin => StrMin::<A>::merge(a, b, shared),
-                    AggregationKind::StrMax => StrMax::<A>::merge(a, b, shared),
-                }
-            }),
+        // A plain loop, not `std::array::from_fn`, for the same inlining reason as
+        // `value` — this runs per matched entry in the partition merge, the hottest
+        // path for a high-cardinality `COUNT(DISTINCT)`. Each slot combines via its
+        // op's own `merge` — same `Op::<A>::merge(a, b, cfg)` shape, no reader.
+        let mut cells = [A::default(); N];
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..N {
+            let (a, b) = (self.cells[s], other.cells[s]);
+            cells[s] = match slots[s].kind {
+                AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b, &()),
+                AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
+                AggregationKind::Min => Min::<A>::merge(a, b, &()),
+                AggregationKind::Max => Max::<A>::merge(a, b, &()),
+                AggregationKind::StrMin => StrMin::<A>::merge(a, b, shared),
+                AggregationKind::StrMax => StrMax::<A>::merge(a, b, shared),
+            };
         }
+        Self { cells }
     }
 
     #[inline(always)]
