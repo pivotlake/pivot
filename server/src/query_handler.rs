@@ -43,6 +43,7 @@ use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::PgWireBackendMessage;
 use thiserror::Error;
 use tokio::task::JoinError;
+use tracing::{info, warn};
 
 thread_local! {
     /// One [`planner::Planner`] (and its non-`Send` DuckDB context) per
@@ -236,7 +237,11 @@ impl SimpleQueryHandler for PivotQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let res = self.run_query(query).await.map_err(|e| e.into_pgwire())?;
+        info!(sql = %query, "query received");
+        let res = self.run_query(query).await.map_err(|e| {
+            warn!(error = %e, sql = %query, "query failed");
+            e.into_pgwire()
+        })?;
         Ok(vec![res])
     }
 }
