@@ -205,23 +205,16 @@ impl DataFlow {
     }
 
     /// Bail on running the current dataflow because of an error. This will set `canceled` to true
-    /// (cancelling it for all workers) and send the error out
-    fn bail_and_cancel(&self, err: Error) {
+    /// (cancelling it for all workers) and send the error out. Called both from inside
+    /// [`try_run`](Self::try_run) and directly by the worker when work it submitted on the
+    /// dataflow's behalf (e.g. a remote read) fails terminally.
+    pub fn bail_and_cancel(&self, err: Error) {
         error!("DataFlow {:?} failed: {err}", self.id());
         if self.err_tx.send(err).is_err() {
             warn!("Unable to send error...");
         }
         self.cancelled.store(true, Ordering::Relaxed);
         worker_waker().notify();
-    }
-
-    /// Fail this dataflow from outside its own execution — e.g. a transport
-    /// read the worker submitted on its behalf failed terminally. Cancels the
-    /// dataflow across all workers and reports the error to the client, exactly
-    /// like an error raised inside [`try_run`](Self::try_run), without
-    /// disturbing any other query.
-    pub fn fail(&self, err: Error) {
-        self.bail_and_cancel(err);
     }
 
     /// Try running a function within the dataflow- this will gracefully catch any errors/panics and
