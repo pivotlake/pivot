@@ -263,8 +263,7 @@ impl CatalogTable {
     /// ([`prune_old_versions`](Self::prune_old_versions)) — so a query still
     /// reading the prior version never has a file deleted out from under it.
     pub fn record_deletions(&self, removed: &[ObjectPath]) -> crate::Result<()> {
-        let resolved: Vec<ObjectPath> =
-            removed.iter().map(|p| self.location.resolve(p)).collect();
+        let resolved: Vec<ObjectPath> = removed.iter().map(|p| self.location.resolve(p)).collect();
         TableManifest::record_deletions(
             self.store.as_ref(),
             &self.name,

@@ -160,7 +160,10 @@ impl TableManifest {
         let doc = PendingDeletions {
             paths: paths.to_vec(),
         };
-        store.put(&Self::deletions_key(name, version), &serde_json::to_vec(&doc)?)?;
+        store.put(
+            &Self::deletions_key(name, version),
+            &serde_json::to_vec(&doc)?,
+        )?;
         Ok(())
     }
 

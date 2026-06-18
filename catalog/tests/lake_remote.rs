@@ -286,7 +286,12 @@ fn footer_load_keeps_many_reads_in_flight() {
     let size = bytes.len() as u64;
     let port = serve_counting_peak(bytes, peak.clone(), Duration::from_millis(50));
     let files: Vec<(Url, u64)> = (0..16)
-        .map(|i| (Url::parse(&format!("http://127.0.0.1:{port}/f{i}")).unwrap(), size))
+        .map(|i| {
+            (
+                Url::parse(&format!("http://127.0.0.1:{port}/f{i}")).unwrap(),
+                size,
+            )
+        })
         .collect();
 
     ParquetTable::from_remote_files(&dispatch, &files).unwrap();
@@ -307,12 +312,22 @@ fn row_group_scan_keeps_many_reads_in_flight() {
     let size = bytes.len() as u64;
     let port = serve_counting_peak(bytes, peak.clone(), Duration::from_millis(50));
     let files: Vec<(Url, u64)> = (0..16)
-        .map(|i| (Url::parse(&format!("http://127.0.0.1:{port}/f{i}")).unwrap(), size))
+        .map(|i| {
+            (
+                Url::parse(&format!("http://127.0.0.1:{port}/f{i}")).unwrap(),
+                size,
+            )
+        })
         .collect();
     let table = Arc::new(ParquetTable::from_remote_files(&dispatch, &files).unwrap());
     peak.store(0, Ordering::SeqCst);
 
-    table_input(&dispatch, &table, Projection::all(2), false).collect().unwrap();
+    table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
 
-    assert!(peak.load(Ordering::SeqCst) >= 4, "row-group reads serialised");
+    assert!(
+        peak.load(Ordering::SeqCst) >= 4,
+        "row-group reads serialised"
+    );
 }
