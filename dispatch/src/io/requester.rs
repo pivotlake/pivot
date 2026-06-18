@@ -127,6 +127,12 @@ impl IORequester {
         self.http.has_active()
     }
 
+    /// Number of HTTP reads issued but not yet completed — the current read-ahead
+    /// depth a worker uses to decide whether to submit more.
+    pub fn http_in_flight(&self) -> usize {
+        self.http_pending.len()
+    }
+
     /// Drain finished reads, one per-read result each. The outer `Result` is for
     /// genuine ring-machinery failures; each inner result is `Ok` for a read
     /// whose bytes landed (block committed, request yielded as a [`Completion`]
