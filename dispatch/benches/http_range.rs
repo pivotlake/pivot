@@ -310,7 +310,7 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
     let port = spawn_backend(tls);
     let scheme = if tls { "https" } else { "http" };
     let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}/obj")).unwrap();
-    let remote = Arc::new(RemoteFile::open(url).unwrap());
+    let remote = Arc::new(RemoteFile::open(url, None).unwrap());
     let loc = FileLocation::Remote(remote.clone());
     memory_ctx().file_cache().open_entry(loc.clone());
 
