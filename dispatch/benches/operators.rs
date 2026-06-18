@@ -78,9 +78,9 @@ use arrow_schema::{DataType, Field, Schema};
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 
 use dispatch::{
-    AggregationKind, AggregationRowValueExtractor, AggregationSlot, Compiled, Contains, Count,
-    DataFlowDispatcher, Dispatch, IntKeyExtractor, IntPairKeyExtractor, OrderBy,
-    RecordBatchOperatorSpec, StringKeyExtractor, Sum, memory_ctx, values_input,
+    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
+    Dynamic, IntKeyExtractor, IntPairKeyExtractor, OrderBy, RecordBatchOperatorSpec,
+    StringKeyExtractor, SumSlot, memory_ctx, values_input,
 };
 
 // ---------------------------------------------------------------------------
@@ -562,14 +562,14 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
     //     extractor — high cardinality, the heaviest grouped-aggregate path.
     {
         // [COUNT(*), SUM(v0), SUM(v1), COUNT(v1)] — matches the compiled
-        // `(Count, Sum<i16>, Sum<i16>, Count)` value extractor.
+        // `(CountSlot, SumSlot<i16>, SumSlot<i16>, CountSlot)` value extractor.
         let slots = vec![
             AggregationSlot::new(AggregationKind::CountStar, 0),
             AggregationSlot::new(AggregationKind::Sum, 2),
             AggregationSlot::new(AggregationKind::Sum, 3),
             AggregationSlot::new(AggregationKind::Count, 3),
         ];
-        type Value = Compiled<(Count, Sum<Int16Type>, Sum<Int16Type>, Count)>;
+        type Value = Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>;
         bench(
             c,
             d,
@@ -657,10 +657,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 4))
-                    .group_by_aggregate::<
-                        IntPairKeyExtractor<Int16Type, Int32Type>,
-                        AggregationRowValueExtractor<4>,
-                    >(vec![0, 1], slots.clone(), Some((0, 10)))
+                    .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<4>>(
+                        vec![0, 1],
+                        slots.clone(),
+                        Some((0, 10)),
+                    )
             },
         );
     }
