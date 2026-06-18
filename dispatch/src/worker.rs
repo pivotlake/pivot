@@ -310,12 +310,18 @@ impl Worker {
         Ok(())
     }
 
-    /// Submit HTTP reads from dataflows onto the same ring until the network
-    /// transport is busy or no more requests remain. Gated on HTTP activity only
-    /// (not disk) so the two queues fill independently.
+    /// Submit HTTP reads from dataflows onto the same ring until this worker has
+    /// [`HTTP_INFLIGHT_TARGET`] reads in flight or no more requests remain. Gated
+    /// on HTTP activity only (not disk) so the two queues fill independently.
+    ///
+    /// Remote objects sit behind ~tens-of-ms RTTs, so a deep read-ahead is what
+    /// hides the latency. Stopping at the *first* outstanding read serialises a
+    /// scan to one read at a time per worker — catastrophic over a table of many
+    /// small files, where the whole query becomes round-trip bound.
     fn saturate_http(&mut self) -> Result<()> {
+        const HTTP_INFLIGHT_TARGET: usize = 100;
         'flows: for flow in self.data_flows.values_mut() {
-            if self.io.has_http_pending() {
+            if self.io.http_in_flight() >= HTTP_INFLIGHT_TARGET {
                 break;
             }
 
@@ -330,7 +336,7 @@ impl Worker {
                     }
                 }
 
-                if self.io.has_http_pending() {
+                if self.io.http_in_flight() >= HTTP_INFLIGHT_TARGET {
                     break;
                 }
             }
