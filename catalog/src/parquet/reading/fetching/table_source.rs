@@ -135,8 +135,18 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         self.row_groups.is_empty()
     }
 
+    /// Eager-path pull. The injector is the *only* source of row groups, so it
+    /// must be reachable from `run_cpu_work` (which calls `try_recv`) — otherwise
+    /// row groups are stolen only in the worker's idle branch, one at a time,
+    /// and a high-latency remote scan never builds read-ahead (in-flight reads
+    /// peak at 1 per worker). A single non-spinning attempt keeps the hot loop
+    /// from spinning on `Steal::Retry`; the next iteration retries. A pruned row
+    /// group also returns `None` (it has been removed; the next call advances).
     fn try_recv(&self) -> Option<RowGroupRequest> {
-        None
+        match self.row_groups.steal() {
+            Steal::Success(s) => self.admit(s),
+            Steal::Empty | Steal::Retry => None,
+        }
     }
 
     fn steal(&self) -> Option<RowGroupRequest> {
@@ -144,18 +154,27 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
             match self.row_groups.steal() {
                 Steal::Empty => return None,
                 Steal::Retry => continue,
+                // Skip row groups the filter prunes; keep stealing rather than
+                // handing the worker a no-op.
                 Steal::Success(s) => {
-                    // Skip row groups the filter can prove hold no matching row;
-                    // keep stealing rather than returning so the worker isn't
-                    // handed a no-op.
-                    if let Some(filter) = &self.filter
-                        && !filter(s.get_metadata())
-                    {
-                        continue;
+                    if let Some(req) = self.admit(s) {
+                        return Some(req);
                     }
-                    return Some(RowGroupRequest::from(s, &self.projection));
                 }
             }
         }
+    }
+}
+
+impl RowGroupInjector {
+    /// Apply the row-group filter and wrap the survivor in a [`RowGroupRequest`];
+    /// `None` if the filter proves it holds no matching row.
+    fn admit(&self, s: QueryRowGroupMetadata) -> Option<RowGroupRequest> {
+        if let Some(filter) = &self.filter
+            && !filter(s.get_metadata())
+        {
+            return None;
+        }
+        Some(RowGroupRequest::from(s, &self.projection))
     }
 }
