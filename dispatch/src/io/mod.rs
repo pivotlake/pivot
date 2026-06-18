@@ -98,6 +98,15 @@ impl Debug for FileLocation {
 
 static NEXT_REMOTE_FILE_ID: AtomicU32 = AtomicU32::new(0);
 
+/// Produces the `Authorization` header value for a remote read — typically a
+/// GCS bearer token. Invoked once per request on a worker thread, so it must be
+/// cheap and non-blocking: it reads an already-minted, cached token, it never
+/// mints one. `None` means the URL is self-authenticating (an S3 presigned URL)
+/// or needs no auth at all. `Arc` so a [`crate::io::FileLocation`]/source can be
+/// cloned (the work-stealing fetch queue clones each file) while sharing one
+/// token cell.
+pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
+
 /// A remote HTTP(S) object, resolved once and reused for every range request
 /// against it.
 ///
@@ -124,13 +133,18 @@ pub struct RemoteFile {
     /// Origin-form request target (path + query) for the HTTP request line.
     request_target: String,
     is_https: bool,
+    /// Mints the `Authorization` header for each request (a bearer token whose
+    /// freshness is the store's concern), or `None` for a self-authenticating
+    /// URL. Read per request, never on the URL's `Hash`/`Eq` path.
+    auth: Option<AuthHeader>,
 }
 
 impl RemoteFile {
     /// Parse `url`, resolve its host to a [`SocketAddr`], and intern it. The DNS
     /// lookup happens here (once) so the per-request hot path never blocks on
-    /// resolution.
-    pub fn open(url: Url) -> std::io::Result<Self> {
+    /// resolution. `auth` supplies a fresh `Authorization` header per request,
+    /// or `None` when the URL carries its own auth.
+    pub fn open(url: Url, auth: Option<AuthHeader>) -> std::io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -180,7 +194,14 @@ impl RemoteFile {
             host_header,
             request_target,
             is_https,
+            auth,
         })
+    }
+
+    /// The `Authorization` header value for the next request, or `None` when the
+    /// URL is self-authenticating. Cheap and non-blocking — reads a cached token.
+    pub fn auth_header(&self) -> Option<Arc<str>> {
+        self.auth.as_ref().and_then(|f| f())
     }
 
     pub fn host(&self) -> &str {

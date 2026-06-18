@@ -77,8 +77,12 @@ pub fn gcs(prefix: &str) -> Option<Backend> {
 pub fn read_via_source(store: &dyn ObjectStore, key: &ObjectPath) -> Vec<u8> {
     match store.source(key).expect("source") {
         DataFileSource::Local(path) => std::fs::read(path).expect("read local source"),
-        DataFileSource::Remote(url) => {
-            let resp = ureq::get(url.as_str()).call().expect("GET source url");
+        DataFileSource::Remote { url, auth } => {
+            let mut req = ureq::get(url.as_str());
+            if let Some(header) = auth.as_ref().and_then(|f| f()) {
+                req = req.set("Authorization", &header);
+            }
+            let resp = req.call().expect("GET source url");
             let mut buf = Vec::new();
             std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)
                 .expect("read source body");

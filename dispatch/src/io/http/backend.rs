@@ -150,11 +150,13 @@ mod blocking_engine {
         /// Issue the range GET on `conn` and read its body into `read.dest`,
         /// returning the connection for re-pooling on success.
         fn do_request(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
+            let auth = read.remote.auth_header();
             let request = proto::build_range_get(
                 read.remote.host_header(),
                 read.remote.request_target(),
                 read.offset,
                 read.len,
+                auth.as_deref(),
             );
             conn.write_all(&request)?;
             conn.flush()?;
@@ -726,6 +728,7 @@ mod uring_engine {
                 read.remote.request_target(),
                 read.offset,
                 read.len,
+                read.remote.auth_header().as_deref(),
             );
 
             Ok(Conn {
@@ -852,6 +855,7 @@ mod uring_engine {
             read.remote.request_target(),
             read.offset,
             read.len,
+            read.remote.auth_header().as_deref(),
         );
         // Fresh request on a healthy pooled connection: reset the retry budget
         // and keep the read so a later transport failure can re-issue it.
