@@ -386,12 +386,13 @@ impl Aggregate {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
-        use dispatch::{AggregationKind, AggregationSlot, IntPairKeyExtractor, Mono};
+        use dispatch::{AggregationKind, AggregationSlot, Dynamic, IntPairKeyExtractor};
 
         // The two-level COUNT(DISTINCT) aggregation is all additive (dedup counts
-        // and re-summed partials), so both levels use the branch-free additive
-        // `Mono` value (no per-slot kind dispatch, no widen, no string arms).
-        type AddVal<const N: usize> = Mono<N>;
+        // and re-summed partials), so both levels use the `ONLY_ADDITIVE` Dynamic:
+        // the const prunes the per-slot Min/Max/string arms, collapsing the fold to
+        // the same branch-free additive codegen as the hand-written `Mono`.
+        type AddVal<const N: usize> = Dynamic<N, i64, true>;
 
         if self.groups.len() != 1 {
             return Err(Error::UnsupportedAggregateGroupAmount(self.groups.len()));

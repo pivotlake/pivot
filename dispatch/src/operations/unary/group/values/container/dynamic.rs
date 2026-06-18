@@ -85,17 +85,32 @@ impl<'b> BoundSlot<'b> {
 }
 
 /// `N` cells of width `A`, each folded by its slot op.
-pub struct Dynamic<const N: usize, A: Numeric + StringCell = i64> {
+///
+/// `ONLY_ADDITIVE` is a fast-path promise: when `true`, every slot is guaranteed
+/// (by the planner) to be a `COUNT` or `SUM`, so the per-slot folds (`update`,
+/// `merge`) drop their `Min`/`Max`/`StrMin`/`StrMax` arms to `unreachable!()`. With
+/// the non-additive arms gone the compiler collapses the per-slot dispatch and the
+/// `StringCell`/`i128` machinery to a branch-free additive loop — recovering the
+/// hand-written `Mono` codegen from this same generic container. The two-level
+/// `COUNT(DISTINCT)` path (all additive) sets it; everything else leaves it `false`.
+pub struct Dynamic<const N: usize, A: Numeric + StringCell = i64, const ONLY_ADDITIVE: bool = false> {
     cells: [A; N],
 }
 
-impl<const N: usize, A: Numeric + StringCell> Copy for Dynamic<N, A> {}
-impl<const N: usize, A: Numeric + StringCell> Clone for Dynamic<N, A> {
+impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Copy
+    for Dynamic<N, A, ONLY_ADDITIVE>
+{
+}
+impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Clone
+    for Dynamic<N, A, ONLY_ADDITIVE>
+{
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<const N: usize, A: Numeric + StringCell> Default for Dynamic<N, A> {
+impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
+    for Dynamic<N, A, ONLY_ADDITIVE>
+{
     fn default() -> Self {
         Self {
             cells: [A::default(); N],
@@ -103,7 +118,9 @@ impl<const N: usize, A: Numeric + StringCell> Default for Dynamic<N, A> {
     }
 }
 
-impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A> {
+impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> AggregationValue
+    for Dynamic<N, A, ONLY_ADDITIVE>
+{
     type Reader<'b> = [BoundSlot<'b>; N];
     /// The per-slot kinds (which op merges/renders each cell) and the value arena
     /// (which a string extreme resolves its keys through).
@@ -129,13 +146,33 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
         let mut cells = [A::default(); N];
         #[allow(clippy::needless_range_loop)]
         for s in 0..N {
+            // `ONLY_ADDITIVE` prunes each non-additive arm *in its body* — `if
+            // ONLY_ADDITIVE { unreachable!() } else { .. }` const-folds to a bare
+            // `unreachable!()` arm. A `_ if ONLY_ADDITIVE` guard arm instead lowers to
+            // a worse Count/Sum dispatch — measured ~2.3B more in `consume_window`.
             cells[s] = match &reader[s] {
                 BoundSlot::Count => Count::<A>::seed((), arena),
                 BoundSlot::Sum(r) => Sum::<A>::seed(r.read(idx), arena),
-                BoundSlot::Min(r) => Min::<A>::seed(r.read(idx), arena),
-                BoundSlot::Max(r) => Max::<A>::seed(r.read(idx), arena),
-                BoundSlot::StrMin(a) => StrMin::<A>::seed(StrRead::read(a, idx), arena),
-                BoundSlot::StrMax(a) => StrMax::<A>::seed(StrRead::read(a, idx), arena),
+                BoundSlot::Min(r) => {
+                    if ONLY_ADDITIVE { unreachable!() } else { Min::<A>::seed(r.read(idx), arena) }
+                }
+                BoundSlot::Max(r) => {
+                    if ONLY_ADDITIVE { unreachable!() } else { Max::<A>::seed(r.read(idx), arena) }
+                }
+                BoundSlot::StrMin(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        StrMin::<A>::seed(StrRead::read(a, idx), arena)
+                    }
+                }
+                BoundSlot::StrMax(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        StrMax::<A>::seed(StrRead::read(a, idx), arena)
+                    }
+                }
             };
         }
         Self { cells }
@@ -157,13 +194,31 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
         #[allow(clippy::needless_range_loop)]
         for s in 0..N {
             let c = self.cells[s];
+            // Per-arm body pruning under `ONLY_ADDITIVE` (see `value` for why this
+            // beats a `_ if ONLY_ADDITIVE` guard arm).
             self.cells[s] = match &reader[s] {
                 BoundSlot::Count => Count::<A>::update(c, (), arena, &()),
                 BoundSlot::Sum(r) => Sum::<A>::update(c, r.read(idx), arena, &()),
-                BoundSlot::Min(r) => Min::<A>::update(c, r.read(idx), arena, &()),
-                BoundSlot::Max(r) => Max::<A>::update(c, r.read(idx), arena, &()),
-                BoundSlot::StrMin(a) => StrMin::<A>::update(c, StrRead::read(a, idx), arena, shared),
-                BoundSlot::StrMax(a) => StrMax::<A>::update(c, StrRead::read(a, idx), arena, shared),
+                BoundSlot::Min(r) => {
+                    if ONLY_ADDITIVE { unreachable!() } else { Min::<A>::update(c, r.read(idx), arena, &()) }
+                }
+                BoundSlot::Max(r) => {
+                    if ONLY_ADDITIVE { unreachable!() } else { Max::<A>::update(c, r.read(idx), arena, &()) }
+                }
+                BoundSlot::StrMin(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        StrMin::<A>::update(c, StrRead::read(a, idx), arena, shared)
+                    }
+                }
+                BoundSlot::StrMax(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        StrMax::<A>::update(c, StrRead::read(a, idx), arena, shared)
+                    }
+                }
             };
         }
         self
@@ -180,13 +235,22 @@ impl<const N: usize, A: Numeric + StringCell> AggregationValue for Dynamic<N, A>
         #[allow(clippy::needless_range_loop)]
         for s in 0..N {
             let (a, b) = (self.cells[s], other.cells[s]);
-            cells[s] = match slots[s].kind {
-                AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b, &()),
-                AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
-                AggregationKind::Min => Min::<A>::merge(a, b, &()),
-                AggregationKind::Max => Max::<A>::merge(a, b, &()),
-                AggregationKind::StrMin => StrMin::<A>::merge(a, b, shared),
-                AggregationKind::StrMax => StrMax::<A>::merge(a, b, shared),
+            cells[s] = if ONLY_ADDITIVE {
+                // All-additive: `Count` and `Sum` both merge by `+`, so skip the
+                // per-slot `slots[s].kind` load and Count/Sum branch entirely — a
+                // pure add, identical to Mono's branch-free merge.
+                a + b
+            } else {
+                match slots[s].kind {
+                    AggregationKind::CountStar | AggregationKind::Count => {
+                        Count::<A>::merge(a, b, &())
+                    }
+                    AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
+                    AggregationKind::Min => Min::<A>::merge(a, b, &()),
+                    AggregationKind::Max => Max::<A>::merge(a, b, &()),
+                    AggregationKind::StrMin => StrMin::<A>::merge(a, b, shared),
+                    AggregationKind::StrMax => StrMax::<A>::merge(a, b, shared),
+                }
             };
         }
         Self { cells }
