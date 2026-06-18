@@ -285,23 +285,19 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     hash,
                     key,
                     &mut self.value_arena,
-                    |arena, cell| V::record_seed(value_reader, i, cell, arena),
-                    |arena, cell| V::record_update(value_reader, i, cell, arena, merge_config),
+                    |arena, cell| *cell = V::value(value_reader, i, arena),
+                    |arena, cell| {
+                        *cell = cell.update_from_reader(value_reader, i, arena, merge_config)
+                    },
                 );
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
-                // Apply any deferred folds for the rows probed so far before the
-                // remaining rows take the (immediate) scatter path.
-                V::finalize(value_reader, &mut self.value_arena, merge_config);
                 self.scatter_range(i + 1, length, key_reader, value_reader);
                 return;
             }
             i += 1;
         }
-        // Replay this window's deferred seeds/updates columnar (a no-op for values
-        // that folded immediately).
-        V::finalize(value_reader, &mut self.value_arena, merge_config);
     }
 
     /// Active table is full: either grow the stack (4x) or, for a radix-eligible

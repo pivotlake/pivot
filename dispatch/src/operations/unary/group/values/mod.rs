@@ -138,37 +138,6 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
         self.merge(Self::value(reader, idx, arena), cfg)
     }
 
-    /// Consume-path *seed* hook for a brand-new group's cell. The default
-    /// materialises immediately (`*cell = value`). A value may instead **record**
-    /// the request against `reader` and a placeholder, then apply every recorded
-    /// seed columnar in [`finalize`](Self::finalize) — turning the per-row scalar
-    /// fold into a per-column pass. `cell` points into the (stable) hash table.
-    #[inline(always)]
-    fn record_seed(reader: &Self::Reader<'_>, idx: usize, cell: &mut Self, arena: &mut WorkerArena) {
-        *cell = Self::value(reader, idx, arena);
-    }
-
-    /// Consume-path *update* hook for an existing group's cell. Default folds the
-    /// row in immediately; a recording value just notes `(idx, cell)` and applies
-    /// it in [`finalize`](Self::finalize).
-    #[inline(always)]
-    fn record_update(
-        reader: &Self::Reader<'_>,
-        idx: usize,
-        cell: &mut Self,
-        arena: &mut WorkerArena,
-        cfg: &Self::MergeConfig,
-    ) {
-        *cell = cell.update_from_reader(reader, idx, arena, cfg);
-    }
-
-    /// Apply everything [`record_seed`](Self::record_seed)/[`record_update`](Self::record_update)
-    /// deferred for this batch's `reader`, then clear the records. Default: nothing
-    /// (the hooks already applied their work). Called once at the end of each
-    /// consume window (and before a mid-window radix switch).
-    #[inline(always)]
-    fn finalize(_reader: &Self::Reader<'_>, _arena: &mut WorkerArena, _cfg: &Self::MergeConfig) {}
-
     /// Combine two partial group values — the partition merge and the radix fold.
     fn merge(self, other: Self, cfg: &Self::MergeConfig) -> Self;
 
