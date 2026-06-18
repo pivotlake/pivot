@@ -72,8 +72,12 @@ pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 
 /// A partition with at least this many small files is merged even if they don't
 /// yet add up to a full output — otherwise partitions whose data never reaches
-/// the byte target accumulate small files without bound.
-const MIN_FILES_TO_MERGE: usize = 8;
+/// the byte target accumulate small files without bound. Kept well above the
+/// count that fills one byte-target output, so a busy partition always merges on
+/// the byte trigger (full-size outputs); this count trigger is only the safety
+/// net for a partition whose data trickles in, and a higher bar there means
+/// fewer small sub-target merges.
+const MIN_FILES_TO_MERGE: usize = 32;
 
 /// Compacts every table of a catalog into target-sized Parquet files,
 /// entirely off the tables' logs: poll, reload, merge what's eligible. Holds
