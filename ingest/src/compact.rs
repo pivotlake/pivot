@@ -70,6 +70,11 @@ pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 /// when a flush commits a new version, so seconds-scale is plenty.
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 
+/// A partition with at least this many small files is merged even if they don't
+/// yet add up to a full output — otherwise partitions whose data never reaches
+/// the byte target accumulate small files without bound.
+const MIN_FILES_TO_MERGE: usize = 8;
+
 /// Compacts every table of a catalog into target-sized Parquet files,
 /// entirely off the tables' logs: poll, reload, merge what's eligible. Holds
 /// nothing but a catalog handle, so the hosting process is a deployment
@@ -202,9 +207,11 @@ impl Compacter {
             if files.len() < 2 {
                 continue;
             }
-            // Oldest first (sink file names embed a timestamp + sequence),
-            // stopping once the batch fills one output.
+            // Oldest first (sink file names embed a timestamp + sequence).
             files.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+
+            // Take as many small files as it takes to fill one ~target-sized
+            // output, and merge them.
             let mut total = 0u64;
             let mut batch = Vec::new();
             for file in files {
@@ -213,6 +220,16 @@ impl Compacter {
                 if total >= self.target_bytes {
                     return Some(batch);
                 }
+            }
+
+            // The partition's small files don't add up to a full output (e.g. a
+            // low-traffic partition of a many-partition table). Merge the pile
+            // anyway once enough have accumulated — otherwise such a partition
+            // accumulates small files forever, which is what bloats a sink to
+            // tens of thousands of tiny files. (The merged file is itself a
+            // candidate, so it keeps growing toward the target as more arrive.)
+            if batch.len() >= MIN_FILES_TO_MERGE {
+                return Some(batch);
             }
         }
         None
