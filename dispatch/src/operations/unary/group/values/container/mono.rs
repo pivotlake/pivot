@@ -68,7 +68,6 @@ impl<const N: usize, A: Numeric> AggregationValue for Mono<N, A> {
     type MergeConfig = ();
     type Columns = [SlabColumn<A>; N];
     type SortKey = A;
-    type Recorder = ();
 
     fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
 
