@@ -107,8 +107,8 @@ impl OtelConfig {
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
-            flush_rows: 50_000,
-            flush_interval: Duration::from_secs(10),
+            flush_rows: 500_000,
+            flush_interval: Duration::from_secs(60),
             max_decoding_message_size: 256 * 1024 * 1024,
             logs: None,
             traces: None,

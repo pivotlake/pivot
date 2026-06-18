@@ -289,14 +289,49 @@ impl ObjectStore for GcsStore {
     }
 
     fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>> {
+        self.list_impl(prefix, None)
+    }
+
+    fn list_from(&self, prefix: &ObjectPath, start: &ObjectPath) -> Result<Vec<FileRef>> {
+        self.list_impl(prefix, Some(start))
+    }
+
+    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
+        if self.emulated {
+            // An emulator can't presign (no signing key) but also needs no auth:
+            // its media endpoint serves the bytes — honoring `Range` — straight
+            // to the ring.
+            let url = format!(
+                "{}/storage/v1/b/{}/o/{}?alt=media",
+                self.endpoint,
+                self.bucket,
+                self.object_path(key)
+            );
+            return url::Url::parse(&url)
+                .map(DataFileSource::Remote)
+                .map_err(|e| StoreError::Config(format!("building emulator media url: {e}")));
+        }
+        Ok(DataFileSource::Remote(self.presign_get(key)?))
+    }
+}
+
+impl GcsStore {
+    /// One-page list of objects directly under `prefix`, optionally beginning at
+    /// `start` (`startOffset`) so the scan skips everything lexicographically
+    /// below it.
+    fn list_impl(&self, prefix: &ObjectPath, start: Option<&ObjectPath>) -> Result<Vec<FileRef>> {
         let token = self.bearer()?;
         let object_prefix = object_key(&self.prefix, prefix);
-        let url = format!(
+        let mut url = format!(
             "{}/storage/v1/b/{}/o?prefix={}%2F&delimiter=%2F",
             self.endpoint,
             self.bucket,
             percent_encode(&object_prefix)
         );
+        if let Some(start) = start {
+            url.push_str("&startOffset=");
+            url.push_str(&percent_encode(&object_key(&self.prefix, start)));
+        }
         let resp = self
             .agent
             .get(&url)
@@ -323,26 +358,6 @@ impl ObjectStore for GcsStore {
             .collect()
     }
 
-    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
-        if self.emulated {
-            // An emulator can't presign (no signing key) but also needs no auth:
-            // its media endpoint serves the bytes — honoring `Range` — straight
-            // to the ring.
-            let url = format!(
-                "{}/storage/v1/b/{}/o/{}?alt=media",
-                self.endpoint,
-                self.bucket,
-                self.object_path(key)
-            );
-            return url::Url::parse(&url)
-                .map(DataFileSource::Remote)
-                .map_err(|e| StoreError::Config(format!("building emulator media url: {e}")));
-        }
-        Ok(DataFileSource::Remote(self.presign_get(key)?))
-    }
-}
-
-impl GcsStore {
     /// A time-limited GET URL for `key`, V4-signed in the query string so the
     /// io_uring HTTP reader can range-read it with no auth headers.
     fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {

@@ -129,10 +129,11 @@ impl CatalogTable {
     /// no manifest at all (a corrupt catalog). Returns whether it advanced;
     /// `Ok(false)` means this copy was already current.
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let manifest = TableManifest::load(self.store.as_ref(), &self.name)?;
-        if manifest.version <= self.manifest.version {
+        let Some(manifest) =
+            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
+        else {
             return Ok(false);
-        }
+        };
         self.manifest = manifest;
         self.sync_files_to_manifest()?;
         Ok(true)
@@ -253,6 +254,22 @@ impl CatalogTable {
     /// already polls every table.
     pub fn prune_old_versions(&self) -> crate::Result<()> {
         TableManifest::prune_old_versions(self.store.as_ref(), &self.name, self.manifest.version)?;
+        Ok(())
+    }
+
+    /// Record the just-swapped-out `removed` inputs (paths as they appear in the
+    /// manifest) for *deferred* deletion at this table's current manifest version.
+    /// Their objects are deleted only when that version is pruned
+    /// ([`prune_old_versions`](Self::prune_old_versions)) — so a query still
+    /// reading the prior version never has a file deleted out from under it.
+    pub fn record_deletions(&self, removed: &[ObjectPath]) -> crate::Result<()> {
+        let resolved: Vec<ObjectPath> = removed.iter().map(|p| self.location.resolve(p)).collect();
+        TableManifest::record_deletions(
+            self.store.as_ref(),
+            &self.name,
+            self.manifest.version,
+            &resolved,
+        )?;
         Ok(())
     }
 
