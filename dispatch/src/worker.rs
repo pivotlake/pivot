@@ -371,13 +371,20 @@ impl Worker {
     fn process_io_completions(&mut self) -> Result<()> {
         for completion in self.io.completions()? {
             match completion {
+                // The owning dataflow may already be gone: a finished or
+                // cancelled query/compaction leaves its read-ahead reads in
+                // flight, and their completions land here afterwards. The block
+                // was already committed in the requester, so a missing dataflow
+                // just means drop the completion (the slot pin releases with it).
                 Ok(Completion::Fs(r)) => {
-                    let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
-                    data_flow.process_fs(r.operator_idx, r.request);
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.process_fs(r.operator_idx, r.request);
+                    }
                 }
                 Ok(Completion::Http(r)) => {
-                    let data_flow = self.data_flows.get_mut(&r.data_flow_id).unwrap();
-                    data_flow.process_http(r.operator_idx, r.request);
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.process_http(r.operator_idx, r.request);
+                    }
                 }
                 Err(failed) => {
                     // A read failed terminally (an HTTP read past its retries, or
