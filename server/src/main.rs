@@ -178,21 +178,10 @@ fn init_tracing() {
 
 /// Returns the total physical memory of the machine in bytes.
 ///
-/// On Linux read `/proc/meminfo`'s `MemTotal` directly: `sysinfo` under-reports
-/// on some kernels (observed ~4 GB on a 30 GB box), which sized the ring/cache
-/// ~15x too small. Fall back to `sysinfo` on other platforms / on parse failure.
+/// `sysinfo`'s Linux backend reads `/proc/meminfo`'s `MemTotal` itself, so this
+/// matches the kernel's figure exactly (verified on the 31.5 GB parquetsink box:
+/// `sysinfo` and a direct `/proc/meminfo` read returned the identical byte count).
 pub fn get_total_memory() -> usize {
-    #[cfg(target_os = "linux")]
-    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(kb) = meminfo
-            .lines()
-            .find_map(|l| l.strip_prefix("MemTotal:"))
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|n| n.parse::<usize>().ok())
-        {
-            return kb * 1024;
-        }
-    }
     sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
     )
