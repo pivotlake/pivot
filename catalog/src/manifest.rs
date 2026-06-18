@@ -32,12 +32,18 @@ const TABLE_MANIFEST_DIR: &str = "_pivot_tables";
 const VERSION_DIGITS: usize = 20;
 /// The version a table's first commit gets.
 pub const FIRST_VERSION: u64 = 1;
-/// How many of the most-recent manifest versions to keep when pruning. A reader
-/// loads by listing then `get`ting the max it saw; retaining a tail means a
-/// reader that observed an older max (e.g. under an eventually-consistent
-/// `list`) before its `get` never races a prune. Everything older is dead
-/// weight — pure space, and it slows the `list` every bind does.
-const VERSIONS_RETAINED: u64 = 8;
+/// How many of the most-recent manifest versions to keep when pruning. A query
+/// resolves a snapshot (one version) and reads its files for the whole query;
+/// the snapshot's files are only physically deleted once *its* version is pruned
+/// (deferred deletions, see [`PendingDeletions`]). So the retained tail must
+/// outlast a query: while it runs, compaction must not advance far enough to
+/// prune the version it's reading. During catch-up the compacter commits a few
+/// versions per second, so a handful of retained versions (the old value) let a
+/// 1 s query's snapshot be pruned out from under it — a `404` mid-scan. This
+/// tail keeps a snapshot alive for ~a minute at that rate, well past any query,
+/// while staying cheap: a few hundred tiny JSON manifests, and a slightly longer
+/// `list` per bind.
+const VERSIONS_RETAINED: u64 = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -306,7 +312,7 @@ mod tests {
     fn prune_keeps_only_the_recent_tail() {
         let dir = TempDir::new().unwrap();
         let store = LocalStore::new(dir.path());
-        let latest = 30;
+        let latest = VERSIONS_RETAINED + 22;
         for v in FIRST_VERSION..=latest {
             assert!(manifest(v).commit(&store, "t").unwrap());
         }
@@ -343,7 +349,7 @@ mod tests {
     fn prune_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let store = LocalStore::new(dir.path());
-        let latest = 20;
+        let latest = VERSIONS_RETAINED + 12;
         for v in FIRST_VERSION..=latest {
             manifest(v).commit(&store, "t").unwrap();
         }
@@ -364,7 +370,7 @@ mod tests {
     fn pruning_a_version_applies_its_deferred_deletions() {
         let dir = TempDir::new().unwrap();
         let store = LocalStore::new(dir.path());
-        let latest = 30;
+        let latest = VERSIONS_RETAINED + 22;
         for v in FIRST_VERSION..=latest {
             assert!(manifest(v).commit(&store, "t").unwrap());
         }
