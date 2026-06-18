@@ -265,17 +265,6 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
-        // Flush the deferred-record buffer every SUB_WINDOW rows so the cells the
-        // columnar finalize touches are still L1-resident (vs letting a full
-        // RECORD_BATCH_SIZE window's distinct cells go cold). 0 = once per window.
-        // EXPERIMENT: env-tunable so we can sweep without rebuilding (PIVOT_SUB_WINDOW).
-        static SUB_WINDOW_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let sub_window = *SUB_WINDOW_CELL.get_or_init(|| {
-            std::env::var("PIVOT_SUB_WINDOW")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(2000)
-        });
         // Raw ptr so the record closures can reach the recorder without holding a
         // borrow of `self` across `self.tables`/`grow_or_switch` (disjoint fields;
         // the recorder mutates only through its own `UnsafeCell`s).
@@ -328,12 +317,6 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 return;
             }
             i += 1;
-            // Flush deferred records while the touched cells are still L1-hot.
-            if sub_window != 0 && i % sub_window == 0 {
-                V::finalize(value_reader, &mut self.value_arena, merge_config, unsafe {
-                    &*recorder
-                });
-            }
         }
         // Replay this window's deferred seeds/updates columnar (a no-op for values
         // that folded immediately).
