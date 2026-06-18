@@ -141,6 +141,7 @@ impl<Ops: OpTuple> AggregationValue for Compiled<Ops> {
     type MergeConfig = Ops::Cfg;
     type Columns = Ops::Columns;
     type SortKey = i128;
+    type Recorder = ();
 
     #[inline(always)]
     fn merge_config(_slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Ops::Cfg {

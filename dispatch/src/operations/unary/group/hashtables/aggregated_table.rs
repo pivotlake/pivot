@@ -132,6 +132,11 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     /// here. There is at most one such key (the hash is a bijection), so this
     /// boolean adds 0 or 1 to the distinct count at output.
     zero_hash_seen: bool,
+    /// Per-worker deferred-update scratch the value type records into during the
+    /// in-place probe (reused across windows). Kept here, not in the per-batch
+    /// reader, so the reader handed to the hot scatter loop carries no record state.
+    /// `()` for values that fold immediately.
+    recorder: V::Recorder,
 }
 
 impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
@@ -159,6 +164,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 .unwrap(),
             scratch: K::Scratch::default(),
             zero_hash_seen: false,
+            recorder: V::Recorder::default(),
         }
     }
 
@@ -168,6 +174,11 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     /// `OUTPUT_CHUNK_ROWS` ≫ `RECORD_BATCH_SIZE` rows per batch) — is consumed in
     /// `RECORD_BATCH_SIZE`-row windows via zero-copy slices. Scan/filter output
     /// (already ≤ `RECORD_BATCH_SIZE`) skips slicing.
+    ///
+    /// `inline(never)`: keeps this a standalone symbol like the immediate path. When
+    /// the deferred record/finalize code grows `consume_window`, letting `consume_batch`
+    /// inline up into the operator's `run_cpu_work` cascades a codegen regression.
+    #[inline(never)]
     pub fn consume_batch(
         &mut self,
         batch: &RecordBatch,
@@ -254,6 +265,10 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
+        // Raw ptr so the record closures can reach the recorder without holding a
+        // borrow of `self` across `self.tables`/`grow_or_switch` (disjoint fields;
+        // the recorder mutates only through its own `UnsafeCell`s).
+        let recorder: *const V::Recorder = &self.recorder;
         let mut i = 0;
         while i < length {
             let hash = self.hashes[i];
@@ -285,15 +300,19 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     hash,
                     key,
                     &mut self.value_arena,
-                    |arena, cell| V::record_seed(value_reader, i, cell, arena),
-                    |arena, cell| V::record_update(value_reader, i, cell, arena, merge_config),
+                    |arena, cell| V::record_seed(value_reader, i, cell, arena, unsafe { &*recorder }),
+                    |arena, cell| {
+                        V::record_update(value_reader, i, cell, arena, merge_config, unsafe {
+                            &*recorder
+                        })
+                    },
                 );
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
                 // Apply any deferred folds for the rows probed so far before the
                 // remaining rows take the (immediate) scatter path.
-                V::finalize(value_reader, &mut self.value_arena, merge_config);
+                V::finalize(value_reader, &mut self.value_arena, merge_config, unsafe { &*recorder });
                 self.scatter_range(i + 1, length, key_reader, value_reader);
                 return;
             }
@@ -301,7 +320,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         }
         // Replay this window's deferred seeds/updates columnar (a no-op for values
         // that folded immediately).
-        V::finalize(value_reader, &mut self.value_arena, merge_config);
+        V::finalize(value_reader, &mut self.value_arena, merge_config, unsafe { &*recorder });
     }
 
     /// Active table is full: either grow the stack (4x) or, for a radix-eligible

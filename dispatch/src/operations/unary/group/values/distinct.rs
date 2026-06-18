@@ -23,6 +23,7 @@ impl AggregationValue for Distinct {
     type MergeConfig = ();
     type Columns = ();
     type SortKey = i64;
+    type Recorder = ();
 
     #[inline(always)]
     fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
