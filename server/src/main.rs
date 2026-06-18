@@ -177,7 +177,22 @@ fn init_tracing() {
 }
 
 /// Returns the total physical memory of the machine in bytes.
+///
+/// On Linux read `/proc/meminfo`'s `MemTotal` directly: `sysinfo` under-reports
+/// on some kernels (observed ~4 GB on a 30 GB box), which sized the ring/cache
+/// ~15x too small. Fall back to `sysinfo` on other platforms / on parse failure.
 pub fn get_total_memory() -> usize {
+    #[cfg(target_os = "linux")]
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(kb) = meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix("MemTotal:"))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            return kb * 1024;
+        }
+    }
     sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
     )
@@ -193,8 +208,16 @@ fn main() -> Result<(), Error> {
             .map(|n| n.get())
             .unwrap_or(1)
     });
-    info!(workers, "initialising dispatch");
-    let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE);
+    let total_mem = get_total_memory();
+    let buffers = total_mem / 2 / BUFFER_SIZE;
+    info!(
+        workers,
+        total_mem_gb = total_mem as f64 / 1e9,
+        ring_gb = (buffers * BUFFER_SIZE) as f64 / 1e9,
+        buffers,
+        "initialising dispatch"
+    );
+    let dispatch = Dispatch::spin_up(workers, buffers);
 
     let ingests = args.ingests();
 
