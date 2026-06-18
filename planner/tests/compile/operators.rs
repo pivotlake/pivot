@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
 use dispatch::Dispatch;
 
 use crate::common::*;
@@ -12,6 +12,10 @@ use rstest::rstest;
 
 fn int_col(values: Vec<i32>) -> ArrayRef {
     Arc::new(Int32Array::from(values))
+}
+
+fn str_col(values: Vec<&'static str>) -> ArrayRef {
+    Arc::new(StringViewArray::from(values))
 }
 
 #[rstest]
@@ -655,6 +659,179 @@ fn global_sum_count_avg_together(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn global_min_max(mut testing_planner: TestingPlanner) {
+    // MIN/MAX fold the extreme over the whole column (no GROUP BY): over
+    // a=[1,2,3,4,5] and b=[10,20,30,40,50], min(a)=1 and max(b)=50.
+    let results = testing_planner
+        .planner
+        .plan("SELECT MIN(a), MAX(b) FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["min"], 1);
+    assert_eq!(rows[0]["max"], 50);
+}
+
+#[rstest]
+fn global_string_min_max(mut testing_planner: TestingPlanner) {
+    // Global string MIN/MAX (no GROUP BY) fold the byte-lexicographic extreme over
+    // the whole column, emitting one Utf8View row each.
+    testing_planner.add_table(
+        "gs_global",
+        &[(
+            "s",
+            Type::Utf8,
+            str_col(vec!["banana", "apple", "date", "cherry"]),
+        )],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT MIN(s), MAX(s) FROM gs_global")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["min"], "apple");
+    assert_eq!(rows[0]["max"], "date");
+}
+
+#[rstest]
+fn grouped_min_max(mut testing_planner: TestingPlanner) {
+    // Per-group extremes through the dynamic value extractor's MIN/MAX slots.
+    // g=1 -> v {10,40} (min 10, max 40); g=2 -> v {20,5} (min 5, max 20). The
+    // consume fold and the partition merge are both kind-aware.
+    testing_planner.add_table(
+        "gv",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2])),
+            ("v", Type::Int32, int_col(vec![10, 40, 20, 5])),
+        ],
+    );
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, MIN(v), MAX(v) FROM gv GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    // A single integer key goes through the row-encoded key extractor, whose key
+    // column is named `k0` (multi-key groups would add `k1`, …).
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["k0"], 1);
+    assert_eq!(rows[0]["v0"], 10); // min
+    assert_eq!(rows[0]["v1"], 40); // max
+    assert_eq!(rows[1]["k0"], 2);
+    assert_eq!(rows[1]["v0"], 5); // min
+    assert_eq!(rows[1]["v1"], 20); // max
+}
+
+#[rstest]
+fn grouped_string_min_and_max(mut testing_planner: TestingPlanner) {
+    // Per-group string extremes via StringExtreme (lazy arena persist + zero-copy
+    // StringView output). Homogeneous direction only, so MIN and MAX are separate
+    // queries. g=1 -> {"banana","apple"}; g=2 -> {"cherry","date"}.
+    testing_planner.add_table(
+        "gs",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2])),
+            (
+                "s",
+                Type::Utf8,
+                str_col(vec!["banana", "apple", "cherry", "date"]),
+            ),
+        ],
+    );
+
+    let run = |p: &mut TestingPlanner, sql: &str| {
+        let results = p
+            .planner
+            .plan(sql)
+            .unwrap()
+            .compile(p.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap();
+        let mut rows = batches_to_json(&results);
+        rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+        rows
+    };
+
+    let mins = run(&mut testing_planner, "SELECT g, MIN(s) FROM gs GROUP BY g");
+    assert_eq!(mins[0]["v0"], "apple");
+    assert_eq!(mins[1]["v0"], "cherry");
+
+    let maxes = run(&mut testing_planner, "SELECT g, MAX(s) FROM gs GROUP BY g");
+    assert_eq!(maxes[0]["v0"], "banana");
+    assert_eq!(maxes[1]["v0"], "date");
+}
+
+/// A string extreme mixed with the opposite direction (or with integer
+/// aggregates) routes to the runtime `Dynamic` value (widened to `i128` so the
+/// `ArenaKey` cell fits) rather than the homogeneous `Compiled` tuple. Both the
+/// string MIN+MAX mix and a string-extreme-beside-an-integer-extreme mix must
+/// compile and return the right per-group values.
+#[rstest]
+fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "gs2",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2])),
+            (
+                "s",
+                Type::Utf8,
+                str_col(vec!["banana", "apple", "cherry", "date"]),
+            ),
+            ("v", Type::Int32, int_col(vec![10, 30, 5, 20])),
+        ],
+    );
+
+    // MIN(s) + MAX(s): a string mix of opposite directions in one value.
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, MIN(s), MAX(s) FROM gs2 GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    assert_eq!(rows[0]["v0"], "apple"); // g=1 min
+    assert_eq!(rows[0]["v1"], "banana"); // g=1 max
+    assert_eq!(rows[1]["v0"], "cherry"); // g=2 min
+    assert_eq!(rows[1]["v1"], "date"); // g=2 max
+
+    // MIN(s) (string) + MAX(v) (integer): a string extreme beside a numeric one.
+    let mixed = testing_planner
+        .planner
+        .plan("SELECT g, MIN(s), MAX(v) FROM gs2 GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+    let mut mixed_rows = batches_to_json(&mixed);
+    mixed_rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    assert_eq!(mixed_rows[0]["v0"], "apple"); // g=1 min(s)
+    assert_eq!(mixed_rows[0]["v1"], 30); // g=1 max(v)
+    assert_eq!(mixed_rows[1]["v0"], "cherry"); // g=2 min(s)
+    assert_eq!(mixed_rows[1]["v1"], 20); // g=2 max(v)
+}
+
+#[rstest]
 fn filter_then_top_n(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .planner
@@ -851,8 +1028,10 @@ fn create_table_passes_with_options_to_catalog() {
 
 #[rstest]
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
+    // `stddev` has no pivot lowering (unlike SUM/COUNT/MIN/MAX/AVG), so it must
+    // surface as a plan-conversion error rather than silently mis-aggregating.
     let result = testing_planner
         .planner
-        .plan("SELECT MIN(b) FROM example_table");
+        .plan("SELECT STDDEV(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }

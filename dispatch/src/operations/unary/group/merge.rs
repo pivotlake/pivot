@@ -34,7 +34,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
-    DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage, ValueExtractor,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage,
 };
 
 /// Collision-to-entry ratio at which we double the target table.
@@ -58,7 +58,7 @@ const PREFETCH_DISTANCE: usize = 8;
 
 /// Try to resize `target` if cumulative collision pressure is too high.
 #[inline]
-fn resize_if_needed<K: KeyExtractor, V: ValueExtractor>(
+fn resize_if_needed<K: KeyExtractor, V: AggregationValue>(
     allocator: &mut SlabAllocator,
     target: &mut MultiSlabTable<K, V>,
 ) {
@@ -79,7 +79,8 @@ fn resize_if_needed<K: KeyExtractor, V: ValueExtractor>(
 /// Slots are processed in small batches ([`SCAN_BATCH_SIZE`]) so that when
 /// we round-robin through the source tables, the target region stays in
 /// cache. Each batch also prefetches [`PREFETCH_DISTANCE`] slots ahead.
-fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
+#[allow(clippy::too_many_arguments)]
+fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue, S: TableStorage<K, V>>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -87,6 +88,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
+    cfg: &V::MergeConfig,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let start = (partition * slot_count) >> partition_bits;
@@ -116,6 +118,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
                         h,
                         K::resolve_persisted(arena, *entry.key()),
                         *entry.value(),
+                        cfg,
                     );
                     resize_if_needed::<K, V>(allocator, target);
                 }
@@ -131,7 +134,8 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableSto
 /// Entries displaced by collisions can land just past `end`. For the last
 /// partition this means wrapping around to slot 0. We follow each source
 /// table's probe chain until hitting an empty slot (`hash == 0`).
-fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
+#[allow(clippy::too_many_arguments)]
+fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue, S: TableStorage<K, V>>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -139,6 +143,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
+    cfg: &V::MergeConfig,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let end = ((partition + 1) * slot_count) >> partition_bits;
@@ -157,6 +162,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
                     h,
                     K::resolve_persisted(arena, *entry.key()),
                     *entry.value(),
+                    cfg,
                 );
                 resize_if_needed::<K, V>(allocator, target);
             }
@@ -166,7 +172,8 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: ValueExtractor, S: TableStora
 }
 
 /// Merge entries from `tables` that belong to `partition` into `target`.
-fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V>>(
+#[allow(clippy::too_many_arguments)]
+fn merge_into_partition<K: KeyExtractor, V: AggregationValue, S: TableStorage<K, V>>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -174,6 +181,7 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
     tables: Vec<&Table<K, V, S>>,
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
+    cfg: &V::MergeConfig,
 ) {
     merge_within_partition_bounds::<K, V, S>(
         allocator,
@@ -183,6 +191,7 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
         &tables,
         target,
         partition_bits,
+        cfg,
     );
     merge_past_partition_bounds::<K, V, S>(
         allocator,
@@ -192,6 +201,7 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
         &tables,
         target,
         partition_bits,
+        cfg,
     );
 }
 
@@ -205,13 +215,14 @@ fn merge_into_partition<K: KeyExtractor, V: ValueExtractor, S: TableStorage<K, V
 /// `tables` holds switched workers' pre-switch stacks and non-switched workers'
 /// full stacks. `partition_bits` = log2(num_partitions) sets the target's
 /// pre_shift, skipping the partition's top bits so it slots on the bits below.
-pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
+pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     partition: usize,
     buffers: &[PartitionBuffers<K, V>],
     tables: &[MultiSlabTable<K, V>],
     partition_capacity: usize,
     num_partitions: usize,
-    arena: &SharedArena,
+    key_arena: &SharedArena,
+    cfg: &V::MergeConfig,
 ) -> MultiSlabTable<K, V> {
     let partition_bits = num_partitions.trailing_zeros();
     let mut allocator = SlabAllocator::new(true);
@@ -225,8 +236,8 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
     for wb in buffers {
         wb.0[partition].for_each(|(hash, key, value)| {
             grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
-            let live = K::resolve_persisted(arena, key);
-            target.merge::<false, _>(hash, live, value);
+            let live = K::resolve_persisted(key_arena, key);
+            target.merge::<false, _>(hash, live, value, cfg);
         });
     }
 
@@ -246,12 +257,13 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
     for (slot_count, group) in by_size.into_iter() {
         merge_into_partition::<K, V, _>(
             &mut allocator,
-            arena,
+            key_arena,
             partition,
             slot_count,
             group,
             &mut target,
             partition_bits,
+            cfg,
         );
     }
     target
@@ -260,7 +272,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: ValueExtractor>(
 /// `partition_capacity` is sized (from the HLL estimate) to hold the partition's
 /// groups, so with a sound estimate this never fires.
 #[inline]
-fn grow_if_full<K: KeyExtractor, V: ValueExtractor>(
+fn grow_if_full<K: KeyExtractor, V: AggregationValue>(
     allocator: &mut SlabAllocator,
     target: &mut MultiSlabTable<K, V>,
     cap: &mut usize,
@@ -284,7 +296,7 @@ mod tests {
     };
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
-        AggregationKind, AggregationSlot, Compiled, Count,
+        AggregationKind, AggregationSlot, AggregationValue, Compiled, CountSlot,
     };
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
@@ -293,7 +305,10 @@ mod tests {
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = Compiled<(Count,)>;
+    // A single `COUNT` slot. Its `MergeConfig` is `((),)` (the op tuple's cfgs).
+    type CountValue = Compiled<(CountSlot,)>;
+    // The `CountValue` merge config: a 1-tuple of the `Count` op's unit cfg.
+    const COUNT_CFG: <CountValue as AggregationValue>::MergeConfig = ((),);
 
     fn make_worker_tables(
         state: &RandomState,
@@ -302,6 +317,7 @@ mod tests {
     ) -> Vec<MultiSlabTable<IntExtractor, CountValue>> {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
+            arena.clone(),
             arena.clone(),
             RadixConfig::DEFAULT,
         );
@@ -313,6 +329,7 @@ mod tests {
             &[0],
             &[AggregationSlot::new(AggregationKind::CountStar, 0)],
             &(),
+            &COUNT_CFG,
         );
         // The test data is low-cardinality, so the worker never switches to radix:
         // `buffers` is None and the full result is in the in-place stack.
@@ -337,9 +354,10 @@ mod tests {
                 partition_cap,
                 PARTITIONS,
                 arena,
+                &COUNT_CFG,
             );
             for entry in result.iter(0) {
-                all_entries.push((*entry.key(), entry.value().0[0] as usize));
+                all_entries.push((*entry.key(), entry.value().sort_key(0) as usize));
             }
         }
         all_entries.sort_by_key(|(k, _)| *k);
@@ -441,6 +459,7 @@ mod tests {
                 partition_cap,
                 PARTITIONS,
                 &arena,
+                &COUNT_CFG,
             );
             total += result.iter(0).count();
         }
@@ -491,6 +510,7 @@ mod tests {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
             arena.clone(),
+            arena.clone(),
             RadixConfig::DEFAULT,
         );
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
@@ -503,6 +523,7 @@ mod tests {
                 &[0],
                 &[AggregationSlot::new(AggregationKind::CountStar, 0)],
                 &(),
+                &COUNT_CFG,
             );
         }
         agg.flush()
@@ -540,10 +561,11 @@ mod tests {
                 DEFAULT_CAPACITY,
                 num_partitions,
                 &arena,
+                &COUNT_CFG,
             );
             for entry in result.iter(0) {
                 occurrences[*entry.key() as usize] += 1;
-                counts[*entry.key() as usize] += entry.value().0[0] as usize;
+                counts[*entry.key() as usize] += entry.value().sort_key(0) as usize;
             }
         }
 

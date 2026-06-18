@@ -43,7 +43,7 @@
 //!    the batched, prefetched merge strategy).
 //! 3. Converts the result table into an Arrow [`RecordBatch`] via the
 //!    [`output`] combinator — key columns from the [`KeyExtractor`], value
-//!    columns from the [`ValueExtractor`] — and sends it downstream.
+//!    columns from the [`AggregationValue`] — and sends it downstream.
 //!
 //! When any worker switched to radix, the same machinery runs at
 //! [`RADIX_PARTITIONS`] granularity, and each job additionally aggregates its
@@ -76,7 +76,7 @@
 //! - [`keys`] — the [`KeyExtractor`] trait and implementations
 //!   ([`IntKeyExtractor`], [`StringKeyExtractor`]), each co-located with its key
 //!   type (e.g. `keys::string` owns [`ArenaKey`])
-//! - [`values`] — the [`ValueExtractor`] trait and implementations, each
+//! - [`values`] — the [`AggregationValue`] trait and implementations, each
 //!   co-located with its value/aggregate type (`Count`, `AggregationRow`) plus
 //!   [`AggregationKind`]/[`AggregationSlot`]
 //! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
@@ -102,8 +102,9 @@ pub use keys::{
     RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
-    Accumulator, Aggregate, AggregationKind, AggregationRowValueExtractor, AggregationSlot,
-    Compiled, Count, DistinctValueExtractor, Sum, ValueExtractor,
+    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
+    Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric, OpTuple,
+    Read, StrMax, StrMaxSlot, StrMin, StrMinSlot, StrRead, Sum, SumSlot, WideSum,
 };
 
 use crate::memory::SlabAllocator;
@@ -149,9 +150,12 @@ const RADIX_PARTITIONS: usize = 4096;
 /// rows and inserts them into its local [`AggregatedTable`]. When consumption
 /// finishes, the accumulated tables are sent to a shared channel and the
 /// `Group` transitions into a [`GroupOutputter`] for the merge phase.
-pub struct Group<K: KeyExtractor, V: ValueExtractor> {
+pub struct Group<K: KeyExtractor, V: AggregationValue> {
     key_cols: Vec<usize>,
+    /// Slots drive the per-batch value reader (which column / `COUNT` vs `SUM`).
     value_slots: Vec<AggregationSlot>,
+    /// The value's merge-time config, built once from the slots (like `key_config`).
+    merge_config: V::MergeConfig,
     key_config: K::Config,
 
     aggregated_table: AggregatedTable<K, V>,
@@ -159,10 +163,11 @@ pub struct Group<K: KeyExtractor, V: ValueExtractor> {
     outputter: GroupOutputter<K, V>,
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        shared_arena: Arc<SharedArena>,
+        key_arena: Arc<SharedArena>,
+        value_arena: Arc<SharedArena>,
         state: RandomState,
         injector: Arc<Injector<PartitionJob<K, V>>>,
         key_cols: Vec<usize>,
@@ -175,27 +180,40 @@ impl<K: KeyExtractor, V: ValueExtractor> Group<K, V> {
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
+        let merge_config = V::merge_config(&value_slots, &value_arena);
+        // A string extreme persists its winner lazily during the in-place fold, so
+        // it must not take the radix scatter path (which materialises — and thus
+        // persists — every row's string before any comparison). Disable the switch
+        // when any value slot is a string extreme; numeric signatures keep radix.
+        let radix = if value_slots.iter().any(|s| s.kind.is_string_extreme()) {
+            radix.without_radix()
+        } else {
+            radix
+        };
         Self {
             key_cols,
             value_slots,
+            merge_config: merge_config.clone(),
             key_config: key_config.clone(),
             outputter: GroupOutputter {
-                shared_arena: shared_arena.clone(),
+                key_arena: key_arena.clone(),
+                value_arena: value_arena.clone(),
                 injector,
                 receiver,
                 partition_jobs_injected,
                 key_config,
+                merge_config,
                 top_k,
                 count_only,
                 output_allocator: None,
             },
             sender,
-            aggregated_table: AggregatedTable::new(state, shared_arena, radix),
+            aggregated_table: AggregatedTable::new(state, key_arena, value_arena, radix),
         }
     }
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> for Group<K, V> {
     type Outputter = GroupOutputter<K, V>;
 
     fn consume<S: Sender<RecordBatch>>(
@@ -208,6 +226,7 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
             &self.key_cols,
             &self.value_slots,
             &self.key_config,
+            &self.merge_config,
         );
         Ok(())
     }
@@ -226,12 +245,19 @@ impl<K: KeyExtractor, V: ValueExtractor> Consumer<RecordBatch, RecordBatch> for 
 /// tables, and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
-pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
-    shared_arena: Arc<SharedArena>,
+pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
+    /// String *key* storage; backs the leading key column(s) at output.
+    key_arena: Arc<SharedArena>,
+    /// String *value* storage (a string `MIN`/`MAX`); backs trailing value
+    /// column(s) and resolves extremes during the partition merge.
+    value_arena: Arc<SharedArena>,
     injector: Arc<Injector<PartitionJob<K, V>>>,
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     key_config: K::Config,
+    /// The value's merge config, threaded into each [`PartitionJob`] so the merge
+    /// folds existing entries via [`AggregationValue::merge`].
+    merge_config: V::MergeConfig,
     top_k: Option<(usize, usize)>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
@@ -248,25 +274,28 @@ pub struct GroupOutputter<K: KeyExtractor, V: ValueExtractor> {
 /// shared [`Injector`] for work-stealing execution. Each job merges all
 /// source tables for partition `index` into one result table and sends the
 /// output as a [`RecordBatch`].
-pub struct PartitionJob<K: KeyExtractor, V: ValueExtractor> {
+pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     /// Switched workers' scatter buffers (empty Vec in the all-in-place case).
     buffers: Arc<Vec<PartitionBuffers<K, V>>>,
     /// Every worker's in-place stack: switched workers' pre-switch tables and
     /// non-switched workers' full stacks. Slot-range-merged at `num_partitions`.
     tables: Arc<Vec<MultiSlabTable<K, V>>>,
     index: usize,
-    arena: Arc<SharedArena>,
+    key_arena: Arc<SharedArena>,
+    value_arena: Arc<SharedArena>,
     partition_capacity: usize,
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
     key_config: K::Config,
+    /// The value's merge config, for the partition merge's entry fold.
+    merge_config: V::MergeConfig,
     top_k: Option<(usize, usize)>,
     count_only: bool,
 }
 
-unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionJob<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionJob<K, V> {}
 
-impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
     /// Merge this partition's scatter buffers and in-place stacks into one result
     /// table and send the output batches, building columns into `allocator`.
     pub fn run<S: Sender<RecordBatch>>(
@@ -280,16 +309,19 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
             &self.tables,
             self.partition_capacity,
             self.num_partitions,
-            &self.arena,
+            &self.key_arena,
+            &self.merge_config,
         );
         if result_map.len() == 0 {
             return Ok(());
         }
         output::build_and_send::<K, V, _, _>(
             result_map,
-            &self.arena,
+            &self.key_arena,
+            &self.value_arena,
             allocator,
             &self.key_config,
+            &self.merge_config,
             self.top_k,
             self.count_only,
             sender,
@@ -297,7 +329,7 @@ impl<K: KeyExtractor, V: ValueExtractor> PartitionJob<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputter<K, V> {
+impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutputter<K, V> {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             let mut all_tables = Vec::new();
@@ -347,10 +379,12 @@ impl<K: KeyExtractor, V: ValueExtractor> Outputter<RecordBatch> for GroupOutputt
                     buffers: buffers.clone(),
                     tables: tables.clone(),
                     index: i,
-                    arena: self.shared_arena.clone(),
+                    key_arena: self.key_arena.clone(),
+                    value_arena: self.value_arena.clone(),
                     partition_capacity,
                     num_partitions,
                     key_config: self.key_config.clone(),
+                    merge_config: self.merge_config.clone(),
                     top_k: self.top_k,
                     count_only: self.count_only,
                 });
@@ -411,8 +445,8 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    type CountValue = Compiled<(Count,)>;
-    type SumValue = Compiled<(Sum<Int32Type>,)>;
+    type CountValue = Compiled<(CountSlot,)>;
+    type SumValue = Compiled<(SumSlot<Int32Type>,)>;
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));
@@ -488,7 +522,7 @@ mod tests {
     /// General harness: choose the key/value extractors, key columns, aggregates,
     /// LIMIT pushdown, and radix config. The common-case wrappers above cover
     /// `Int32` keys + `COUNT(*)`.
-    fn run_group_full<K: KeyExtractor<Config: Default>, V: ValueExtractor>(
+    fn run_group_full<K: KeyExtractor<Config: Default>, V: AggregationValue>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
@@ -497,7 +531,8 @@ mod tests {
     ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
-        let arena = SharedArena::new(64);
+        let key_arena = SharedArena::new(64);
+        let value_arena = SharedArena::new(64);
         let state = RandomState::new();
         let injector = Arc::new(Injector::new());
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
@@ -507,7 +542,8 @@ mod tests {
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<K, V>::new(
-                    arena.clone(),
+                    key_arena.clone(),
+                    value_arena.clone(),
                     state.clone(),
                     injector.clone(),
                     key_cols.clone(),
@@ -768,7 +804,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![id, name, val]).unwrap()
     }
 
-    fn run_row_key_group<V: ValueExtractor>(
+    fn run_row_key_group<V: AggregationValue>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         schema: RowKeySchema,
@@ -776,7 +812,8 @@ mod tests {
     ) -> CollectSender {
         init_test_free_pool(64);
         let worker_count = worker_batches.len();
-        let arena = SharedArena::new(64);
+        let key_arena = SharedArena::new(64);
+        let value_arena = SharedArena::new(64);
         let state = RandomState::new();
         let injector = Arc::new(Injector::new());
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
@@ -785,7 +822,8 @@ mod tests {
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<RowKeyExtractor, V>::new(
-                    arena.clone(),
+                    key_arena.clone(),
+                    value_arena.clone(),
                     state.clone(),
                     injector.clone(),
                     key_cols.clone(),
@@ -822,7 +860,7 @@ mod tests {
     fn row_key_mixed_int_string_counts() {
         let batch = mixed_key_batch(&[1, 1, 1, 2, 2], &["a", "b", "a", "a", "a"], &[0; 5]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<Compiled<(Count,)>>(
+        let sender = run_row_key_group::<Compiled<(CountSlot,)>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -846,7 +884,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &["x", long, "x", "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![batch]],
             vec![0, 1],
             schema,
@@ -866,7 +904,7 @@ mod tests {
     #[test]
     fn row_key_two_workers_merge() {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let sender = run_row_key_group::<Compiled<(Count,)>>(
+        let sender = run_row_key_group::<Compiled<(CountSlot,)>>(
             vec![
                 vec![mixed_key_batch(&[1, 2], &["a", "a"], &[0; 2])],
                 vec![mixed_key_batch(&[1, 1], &["a", "b"], &[0; 2])],
@@ -896,7 +934,7 @@ mod tests {
         let batch = mixed_key_batch(&[1, 2, 1, 2], &[long, "y", long, "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![batch]],
             vec![1, 0], // name (col 1) then id (col 0)
             schema,
@@ -927,7 +965,7 @@ mod tests {
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
         let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
 
-        let sender = run_row_key_group::<Compiled<(Sum<Int32Type>,)>>(
+        let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![b1, b2]],
             vec![0, 1],
             schema,
@@ -938,5 +976,209 @@ mod tests {
             row_key_rows(&sender),
             vec![(1, "a".to_string(), 13), (1, long.to_string(), 12)],
         );
+    }
+
+    // ---- Mixed string + integer aggregates (`Compiled` per-op atoms) ----
+
+    /// `GROUP BY id` computing `MIN(name)` (string) and `MAX(v)` (int) in one
+    /// value — the heterogeneous mix the per-op `Compiled` tuple unlocks. Each
+    /// slot keeps its own cell (`ArenaKey` for the string, `i64` for the int) and
+    /// emits its own column type (`Utf8View`, `Int64`), with no per-row dispatch.
+    #[test]
+    fn mixed_string_min_int_max() {
+        // (id, name, v): id 1 -> min name "ant", max v 30; id 2 -> "fig", 7.
+        let batch = mixed_key_batch(
+            &[1, 2, 1, 2, 1],
+            &["cat", "fig", "ant", "bee", "dog"],
+            &[10, 7, 30, 5, 20],
+        );
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::Min, 1), // MIN(name) — string
+            AggregationSlot::new(AggregationKind::Max, 2), // MAX(v)    — int
+        ];
+        type Mix = Compiled<(StrMinSlot, MaxSlot<Int32Type>)>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let mut rows: Vec<(i64, String, i64)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.i64_column(2))
+            .map(|((id, name), v)| (id, name, v))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, "ant".to_string(), 30), (2, "bee".to_string(), 7)]
+        );
+    }
+
+    // ---- Mixed string + integer aggregates via the runtime `Dynamic` ----
+
+    /// The same `MIN(name)` (string) + `MAX(v)` (int) mix, but folded by the
+    /// runtime [`Dynamic`] instead of a `Compiled` tuple — the path the planner
+    /// now takes for a heterogeneous string signature. The wide (`i128`) cell
+    /// holds the string slot's `ArenaKey` and the int slot's value, so the int
+    /// extreme renders as `Decimal128` (every numeric slot in a wide value does).
+    #[test]
+    fn dynamic_string_min_int_max() {
+        let batch = mixed_key_batch(
+            &[1, 2, 1, 2, 1],
+            &["cat", "fig", "ant", "bee", "dog"],
+            &[10, 7, 30, 5, 20],
+        );
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1), // MIN(name) — string
+            AggregationSlot::new(AggregationKind::Max, 2),    // MAX(v)    — int
+        ];
+        type Mix = Dynamic<2, i128>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let mut rows: Vec<(i64, String, i128)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.decimal128_column(2))
+            .map(|((id, name), v)| (id, name, v))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, "ant".to_string(), 30), (2, "bee".to_string(), 7)]
+        );
+    }
+
+    /// `MIN(name)` and `MAX(name)` over the *same* string column — a string mix
+    /// of opposite directions (rejected by the old `Compiled`-only routing). Each
+    /// slot keeps its own `ArenaKey` cell and folds its own direction.
+    #[test]
+    fn dynamic_string_min_and_max() {
+        let batch = mixed_key_batch(
+            &[1, 2, 1, 2, 1],
+            &["cat", "fig", "ant", "bee", "dog"],
+            &[10, 7, 30, 5, 20],
+        );
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1), // MIN(name)
+            AggregationSlot::new(AggregationKind::StrMax, 1), // MAX(name)
+        ];
+        type Mix = Dynamic<2, i128>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let mut rows: Vec<(i64, String, String)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.string_column(2))
+            .map(|((id, min), max)| (id, min, max))
+            .collect();
+        rows.sort();
+        // id 1 -> names {cat, ant, dog}: min "ant", max "dog".
+        // id 2 -> names {fig, bee}:      min "bee", max "fig".
+        assert_eq!(
+            rows,
+            vec![
+                (1, "ant".to_string(), "dog".to_string()),
+                (2, "bee".to_string(), "fig".to_string()),
+            ]
+        );
+    }
+
+    /// Two workers each see part of every group, so the string extremes must
+    /// survive the partition merge (which resolves both `ArenaKey`s through the
+    /// shared value arena) and a long string (> 12 bytes, a non-inline view) must
+    /// round-trip through the arena rather than the inline header.
+    #[test]
+    fn dynamic_string_extreme_merges_across_workers() {
+        let long_a = "alpha-aardvark-antelope"; // > 12 bytes, non-inline view
+        let long_z = "zeta-zebra-zephyr-zenith";
+        let w0 = mixed_key_batch(&[1, 1], &["mango", long_z], &[1, 2]);
+        let w1 = mixed_key_batch(&[1, 1], &[long_a, "mint"], &[3, 4]);
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1),
+            AggregationSlot::new(AggregationKind::StrMax, 1),
+        ];
+        type Mix = Dynamic<2, i128>;
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![w0], vec![w1]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let ids = sender.i64_column(0);
+        let mins = sender.string_column(1);
+        let maxes = sender.string_column(2);
+        assert_eq!(ids, vec![1]);
+        assert_eq!(mins, vec![long_a.to_string()]);
+        assert_eq!(maxes, vec![long_z.to_string()]);
+    }
+
+    /// High cardinality with an aggressive `switch_threshold` a *numeric* value
+    /// would cross and scatter on. A string value must stay on the in-place fold
+    /// (radix is disabled for it, since scatter would eagerly persist every row's
+    /// string), so this exercises in-place stack growth with string cells and
+    /// confirms every group's `MIN`/`MAX(name)` is still correct.
+    #[test]
+    fn dynamic_string_high_cardinality_stays_correct() {
+        const N: i64 = 400;
+        let ids: Vec<i64> = (0..N).chain(0..N).collect();
+        // Group k sees "a{k}" then "z{k}": MIN is the "a" form, MAX the "z" form.
+        let lows: Vec<String> = (0..N).map(|k| format!("a{k:04}")).collect();
+        let highs: Vec<String> = (0..N).map(|k| format!("z{k:04}")).collect();
+        let names: Vec<&str> = lows
+            .iter()
+            .chain(highs.iter())
+            .map(String::as_str)
+            .collect();
+        let vals: Vec<i32> = vec![0; (2 * N) as usize];
+        let batch = mixed_key_batch(&ids, &names, &vals);
+
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::StrMin, 1),
+            AggregationSlot::new(AggregationKind::StrMax, 1),
+        ];
+        type Mix = Dynamic<2, i128>;
+        // A threshold the in-place table crosses well before N groups — a numeric
+        // value would switch to radix here; the string value's override must not.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            radix,
+        );
+
+        let mut rows: Vec<(i64, String, String)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.string_column(2))
+            .map(|((id, min), max)| (id, min, max))
+            .collect();
+        rows.sort();
+        let expected: Vec<(i64, String, String)> = (0..N)
+            .map(|k| (k, format!("a{k:04}"), format!("z{k:04}")))
+            .collect();
+        assert_eq!(rows, expected);
     }
 }
