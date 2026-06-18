@@ -21,6 +21,7 @@ use super::super::read::{IntRead, Read, StrRead};
 use super::super::{
     AggregationKind, AggregationSlot, AggregationValue, Count, Max, Min, StrMax, StrMin, Sum,
 };
+use crate::RECORD_BATCH_SIZE;
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
@@ -28,6 +29,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
 use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field};
+use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 /// An integer column bound at one of the three widths, read as `i64`. The width
@@ -118,10 +120,38 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
     }
 }
 
+/// Per-batch reader for [`Dynamic`]: the bound slots, plus two recording buffers
+/// the deferred consume path appends `(row, cell)` to. `Dynamic` defers its
+/// per-row seed/update — [`record_seed`](Dynamic::record_seed)/
+/// [`record_update`](AggregationValue::record_update) just push here and leave a
+/// placeholder — then [`finalize`](AggregationValue::finalize) replays them one
+/// *column* at a time. `UnsafeCell` so `probe_fold`'s seed and update closures can
+/// both record through a shared `&reader`; sound because a worker consumes
+/// single-threaded and the reader never leaves the window.
+pub struct DynReader<'b, const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> {
+    slots: [BoundSlot<'b>; N],
+    /// Recorded `(row, cell)` for new-group seeds and existing-group updates. Each
+    /// is a fixed-capacity buffer (reserved to `RECORD_BATCH_SIZE`, the most a window
+    /// can produce) written by a raw indexed store — no per-row capacity check.
+    seeds: UnsafeCell<Vec<(u32, *mut Dynamic<N, A, ONLY_ADDITIVE>)>>,
+    updates: UnsafeCell<Vec<(u32, *mut Dynamic<N, A, ONLY_ADDITIVE>)>>,
+}
+
+/// Push `x` into `v` with no capacity check — the caller guarantees `v.len() <
+/// v.capacity()` (each buffer is reserved to `RECORD_BATCH_SIZE`, the window cap).
+#[inline(always)]
+unsafe fn push_unchecked<T>(v: &mut Vec<T>, x: T) {
+    let n = v.len();
+    unsafe {
+        v.as_mut_ptr().add(n).write(x);
+        v.set_len(n + 1);
+    }
+}
+
 impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> AggregationValue
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
-    type Reader<'b> = [BoundSlot<'b>; N];
+    type Reader<'b> = DynReader<'b, N, A, ONLY_ADDITIVE>;
     /// The per-slot kinds (which op merges/renders each cell) and the value arena
     /// (which a string extreme resolves its keys through).
     type MergeConfig = (Arc<[AggregationSlot]>, Arc<SharedArena>);
@@ -132,13 +162,17 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
         (Arc::from(slots), arena.clone())
     }
 
-    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> [BoundSlot<'b>; N] {
+    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b> {
         assert_eq!(slots.len(), N, "slot count must match N");
-        std::array::from_fn(|s| BoundSlot::bind(batch, &slots[s]))
+        DynReader {
+            slots: std::array::from_fn(|s| BoundSlot::bind(batch, &slots[s])),
+            seeds: UnsafeCell::new(Vec::with_capacity(RECORD_BATCH_SIZE)),
+            updates: UnsafeCell::new(Vec::with_capacity(RECORD_BATCH_SIZE)),
+        }
     }
 
     #[inline(always)]
-    fn value(reader: &[BoundSlot<'_>; N], idx: usize, arena: &mut WorkerArena) -> Self {
+    fn value(reader: &Self::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> Self {
         // A plain loop, not `std::array::from_fn`: the per-slot match is large, so
         // as a `from_fn` closure it exceeds the inline threshold and is emitted
         // out-of-line through the `Wrapped`/try-trait machinery — measured at ~40%
@@ -150,7 +184,7 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
             // ONLY_ADDITIVE { unreachable!() } else { .. }` const-folds to a bare
             // `unreachable!()` arm. A `_ if ONLY_ADDITIVE` guard arm instead lowers to
             // a worse Count/Sum dispatch — measured ~2.3B more in `consume_window`.
-            cells[s] = match &reader[s] {
+            cells[s] = match &reader.slots[s] {
                 BoundSlot::Count => Count::<A>::seed((), arena),
                 BoundSlot::Sum(r) => Sum::<A>::seed(r.read(idx), arena),
                 BoundSlot::Min(r) => {
@@ -181,7 +215,7 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
     #[inline(always)]
     fn update_from_reader(
         mut self,
-        reader: &[BoundSlot<'_>; N],
+        reader: &Self::Reader<'_>,
         idx: usize,
         arena: &mut WorkerArena,
         cfg: &Self::MergeConfig,
@@ -196,7 +230,7 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
             let c = self.cells[s];
             // Per-arm body pruning under `ONLY_ADDITIVE` (see `value` for why this
             // beats a `_ if ONLY_ADDITIVE` guard arm).
-            self.cells[s] = match &reader[s] {
+            self.cells[s] = match &reader.slots[s] {
                 BoundSlot::Count => Count::<A>::update(c, (), arena, &()),
                 BoundSlot::Sum(r) => Sum::<A>::update(c, r.read(idx), arena, &()),
                 BoundSlot::Min(r) => {
@@ -222,6 +256,119 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
             };
         }
         self
+    }
+
+    /// Defer the seed: write a placeholder (so a later same-window update folds
+    /// against a correct base) and record `(row, cell)`; the real seed value is
+    /// materialised columnar in [`finalize`](Self::finalize).
+    #[inline(always)]
+    fn record_seed(reader: &Self::Reader<'_>, idx: usize, cell: &mut Self, _arena: &mut WorkerArena) {
+        // SAFETY: single-threaded per worker; `seeds` is not otherwise borrowed, the
+        // buffer has spare capacity (reserved to `RECORD_BATCH_SIZE`), and `cell`
+        // points into a table slot that stays put (no in-place rehash) until finalize.
+        unsafe { push_unchecked(&mut *reader.seeds.get(), (idx as u32, cell as *mut Self)) };
+        *cell = Self::default();
+    }
+
+    /// Defer the update: record `(row, cell)`; [`finalize`](Self::finalize) folds it.
+    #[inline(always)]
+    fn record_update(
+        reader: &Self::Reader<'_>,
+        idx: usize,
+        cell: &mut Self,
+        _arena: &mut WorkerArena,
+        _cfg: &Self::MergeConfig,
+    ) {
+        unsafe { push_unchecked(&mut *reader.updates.get(), (idx as u32, cell as *mut Self)) };
+    }
+
+    /// Replay the window's recorded seeds then updates, **one column at a time**:
+    /// the per-slot op dispatch happens once per slot, then a tight loop folds every
+    /// recorded row into its cell.
+    fn finalize(reader: &Self::Reader<'_>, arena: &mut WorkerArena, cfg: &Self::MergeConfig) {
+        let (_, shared) = cfg;
+        // SAFETY: single-threaded per worker; `seeds`/`updates` aren't aliased and
+        // every recorded cell pointer is still valid (no in-place rehash).
+        let seeds = unsafe { &mut *reader.seeds.get() };
+        let updates = unsafe { &mut *reader.updates.get() };
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..N {
+            match &reader.slots[s] {
+                BoundSlot::Count => {
+                    for &(_, cell) in seeds.iter() {
+                        unsafe { (*cell).cells[s] = Count::<A>::seed((), arena) };
+                    }
+                    for &(_, cell) in updates.iter() {
+                        let c = unsafe { (*cell).cells[s] };
+                        unsafe { (*cell).cells[s] = Count::<A>::update(c, (), arena, &()) };
+                    }
+                }
+                BoundSlot::Sum(r) => {
+                    for &(idx, cell) in seeds.iter() {
+                        unsafe { (*cell).cells[s] = Sum::<A>::seed(r.read(idx as usize), arena) };
+                    }
+                    for &(idx, cell) in updates.iter() {
+                        let c = unsafe { (*cell).cells[s] };
+                        unsafe {
+                            (*cell).cells[s] = Sum::<A>::update(c, r.read(idx as usize), arena, &())
+                        };
+                    }
+                }
+                BoundSlot::Min(r) if !ONLY_ADDITIVE => {
+                    for &(idx, cell) in seeds.iter() {
+                        unsafe { (*cell).cells[s] = Min::<A>::seed(r.read(idx as usize), arena) };
+                    }
+                    for &(idx, cell) in updates.iter() {
+                        let c = unsafe { (*cell).cells[s] };
+                        unsafe {
+                            (*cell).cells[s] = Min::<A>::update(c, r.read(idx as usize), arena, &())
+                        };
+                    }
+                }
+                BoundSlot::Max(r) if !ONLY_ADDITIVE => {
+                    for &(idx, cell) in seeds.iter() {
+                        unsafe { (*cell).cells[s] = Max::<A>::seed(r.read(idx as usize), arena) };
+                    }
+                    for &(idx, cell) in updates.iter() {
+                        let c = unsafe { (*cell).cells[s] };
+                        unsafe {
+                            (*cell).cells[s] = Max::<A>::update(c, r.read(idx as usize), arena, &())
+                        };
+                    }
+                }
+                BoundSlot::StrMin(a) if !ONLY_ADDITIVE => {
+                    for &(idx, cell) in seeds.iter() {
+                        unsafe {
+                            (*cell).cells[s] = StrMin::<A>::seed(StrRead::read(a, idx as usize), arena)
+                        };
+                    }
+                    for &(idx, cell) in updates.iter() {
+                        let c = unsafe { (*cell).cells[s] };
+                        unsafe {
+                            (*cell).cells[s] =
+                                StrMin::<A>::update(c, StrRead::read(a, idx as usize), arena, shared)
+                        };
+                    }
+                }
+                BoundSlot::StrMax(a) if !ONLY_ADDITIVE => {
+                    for &(idx, cell) in seeds.iter() {
+                        unsafe {
+                            (*cell).cells[s] = StrMax::<A>::seed(StrRead::read(a, idx as usize), arena)
+                        };
+                    }
+                    for &(idx, cell) in updates.iter() {
+                        let c = unsafe { (*cell).cells[s] };
+                        unsafe {
+                            (*cell).cells[s] =
+                                StrMax::<A>::update(c, StrRead::read(a, idx as usize), arena, shared)
+                        };
+                    }
+                }
+                _ => unreachable!("non-additive slot under ONLY_ADDITIVE"),
+            }
+        }
+        seeds.clear();
+        updates.clear();
     }
 
     #[inline(always)]
