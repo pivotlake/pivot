@@ -383,7 +383,11 @@ impl GcsStore {
             ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_string()),
             ("X-Goog-Credential", percent_encode(&credential)),
             ("X-Goog-Date", datetime.clone()),
-            ("X-Goog-Expires", "3600".to_string()),
+            // A file's URL is signed once when its footer loads and then reused
+            // for the life of the manifest entry — which far outlives an hour for
+            // a long-running server. Sign for the GCS V4 maximum (7 days) so reads
+            // don't start failing with `400` once a short-lived URL expires.
+            ("X-Goog-Expires", "604800".to_string()),
             ("X-Goog-SignedHeaders", "host".to_string()),
         ]
         .map(|(k, v)| format!("{k}={v}"))
