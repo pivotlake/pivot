@@ -1,7 +1,7 @@
 //! Assembles a merged partition table into output [`RecordBatch`]es.
 //!
 //! This is the one place the key and value sides meet on the output path: the
-//! [`KeyExtractor`] emits the leading key column(s) and the [`ValueExtractor`]
+//! [`KeyExtractor`] emits the leading key column(s) and the [`AggregationValue`]
 //! the trailing value column(s), and a single combinator zips them — so neither
 //! extractor has to know about the other.
 //!
@@ -22,7 +22,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::values::{ValueColumns, ValueExtractor};
+use crate::operations::unary::group::values::AggregationValue;
 
 use super::Result;
 
@@ -65,21 +65,17 @@ impl<P, Val, S: Ord> Ord for TopK<P, Val, S> {
 /// (instead of every group) lets a downstream `ORDER BY … DESC LIMIT` discard
 /// nothing it would otherwise have to materialise — at very large group counts that is the
 /// difference between emitting every group and emitting `limit` of them.
-fn top_k_rows<K, V, S>(
-    table: &Table<K, V, S>,
-    slot: usize,
-    limit: usize,
-) -> Vec<(K::Persisted, V::Value)>
+fn top_k_rows<K, V, S>(table: &Table<K, V, S>, slot: usize, limit: usize) -> Vec<(K::Persisted, V)>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     S: TableStorage<K, V>,
 {
     // Size-`limit` min-heap (via `Reverse`) keyed by the sort scalar; keeps the
     // `limit` largest entries seen.
     let mut heap = BinaryHeap::with_capacity(limit + 1);
     for entry in table.iter(0) {
-        let sort = V::sort_key(entry.value(), slot);
+        let sort = entry.value().sort_key(slot);
         if heap.len() < limit {
             heap.push(Reverse(TopK {
                 sort,
@@ -104,17 +100,19 @@ where
 fn emit<K, V, Snd>(
     keys: K::Columns,
     values: V::Columns,
-    arena: &Arc<SharedArena>,
+    key_arena: &Arc<SharedArena>,
+    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
+    merge_config: &V::MergeConfig,
     sender: &mut Snd,
 ) -> Result<()>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     Snd: Sender<RecordBatch>,
 {
-    let (mut fields, mut columns) = keys.finish(arena, allocator);
-    let (value_fields, value_columns) = values.finish();
+    let (mut fields, mut columns) = keys.finish(key_arena, allocator);
+    let (value_fields, value_columns) = V::finish_columns(values, value_arena, merge_config);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -124,31 +122,42 @@ where
 
 /// Build `total` `(key, value)` pairs from `rows` into output `RecordBatch`es —
 /// one per [`OUTPUT_CHUNK_ROWS`]-row chunk, on `allocator`'s slab memory.
+#[allow(clippy::too_many_arguments)]
 fn emit_chunks<K, V, Snd, I>(
     mut rows: I,
     total: usize,
-    arena: &Arc<SharedArena>,
+    key_arena: &Arc<SharedArena>,
+    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
+    merge_config: &V::MergeConfig,
     sender: &mut Snd,
 ) -> Result<()>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     Snd: Sender<RecordBatch>,
-    I: Iterator<Item = (K::Persisted, V::Value)>,
+    I: Iterator<Item = (K::Persisted, V)>,
 {
     let mut remaining = total;
     while remaining > 0 {
         let chunk = remaining.min(OUTPUT_CHUNK_ROWS);
         let mut keys = K::Columns::with_capacity(allocator, chunk, key_config);
-        let mut values = V::Columns::with_capacity(allocator, chunk);
+        let mut values = V::new_columns(allocator, chunk);
         for _ in 0..chunk {
             let (key, value) = rows.next().expect("iterator yields `total` items");
             keys.push(&key);
-            values.push(&value);
+            value.push_to(&mut values);
         }
-        emit::<K, V, Snd>(keys, values, arena, allocator, sender)?;
+        emit::<K, V, Snd>(
+            keys,
+            values,
+            key_arena,
+            value_arena,
+            allocator,
+            merge_config,
+            sender,
+        )?;
         remaining -= chunk;
     }
     Ok(())
@@ -160,18 +169,21 @@ where
 /// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
 /// `ORDER BY <value_slot> DESC LIMIT limit`; only this partition's top-`limit`
 /// rows are emitted in that case.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
-    arena: &Arc<SharedArena>,
+    key_arena: &Arc<SharedArena>,
+    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
+    merge_config: &V::MergeConfig,
     top_k: Option<(usize, usize)>,
     count_only: bool,
     sender: &mut Snd,
 ) -> Result<()>
 where
     K: KeyExtractor,
-    V: ValueExtractor,
+    V: AggregationValue,
     S: TableStorage<K, V>,
     Snd: Sender<RecordBatch>,
 {
@@ -196,16 +208,27 @@ where
             emit_chunks::<K, V, Snd, _>(
                 rows.into_iter(),
                 total,
-                arena,
+                key_arena,
+                value_arena,
                 allocator,
                 key_config,
+                merge_config,
                 sender,
             )
         }
         _ => {
             let total = table.len();
             let rows = table.iter(0).map(|e| (*e.key(), *e.value()));
-            emit_chunks::<K, V, Snd, _>(rows, total, arena, allocator, key_config, sender)
+            emit_chunks::<K, V, Snd, _>(
+                rows,
+                total,
+                key_arena,
+                value_arena,
+                allocator,
+                key_config,
+                merge_config,
+                sender,
+            )
         }
     }
 }

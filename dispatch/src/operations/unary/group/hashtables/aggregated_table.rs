@@ -26,7 +26,7 @@ use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ValueExtractor,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::values::AggregationSlot;
@@ -59,24 +59,33 @@ impl RadixConfig {
         switch_threshold: SWITCH_THRESHOLD,
         partitions: RADIX_PARTITIONS,
     };
+
+    /// The same config with the radix switch disabled (the threshold can never be
+    /// crossed), so the worker always folds in-place and never scatters. Used
+    /// when a value holds a string extreme: the scatter path materialises every
+    /// row's value, which for a string means persisting it into the arena before
+    /// any comparison — so a loser would be persisted. The in-place fold compares
+    /// first and persists only a winner, keeping the arena to kept strings.
+    pub const fn without_radix(self) -> Self {
+        Self {
+            switch_threshold: usize::MAX,
+            partitions: self.partitions,
+        }
+    }
 }
 
 /// One scattered row: `(hash, persisted key, per-row value contribution)`.
-pub type RadixRow<K, V> = (
-    u64,
-    <K as KeyExtractor>::Persisted,
-    <V as ValueExtractor>::Value,
-);
+pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, V);
 
 /// A worker's scatter output: one engine-backed buffer of raw rows per partition.
-pub struct PartitionBuffers<K: KeyExtractor, V: ValueExtractor>(pub Vec<SlabVec<RadixRow<K, V>>>);
-unsafe impl<K: KeyExtractor, V: ValueExtractor> Send for PartitionBuffers<K, V> {}
+pub struct PartitionBuffers<K: KeyExtractor, V: AggregationValue>(pub Vec<SlabVec<RadixRow<K, V>>>);
+unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionBuffers<K, V> {}
 
 /// What a worker hands the merge phase: its in-place stack (always), the radix
 /// scatter buffers (only if it switched), and its distinct-count sketch. The
 /// merge slot-range-combines the stack and the buffers by the same top hash bits,
 /// so a switched worker's pre-switch stack needs no pre-fold into the buffers.
-pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
+pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue> {
     /// In-place table stack: the full result if the worker never switched,
     /// otherwise its pre-switch tables.
     pub tables: Vec<MultiSlabTable<K, V>>,
@@ -92,9 +101,15 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: ValueExtractor> {
 /// Per-worker aggregation state for the adaptive in-place → radix consume
 /// strategy (see the module docs). Holds the in-place table stack and, after a
 /// switch, the per-partition scatter buffers plus a distinct-count sketch.
-pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
+pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     hash_state: RandomState,
-    worker_arena: WorkerArena,
+    /// String *key* storage. Separate from the value arena so a live string key
+    /// (which holds `&mut key_arena` until persisted) and a string-extreme value
+    /// fold (which needs `&mut value_arena`) never alias — letting consume probe
+    /// and fold in one fused pass.
+    key_arena: WorkerArena,
+    /// String *value* storage (a string `MIN`/`MAX`); empty for numeric values.
+    value_arena: WorkerArena,
     allocator: SlabAllocator,
     /// Phase 1: stack of growing in-place tables.
     tables: Vec<MultiSlabTable<K, V>>,
@@ -119,13 +134,19 @@ pub struct AggregatedTable<K: KeyExtractor, V: ValueExtractor> {
     zero_hash_seen: bool,
 }
 
-impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
-    pub fn new(state: RandomState, shared_arena: Arc<SharedArena>, radix: RadixConfig) -> Self {
+impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
+    pub fn new(
+        state: RandomState,
+        key_arena: Arc<SharedArena>,
+        value_arena: Arc<SharedArena>,
+        radix: RadixConfig,
+    ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::multi_slab(&mut allocator, DEFAULT_CAPACITY, 0);
         Self {
             hash_state: state,
-            worker_arena: WorkerArena::new(shared_arena),
+            key_arena: WorkerArena::new(key_arena),
+            value_arena: WorkerArena::new(value_arena),
             allocator,
             tables: vec![table],
             buffers: None,
@@ -153,16 +174,23 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
+        merge_config: &V::MergeConfig,
     ) {
         let total = batch.num_rows();
         if total <= RECORD_BATCH_SIZE {
-            self.consume_window(batch, key_cols, value_slots, key_config);
+            self.consume_window(batch, key_cols, value_slots, key_config, merge_config);
             return;
         }
         let mut start = 0;
         while start < total {
             let len = (total - start).min(RECORD_BATCH_SIZE);
-            self.consume_window(&batch.slice(start, len), key_cols, value_slots, key_config);
+            self.consume_window(
+                &batch.slice(start, len),
+                key_cols,
+                value_slots,
+                key_config,
+                merge_config,
+            );
             start += len;
         }
     }
@@ -173,6 +201,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
+        merge_config: &V::MergeConfig,
     ) {
         let length = batch.num_rows();
         debug_assert!(
@@ -203,7 +232,9 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             if self.switched_to_radix {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
-                self.consume_scalared(length, &key_reader, &value_reader);
+                // The value type fixes the fold (Mono is branch-free, Dynamic
+                // dispatches per slot via `merge_config`); the probe just consumes.
+                self.consume_scalared(length, &key_reader, &value_reader, merge_config);
             }
         }
         self.scratch = scratch;
@@ -219,6 +250,7 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
         length: usize,
         key_reader: &K::Reader<'b>,
         value_reader: &V::Reader<'b>,
+        merge_config: &V::MergeConfig,
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
@@ -243,9 +275,21 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 if i + L1_DISTANCE < length {
                     table.prefetch(self.hashes[i + L1_DISTANCE]);
                 }
-                let key = K::live_key(key_reader, i, &mut self.worker_arena);
-                let value = V::value(value_reader, i);
-                table.merge::<false, _>(hash, key, value);
+                // Probe and fold in one pass. The live key persists into the key
+                // arena; the value arena is handed to whichever arm runs — `seed`
+                // materialises a new group's value, `update` folds the row into an
+                // existing one (a string extreme persists only if it wins).
+                // Separate arenas keep the key's borrow and the value's disjoint.
+                let key = K::live_key(key_reader, i, &mut self.key_arena);
+                table.probe_fold::<false, _, _, _, _>(
+                    hash,
+                    key,
+                    &mut self.value_arena,
+                    |arena, cell| *cell = V::value(value_reader, i, arena),
+                    |arena, cell| {
+                        *cell = cell.update_from_reader(value_reader, i, arena, merge_config)
+                    },
+                );
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
@@ -288,7 +332,8 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
     ) {
         let shift = u64::BITS - self.radix_cfg.partitions.trailing_zeros();
         let Self {
-            worker_arena,
+            key_arena,
+            value_arena,
             allocator,
             buffers,
             hll,
@@ -300,8 +345,11 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
             let hash = hashes[i];
             hll.add(hash);
             let p = (hash >> shift) as usize;
-            let key = K::live_key(key_reader, i, worker_arena).persist();
-            let value = V::value(value_reader, i);
+            // Radix is integer-key-only (strings never radix), so the key never
+            // touches the key arena here; a string *extreme* value still persists
+            // into the value arena.
+            let key = K::live_key(key_reader, i, key_arena).persist();
+            let value = V::value(value_reader, i, value_arena);
             buffers[p].push(allocator, (hash, key, value));
         }
     }
@@ -319,7 +367,8 @@ impl<K: KeyExtractor, V: ValueExtractor> AggregatedTable<K, V> {
                 }
             }
         }
-        self.worker_arena.flush();
+        self.key_arena.flush();
+        self.value_arena.flush();
         AggregatedTableOutput {
             tables: self.tables,
             buffers: self.buffers.map(PartitionBuffers),

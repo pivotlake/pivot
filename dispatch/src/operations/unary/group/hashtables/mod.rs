@@ -16,10 +16,10 @@ use std::ops::{Index, IndexMut};
 use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 pub use crate::operations::unary::group::keys::KeyExtractor;
-pub use crate::operations::unary::group::values::ValueExtractor;
+pub use crate::operations::unary::group::values::AggregationValue;
 
 mod hash_table;
-pub use hash_table::{Entry, LiveKey, MAX_LOAD_FACTOR, PersistedKey, Value};
+pub use hash_table::{Entry, LiveKey, MAX_LOAD_FACTOR, PersistedKey};
 
 mod aggregated_table;
 pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuffers, RadixConfig};
@@ -27,8 +27,8 @@ pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuff
 /// Initial number of slots for a new per-worker hash table.
 pub const DEFAULT_CAPACITY: usize = 128;
 
-/// The `Entry` stored in a table for a given key/value extractor pair.
-pub type ExtractorEntry<K, V> = Entry<<K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value>;
+/// The `Entry` stored in a table for a given key extractor and aggregation value.
+pub type ExtractorEntry<K, V> = Entry<<K as KeyExtractor>::Persisted, V>;
 
 /// Marker trait for any backing storage that can index a key/value `Entry` by
 /// `usize`.
@@ -36,20 +36,19 @@ pub type ExtractorEntry<K, V> = Entry<<K as KeyExtractor>::Persisted, <V as Valu
 /// Automatically implemented for anything that implements
 /// `Index<usize> + IndexMut<usize>` with the right output type, so
 /// `Vec`, `SlabBuffer`, and `MultiSlabBuffer` all qualify.
-pub trait TableStorage<K: KeyExtractor + ?Sized, V: ValueExtractor + ?Sized>:
+pub trait TableStorage<K: KeyExtractor + ?Sized, V: AggregationValue>:
     Index<usize, Output = ExtractorEntry<K, V>> + IndexMut<usize>
 {
 }
 
-impl<K: KeyExtractor + ?Sized, V: ValueExtractor + ?Sized, T> TableStorage<K, V> for T where
+impl<K: KeyExtractor + ?Sized, V: AggregationValue, T> TableStorage<K, V> for T where
     T: Index<usize, Output = ExtractorEntry<K, V>> + IndexMut<usize>
 {
 }
 
-/// A [`BaseHashTable`] parameterized by a key extractor, a value extractor, and
-/// a storage backend.
-pub type Table<K, V, S> =
-    BaseHashTable<<K as KeyExtractor>::Persisted, <V as ValueExtractor>::Value, S>;
+/// A [`BaseHashTable`] parameterized by a key extractor, an aggregation value,
+/// and a storage backend.
+pub type Table<K, V, S> = BaseHashTable<<K as KeyExtractor>::Persisted, V, S>;
 
 /// A [`Table`] backed by multiple slab buffers (for tables exceeding one slab).
 pub type MultiSlabTable<K, V> = Table<K, V, MultiSlabBuffer<ExtractorEntry<K, V>>>;

@@ -63,6 +63,9 @@ pub enum AggregateFunc {
     CountStar(CountStar),
     Sum(NumericAggregate),
     Avg(NumericAggregate),
+    /// `MIN(col)` / `MAX(col)` over an integer column — keep the running extreme.
+    Min(NumericAggregate),
+    Max(NumericAggregate),
     /// `COUNT(col)` — counts non-null values. DuckDB lowers `AVG(col)` to
     /// `sum(col) / count(col)`, so this shows up in average plans.
     Count(NumericAggregate),
@@ -87,6 +90,8 @@ impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
             "count_star" => Ok(AggregateFunc::CountStar(a.try_into()?)),
             "sum" => Ok(AggregateFunc::Sum(a.try_into()?)),
             "avg" => Ok(AggregateFunc::Avg(a.try_into()?)),
+            "min" => Ok(AggregateFunc::Min(a.try_into()?)),
+            "max" => Ok(AggregateFunc::Max(a.try_into()?)),
             "count" if a.distinct => Ok(AggregateFunc::CountDistinct(a.try_into()?)),
             "count" => Ok(AggregateFunc::Count(a.try_into()?)),
             _ => Err(Error::UnsupportedAggregateFunction(a.aggregate_function)),
@@ -100,6 +105,8 @@ impl Display for AggregateFunc {
             AggregateFunc::CountStar(_) => f.write_str("count_star()"),
             AggregateFunc::Sum(a) => write!(f, "sum(#{})", a.column.column_idx),
             AggregateFunc::Avg(a) => write!(f, "avg(#{})", a.column.column_idx),
+            AggregateFunc::Min(a) => write!(f, "min(#{})", a.column.column_idx),
+            AggregateFunc::Max(a) => write!(f, "max(#{})", a.column.column_idx),
             AggregateFunc::Count(a) => write!(f, "count(#{})", a.column.column_idx),
             AggregateFunc::CountDistinct(a) => {
                 write!(f, "count(distinct #{})", a.column.column_idx)
