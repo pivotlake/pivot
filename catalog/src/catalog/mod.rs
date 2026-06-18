@@ -203,11 +203,12 @@ impl ParquetCatalog {
     /// [`Catalog::table`] *minus the reload*, and typed). Useful for callers
     /// (and tests) that need state the [`Table`] trait does not expose.
     pub fn binding(&self, name: &str) -> Option<TableBinding> {
-        self.tables
-            .read()
-            .unwrap()
-            .get(name)
-            .map(CatalogTable::binding)
+        let columns = self.tables.read().unwrap().get(name)?.columns();
+        Some(TableBinding::new(
+            name.to_string(),
+            columns,
+            self.tables.clone(),
+        ))
     }
 
     /// The worker pool this catalog fetches footers on — shared with callers
@@ -382,33 +383,37 @@ impl ParquetCatalog {
 }
 
 impl Catalog for ParquetCatalog {
-    /// Resolve `name` to a fresh, independently-mutable [`TableBinding`],
-    /// **reloading first**: a copy of the table is taken and refreshed (one LIST
-    /// to check the latest version; new files' footers fetched only if it
-    /// advanced), so every query starts from the latest committed file list — a
-    /// commit by ingest, a compaction, or another process becomes visible to the
-    /// next query. An advanced copy is swapped back into the map so the next
-    /// resolve starts current. Each binding is its own value, so per-query filter
-    /// pushdown prunes its view without affecting other concurrent queries.
+    /// Resolve `name` to a **live** [`TableBinding`]: it carries the table's
+    /// schema and (after pushdown) this query's predicates, but reads its file
+    /// set from the catalog's master map every time it compiles — so a reused
+    /// (cached) plan always scans the latest committed files. The reload itself
+    /// happens in [`refresh`](Catalog::refresh), called once per table at the top
+    /// of `Plan::compile`; resolving here is pure in-memory and does no I/O. Each
+    /// binding is its own value, so per-query filter pushdown prunes its view
+    /// without affecting other concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        let mut table = self.tables.read().unwrap().get(name)?.clone();
-        let advanced = match table.refresh() {
-            Ok(advanced) => advanced,
-            // Serve the version we have rather than failing the query; the next
-            // resolve retries the reload.
+        Some(Box::new(self.binding(name)?))
+    }
+
+    /// Reload `name`'s master copy to the latest committed version (one LIST;
+    /// new files' footers fetched only if it advanced), publishing the advanced
+    /// copy so every later resolve and every live binding reads it. A refresh
+    /// error serves the last known version rather than failing the query.
+    fn refresh(&self, name: &str) -> CatalogResult<()> {
+        let mut table = match self.tables.read().unwrap().get(name) {
+            Some(table) => table.clone(),
+            None => return Ok(()),
+        };
+        match table.refresh() {
+            Ok(true) => {
+                self.tables.write().unwrap().insert(name.to_string(), table);
+            }
+            Ok(false) => {}
             Err(e) => {
                 warn!(table = name, error = %e, "table refresh failed; serving last known version");
-                false
             }
-        };
-        // Take the binding off the copy (it clones only the row-group `Arc`s it
-        // needs), then — if the copy advanced — publish it for the next resolve
-        // by moving it in, no second full clone.
-        let binding = table.binding();
-        if advanced {
-            self.tables.write().unwrap().insert(name.to_string(), table);
         }
-        Some(Box::new(binding))
+        Ok(())
     }
 
     fn create_table(

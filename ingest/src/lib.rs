@@ -412,7 +412,7 @@ mod tests {
     /// until a resolve), then return the typed binding.
     fn fresh_binding(catalog: &catalog::ParquetCatalog, name: &str) -> catalog::TableBinding {
         use planner::catalog::Catalog as _;
-        let _ = catalog.table(name);
+        catalog.refresh(name).unwrap();
         catalog.binding(name).unwrap()
     }
 
@@ -533,7 +533,7 @@ mod tests {
             catalog
                 .binding("otel_logs")
                 .unwrap()
-                .parquet
+                .current_parquet()
                 .row_groups()
                 .is_empty()
         );
@@ -546,7 +546,8 @@ mod tests {
         );
 
         let table = fresh_binding(&catalog, "otel_logs");
-        let groups = table.parquet.row_groups();
+        let parquet = table.current_parquet();
+        let groups = parquet.row_groups();
         assert_eq!(
             groups.iter().map(|rg| rg.num_rows).sum::<i64>(),
             5,
@@ -597,7 +598,8 @@ mod tests {
         // catalog, and indices stayed sequential.
         assert_eq!(parquet_file_count(dir.path()), 1);
         let table = fresh_binding(&catalog, "otel_logs");
-        let groups = table.parquet.row_groups();
+        let parquet = table.current_parquet();
+        let groups = parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
         assert!(
@@ -762,7 +764,7 @@ mod tests {
         let table = catalog.binding("events").unwrap();
         assert_eq!(
             table
-                .parquet
+                .current_parquet()
                 .row_groups()
                 .iter()
                 .map(|rg| rg.num_rows)
@@ -816,10 +818,11 @@ mod tests {
             .unwrap()
             .block_on(compacter.compact_all());
 
-        // The server's next bind reloads to the compacted version.
-        assert!(planner::catalog::Catalog::table(&*server_catalog, "otel_logs").is_some());
+        // The server's next query refreshes to the compacted version.
+        planner::catalog::Catalog::refresh(&*server_catalog, "otel_logs").unwrap();
         let table = server_catalog.binding("otel_logs").unwrap();
-        let groups = table.parquet.row_groups();
+        let parquet = table.current_parquet();
+        let groups = parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
         assert!(

@@ -90,9 +90,10 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Pa
 /// Refresh from the latest committed manifest (what a query bind does) and scan
 /// the table's `value` column, sorted.
 fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
-    let _ = PlannerCatalog::table(cat, name);
+    PlannerCatalog::refresh(cat, name).unwrap();
     let table = cat.binding(name).expect("table bound");
-    let out = table_input(d, &table.parquet, Projection::all(2), false)
+    let parquet = table.current_parquet();
+    let out = table_input(d, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
     let mut values = collect_i64s(&out, 1);
@@ -101,7 +102,7 @@ fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
 }
 
 fn row_groups(cat: &ParquetCatalog, name: &str) -> usize {
-    cat.binding(name).unwrap().parquet.row_groups().len()
+    cat.binding(name).unwrap().current_parquet().row_groups().len()
 }
 
 // --- behaviours (run on every backend) -------------------------------------

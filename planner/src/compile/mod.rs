@@ -89,6 +89,8 @@ pub enum Error {
     UnexpectedCreateTableInputs,
     #[error("compiling table scan: {0}")]
     TableScan(#[source] crate::catalog::Error),
+    #[error("refreshing table to latest version: {0}")]
+    Refresh(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
 }
@@ -103,6 +105,14 @@ impl Plan {
         &self,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        // Refresh every table this plan reads to its latest committed version,
+        // once each, before any scan compiles. A cached plan is re-run through
+        // here, so this is where it picks up data committed since it was planned.
+        // Doing it up front (not per scan) means a table feeding both a scan and
+        // a late materialize reloads once and both read one consistent snapshot.
+        for name in self.root.referenced_table_names() {
+            self.catalog.refresh(&name).map_err(Error::Refresh)?;
+        }
         let mut slots = DynamicFilterSlots::new();
         self.root.compile(dispatcher, &self.catalog, &mut slots)
     }
