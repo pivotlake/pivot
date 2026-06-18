@@ -431,17 +431,29 @@ impl FileCache {
                 continue;
             }
             if let Some(write_buffer) = memory_ctx().ring().try_write(slot_idx) {
-                // Exclusive now: unbind the region from the map before reusing.
+                // Exclusive now. Only *cache regions* are ours to reclaim. A slot
+                // with no bound region is a free buffer parked in a pool (every
+                // slot is pre-faulted into a pool at startup, and freed buffers
+                // return there). Handing one out here would alias the pool's copy
+                // — two owners of one 2 MB slot — which orphans the slot's
+                // `fd_regions` entry and livelocks `get_region`. Release it without
+                // pooling it (its pool listing stays valid) and keep scanning.
                 let entry = unsafe { &mut *self.entries[slot_idx].get() };
-                if let Some((location, region)) = entry.region.take() {
-                    let file_maps = self.file_maps.read().unwrap();
-                    file_maps
-                        .get(&location)
-                        .unwrap()
-                        .write()
-                        .unwrap()
-                        .remove(&region);
-                }
+                let Some((location, region)) = entry.region.take() else {
+                    std::mem::forget(write_buffer);
+                    memory_ctx()
+                        .ring()
+                        .set_slot_used(slot_idx, 0, Ordering::Release);
+                    continue;
+                };
+                self.file_maps
+                    .read()
+                    .unwrap()
+                    .get(&location)
+                    .unwrap()
+                    .write()
+                    .unwrap()
+                    .remove(&region);
                 return write_buffer;
             }
         }
@@ -553,6 +565,31 @@ mod tests {
         for (i, &b) in bytes.iter().enumerate() {
             assert_eq!(b, pattern_at(slot_start + i), "byte {i}");
         }
+    }
+
+    /// Regression for the parquetsink OOM: the CLOCK evictor must not reclaim a
+    /// ring slot that is still sitting in the free pool. When it does, that one
+    /// 2 MB slot is owned by both the pool and the evictor — and once the evicted
+    /// copy is installed as a cache region, the pool re-issues it, orphaning the
+    /// `fd_regions` entry and livelocking `get_region`.
+    #[test]
+    fn evict_does_not_steal_a_slot_from_the_free_pool() {
+        init_test_free_pool(2);
+        cache().open_entry(FD());
+        // A real cached region: its set ref_bit makes the CLOCK hand skip it, so
+        // the evictor reaches a slot that is still in the pool.
+        drop(miss(cache().get_region(&FD(), 0, 0, SB)));
+
+        let evicted = cache().evict();
+        let still_pooled: Vec<usize> =
+            std::iter::from_fn(|| memory_ctx().pop_free_idx(false)).collect();
+
+        assert!(
+            !still_pooled.contains(&evicted.slot_idx),
+            "evict() handed out slot {} while the pool still lists it {:?}: two owners of one ring slot",
+            evicted.slot_idx,
+            still_pooled,
+        );
     }
 
     #[test]
