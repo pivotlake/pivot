@@ -92,6 +92,10 @@ impl Table for TestTable {
         Box::new(self.clone())
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn materialize(
         &self,
         input: RecordBatchOperatorSpec,

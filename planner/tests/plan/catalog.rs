@@ -52,6 +52,10 @@ impl Table for RecordingTable {
         Box::new(self.clone())
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn pushdown_filter(&mut self, filter: TableFilter) -> planner::catalog::Result<bool> {
         self.received.lock().unwrap().push(filter);
         Ok(self.accept_pushdown)

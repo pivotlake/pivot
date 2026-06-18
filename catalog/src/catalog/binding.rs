@@ -31,6 +31,9 @@ struct PushedPredicate {
 /// [`Table::pushdown_filter`] without affecting others.
 #[derive(Clone, Debug)]
 pub struct TableBinding {
+    /// The catalog name this binding resolves, so a cached plan can re-resolve
+    /// the table's latest file set at compile time (see [`Table::rebind_onto`]).
+    name: String,
     pub columns: Vec<Column>,
     /// The table's row-group metadata, read once when the table was defined and
     /// shared across every binding/query (cheap `Arc` clone). Pruning a binding's
@@ -45,8 +48,9 @@ pub struct TableBinding {
 impl TableBinding {
     /// A binding over one table version's scan view, with no predicates pushed
     /// yet.
-    pub(super) fn new(columns: Vec<Column>, parquet: Arc<ParquetTable>) -> Self {
+    pub(super) fn new(name: String, columns: Vec<Column>, parquet: Arc<ParquetTable>) -> Self {
         Self {
+            name,
             columns,
             parquet,
             predicates: Vec::new(),
@@ -108,6 +112,30 @@ impl Table for TableBinding {
         // Late materialization re-reads rows by their *global* row-group index,
         // so it uses the full table, not the pruned scan view.
         materialize(input, self.parquet.clone(), projection)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
+    fn rebind_onto(&self, fresh: &dyn Table) -> Box<dyn Table> {
+        // `fresh` is the catalog's latest predicate-less binding for this same
+        // table. Take its file set; keep our own columns and pushed-down
+        // predicates. If the downcast ever fails (a different backend), fall
+        // back to our own — never wrong, just possibly stale.
+        let Some(fresh) = fresh.as_any().downcast_ref::<TableBinding>() else {
+            return self.clone_box();
+        };
+        Box::new(Self {
+            name: self.name.clone(),
+            columns: self.columns.clone(),
+            parquet: fresh.parquet.clone(),
+            predicates: self.predicates.clone(),
+        })
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {

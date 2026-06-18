@@ -125,6 +125,29 @@ pub trait Table: Debug + Send + Sync {
     fn pushdown_filter(&mut self, _filter: TableFilter) -> Result<bool> {
         Ok(false)
     }
+
+    /// Downcast hook, so a re-resolved table can read another instance's
+    /// concrete file set in [`rebind_onto`](Table::rebind_onto).
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// This table's catalog name, if it has one.
+    ///
+    /// Used at compile time to re-resolve the table's *current* file set from
+    /// the live catalog, so a reused (cached) plan still sees data committed
+    /// since it was planned. `None` for backends that are not catalog-resolved
+    /// (e.g. test stubs), which then skip the refresh.
+    fn name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Return a copy of `self` that scans `fresh`'s file set instead of its
+    /// own, keeping `self`'s pushed-down predicates. `fresh` is the latest
+    /// predicate-less resolution of the *same* table from the catalog (see
+    /// [`Catalog::table`]). Default: ignore `fresh` and clone unchanged, for
+    /// backends with no separable file set.
+    fn rebind_onto(&self, _fresh: &dyn Table) -> Box<dyn Table> {
+        self.clone_box()
+    }
 }
 
 /// Adapts a Pivot [`Table`] to DuckDB's [`DuckDBTable`] trait,

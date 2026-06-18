@@ -3,7 +3,7 @@
 //! Each [`Operator`](crate::operator::Operator) variant has a `compile`
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
-use crate::catalog::{Catalog, DynamicScanPredicate};
+use crate::catalog::{Catalog, DynamicScanPredicate, Table};
 use crate::compile::dummy_scan::DummyScanNullaryFactory;
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
@@ -730,12 +730,38 @@ fn row_key_schema(key_refs: &[&crate::expression::Ref]) -> Option<dispatch::RowK
     Some(dispatch::RowKeySchema::new(types))
 }
 
+/// Per-compile cache of each referenced table re-resolved to its latest
+/// committed version. Keyed by table name so every scan/materialize of the same
+/// table in one plan shares a single consistent snapshot (and is refreshed by
+/// only one [`Catalog::table`] call). `None` records a table that vanished
+/// between planning and this compile.
+pub(crate) type RefreshMemo = std::collections::HashMap<String, Option<Box<dyn Table>>>;
+
+/// Re-resolve `table` against the live catalog so a reused (cached) plan scans
+/// data committed since it was planned, preserving `table`'s pushed-down
+/// predicates. Tables with no catalog name (test stubs) pass through unchanged.
+fn refreshed(table: &dyn Table, catalog: &dyn Catalog, memo: &mut RefreshMemo) -> Box<dyn Table> {
+    let Some(name) = table.name() else {
+        return table.clone_box();
+    };
+    let fresh = memo
+        .entry(name.to_string())
+        .or_insert_with(|| catalog.table(name));
+    match fresh {
+        Some(fresh) => table.rebind_onto(fresh.as_ref()),
+        None => table.clone_box(),
+    }
+}
+
 impl Input {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
+        catalog: &dyn Catalog,
         slots: &mut DynamicFilterSlots,
+        memo: &mut RefreshMemo,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        let table = refreshed(self.table.as_ref(), catalog, memo);
         let column_indices: Vec<usize> = self
             .columns
             .iter()
@@ -749,7 +775,7 @@ impl Input {
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
-        self.table
+        table
             .compile(
                 dispatcher,
                 projection,
@@ -764,9 +790,15 @@ impl Materialize {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        catalog: &dyn Catalog,
+        memo: &mut RefreshMemo,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        // Share the scan's refreshed snapshot (same `memo` key) so late
+        // materialization re-reads rows from the exact files the scan saw —
+        // global row-group indices must line up.
+        let table = refreshed(self.table.as_ref(), catalog, memo);
         let projection = DispatchProjection::columns(self.columns.iter().copied());
-        Ok(self.table.materialize(input, projection))
+        Ok(table.materialize(input, projection))
     }
 }
 

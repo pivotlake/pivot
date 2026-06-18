@@ -104,7 +104,8 @@ impl Plan {
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let mut slots = DynamicFilterSlots::new();
-        self.root.compile(dispatcher, &self.catalog, &mut slots)
+        let mut memo = crate::compile::operator::RefreshMemo::new();
+        self.root.compile(dispatcher, &self.catalog, &mut slots, &mut memo)
     }
 }
 
@@ -114,20 +115,21 @@ impl PlanNode {
         dispatcher: &DataFlowDispatcher,
         catalog: &Arc<dyn Catalog>,
         slots: &mut DynamicFilterSlots,
+        memo: &mut crate::compile::operator::RefreshMemo,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, slots)?);
+            inputs.push(input.compile(dispatcher, catalog, slots, memo)?);
         }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher, slots),
+            crate::Operator::Input(o) => o.compile(dispatcher, catalog.as_ref(), slots, memo),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
-            crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Materialize(o) => o.compile(inputs.remove(0), catalog.as_ref(), memo),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);

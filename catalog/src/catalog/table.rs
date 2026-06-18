@@ -383,6 +383,7 @@ impl CatalogTable {
             .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
         TableBinding::new(
+            self.name.clone(),
             self.manifest.columns.clone(),
             Arc::new(ParquetTable::new(row_groups)),
         )

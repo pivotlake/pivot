@@ -23,8 +23,13 @@ use planner::types::Type;
 /// metadata-fetch dataflow) when the table is defined.
 fn dispatcher() -> DataFlowDispatcher {
     static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
+    // The file cache is process-global and accumulates a resident region per
+    // distinct file scanned across the whole binary; with `PANIC_ON_EVICT` on
+    // (the test default), running out of ring slots panics instead of evicting.
+    // Size it well above the suite's distinct-file count so adding tests doesn't
+    // tip a later one over.
     DISPATCH
-        .get_or_init(|| Dispatch::spin_up(1, 32))
+        .get_or_init(|| Dispatch::spin_up(1, 128))
         .dispatcher()
         .clone()
 }
@@ -381,6 +386,48 @@ fn append_data_file_makes_new_file_visible_to_new_binds() {
     let groups = table.parquet.row_groups();
     assert_eq!(groups.len(), 4);
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
+}
+
+/// A reused (cached) plan re-resolves its file set at compile time: a binding
+/// captured at one version, rebound onto the catalog's latest resolution, scans
+/// files committed since — without re-planning. The untouched original stays
+/// stale, which is exactly why a cached plan must rebind.
+#[test]
+fn rebind_onto_latest_picks_up_files_committed_after_planning() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    let cached = catalog.binding("t").unwrap();
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
+    append(&catalog, "t", &new_file);
+    let fresh = PlannerCatalog::table(&*catalog, "t").unwrap();
+    let rebound = cached.rebind_onto(fresh.as_ref());
+
+    assert_eq!(row_group_count(&cached), 3);
+    let rebound = rebound.as_any().downcast_ref::<TableBinding>().unwrap();
+    assert_eq!(row_group_count(rebound), 4);
+}
+
+/// Re-resolving keeps the plan's pushed-down predicates: rebinding the latest
+/// file set must not reset pruning to "scan everything".
+#[test]
+fn rebind_onto_latest_preserves_pushed_predicates() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    let mut cached = catalog.binding("t").unwrap();
+    cached
+        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .unwrap();
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
+    append(&catalog, "t", &new_file);
+    let fresh = PlannerCatalog::table(&*catalog, "t").unwrap();
+    let rebound = cached.rebind_onto(fresh.as_ref());
+
+    let rebound = rebound.as_any().downcast_ref::<TableBinding>().unwrap();
+    assert_eq!(row_group_count(rebound), 1);
 }
 
 /// Appending the same path twice (a replayed flush notification) must not
