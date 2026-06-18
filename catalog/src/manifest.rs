@@ -32,12 +32,16 @@ const TABLE_MANIFEST_DIR: &str = "_pivot_tables";
 const VERSION_DIGITS: usize = 20;
 /// The version a table's first commit gets.
 pub const FIRST_VERSION: u64 = 1;
-/// How many of the most-recent manifest versions to keep when pruning. A reader
-/// loads by listing then `get`ting the max it saw; retaining a tail means a
-/// reader that observed an older max (e.g. under an eventually-consistent
-/// `list`) before its `get` never races a prune. Everything older is dead
-/// weight — pure space, and it slows the `list` every bind does.
-const VERSIONS_RETAINED: u64 = 8;
+/// How many of the most-recent manifest versions to keep when pruning. A query
+/// resolves a snapshot (one version) and reads its files for the whole query;
+/// the snapshot's files are only physically deleted once *its* version is pruned
+/// (deferred deletions, see [`PendingDeletions`]). So the retained tail must
+/// outlast a query: while it runs, compaction must not advance far enough to
+/// prune the version it's reading. Each statement re-resolves to the latest
+/// manifest (plans are never cached) and finishes in well under a second, so a
+/// tail of 32 — ~16 s of headroom at a few commits/sec — is ample, while keeping
+/// the version directory (and the `list` per bind) small.
+const VERSIONS_RETAINED: u64 = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -87,6 +91,18 @@ impl ManifestEntry {
     }
 }
 
+/// The data files a compaction swap removed at a given table-manifest version,
+/// recorded so the objects are deleted *lazily* — only when that version is
+/// pruned, by which point the retention tail guarantees no live reader still
+/// references them. This is how lakehouses avoid a reader hitting a file deleted
+/// out from under it (Iceberg snapshot expiry, Delta `VACUUM`): a commit only
+/// stops referencing the old files; a later GC removes them.
+#[derive(Default, Serialize, Deserialize)]
+pub struct PendingDeletions {
+    /// Already-`location`-resolved store keys of the files to delete.
+    pub paths: Vec<ObjectPath>,
+}
+
 /// One table's durable record: its declared schema (`columns`), its partition and
 /// sort specs (column names; either may be empty), and its committed file list
 /// (`entries`) at `version`. Mirrors the live [`CatalogTable`] state the catalog
@@ -117,6 +133,40 @@ impl TableManifest {
         Self::dir(name).join(&format!("{version:0VERSION_DIGITS$}.json"))
     }
 
+    /// The subdirectory holding table `name`'s deferred-deletions records. Kept
+    /// out of the version directory so the per-bind `list` (which scans for the
+    /// latest version) only ever sees version files — never these.
+    fn deletions_dir(name: &str) -> ObjectPath {
+        Self::dir(name).join("deletions")
+    }
+
+    /// The store key of the deferred-deletions record for `version` of table
+    /// `name`, under its own subdirectory.
+    fn deletions_key(name: &str, version: u64) -> ObjectPath {
+        Self::deletions_dir(name).join(&format!("{version:0VERSION_DIGITS$}.json"))
+    }
+
+    /// Record the data files a swap at `version` removed, for deletion when that
+    /// version is later pruned. A no-op for an empty list.
+    pub fn record_deletions(
+        store: &dyn ObjectStore,
+        name: &str,
+        version: u64,
+        paths: &[ObjectPath],
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let doc = PendingDeletions {
+            paths: paths.to_vec(),
+        };
+        store.put(
+            &Self::deletions_key(name, version),
+            &serde_json::to_vec(&doc)?,
+        )?;
+        Ok(())
+    }
+
     /// Load table `name`'s latest committed manifest — one `list` of its version
     /// directory for the highest version, then a `get` of it. The database
     /// manifest is the index of which tables exist, so a name listed there with
@@ -137,6 +187,37 @@ impl TableManifest {
             .get(&Self::key(name, version))?
             .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Load the latest manifest **only if it is newer than `since`** — the
+    /// per-query reload. Lists with a `start` offset of `since`'s version key, so
+    /// the scan begins at the caller's cursor instead of the bottom of the
+    /// directory: it skips every older version *and* the soft-deleted tombstones
+    /// of every version ever pruned (which a full prefix scan would otherwise
+    /// wade through — the dominant cost as the graveyard grows). Returns
+    /// `Ok(None)` when `since` is already current, so no `get` is paid when
+    /// nothing changed.
+    pub fn load_after(store: &dyn ObjectStore, name: &str, since: u64) -> Result<Option<Self>> {
+        let newest = store
+            .list_from(&Self::dir(name), &Self::key(name, since))?
+            .iter()
+            .filter_map(|file| {
+                file.path
+                    .name()
+                    .strip_suffix(".json")
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .filter(|&v| v > since)
+            .max();
+        match newest {
+            None => Ok(None),
+            Some(v) => {
+                let bytes = store
+                    .get(&Self::key(name, v))?
+                    .ok_or_else(|| Error::MissingTableManifest(name.to_string()))?;
+                Ok(Some(serde_json::from_slice(&bytes)?))
+            }
+        }
     }
 
     /// Commit this manifest at its `version` via compare-and-swap: `Ok(true)` if
@@ -169,6 +250,20 @@ impl TableManifest {
             .filter(|&v| v < cutoff)
             .collect();
         for v in stale {
+            // `v` is now older than the retention tail, so no live query can still
+            // be reading the snapshot that referenced these files: every statement
+            // re-resolves to the latest manifest and finishes far inside the tail's
+            // lifetime. So physically delete the files the swap at `v` removed
+            // (recorded as a deferred-deletions record), then drop that record and
+            // the version manifest. Each delete is idempotent, so a concurrent
+            // prune / retry is harmless.
+            if let Some(bytes) = store.get(&Self::deletions_key(name, v))? {
+                let pending: PendingDeletions = serde_json::from_slice(&bytes)?;
+                for path in &pending.paths {
+                    store.delete(path)?;
+                }
+            }
+            store.delete(&Self::deletions_key(name, v))?;
             store.delete(&Self::key(name, v))?;
         }
         Ok(())
@@ -258,7 +353,7 @@ mod tests {
     fn prune_keeps_only_the_recent_tail() {
         let dir = TempDir::new().unwrap();
         let store = LocalStore::new(dir.path());
-        let latest = 30;
+        let latest = VERSIONS_RETAINED + 22;
         for v in FIRST_VERSION..=latest {
             assert!(manifest(v).commit(&store, "t").unwrap());
         }
@@ -295,7 +390,7 @@ mod tests {
     fn prune_is_idempotent() {
         let dir = TempDir::new().unwrap();
         let store = LocalStore::new(dir.path());
-        let latest = 20;
+        let latest = VERSIONS_RETAINED + 12;
         for v in FIRST_VERSION..=latest {
             manifest(v).commit(&store, "t").unwrap();
         }
@@ -306,6 +401,41 @@ mod tests {
         assert_eq!(
             live_versions(&store, "t").len() as u64,
             VERSIONS_RETAINED + 1
+        );
+    }
+
+    /// Pruning a version physically deletes the data files its swap removed
+    /// (recorded as a deferred-deletions record), then drops the deletions record
+    /// and the version manifest. Safe once the version is past the retention tail:
+    /// no live reader still resolves a snapshot that old.
+    #[test]
+    fn pruning_deletes_swapped_out_data_files() {
+        let dir = TempDir::new().unwrap();
+        let store = LocalStore::new(dir.path());
+        let latest = VERSIONS_RETAINED + 22;
+        for v in FIRST_VERSION..=latest {
+            assert!(manifest(v).commit(&store, "t").unwrap());
+        }
+        let data = ObjectPath::new("data/old.parquet");
+        store.put(&data, b"rows").unwrap();
+        TableManifest::record_deletions(&store, "t", 5, std::slice::from_ref(&data)).unwrap();
+
+        TableManifest::prune_old_versions(&store, "t", latest).unwrap();
+
+        assert!(
+            store.get(&data).unwrap().is_none(),
+            "the swapped-out data file is physically deleted"
+        );
+        assert!(
+            store
+                .get(&TableManifest::deletions_key("t", 5))
+                .unwrap()
+                .is_none(),
+            "the deletions record is pruned"
+        );
+        assert!(
+            store.get(&TableManifest::key("t", 5)).unwrap().is_none(),
+            "the version manifest is pruned"
         );
     }
 }
