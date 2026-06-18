@@ -128,14 +128,17 @@ pub struct DynReader<'b, const N: usize> {
     slots: [BoundSlot<'b>; N],
 }
 
-/// Per-worker deferred-update scratch, reused across windows (the table owns one).
-/// One `RECORD_BATCH_SIZE`-capacity buffer of `(row, cell)` records — at most one
-/// per row. Written by a raw indexed store; `n` is the count. New groups seed
-/// immediately (see [`record_seed`](AggregationValue::record_seed)), so only the
-/// *updates* of already-seeded groups are recorded here and replayed in finalize.
+/// Per-worker deferred scratch, reused across windows (the table owns one). One
+/// `2·RECORD_BATCH_SIZE`-capacity buffer of `(row, cell)` records split in two
+/// halves: **seeds** grow from the front `[0, RECORD_BATCH_SIZE)`, **updates** from
+/// the back `[RECORD_BATCH_SIZE, 2·RECORD_BATCH_SIZE)`. Both record at most one per
+/// row, so each half can't overflow a window. `finalize` replays the seed half as
+/// SETs (materialise the real value over the fake one the probe stamped) then the
+/// update half as FOLDs — every seed lands before any update, columnar.
 pub struct DynRecorder<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> {
     records: UnsafeCell<Vec<(u32, *mut Dynamic<N, A, ONLY_ADDITIVE>)>>,
-    n: UnsafeCell<usize>,
+    n_seed: UnsafeCell<usize>,
+    n_update: UnsafeCell<usize>,
 }
 
 impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
@@ -143,8 +146,9 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
 {
     fn default() -> Self {
         Self {
-            records: UnsafeCell::new(Vec::with_capacity(RECORD_BATCH_SIZE)),
-            n: UnsafeCell::new(0),
+            records: UnsafeCell::new(Vec::with_capacity(2 * RECORD_BATCH_SIZE)),
+            n_seed: UnsafeCell::new(0),
+            n_update: UnsafeCell::new(0),
         }
     }
 }
@@ -265,14 +269,34 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
         self
     }
 
-    // No `record_seed` override: a new group is seeded **immediately** via the trait
-    // default (`*cell = Self::value(..)`) — one hot write of the real value, exactly
-    // like the immediate path. Deferring it would need a placeholder write into a
-    // fresh cell, a *second* (cold, scattered) touch — the whole source of the
-    // deferred path's slowdown on a high-cardinality query. Only updates are deferred.
+    /// Defer the seed: stamp a cheap fake value into the fresh cell (so a later row
+    /// on the same key takes the *update* path, not seed, before finalize runs), and
+    /// record `(row, cell)` into the **front** half. [`finalize`](Self::finalize)
+    /// overwrites the fake with the real materialised value, columnar. Fully general
+    /// — no `ONLY_ADDITIVE` assumption.
+    #[inline(always)]
+    fn record_seed(
+        _reader: &Self::Reader<'_>,
+        idx: usize,
+        cell: &mut Self,
+        _arena: &mut WorkerArena,
+        rec: &Self::Recorder,
+    ) {
+        // Fake placeholder: any value works (finalize SETs the real one over it).
+        *cell = Self { cells: [A::from(1); N] };
+        // SAFETY: single-threaded per worker; the front half reserves
+        // `RECORD_BATCH_SIZE` (≥ the seeds one window can produce); the slot stays
+        // put (no in-place rehash) until finalize.
+        unsafe {
+            let base = (*rec.records.get()).as_mut_ptr();
+            let n = &mut *rec.n_seed.get();
+            base.add(*n).write((idx as u32, cell as *mut Self));
+            *n += 1;
+        }
+    }
 
-    /// Defer the update: record `(row, cell)` into the per-worker recorder;
-    /// [`finalize`](Self::finalize) replays it columnar.
+    /// Defer the update: record `(row, cell)` into the **back** half of the buffer;
+    /// [`finalize`](Self::finalize) folds it columnar after the seeds.
     #[inline(always)]
     fn record_update(
         _reader: &Self::Reader<'_>,
@@ -282,19 +306,22 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
         _cfg: &Self::MergeConfig,
         rec: &Self::Recorder,
     ) {
-        // SAFETY: single-threaded per worker; the buffer reserves `RECORD_BATCH_SIZE`
-        // (≥ the rows a window can produce), and `cell` points into a table slot that
-        // stays put (no in-place rehash) until finalize.
+        // SAFETY: single-threaded per worker; the back half reserves
+        // `RECORD_BATCH_SIZE` (≥ the updates one window can produce); the slot stays
+        // put (no in-place rehash) until finalize.
         unsafe {
             let base = (*rec.records.get()).as_mut_ptr();
-            let n = &mut *rec.n.get();
-            base.add(*n).write((idx as u32, cell as *mut Self));
+            let n = &mut *rec.n_update.get();
+            base.add(RECORD_BATCH_SIZE + *n).write((idx as u32, cell as *mut Self));
             *n += 1;
         }
     }
 
-    /// Replay the window's recorded updates **one column at a time**: dispatch on the
-    /// slot op once, then a tight loop folds every recorded row into its cell.
+    /// Replay the window's records **one column at a time**: dispatch on the slot op
+    /// once, then tight loops — first SET every recorded *seed* (materialise the real
+    /// value over the fake placeholder), then FOLD every recorded *update* into its
+    /// cell. Seeds precede updates here, so a key seeded and updated in the same
+    /// window lands correctly. Fully general over all ops.
     fn finalize(
         reader: &Self::Reader<'_>,
         arena: &mut WorkerArena,
@@ -303,18 +330,28 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
     ) {
         let (_, shared) = cfg;
         // SAFETY: single-threaded per worker; the recorded cell pointers are valid.
-        let updates =
-            unsafe { std::slice::from_raw_parts((*rec.records.get()).as_ptr(), *rec.n.get()) };
+        // Seeds occupy the front half; updates the back half (offset RECORD_BATCH_SIZE).
+        let base = unsafe { (*rec.records.get()).as_ptr() };
+        let seeds = unsafe { std::slice::from_raw_parts(base, *rec.n_seed.get()) };
+        let updates = unsafe {
+            std::slice::from_raw_parts(base.add(RECORD_BATCH_SIZE), *rec.n_update.get())
+        };
         #[allow(clippy::needless_range_loop)]
         for s in 0..N {
             match &reader.slots[s] {
                 BoundSlot::Count => {
+                    for &(_, cell) in seeds {
+                        unsafe { (*cell).cells[s] = Count::<A>::seed((), arena) };
+                    }
                     for &(_, cell) in updates {
                         let c = unsafe { (*cell).cells[s] };
                         unsafe { (*cell).cells[s] = Count::<A>::update(c, (), arena, &()) };
                     }
                 }
                 BoundSlot::Sum(r) => {
+                    for &(idx, cell) in seeds {
+                        unsafe { (*cell).cells[s] = Sum::<A>::seed(r.read(idx as usize), arena) };
+                    }
                     for &(idx, cell) in updates {
                         let c = unsafe { (*cell).cells[s] };
                         unsafe {
@@ -322,7 +359,10 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                         };
                     }
                 }
-                BoundSlot::Min(r) if !ONLY_ADDITIVE => {
+                BoundSlot::Min(r) => {
+                    for &(idx, cell) in seeds {
+                        unsafe { (*cell).cells[s] = Min::<A>::seed(r.read(idx as usize), arena) };
+                    }
                     for &(idx, cell) in updates {
                         let c = unsafe { (*cell).cells[s] };
                         unsafe {
@@ -330,7 +370,10 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                         };
                     }
                 }
-                BoundSlot::Max(r) if !ONLY_ADDITIVE => {
+                BoundSlot::Max(r) => {
+                    for &(idx, cell) in seeds {
+                        unsafe { (*cell).cells[s] = Max::<A>::seed(r.read(idx as usize), arena) };
+                    }
                     for &(idx, cell) in updates {
                         let c = unsafe { (*cell).cells[s] };
                         unsafe {
@@ -338,7 +381,12 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                         };
                     }
                 }
-                BoundSlot::StrMin(a) if !ONLY_ADDITIVE => {
+                BoundSlot::StrMin(a) => {
+                    for &(idx, cell) in seeds {
+                        unsafe {
+                            (*cell).cells[s] = StrMin::<A>::seed(StrRead::read(a, idx as usize), arena)
+                        };
+                    }
                     for &(idx, cell) in updates {
                         let c = unsafe { (*cell).cells[s] };
                         unsafe {
@@ -347,7 +395,12 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                         };
                     }
                 }
-                BoundSlot::StrMax(a) if !ONLY_ADDITIVE => {
+                BoundSlot::StrMax(a) => {
+                    for &(idx, cell) in seeds {
+                        unsafe {
+                            (*cell).cells[s] = StrMax::<A>::seed(StrRead::read(a, idx as usize), arena)
+                        };
+                    }
                     for &(idx, cell) in updates {
                         let c = unsafe { (*cell).cells[s] };
                         unsafe {
@@ -356,10 +409,12 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                         };
                     }
                 }
-                _ => unreachable!("non-additive slot under ONLY_ADDITIVE"),
             }
         }
-        unsafe { *rec.n.get() = 0 };
+        unsafe {
+            *rec.n_seed.get() = 0;
+            *rec.n_update.get() = 0;
+        }
     }
 
     #[inline(always)]
