@@ -129,10 +129,11 @@ impl CatalogTable {
     /// no manifest at all (a corrupt catalog). Returns whether it advanced;
     /// `Ok(false)` means this copy was already current.
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let manifest = TableManifest::load(self.store.as_ref(), &self.name)?;
-        if manifest.version <= self.manifest.version {
+        let Some(manifest) =
+            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
+        else {
             return Ok(false);
-        }
+        };
         self.manifest = manifest;
         self.sync_files_to_manifest()?;
         Ok(true)

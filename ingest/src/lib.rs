@@ -593,9 +593,9 @@ mod tests {
             .unwrap()
             .block_on(compacter.compact_all());
 
-        // One merged file replaced the three inputs, on disk and in the
-        // catalog, and indices stayed sequential.
-        assert_eq!(parquet_file_count(dir.path()), 1);
+        // The merge is a 3→1 swap in the catalog; the three inputs linger on
+        // disk as deferred-deletion orphans until their version is pruned.
+        assert_eq!(catalog.table_files("otel_logs").unwrap().len(), 1);
         let table = fresh_binding(&catalog, "otel_logs");
         let groups = table.parquet.row_groups();
         assert_eq!(groups.len(), 1);
@@ -608,11 +608,13 @@ mod tests {
                 .any(|f| f.path.as_str().contains("compacted"))
         );
 
-        // The merged file's contents round-trip through the engine's scan.
-        let reread = read_table(&dispatch, dir.path());
+        // The merged file's contents round-trip through the engine's scan. Read
+        // via the live catalog binding (the swapped-in merged file), not the raw
+        // directory — under deferred deletion the directory still holds the
+        // un-pruned input orphans.
         let batches = table_input(
             dispatch.dispatcher(),
-            &reread,
+            &table.parquet,
             Projection::all(NUM_LOG_COLUMNS),
             false,
         )
@@ -666,9 +668,10 @@ mod tests {
             .unwrap()
             .block_on(compacter.compact_all());
 
-        // The three merged into one file that still carries the "svc" partition
-        // tuple and has recomputed (non-empty) sort bounds.
-        assert_eq!(parquet_file_count(dir.path()), 1);
+        // The three merged into one file (a catalog swap; the inputs linger on
+        // disk until pruned) that still carries the "svc" partition tuple and
+        // has recomputed (non-empty) sort bounds.
+        assert_eq!(catalog.table_files("otel_logs").unwrap().len(), 1);
         let mut table = catalog.table_handle("otel_logs").unwrap();
         table.refresh().unwrap();
         let partitions = table.file_partitions();
@@ -757,7 +760,9 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".parquet"))
             .collect();
-        assert_eq!(on_disk, vec![files[0].path.as_str().to_string()]);
+        // Deferred deletion: the merged object is written to the store; the two
+        // inputs remain as orphans until their version is pruned.
+        assert!(on_disk.contains(&files[0].path.as_str().to_string()));
 
         let table = catalog.binding("events").unwrap();
         assert_eq!(
@@ -829,7 +834,9 @@ mod tests {
                 .iter()
                 .any(|f| f.path.as_str().contains("compacted"))
         );
-        assert_eq!(parquet_file_count(data_dir.path()), 1);
+        // Logical 3→1 swap; the inputs linger on disk until their version is
+        // pruned (deferred deletion).
+        assert_eq!(server_catalog.table_files("otel_logs").unwrap().len(), 1);
 
         dispatch.exit();
     }

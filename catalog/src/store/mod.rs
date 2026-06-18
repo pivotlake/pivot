@@ -150,6 +150,18 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// `prefix` it listed to read it.
     fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>>;
 
+    /// Like [`list`](Self::list), but only objects whose key is at or after
+    /// `start` (a lexicographic lower bound — a full key under `prefix`, e.g. the
+    /// caller's current version file). A backend with a server-side start offset
+    /// (GCS `startOffset`, S3 `start-after`) uses it to begin the scan at `start`
+    /// instead of the bottom of the prefix — crucial when the prefix has
+    /// accumulated many soft-deleted tombstones a full scan would wade through.
+    /// The default ignores `start` and returns a full `list` (a correct
+    /// superset); callers must filter the result themselves regardless.
+    fn list_from(&self, prefix: &ObjectPath, _start: &ObjectPath) -> Result<Vec<FileRef>> {
+        self.list(prefix)
+    }
+
     /// How the io_uring reader should fetch object `key`: a local backend yields
     /// a filesystem path, a remote one a presigned GET URL. (Identity — the
     /// [`FileRef`] — is the caller's; this is only how to read the bytes.)
