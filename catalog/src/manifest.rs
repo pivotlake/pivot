@@ -212,17 +212,17 @@ impl TableManifest {
             .filter(|&v| v < cutoff)
             .collect();
         for v in stale {
-            // Apply this version's deferred deletions first: the files it swapped
-            // out sit below the retention tail now, so no live reader references
-            // them. `delete` treats a missing key as success, so a re-run after a
-            // crash (the deletions record outlives a partial sweep) is harmless.
-            if let Some(bytes) = store.get(&Self::deletions_key(name, v))? {
-                let doc: PendingDeletions = serde_json::from_slice(&bytes)?;
-                for path in &doc.paths {
-                    store.delete(path)?;
-                }
-                store.delete(&Self::deletions_key(name, v))?;
-            }
+            // NOTE: we intentionally do NOT physically delete this version's
+            // swapped-out data files here. Under heavy compaction the version
+            // *listing* (eventually-consistent) can leave a query's resolved
+            // snapshot lagging far behind the prune cutoff; deleting its files
+            // 404s the in-flight scan. Leaving the files as orphans lets that scan
+            // read a valid (if slightly stale) snapshot instead — correct snapshot
+            // isolation. Orphans are reclaimed by a separate consistency-aware GC
+            // (compare live objects against every retained manifest), not here.
+            // We still drop the deletions record and the version manifest so the
+            // metadata directory stays small and `list` stays cheap.
+            store.delete(&Self::deletions_key(name, v))?;
             store.delete(&Self::key(name, v))?;
         }
         Ok(())
@@ -363,11 +363,12 @@ mod tests {
         );
     }
 
-    /// Pruning a version applies its recorded deferred deletions: the swapped-out
-    /// data files (and the deletions record) are removed once that version falls
-    /// below the retention cutoff.
+    /// Pruning a version drops its manifest and its deletions record, but does
+    /// NOT physically delete the swapped-out data files — they're left as orphans
+    /// so a query snapshot lagging behind the cutoff reads valid files instead of
+    /// a 404. (A separate consistency-aware GC reclaims true orphans.)
     #[test]
-    fn pruning_a_version_applies_its_deferred_deletions() {
+    fn pruning_drops_metadata_but_keeps_data_files() {
         let dir = TempDir::new().unwrap();
         let store = LocalStore::new(dir.path());
         let latest = VERSIONS_RETAINED + 22;
@@ -381,36 +382,19 @@ mod tests {
         TableManifest::prune_old_versions(&store, "t", latest).unwrap();
 
         assert!(
-            store.get(&data).unwrap().is_none(),
-            "version 5 is below the cutoff, so its deferred-deleted file is gone"
+            store.get(&data).unwrap().is_some(),
+            "the swapped-out data file is kept (orphaned), not deleted"
         );
         assert!(
             store
                 .get(&TableManifest::deletions_key("t", 5))
                 .unwrap()
                 .is_none(),
-            "the deletions record is cleaned up too"
+            "the deletions record is pruned"
         );
-    }
-
-    /// A file recorded for deletion is NOT removed while its version is still
-    /// within the retained tail — a reader could still be on an older version.
-    #[test]
-    fn deferred_deletions_wait_until_their_version_is_pruned() {
-        let dir = TempDir::new().unwrap();
-        let store = LocalStore::new(dir.path());
-        for v in FIRST_VERSION..=3 {
-            manifest(v).commit(&store, "t").unwrap();
-        }
-        let data = ObjectPath::new("data/recent.parquet");
-        store.put(&data, b"rows").unwrap();
-        TableManifest::record_deletions(&store, "t", 3, std::slice::from_ref(&data)).unwrap();
-
-        TableManifest::prune_old_versions(&store, "t", 3).unwrap();
-
         assert!(
-            store.get(&data).unwrap().is_some(),
-            "version 3 is within the retained tail, so the file must survive"
+            store.get(&TableManifest::key("t", 5)).unwrap().is_none(),
+            "the version manifest is pruned"
         );
     }
 }
