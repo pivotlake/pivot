@@ -256,6 +256,23 @@ impl CatalogTable {
         Ok(())
     }
 
+    /// Record the just-swapped-out `removed` inputs (paths as they appear in the
+    /// manifest) for *deferred* deletion at this table's current manifest version.
+    /// Their objects are deleted only when that version is pruned
+    /// ([`prune_old_versions`](Self::prune_old_versions)) — so a query still
+    /// reading the prior version never has a file deleted out from under it.
+    pub fn record_deletions(&self, removed: &[ObjectPath]) -> crate::Result<()> {
+        let resolved: Vec<ObjectPath> =
+            removed.iter().map(|p| self.location.resolve(p)).collect();
+        TableManifest::record_deletions(
+            self.store.as_ref(),
+            &self.name,
+            self.manifest.version,
+            &resolved,
+        )?;
+        Ok(())
+    }
+
     /// Reconcile `files` to the current `manifest`: drop the files no longer in
     /// it, then fetch and append the ones not yet held.
     fn sync_files_to_manifest(&mut self) -> crate::Result<()> {

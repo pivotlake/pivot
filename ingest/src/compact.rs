@@ -311,10 +311,13 @@ impl CompactJob {
             }
             return Ok(Vec::new());
         }
-        for input in &inputs {
-            if let Err(e) = table.delete_data_file(&input.path) {
-                warn!(error = %e, file = %input.path, "compaction: deleting merged-away input failed (orphan left)");
-            }
+        // Don't delete the swapped-out inputs now: a query that loaded the prior
+        // manifest version is still reading them (that's the `404 expected 206`
+        // a reader hits when compaction deletes under it). Record them instead —
+        // they're deleted when this version is pruned, by which point the
+        // retention tail guarantees no reader still references them.
+        if let Err(e) = table.record_deletions(&removed) {
+            warn!(error = %e, "compaction: recording deferred deletions failed (inputs will linger as orphans)");
         }
         Ok(added.into_iter().map(|entry| entry.file).collect())
     }
