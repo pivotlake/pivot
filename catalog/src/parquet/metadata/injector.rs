@@ -42,7 +42,16 @@ impl Receiver<DataFile> for FileInjector {
     }
 
     fn try_recv(&self) -> Option<DataFile> {
-        None
+        // Drive footer loading from the eager `run_cpu_work` path (which calls
+        // `try_recv`), not only the worker's idle `steal` path — otherwise each
+        // worker fetches one footer at a time and a large catch-up (many new
+        // files committed since the last query) serialises into ~1s. A single
+        // non-spinning attempt keeps the hot loop from spinning on `Steal::Retry`;
+        // the next iteration retries. Mirrors the `RowGroupInjector` fix.
+        match self.files.steal() {
+            Steal::Success(file) => Some(file),
+            Steal::Empty | Steal::Retry => None,
+        }
     }
 
     fn steal(&self) -> Option<DataFile> {
