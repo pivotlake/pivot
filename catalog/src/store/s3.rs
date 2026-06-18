@@ -240,7 +240,11 @@ impl ObjectStore for S3Store {
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
-        Ok(DataFileSource::Remote(self.presign_get(key)?))
+        // S3 presigns the URL: auth rides in the query string, no per-request header.
+        Ok(DataFileSource::Remote {
+            url: self.presign_get(key)?,
+            auth: None,
+        })
     }
 }
 

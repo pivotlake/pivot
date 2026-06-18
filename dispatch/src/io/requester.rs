@@ -462,7 +462,7 @@ mod tests {
         let port = spawn_server(2);
 
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
-        let remote = Arc::new(RemoteFile::open(url).unwrap());
+        let remote = Arc::new(RemoteFile::open(url, None).unwrap());
         let loc = FileLocation::Remote(remote);
         memory_ctx().file_cache().open_entry(loc.clone());
 
@@ -484,7 +484,7 @@ mod tests {
         let port = spawn_stale_pool_server();
 
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
-        let remote = Arc::new(RemoteFile::open(url).unwrap());
+        let remote = Arc::new(RemoteFile::open(url, None).unwrap());
         let loc = FileLocation::Remote(remote);
         memory_ctx().file_cache().open_entry(loc.clone());
 
