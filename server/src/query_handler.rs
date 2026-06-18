@@ -21,9 +21,8 @@
 //! [`dispatch::CancelToken::cancel`] on the running dataflow.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::arrow_to_pgwire::PGRowBatch;
 use async_trait::async_trait;
@@ -51,25 +50,6 @@ thread_local! {
     /// catalog is process-global so it's safe to share the same planner
     /// across connections that land on the same thread.
     static PLANNER: RefCell<Option<planner::Planner>> = const { RefCell::new(None) };
-}
-
-/// Whether a planned query is a read-only (SELECT) plan whose `Plan` is safe to
-/// cache. Identified *positively* from the plan's root operator: only the
-/// read-only operators are cacheable, so any statement we don't explicitly
-/// allow — `CreateTable` today, or any operator variant added later — defaults
-/// to not-cached (and flushes the cache, since it may change the schema cached
-/// plans were built against).
-fn plan_is_cacheable(plan: &planner::Plan) -> bool {
-    use planner::Operator;
-    matches!(
-        plan.root.operator,
-        Operator::Input(_)
-            | Operator::Projection(_)
-            | Operator::Filter(_)
-            | Operator::Aggregate(_)
-            | Operator::OrderBy(_)
-            | Operator::TopN(_)
-    )
 }
 
 fn with_planner<R>(
@@ -144,14 +124,6 @@ impl Drop for CancelOnDrop {
 pub struct PivotQueryHandler {
     catalog: Arc<dyn planner::catalog::Catalog>,
     dispatcher: dispatch::DataFlowDispatcher,
-    /// Cache of planned (but not yet compiled) query plans, keyed by SQL text.
-    /// Planning a statement (DuckDB optimize + bridge round-trip + plan
-    /// translation) is a fixed few-millisecond cost paid on every query — a
-    /// large fraction of a small query's latency. Repeated SELECTs (the common
-    /// case for dashboards/benchmarks) reuse the cached `Plan` and only re-run
-    /// the cheap `compile` + execute. Shared across connections; only SELECTs
-    /// are cached and any non-SELECT statement flushes it (see `run_query`).
-    plan_cache: Arc<Mutex<HashMap<String, Arc<planner::Plan>>>>,
 }
 
 impl PivotQueryHandler {
@@ -162,7 +134,6 @@ impl PivotQueryHandler {
         Self {
             catalog,
             dispatcher,
-            plan_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -170,34 +141,20 @@ impl PivotQueryHandler {
         let dispatcher = self.dispatcher.clone();
         let query = query.to_string();
 
-        // Reuse a cached plan if we've planned this exact SQL before. Only
-        // read-only SELECT plans are ever inserted, so a cache hit is always a
-        // SELECT regardless of what `query` is. Planning is a fixed few-ms cost;
-        // skipping it on repeated SELECTs shaves that off every query after the
-        // first.
-        let cached = self.plan_cache.lock().unwrap().get(&query).cloned();
-        let plan = match cached {
-            Some(plan) => plan,
-            None => {
-                let catalog = self.catalog.clone();
-                let q = query.clone();
-                let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
-                    with_planner(&catalog, |planner| Ok(Arc::new(planner.plan(&q)?)))
-                })
-                .await
-                .map_err(Error::PlannerPanic)??;
-                // Cache SELECTs; treat anything else (DDL/DML/…) as a cache
-                // flush — it may invalidate the schema cached plans were built
-                // against — and don't cache it.
-                let mut cache = self.plan_cache.lock().unwrap();
-                if plan_is_cacheable(&plan) {
-                    cache.insert(query.clone(), plan.clone());
-                } else {
-                    cache.clear();
-                }
-                plan
-            }
-        };
+        // Plan every query freshly — never cache the plan. A plan bakes in the
+        // table's current file list, resolved during DuckDB binding via
+        // `catalog.table()` (which `refresh()`es to the latest manifest). Caching
+        // a plan would freeze that binding: repeated SELECTs would silently serve
+        // an old snapshot (never seeing newly-ingested rows) and would read files
+        // compaction has since swapped away. Planning is a fixed few-ms cost — a
+        // worthwhile price for always querying the current data.
+        let catalog = self.catalog.clone();
+        let q = query.clone();
+        let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
+            with_planner(&catalog, |planner| Ok(Arc::new(planner.plan(&q)?)))
+        })
+        .await
+        .map_err(Error::PlannerPanic)??;
 
         // Compile the (possibly cached) plan into a fresh dataflow and launch
         // it. `compile` is pure pivot work (no DuckDB), so it runs on any
