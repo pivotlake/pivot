@@ -12,6 +12,7 @@
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
+use dispatch::io::AuthHeader;
 use std::fmt::Debug;
 use std::path::PathBuf;
 
@@ -84,13 +85,31 @@ pub struct DataFile {
 }
 
 /// Where a data file's bytes live: a local filesystem path (read via the
-/// io_uring file path) or a concrete — already presigned — URL (read via HTTP
-/// range requests on the same ring). Which variant a store yields is entirely
-/// its business, not the caller's.
-#[derive(Clone, Debug)]
+/// io_uring file path) or a remote URL (read via HTTP range requests on the same
+/// ring). A remote URL either carries its own auth (an S3 presigned URL, `auth:
+/// None`) or pairs a stable URL with an [`AuthHeader`] that mints a fresh bearer
+/// token per request (GCS). Which variant a store yields is entirely its
+/// business, not the caller's.
+#[derive(Clone)]
 pub enum DataFileSource {
     Local(PathBuf),
-    Remote(url::Url),
+    Remote {
+        url: url::Url,
+        auth: Option<AuthHeader>,
+    },
+}
+
+impl Debug for DataFileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(path) => f.debug_tuple("Local").field(path).finish(),
+            Self::Remote { url, auth } => f
+                .debug_struct("Remote")
+                .field("url", url)
+                .field("auth", &auth.is_some())
+                .finish(),
+        }
+    }
 }
 
 impl DataFile {
@@ -107,15 +126,15 @@ impl DataFile {
         }
     }
 
-    /// A data file at a concrete (already-presigned) remote URL; its [`FileRef`]
-    /// path is the URL's path component.
+    /// A data file at a self-authenticating remote URL (no per-request auth); its
+    /// [`FileRef`] path is the URL's path component.
     pub fn remote(url: url::Url, size: u64) -> Self {
         Self {
             file: FileRef {
                 path: ObjectPath::new(url.path()),
                 size,
             },
-            source: DataFileSource::Remote(url),
+            source: DataFileSource::Remote { url, auth: None },
         }
     }
 }
@@ -163,8 +182,9 @@ pub trait ObjectStore: Debug + Send + Sync {
     }
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
-    /// a filesystem path, a remote one a presigned GET URL. (Identity — the
-    /// [`FileRef`] — is the caller's; this is only how to read the bytes.)
+    /// a filesystem path, a remote one a GET URL — either presigned or paired
+    /// with a per-request bearer token. (Identity — the [`FileRef`] — is the
+    /// caller's; this is only how to read the bytes.)
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource>;
 }
 

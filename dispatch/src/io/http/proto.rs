@@ -26,13 +26,23 @@ pub enum ProtoError {
 ///
 /// `Connection: keep-alive` so the connection can be returned to the pool, and
 /// `Accept-Encoding: identity` so the body length matches the requested range
-/// exactly (no transfer/content encoding to undo).
-pub fn build_range_get(host: &str, target: &str, offset: u64, len: usize) -> Vec<u8> {
+/// exactly (no transfer/content encoding to undo). `auth`, when present, is the
+/// `Authorization` header value (e.g. `Bearer <token>`) for a store that
+/// authenticates each request rather than signing the URL.
+pub fn build_range_get(
+    host: &str,
+    target: &str,
+    offset: u64,
+    len: usize,
+    auth: Option<&str>,
+) -> Vec<u8> {
     let end = offset + len as u64 - 1;
+    let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
     format!(
         "GET {target} HTTP/1.1\r\n\
          Host: {host}\r\n\
          Range: bytes={offset}-{end}\r\n\
+         {auth}\
          Accept-Encoding: identity\r\n\
          Connection: keep-alive\r\n\
          User-Agent: pivotdb-dispatch/0.1\r\n\
@@ -100,13 +110,21 @@ mod tests {
 
     #[test]
     fn range_get_has_expected_request_line_and_headers() {
-        let req = build_range_get("example.com", "/data.parquet", 4096, 8192);
+        let req = build_range_get("example.com", "/data.parquet", 4096, 8192, None);
         let text = String::from_utf8(req).unwrap();
         assert!(text.starts_with("GET /data.parquet HTTP/1.1\r\n"));
         assert!(text.contains("Host: example.com\r\n"));
         // [4096, 4096+8192) -> bytes=4096-12287
         assert!(text.contains("Range: bytes=4096-12287\r\n"));
+        assert!(!text.contains("Authorization"));
         assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn range_get_emits_authorization_when_present() {
+        let req = build_range_get("example.com", "/data.parquet", 0, 1, Some("Bearer tok"));
+        let text = String::from_utf8(req).unwrap();
+        assert!(text.contains("Authorization: Bearer tok\r\n"));
     }
 
     #[test]

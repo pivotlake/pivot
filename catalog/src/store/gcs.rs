@@ -1,17 +1,26 @@
 //! Google Cloud Storage backend: blocking HTTP via [`ureq`] over the GCS JSON
-//! API, authenticated with an OAuth2 bearer token.
+//! API, authenticated with an OAuth2 bearer token — for both the control-plane
+//! metadata ops here *and* the io_uring range reads, which carry a fresh
+//! `Authorization: Bearer` header rather than a presigned URL (presigned URLs
+//! expire after an hour, stranding files cached across queries).
 //!
 //! The token is minted (and cached until shortly before expiry) from, in order:
 //! `GOOGLE_APPLICATION_CREDENTIALS` pointing at a **service-account** key (a
 //! self-signed RS256 JWT exchanged for an access token) or an **authorized_user**
 //! file (refresh-token grant), else the **GCE metadata server** (workload
-//! identity on Google compute). RS256 signing uses `ring`; everything is
-//! synchronous, no async runtime.
+//! identity on Google compute). Minting is a blocking `ureq` call kept off the
+//! ring: it happens on the control thread (every query primes the token via
+//! [`source`](GcsStore::source)), so a worker only ever *reads* a current token.
+//! RS256 signing uses `ring`; everything is synchronous, no async runtime.
 
 use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use base64::Engine;
-use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Re-mint a token once it's within this many seconds of expiry. Generous so a
+/// token primed at query start stays valid for the whole query's worker reads.
+const TOKEN_REFRESH_MARGIN: u64 = 300;
 
 const TOKEN_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const OAUTH_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
@@ -26,20 +35,32 @@ const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 pub struct GcsStore {
     bucket: String,
     prefix: String,
-    agent: ureq::Agent,
-    token: Mutex<Option<CachedToken>>,
     /// JSON API origin (scheme + host[:port], no trailing slash). The real
     /// service by default; an emulator when `STORAGE_EMULATOR_HOST` is set.
     endpoint: String,
-    /// Whether `endpoint` is an emulator: it ignores credentials, so we skip
-    /// minting OAuth tokens and hand the ring a plain media URL (an emulator has
-    /// no signing keys to presign with).
+    /// Shared token state. An `Arc` so [`source`](Self::source) can hand workers
+    /// a closure that reads the same cell this store re-mints.
+    auth: Arc<GcsAuth>,
+}
+
+/// Shared OAuth2 token state. The token outlives any one query and is identical
+/// for every file and worker, so a single cell is shared store-wide. Reads (the
+/// worker hot path) take the `RwLock` for read and never block each other; only
+/// a rare re-mint takes it for write — and the blocking mint itself runs
+/// *outside* the lock, so workers never stall behind a network round-trip.
+#[derive(Debug)]
+struct GcsAuth {
+    agent: ureq::Agent,
+    token: RwLock<Option<CachedToken>>,
+    /// Whether the endpoint is an emulator: it ignores credentials, so we never
+    /// mint a token and reads need no `Authorization` header.
     emulated: bool,
 }
 
 #[derive(Debug, Clone)]
 struct CachedToken {
-    value: String,
+    /// The full header value (`Bearer <token>`), ready to send as-is.
+    header: Arc<str>,
     /// Unix seconds after which the token must be re-minted.
     expires_at: u64,
 }
@@ -68,38 +89,56 @@ impl GcsStore {
         Ok(Self {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
-            agent: ureq::AgentBuilder::new().build(),
-            token: Mutex::new(None),
             endpoint,
-            emulated,
+            auth: Arc::new(GcsAuth {
+                agent: ureq::AgentBuilder::new().build(),
+                token: RwLock::new(None),
+                emulated,
+            }),
         })
     }
 
-    /// A valid bearer token, minting and caching a fresh one when needed.
-    fn bearer(&self) -> Result<String> {
-        // An emulator ignores `Authorization`; never try to mint a real token
-        // (there are no credentials in a test environment).
+    /// `storage.googleapis.com` object path for a catalog-relative key.
+    fn object_path(&self, key: &ObjectPath) -> String {
+        percent_encode(&object_key(&self.prefix, key))
+    }
+}
+
+impl GcsAuth {
+    /// A current `Authorization` header, minting and caching a fresh token when
+    /// the cached one is missing or near expiry. Blocking (`ureq`); call only on
+    /// the control thread — workers use [`current`](Self::current) instead.
+    fn header(&self) -> Result<Arc<str>> {
+        // An emulator ignores `Authorization`; never mint (no credentials exist).
         if self.emulated {
-            return Ok("emulator".to_string());
+            return Ok(Arc::from("Bearer emulator"));
         }
         let now = unix_now();
+        if let Some(tok) = self.token.read().unwrap().as_ref()
+            && tok.expires_at > now + TOKEN_REFRESH_MARGIN
         {
-            let cache = self.token.lock().unwrap();
-            if let Some(tok) = cache.as_ref() {
-                // 60s safety margin so an in-flight request never uses a token
-                // that expires mid-flight.
-                if tok.expires_at > now + 60 {
-                    return Ok(tok.value.clone());
-                }
-            }
+            return Ok(tok.header.clone());
         }
+        // Mint without holding the lock — a concurrent mint is harmless (last
+        // writer wins) and this way a worker's `current` read never waits on the
+        // network round-trip.
         let (value, expires_in) = self.mint_token()?;
-        let token = CachedToken {
-            value: value.clone(),
+        let header: Arc<str> = Arc::from(format!("Bearer {value}"));
+        *self.token.write().unwrap() = Some(CachedToken {
+            header: header.clone(),
             expires_at: now + expires_in,
-        };
-        *self.token.lock().unwrap() = Some(token);
-        Ok(value)
+        });
+        Ok(header)
+    }
+
+    /// The currently cached header, or `None` if none is cached yet. Lock-free
+    /// read-only fast path for workers — never mints, never blocks.
+    fn current(&self) -> Option<Arc<str>> {
+        self.token
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|t| t.header.clone())
     }
 
     /// Mint a fresh access token, returning `(token, lifetime_seconds)`.
@@ -187,16 +226,11 @@ impl GcsStore {
             })?;
         parse_token_response(resp)
     }
-
-    /// `storage.googleapis.com` object path for a catalog-relative key.
-    fn object_path(&self, key: &ObjectPath) -> String {
-        percent_encode(&object_key(&self.prefix, key))
-    }
 }
 
 impl ObjectStore for GcsStore {
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
-        let token = self.bearer()?;
+        let header = self.auth.header()?;
         let url = format!(
             "{}/storage/v1/b/{}/o/{}?alt=media",
             self.endpoint,
@@ -204,9 +238,10 @@ impl ObjectStore for GcsStore {
             self.object_path(key)
         );
         match self
+            .auth
             .agent
             .get(&url)
-            .set("Authorization", &format!("Bearer {token}"))
+            .set("Authorization", &header)
             .call()
         {
             Ok(resp) => {
@@ -226,7 +261,7 @@ impl ObjectStore for GcsStore {
     }
 
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
-        let token = self.bearer()?;
+        let header = self.auth.header()?;
         let url = format!(
             "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
             self.endpoint,
@@ -234,9 +269,10 @@ impl ObjectStore for GcsStore {
             self.object_path(key)
         );
         match self
+            .auth
             .agent
             .post(&url)
-            .set("Authorization", &format!("Bearer {token}"))
+            .set("Authorization", &header)
             .set("Content-Type", "application/octet-stream")
             .send_bytes(data)
         {
@@ -246,7 +282,7 @@ impl ObjectStore for GcsStore {
     }
 
     fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
-        let token = self.bearer()?;
+        let header = self.auth.header()?;
         // GCS conditional create: `ifGenerationMatch=0` only succeeds when no
         // live generation of the object exists; otherwise 412.
         let url = format!(
@@ -256,9 +292,10 @@ impl ObjectStore for GcsStore {
             self.object_path(key)
         );
         match self
+            .auth
             .agent
             .post(&url)
-            .set("Authorization", &format!("Bearer {token}"))
+            .set("Authorization", &header)
             .set("Content-Type", "application/octet-stream")
             .send_bytes(data)
         {
@@ -269,7 +306,7 @@ impl ObjectStore for GcsStore {
     }
 
     fn delete(&self, key: &ObjectPath) -> Result<()> {
-        let token = self.bearer()?;
+        let header = self.auth.header()?;
         let url = format!(
             "{}/storage/v1/b/{}/o/{}",
             self.endpoint,
@@ -277,9 +314,10 @@ impl ObjectStore for GcsStore {
             self.object_path(key)
         );
         match self
+            .auth
             .agent
             .delete(&url)
-            .set("Authorization", &format!("Bearer {token}"))
+            .set("Authorization", &header)
             .call()
         {
             // DELETE is idempotent; a missing key is the goal state.
@@ -297,21 +335,31 @@ impl ObjectStore for GcsStore {
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
-        if self.emulated {
-            // An emulator can't presign (no signing key) but also needs no auth:
-            // its media endpoint serves the bytes — honoring `Range` — straight
-            // to the ring.
-            let url = format!(
-                "{}/storage/v1/b/{}/o/{}?alt=media",
-                self.endpoint,
-                self.bucket,
-                self.object_path(key)
-            );
-            return url::Url::parse(&url)
-                .map(DataFileSource::Remote)
-                .map_err(|e| StoreError::Config(format!("building emulator media url: {e}")));
+        // The same media URL the JSON API serves for `get`, but range-read
+        // straight off the ring. Unlike a presigned URL it's stable (no embedded
+        // signature to expire) — auth rides in a per-request `Authorization`
+        // header instead, so a file cached across queries never goes stale.
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}?alt=media",
+            self.endpoint,
+            self.bucket,
+            self.object_path(key)
+        );
+        let url = url::Url::parse(&url)
+            .map_err(|e| StoreError::Config(format!("building gcs media url: {e}")))?;
+
+        // An emulator ignores `Authorization`, so its reads need no header.
+        if self.auth.emulated {
+            return Ok(DataFileSource::Remote { url, auth: None });
         }
-        Ok(DataFileSource::Remote(self.presign_get(key)?))
+        // Prime the token here on the control thread (a blocking mint is fine off
+        // the ring) so the query's worker reads find a fresh one and never mint.
+        self.auth.header()?;
+        let auth = self.auth.clone();
+        Ok(DataFileSource::Remote {
+            url,
+            auth: Some(Arc::new(move || auth.current())),
+        })
     }
 }
 
@@ -320,7 +368,7 @@ impl GcsStore {
     /// `start` (`startOffset`) so the scan skips everything lexicographically
     /// below it.
     fn list_impl(&self, prefix: &ObjectPath, start: Option<&ObjectPath>) -> Result<Vec<FileRef>> {
-        let token = self.bearer()?;
+        let header = self.auth.header()?;
         let object_prefix = object_key(&self.prefix, prefix);
         let mut url = format!(
             "{}/storage/v1/b/{}/o?prefix={}%2F&delimiter=%2F",
@@ -333,9 +381,10 @@ impl GcsStore {
             url.push_str(&percent_encode(&object_key(&self.prefix, start)));
         }
         let resp = self
+            .auth
             .agent
             .get(&url)
-            .set("Authorization", &format!("Bearer {token}"))
+            .set("Authorization", &header)
             .call()
             .map_err(|e| StoreError::Http(format!("GCS LIST {object_prefix}: {e}")))?;
         let body: ListResponse = resp
@@ -357,113 +406,6 @@ impl GcsStore {
             })
             .collect()
     }
-
-    /// A time-limited GET URL for `key`, V4-signed in the query string so the
-    /// io_uring HTTP reader can range-read it with no auth headers.
-    fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {
-        // V4 signed URLs require RSA signing with a service-account private key;
-        // the metadata-server / authorized-user token flows can't presign.
-        let cred_path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").map_err(|_| {
-            StoreError::Config(
-                "GCS presigning needs a service-account key in \
-                 GOOGLE_APPLICATION_CREDENTIALS"
-                    .to_string(),
-            )
-        })?;
-        let bytes = std::fs::read(&cred_path).map_err(|source| StoreError::Io {
-            key: cred_path.clone(),
-            source,
-        })?;
-        let creds: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| StoreError::Config(format!("parsing {cred_path}: {e}")))?;
-        if creds.get("type").and_then(|t| t.as_str()) != Some("service_account") {
-            return Err(StoreError::Config(
-                "GCS presigning needs a service_account key (other credential \
-                 types can't sign URLs)"
-                    .to_string(),
-            ));
-        }
-        let client_email = field(&creds, "client_email")?;
-        let private_key = field(&creds, "private_key")?;
-
-        let object = object_key(&self.prefix, key);
-        let canonical_uri = format!("/{}/{}", self.bucket, encode_path(&object));
-        let (date, datetime) = goog_v4_timestamp();
-        let scope = format!("{date}/auto/storage/goog4_request");
-        let credential = format!("{client_email}/{scope}");
-
-        // Canonical query: the X-Goog-* params, percent-encoded and sorted by key
-        // (these five are already in sorted order).
-        let canonical_query = [
-            ("X-Goog-Algorithm", "GOOG4-RSA-SHA256".to_string()),
-            ("X-Goog-Credential", percent_encode(&credential)),
-            ("X-Goog-Date", datetime.clone()),
-            ("X-Goog-Expires", "3600".to_string()),
-            ("X-Goog-SignedHeaders", "host".to_string()),
-        ]
-        .map(|(k, v)| format!("{k}={v}"))
-        .join("&");
-
-        let canonical_request = format!(
-            "GET\n{canonical_uri}\n{canonical_query}\nhost:storage.googleapis.com\n\nhost\nUNSIGNED-PAYLOAD"
-        );
-        let hashed =
-            hex(ring::digest::digest(&ring::digest::SHA256, canonical_request.as_bytes()).as_ref());
-        let string_to_sign = format!("GOOG4-RSA-SHA256\n{datetime}\n{scope}\n{hashed}");
-        let signature = hex(&rs256_sign(&private_key, string_to_sign.as_bytes())?);
-
-        let url = format!(
-            "https://storage.googleapis.com{canonical_uri}?{canonical_query}&X-Goog-Signature={signature}"
-        );
-        url::Url::parse(&url).map_err(|e| StoreError::Config(format!("building signed url: {e}")))
-    }
-}
-
-/// Percent-encode an object name for a URL *path*, preserving the `/`
-/// separators between segments.
-fn encode_path(object: &str) -> String {
-    object
-        .split('/')
-        .map(percent_encode)
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// Lowercase hex encoding.
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-/// Current UTC time as GCS V4 expects it: `(YYYYMMDD, YYYYMMDDTHHMMSSZ)`.
-fn goog_v4_timestamp() -> (String, String) {
-    let secs = unix_now();
-    let days = (secs / 86_400) as i64;
-    let tod = secs % 86_400;
-    let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    let (y, mo, d) = civil_from_days(days);
-    (
-        format!("{y:04}{mo:02}{d:02}"),
-        format!("{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z"),
-    )
-}
-
-/// Convert a count of days since the Unix epoch to a civil `(year, month, day)`
-/// (Howard Hinnant's algorithm). Valid for all dates we'll ever stamp.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[derive(serde::Deserialize)]
@@ -588,5 +530,44 @@ mod tests {
                 ("db/events/b.parquet".to_string(), 4096),
             ]
         );
+    }
+
+    fn auth(emulated: bool, token: Option<CachedToken>) -> GcsAuth {
+        GcsAuth {
+            agent: ureq::AgentBuilder::new().build(),
+            token: RwLock::new(token),
+            emulated,
+        }
+    }
+
+    #[test]
+    fn emulated_auth_never_mints() {
+        let auth = auth(true, None);
+
+        let header = auth.header().unwrap();
+
+        // No credentials in a test env; an emulator ignores `Authorization`.
+        assert_eq!(&*header, "Bearer emulator");
+    }
+
+    #[test]
+    fn current_reads_cached_header_without_minting() {
+        let cached = CachedToken {
+            header: Arc::from("Bearer abc"),
+            expires_at: u64::MAX,
+        };
+        let auth = auth(false, Some(cached));
+
+        // Worker hot path: a plain read of the cell, no network.
+        assert_eq!(auth.current().as_deref(), Some("Bearer abc"));
+        // A still-valid token short-circuits the (blocking) mint too.
+        assert_eq!(&*auth.header().unwrap(), "Bearer abc");
+    }
+
+    #[test]
+    fn current_is_none_before_any_token_is_minted() {
+        let auth = auth(false, None);
+
+        assert!(auth.current().is_none());
     }
 }
