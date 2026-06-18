@@ -23,8 +23,13 @@ use planner::types::Type;
 /// metadata-fetch dataflow) when the table is defined.
 fn dispatcher() -> DataFlowDispatcher {
     static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
+    // The file cache is process-global and accumulates a resident region per
+    // distinct file scanned across the whole binary; with `PANIC_ON_EVICT` on
+    // (the test default), running out of ring slots panics instead of evicting.
+    // Size it well above the suite's distinct-file count so adding tests doesn't
+    // tip a later one over.
     DISPATCH
-        .get_or_init(|| Dispatch::spin_up(1, 32))
+        .get_or_init(|| Dispatch::spin_up(1, 128))
         .dispatcher()
         .clone()
 }
@@ -157,7 +162,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
     // No path: the table lives under the (in-memory) database root with no data.
     create_table(&catalog, req).unwrap();
     let table = catalog.binding("t").unwrap();
-    assert!(table.parquet.row_groups().is_empty());
+    assert!(table.current_parquet().row_groups().is_empty());
 }
 
 #[test]
@@ -173,7 +178,7 @@ fn create_table_over_a_missing_path_yields_an_empty_table() {
         catalog
             .binding("t")
             .unwrap()
-            .parquet
+            .current_parquet()
             .row_groups()
             .is_empty()
     );
@@ -358,10 +363,10 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
         .unwrap()
 }
 
-/// Resolve `name` through the planner trait — what a query does on bind — so the
-/// catalog refreshes its in-memory copy from the latest committed manifest.
+/// Refresh `name` to the latest committed manifest — what `Plan::compile` does
+/// once per referenced table before any scan reads its files.
 fn resolve(catalog: &ParquetCatalog, name: &str) {
-    let _ = PlannerCatalog::table(catalog, name);
+    PlannerCatalog::refresh(catalog, name).unwrap();
 }
 
 /// A file appended after `CREATE TABLE` becomes visible to new binds, with
@@ -371,14 +376,15 @@ fn append_data_file_makes_new_file_visible_to_new_binds() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
+    assert_eq!(catalog.binding("t").unwrap().current_parquet().row_groups().len(), 3);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
     append(&catalog, "t", &new_file);
 
     resolve(&catalog, "t");
     let table = catalog.binding("t").unwrap();
-    let groups = table.parquet.row_groups();
+    let parquet = table.current_parquet();
+    let groups = parquet.row_groups();
     assert_eq!(groups.len(), 4);
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
 }
@@ -398,7 +404,7 @@ fn append_data_file_is_idempotent_per_path() {
     append(&catalog, "t", &new_file);
 
     resolve(&catalog, "t");
-    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
+    assert_eq!(catalog.binding("t").unwrap().current_parquet().row_groups().len(), 4);
 }
 
 /// No table yet (ingest runs before `CREATE TABLE`): there is no handle to
@@ -421,7 +427,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let extra = write_ids(dir.path(), "extra.parquet", &[40]);
     append(&catalog, "t", &extra);
     resolve(&catalog, "t");
-    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
+    assert_eq!(catalog.binding("t").unwrap().current_parquet().row_groups().len(), 4);
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
@@ -457,13 +463,52 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
     resolve(&catalog, "t");
     let table = catalog.binding("t").unwrap();
-    let groups = table.parquet.row_groups();
+    let parquet = table.current_parquet();
+    let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].num_rows, 4);
 }
 
+/// A binding is a *live handle*: one captured before data is committed scans the
+/// new files after a refresh, with no re-resolve and no rebind. This is exactly
+/// what lets a reused (cached) plan see data committed since it was planned.
+#[test]
+fn live_binding_sees_committed_files_after_refresh() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    let cached = catalog.binding("t").unwrap();
+    assert_eq!(cached.current_parquet().row_groups().len(), 3);
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
+    append(&catalog, "t", &new_file);
+    PlannerCatalog::refresh(&*catalog, "t").unwrap();
+
+    assert_eq!(cached.current_parquet().row_groups().len(), 4);
+}
+
+/// A live binding keeps its pushed-down predicates across a refresh: pruning
+/// applies to the latest files, not a frozen snapshot.
+#[test]
+fn live_binding_prunes_latest_files_with_pushed_predicate() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    let mut cached = catalog.binding("t").unwrap();
+    cached
+        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .unwrap();
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
+    append(&catalog, "t", &new_file);
+    PlannerCatalog::refresh(&*catalog, "t").unwrap();
+
+    // `id = 20` still prunes to the single matching row group, over the 4 files.
+    assert_eq!(row_group_count(&cached), 1);
+}
+
 /// A second catalog over the same persisted root sees another instance's
-/// append at its next bind: `Catalog::table` refreshes from the committed
+/// append at its next refresh: `Catalog::refresh` reloads from the committed
 /// manifest, so cross-process commits surface without any re-`CREATE`.
 #[test]
 fn other_catalog_instance_sees_append_at_next_bind() {
@@ -475,17 +520,17 @@ fn other_catalog_instance_sees_append_at_next_bind() {
 
     // The reader opens before the new file exists, at version 1.
     let reader = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(reader.binding("t").unwrap().parquet.row_groups().len(), 3);
+    assert_eq!(reader.binding("t").unwrap().current_parquet().row_groups().len(), 3);
 
     let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
     append(&writer, "t", &new_file);
 
-    // Binding through the trait (what a query does) reloads to version 2.
-    assert!(PlannerCatalog::table(&reader, "t").is_some());
+    // Refreshing (what a query does once before compile) reloads to version 2.
+    PlannerCatalog::refresh(&reader, "t").unwrap();
     let table = reader.binding("t").unwrap();
     assert_eq!(
         table
-            .parquet
+            .current_parquet()
             .row_groups()
             .iter()
             .map(|rg| rg.num_rows)
@@ -509,7 +554,7 @@ fn reopened_database_restores_appended_files_from_manifest() {
     }
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let table = reopened.binding("t").unwrap();
-    assert_eq!(table.parquet.row_groups().len(), 4);
+    assert_eq!(table.current_parquet().row_groups().len(), 4);
 }
 
 /// Only committed files exist: after a compaction swap, a leftover input
@@ -537,7 +582,8 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let table = reopened.binding("t").unwrap();
-    let groups = table.parquet.row_groups();
+    let parquet = table.current_parquet();
+    let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);
 }

@@ -3,8 +3,11 @@
 //! the master entry, so a query's filter pushdown prunes its own view without
 //! affecting anyone else.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, RwLock};
 
+use super::CatalogTable;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
@@ -26,31 +29,66 @@ struct PushedPredicate {
     value: Scalar<ArrayRef>,
 }
 
-/// A catalog table backed by a directory of Parquet files. Cloned per-binding
-/// so each query accumulates its own pushed-down predicates via
-/// [`Table::pushdown_filter`] without affecting others.
-#[derive(Clone, Debug)]
+/// A catalog table, resolved as a **live handle**: it carries the table's
+/// schema and this query's pushed-down predicates, but *not* a frozen file set.
+/// It reads the current row groups from the catalog's master map every time it
+/// compiles ([`current_parquet`](Self::current_parquet)), so a reused (cached)
+/// plan always scans the latest committed files. Cloned per-binding so each
+/// query accumulates its own predicates without affecting others; the clone
+/// shares the same master map (cheap `Arc` clone).
+#[derive(Clone)]
 pub struct TableBinding {
+    /// The catalog name resolved, used to read this table's current files out of
+    /// `tables` at compile time.
+    name: String,
     pub columns: Vec<Column>,
-    /// The table's row-group metadata, read once when the table was defined and
-    /// shared across every binding/query (cheap `Arc` clone). Pruning a binding's
-    /// predicates clones the row-group `Vec` and filters it — no footer re-read.
-    pub parquet: Arc<ParquetTable>,
+    /// Shared handle to the catalog's master table map. Read (never written)
+    /// here; the once-per-query refresh that advances it lives in
+    /// `Plan::compile`, before any binding reads — so a scan and its late
+    /// materialize both see one consistent snapshot.
+    tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
     /// Single-column predicates pushed down for this binding (recorded here
     /// because the `Table` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
 }
 
+impl fmt::Debug for TableBinding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Skip `tables` — it's the whole catalog map and not meaningfully
+        // printable for one binding.
+        f.debug_struct("TableBinding")
+            .field("name", &self.name)
+            .field("columns", &self.columns)
+            .field("predicates", &self.predicates)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TableBinding {
-    /// A binding over one table version's scan view, with no predicates pushed
-    /// yet.
-    pub(super) fn new(columns: Vec<Column>, parquet: Arc<ParquetTable>) -> Self {
+    /// A live binding over `name`'s scan view, with no predicates pushed yet.
+    pub(super) fn new(
+        name: String,
+        columns: Vec<Column>,
+        tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
+    ) -> Self {
         Self {
+            name,
             columns,
-            parquet,
+            tables,
             predicates: Vec::new(),
         }
+    }
+
+    /// This table's current committed row groups, read from the catalog's master
+    /// map. Empty if the table vanished (dropped) since this binding was made.
+    pub fn current_parquet(&self) -> Arc<ParquetTable> {
+        self.tables
+            .read()
+            .unwrap()
+            .get(&self.name)
+            .map(CatalogTable::parquet)
+            .unwrap_or_else(|| Arc::new(ParquetTable::new(Vec::new())))
     }
 }
 
@@ -96,6 +134,10 @@ impl Table for TableBinding {
         self.columns.clone()
     }
 
+    fn name(&self) -> Option<&str> {
+        Some(&self.name)
+    }
+
     fn clone_box(&self) -> Box<dyn Table> {
         Box::new(self.clone())
     }
@@ -107,7 +149,7 @@ impl Table for TableBinding {
     ) -> RecordBatchOperatorSpec {
         // Late materialization re-reads rows by their *global* row-group index,
         // so it uses the full table, not the pruned scan view.
-        materialize(input, self.parquet.clone(), projection)
+        materialize(input, self.current_parquet(), projection)
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
@@ -145,7 +187,7 @@ impl TableBinding {
     /// unoptimized. No footer I/O: the row groups were materialized once when the
     /// table was defined. Exposed so pruning can be asserted directly.
     pub fn pruned_parquet(&self) -> ParquetTable {
-        let mut parquet = (*self.parquet).clone();
+        let mut parquet = (*self.current_parquet()).clone();
         parquet.row_groups_mut().retain(|rg| {
             !self.predicates.iter().any(|p| {
                 row_group_eliminated(rg.as_ref(), p.column_idx, p.compare_type, &p.value)

@@ -96,6 +96,15 @@ pub trait Table: Debug + Send + Sync {
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
 
+    /// The table's catalog name, if it has one — used by
+    /// [`Plan::compile`](crate::Plan::compile) to refresh exactly the tables a
+    /// plan reads to their latest committed version before compiling. `None` for
+    /// backends that aren't catalog-resolved (e.g. test stubs), which then need
+    /// no refresh.
+    fn name(&self) -> Option<&str> {
+        None
+    }
+
     /// Clone this table into a fresh boxed trait object.
     ///
     /// A late-materialized query references one table from both its narrow scan
@@ -179,6 +188,17 @@ pub trait Catalog: Debug + Send + Sync {
     /// per-query filter pushdown can mutate the table without affecting
     /// concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>>;
+
+    /// Reload `name` to its latest committed version so a query (including one
+    /// replaying a cached plan) reads data committed since it was planned.
+    /// Called once per referenced table at the top of
+    /// [`Plan::compile`](crate::Plan::compile), before any scan reads its files,
+    /// so a table feeding both a scan and a late materialize refreshes once and
+    /// both see one consistent snapshot. Default: no-op, for backends whose
+    /// tables are always current (e.g. in-memory test stubs).
+    fn refresh(&self, _name: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Compile a `CREATE TABLE` statement into the dataflow that writes the new
     /// table into the catalog.
