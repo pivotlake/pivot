@@ -66,7 +66,14 @@ impl<T: Send> Receiver<T> for InjectorSource<T> {
     }
 
     fn try_recv(&self) -> Option<T> {
-        None
+        // Consume from the eager `run_cpu_work` path, not only the idle `steal`
+        // path: when downstream of this source does per-item IO, deferring to the
+        // idle path serialises it (one item in flight at a time). A single
+        // non-spinning attempt keeps the hot loop from spinning on `Steal::Retry`.
+        match self.items.steal() {
+            Steal::Success(item) => Some(item),
+            Steal::Empty | Steal::Retry => None,
+        }
     }
 
     fn steal(&self) -> Option<T> {
