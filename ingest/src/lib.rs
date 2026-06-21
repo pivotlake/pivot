@@ -406,14 +406,16 @@ mod tests {
             .unwrap();
     }
 
-    /// Resolve `name` through the catalog trait — what a query bind does — so the
-    /// catalog refreshes its in-memory copy from the latest committed manifest
-    /// (a writer evolves a cloned-out handle, so the catalog's own copy lags
-    /// until a resolve), then return the typed binding.
-    fn fresh_binding(catalog: &catalog::ParquetCatalog, name: &str) -> catalog::TableBinding {
+    /// Refresh `name` to the latest committed manifest (a writer evolves a
+    /// cloned-out handle, so the catalog's own copy lags until a refresh), then
+    /// return its current row groups.
+    fn fresh_parquet(
+        catalog: &catalog::ParquetCatalog,
+        name: &str,
+    ) -> Arc<catalog::parquet::ParquetTable> {
         use planner::catalog::Catalog as _;
         catalog.refresh(name).unwrap();
-        catalog.binding(name).unwrap()
+        catalog.current_parquet(name)
     }
 
     /// Load the written directory back into a `ParquetTable`. Drives the
@@ -531,9 +533,7 @@ mod tests {
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
         assert!(
             catalog
-                .binding("otel_logs")
-                .unwrap()
-                .current_parquet()
+                .current_parquet("otel_logs")
                 .row_groups()
                 .is_empty()
         );
@@ -545,8 +545,7 @@ mod tests {
             catalog.clone(),
         );
 
-        let table = fresh_binding(&catalog, "otel_logs");
-        let parquet = table.current_parquet();
+        let parquet = fresh_parquet(&catalog, "otel_logs");
         let groups = parquet.row_groups();
         assert_eq!(
             groups.iter().map(|rg| rg.num_rows).sum::<i64>(),
@@ -597,8 +596,7 @@ mod tests {
         // One merged file replaced the three inputs, on disk and in the
         // catalog, and indices stayed sequential.
         assert_eq!(parquet_file_count(dir.path()), 1);
-        let table = fresh_binding(&catalog, "otel_logs");
-        let parquet = table.current_parquet();
+        let parquet = fresh_parquet(&catalog, "otel_logs");
         let groups = parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
@@ -761,10 +759,9 @@ mod tests {
             .collect();
         assert_eq!(on_disk, vec![files[0].path.as_str().to_string()]);
 
-        let table = catalog.binding("events").unwrap();
         assert_eq!(
-            table
-                .current_parquet()
+            catalog
+                .current_parquet("events")
                 .row_groups()
                 .iter()
                 .map(|rg| rg.num_rows)
@@ -820,8 +817,7 @@ mod tests {
 
         // The server's next query refreshes to the compacted version.
         planner::catalog::Catalog::refresh(&*server_catalog, "otel_logs").unwrap();
-        let table = server_catalog.binding("otel_logs").unwrap();
-        let parquet = table.current_parquet();
+        let parquet = server_catalog.current_parquet("otel_logs");
         let groups = parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);

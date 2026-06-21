@@ -155,31 +155,3 @@ impl fmt::Display for Plan {
         write!(f, "{}", self.root)
     }
 }
-
-impl PlanNode {
-    /// The distinct catalog names of every table this plan reads — its scans and
-    /// late materializes. [`Plan::compile`](crate::Plan::compile) refreshes each
-    /// exactly once before compiling, so a table feeding both a scan and a
-    /// materialize is reloaded a single time and both see one snapshot.
-    pub(crate) fn referenced_table_names(&self) -> Vec<String> {
-        let mut names = Vec::new();
-        self.collect_table_names(&mut names);
-        names
-    }
-
-    fn collect_table_names(&self, names: &mut Vec<String>) {
-        let table = match &self.operator {
-            Operator::Input(o) => Some(&o.table),
-            Operator::Materialize(o) => Some(&o.table),
-            _ => None,
-        };
-        if let Some(name) = table.and_then(|t| t.name()) {
-            if !names.iter().any(|n| n == name) {
-                names.push(name.to_string());
-            }
-        }
-        for input in &self.inputs {
-            input.collect_table_names(names);
-        }
-    }
-}

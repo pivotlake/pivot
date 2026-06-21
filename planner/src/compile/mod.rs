@@ -22,7 +22,7 @@
 mod dummy_scan;
 mod operator;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, QueryContext};
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
@@ -89,8 +89,6 @@ pub enum Error {
     UnexpectedCreateTableInputs,
     #[error("compiling table scan: {0}")]
     TableScan(#[source] crate::catalog::Error),
-    #[error("refreshing table to latest version: {0}")]
-    Refresh(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
 }
@@ -105,16 +103,15 @@ impl Plan {
         &self,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Refresh every table this plan reads to its latest committed version,
-        // once each, before any scan compiles. A cached plan is re-run through
-        // here, so this is where it picks up data committed since it was planned.
-        // Doing it up front (not per scan) means a table feeding both a scan and
-        // a late materialize reloads once and both read one consistent snapshot.
-        for name in self.root.referenced_table_names() {
-            self.catalog.refresh(&name).map_err(Error::Refresh)?;
-        }
+        // A cached plan is re-run through here, so this is where it must pick up
+        // data committed since it was planned. The query context reloads each
+        // table a scan touches to its latest version the first time it compiles —
+        // lazily, and once per table, so a table feeding both a scan and a late
+        // materialize reloads a single time and both read one snapshot.
+        let ctx = self.catalog.query_context();
         let mut slots = DynamicFilterSlots::new();
-        self.root.compile(dispatcher, &self.catalog, &mut slots)
+        self.root
+            .compile(dispatcher, &self.catalog, ctx.as_ref(), &mut slots)
     }
 }
 
@@ -123,21 +120,22 @@ impl PlanNode {
         &self,
         dispatcher: &DataFlowDispatcher,
         catalog: &Arc<dyn Catalog>,
+        ctx: &dyn QueryContext,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, slots)?);
+            inputs.push(input.compile(dispatcher, catalog, ctx, slots)?);
         }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher, slots),
+            crate::Operator::Input(o) => o.compile(dispatcher, ctx, slots),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
-            crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Materialize(o) => o.compile(inputs.remove(0), ctx),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);

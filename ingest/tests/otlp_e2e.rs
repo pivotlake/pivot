@@ -174,9 +174,7 @@ fn table_rows(catalog: &ParquetCatalog) -> i64 {
     use planner::catalog::Catalog as _;
     catalog.refresh("otel_logs").unwrap();
     catalog
-        .binding("otel_logs")
-        .unwrap()
-        .current_parquet()
+        .current_parquet("otel_logs")
         .row_groups()
         .iter()
         .map(|rg| rg.num_rows)
