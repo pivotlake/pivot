@@ -23,16 +23,17 @@
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
 use async_trait::async_trait;
-use dispatch::{CancelToken, DataFlowHandle};
-use futures::{Sink, stream};
+use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
+use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{QueryResponse, Response};
+use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers,
@@ -40,9 +41,13 @@ use pgwire::api::{
 use pgwire::error::PgWireResult;
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::response::NoticeResponse;
 use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::{info, warn};
+
+/// Per-connection flag (a GUC-style name) toggled with `SET pivot_stats = on`.
+const STATS_FLAG: &str = "pivot_stats";
 
 thread_local! {
     /// One [`planner::Planner`] (and its non-`Send` DuckDB context) per
@@ -137,7 +142,10 @@ impl PivotQueryHandler {
         }
     }
 
-    async fn run_query(&self, query: &str) -> Result<Response> {
+    /// Plan, compile, and run `query`, timing each phase. When `collect_stats`,
+    /// the dataflow also tallies its IO/CPU work (otherwise that's skipped at no
+    /// cost). Returns the response and the timing + per-dataflow stats.
+    async fn run_query(&self, query: &str, collect_stats: bool) -> Result<(Response, QueryStats)> {
         let dispatcher = self.dispatcher.clone();
         let query = query.to_string();
 
@@ -150,55 +158,158 @@ impl PivotQueryHandler {
         // worthwhile price for always querying the current data.
         let catalog = self.catalog.clone();
         let q = query.clone();
+        let started = Instant::now();
         let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
             with_planner(&catalog, |planner| Ok(Arc::new(planner.plan(&q)?)))
         })
         .await
         .map_err(Error::PlannerPanic)??;
+        let plan_time = started.elapsed();
 
-        // Compile the (possibly cached) plan into a fresh dataflow and launch
-        // it. `compile` is pure pivot work (no DuckDB), so it runs on any
-        // blocking thread without the planner thread-local.
+        // Compile the plan into a fresh dataflow and launch it. `compile` is pure
+        // pivot work (no DuckDB), so it runs on any blocking thread without the
+        // planner thread-local. `execute_with_stats` turns on the dataflow's
+        // IO/CPU tally only when the client asked for it.
+        let started = Instant::now();
         let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-            let spec = plan.compile(&dispatcher)?;
-            Ok(spec.map(|| |b| PGRowBatch::from(b)).execute())
+            let rows = plan.compile(&dispatcher)?.map(|| |b| PGRowBatch::from(b));
+            Ok(if collect_stats {
+                rows.execute_with_stats()
+            } else {
+                rows.execute()
+            })
         })
         .await
         .map_err(Error::PlannerPanic)??;
+        let compile_time = started.elapsed();
 
         // Cancel the dataflow if our future is dropped before drain finishes —
         // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
         // raw disconnects (whole connection task dropped).
         let guard = CancelOnDrop::new(handle.cancel_token());
-        let batches: Vec<_> = tokio::task::spawn_blocking(move || handle.collect())
+        let started = Instant::now();
+        let (batches, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
             .await
             .map_err(Error::WorkerPanic)??;
+        let exec_time = started.elapsed();
         guard.defuse();
 
         let fields = batches
             .first()
             .map_or(Arc::new(vec![]), |b| b.fields.clone());
-        Ok(Response::Query(QueryResponse::new(
+        let response = Response::Query(QueryResponse::new(
             fields,
             stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
-        )))
+        ));
+        Ok((
+            response,
+            QueryStats {
+                plan: plan_time,
+                compile: compile_time,
+                exec: exec_time,
+                flow,
+            },
+        ))
     }
+}
+
+/// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
+/// tally — formatted into a one-line client `NOTICE` when stats are on.
+struct QueryStats {
+    plan: Duration,
+    compile: Duration,
+    exec: Duration,
+    flow: DataFlowStats,
+}
+
+impl QueryStats {
+    fn summary(&self) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        format!(
+            "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
+             http_reads={} disk_reads={} cpu={:.1}ms",
+            ms(self.plan),
+            ms(self.compile),
+            ms(self.exec),
+            self.flow.http_requests,
+            self.flow.disk_requests,
+            ms(self.flow.cpu),
+        )
+    }
+}
+
+/// Intercept `SET pivot_stats = on|off` / `RESET pivot_stats`, toggling the
+/// per-connection flag and acking like a normal `SET`. `None` for any other
+/// statement, which then runs as usual.
+fn toggle_stats<C: ClientInfo>(client: &mut C, query: &str) -> Option<Response> {
+    let stmt = query
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_ascii_lowercase();
+    if stmt == format!("reset {STATS_FLAG}") {
+        client.metadata_mut().remove(STATS_FLAG);
+        return Some(Response::Execution(Tag::new("RESET")));
+    }
+    let rest = stmt
+        .strip_prefix("set ")?
+        .trim_start()
+        .strip_prefix(STATS_FLAG)?
+        .trim_start();
+    // `= on` or `to on`
+    let value = rest
+        .strip_prefix('=')
+        .or_else(|| rest.strip_prefix("to "))
+        .map(str::trim)?;
+    if matches!(value, "on" | "true" | "1") {
+        client
+            .metadata_mut()
+            .insert(STATS_FLAG.to_string(), "on".to_string());
+    } else {
+        client.metadata_mut().remove(STATS_FLAG);
+    }
+    Some(Response::Execution(Tag::new("SET")))
+}
+
+/// Whether this connection has `pivot_stats` on.
+fn stats_on<C: ClientInfo>(client: &C) -> bool {
+    client.metadata().get(STATS_FLAG).is_some_and(|v| v == "on")
 }
 
 #[async_trait]
 impl SimpleQueryHandler for PivotQueryHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // `SET pivot_stats = on` flips the per-connection flag; it isn't a real
+        // query.
+        if let Some(ack) = toggle_stats(client, query) {
+            return Ok(vec![ack]);
+        }
+        let with_stats = stats_on(client);
+
         info!(sql = %query, "query received");
-        let res = self.run_query(query).await.map_err(|e| {
+        let (res, stats) = self.run_query(query, with_stats).await.map_err(|e| {
             warn!(error = %e, sql = %query, "query failed");
             e.into_pgwire()
         })?;
+
+        // Send the breakdown as an INFO notice before the rows; psql prints it.
+        if with_stats {
+            let notice = NoticeResponse::from(ErrorInfo::new(
+                "INFO".to_string(),
+                "00000".to_string(),
+                stats.summary(),
+            ));
+            client
+                .send(PgWireBackendMessage::NoticeResponse(notice))
+                .await?;
+        }
+
         info!(sql = %query, "query succeeded");
         Ok(vec![res])
     }

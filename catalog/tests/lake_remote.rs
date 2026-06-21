@@ -331,3 +331,24 @@ fn row_group_scan_keeps_many_reads_in_flight() {
         "row-group reads serialised"
     );
 }
+
+/// A remote scan reports its per-dataflow stats: HTTP reads counted, CPU time
+/// recorded, and no disk reads (everything is remote). `collect_with_stats`
+/// turns the tally on; plain `collect` leaves it off.
+#[test]
+fn remote_scan_reports_io_and_cpu_stats() {
+    let dispatch = dispatch_with_buffers(2, 128);
+    let bytes = wide_parquet_bytes();
+    let size = bytes.len() as u64;
+    let url = serve_with_ranges(bytes);
+    let table = Arc::new(ParquetTable::from_remote_files(&dispatch, &[(url, size)]).unwrap());
+
+    let (batches, stats) = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect_with_stats()
+        .unwrap();
+
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 256);
+    assert!(stats.http_requests > 0, "the scan fetched column chunks over http");
+    assert_eq!(stats.disk_requests, 0, "a remote scan reads no local files");
+    assert!(stats.cpu > Duration::ZERO, "the scan spent cpu decoding");
+}

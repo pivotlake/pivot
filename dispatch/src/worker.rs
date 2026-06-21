@@ -405,7 +405,9 @@ impl Worker {
 
         for id in to_remove {
             debug!("Finished data flow {:?}", id);
-            self.data_flows.remove(&id);
+            if let Some(flow) = self.data_flows.remove(&id) {
+                flow.report_stats();
+            }
         }
     }
 

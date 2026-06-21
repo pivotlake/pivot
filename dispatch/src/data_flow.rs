@@ -23,6 +23,7 @@
 use crate::Identifier;
 use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
 use crate::operations::{FinishStatus, Operator};
+use crate::stats::DataFlowStats;
 use crate::worker::worker_waker;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -30,6 +31,7 @@ use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::Instant;
 use std::{panic, result};
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -170,6 +172,12 @@ pub struct DataFlow {
     cancelled: Arc<AtomicBool>,
     err_tx: mpsc::Sender<Error>,
     graph: OperatorGraph,
+    /// This worker's running stats tally, `Some` only when the query opted into
+    /// stats — otherwise collection is skipped entirely (no timing, no counting).
+    stats: Option<DataFlowStats>,
+    /// Where [`report_stats`](Self::report_stats) ships the tally when this
+    /// worker's copy of the dataflow finishes; the handle folds all workers'.
+    stats_tx: mpsc::Sender<DataFlowStats>,
 }
 
 impl Debug for DataFlow {
@@ -180,22 +188,36 @@ impl Debug for DataFlow {
 }
 
 impl DataFlow {
+    #[allow(clippy::too_many_arguments)] // wired straight from the builder; each is needed
     pub fn new(
         id: Identifier,
         canceled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<Error>,
         operators: Vec<Box<dyn Operator>>,
         publisher_to_subscriber: HashMap<Identifier, Identifier>,
+        stats_tx: mpsc::Sender<DataFlowStats>,
+        collect_stats: bool,
     ) -> Self {
         Self {
             id,
             graph: OperatorGraph::from_edges(operators, publisher_to_subscriber),
             cancelled: canceled,
             err_tx,
+            stats: collect_stats.then(DataFlowStats::default),
+            stats_tx,
         }
     }
     pub fn id(&self) -> Identifier {
         self.id
+    }
+
+    /// Ship this worker's stats tally to the handle. A no-op when the query
+    /// didn't opt in. Called by the worker once this copy of the dataflow is
+    /// done, before it's dropped.
+    pub fn report_stats(&self) {
+        if let Some(stats) = self.stats {
+            let _ = self.stats_tx.send(stats);
+        }
     }
 
     /// Is this dataflow cancelled? This is an AtomicBool that can be set from other workers or from
@@ -227,7 +249,14 @@ impl DataFlow {
     /// Similar to the above function, `try_run_or` will run catch any errors and handle them
     /// appropriately, while also returning a default value if there is indeed an error
     fn try_run_or<R>(&mut self, default: R, f: impl FnOnce(&mut Self) -> Result<R>) -> R {
-        match panic::catch_unwind(AssertUnwindSafe(|| f(self))) {
+        // Every operator step funnels through here, so it's the one place to time
+        // CPU. `then` skips the clock reads entirely when stats are off.
+        let started = self.stats.is_some().then(Instant::now);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| f(self)));
+        if let (Some(stats), Some(started)) = (self.stats.as_mut(), started) {
+            stats.cpu += started.elapsed();
+        }
+        match outcome {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 self.bail_and_cancel(e);
@@ -339,7 +368,7 @@ impl DataFlow {
     /// Collect pending filesystem read requests from operators (leaf-to-root).
     /// Returns the first batch found, or `None` if no operator needs disk IO.
     pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
-        self.try_run_or(None, |d| {
+        let requests = self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
                     let requests = op.operator.next_fs_requests()?;
@@ -355,13 +384,15 @@ impl DataFlow {
                     }
                 })
                 .map(|c| c.break_value())
-        })
+        });
+        self.record_io(|s| &mut s.disk_requests, &requests);
+        requests
     }
 
     /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
     /// [`get_next_fs_request`](Self::get_next_fs_request).
     pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
-        self.try_run_or(None, |d| {
+        let requests = self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
                     let requests = op.operator.next_http_requests()?;
@@ -377,6 +408,21 @@ impl DataFlow {
                     }
                 })
                 .map(|c| c.break_value())
-        })
+        });
+        self.record_io(|s| &mut s.http_requests, &requests);
+        requests
+    }
+
+    /// Count the IO requests just produced for this dataflow (a no-op when stats
+    /// are off). The worker submits every request in a returned batch, so the
+    /// count of what's returned is the count of what's issued.
+    fn record_io<T>(
+        &mut self,
+        field: impl FnOnce(&mut DataFlowStats) -> &mut u64,
+        requests: &Option<Vec<T>>,
+    ) {
+        if let (Some(stats), Some(requests)) = (self.stats.as_mut(), requests) {
+            *field(stats) += requests.len() as u64;
+        }
     }
 }
