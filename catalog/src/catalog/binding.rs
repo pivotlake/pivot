@@ -198,6 +198,18 @@ impl Table for TableBinding {
         }
         Some((min?, max?))
     }
+
+    fn row_count(&self, ctx: &dyn QueryContext) -> Option<i64> {
+        // Only sound for the whole, unfiltered table: a pushed-down predicate
+        // means the scan this binding stands for excludes rows.
+        if !self.predicates.is_empty() {
+            return None;
+        }
+        // The parquet footer carries each row group's exact row count, so the
+        // table's count is their sum, with no data pages read.
+        let parquet = self.resolve_files(ctx).ok()?;
+        Some(parquet.row_groups().iter().map(|rg| rg.num_rows).sum())
+    }
 }
 
 /// `a < b` over two single-value scalars of the same physical type. A null,

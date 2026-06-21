@@ -6,7 +6,7 @@ use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
 use crate::operator::Input;
 use crate::types::Type;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use std::sync::Arc;
@@ -52,6 +52,25 @@ impl Aggregate {
         }
         if !scan.dynamic_filters.is_empty() {
             return Ok(None);
+        }
+
+        // A lone unfiltered COUNT(*) is the sum of every row group's row count.
+        // Emit the same UInt64 "count" column the dedicated count operator does.
+        if self.is_lone_count_star() {
+            let Some(count) = scan.table.row_count(ctx) else {
+                return Ok(None);
+            };
+            let array = UInt64Array::from(vec![count as u64]);
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "count",
+                DataType::UInt64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])
+                .expect("single-row count batch");
+            return Ok(Some(
+                dispatch::values_input(dispatcher, [batch]).record_batches(),
+            ));
         }
 
         let mut fields = Vec::with_capacity(self.expressions.len());
