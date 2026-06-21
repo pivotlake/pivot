@@ -139,7 +139,7 @@ fn constant_comparison(
 // — no dispatcher needed.
 fn row_group_count(catalog: &ParquetCatalog, name: &str, table: &TableBinding) -> usize {
     table
-        .pruned_parquet(&catalog.current_parquet(name))
+        .pruned_parquet(&current_parquet(catalog, name))
         .row_groups()
         .len()
 }
@@ -165,7 +165,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
     // No path: the table lives under the (in-memory) database root with no data.
     create_table(&catalog, req).unwrap();
     assert!(catalog.binding("t").is_some());
-    assert!(catalog.current_parquet("t").row_groups().is_empty());
+    assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn create_table_over_a_missing_path_yields_an_empty_table() {
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
     create_table(&catalog, create_request("t", bogus, columns)).unwrap();
     assert!(catalog.binding("t").is_some());
-    assert!(catalog.current_parquet("t").row_groups().is_empty());
+    assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
 
 #[test]
@@ -360,10 +360,12 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
         .unwrap()
 }
 
-/// Refresh `name` to the latest committed manifest — what `Plan::compile` does
-/// once per referenced table before any scan reads its files.
-fn resolve(catalog: &ParquetCatalog, name: &str) {
-    PlannerCatalog::refresh(catalog, name).unwrap();
+/// Reload `name` to its latest committed manifest (advancing the catalog's
+/// master, as a query's scan does through the query context) and return its
+/// current row groups for inspection.
+fn current_parquet(catalog: &ParquetCatalog, name: &str) -> Arc<catalog::parquet::ParquetTable> {
+    catalog.refresh(name).expect("reload");
+    catalog.table_handle(name).expect("table exists").parquet()
 }
 
 /// A file appended after `CREATE TABLE` becomes visible to new binds, with
@@ -373,13 +375,12 @@ fn append_data_file_makes_new_file_visible_to_new_binds() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    assert_eq!(catalog.current_parquet("t").row_groups().len(), 3);
+    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 3);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
     append(&catalog, "t", &new_file);
 
-    resolve(&catalog, "t");
-    let parquet = catalog.current_parquet("t");
+    let parquet = current_parquet(&catalog, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 4);
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
@@ -399,8 +400,7 @@ fn append_data_file_is_idempotent_per_path() {
     // Appending the same file again is a no-op (it must not double-count).
     append(&catalog, "t", &new_file);
 
-    resolve(&catalog, "t");
-    assert_eq!(catalog.current_parquet("t").row_groups().len(), 4);
+    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 4);
 }
 
 /// No table yet (ingest runs before `CREATE TABLE`): there is no handle to
@@ -422,8 +422,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let extra = write_ids(dir.path(), "extra.parquet", &[40]);
     append(&catalog, "t", &extra);
-    resolve(&catalog, "t");
-    assert_eq!(catalog.current_parquet("t").row_groups().len(), 4);
+    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 4);
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
@@ -457,8 +456,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         "second swap aborts: its inputs were already swapped out"
     );
 
-    resolve(&catalog, "t");
-    let parquet = catalog.current_parquet("t");
+    let parquet = current_parquet(&catalog, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].num_rows, 4);
@@ -481,15 +479,14 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
     append(&catalog, "t", &new_file);
-    PlannerCatalog::refresh(&*catalog, "t").unwrap();
 
     // `id = 20` still prunes to the single matching row group, now over 4 files.
     assert_eq!(row_group_count(&catalog, "t", &table), 1);
 }
 
 /// A second catalog over the same persisted root sees another instance's
-/// append at its next refresh: `Catalog::refresh` reloads from the committed
-/// manifest, so cross-process commits surface without any re-`CREATE`.
+/// append at its next reload: reloading reads the committed manifest, so
+/// cross-process commits surface without any re-`CREATE`.
 #[test]
 fn other_catalog_instance_sees_append_at_next_bind() {
     let (data_dir, columns) = three_row_table();
@@ -500,22 +497,18 @@ fn other_catalog_instance_sees_append_at_next_bind() {
 
     // The reader opens before the new file exists, at version 1.
     let reader = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(reader.current_parquet("t").row_groups().len(), 3);
+    assert_eq!(current_parquet(&reader, "t").row_groups().len(), 3);
 
     let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
     append(&writer, "t", &new_file);
 
-    // Refreshing (what a query does once before compile) reloads to version 2.
-    PlannerCatalog::refresh(&reader, "t").unwrap();
-    assert_eq!(
-        reader
-            .current_parquet("t")
-            .row_groups()
-            .iter()
-            .map(|rg| rg.num_rows)
-            .sum::<i64>(),
-        5
-    );
+    // The reader's next reload picks up version 2 from the committed manifest.
+    let rows = current_parquet(&reader, "t")
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_rows)
+        .sum::<i64>();
+    assert_eq!(rows, 5);
 }
 
 /// Restart reads the committed manifest, not the directory: files appended
@@ -532,7 +525,7 @@ fn reopened_database_restores_appended_files_from_manifest() {
         append(&catalog, "t", &new_file);
     }
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(reopened.current_parquet("t").row_groups().len(), 4);
+    assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
 }
 
 /// Only committed files exist: after a compaction swap, a leftover input
@@ -559,7 +552,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
         .unwrap();
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    let parquet = reopened.current_parquet("t");
+    let parquet = current_parquet(&reopened, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);

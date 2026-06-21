@@ -413,9 +413,8 @@ mod tests {
         catalog: &catalog::ParquetCatalog,
         name: &str,
     ) -> Arc<catalog::parquet::ParquetTable> {
-        use planner::catalog::Catalog as _;
         catalog.refresh(name).unwrap();
-        catalog.current_parquet(name)
+        catalog.table_handle(name).unwrap().parquet()
     }
 
     /// Load the written directory back into a `ParquetTable`. Drives the
@@ -531,12 +530,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
-        assert!(
-            catalog
-                .current_parquet("otel_logs")
-                .row_groups()
-                .is_empty()
-        );
+        assert!(fresh_parquet(&catalog, "otel_logs").row_groups().is_empty());
 
         flush_each(
             dispatch.dispatcher(),
@@ -759,15 +753,12 @@ mod tests {
             .collect();
         assert_eq!(on_disk, vec![files[0].path.as_str().to_string()]);
 
-        assert_eq!(
-            catalog
-                .current_parquet("events")
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows)
-                .sum::<i64>(),
-            3
-        );
+        let rows = fresh_parquet(&catalog, "events")
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows)
+            .sum::<i64>();
+        assert_eq!(rows, 3);
 
         dispatch.exit();
     }
@@ -815,9 +806,8 @@ mod tests {
             .unwrap()
             .block_on(compacter.compact_all());
 
-        // The server's next query refreshes to the compacted version.
-        planner::catalog::Catalog::refresh(&*server_catalog, "otel_logs").unwrap();
-        let parquet = server_catalog.current_parquet("otel_logs");
+        // The server's next query reloads to the compacted version.
+        let parquet = fresh_parquet(&server_catalog, "otel_logs");
         let groups = parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
