@@ -413,8 +413,9 @@ mod tests {
         catalog: &catalog::ParquetCatalog,
         name: &str,
     ) -> Arc<catalog::parquet::ParquetTable> {
-        catalog.refresh(name).unwrap();
-        catalog.table_handle(name).unwrap().parquet()
+        let mut table = catalog.table_handle(name).expect("table exists");
+        table.refresh().expect("manifest reload");
+        table.parquet()
     }
 
     /// Load the written directory back into a `ParquetTable`. Drives the

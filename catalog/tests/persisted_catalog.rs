@@ -91,8 +91,9 @@ fn current_parquet(
     catalog: &ParquetCatalog,
     name: &str,
 ) -> std::sync::Arc<catalog::parquet::ParquetTable> {
-    catalog.refresh(name).expect("reload");
-    catalog.table_handle(name).expect("table exists").parquet()
+    let mut table = catalog.table_handle(name).expect("table exists");
+    table.refresh().expect("manifest reload");
+    table.parquet()
 }
 
 #[test]

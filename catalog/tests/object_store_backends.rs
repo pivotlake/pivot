@@ -89,9 +89,13 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Pa
 
 /// Reload from the latest committed manifest (what a query's scan does through
 /// the query context) and return the table's current row groups.
-fn current_parquet(cat: &ParquetCatalog, name: &str) -> std::sync::Arc<catalog::parquet::ParquetTable> {
-    cat.refresh(name).expect("reload");
-    cat.table_handle(name).expect("table exists").parquet()
+fn current_parquet(
+    cat: &ParquetCatalog,
+    name: &str,
+) -> std::sync::Arc<catalog::parquet::ParquetTable> {
+    let mut table = cat.table_handle(name).expect("table exists");
+    table.refresh().expect("manifest reload");
+    table.parquet()
 }
 
 /// Scan the table's `value` column, sorted.

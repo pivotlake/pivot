@@ -360,12 +360,13 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
         .unwrap()
 }
 
-/// Reload `name` to its latest committed manifest (advancing the catalog's
-/// master, as a query's scan does through the query context) and return its
-/// current row groups for inspection.
+/// Reload `name` to its latest committed manifest and return its current row
+/// groups for inspection — a query's scan does the same through its query
+/// context; here we drive it on a cloned-out table handle.
 fn current_parquet(catalog: &ParquetCatalog, name: &str) -> Arc<catalog::parquet::ParquetTable> {
-    catalog.refresh(name).expect("reload");
-    catalog.table_handle(name).expect("table exists").parquet()
+    let mut table = catalog.table_handle(name).expect("table exists");
+    table.refresh().expect("manifest reload");
+    table.parquet()
 }
 
 /// A file appended after `CREATE TABLE` becomes visible to new binds, with
@@ -434,15 +435,14 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         path: ObjectPath::new("merged.parquet"),
         size: merged_size,
     })];
-    // A losing compacter clones the table out at the same version (inputs still
-    // present) before the winning swap lands.
+    // A losing compacter clones the table out at the version where the inputs
+    // are present, before the winning swap lands.
     let mut loser = catalog.table_handle("t").unwrap();
+    loser.refresh().unwrap();
+    let mut winner = catalog.table_handle("t").unwrap();
+    winner.refresh().unwrap();
     assert!(
-        catalog
-            .table_handle("t")
-            .unwrap()
-            .replace_data_files(&removed, &added)
-            .unwrap(),
+        winner.replace_data_files(&removed, &added).unwrap(),
         "first swap commits"
     );
     // The loser only discovers the inputs are gone after its CAS conflict +
