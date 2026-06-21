@@ -62,7 +62,7 @@ use crate::operations::{
     KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy,
     OrderByLimitFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
-use crate::{DataFlowDispatcher, DataFlowHandle};
+use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
 /// Object-safe version of [`OperatorFactory<RecordBatch>`].
@@ -667,6 +667,17 @@ impl RecordBatchOperatorSpec {
         OperatorSpec::new(self.dispatcher, factories).execute()
     }
 
+    /// Like [`execute`](Self::execute) but with per-dataflow stats collection on;
+    /// read them back via [`DataFlowHandle::collect_with_stats`].
+    pub fn execute_with_stats(self) -> DataFlowHandle<RecordBatch> {
+        let factories: Vec<_> = self
+            .factories
+            .into_iter()
+            .map(RecordBatchFactoryBridge)
+            .collect();
+        OperatorSpec::new(self.dispatcher, factories).execute_with_stats()
+    }
+
     /// Run the dataflow and collect every batch into a `Vec`.
     ///
     /// Appends a `CopyOut`
@@ -678,5 +689,14 @@ impl RecordBatchOperatorSpec {
         self.unary((0..count).map(|_| CopyOutFactory))
             .execute()
             .collect()
+    }
+
+    /// Like [`collect`](Self::collect), but also returns the dataflow's IO/CPU
+    /// stats folded across workers.
+    pub fn collect_with_stats(self) -> crate::data_flow::Result<(Vec<RecordBatch>, DataFlowStats)> {
+        let count = self.worker_count();
+        self.unary((0..count).map(|_| CopyOutFactory))
+            .execute_with_stats()
+            .collect_with_stats()
     }
 }

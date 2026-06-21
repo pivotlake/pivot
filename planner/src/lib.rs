@@ -118,7 +118,7 @@ pub mod types;
 use std::sync::Arc;
 
 use crate::catalog::Catalog;
-pub use operator::Operator;
+pub use operator::{Operator, SetVariable};
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;
 

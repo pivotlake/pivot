@@ -164,3 +164,30 @@ fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
             Input([#0:Int32, #1:Int32])
     ");
 }
+
+#[rstest]
+fn set_variable_is_parsed_by_duckdb(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("SET pivot_stats = true")
+        .unwrap();
+
+    let set = plan
+        .as_set_variable()
+        .expect("SET should not compile to a query");
+
+    assert_eq!(set.name, "pivot_stats");
+    assert_eq!(set.value.as_deref(), Some("true"));
+}
+
+#[rstest]
+fn reset_variable_carries_no_value(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.planner.plan("RESET pivot_stats").unwrap();
+
+    let set = plan
+        .as_set_variable()
+        .expect("RESET should not compile to a query");
+
+    assert_eq!(set.name, "pivot_stats");
+    assert_eq!(set.value, None);
+}

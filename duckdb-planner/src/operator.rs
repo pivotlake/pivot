@@ -164,6 +164,21 @@ impl fmt::Debug for Materialize {
 #[derive(CustomDeserializer, Debug)]
 pub struct DummyScan {}
 
+/// `SET <name> = <value>` (and, relabelled by the bridge, `RESET <name>`, which
+/// arrives with `value = None`).
+///
+/// DuckDB binds a `SET` of *any* name without validating that the setting
+/// exists — that check only fires at execution, which pivot never runs — so
+/// `name` is whatever the user typed and it's up to the consumer to decide which
+/// names it honours. `value` is the bound constant in string form as DuckDB
+/// serialized it (so a boolean reads back as `"true"`/`"false"`); `None` for a
+/// `RESET`.
+#[derive(CustomDeserializer, Debug)]
+pub struct SetVariable {
+    pub name: String,
+    pub value: Option<String>,
+}
+
 /// A logical operator in the query plan. Discriminated by DuckDB's
 /// [`LogicalOperatorType`].
 #[derive(CustomDeserializer, Debug)]
@@ -189,6 +204,9 @@ pub enum Operator {
     CreateTable(CreateTable),
     #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
     DummyScan(DummyScan),
+    // The bridge tags both SET and RESET as LOGICAL_SET (RESET carries no value).
+    #[type_tag(LogicalOperatorType::LOGICAL_SET)]
+    Set(SetVariable),
     // The bridge collapses DuckDB's late-materialization SEMI join into this
     // node and emits it tagged with LOGICAL_COMPARISON_JOIN (a raw join never
     // otherwise reaches Rust). Resolved to `Materialize` (table attached) the
@@ -214,6 +232,7 @@ impl Operator {
             | Operator::TopN(_)
             | Operator::CreateTable(_)
             | Operator::DummyScan(_)
+            | Operator::Set(_)
             | Operator::Materialize(_)
             | Operator::RawMaterialize(_)
             | Operator::RawInput(_) => None,
@@ -308,6 +327,10 @@ impl fmt::Display for Operator {
                 )
             }
             Operator::DummyScan(_) => write!(f, "DummyScan"),
+            Operator::Set(s) => match &s.value {
+                Some(v) => write!(f, "Set({} = {v})", s.name),
+                None => write!(f, "Reset({})", s.name),
+            },
             Operator::RawMaterialize(m) => {
                 let cols: Vec<String> = m.columns.iter().map(|c| format!("#{c}")).collect();
                 write!(f, "Materialize([{}])", cols.join(", "))
