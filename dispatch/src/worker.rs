@@ -366,11 +366,13 @@ impl Worker {
                 // just means drop the completion (the slot pin releases with it).
                 Ok(Completion::Fs(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.record_disk_time(r.submitted_at);
                         data_flow.process_fs(r.operator_idx, r.request);
                     }
                 }
                 Ok(Completion::Http(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.record_http_time(r.submitted_at);
                         data_flow.process_http(r.operator_idx, r.request);
                     }
                 }

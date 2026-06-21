@@ -31,7 +31,7 @@ use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{panic, result};
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -368,7 +368,7 @@ impl DataFlow {
     /// Collect pending filesystem read requests from operators (leaf-to-root).
     /// Returns the first batch found, or `None` if no operator needs disk IO.
     pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
-        let requests = self.try_run_or(None, |d| {
+        let mut requests = self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
                     let requests = op.operator.next_fs_requests()?;
@@ -385,14 +385,14 @@ impl DataFlow {
                 })
                 .map(|c| c.break_value())
         });
-        self.record_io(|s| &mut s.disk_requests, &requests);
+        self.record_issued(|s| &mut s.disk_requests, &mut requests);
         requests
     }
 
     /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
     /// [`get_next_fs_request`](Self::get_next_fs_request).
     pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
-        let requests = self.try_run_or(None, |d| {
+        let mut requests = self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
                     let requests = op.operator.next_http_requests()?;
@@ -409,20 +409,47 @@ impl DataFlow {
                 })
                 .map(|c| c.break_value())
         });
-        self.record_io(|s| &mut s.http_requests, &requests);
+        self.record_issued(|s| &mut s.http_requests, &mut requests);
         requests
     }
 
-    /// Count the IO requests just produced for this dataflow (a no-op when stats
-    /// are off). The worker submits every request in a returned batch, so the
-    /// count of what's returned is the count of what's issued.
-    fn record_io<T>(
+    /// Bill a completed read's in-flight time to this dataflow, the companion to
+    /// the count taken in [`get_next_http_request`](Self::get_next_http_request).
+    /// A no-op when stats are off (then `submitted_at` is `None`).
+    pub fn record_http_time(&mut self, submitted_at: Option<Instant>) {
+        self.record_io_time(submitted_at, |s| &mut s.http_time);
+    }
+
+    /// As [`record_http_time`](Self::record_http_time), for a disk read.
+    pub fn record_disk_time(&mut self, submitted_at: Option<Instant>) {
+        self.record_io_time(submitted_at, |s| &mut s.disk_time);
+    }
+
+    fn record_io_time(
         &mut self,
-        field: impl FnOnce(&mut DataFlowStats) -> &mut u64,
-        requests: &Option<Vec<T>>,
+        submitted_at: Option<Instant>,
+        field: impl FnOnce(&mut DataFlowStats) -> &mut Duration,
     ) {
-        if let (Some(stats), Some(requests)) = (self.stats.as_mut(), requests) {
-            *field(stats) += requests.len() as u64;
+        if let (Some(stats), Some(submitted_at)) = (self.stats.as_mut(), submitted_at) {
+            *field(stats) += submitted_at.elapsed();
+        }
+    }
+
+    /// Count the IO requests just produced for this dataflow and stamp each with
+    /// the issue time (so its completion can be billed), a no-op when stats are
+    /// off. The worker submits every request in a returned batch, so the count of
+    /// what's returned is the count of what's issued.
+    fn record_issued<R>(
+        &mut self,
+        count: impl FnOnce(&mut DataFlowStats) -> &mut u64,
+        requests: &mut Option<Vec<DataFlowRequest<R>>>,
+    ) {
+        if let (Some(stats), Some(requests)) = (self.stats.as_mut(), requests.as_mut()) {
+            *count(stats) += requests.len() as u64;
+            let now = Instant::now();
+            for request in requests.iter_mut() {
+                request.submitted_at = Some(now);
+            }
         }
     }
 }
