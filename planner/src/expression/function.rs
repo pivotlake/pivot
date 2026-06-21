@@ -34,7 +34,7 @@ impl TryFrom<duckdb_expression::Function> for Function {
         match f.function.as_str() {
             "contains" => Ok(Function::Contains(f.try_into()?)),
             "+" | "-" | "*" => Ok(Function::Arithmetic(f.try_into()?)),
-            "length" => Ok(Function::Length(f.try_into()?)),
+            "length" | "strlen" | "len" => Ok(Function::Length(f.try_into()?)),
             "regexp_replace" => Ok(Function::RegexpReplace(f.try_into()?)),
             "/" => Ok(Function::Divide(f.try_into()?)),
             "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),

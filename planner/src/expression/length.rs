@@ -1,4 +1,4 @@
-//! [`Length`] — SQL `length(string)`, the Unicode character count.
+//! [`Length`] — SQL `length(string)`, the byte length of the string.
 
 use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
@@ -8,8 +8,12 @@ use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
-/// SQL `length(string)` — the number of Unicode *characters* (not bytes) in
-/// the string, as `BIGINT`. Arrives as a `BOUND_FUNCTION` named `length`.
+/// SQL `length(string)` — the number of *bytes* in the string, as `BIGINT`.
+/// Arrives as a `BOUND_FUNCTION` named `length` (also `strlen`/`len`).
+///
+/// This is ClickHouse's `length()` semantics (byte count). It differs from
+/// DuckDB's `length`/`strlen`, which count Unicode characters; we don't use
+/// DuckDB as the result oracle, so byte count is the intended answer here.
 #[derive(Debug, Clone)]
 pub struct Length {
     pub input: Box<Expression>,
@@ -46,23 +50,13 @@ impl Length {
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();
-                // `length()` counts Unicode characters, not bytes (arrow's
-                // own length kernel returns *byte* lengths for Utf8View, so it
-                // can't be used here).
-                //
-                // In UTF-8 each character is encoded as exactly one leading
-                // byte followed by zero or more continuation bytes, and a
-                // continuation byte is the only kind that starts with the bit
-                // pattern `10xxxxxx`. So the number of characters equals the
-                // number of *non*-continuation bytes. `b & 0xC0` masks off the
-                // low 6 bits, leaving the top two; `!= 0x80` (i.e. `!= 10xxxxxx`)
-                // is true for every leading byte. Counting those is a single
-                // branch-free pass that vectorizes and avoids the per-codepoint
-                // decoding `chars().count()` would do.
-                let lengths: Int64Array = strings
-                    .iter()
-                    .map(|v| v.map(|s| s.bytes().filter(|&b| (b & 0xC0) != 0x80).count() as i64))
-                    .collect();
+                // Byte length: each StringView stores its length in the view
+                // header, so `&str::len()` reads it without ever touching the
+                // string payload buffers. That makes this O(rows), not
+                // O(bytes) — no per-byte scan like a Unicode character count
+                // would need.
+                let lengths: Int64Array =
+                    strings.iter().map(|v| v.map(|s| s.len() as i64)).collect();
                 ExprResult::Array(Arc::new(lengths) as ArrayRef)
             }) as ExprEvalFn
         }))
@@ -77,8 +71,7 @@ mod tests {
     use rstest::rstest;
     use std::sync::Arc;
 
-    #[rstest]
-    fn counts_unicode_chars(mut testing_planner: TestingPlanner) {
+    fn strs_table(testing_planner: &mut TestingPlanner) {
         testing_planner.add_table(
             "strs",
             &[(
@@ -92,16 +85,37 @@ mod tests {
                 ])) as ArrayRef,
             )],
         );
+    }
+
+    #[rstest]
+    fn counts_bytes(mut testing_planner: TestingPlanner) {
+        strs_table(&mut testing_planner);
 
         let mut rows = run(&mut testing_planner, "SELECT length(s) FROM strs");
 
         rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
-
+        // Byte counts, not characters: "héllo" is 6 bytes (é is 2),
+        // "日本語abc" is 12 (three 3-byte CJK chars + "abc").
         assert_eq!(
             rows.iter()
                 .map(|r| r["col0"].as_i64().unwrap())
                 .collect::<Vec<_>>(),
-            vec![0, 5, 5, 6]
+            vec![0, 5, 6, 12]
+        );
+    }
+
+    #[rstest]
+    fn strlen_is_an_alias(mut testing_planner: TestingPlanner) {
+        strs_table(&mut testing_planner);
+
+        let mut rows = run(&mut testing_planner, "SELECT strlen(s) FROM strs");
+
+        rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["col0"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 5, 6, 12]
         );
     }
 }
