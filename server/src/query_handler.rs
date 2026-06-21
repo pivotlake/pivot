@@ -290,17 +290,20 @@ struct QueryStats {
 impl QueryStats {
     fn summary(&self) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         // The IO/cpu figures are sums (over workers and in-flight reads), so
         // `time/reads` is the average read latency and the totals can top exec.
         format!(
             "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
-             http={} reads/{:.1}ms  disk={} reads/{:.1}ms  cpu={:.1}ms",
+             http={} reads/{:.1}MiB/{:.1}ms  disk={} reads/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
             ms(self.plan),
             ms(self.compile),
             ms(self.exec),
             self.flow.http_requests,
+            mib(self.flow.http_bytes),
             ms(self.flow.http_time),
             self.flow.disk_requests,
+            mib(self.flow.disk_bytes),
             ms(self.flow.disk_time),
             ms(self.flow.cpu),
         )
