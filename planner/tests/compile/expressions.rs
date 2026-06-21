@@ -126,6 +126,267 @@ fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
     assert_eq!(minute_one["v0"], 2);
 }
 
+/// A table with a minute-of-hour computed group key (`EventTime` 0,90,150,3690 →
+/// minutes 0,1,2,1) and a value column. minute 1 holds two rows (v=20, v=40).
+fn minute_grouped_table(testing_planner: &mut TestingPlanner, name: &str) {
+    use arrow_array::Int64Array;
+    testing_planner.add_table(
+        name,
+        &[
+            (
+                "EventTime",
+                Type::Timestamp,
+                Arc::new(Int64Array::from(vec![0i64, 90, 150, 3690])) as ArrayRef,
+            ),
+            (
+                "v",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+            ),
+        ],
+    );
+}
+
+#[rstest]
+fn group_by_computed_key_sum(mut testing_planner: TestingPlanner) {
+    minute_grouped_table(&mut testing_planner, "ev");
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT extract(minute FROM EventTime) AS m, SUM(v) FROM ev GROUP BY m")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["key"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    // minute 1 = 20 + 40 = 60.
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v0"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10, 60, 30]
+    );
+}
+
+#[rstest]
+fn group_by_computed_key_min_max(mut testing_planner: TestingPlanner) {
+    minute_grouped_table(&mut testing_planner, "ev");
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT extract(minute FROM EventTime) AS m, MIN(v), MAX(v) FROM ev GROUP BY m")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+
+    // minute 1 = {20, 40}; the others are singletons.
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v0"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10, 20, 30]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v1"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10, 40, 30]
+    );
+}
+
+#[rstest]
+fn group_by_computed_key_multi_agg(mut testing_planner: TestingPlanner) {
+    minute_grouped_table(&mut testing_planner, "ev");
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT extract(minute FROM EventTime) AS m, SUM(v), COUNT(*), MAX(v) FROM ev GROUP BY m")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v0"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10, 60, 30] // sum
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v1"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 1] // count(*)
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v2"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10, 40, 30] // max
+    );
+}
+
+#[rstest]
+fn group_by_computed_key_avg(mut testing_planner: TestingPlanner) {
+    minute_grouped_table(&mut testing_planner, "ev");
+
+    // AVG over a computed key errored before computed keys were folded into the
+    // general grouped path (DuckDB lowers it to sum+count over the key column).
+    let results = testing_planner
+        .planner
+        .plan(
+            "SELECT extract(minute FROM EventTime) AS m, AVG(v) AS a FROM ev GROUP BY m ORDER BY m",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    // Ordered by minute; the second column is the average (the divide projection
+    // renames columns, so read it by position). minute 1 = avg(20, 40) = 30.
+    let avgs: Vec<f64> = rows
+        .iter()
+        .map(|r| {
+            r.as_object()
+                .unwrap()
+                .values()
+                .nth(1)
+                .unwrap()
+                .as_f64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(avgs, vec![10.0, 30.0, 30.0]);
+}
+
+#[rstest]
+fn group_by_plain_and_computed_key(mut testing_planner: TestingPlanner) {
+    use arrow_array::Int64Array;
+    // A plain column key mixed with a computed key (ClickBench Q18 shape). Groups
+    // (uid, minute): (1,0)=v[10]; (1,1)=v[20,40]; (2,2)=v[30]. The multi-key row
+    // encoder names the two key columns k0, k1.
+    testing_planner.add_table(
+        "t",
+        &[
+            (
+                "uid",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![1, 1, 2, 1])) as ArrayRef,
+            ),
+            (
+                "EventTime",
+                Type::Timestamp,
+                Arc::new(Int64Array::from(vec![0i64, 90, 150, 90])) as ArrayRef,
+            ),
+            (
+                "v",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT uid, extract(minute FROM EventTime) AS m, SUM(v), COUNT(*) FROM t GROUP BY uid, m")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()));
+
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![(1, 0), (1, 1), (2, 2)]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v0"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![10, 60, 30] // sum
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v1"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 1] // count(*)
+    );
+}
+
+#[rstest]
+fn group_by_column_and_arithmetic_key(mut testing_planner: TestingPlanner) {
+    // A plain column grouped alongside an arithmetic expression of a DIFFERENT
+    // column, so the computed key isn't functionally derived from a group key
+    // (which DuckDB's RemoveDerivedGroups would prune). a=[1,1,2,1], b-1=[4,5,6,4]
+    // → groups (a, b-1): (1,4)=2 rows, (1,5)=1, (2,6)=1.
+    testing_planner.add_table(
+        "t",
+        &[
+            (
+                "a",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![1, 1, 2, 1])) as ArrayRef,
+            ),
+            (
+                "b",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![5, 6, 7, 5])) as ArrayRef,
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT a, b - 1 AS d, COUNT(*) FROM t GROUP BY a, d")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()));
+
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![(1, 4), (1, 5), (2, 6)]
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["v0"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![2, 1, 1]
+    );
+}
+
 /// Every `extract(<part> FROM ts)` part, validated against values produced by
 /// the DuckDB CLI at four timestamps (incl. a pre-epoch negative one and dates
 /// that exercise the ISO-week year-boundary rollover):
