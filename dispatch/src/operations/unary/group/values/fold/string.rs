@@ -24,19 +24,16 @@ pub struct StrMax<A = i128>(PhantomData<A>);
 
 macro_rules! str_extreme {
     ($Op:ident, $wins:tt) => {
-        // Lifetime-free: a container names `StrMin`'s `Acc`/`Cfg`/`merge` without
-        // touching the borrowed-`&str` `Fold` bound below.
+        // Lifetime-free: a container names `StrMin`'s `Acc`/`SharedContext`/`merge`
+        // without touching the borrowed-`&str` `Fold` bound below.
         impl<A: StringCell> FoldAcc for $Op<A> {
             type Acc = A;
-            type Cfg = Arc<SharedArena>;
+            type SharedContext = Arc<SharedArena>;
+            type WorkerContext = WorkerArena;
 
             #[inline(always)]
-            fn cfg(arena: &Arc<SharedArena>) -> Arc<SharedArena> {
-                arena.clone()
-            }
-            #[inline(always)]
-            fn merge(a: A, b: A, cfg: &Arc<SharedArena>) -> A {
-                if b.into_key().resolve(cfg) $wins a.into_key().resolve(cfg) {
+            fn merge(a: A, b: A, ctx: &Arc<SharedArena>) -> A {
+                if b.into_key().resolve(ctx) $wins a.into_key().resolve(ctx) {
                     b
                 } else {
                     a
@@ -45,23 +42,23 @@ macro_rules! str_extreme {
             fn finish(
                 name: &str,
                 col: SlabColumn<A>,
-                arena: &Arc<SharedArena>,
+                ctx: &Arc<SharedArena>,
             ) -> (Field, ArrayRef) {
-                A::finish(name, col, arena)
+                A::finish(name, col, ctx)
             }
         }
 
         impl<'b, A: StringCell> Fold<&'b str> for $Op<A> {
             #[inline(always)]
-            fn seed(v: &str, arena: &mut WorkerArena) -> A {
-                A::from_key(arena.push(v))
+            fn seed(v: &str, wc: &mut WorkerArena) -> A {
+                A::from_key(wc.push(v))
             }
             #[inline(always)]
-            fn update(acc: A, v: &str, arena: &mut WorkerArena, cfg: &Arc<SharedArena>) -> A {
+            fn update(acc: A, v: &str, wc: &mut WorkerArena, ctx: &Arc<SharedArena>) -> A {
                 // Raw bytes vs the current extreme (the cell viewed as a key);
                 // persist only a winner.
-                if v.as_bytes() $wins acc.into_key().resolve(cfg) {
-                    A::from_key(arena.push(v))
+                if v.as_bytes() $wins acc.into_key().resolve(ctx) {
+                    A::from_key(wc.push(v))
                 } else {
                     acc
                 }

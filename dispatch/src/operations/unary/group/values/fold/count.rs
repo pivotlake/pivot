@@ -3,12 +3,10 @@
 
 use super::{Fold, FoldAcc};
 use crate::arrays::SlabColumn;
-use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::values::cell::Numeric;
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 /// Counts rows, in accumulator width `A` (`i64` by default — a count never
 /// exceeds the row count). The width is generic so the runtime `Dynamic` value,
@@ -18,26 +16,25 @@ pub struct Count<A = i64>(PhantomData<A>);
 
 impl<A: Numeric> FoldAcc for Count<A> {
     type Acc = A;
-    type Cfg = ();
+    type SharedContext = ();
+    type WorkerContext = ();
 
     #[inline(always)]
-    fn cfg(_arena: &Arc<SharedArena>) {}
-    #[inline(always)]
-    fn merge(a: A, b: A, _cfg: &()) -> A {
+    fn merge(a: A, b: A, _ctx: &()) -> A {
         a + b
     }
-    fn finish(name: &str, col: SlabColumn<A>, _arena: &Arc<SharedArena>) -> (Field, ArrayRef) {
+    fn finish(name: &str, col: SlabColumn<A>, _ctx: &()) -> (Field, ArrayRef) {
         A::finish(name, col)
     }
 }
 
 impl<A: Numeric> Fold<()> for Count<A> {
     #[inline(always)]
-    fn seed(_v: (), _arena: &mut WorkerArena) -> A {
+    fn seed(_v: (), _wc: &mut ()) -> A {
         A::from(1)
     }
     #[inline(always)]
-    fn update(acc: A, _v: (), _arena: &mut WorkerArena, _cfg: &()) -> A {
+    fn update(acc: A, _v: (), _wc: &mut (), _ctx: &()) -> A {
         acc + A::from(1)
     }
 }

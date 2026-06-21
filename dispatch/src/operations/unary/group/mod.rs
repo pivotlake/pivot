@@ -104,7 +104,7 @@ pub use keys::{
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric, OpTuple,
-    Read, StrMax, StrMaxSlot, StrMin, StrMinSlot, StrRead, Sum, SumSlot, WideSum,
+    Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, WideSum, WorkerContext,
 };
 
 use crate::memory::SlabAllocator;
@@ -154,8 +154,9 @@ pub struct Group<K: KeyExtractor, V: AggregationValue> {
     key_cols: Vec<usize>,
     /// Slots drive the per-batch value reader (which column / `COUNT` vs `SUM`).
     value_slots: Vec<AggregationSlot>,
-    /// The value's merge-time config, built once from the slots (like `key_config`).
-    merge_config: V::MergeConfig,
+    /// The value's shared, read-side context, built once from the slots + value
+    /// arena (like `key_config`); resolves string keys during merge/output.
+    shared_context: V::SharedContext,
     key_config: K::Config,
 
     aggregated_table: AggregatedTable<K, V>,
@@ -180,7 +181,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
-        let merge_config = V::merge_config(&value_slots, &value_arena);
+        let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         // A string extreme persists its winner lazily during the in-place fold, so
         // it must not take the radix scatter path (which materialises — and thus
         // persists — every row's string before any comparison). Disable the switch
@@ -190,25 +191,28 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         } else {
             radix
         };
+        // The per-worker write context is spawned from the shared one (a fresh
+        // `WorkerArena` for a string value, `()` for numeric).
+        let aggregated_table =
+            AggregatedTable::new(state, key_arena.clone(), shared_context.worker(), radix);
         Self {
             key_cols,
             value_slots,
-            merge_config: merge_config.clone(),
+            shared_context: shared_context.clone(),
             key_config: key_config.clone(),
             outputter: GroupOutputter {
-                key_arena: key_arena.clone(),
-                value_arena: value_arena.clone(),
+                key_arena,
                 injector,
                 receiver,
                 partition_jobs_injected,
                 key_config,
-                merge_config,
+                shared_context,
                 top_k,
                 count_only,
                 output_allocator: None,
             },
             sender,
-            aggregated_table: AggregatedTable::new(state, key_arena, value_arena, radix),
+            aggregated_table,
         }
     }
 }
@@ -226,7 +230,7 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
             &self.key_cols,
             &self.value_slots,
             &self.key_config,
-            &self.merge_config,
+            &self.shared_context,
         );
         Ok(())
     }
@@ -248,16 +252,14 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
 pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     /// String *key* storage; backs the leading key column(s) at output.
     key_arena: Arc<SharedArena>,
-    /// String *value* storage (a string `MIN`/`MAX`); backs trailing value
-    /// column(s) and resolves extremes during the partition merge.
-    value_arena: Arc<SharedArena>,
     injector: Arc<Injector<PartitionJob<K, V>>>,
     receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     key_config: K::Config,
-    /// The value's merge config, threaded into each [`PartitionJob`] so the merge
-    /// folds existing entries via [`AggregationValue::merge`].
-    merge_config: V::MergeConfig,
+    /// The value's shared context, threaded into each [`PartitionJob`] so the merge
+    /// folds existing entries via [`AggregationValue::merge`] and the output
+    /// resolves string extremes (it carries the value arena).
+    shared_context: V::SharedContext,
     top_k: Option<(usize, usize)>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
@@ -282,13 +284,12 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     tables: Arc<Vec<MultiSlabTable<K, V>>>,
     index: usize,
     key_arena: Arc<SharedArena>,
-    value_arena: Arc<SharedArena>,
     partition_capacity: usize,
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
     key_config: K::Config,
-    /// The value's merge config, for the partition merge's entry fold.
-    merge_config: V::MergeConfig,
+    /// The value's shared context, for the partition merge's entry fold + output.
+    shared_context: V::SharedContext,
     top_k: Option<(usize, usize)>,
     count_only: bool,
 }
@@ -310,7 +311,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
             self.partition_capacity,
             self.num_partitions,
             &self.key_arena,
-            &self.merge_config,
+            &self.shared_context,
         );
         if result_map.len() == 0 {
             return Ok(());
@@ -318,10 +319,9 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
         output::build_and_send::<K, V, _, _>(
             result_map,
             &self.key_arena,
-            &self.value_arena,
             allocator,
             &self.key_config,
-            &self.merge_config,
+            &self.shared_context,
             self.top_k,
             self.count_only,
             sender,
@@ -380,11 +380,10 @@ impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutpu
                     tables: tables.clone(),
                     index: i,
                     key_arena: self.key_arena.clone(),
-                    value_arena: self.value_arena.clone(),
                     partition_capacity,
                     num_partitions,
                     key_config: self.key_config.clone(),
-                    merge_config: self.merge_config.clone(),
+                    shared_context: self.shared_context.clone(),
                     top_k: self.top_k,
                     count_only: self.count_only,
                 });
@@ -438,7 +437,6 @@ mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::keys::{IntKeyExtractor, StringKeyExtractor};
-    use crate::operations::unary::group::values::Sum;
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
@@ -975,46 +973,6 @@ mod tests {
         assert_eq!(
             row_key_rows(&sender),
             vec![(1, "a".to_string(), 13), (1, long.to_string(), 12)],
-        );
-    }
-
-    // ---- Mixed string + integer aggregates (`Compiled` per-op atoms) ----
-
-    /// `GROUP BY id` computing `MIN(name)` (string) and `MAX(v)` (int) in one
-    /// value — the heterogeneous mix the per-op `Compiled` tuple unlocks. Each
-    /// slot keeps its own cell (`ArenaKey` for the string, `i64` for the int) and
-    /// emits its own column type (`Utf8View`, `Int64`), with no per-row dispatch.
-    #[test]
-    fn mixed_string_min_int_max() {
-        // (id, name, v): id 1 -> min name "ant", max v 30; id 2 -> "fig", 7.
-        let batch = mixed_key_batch(
-            &[1, 2, 1, 2, 1],
-            &["cat", "fig", "ant", "bee", "dog"],
-            &[10, 7, 30, 5, 20],
-        );
-        let slots = vec![
-            AggregationSlot::new(AggregationKind::Min, 1), // MIN(name) — string
-            AggregationSlot::new(AggregationKind::Max, 2), // MAX(v)    — int
-        ];
-        type Mix = Compiled<(StrMinSlot, MaxSlot<Int32Type>)>;
-        let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
-            vec![vec![batch]],
-            vec![0],
-            slots,
-            None,
-            RadixConfig::DEFAULT,
-        );
-        let mut rows: Vec<(i64, String, i64)> = sender
-            .i64_column(0)
-            .into_iter()
-            .zip(sender.string_column(1))
-            .zip(sender.i64_column(2))
-            .map(|((id, name), v)| (id, name, v))
-            .collect();
-        rows.sort();
-        assert_eq!(
-            rows,
-            vec![(1, "ant".to_string(), 30), (2, "bee".to_string(), 7)]
         );
     }
 

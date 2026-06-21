@@ -8,10 +8,8 @@
 
 use super::{AggregationSlot, AggregationValue};
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
-use std::sync::Arc;
 
 /// Zero-sized keys-only value: distinctness needs no accumulator, so merging two
 /// occurrences of the same key is a no-op and the result has no value columns.
@@ -20,23 +18,21 @@ pub struct Distinct;
 
 impl AggregationValue for Distinct {
     type Reader<'b> = ();
-    type MergeConfig = ();
+    type SharedContext = ();
     type Columns = ();
     type SortKey = i64;
-
-    #[inline(always)]
-    fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
+    type WorkerContext = ();
 
     #[inline(always)]
     fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
 
     #[inline(always)]
-    fn value(_reader: &(), _idx: usize, _arena: &mut WorkerArena) -> Self {
+    fn value(_reader: &(), _idx: usize, _wc: &mut ()) -> Self {
         Distinct
     }
 
     #[inline(always)]
-    fn merge(self, _other: Self, _cfg: &()) -> Self {
+    fn merge(self, _other: Self, _ctx: &()) -> Self {
         // No accumulator — both sides are the same (distinct) key.
         self
     }
@@ -52,11 +48,7 @@ impl AggregationValue for Distinct {
     #[inline(always)]
     fn push_to(&self, _cols: &mut ()) {}
 
-    fn finish_columns(
-        _cols: (),
-        _arena: &Arc<SharedArena>,
-        _cfg: &(),
-    ) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish_columns(_cols: (), _ctx: &()) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
     }
 }
