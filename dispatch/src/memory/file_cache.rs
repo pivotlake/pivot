@@ -320,9 +320,20 @@ impl FileCache {
 
             // Register region → slot, unless another worker beat us to it.
             let file_maps = self.file_maps.read().unwrap();
-            let fd_regions = file_maps
-                .get(location)
-                .expect("Missing file in file cache!");
+            let Some(fd_regions) = file_maps.get(location) else {
+                // The outer entry was pruned (its last region was evicted) after
+                // this file was registered. Re-create it and retry; our unbound
+                // write buffer returns to the pool. The fresh entry is empty, so
+                // the evictor — which only prunes on a region eviction — can't
+                // race it away before we insert below.
+                drop(file_maps);
+                self.file_maps
+                    .write()
+                    .unwrap()
+                    .entry(location.clone())
+                    .or_default();
+                continue;
+            };
             let mut fd_regions = fd_regions.write().unwrap();
             if fd_regions.contains_key(&region) {
                 // Another worker already cached this region; retry the fast path
@@ -366,7 +377,10 @@ impl FileCache {
     /// the pin).
     fn get_buffer(&self, location: &FileLocation, region: usize) -> Option<ReadBuffer> {
         let file_maps = self.file_maps.read().unwrap();
-        let fd_regions = file_maps.get(location).unwrap().read().unwrap();
+        // The outer entry may be absent — its last region was evicted and pruned
+        // after registration. Treat that as a plain cache miss; `get_region`
+        // re-creates the entry before caching.
+        let fd_regions = file_maps.get(location)?.read().unwrap();
         let ring_idx = fd_regions.get(&region)?.ring_idx;
         let buffer = memory_ctx().ring().try_read(ring_idx)?;
         // Re-check under the pin: eviction may have recycled the slot for a
@@ -633,6 +647,32 @@ mod tests {
                 "an evicted file's outer file_maps entry was left behind — leak",
             );
         }
+    }
+
+    /// Regression: a registered file's reads call `get_region` many times while
+    /// the evictor may prune its entry between them (last region evicted). The
+    /// read path must re-create the entry and report a miss, not `unwrap`/`expect`
+    /// on the now-absent map entry.
+    #[test]
+    fn reading_a_file_after_its_entry_was_pruned_does_not_panic() {
+        init_test_free_pool(8);
+        let f = FileLocation::Local(std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()));
+        cache().open_entry(f.clone());
+        drop(miss(cache().get_region(&f, 0, 0, SB)));
+
+        // Evict the only cached region — the prune drops f's outer entry.
+        cache().evict();
+        assert!(
+            !cache().file_maps.read().unwrap().contains_key(&f),
+            "evicting the last region should prune the entry",
+        );
+
+        // Reading f again must tolerate the absent entry: re-create it + miss.
+        drop(miss(cache().get_region(&f, 0, 0, SB)));
+        assert!(
+            cache().file_maps.read().unwrap().contains_key(&f),
+            "re-reading a pruned file should re-create its entry",
+        );
     }
 
     #[test]
