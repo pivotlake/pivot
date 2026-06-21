@@ -4,12 +4,10 @@
 
 use super::{Fold, FoldAcc};
 use crate::arrays::SlabColumn;
-use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::values::cell::Numeric;
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 /// `MIN`, accumulating in width `A`.
 pub struct Min<A = i64>(PhantomData<A>);
@@ -20,30 +18,25 @@ macro_rules! int_extreme {
     ($Op:ident, $keep:ident) => {
         impl<A: Numeric> FoldAcc for $Op<A> {
             type Acc = A;
-            type Cfg = ();
+            type SharedContext = ();
+            type WorkerContext = ();
 
             #[inline(always)]
-            fn cfg(_arena: &Arc<SharedArena>) {}
-            #[inline(always)]
-            fn merge(a: A, b: A, _cfg: &()) -> A {
+            fn merge(a: A, b: A, _ctx: &()) -> A {
                 Ord::$keep(a, b)
             }
-            fn finish(
-                name: &str,
-                col: SlabColumn<A>,
-                _arena: &Arc<SharedArena>,
-            ) -> (Field, ArrayRef) {
+            fn finish(name: &str, col: SlabColumn<A>, _ctx: &()) -> (Field, ArrayRef) {
                 A::finish(name, col)
             }
         }
 
         impl<A: Numeric> Fold<i64> for $Op<A> {
             #[inline(always)]
-            fn seed(v: i64, _arena: &mut WorkerArena) -> A {
+            fn seed(v: i64, _wc: &mut ()) -> A {
                 A::from(v)
             }
             #[inline(always)]
-            fn update(acc: A, v: i64, _arena: &mut WorkerArena, _cfg: &()) -> A {
+            fn update(acc: A, v: i64, _wc: &mut (), _ctx: &()) -> A {
                 Ord::$keep(acc, A::from(v))
             }
         }

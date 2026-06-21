@@ -29,7 +29,7 @@ use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable,
 };
 use crate::operations::unary::group::hll::Hll;
-use crate::operations::unary::group::values::AggregationSlot;
+use crate::operations::unary::group::values::{AggregationSlot, WorkerContext};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
@@ -103,13 +103,15 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue> {
 /// switch, the per-partition scatter buffers plus a distinct-count sketch.
 pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     hash_state: RandomState,
-    /// String *key* storage. Separate from the value arena so a live string key
-    /// (which holds `&mut key_arena` until persisted) and a string-extreme value
-    /// fold (which needs `&mut value_arena`) never alias — letting consume probe
-    /// and fold in one fused pass.
+    /// String *key* storage. Separate from the value's write state so a live
+    /// string key (which holds `&mut key_arena` until persisted) and a
+    /// string-extreme value fold (which needs `&mut worker_context`) never alias —
+    /// letting consume probe and fold in one fused pass.
     key_arena: WorkerArena,
-    /// String *value* storage (a string `MIN`/`MAX`); empty for numeric values.
-    value_arena: WorkerArena,
+    /// The value's per-worker consume write state: `()` for a numeric signature
+    /// (consume threads `&mut ()`, free), a real `WorkerArena` for a string
+    /// extreme (it stores winners). Spawned by `Group` from the shared context.
+    worker_context: V::WorkerContext,
     allocator: SlabAllocator,
     /// Phase 1: stack of growing in-place tables.
     tables: Vec<MultiSlabTable<K, V>>,
@@ -138,7 +140,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     pub fn new(
         state: RandomState,
         key_arena: Arc<SharedArena>,
-        value_arena: Arc<SharedArena>,
+        worker_context: V::WorkerContext,
         radix: RadixConfig,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
@@ -146,7 +148,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         Self {
             hash_state: state,
             key_arena: WorkerArena::new(key_arena),
-            value_arena: WorkerArena::new(value_arena),
+            worker_context,
             allocator,
             tables: vec![table],
             buffers: None,
@@ -174,11 +176,11 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
-        merge_config: &V::MergeConfig,
+        shared_context: &V::SharedContext,
     ) {
         let total = batch.num_rows();
         if total <= RECORD_BATCH_SIZE {
-            self.consume_window(batch, key_cols, value_slots, key_config, merge_config);
+            self.consume_window(batch, key_cols, value_slots, key_config, shared_context);
             return;
         }
         let mut start = 0;
@@ -189,7 +191,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 key_cols,
                 value_slots,
                 key_config,
-                merge_config,
+                shared_context,
             );
             start += len;
         }
@@ -201,7 +203,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         key_cols: &[usize],
         value_slots: &[AggregationSlot],
         key_config: &K::Config,
-        merge_config: &V::MergeConfig,
+        shared_context: &V::SharedContext,
     ) {
         let length = batch.num_rows();
         debug_assert!(
@@ -233,8 +235,8 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
                 // The value type fixes the fold (Mono is branch-free, Dynamic
-                // dispatches per slot via `merge_config`); the probe just consumes.
-                self.consume_scalared(length, &key_reader, &value_reader, merge_config);
+                // dispatches per slot via `shared_context`); the probe just consumes.
+                self.consume_scalared(length, &key_reader, &value_reader, shared_context);
             }
         }
         self.scratch = scratch;
@@ -250,7 +252,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         length: usize,
         key_reader: &K::Reader<'b>,
         value_reader: &V::Reader<'b>,
-        merge_config: &V::MergeConfig,
+        shared_context: &V::SharedContext,
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
@@ -276,19 +278,21 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     table.prefetch(self.hashes[i + L1_DISTANCE]);
                 }
                 // Probe and fold in one pass. The live key persists into the key
-                // arena; the value arena is handed to whichever arm runs — `seed`
-                // materialises a new group's value, `update` folds the row into an
-                // existing one (a string extreme persists only if it wins).
-                // Separate arenas keep the key's borrow and the value's disjoint.
+                // arena; the value's write state (`&mut self.worker_context`) is
+                // handed to whichever arm runs — `seed` materialises a new group's
+                // value, `update` folds the row into an existing one (a string
+                // extreme persists only if it wins). When `V::WorkerContext` is `()`
+                // (a string-free `Compiled` signature) this threads `&mut ()` —
+                // free, with nothing in the loop that can alias the table it
+                // mutates; a string extreme threads its `WorkerArena` to store the
+                // winning string.
                 let key = K::live_key(key_reader, i, &mut self.key_arena);
                 table.probe_fold::<false, _, _, _, _>(
                     hash,
                     key,
-                    &mut self.value_arena,
-                    |arena, cell| *cell = V::value(value_reader, i, arena),
-                    |arena, cell| {
-                        *cell = cell.update_from_reader(value_reader, i, arena, merge_config)
-                    },
+                    &mut self.worker_context,
+                    |wc, cell| *cell = V::value(value_reader, i, wc),
+                    |wc, cell| *cell = cell.update_from_reader(value_reader, i, wc, shared_context),
                 );
                 table.undersized()
             };
@@ -333,7 +337,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         let shift = u64::BITS - self.radix_cfg.partitions.trailing_zeros();
         let Self {
             key_arena,
-            value_arena,
+            worker_context,
             allocator,
             buffers,
             hll,
@@ -345,11 +349,11 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             let hash = hashes[i];
             hll.add(hash);
             let p = (hash >> shift) as usize;
-            // Radix is integer-key-only (strings never radix), so the key never
-            // touches the key arena here; a string *extreme* value still persists
-            // into the value arena.
+            // Only a numeric signature ever radixes (a string extreme disables the
+            // switch), so `value` persists nothing into `worker_context` here even
+            // when it is a `Dynamic`'s `WorkerArena` (the string arms are dead).
             let key = K::live_key(key_reader, i, key_arena).persist();
-            let value = V::value(value_reader, i, value_arena);
+            let value = V::value(value_reader, i, worker_context);
             buffers[p].push(allocator, (hash, key, value));
         }
     }
@@ -368,7 +372,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             }
         }
         self.key_arena.flush();
-        self.value_arena.flush();
+        self.worker_context.flush();
         AggregatedTableOutput {
             tables: self.tables,
             buffers: self.buffers.map(PartitionBuffers),

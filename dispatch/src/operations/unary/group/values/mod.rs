@@ -11,9 +11,10 @@
 //! - an **[`Aggregation`]** op — fully typed to its own input array and cell
 //!   ([`Count`], [`Sum<T>`](Sum), [`Min<T>`](Min), [`Max<T>`](Max), [`StrMin`],
 //!   [`StrMax`]).
-//! - **containers** — [`Compiled`](container::Compiled) (a fixed tuple of ops,
-//!   any mix, branch-free) and [`Dynamic`](container::Dynamic) (a runtime numeric
-//!   signature folded per slot, generic over the width).
+//! - **containers** — [`Compiled`](container::Compiled) (a fixed *numeric* tuple
+//!   of ops, branch-free) and [`Dynamic`](container::Dynamic) (a runtime
+//!   signature folded per slot, generic over the width — the path for any string
+//!   extreme).
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
@@ -28,9 +29,7 @@ pub mod fold;
 pub mod read;
 
 pub use cell::{Cell, Numeric};
-pub use container::{
-    Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, StrMaxSlot, StrMinSlot, SumSlot,
-};
+pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, SumSlot};
 pub use distinct::Distinct;
 pub use fold::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
 pub use read::{IntRead, NoRead, Read, StrRead};
@@ -87,6 +86,51 @@ impl AggregationSlot {
     }
 }
 
+/// The shared, read-side context the merge + output phase resolves through — the
+/// counterpart to a value's per-worker [`WorkerContext`]. Built once from the
+/// slots and the value arena (cloned across workers and into the merge jobs).
+/// `()` for a numeric value (it stores nothing); a string-capable value carries
+/// the slot layout and the `Arc<SharedArena>` its keys resolve through.
+pub trait SharedContext: Clone + Send + Sync + 'static {
+    /// The per-worker write side this context spawns for the consume phase.
+    type Worker: WorkerContext;
+    /// Build the context for `slots` over the value `arena`.
+    fn build(slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Self;
+    /// Spawn a fresh per-worker write context (called once per worker).
+    fn worker(&self) -> Self::Worker;
+}
+
+/// The per-worker, exclusive write side of a value's string storage during
+/// consume. `()` for a numeric value; a [`WorkerArena`] for a string extreme.
+pub trait WorkerContext {
+    /// Hand any active arena buffer back to the shared arena at end of consume.
+    fn flush(self);
+}
+
+impl SharedContext for () {
+    type Worker = ();
+    fn build(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
+    fn worker(&self) {}
+}
+impl WorkerContext for () {
+    fn flush(self) {}
+}
+
+impl SharedContext for (Arc<[AggregationSlot]>, Arc<SharedArena>) {
+    type Worker = WorkerArena;
+    fn build(slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Self {
+        (Arc::from(slots), arena.clone())
+    }
+    fn worker(&self) -> WorkerArena {
+        WorkerArena::new(self.1.clone())
+    }
+}
+impl WorkerContext for WorkerArena {
+    fn flush(self) {
+        WorkerArena::flush(self)
+    }
+}
+
 /// The per-group value stored in a GROUP BY hash table — read from input rows,
 /// folded with other rows and partials, and emitted as the result's value columns.
 ///
@@ -100,46 +144,46 @@ impl AggregationSlot {
 pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
-    /// Runtime data [`merge`](Self::merge) needs that the type can't carry (slot
-    /// kinds for [`Dynamic`](container::Dynamic); the value arena for a string
-    /// extreme; `()` otherwise). Built once at `Group` creation, like
-    /// [`KeyExtractor::Config`](super::keys::KeyExtractor::Config).
-    type MergeConfig: Clone + Send + Sync + 'static;
+    /// The shared, read-side context [`merge`](Self::merge)/[`finish_columns`](Self::finish_columns)
+    /// resolve through (slot kinds for [`Dynamic`](container::Dynamic) + the value
+    /// arena for a string extreme; `()` otherwise). It builds the per-worker
+    /// [`WorkerContext`](Self::WorkerContext); see [`SharedContext`].
+    type SharedContext: SharedContext<Worker = Self::WorkerContext>;
     /// The result value columns under construction.
     type Columns;
     /// The scalar an `ORDER BY <slot> DESC LIMIT k` sorts on — widened to `i128`
     /// so a wide sum compares at full precision.
     type SortKey: Ord + Copy;
-
-    /// Build the [`MergeConfig`](Self::MergeConfig) for these `slots`, once, at
-    /// `Group` creation. `arena` is the *value* arena (a string extreme keeps it
-    /// to resolve `ArenaKey`s during the partition merge).
-    fn merge_config(slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Self::MergeConfig;
+    /// The per-worker write state consume folds into — `()` for an all-numeric
+    /// signature (so consume threads `&mut ()`, free: a `()` reference can't alias
+    /// the table the probe loop mutates), a real [`WorkerArena`] for a string
+    /// extreme. Spawned from [`SharedContext`](Self::SharedContext) per worker.
+    type WorkerContext: WorkerContext;
 
     /// Bind `batch`'s value columns for the configured `slots`.
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
 
     /// Materialise a brand-new group from row `idx` — the consume path's new-key
-    /// case, and the radix scatter. `arena` is the value arena a string extreme
-    /// persists its winning string into; numeric cells ignore it.
-    fn value(reader: &Self::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> Self;
+    /// case, and the radix scatter. `wc` is the per-worker write state a string
+    /// extreme persists its winning string into; numeric cells ignore it.
+    fn value(reader: &Self::Reader<'_>, idx: usize, wc: &mut Self::WorkerContext) -> Self;
 
     /// Fold row `idx` into this (existing) group. Defaults to merging the row's
     /// [`value`](Self::value) in; a string extreme overrides it to compare against
-    /// the current extreme (resolved via `arena`) and persist only when it wins.
+    /// the current extreme (resolved via `ctx`) and persist only when it wins.
     #[inline(always)]
     fn update_from_reader(
         self,
         reader: &Self::Reader<'_>,
         idx: usize,
-        arena: &mut WorkerArena,
-        cfg: &Self::MergeConfig,
+        wc: &mut Self::WorkerContext,
+        ctx: &Self::SharedContext,
     ) -> Self {
-        self.merge(Self::value(reader, idx, arena), cfg)
+        self.merge(Self::value(reader, idx, wc), ctx)
     }
 
     /// Combine two partial group values — the partition merge and the radix fold.
-    fn merge(self, other: Self, cfg: &Self::MergeConfig) -> Self;
+    fn merge(self, other: Self, ctx: &Self::SharedContext) -> Self;
 
     /// This group's value for slot `slot`, as an `ORDER BY` sort key.
     fn sort_key(&self, slot: usize) -> Self::SortKey;
@@ -149,14 +193,12 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     fn new_columns(allocator: &mut SlabAllocator, rows: usize) -> Self::Columns;
     /// Append this group to the columns.
     fn push_to(&self, cols: &mut Self::Columns);
-    /// Materialise the columns and their fields. `arena` backs the zero-copy
-    /// `StringView` output of a string extreme; numeric columns ignore it. `cfg`
+    /// Materialise the columns and their fields. `ctx` backs the zero-copy
+    /// `StringView` output of a string extreme (numeric columns ignore it) and
     /// carries the per-slot descriptor a runtime value ([`Dynamic`](container::Dynamic))
-    /// needs to pick each slot's output type (a string extreme renders `Utf8View`,
-    /// a numeric slot its width's Arrow type); fixed-signature values ignore it.
+    /// needs to pick each slot's output type.
     fn finish_columns(
         cols: Self::Columns,
-        arena: &Arc<SharedArena>,
-        cfg: &Self::MergeConfig,
+        ctx: &Self::SharedContext,
     ) -> (Vec<Field>, Vec<ArrayRef>);
 }

@@ -15,10 +15,8 @@ use super::super::{AggregationKind, AggregationSlot, AggregationValue};
 use super::dynamic::NumReader;
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
-use std::sync::Arc;
 
 /// One additive slot's reader: a `COUNT` (no column, contributes `1`) or a `SUM`
 /// (a numeric column, contributes the row's value). Built once per batch.
@@ -65,11 +63,10 @@ impl<const N: usize, A: Numeric> Default for Mono<N, A> {
 
 impl<const N: usize, A: Numeric> AggregationValue for Mono<N, A> {
     type Reader<'b> = [AddReader<'b>; N];
-    type MergeConfig = ();
+    type SharedContext = ();
     type Columns = [SlabColumn<A>; N];
     type SortKey = A;
-
-    fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
+    type WorkerContext = ();
 
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> [AddReader<'b>; N] {
         assert_eq!(slots.len(), N, "slot count must match N");
@@ -77,7 +74,7 @@ impl<const N: usize, A: Numeric> AggregationValue for Mono<N, A> {
     }
 
     #[inline(always)]
-    fn value(reader: &[AddReader<'_>; N], idx: usize, _arena: &mut WorkerArena) -> Self {
+    fn value(reader: &[AddReader<'_>; N], idx: usize, _wc: &mut ()) -> Self {
         let mut cells = [A::default(); N];
         #[allow(clippy::needless_range_loop)]
         for s in 0..N {
@@ -87,7 +84,7 @@ impl<const N: usize, A: Numeric> AggregationValue for Mono<N, A> {
     }
 
     #[inline(always)]
-    fn merge(self, other: Self, _cfg: &()) -> Self {
+    fn merge(self, other: Self, _ctx: &()) -> Self {
         // Branch-free: one `+` per cell, no per-slot dispatch.
         let mut cells = [A::default(); N];
         #[allow(clippy::needless_range_loop)]
@@ -113,14 +110,10 @@ impl<const N: usize, A: Numeric> AggregationValue for Mono<N, A> {
         }
     }
 
-    fn finish_columns(
-        cols: [SlabColumn<A>; N],
-        _arena: &Arc<SharedArena>,
-        _cfg: &(),
-    ) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish_columns(cols: [SlabColumn<A>; N], _ctx: &()) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = Vec::with_capacity(N);
         let arrays = Vec::with_capacity(N);
-        for (_s, _col) in cols.into_iter().enumerate() {
+        for _col in cols {
             // let (f, a) = <A as NumericArrow>::finish(&format!("v{s}"), col);
             todo!()
             // fields.push(f);

@@ -3,11 +3,14 @@
 //!
 //! A slot is one `(`[`Read`]`, `[`Fold`]`)` pair — named [`Pair`], aliased to
 //! [`CountSlot`]/[`SumSlot`]/… — a whole op with its own input array and its own
-//! cell. Because each slot carries its read *and* its fold, a `Compiled` shape
-//! mixes families freely — a string extreme beside an integer one
-//! (`Compiled<(StrMinSlot, MaxSlot<Int32Type>)>`), each reading its *own typed
-//! array*. That's what keeps string extremes lazy and removes every int/str
-//! special case.
+//! cell, so a `Compiled` mixes integer families freely (a `SUM` beside a `MAX`),
+//! each reading its *own typed array* with no per-row dispatch. It is
+//! **numeric-only**: every op's [`WorkerContext`](super::super::fold::FoldAcc::WorkerContext)
+//! and [`SharedContext`](super::super::fold::FoldAcc::SharedContext) is `()`, so
+//! both its value contexts are concretely `()` — consume threads `&mut ()` (free)
+//! and merge/finish thread `&()`. A signature carrying a string extreme — which
+//! needs a real `WorkerArena` to store winners — takes the
+//! [`Dynamic`](super::Dynamic) path instead.
 //!
 //! There is no per-slot trait and no plumbing trait: a slot's behaviour *is* its
 //! [`Read`] plus its [`Fold`]/[`FoldAcc`], so [`impl_compiled!`] emits the whole
@@ -25,16 +28,14 @@
 //! until plan time) fall back to [`Dynamic`](super::Dynamic).
 
 use super::super::cell::Cell;
-use super::super::fold::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum};
-use super::super::read::{IntRead, NoRead, Read, StrRead};
+use super::super::fold::{Count, Fold, FoldAcc, Max, Min, Sum};
+use super::super::read::{IntRead, NoRead, Read};
 use super::super::{AggregationSlot, AggregationValue};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 /// A `(Read, Fold)` pair as one *nominal* type — a slot. A bare `(R, F)` tuple
 /// would do, but nesting tuples inside a `Compiled<…>` signature blows the
@@ -57,10 +58,8 @@ pub type SumSlot<T, A = i64> = Pair<IntRead<T>, Sum<A>>;
 pub type MinSlot<T, A = i64> = Pair<IntRead<T>, Min<A>>;
 /// `MAX(col: T)` over an integer column, accumulating in `A`.
 pub type MaxSlot<T, A = i64> = Pair<IntRead<T>, Max<A>>;
-/// `MIN(col)` over a string column — the winning key in a 128-bit cell.
-pub type StrMinSlot<A = i128> = Pair<StrRead, StrMin<A>>;
-/// `MAX(col)` over a string column.
-pub type StrMaxSlot<A = i128> = Pair<StrRead, StrMax<A>>;
+// (No `StrMinSlot`/`StrMaxSlot`: `Compiled` is numeric-only — a string extreme.s
+// `WorkerContext` is `WorkerArena`, not `()` — so a string signature uses `Dynamic`.)
 
 /// What a tuple of slots stores: the parallel tuple of accumulator cells, e.g.
 /// `(i64,)` or `(i128, i64)`. The *only* thing [`Compiled`] needs from `Ops` that
@@ -99,7 +98,7 @@ impl<Ops: OpTuple> Default for Compiled<Ops> {
 /// unrolls the obvious per-slot call — `R::read` to pull the value,
 /// `F::seed`/`update`/`merge`/`finish` to fold it — and writes the
 /// reader / config / column shapes as literal tuples. The lifetime-free
-/// `F::Acc`/`Cfg`/`merge`/… come from `FoldAcc`; only `seed`/`update` (which take
+/// `F::Acc`/`SharedContext`/`merge`/… come from `FoldAcc`; only `seed`/`update` (which take
 /// the read value) need the `for<'b> Fold<…>` bound a borrowed `&str` forces.
 macro_rules! impl_compiled {
     ($($R:ident $F:ident $idx:tt),+) => {
@@ -110,19 +109,20 @@ macro_rules! impl_compiled {
             type Accs = ($($F::Acc,)+);
         }
 
+        // `Compiled` is numeric-only — every op's `WorkerContext`/`SharedContext`
+        // is `()` — so both its contexts are concretely `()`: consume threads
+        // `&mut ()` (free) and merge/finish thread `&()`. A signature with a string
+        // extreme takes the `Dynamic` path instead, whose contexts are a real
+        // `WorkerArena` / `(slots, Arc<SharedArena>)`.
         impl<$($R, $F),+> AggregationValue for Compiled<($(Pair<$R, $F>,)+)>
         where
-            $($R: Read, $F: FoldAcc + for<'b> Fold<$R::Val<'b>>, $F::Acc: Into<i128>,)+
+            $($R: Read, $F: FoldAcc<SharedContext = (), WorkerContext = ()> + for<'b> Fold<$R::Val<'b>>, $F::Acc: Into<i128>,)+
         {
             type Reader<'b> = ($($R::Input<'b>,)+);
-            type MergeConfig = ($($F::Cfg,)+);
+            type SharedContext = ();
             type Columns = ($(SlabColumn<$F::Acc>,)+);
             type SortKey = i128;
-
-            fn merge_config(_slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Self::MergeConfig {
-                // The kinds are static (named in the tuple); only the arena is runtime.
-                ($($F::cfg(arena),)+)
-            }
+            type WorkerContext = ();
 
             fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b> {
                 debug_assert_eq!(slots.len(), [$($idx),+].len(), "slot count must match the tuple arity");
@@ -130,8 +130,8 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
-            fn value(reader: &Self::Reader<'_>, idx: usize, arena: &mut WorkerArena) -> Self {
-                Self { accs: ($($F::seed($R::read(&reader.$idx, idx), arena),)+) }
+            fn value(reader: &Self::Reader<'_>, idx: usize, wc: &mut ()) -> Self {
+                Self { accs: ($($F::seed($R::read(&reader.$idx, idx), wc),)+) }
             }
 
             #[inline(always)]
@@ -139,17 +139,17 @@ macro_rules! impl_compiled {
                 self,
                 reader: &Self::Reader<'_>,
                 idx: usize,
-                arena: &mut WorkerArena,
-                cfg: &Self::MergeConfig,
+                wc: &mut (),
+                ctx: &(),
             ) -> Self {
                 Self {
-                    accs: ($($F::update(self.accs.$idx, $R::read(&reader.$idx, idx), arena, &cfg.$idx),)+),
+                    accs: ($($F::update(self.accs.$idx, $R::read(&reader.$idx, idx), wc, ctx),)+),
                 }
             }
 
             #[inline(always)]
-            fn merge(self, other: Self, cfg: &Self::MergeConfig) -> Self {
-                Self { accs: ($($F::merge(self.accs.$idx, other.accs.$idx, &cfg.$idx),)+) }
+            fn merge(self, other: Self, ctx: &()) -> Self {
+                Self { accs: ($($F::merge(self.accs.$idx, other.accs.$idx, ctx),)+) }
             }
 
             #[inline(always)]
@@ -174,13 +174,12 @@ macro_rules! impl_compiled {
 
             fn finish_columns(
                 cols: Self::Columns,
-                arena: &Arc<SharedArena>,
-                _cfg: &Self::MergeConfig,
+                ctx: &(),
             ) -> (Vec<Field>, Vec<ArrayRef>) {
                 let mut fields = Vec::new();
                 let mut arrays = Vec::new();
                 $(
-                    let (f, a) = $F::finish(&format!("v{}", $idx), cols.$idx, arena);
+                    let (f, a) = $F::finish(&format!("v{}", $idx), cols.$idx, ctx);
                     fields.push(f);
                     arrays.push(a);
                 )+

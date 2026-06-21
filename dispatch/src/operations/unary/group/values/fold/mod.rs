@@ -30,34 +30,37 @@ pub use sum::{Sum, WideSum};
 
 use super::cell::Cell;
 use crate::arrays::SlabColumn;
-use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
-use std::sync::Arc;
 
 /// An op's *accumulator* behaviour — everything that doesn't depend on the read
 /// value `V`: the cell type, how two partials combine, the sort key, the render.
 ///
-/// Kept separate from [`Fold`] so a container can name `Acc`/`Cfg` **without**
+/// Kept separate from [`Fold`] so a container can name `Acc`/`SharedContext` **without**
 /// going through the `for<'b> Fold<…>` bound a borrowed read value (`&'b str`)
 /// forces — that lifetime-carrying projection sends the monomorphisation
 /// collector into a loop when the value flows through the top-k heap.
 pub trait FoldAcc: Send + Sync + 'static {
     /// This op's accumulator cell (`i64` / `i128` / `ArenaKey`-in-`i128`).
     type Acc: Cell;
-    /// Runtime data [`merge`](Self::merge) / [`Fold::update`] need that the type
-    /// can't carry: the value arena for a string extreme; `()` otherwise.
-    type Cfg: Clone + Send + Sync + 'static;
+    /// The shared, read-side context [`merge`](Self::merge)/[`finish`](Self::finish)
+    /// resolve through: the value arena (`Arc<SharedArena>`) for a string extreme,
+    /// `()` for a numeric op.
+    type SharedContext: Clone + Send + Sync + 'static;
+    /// The per-worker write state [`seed`](Fold::seed)/[`update`](Fold::update)
+    /// fold into during consume: `()` for a numeric op (it persists nothing), the
+    /// concrete [`WorkerArena`] for a string extreme (it stores winners). A
+    /// numeric op's `()` lets consume thread `&mut ()` — free, since a `()`
+    /// reference can't alias the table the probe loop mutates.
+    type WorkerContext;
 
-    /// Build the fold config from the value arena.
-    fn cfg(arena: &Arc<SharedArena>) -> Self::Cfg;
     /// Combine two finished partials — the partition merge and radix fold.
-    fn merge(a: Self::Acc, b: Self::Acc, cfg: &Self::Cfg) -> Self::Acc;
+    fn merge(a: Self::Acc, b: Self::Acc, ctx: &Self::SharedContext) -> Self::Acc;
     /// Render a finished column of cells into the Arrow array + field.
     fn finish(
         name: &str,
         col: SlabColumn<Self::Acc>,
-        arena: &Arc<SharedArena>,
+        ctx: &Self::SharedContext,
     ) -> (Field, ArrayRef);
 }
 
@@ -68,8 +71,13 @@ pub trait FoldAcc: Send + Sync + 'static {
 /// extreme persists only a winner here).
 pub trait Fold<V>: FoldAcc {
     /// Materialise a new group's cell from a row's value.
-    fn seed(v: V, arena: &mut WorkerArena) -> Self::Acc;
+    fn seed(v: V, wc: &mut Self::WorkerContext) -> Self::Acc;
     /// Fold a value into an existing cell (a string extreme compares the raw
     /// `&str` and persists only when it wins).
-    fn update(acc: Self::Acc, v: V, arena: &mut WorkerArena, cfg: &Self::Cfg) -> Self::Acc;
+    fn update(
+        acc: Self::Acc,
+        v: V,
+        wc: &mut Self::WorkerContext,
+        ctx: &Self::SharedContext,
+    ) -> Self::Acc;
 }
