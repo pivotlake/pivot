@@ -106,17 +106,19 @@ fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
 }
 
 /// The aggregate kind for a `MIN`/`MAX` over a column of type `ty`: the byte-wise
-/// string extreme (`StrMin`/`StrMax`) for a `Utf8` column so the value container
-/// folds it through its arena path, the numeric extreme otherwise. Shared by the
-/// global and grouped aggregate paths.
-fn extreme_kind(is_max: bool, ty: &Type) -> dispatch::AggregationKind {
+/// string extreme (`StrMin`/`StrMax`) for a `Utf8` column (folded through the value
+/// container's arena path), the numeric extreme for the integer widths the executor
+/// can read (`Int16`/`Int32`/`Int64`). `None` for any other type — the caller turns
+/// that into a clean `UnsupportedAggregateExpression` error rather than a worker
+/// panic in `NumReader::bind` / `reduce_int_column`, which handle only those widths.
+/// Shared by the global and grouped aggregate paths.
+fn extreme_kind(is_max: bool, ty: &Type) -> Option<dispatch::AggregationKind> {
     use dispatch::AggregationKind::{Max, Min, StrMax, StrMin};
-    match (ty == &Type::Utf8, is_max) {
-        (true, false) => StrMin,
-        (true, true) => StrMax,
-        (false, false) => Min,
-        (false, true) => Max,
-    }
+    Some(match ty {
+        Type::Utf8 => if is_max { StrMax } else { StrMin },
+        Type::Int16 | Type::Int32 | Type::Int64 => if is_max { Max } else { Min },
+        _ => return None,
+    })
 }
 
 impl Aggregate {
@@ -175,18 +177,16 @@ impl Aggregate {
                         Expression::AggregateFunc(AggregateFunc::Sum(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Sum, a.column.column_idx),
                         ),
-                        Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(
-                            AggregationSlot::new(
-                                extreme_kind(false, &a.column.return_type),
-                                a.column.column_idx,
-                            ),
-                        ),
-                        Expression::AggregateFunc(AggregateFunc::Max(a)) => Ok(
-                            AggregationSlot::new(
-                                extreme_kind(true, &a.column.return_type),
-                                a.column.column_idx,
-                            ),
-                        ),
+                        Expression::AggregateFunc(AggregateFunc::Min(a)) => {
+                            extreme_kind(false, &a.column.return_type)
+                                .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
+                                .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))
+                        }
+                        Expression::AggregateFunc(AggregateFunc::Max(a)) => {
+                            extreme_kind(true, &a.column.return_type)
+                                .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
+                                .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))
+                        }
                         Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Count, a.column.column_idx),
                         ),
@@ -579,14 +579,16 @@ impl Aggregate {
                     AggregationKind::Sum,
                     a.column.column_idx,
                 )),
-                Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(AggregationSlot::new(
-                    extreme_kind(false, &a.column.return_type),
-                    a.column.column_idx,
-                )),
-                Expression::AggregateFunc(AggregateFunc::Max(a)) => Ok(AggregationSlot::new(
-                    extreme_kind(true, &a.column.return_type),
-                    a.column.column_idx,
-                )),
+                Expression::AggregateFunc(AggregateFunc::Min(a)) => {
+                    extreme_kind(false, &a.column.return_type)
+                        .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
+                        .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))
+                }
+                Expression::AggregateFunc(AggregateFunc::Max(a)) => {
+                    extreme_kind(true, &a.column.return_type)
+                        .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
+                        .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))
+                }
                 Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(AggregationSlot::new(
                     AggregationKind::Count,
                     a.column.column_idx,

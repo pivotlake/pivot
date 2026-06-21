@@ -56,8 +56,8 @@ pub enum AggregationKind {
     /// `MAX(col)` over an integer column.
     Max,
     /// `MIN(col)` over a string (`Utf8`) column — its cell is an `ArenaKey` and
-    /// its fold compares the raw bytes, so it routes through the container's
-    /// string path, not the numeric [`combine`](Self::combine).
+    /// its fold ([`StrMin`]) compares the raw bytes through the value arena, not
+    /// the numeric path.
     StrMin,
     /// `MAX(col)` over a string (`Utf8`) column.
     StrMax,

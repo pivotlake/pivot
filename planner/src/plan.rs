@@ -129,7 +129,21 @@ impl PlanNode {
                 }
                 Step::SetAgg(slot) => {
                     if let Operator::Aggregate(a) = &mut node.operator {
-                        a.top_k = Some((slot, limit));
+                        // Don't push top-k onto a string MIN/MAX. A string
+                        // extreme's `sort_key` is its raw `ArenaKey`/StringView
+                        // header bits, not lexicographic order, so a per-partition
+                        // top-k would keep the wrong rows. Leave it to the full
+                        // `TopN` sort above (only the pushdown is skipped).
+                        use crate::expression::AggregateFunc;
+                        let string_extreme = matches!(
+                            a.expressions.get(slot),
+                            Some(Expression::AggregateFunc(
+                                AggregateFunc::Min(x) | AggregateFunc::Max(x)
+                            )) if x.column.return_type == crate::types::Type::Utf8
+                        );
+                        if !string_extreme {
+                            a.top_k = Some((slot, limit));
+                        }
                     }
                     return;
                 }

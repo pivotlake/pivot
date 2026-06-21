@@ -778,6 +778,38 @@ fn grouped_string_min_and_max(mut testing_planner: TestingPlanner) {
     assert_eq!(maxes[1]["v0"], "date");
 }
 
+#[rstest]
+fn grouped_string_max_order_by_limit(mut testing_planner: TestingPlanner) {
+    // ORDER BY MAX(s) DESC LIMIT must rank by lexicographic order. A string
+    // extreme's sort_key is its raw ArenaKey bits, so the group top-k pushdown
+    // must NOT fire on it (plan.rs guards it); the full TopN sorts instead.
+    // Per-group MAX: g1=avocado, g2=zebra, g3=melon -> DESC LIMIT 1 -> zebra.
+    testing_planner.add_table(
+        "gsl",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2, 3, 3])),
+            (
+                "s",
+                Type::Utf8,
+                str_col(vec!["apple", "avocado", "zebra", "yak", "mango", "melon"]),
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, MAX(s) FROM gsl GROUP BY g ORDER BY MAX(s) DESC LIMIT 1")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["v0"], "zebra");
+}
+
 /// A string extreme mixed with the opposite direction (or with integer
 /// aggregates) routes to the runtime `Dynamic` value (widened to `i128` so the
 /// `ArenaKey` cell fits) rather than the homogeneous `Compiled` tuple. Both the

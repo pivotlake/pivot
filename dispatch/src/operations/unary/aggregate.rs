@@ -128,39 +128,52 @@ fn merge_num<A: Numeric>(kind: AggregationKind, a: A, b: A) -> A {
 }
 
 /// Reduce one batch's integer column to a partial of `kind` (`SUM`/`MIN`/`MAX`),
-/// or `None` if the column is empty. The width is hoisted out of the row loop, and
-/// the loop seeds from the first element then folds the rest — so there is no
-/// per-row take-first (`Option`) check; only `merge_num`'s kind match, which is
-/// loop-invariant and lifts out.
+/// or `None` if it contributes nothing (empty or all-NULL). NULLs are skipped
+/// (SQL aggregates ignore them). See `reduce_with!` for the vectorised no-NULL
+/// fast path vs the null-skipping slow path.
 fn reduce_int_column<A: Numeric>(kind: AggregationKind, arr: &dyn Array) -> Option<A> {
-    // Hoist the `kind` dispatch OUT of the row loop: each arm is then a
-    // monomorphic reduction (`acc + v` / `acc.min/max(v)`) that LLVM recognises
-    // and vectorises. Calling `merge_num(kind, ..)` per row left a loop-carried
-    // runtime branch the autovectoriser would not lift, so the reduction ran
-    // scalar — ~2x slower on a full-column SUM.
     macro_rules! reduce_primitive {
         ($ty:ty) => {{
             let a = arr.as_primitive::<$ty>();
             if a.is_empty() {
                 return None;
             }
+            // `reduce_with!` takes the per-op combine so `kind` is hoisted OUT of
+            // the row loop: the no-NULL arm is then a monomorphic reduction LLVM
+            // vectorises (a per-row `merge_num(kind, ..)` left a loop-carried branch
+            // the autovectoriser would not lift — ~2x slower on a full-column SUM).
+            // The NULL arm skips null slots (SQL aggregates ignore NULLs) and so
+            // carries the take-first `Option`; it only runs when NULLs are present.
             macro_rules! reduce_with {
                 ($merge:expr) => {{
-                    let mut acc = A::from(unsafe { a.value_unchecked(0) } as i64);
-                    for i in 1..a.len() {
-                        let v = A::from(unsafe { a.value_unchecked(i) } as i64);
-                        acc = $merge(acc, v);
+                    if a.null_count() == 0 {
+                        let mut acc = A::from(unsafe { a.value_unchecked(0) } as i64);
+                        for i in 1..a.len() {
+                            acc = $merge(acc, A::from(unsafe { a.value_unchecked(i) } as i64));
+                        }
+                        Some(acc)
+                    } else {
+                        let mut acc: Option<A> = None;
+                        for i in 0..a.len() {
+                            if a.is_null(i) {
+                                continue;
+                            }
+                            let v = A::from(unsafe { a.value_unchecked(i) } as i64);
+                            acc = Some(match acc {
+                                Some(p) => $merge(p, v),
+                                None => v,
+                            });
+                        }
+                        acc
                     }
-                    acc
                 }};
             }
-            let acc = match kind {
+            match kind {
                 AggregationKind::Sum => reduce_with!(|a, b| Sum::<A>::merge(a, b, &())),
                 AggregationKind::Min => reduce_with!(|a, b| Min::<A>::merge(a, b, &())),
                 AggregationKind::Max => reduce_with!(|a, b| Max::<A>::merge(a, b, &())),
                 _ => unreachable!("reduce_int_column only handles SUM/MIN/MAX"),
-            };
-            Some(acc)
+            }
         }};
     }
 
@@ -173,24 +186,38 @@ fn reduce_int_column<A: Numeric>(kind: AggregationKind, arr: &dyn Array) -> Opti
 }
 
 /// Reduce one batch's `Utf8View` column to its extreme (`is_max` picks `MAX` vs
-/// `MIN`), or `None` if empty. Seeds from the first row and keeps a *borrowed*
-/// `&str` winner through the loop, allocating the owned `String` once at the end —
-/// no per-row take-first check and no per-row allocation.
+/// `MIN`), or `None` if it contributes nothing (empty or all-NULL). NULLs are
+/// skipped. Keeps a *borrowed* `&str` winner through the loop, allocating the owned
+/// `String` once at the end — no per-row allocation. The grouped
+/// `StrMin`/`StrMax::merge` can't be reused here — it folds arena keys resolved
+/// through the value arena, which the global path has no arena for — so the extreme
+/// is a plain `Ord` compare on the `&str` itself.
 fn reduce_str_column(is_max: bool, arr: &dyn Array) -> Option<String> {
     let a = arr.as_string_view();
-    if a.is_empty() {
-        return None;
+    if a.null_count() == 0 {
+        if a.is_empty() {
+            return None;
+        }
+        let mut acc: &str = unsafe { a.value_unchecked(0) };
+        for i in 1..a.len() {
+            let v = unsafe { a.value_unchecked(i) };
+            acc = if is_max { acc.max(v) } else { acc.min(v) };
+        }
+        Some(acc.to_string())
+    } else {
+        let mut acc: Option<&str> = None;
+        for i in 0..a.len() {
+            if a.is_null(i) {
+                continue;
+            }
+            let v = unsafe { a.value_unchecked(i) };
+            acc = Some(match acc {
+                Some(p) => if is_max { p.max(v) } else { p.min(v) },
+                None => v,
+            });
+        }
+        acc.map(str::to_string)
     }
-    // Keep a borrowed winner through the loop, allocating once at the end. The
-    // grouped `StrMin`/`StrMax::merge` can't be reused — it folds arena keys
-    // resolved through the value arena, which the global path has no arena for —
-    // so the extreme is a plain `Ord` compare on the `&str` itself.
-    let mut acc: &str = unsafe { a.value_unchecked(0) };
-    for i in 1..a.len() {
-        let v = unsafe { a.value_unchecked(i) };
-        acc = if is_max { acc.max(v) } else { acc.min(v) };
-    }
-    Some(acc.to_string())
 }
 
 /// The output column name for an aggregate of this kind.
@@ -453,7 +480,9 @@ mod tests {
     fn single_worker_sum() {
         // Int32 column → i64 accumulator → Int64 output.
         let ops = build::<i64>(1, vec![slot(AggregationKind::Sum, 0)]);
+
         let out = run_consumers(ops, vec![vec![make_batch(&[1, 2, 3]), make_batch(&[4, 5])]]);
+
         assert_eq!(out.items.len(), 1);
         assert_eq!(col_i64(&out.items[0], 0), 15);
     }
@@ -467,7 +496,9 @@ mod tests {
                 slot(AggregationKind::Count, 0),
             ],
         );
+
         let out = run_consumers(ops, vec![vec![make_batch(&[2, 4, 6, 8])]]);
+
         assert_eq!(out.items.len(), 1);
         assert_eq!(col_i64(&out.items[0], 0), 20); // sum
         assert_eq!(col_i64(&out.items[0], 1), 4); // count
@@ -476,6 +507,7 @@ mod tests {
     #[test]
     fn multiple_workers_sum_merge() {
         let ops = build::<i64>(3, vec![slot(AggregationKind::Sum, 0)]);
+
         let out = run_consumers(
             ops,
             vec![
@@ -484,6 +516,7 @@ mod tests {
                 vec![make_batch(&[1])],
             ],
         );
+
         assert_eq!(out.items.len(), 1);
         assert_eq!(col_i64(&out.items[0], 0), 36);
     }
@@ -503,14 +536,18 @@ mod tests {
         )
         .unwrap();
         let ops = build::<i128>(1, vec![slot(AggregationKind::Sum, 0)]);
+
         let out = run_consumers(ops, vec![vec![batch]]);
+
         assert_eq!(col_i128(&out.items[0], 0), 3 * i64::MAX as i128);
     }
 
     #[test]
     fn count_star_counts_all_rows() {
         let ops = build::<i64>(1, vec![slot(AggregationKind::CountStar, 0)]);
+
         let out = run_consumers(ops, vec![vec![make_batch(&[5, 6, 7]), make_batch(&[8])]]);
+
         assert_eq!(col_i64(&out.items[0], 0), 4);
     }
 
@@ -521,10 +558,12 @@ mod tests {
             1,
             vec![slot(AggregationKind::Min, 0), slot(AggregationKind::Max, 0)],
         );
+
         let out = run_consumers(
             ops,
             vec![vec![make_batch(&[5, 2, 9]), make_batch(&[7, 1, 8])]],
         );
+
         assert_eq!(out.items.len(), 1);
         assert_eq!(col_i64(&out.items[0], 0), 1); // min
         assert_eq!(col_i64(&out.items[0], 1), 9); // max
@@ -539,6 +578,7 @@ mod tests {
             3,
             vec![slot(AggregationKind::Min, 0), slot(AggregationKind::Max, 0)],
         );
+
         let out = run_consumers(
             ops,
             vec![
@@ -547,17 +587,39 @@ mod tests {
                 vec![make_batch(&[7])],
             ],
         );
+
         assert_eq!(out.items.len(), 1);
         assert_eq!(col_i64(&out.items[0], 0), -3); // min
         assert_eq!(col_i64(&out.items[0], 1), 20); // max
     }
 
     #[test]
-    fn empty_input_sum_is_zero() {
+    fn empty_input_sum_is_null() {
         let ops = build::<i64>(1, vec![slot(AggregationKind::Sum, 0)]);
+
         let out = run_consumers(ops, vec![vec![]]);
+
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i64(&out.items[0], 0), 0);
+        assert!(out.items[0].column(0).is_null(0)); // SUM of zero rows is NULL
+    }
+
+    #[test]
+    fn min_max_skip_nulls() {
+        let array = Int32Array::from(vec![Some(5), None, Some(2), None, Some(9)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)])),
+            vec![Arc::new(array)],
+        )
+        .unwrap();
+        let ops = build::<i64>(
+            1,
+            vec![slot(AggregationKind::Min, 0), slot(AggregationKind::Max, 0)],
+        );
+
+        let out = run_consumers(ops, vec![vec![batch]]);
+
+        assert_eq!(col_i64(&out.items[0], 0), 2); // min ignores NULLs
+        assert_eq!(col_i64(&out.items[0], 1), 9); // max ignores NULLs
     }
 
     #[test]
@@ -570,6 +632,7 @@ mod tests {
                 slot(AggregationKind::StrMax, 0),
             ],
         );
+
         let out = run_consumers(
             ops,
             vec![vec![
@@ -577,6 +640,7 @@ mod tests {
                 make_str_batch(&["date", "avocado"]),
             ]],
         );
+
         assert_eq!(out.items.len(), 1);
         assert_eq!(col_str(&out.items[0], 0), "apple"); // min
         assert_eq!(col_str(&out.items[0], 1), "date"); // max
@@ -591,6 +655,7 @@ mod tests {
                 slot(AggregationKind::StrMax, 0),
             ],
         );
+
         let out = run_consumers(
             ops,
             vec![
@@ -599,6 +664,7 @@ mod tests {
                 vec![make_str_batch(&["kiwi"])],
             ],
         );
+
         assert_eq!(out.items.len(), 1);
         assert_eq!(col_str(&out.items[0], 0), "apple"); // min
         assert_eq!(col_str(&out.items[0], 1), "zebra"); // max
@@ -627,7 +693,9 @@ mod tests {
                 slot(AggregationKind::Sum, 1),
             ],
         );
+
         let out = run_consumers(ops, vec![vec![batch]]);
+
         assert_eq!(col_str(&out.items[0], 0), "apple");
         assert_eq!(col_i64(&out.items[0], 1), 6);
     }
