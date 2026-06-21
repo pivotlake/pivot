@@ -74,6 +74,7 @@ impl Table for TestTable {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        _cache: &dyn planner::catalog::QueryContext,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         Ok(table_input_with_filter(
             dispatcher,
@@ -96,6 +97,7 @@ impl Table for TestTable {
         &self,
         input: RecordBatchOperatorSpec,
         projection: Projection,
+        _cache: &dyn planner::catalog::QueryContext,
     ) -> RecordBatchOperatorSpec {
         catalog::parquet::materialize(input, self.parquet_table.clone(), projection)
     }

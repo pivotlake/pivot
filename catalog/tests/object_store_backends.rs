@@ -91,8 +91,7 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Pa
 /// the table's `value` column, sorted.
 fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
     PlannerCatalog::refresh(cat, name).unwrap();
-    let table = cat.binding(name).expect("table bound");
-    let parquet = table.current_parquet();
+    let parquet = cat.current_parquet(name);
     let out = table_input(d, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -102,7 +101,7 @@ fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
 }
 
 fn row_groups(cat: &ParquetCatalog, name: &str) -> usize {
-    cat.binding(name).unwrap().current_parquet().row_groups().len()
+    cat.current_parquet(name).row_groups().len()
 }
 
 // --- behaviours (run on every backend) -------------------------------------

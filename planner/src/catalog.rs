@@ -12,6 +12,7 @@
 //! standalone wrapper structs (rather than blanket impls) because the orphan
 //! rule prevents implementing a foreign trait for `Box<dyn Table>` directly.
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use crate::expression::{CompareType, TableFilter};
@@ -65,6 +66,29 @@ pub struct CreateTableRequest {
     pub if_not_exists: bool,
 }
 
+/// An opaque per-query context, created once per [`Plan::compile`](crate::Plan::compile)
+/// (via [`Catalog::query_context`]) and threaded to every [`Table::compile`]. The
+/// planner treats it as a black box; a backend's [`Table`] downcasts it to its
+/// own concrete context and reads whatever it needs. The catalog, for instance,
+/// uses it to reload + pin each table's files once per query — so a reused
+/// (cached) plan sees data committed since it was planned, and a scan and its
+/// late materialize share one snapshot.
+pub trait QueryContext {
+    /// Downcast hook. The trait carries no behaviour of its own — a backend
+    /// recovers its concrete context from this and reads whatever it needs.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// The default [`QueryContext`]: carries nothing, for backends whose tables are
+/// always current (e.g. in-memory test stubs) and never downcast it.
+pub struct NoQueryContext;
+
+impl QueryContext for NoQueryContext {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A table that the planner can read from.
 ///
 /// Implementations expose two pieces of information: the column list (used
@@ -85,25 +109,21 @@ pub trait Table: Debug + Send + Sync {
     /// row-group ID and per-row index). Backends that don't materialize can
     /// ignore it; the bridge only sets it on a late-materialized query's narrow
     /// scan.
+    /// `ctx` is the per-query [`QueryContext`]; a backend reading mutable storage
+    /// downcasts it to reload itself to the latest committed version before
+    /// scanning, so a reused (cached) plan sees data committed since it was
+    /// planned. Backends with no such notion ignore it.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        ctx: &dyn QueryContext,
     ) -> Result<RecordBatchOperatorSpec>;
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
-
-    /// The table's catalog name, if it has one — used by
-    /// [`Plan::compile`](crate::Plan::compile) to refresh exactly the tables a
-    /// plan reads to their latest committed version before compiling. `None` for
-    /// backends that aren't catalog-resolved (e.g. test stubs), which then need
-    /// no refresh.
-    fn name(&self) -> Option<&str> {
-        None
-    }
 
     /// Clone this table into a fresh boxed trait object.
     ///
@@ -123,6 +143,7 @@ pub trait Table: Debug + Send + Sync {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
+        _ctx: &dyn QueryContext,
     ) -> RecordBatchOperatorSpec {
         unreachable!("materialize called on a table that does not support late materialization")
     }
@@ -189,15 +210,19 @@ pub trait Catalog: Debug + Send + Sync {
     /// concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>>;
 
-    /// Reload `name` to its latest committed version so a query (including one
-    /// replaying a cached plan) reads data committed since it was planned.
-    /// Called once per referenced table at the top of
-    /// [`Plan::compile`](crate::Plan::compile), before any scan reads its files,
-    /// so a table feeding both a scan and a late materialize refreshes once and
-    /// both see one consistent snapshot. Default: no-op, for backends whose
-    /// tables are always current (e.g. in-memory test stubs).
+    /// Reload `name` to its latest committed version. Default: no-op, for
+    /// backends whose tables are always current (e.g. in-memory test stubs).
+    /// The per-query reloading a compiling plan does goes through
+    /// [`query_cache`](Catalog::query_cache); this is the one-shot primitive
+    /// underneath it (and what callers outside a query use).
     fn refresh(&self, _name: &str) -> Result<()> {
         Ok(())
+    }
+
+    /// A fresh [`QueryContext`] for one [`Plan::compile`](crate::Plan::compile).
+    /// Default: an empty context, for always-current backends.
+    fn query_context(&self) -> Box<dyn QueryContext> {
+        Box::new(NoQueryContext)
     }
 
     /// Compile a `CREATE TABLE` statement into the dataflow that writes the new

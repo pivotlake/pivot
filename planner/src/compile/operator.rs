@@ -3,7 +3,7 @@
 //! Each [`Operator`](crate::operator::Operator) variant has a `compile`
 //! method here that translates it into a [`RecordBatchOperatorSpec`] call.
 
-use crate::catalog::{Catalog, DynamicScanPredicate};
+use crate::catalog::{Catalog, DynamicScanPredicate, QueryContext};
 use crate::compile::dummy_scan::DummyScanNullaryFactory;
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::dynamic_filter::DynamicFilter;
@@ -734,6 +734,7 @@ impl Input {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
+        ctx: &dyn QueryContext,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let column_indices: Vec<usize> = self
@@ -755,6 +756,7 @@ impl Input {
                 projection,
                 dynamic_filters,
                 self.emit_row_group_metadata,
+                ctx,
             )
             .map_err(Error::TableScan)
     }
@@ -764,9 +766,10 @@ impl Materialize {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        ctx: &dyn QueryContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let projection = DispatchProjection::columns(self.columns.iter().copied());
-        Ok(self.table.materialize(input, projection))
+        Ok(self.table.materialize(input, projection, ctx))
     }
 }
 

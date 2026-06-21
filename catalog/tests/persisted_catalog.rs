@@ -105,7 +105,7 @@ fn create_table_with_path_scans_rows() {
 
     let table = catalog.binding("events").expect("table created");
     assert_eq!(table.columns.len(), 2);
-    let parquet = table.current_parquet();
+    let parquet = catalog.current_parquet("events");
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -143,7 +143,7 @@ fn tables_persist_across_reopen() {
         .binding("events")
         .expect("table reloaded from the manifest");
     assert_eq!(table.columns.len(), 2);
-    let parquet = table.current_parquet();
+    let parquet = reopened.current_parquet("events");
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -162,8 +162,8 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 
         // A data-less table: registered, with no row groups (its data lives under
         // `<root>/t`, which fills in once a file is registered there).
-        let t = catalog.binding("t").unwrap();
-        assert!(t.current_parquet().row_groups().is_empty());
+        assert!(catalog.binding("t").is_some());
+        assert!(catalog.current_parquet("t").row_groups().is_empty());
     }
 
     // And it survives a reopen.
@@ -203,9 +203,8 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     )
     .unwrap();
 
-    let table = catalog.binding("events").unwrap();
-    assert_eq!(table.current_parquet().row_groups().len(), 8);
-    let parquet = table.current_parquet();
+    assert_eq!(catalog.current_parquet("events").row_groups().len(), 8);
+    let parquet = catalog.current_parquet("events");
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -214,8 +213,8 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     // The no-data case drives the same fan-in with nothing to fetch: every
     // worker's sink finishes empty and worker 0 still commits.
     create(&dispatch, &catalog, rooted_request("empty", columns())).unwrap();
-    let empty = catalog.binding("empty").unwrap();
-    assert!(empty.current_parquet().row_groups().is_empty());
+    assert!(catalog.binding("empty").is_some());
+    assert!(catalog.current_parquet("empty").row_groups().is_empty());
 }
 
 #[test]
