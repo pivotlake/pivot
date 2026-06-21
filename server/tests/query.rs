@@ -145,6 +145,97 @@ async fn drop_cache_evicts_file_cache(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn global_min_max_answers_from_metadata(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_minmax", dir.path()).await;
+
+    let rows = select_rows(&conn, "SELECT MIN(id), MAX(id) FROM people_minmax").await;
+
+    assert_eq!(rows, vec![vec![Some("1".into()), Some("3".into())]]);
+}
+
+/// The unfiltered global MIN/MAX short-circuits to parquet row-group stats and
+/// never reads a data page, so it leaves the file cache empty. Proven by
+/// clearing the cache (of any footer-load residue), running the aggregate, and
+/// finding nothing to evict afterwards.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn global_min_max_does_not_scan(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_minmax_noscan", dir.path()).await;
+
+    select_one_i64(&conn, "SELECT drop_cache()").await;
+    select_rows(&conn, "SELECT MIN(id), MAX(id) FROM people_minmax_noscan").await;
+    let evicted = select_one_i64(&conn, "SELECT drop_cache()").await;
+
+    assert_eq!(evicted, 0, "metadata short-circuit must not scan any pages");
+}
+
+/// A WHERE clause excludes rows, so the metadata short-circuit is unsound and
+/// must not fire: the aggregate returns the *filtered* extremes (not the whole
+/// table's) and actually scans pages (the cache has something to evict after).
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_min_max_does_not_short_circuit(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_minmax_filtered", dir.path()).await;
+
+    select_one_i64(&conn, "SELECT drop_cache()").await;
+    let rows =
+        select_rows(&conn, "SELECT MIN(id), MAX(id) FROM people_minmax_filtered WHERE id > 1")
+            .await;
+    let evicted = select_one_i64(&conn, "SELECT drop_cache()").await;
+
+    assert_eq!(rows, vec![vec![Some("2".into()), Some("3".into())]]);
+    assert!(evicted >= 1, "a filtered aggregate must scan, not read stats");
+}
+
+/// Regression: the metadata short-circuit only fires for integer/temporal
+/// columns whose stats cast losslessly to Int64. Before the type allowlist, a
+/// global MIN/MAX over a DOUBLE column cast the float stats to Int64 and
+/// silently returned the truncated values ([3, 9] for {3.7, 9.2}); now a
+/// non-integer column declines the short-circuit, so the truncated row is never
+/// produced (today the unsupported float aggregate errors instead of
+/// corrupting, either outcome is acceptable, the wrong row is not).
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn global_min_max_does_not_short_circuit_double_column(#[future] conn: Conn) {
+    let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
+    let f: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![3.7f64, 9.2, 5.0]));
+    let dir = write_parquet(&RecordBatch::try_new(schema, vec![f]).unwrap());
+    conn.simple_query(&format!(
+        "CREATE TABLE doubles (f DOUBLE) WITH (path = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    let result = conn.simple_query("SELECT MIN(f), MAX(f) FROM doubles").await;
+
+    if let Ok(msgs) = result {
+        let rows: Vec<Vec<Option<String>>> = msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => {
+                    Some((0..r.len()).map(|i| r.get(i).map(|s| s.to_string())).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_ne!(
+            rows,
+            vec![vec![Some("3".into()), Some("9".into())]],
+            "DOUBLE MIN/MAX must not be silently truncated to Int64"
+        );
+    }
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn query_against_unknown_table_errors(#[future] conn: Conn) {
     let err = conn
         .simple_query("SELECT id FROM does_not_exist")
