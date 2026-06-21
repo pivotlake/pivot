@@ -105,6 +105,20 @@ fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
     })
 }
 
+/// The aggregate kind for a `MIN`/`MAX` over a column of type `ty`: the byte-wise
+/// string extreme (`StrMin`/`StrMax`) for a `Utf8` column so the value container
+/// folds it through its arena path, the numeric extreme otherwise. Shared by the
+/// global and grouped aggregate paths.
+fn extreme_kind(is_max: bool, ty: &Type) -> dispatch::AggregationKind {
+    use dispatch::AggregationKind::{Max, Min, StrMax, StrMin};
+    match (ty == &Type::Utf8, is_max) {
+        (true, false) => StrMin,
+        (true, true) => StrMax,
+        (false, false) => Min,
+        (false, true) => Max,
+    }
+}
+
 impl Aggregate {
     pub fn compile(
         &self,
@@ -161,24 +175,18 @@ impl Aggregate {
                         Expression::AggregateFunc(AggregateFunc::Sum(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Sum, a.column.column_idx),
                         ),
-                        // A MIN/MAX over a string column folds the byte extreme
-                        // (StrMin/StrMax); over an integer column the numeric one.
-                        Expression::AggregateFunc(AggregateFunc::Min(a)) => {
-                            let kind = if a.column.return_type == Type::Utf8 {
-                                AggregationKind::StrMin
-                            } else {
-                                AggregationKind::Min
-                            };
-                            Ok(AggregationSlot::new(kind, a.column.column_idx))
-                        }
-                        Expression::AggregateFunc(AggregateFunc::Max(a)) => {
-                            let kind = if a.column.return_type == Type::Utf8 {
-                                AggregationKind::StrMax
-                            } else {
-                                AggregationKind::Max
-                            };
-                            Ok(AggregationSlot::new(kind, a.column.column_idx))
-                        }
+                        Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(
+                            AggregationSlot::new(
+                                extreme_kind(false, &a.column.return_type),
+                                a.column.column_idx,
+                            ),
+                        ),
+                        Expression::AggregateFunc(AggregateFunc::Max(a)) => Ok(
+                            AggregationSlot::new(
+                                extreme_kind(true, &a.column.return_type),
+                                a.column.column_idx,
+                            ),
+                        ),
                         Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(
                             AggregationSlot::new(AggregationKind::Count, a.column.column_idx),
                         ),
@@ -571,23 +579,12 @@ impl Aggregate {
                     AggregationKind::Sum,
                     a.column.column_idx,
                 )),
-                // A `Utf8` extreme is stamped `StrMin`/`StrMax` so the value
-                // container folds it through its arena path (an `ArenaKey` cell);
-                // an integer extreme stays numeric.
                 Expression::AggregateFunc(AggregateFunc::Min(a)) => Ok(AggregationSlot::new(
-                    if a.column.return_type == Type::Utf8 {
-                        AggregationKind::StrMin
-                    } else {
-                        AggregationKind::Min
-                    },
+                    extreme_kind(false, &a.column.return_type),
                     a.column.column_idx,
                 )),
                 Expression::AggregateFunc(AggregateFunc::Max(a)) => Ok(AggregationSlot::new(
-                    if a.column.return_type == Type::Utf8 {
-                        AggregationKind::StrMax
-                    } else {
-                        AggregationKind::Max
-                    },
+                    extreme_kind(true, &a.column.return_type),
                     a.column.column_idx,
                 )),
                 Expression::AggregateFunc(AggregateFunc::Count(a)) => Ok(AggregationSlot::new(

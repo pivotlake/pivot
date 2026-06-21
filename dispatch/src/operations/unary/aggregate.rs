@@ -89,15 +89,9 @@ impl<A: Numeric> Partial<A> {
         match self {
             Partial::Num(total) => num_column::<A>(kind, total),
             Partial::Str(total) => {
-                let name = if matches!(kind, AggregationKind::StrMax) {
-                    "max"
-                } else {
-                    "min"
-                };
-                let arr: ArrayRef = Arc::new(StringViewArray::from_iter(std::iter::once(
-                    total.as_deref(),
-                )));
-                (Field::new(name, DataType::Utf8View, true), arr)
+                let arr: ArrayRef =
+                    Arc::new(StringViewArray::from_iter(std::iter::once(total.as_deref())));
+                (Field::new(column_name(kind), DataType::Utf8View, true), arr)
             }
         }
     }
@@ -199,23 +193,26 @@ fn reduce_str_column(is_max: bool, arr: &dyn Array) -> Option<String> {
     Some(acc.to_string())
 }
 
+/// The output column name for an aggregate of this kind.
+fn column_name(kind: AggregationKind) -> &'static str {
+    match kind {
+        AggregationKind::CountStar | AggregationKind::Count => "count",
+        AggregationKind::Sum => "sum",
+        AggregationKind::Min | AggregationKind::StrMin => "min",
+        AggregationKind::Max | AggregationKind::StrMax => "max",
+    }
+}
+
 /// Build the single output column for one numeric aggregate slot. `None` means
 /// zero rows were aggregated: a SQL `NULL` for `SUM`/`MIN`/`MAX`, `0` for `COUNT`.
 fn num_column<A: Numeric>(kind: AggregationKind, total: Option<A>) -> (Field, ArrayRef) {
     match kind {
         // `Int64` or `Decimal128(38, 0)` per the accumulator width; nullable, so
         // an empty input emits `NULL` (DuckDB's `SUM`/`MIN`/`MAX` of nothing).
-        AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
-            let name = match kind {
-                AggregationKind::Min => "min",
-                AggregationKind::Max => "max",
-                _ => "sum",
-            };
-            (
-                Field::new(name, A::data_type(), true),
-                A::scalar_array(total),
-            )
-        }
+        AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => (
+            Field::new(column_name(kind), A::data_type(), true),
+            A::scalar_array(total),
+        ),
         // A count is `0` over zero rows (never NULL) and fits i64; the checked
         // narrowing panics on the impossible overflow rather than truncating.
         AggregationKind::Count | AggregationKind::CountStar => {
@@ -223,7 +220,7 @@ fn num_column<A: Numeric>(kind: AggregationKind, total: Option<A>) -> (Field, Ar
                 .map(|v| i64::try_from(v.into()).expect("count exceeds i64::MAX"))
                 .unwrap_or(0);
             (
-                Field::new("count", DataType::Int64, false),
+                Field::new(column_name(kind), DataType::Int64, false),
                 Arc::new(Int64Array::from(vec![count])),
             )
         }
