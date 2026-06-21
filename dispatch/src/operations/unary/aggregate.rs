@@ -139,17 +139,33 @@ fn merge_num<A: Numeric>(kind: AggregationKind, a: A, b: A) -> A {
 /// per-row take-first (`Option`) check; only `merge_num`'s kind match, which is
 /// loop-invariant and lifts out.
 fn reduce_int_column<A: Numeric>(kind: AggregationKind, arr: &dyn Array) -> Option<A> {
+    // Hoist the `kind` dispatch OUT of the row loop: each arm is then a
+    // monomorphic reduction (`acc + v` / `acc.min/max(v)`) that LLVM recognises
+    // and vectorises. Calling `merge_num(kind, ..)` per row left a loop-carried
+    // runtime branch the autovectoriser would not lift, so the reduction ran
+    // scalar — ~2x slower on a full-column SUM.
     macro_rules! reduce_primitive {
         ($ty:ty) => {{
             let a = arr.as_primitive::<$ty>();
             if a.is_empty() {
                 return None;
             }
-            let mut acc = A::from(unsafe { a.value_unchecked(0) } as i64);
-            for i in 1..a.len() {
-                let v = A::from(unsafe { a.value_unchecked(i) } as i64);
-                acc = merge_num(kind, acc, v);
+            macro_rules! reduce_with {
+                ($merge:expr) => {{
+                    let mut acc = A::from(unsafe { a.value_unchecked(0) } as i64);
+                    for i in 1..a.len() {
+                        let v = A::from(unsafe { a.value_unchecked(i) } as i64);
+                        acc = $merge(acc, v);
+                    }
+                    acc
+                }};
             }
+            let acc = match kind {
+                AggregationKind::Sum => reduce_with!(|a, b| Sum::<A>::merge(a, b, &())),
+                AggregationKind::Min => reduce_with!(|a, b| Min::<A>::merge(a, b, &())),
+                AggregationKind::Max => reduce_with!(|a, b| Max::<A>::merge(a, b, &())),
+                _ => unreachable!("reduce_int_column only handles SUM/MIN/MAX"),
+            };
             Some(acc)
         }};
     }
