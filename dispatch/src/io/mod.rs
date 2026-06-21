@@ -281,6 +281,25 @@ pub struct HttpRequest {
     pub block: MissingBlock,
 }
 
+/// A read request that knows how many bytes it transfers, so stats can total
+/// the bytes read alongside the request count. Both transports read a
+/// [`MissingBlock`], so both report its byte length.
+pub trait ReadLen {
+    fn read_len(&self) -> u64;
+}
+
+impl ReadLen for FsRequest {
+    fn read_len(&self) -> u64 {
+        self.block.len() as u64
+    }
+}
+
+impl ReadLen for HttpRequest {
+    fn read_len(&self) -> u64 {
+        self.block.len() as u64
+    }
+}
+
 /// Associates a read request ([`FsRequest`] or [`HttpRequest`]) with the
 /// dataflow and operator that issued it, so the completed read can be routed
 /// back to the correct operator.

@@ -353,10 +353,15 @@ fn remote_scan_reports_io_and_cpu_stats() {
         "the scan fetched column chunks over http"
     );
     assert!(
+        stats.http_bytes > 0,
+        "and those reads moved bytes over the wire"
+    );
+    assert!(
         stats.http_time > Duration::ZERO,
         "and those reads took time"
     );
     assert_eq!(stats.disk_requests, 0, "a remote scan reads no local files");
+    assert_eq!(stats.disk_bytes, 0, "and so reads no bytes off disk");
     assert_eq!(
         stats.disk_time,
         Duration::ZERO,
