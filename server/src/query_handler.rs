@@ -24,16 +24,17 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
 use async_trait::async_trait;
-use dispatch::{CancelToken, DataFlowHandle};
-use futures::{Sink, stream};
+use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
+use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{QueryResponse, Response};
+use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers,
@@ -41,9 +42,15 @@ use pgwire::api::{
 use pgwire::error::PgWireResult;
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::response::NoticeResponse;
 use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::{info, warn};
+
+/// Per-connection flag (a GUC-style name) toggled with `SET pivot_stats = true`.
+/// (DuckDB's parser rejects the bare Postgres `= on` keyword, so use `= true`,
+/// `= 1`, or quoted `= 'on'`.)
+const STATS_FLAG: &str = "pivot_stats";
 
 thread_local! {
     /// One [`planner::Planner`] (and its non-`Send` DuckDB context) per
@@ -166,7 +173,10 @@ impl PivotQueryHandler {
         }
     }
 
-    async fn run_query(&self, query: &str) -> Result<Response> {
+    /// Plan `query`, then either run it (timing each phase, tallying the
+    /// dataflow's IO/CPU work when `collect_stats`) or — if it turned out to be a
+    /// `SET`/`RESET` — return that for the caller to apply to the connection.
+    async fn run_query(&self, query: &str, collect_stats: bool) -> Result<Outcome> {
         let dispatcher = self.dispatcher.clone();
         let query = query.to_string();
 
@@ -174,7 +184,9 @@ impl PivotQueryHandler {
         // read-only SELECT plans are ever inserted, so a cache hit is always a
         // SELECT regardless of what `query` is. Planning is a fixed few-ms cost;
         // skipping it on repeated SELECTs shaves that off every query after the
-        // first.
+        // first — which the `plan` phase time below makes visible (near-zero on a
+        // hit, the full planner round-trip on a miss).
+        let started = Instant::now();
         let cached = self.plan_cache.lock().unwrap().get(&query).cloned();
         let plan = match cached {
             Some(plan) => plan,
@@ -198,50 +210,171 @@ impl PivotQueryHandler {
                 plan
             }
         };
+        let plan_time = started.elapsed();
 
-        // Compile the (possibly cached) plan into a fresh dataflow and launch
-        // it. `compile` is pure pivot work (no DuckDB), so it runs on any
-        // blocking thread without the planner thread-local.
+        // A `SET`/`RESET` is a session command, not a query — DuckDB parsed and
+        // typed it for us, so there's no string-munging here. It compiles to no
+        // dataflow; hand it back for `do_query` to apply to the connection.
+        if let Some(set) = plan.as_set_variable() {
+            return Ok(Outcome::Set {
+                name: set.name.clone(),
+                value: set.value.clone(),
+            });
+        }
+
+        // Compile the plan into a fresh dataflow and launch it. `compile` is pure
+        // pivot work (no DuckDB), so it runs on any blocking thread without the
+        // planner thread-local. `execute_with_stats` turns on the dataflow's
+        // IO/CPU tally only when the client asked for it.
+        let started = Instant::now();
         let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-            let spec = plan.compile(&dispatcher)?;
-            Ok(spec.map(|| |b| PGRowBatch::from(b)).execute())
+            let rows = plan.compile(&dispatcher)?.map(|| |b| PGRowBatch::from(b));
+            Ok(if collect_stats {
+                rows.execute_with_stats()
+            } else {
+                rows.execute()
+            })
         })
         .await
         .map_err(Error::PlannerPanic)??;
+        let compile_time = started.elapsed();
 
         // Cancel the dataflow if our future is dropped before drain finishes —
         // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
         // raw disconnects (whole connection task dropped).
         let guard = CancelOnDrop::new(handle.cancel_token());
-        let batches: Vec<_> = tokio::task::spawn_blocking(move || handle.collect())
+        let started = Instant::now();
+        let (batches, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
             .await
             .map_err(Error::WorkerPanic)??;
+        let exec_time = started.elapsed();
         guard.defuse();
 
         let fields = batches
             .first()
             .map_or(Arc::new(vec![]), |b| b.fields.clone());
-        Ok(Response::Query(QueryResponse::new(
+        let response = Response::Query(QueryResponse::new(
             fields,
             stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
-        )))
+        ));
+        Ok(Outcome::Query(
+            response,
+            QueryStats {
+                plan: plan_time,
+                compile: compile_time,
+                exec: exec_time,
+                flow,
+            },
+        ))
     }
+}
+
+/// What [`run_query`](PivotQueryHandler::run_query) resolved a statement to.
+enum Outcome {
+    /// A normal query: its rows plus where its time went.
+    Query(Response, QueryStats),
+    /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
+    /// for `RESET`; the server decides which names actually mean anything.
+    Set { name: String, value: Option<String> },
+}
+
+/// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
+/// tally — formatted into a one-line client `NOTICE` when stats are on.
+struct QueryStats {
+    plan: Duration,
+    compile: Duration,
+    exec: Duration,
+    flow: DataFlowStats,
+}
+
+impl QueryStats {
+    fn summary(&self) -> String {
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        // The IO/cpu figures are sums (over workers and in-flight reads), so
+        // `time/reads` is the average read latency and the totals can top exec.
+        format!(
+            "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
+             http={} reads/{:.1}ms  disk={} reads/{:.1}ms  cpu={:.1}ms",
+            ms(self.plan),
+            ms(self.compile),
+            ms(self.exec),
+            self.flow.http_requests,
+            ms(self.flow.http_time),
+            self.flow.disk_requests,
+            ms(self.flow.disk_time),
+            ms(self.flow.cpu),
+        )
+    }
+}
+
+/// Apply a `SET`/`RESET` to the connection. pivot only knows [`STATS_FLAG`];
+/// every other name is accepted as a no-op, since clients routinely set GUCs
+/// (`client_encoding`, `application_name`, …) we don't model. Acks with the verb
+/// the client used (`SET`/`RESET`).
+fn apply_set<C: ClientInfo>(client: &mut C, name: &str, value: Option<&str>) -> Response {
+    if name.eq_ignore_ascii_case(STATS_FLAG) {
+        // RESET (no value) or any non-truthy value turns it off.
+        if value.is_some_and(is_truthy) {
+            client
+                .metadata_mut()
+                .insert(STATS_FLAG.to_string(), "on".to_string());
+        } else {
+            client.metadata_mut().remove(STATS_FLAG);
+        }
+    }
+    Response::Execution(Tag::new(if value.is_none() { "RESET" } else { "SET" }))
+}
+
+/// Whether a serialized `SET` value reads as on. Covers the spellings DuckDB may
+/// produce — `true`/`1` for a boolean/int literal, `on`/`yes` for a quoted string.
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "t" | "1" | "on" | "yes"
+    )
+}
+
+/// Whether this connection has `pivot_stats` on.
+fn stats_on<C: ClientInfo>(client: &C) -> bool {
+    client.metadata().get(STATS_FLAG).is_some_and(|v| v == "on")
 }
 
 #[async_trait]
 impl SimpleQueryHandler for PivotQueryHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let with_stats = stats_on(client);
+
         info!(sql = %query, "query received");
-        let res = self.run_query(query).await.map_err(|e| {
+        let outcome = self.run_query(query, with_stats).await.map_err(|e| {
             warn!(error = %e, sql = %query, "query failed");
             e.into_pgwire()
         })?;
+
+        let res = match outcome {
+            // `SET pivot_stats = true` (DuckDB-parsed) flips the per-connection flag.
+            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+            Outcome::Query(res, stats) => {
+                // Send the breakdown as an INFO notice before the rows; psql prints it.
+                if with_stats {
+                    let notice = NoticeResponse::from(ErrorInfo::new(
+                        "INFO".to_string(),
+                        "00000".to_string(),
+                        stats.summary(),
+                    ));
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(notice))
+                        .await?;
+                }
+                res
+            }
+        };
+
         info!(sql = %query, "query succeeded");
         Ok(vec![res])
     }

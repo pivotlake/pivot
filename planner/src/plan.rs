@@ -11,7 +11,7 @@
 
 use crate::catalog::Catalog;
 use crate::expression::Expression;
-use crate::operator::{self, Operator, OrderByDirection};
+use crate::operator::{self, Operator, OrderByDirection, SetVariable};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -148,6 +148,25 @@ impl PlanNode {
 pub struct Plan {
     pub catalog: Arc<dyn Catalog>,
     pub root: PlanNode,
+}
+
+impl Plan {
+    /// If this plan is a bare `SET`/`RESET`, return it. Such a statement is a
+    /// session command, not a query — it compiles to nothing — so the server
+    /// checks this first and acts on the variables it recognises instead of
+    /// running a dataflow.
+    ///
+    /// Requires no child operators: a plain `SET x = <const>`/`RESET x` has none,
+    /// whereas DuckDB's `SET VARIABLE x = <expr>` (a user variable, which pivot
+    /// doesn't support) carries its value as a child subtree — exclude that so it
+    /// falls through to a clean "not compilable" error rather than being applied
+    /// with a bogus value.
+    pub fn as_set_variable(&self) -> Option<&SetVariable> {
+        match &self.root.operator {
+            Operator::SetVariable(set) if self.root.inputs.is_empty() => Some(set),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Plan {

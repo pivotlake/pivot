@@ -1,6 +1,7 @@
 use crate::Identifier;
 use crate::data_flow::DataFlow;
 use crate::operations::Operator;
+use crate::stats::DataFlowStats;
 use ahash::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -49,10 +50,20 @@ impl Chain {
         self,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
+        stats_tx: mpsc::Sender<DataFlowStats>,
+        collect_stats: bool,
     ) -> DataFlow {
         let map: HashMap<Identifier, Identifier> =
             (0..self.operators.len() - 1).map(|i| (i, i + 1)).collect();
-        DataFlow::new(next_dataflow_id(), cancelled, err_tx, self.operators, map)
+        DataFlow::new(
+            next_dataflow_id(),
+            cancelled,
+            err_tx,
+            self.operators,
+            map,
+            stats_tx,
+            collect_stats,
+        )
     }
 }
 
@@ -66,6 +77,10 @@ pub struct DataFlowBuilder {
     cancelled: Arc<AtomicBool>,
     /// A sender for errors that may occur during running
     err_tx: mpsc::Sender<crate::data_flow::Error>,
+    /// Where this worker's stats tally is shipped (used only when `collect_stats`)
+    stats_tx: mpsc::Sender<DataFlowStats>,
+    /// Whether the query opted into per-dataflow stats collection
+    collect_stats: bool,
     /// The last operator in the dataflow
     build: Box<dyn FnOnce() -> Chain + Send>,
 }
@@ -75,10 +90,14 @@ impl DataFlowBuilder {
         build: Box<dyn FnOnce() -> Chain + Send>,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
+        stats_tx: mpsc::Sender<DataFlowStats>,
+        collect_stats: bool,
     ) -> Self {
         Self {
             cancelled,
             err_tx,
+            stats_tx,
+            collect_stats,
             build,
         }
     }
@@ -95,6 +114,11 @@ impl DataFlowBuilder {
             Error::PanicOnBuild(msg.to_string())
         })?;
 
-        Ok(chain.into_data_flow(self.cancelled, self.err_tx))
+        Ok(chain.into_data_flow(
+            self.cancelled,
+            self.err_tx,
+            self.stats_tx,
+            self.collect_stats,
+        ))
     }
 }

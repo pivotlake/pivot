@@ -74,6 +74,7 @@ mod data_flow;
 mod functions;
 mod operations;
 mod scan;
+mod stats;
 
 use crate::operations::nullary::OneShotNullaryFactory;
 use crate::worker::{Worker, WorkerWaker};
@@ -87,6 +88,7 @@ pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use scan::{Projection, ROW_GROUP_IDX_FIELD, ROW_IDX_FIELD, trailing_metadata_columns};
+pub use stats::DataFlowStats;
 
 pub use operations::channels::{
     ChannelFactory, FanInChannelFactory, MpscReceiver, Receiver, ReturnToWorkerMpscFactory,

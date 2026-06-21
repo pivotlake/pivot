@@ -1,3 +1,4 @@
+use crate::stats::DataFlowStats;
 use crate::worker::WorkerWaker;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -12,6 +13,8 @@ pub struct DataFlowHandle<T> {
     rx: mpsc::Receiver<T>,
     /// Receives errors that a worker queues before dropping its err-sender.
     err_rx: mpsc::Receiver<crate::data_flow::Error>,
+    /// Receives each worker's stats tally (empty unless the query opted in).
+    stats_rx: mpsc::Receiver<DataFlowStats>,
     /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
     /// Shared with the [`DataFlowDispatcher`](crate::DataFlowDispatcher) so that cancel callers (which
@@ -23,12 +26,14 @@ impl<T> DataFlowHandle<T> {
     pub fn new(
         rx: mpsc::Receiver<T>,
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
+        stats_rx: mpsc::Receiver<DataFlowStats>,
         cancelled: Arc<AtomicBool>,
         waker: Arc<WorkerWaker>,
     ) -> Self {
         Self {
             rx,
             err_rx,
+            stats_rx,
             cancelled,
             waker,
         }
@@ -52,7 +57,16 @@ impl<T> DataFlowHandle<T> {
 
     /// Block until every worker drops its output sender, then return all
     /// items in order, or the first worker error if any occurred.
-    pub fn collect(mut self) -> crate::data_flow::Result<Vec<T>> {
+    pub fn collect(self) -> crate::data_flow::Result<Vec<T>> {
+        Ok(self.collect_with_stats()?.0)
+    }
+
+    /// Like [`collect`](Self::collect), but also returns the dataflow's stats
+    /// folded across every worker. The tally is all zeros unless the dataflow
+    /// was launched with [`execute_with_stats`](crate::OperatorSpec::execute_with_stats).
+    /// By the time the output channel has closed, every worker that finished has
+    /// already shipped its tally, so the stats channel is fully drained here.
+    pub fn collect_with_stats(mut self) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
         let mut items = Vec::new();
         for item in &mut self {
             items.push(item?);
@@ -63,7 +77,11 @@ impl<T> DataFlowHandle<T> {
         if let Ok(e) = self.err_rx.try_recv() {
             return Err(e);
         }
-        Ok(items)
+        let mut stats = DataFlowStats::default();
+        while let Ok(worker_stats) = self.stats_rx.try_recv() {
+            stats.merge(&worker_stats);
+        }
+        Ok((items, stats))
     }
 }
 

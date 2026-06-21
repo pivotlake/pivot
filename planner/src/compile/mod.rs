@@ -91,6 +91,8 @@ pub enum Error {
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("SET/RESET is a session command, not a compilable query")]
+    SetVariableNotCompilable,
 }
 
 impl Plan {
@@ -135,6 +137,9 @@ impl PlanNode {
                 o.compile(dispatcher, catalog)
             }
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
+            // SET/RESET is intercepted by the server after planning (it toggles
+            // session state, not data), so it should never reach compilation.
+            crate::Operator::SetVariable(_) => Err(Error::SetVariableNotCompilable),
         }
     }
 }

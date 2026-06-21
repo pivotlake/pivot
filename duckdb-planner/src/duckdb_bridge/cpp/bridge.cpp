@@ -10,6 +10,8 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_set.hpp"
+#include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -581,6 +583,30 @@ json build_create_table(duckdb::LogicalCreateTable *create_table) {
     };
 }
 
+// `SET <name> = <value>`. DuckDB's binder builds a LogicalSet for *any* name —
+// it doesn't validate the setting exists until execution, which pivot never runs
+// — so the name comes through verbatim and pivot decides what (if anything) it
+// means. The value is a bound constant; pivot only ever wants its string form
+// (a boolean reads back as "true"/"false"), so serialize just that, not the
+// `{logical_type, raw_value}` pair every other scalar carries.
+json build_set(duckdb::LogicalSet *set) {
+	return {
+		{"name", set->name},
+		{"value", set->value.ToString()},
+	};
+}
+
+// `RESET <name>` — restore the setting's default. pivot has no per-setting
+// default machinery, so we model it as a SET with no value (`null`); the consumer
+// reads "no value" as "off / default". Emitted under the LOGICAL_SET tag (see the
+// switch) so the Rust side needs only one variant.
+json build_reset(duckdb::LogicalReset *reset) {
+	return {
+		{"name", reset->name},
+		{"value", nullptr},
+	};
+}
+
 // Remove DuckDB's row-id column from an already-built late-mat RHS subtree JSON.
 //
 // Late materialization threads a row-id column from the narrow scan up to the
@@ -788,6 +814,16 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE: {
 		new_operator["data"] = build_create_table(&op->Cast<duckdb::LogicalCreateTable>());
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_SET: {
+		new_operator["data"] = build_set(&op->Cast<duckdb::LogicalSet>());
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_RESET: {
+		// Relabel RESET to SET (with a null value) so Rust needs one variant.
+		new_operator["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_SET);
+		new_operator["data"] = build_reset(&op->Cast<duckdb::LogicalReset>());
 		break;
 	}
 	default:

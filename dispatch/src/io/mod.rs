@@ -267,6 +267,10 @@ pub struct DataFlowRequest<R> {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
     pub request: R,
+    /// When the issuing dataflow handed this read off, stamped only when the
+    /// query opted into stats — the completion path reads it back to bill the
+    /// read's in-flight time. `None` (no clock read) otherwise.
+    pub submitted_at: Option<std::time::Instant>,
 }
 
 impl<R> DataFlowRequest<R> {
@@ -275,6 +279,7 @@ impl<R> DataFlowRequest<R> {
             data_flow_id,
             operator_idx,
             request,
+            submitted_at: None,
         }
     }
 }
