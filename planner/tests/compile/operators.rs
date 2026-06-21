@@ -396,6 +396,50 @@ fn select_star_filtered_top_n_late_materializes(mut testing_planner: TestingPlan
 }
 
 #[rstest]
+fn grouped_avg_length_filtered_having_ordered(mut testing_planner: TestingPlanner) {
+    // AVG(length(url)) per group, an empty-string WHERE filter, a HAVING on
+    // COUNT(*), then ORDER BY the avg DESC. length() is byte count, so g=1
+    // averages (5+2)/2 = 3.5 and g=2 averages (4+2)/2 = 3.0; the "" rows are
+    // filtered before aggregation and g=3 (one row) is dropped by
+    // HAVING COUNT(*) > 1.
+    testing_planner.add_table(
+        "pages",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 1, 2, 2, 3])),
+            (
+                "url",
+                Type::Utf8,
+                str_col(vec!["abcde", "fg", "", "wxyz", "uv", "zzzz"]),
+            ),
+        ],
+    );
+
+    let rows = batches_to_json(
+        &testing_planner
+            .planner
+            .plan(
+                "SELECT g, AVG(length(url)) AS l, COUNT(*) AS c FROM pages \
+                 WHERE url <> '' GROUP BY g HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 25",
+            )
+            .unwrap()
+            .compile(testing_planner.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap(),
+    );
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "g=3 should be dropped by HAVING; got {rows:?}"
+    );
+    let groups: Vec<i64> = rows.iter().map(|r| r["col0"].as_i64().unwrap()).collect();
+    let avgs: Vec<f64> = rows.iter().map(|r| r["col2"].as_f64().unwrap()).collect();
+    assert_eq!(groups, vec![1, 2]);
+    assert_eq!(avgs, vec![3.5, 3.0]);
+}
+
+#[rstest]
 fn group_by_int_column(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .planner

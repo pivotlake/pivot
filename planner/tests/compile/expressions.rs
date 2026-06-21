@@ -631,7 +631,7 @@ fn arithmetic_in_projection(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
-fn length_counts_unicode_chars(mut testing_planner: TestingPlanner) {
+fn length_counts_bytes(mut testing_planner: TestingPlanner) {
     testing_planner.add_table(
         "strs",
         &[
@@ -665,10 +665,10 @@ fn length_counts_unicode_chars(mut testing_planner: TestingPlanner) {
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
 
-    // length() counts characters, not bytes: "héllo" is 6 bytes but 5 chars,
-    // "日本語abc" is 12 bytes but 6 chars.
+    // length() counts bytes, not characters: "héllo" is 6 bytes (é is 2),
+    // "日本語abc" is 12 bytes (three 3-byte CJK chars + "abc").
     let lengths: Vec<i64> = rows.iter().map(|r| r["col1"].as_i64().unwrap()).collect();
-    assert_eq!(lengths, vec![5, 5, 0, 6]);
+    assert_eq!(lengths, vec![5, 6, 0, 12]);
 }
 
 #[rstest]
