@@ -9,7 +9,7 @@ use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::{Array, ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
     Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
@@ -162,6 +162,53 @@ impl Table for TableBinding {
 
         Ok(false)
     }
+
+    fn column_min_max(
+        &self,
+        column: usize,
+        ctx: &dyn QueryContext,
+    ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+        // Only sound for the whole, unfiltered table: a pushed-down predicate
+        // means the scan this binding stands for excludes rows.
+        if !self.predicates.is_empty() {
+            return None;
+        }
+        // Read this binding's current committed files, the same snapshot a scan
+        // would see; an unresolvable context (e.g. table dropped) means "scan".
+        let parquet = self.resolve_files(ctx).ok()?;
+        let row_groups = parquet.row_groups();
+        if row_groups.is_empty() {
+            return None;
+        }
+        // Every row group must carry both bounds; fold them with the arrow
+        // comparison kernels (stats come back typed as the physical column).
+        let mut min: Option<Scalar<ArrayRef>> = None;
+        let mut max: Option<Scalar<ArrayRef>> = None;
+        for rg in row_groups {
+            let stats = rg.column_statistics(column)?;
+            let (rg_min, rg_max) = (stats.min.as_ref()?, stats.max.as_ref()?);
+            min = Some(match min {
+                Some(m) if scalar_lt(&m, rg_min) => m,
+                _ => rg_min.clone(),
+            });
+            max = Some(match max {
+                Some(m) if scalar_lt(rg_max, &m) => m,
+                _ => rg_max.clone(),
+            });
+        }
+        Some((min?, max?))
+    }
+}
+
+/// `a < b` over two single-value scalars of the same physical type. A null,
+/// type mismatch, or kernel error reads as `false`. In [`column_min_max`] every
+/// comparison is between two same-typed integer/temporal stat bounds, where the
+/// kernel never errors and the bounds are non-null. (Mirrors the stricter,
+/// private `scalar_lt` in `parquet::reading::fetching`; worth consolidating.)
+///
+/// [`column_min_max`]: TableBinding::column_min_max
+fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
+    arrow_ord::cmp::lt(a, b).map_or(false, |r| r.len() == 1 && r.is_valid(0) && r.value(0))
 }
 
 impl TableBinding {
