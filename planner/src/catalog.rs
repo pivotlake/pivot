@@ -171,6 +171,15 @@ pub trait Table: Debug + Send + Sync {
     ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         None
     }
+
+    /// The table's total row count derived purely from metadata, if it can be
+    /// answered without scanning any rows (e.g. summing Parquet row-group row
+    /// counts, with no predicates pushed into this binding). `None` means
+    /// "unknown, scan instead" and is always a safe answer. `ctx` resolves the
+    /// binding's current files, as in [`column_min_max`](Table::column_min_max).
+    fn row_count(&self, _ctx: &dyn QueryContext) -> Option<i64> {
+        None
+    }
 }
 
 /// Adapts a Pivot [`Table`] to DuckDB's [`DuckDBTable`] trait,
