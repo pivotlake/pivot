@@ -23,7 +23,7 @@
 use crate::Identifier;
 use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
 use crate::operations::{FinishStatus, Operator};
-use crate::stats::DataFlowStats;
+use crate::stats::{DataFlowStats, StatsCollector};
 use crate::worker::worker_waker;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -31,7 +31,7 @@ use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{panic, result};
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -172,12 +172,9 @@ pub struct DataFlow {
     cancelled: Arc<AtomicBool>,
     err_tx: mpsc::Sender<Error>,
     graph: OperatorGraph,
-    /// This worker's running stats tally, `Some` only when the query opted into
-    /// stats — otherwise collection is skipped entirely (no timing, no counting).
-    stats: Option<DataFlowStats>,
-    /// Where [`report_stats`](Self::report_stats) ships the tally when this
-    /// worker's copy of the dataflow finishes; the handle folds all workers'.
-    stats_tx: mpsc::Sender<DataFlowStats>,
+    /// Collects this worker's execution stats for the dataflow. Inert unless the
+    /// query opted in; driven by the worker through [`stats`](Self::stats).
+    stats: StatsCollector,
 }
 
 impl Debug for DataFlow {
@@ -203,21 +200,17 @@ impl DataFlow {
             graph: OperatorGraph::from_edges(operators, publisher_to_subscriber),
             cancelled: canceled,
             err_tx,
-            stats: collect_stats.then(DataFlowStats::default),
-            stats_tx,
+            stats: StatsCollector::new(stats_tx, collect_stats),
         }
     }
     pub fn id(&self) -> Identifier {
         self.id
     }
 
-    /// Ship this worker's stats tally to the handle. A no-op when the query
-    /// didn't opt in. Called by the worker once this copy of the dataflow is
-    /// done, before it's dropped.
-    pub fn report_stats(&self) {
-        if let Some(stats) = self.stats {
-            let _ = self.stats_tx.send(stats);
-        }
+    /// This dataflow's stats collector. The worker records IO/CPU work against it
+    /// (`flow.stats().record_*`) and `report`s it when the dataflow finishes.
+    pub fn stats(&mut self) -> &mut StatsCollector {
+        &mut self.stats
     }
 
     /// Is this dataflow cancelled? This is an AtomicBool that can be set from other workers or from
@@ -249,12 +242,13 @@ impl DataFlow {
     /// Similar to the above function, `try_run_or` will run catch any errors and handle them
     /// appropriately, while also returning a default value if there is indeed an error
     fn try_run_or<R>(&mut self, default: R, f: impl FnOnce(&mut Self) -> Result<R>) -> R {
-        // Every operator step funnels through here, so it's the one place to time
-        // CPU. `then` skips the clock reads entirely when stats are off.
-        let started = self.stats.is_some().then(Instant::now);
+        // Every operator step funnels through here, so it's the one place that
+        // can see the dataflow's CPU work (the worker only sees opaque method
+        // calls). `then` skips the clock reads when stats are off.
+        let started = self.stats.enabled().then(Instant::now);
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| f(self)));
-        if let (Some(stats), Some(started)) = (self.stats.as_mut(), started) {
-            stats.cpu += started.elapsed();
+        if let Some(started) = started {
+            self.stats.record_cpu(started.elapsed());
         }
         match outcome {
             Ok(Ok(v)) => v,
@@ -368,7 +362,7 @@ impl DataFlow {
     /// Collect pending filesystem read requests from operators (leaf-to-root).
     /// Returns the first batch found, or `None` if no operator needs disk IO.
     pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
-        let mut requests = self.try_run_or(None, |d| {
+        self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
                     let requests = op.operator.next_fs_requests()?;
@@ -384,15 +378,13 @@ impl DataFlow {
                     }
                 })
                 .map(|c| c.break_value())
-        });
-        self.record_issued(|s| &mut s.disk_requests, &mut requests);
-        requests
+        })
     }
 
     /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
     /// [`get_next_fs_request`](Self::get_next_fs_request).
     pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
-        let mut requests = self.try_run_or(None, |d| {
+        self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
                     let requests = op.operator.next_http_requests()?;
@@ -408,48 +400,6 @@ impl DataFlow {
                     }
                 })
                 .map(|c| c.break_value())
-        });
-        self.record_issued(|s| &mut s.http_requests, &mut requests);
-        requests
-    }
-
-    /// Bill a completed read's in-flight time to this dataflow, the companion to
-    /// the count taken in [`get_next_http_request`](Self::get_next_http_request).
-    /// A no-op when stats are off (then `submitted_at` is `None`).
-    pub fn record_http_time(&mut self, submitted_at: Option<Instant>) {
-        self.record_io_time(submitted_at, |s| &mut s.http_time);
-    }
-
-    /// As [`record_http_time`](Self::record_http_time), for a disk read.
-    pub fn record_disk_time(&mut self, submitted_at: Option<Instant>) {
-        self.record_io_time(submitted_at, |s| &mut s.disk_time);
-    }
-
-    fn record_io_time(
-        &mut self,
-        submitted_at: Option<Instant>,
-        field: impl FnOnce(&mut DataFlowStats) -> &mut Duration,
-    ) {
-        if let (Some(stats), Some(submitted_at)) = (self.stats.as_mut(), submitted_at) {
-            *field(stats) += submitted_at.elapsed();
-        }
-    }
-
-    /// Count the IO requests just produced for this dataflow and stamp each with
-    /// the issue time (so its completion can be billed), a no-op when stats are
-    /// off. The worker submits every request in a returned batch, so the count of
-    /// what's returned is the count of what's issued.
-    fn record_issued<R>(
-        &mut self,
-        count: impl FnOnce(&mut DataFlowStats) -> &mut u64,
-        requests: &mut Option<Vec<DataFlowRequest<R>>>,
-    ) {
-        if let (Some(stats), Some(requests)) = (self.stats.as_mut(), requests.as_mut()) {
-            *count(stats) += requests.len() as u64;
-            let now = Instant::now();
-            for request in requests.iter_mut() {
-                request.submitted_at = Some(now);
-            }
-        }
+        })
     }
 }

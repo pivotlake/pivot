@@ -297,7 +297,8 @@ impl Worker {
                 break;
             }
 
-            while let Some(requests) = flow.get_next_fs_request() {
+            while let Some(mut requests) = flow.get_next_fs_request() {
+                flow.stats().record_issued_disk(&mut requests);
                 for r in requests {
                     self.io.request(r)?;
                 }
@@ -325,7 +326,8 @@ impl Worker {
                 break;
             }
 
-            while let Some(requests) = flow.get_next_http_request() {
+            while let Some(mut requests) = flow.get_next_http_request() {
+                flow.stats().record_issued_http(&mut requests);
                 for r in requests {
                     // Submitting a remote read can fail (socket exhaustion, TLS
                     // setup). Fail just this dataflow rather than propagating —
@@ -366,13 +368,13 @@ impl Worker {
                 // just means drop the completion (the slot pin releases with it).
                 Ok(Completion::Fs(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.record_disk_time(r.submitted_at);
+                        data_flow.stats().record_disk_time(r.submitted_at);
                         data_flow.process_fs(r.operator_idx, r.request);
                     }
                 }
                 Ok(Completion::Http(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.record_http_time(r.submitted_at);
+                        data_flow.stats().record_http_time(r.submitted_at);
                         data_flow.process_http(r.operator_idx, r.request);
                     }
                 }
@@ -407,8 +409,8 @@ impl Worker {
 
         for id in to_remove {
             debug!("Finished data flow {:?}", id);
-            if let Some(flow) = self.data_flows.remove(&id) {
-                flow.report_stats();
+            if let Some(mut flow) = self.data_flows.remove(&id) {
+                flow.stats().report();
             }
         }
     }
