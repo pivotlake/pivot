@@ -446,14 +446,27 @@ impl FileCache {
                         .set_slot_used(slot_idx, 0, Ordering::Release);
                     continue;
                 };
-                self.file_maps
-                    .read()
-                    .unwrap()
-                    .get(&location)
-                    .unwrap()
-                    .write()
-                    .unwrap()
-                    .remove(&region);
+                let now_empty = {
+                    let file_maps = self.file_maps.read().unwrap();
+                    let mut regions = file_maps.get(&location).unwrap().write().unwrap();
+                    regions.remove(&region);
+                    regions.is_empty()
+                };
+                // Prune the per-file outer entry once its last cached region is
+                // evicted. The map is keyed by `FileLocation` (an `Arc<File>` /
+                // `Arc<RemoteFile>`) and a key is never reused, so without this a
+                // dead entry — pinning its `Arc` and the file/connection it holds —
+                // lingers for every file ever opened, leaking unboundedly under
+                // steady ingest+compaction. Re-check emptiness under the write lock
+                // so a concurrent `get` that just re-cached a region isn't dropped.
+                if now_empty {
+                    let mut file_maps = self.file_maps.write().unwrap();
+                    if let Some(regions) = file_maps.get(&location) {
+                        if regions.read().unwrap().is_empty() {
+                            file_maps.remove(&location);
+                        }
+                    }
+                }
                 return write_buffer;
             }
         }
@@ -590,6 +603,36 @@ mod tests {
             evicted.slot_idx,
             still_pooled,
         );
+    }
+
+    /// Regression for the parquetsink OOM: evicting a file's last cached region
+    /// must drop its outer `file_maps` entry. `file_maps` is keyed by a never-
+    /// reused `FileLocation`, so a lingering empty entry per file leaks unbounded.
+    #[test]
+    fn evicting_a_files_last_region_prunes_its_outer_entry() {
+        init_test_free_pool(16);
+        let files: Vec<FileLocation> = (0..4)
+            .map(|_| FileLocation::Local(std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap())))
+            .collect();
+        for f in &files {
+            cache().open_entry(f.clone());
+            drop(miss(cache().get_region(f, 0, 0, SB)));
+        }
+
+        // Evict each cached region — one reclaim per call, over this test
+        // thread's own cache (memory_ctx is thread-local). Exactly `files.len()`
+        // calls, so we never spin `evict()` on an empty cache.
+        for _ in &files {
+            cache().evict();
+        }
+
+        let file_maps = cache().file_maps.read().unwrap();
+        for f in &files {
+            assert!(
+                !file_maps.contains_key(f),
+                "an evicted file's outer file_maps entry was left behind — leak",
+            );
+        }
     }
 
     #[test]
