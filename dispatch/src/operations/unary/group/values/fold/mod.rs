@@ -49,6 +49,13 @@ pub trait FoldAcc: Send + Sync + 'static {
     /// can't carry: the value arena for a string extreme; `()` otherwise.
     type Cfg: Clone + Send + Sync + 'static;
 
+    /// Whether folding this op needs no value arena and persists nothing lazily —
+    /// `true` for every numeric op, `false` for a string extreme (whose `update`
+    /// persists a winning `&str` into the arena). A value signature folds in place
+    /// during consume (materialise the row, `merge` it) only when *every* slot is
+    /// arena-free; see [`AggregationValue::FOLDS_IN_PLACE`](super::AggregationValue::FOLDS_IN_PLACE).
+    const ARENA_FREE: bool = true;
+
     /// Build the fold config from the value arena.
     fn cfg(arena: &Arc<SharedArena>) -> Self::Cfg;
     /// Combine two finished partials — the partition merge and radix fold.

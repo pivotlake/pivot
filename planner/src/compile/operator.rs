@@ -659,36 +659,37 @@ impl Aggregate {
             Shape::Numeric
         };
 
-        // Numeric value: `Dynamic<N, acc>`, folding each slot by its kind,
-        // dispatched by arity. One arm runs, so it consumes `input`/`key_cols`/
-        // `slots` exactly once.
+        // Whether every slot folds additively (`COUNT`/`SUM`) — no `MIN`/`MAX` and
+        // no string extreme. An all-additive runtime signature uses the
+        // `ONLY_ADDITIVE` `Dynamic`, which drops the per-slot kind dispatch to a
+        // branch-free `+` and folds in place during consume — recovering the old
+        // additive fallback's codegen instead of paying the general path's per-row
+        // op dispatch (a measured ~7% on low-cardinality grouped aggregates).
+        let all_additive = slots.iter().all(|s| {
+            matches!(
+                s.kind,
+                AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
+            )
+        });
+
+        // Numeric value: `Dynamic<N, acc, ADDITIVE>`, folding each slot by its kind
+        // (or branch-free `+` when `ADDITIVE`), dispatched by arity. One arm runs,
+        // so it consumes `input`/`key_cols`/`slots` exactly once.
         macro_rules! num_arity {
-            ($Key:ty, $acc:ty) => {
+            ($Key:ty, $acc:ty, $add:literal) => {
                 match slots.len() {
-                    1 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<1, $acc>>(key_cols, slots, top_k))
-                    }
-                    2 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<2, $acc>>(key_cols, slots, top_k))
-                    }
-                    3 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<3, $acc>>(key_cols, slots, top_k))
-                    }
-                    4 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<4, $acc>>(key_cols, slots, top_k))
-                    }
-                    5 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<5, $acc>>(key_cols, slots, top_k))
-                    }
-                    6 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<6, $acc>>(key_cols, slots, top_k))
-                    }
+                    1 => Ok(input
+                        .group_by_aggregate::<$Key, Dynamic<1, $acc, $add>>(key_cols, slots, top_k)),
+                    2 => Ok(input
+                        .group_by_aggregate::<$Key, Dynamic<2, $acc, $add>>(key_cols, slots, top_k)),
+                    3 => Ok(input
+                        .group_by_aggregate::<$Key, Dynamic<3, $acc, $add>>(key_cols, slots, top_k)),
+                    4 => Ok(input
+                        .group_by_aggregate::<$Key, Dynamic<4, $acc, $add>>(key_cols, slots, top_k)),
+                    5 => Ok(input
+                        .group_by_aggregate::<$Key, Dynamic<5, $acc, $add>>(key_cols, slots, top_k)),
+                    6 => Ok(input
+                        .group_by_aggregate::<$Key, Dynamic<6, $acc, $add>>(key_cols, slots, top_k)),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             };
@@ -721,7 +722,8 @@ impl Aggregate {
         macro_rules! by_shape {
             ($Key:ty, $acc:ty) => {
                 match shape {
-                    Shape::Numeric => num_arity!($Key, $acc),
+                    Shape::Numeric if all_additive => num_arity!($Key, $acc, true),
+                    Shape::Numeric => num_arity!($Key, $acc, false),
                     Shape::StrMin => str_arity!($Key, StrMinSlot),
                     Shape::StrMax => str_arity!($Key, StrMaxSlot),
                 }
@@ -778,14 +780,14 @@ impl Aggregate {
                 // Same shape → arity dispatch as the int-pair path, but with the
                 // row-encoded key extractor and its schema config.
                 macro_rules! row_num_arity {
-                    () => {
+                    ($add:literal) => {
                         match slots.len() {
-                            1 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<1, $acc>>(key_cols, slots, top_k, schema)),
-                            2 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<2, $acc>>(key_cols, slots, top_k, schema)),
-                            3 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<3, $acc>>(key_cols, slots, top_k, schema)),
-                            4 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<4, $acc>>(key_cols, slots, top_k, schema)),
-                            5 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<5, $acc>>(key_cols, slots, top_k, schema)),
-                            6 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<6, $acc>>(key_cols, slots, top_k, schema)),
+                            1 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<1, $acc, $add>>(key_cols, slots, top_k, schema)),
+                            2 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<2, $acc, $add>>(key_cols, slots, top_k, schema)),
+                            3 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<3, $acc, $add>>(key_cols, slots, top_k, schema)),
+                            4 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<4, $acc, $add>>(key_cols, slots, top_k, schema)),
+                            5 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<5, $acc, $add>>(key_cols, slots, top_k, schema)),
+                            6 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Dynamic<6, $acc, $add>>(key_cols, slots, top_k, schema)),
                             n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                         }
                     };
@@ -802,7 +804,8 @@ impl Aggregate {
                     };
                 }
                 match shape {
-                    Shape::Numeric => row_num_arity!(),
+                    Shape::Numeric if all_additive => row_num_arity!(true),
+                    Shape::Numeric => row_num_arity!(false),
                     Shape::StrMin => row_str_arity!(StrMinSlot),
                     Shape::StrMax => row_str_arity!(StrMaxSlot),
                 }

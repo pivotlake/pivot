@@ -114,6 +114,9 @@ macro_rules! impl_compiled {
         where
             $($R: Read, $F: FoldAcc + for<'b> Fold<$R::Val<'b>>, $F::Acc: Into<i128>,)+
         {
+            // Fold in place during consume unless some slot is a string extreme.
+            const FOLDS_IN_PLACE: bool = $($F::ARENA_FREE &&)+ true;
+
             type Reader<'b> = ($($R::Input<'b>,)+);
             type MergeConfig = ($($F::Cfg,)+);
             type Columns = ($(SlabColumn<$F::Acc>,)+);

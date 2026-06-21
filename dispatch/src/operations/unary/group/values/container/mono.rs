@@ -64,6 +64,9 @@ impl<const N: usize, A: Numeric> Default for Mono<N, A> {
 }
 
 impl<const N: usize, A: Numeric> AggregationValue for Mono<N, A> {
+    // Additive-only: no string extreme, so it always folds in place.
+    const FOLDS_IN_PLACE: bool = true;
+
     type Reader<'b> = [AddReader<'b>; N];
     type MergeConfig = ();
     type Columns = [SlabColumn<A>; N];

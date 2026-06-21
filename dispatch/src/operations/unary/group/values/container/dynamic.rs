@@ -122,6 +122,10 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
 impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> AggregationValue
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
+    // Only the all-additive instantiation is statically string-free; a general
+    // `Dynamic` may carry a runtime string extreme, so it folds lazily.
+    const FOLDS_IN_PLACE: bool = ONLY_ADDITIVE;
+
     type Reader<'b> = [BoundSlot<'b>; N];
     /// The per-slot kinds (which op merges/renders each cell) and the value arena
     /// (which a string extreme resolves its keys through).

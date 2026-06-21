@@ -30,6 +30,10 @@ macro_rules! str_extreme {
             type Acc = A;
             type Cfg = Arc<SharedArena>;
 
+            // A string extreme's `update` persists the winning `&str` into the
+            // value arena, so its signature can't fold in place during consume.
+            const ARENA_FREE: bool = false;
+
             #[inline(always)]
             fn cfg(arena: &Arc<SharedArena>) -> Arc<SharedArena> {
                 arena.clone()

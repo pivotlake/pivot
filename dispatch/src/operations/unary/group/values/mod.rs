@@ -98,6 +98,17 @@ impl AggregationSlot {
 /// same elementwise op for rows and partials, `update_from_reader` defaults to
 /// merging the row in.
 pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
+    /// Whether consume can fold a row *in place* — materialise the row with
+    /// [`value`](Self::value) and `merge` it — instead of the lazy
+    /// [`probe_fold`](super::super::hashtables::hash_table::BaseHashTable::probe_fold)
+    /// path. True only when no slot is a string extreme: a string extreme must
+    /// fold lazily (compare first, persist only a winner), so it leaves this
+    /// `false`. The in-place path keeps the `&mut value_arena` — which a numeric
+    /// fold never touches — out of the hot probe loop, recovering the pre-refactor
+    /// codegen for the common all-numeric grouped aggregate. A `const`, so the
+    /// consume branch is resolved at monomorphisation with no runtime cost.
+    const FOLDS_IN_PLACE: bool = false;
+
     /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
     /// Runtime data [`merge`](Self::merge) needs that the type can't carry (slot

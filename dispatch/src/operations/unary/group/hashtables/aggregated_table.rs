@@ -281,15 +281,28 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 // existing one (a string extreme persists only if it wins).
                 // Separate arenas keep the key's borrow and the value's disjoint.
                 let key = K::live_key(key_reader, i, &mut self.key_arena);
-                table.probe_fold::<false, _, _, _, _>(
-                    hash,
-                    key,
-                    &mut self.value_arena,
-                    |arena, cell| *cell = V::value(value_reader, i, arena),
-                    |arena, cell| {
-                        *cell = cell.update_from_reader(value_reader, i, arena, merge_config)
-                    },
-                );
+                if V::FOLDS_IN_PLACE {
+                    // All-numeric signature: materialise the row and fold it in,
+                    // keeping the `&mut value_arena` (which the fold never touches)
+                    // out of the probe loop. Equivalent to the pre-refactor path.
+                    let value = V::value(value_reader, i, &mut self.value_arena);
+                    table.merge::<false, _>(hash, key, value, merge_config);
+                } else {
+                    // Probe and fold in one pass. The live key persists into the key
+                    // arena; the value arena is handed to whichever arm runs — `seed`
+                    // materialises a new group's value, `update` folds the row into an
+                    // existing one (a string extreme persists only if it wins).
+                    // Separate arenas keep the key's borrow and the value's disjoint.
+                    table.probe_fold::<false, _, _, _, _>(
+                        hash,
+                        key,
+                        &mut self.value_arena,
+                        |arena, cell| *cell = V::value(value_reader, i, arena),
+                        |arena, cell| {
+                            *cell = cell.update_from_reader(value_reader, i, arena, merge_config)
+                        },
+                    );
+                }
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
