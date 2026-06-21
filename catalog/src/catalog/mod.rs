@@ -208,23 +208,6 @@ impl ParquetCatalog {
         Some(TableBinding::new(name.to_string(), columns))
     }
 
-    /// Reload `name`'s master copy to the latest committed version, publishing
-    /// the advanced copy. The scan path reloads through a query's
-    /// [`QueryContext`]; this is the same reload driven directly, for callers
-    /// that hold the catalog outside a compiling query. Errors if the table
-    /// doesn't exist or the reload fails.
-    pub fn refresh(&self, name: &str) -> CatalogResult<()> {
-        self.query_context_inner().parquet(name).map(|_| ())
-    }
-
-    /// A fresh [`ParquetQueryContext`] over this catalog's tables.
-    fn query_context_inner(&self) -> ParquetQueryContext {
-        ParquetQueryContext {
-            tables: self.tables.clone(),
-            pinned: Mutex::new(HashMap::new()),
-        }
-    }
-
     /// The worker pool this catalog fetches footers on — shared with callers
     /// (the compacter) that drive their own dataflows over the same tables.
     pub fn dispatcher(&self) -> &DataFlowDispatcher {
@@ -408,7 +391,10 @@ impl Catalog for ParquetCatalog {
     }
 
     fn query_context(&self) -> Box<dyn QueryContext> {
-        Box::new(self.query_context_inner())
+        Box::new(ParquetQueryContext {
+            tables: self.tables.clone(),
+            pinned: Mutex::new(HashMap::new()),
+        })
     }
 
     fn create_table(
