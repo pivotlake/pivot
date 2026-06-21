@@ -25,7 +25,9 @@ use parquet::file::properties::WriterProperties;
 use catalog::parquet::table_input;
 use catalog::store::ObjectPath;
 use catalog::{FileRef, ParquetCatalog};
-use common::{DispatchGuard, collect_i64s, dispatch_with_buffers, strings_and_ints};
+use common::{
+    DispatchGuard, collect_i64s, current_parquet, dispatch_with_buffers, strings_and_ints,
+};
 use dispatch::Projection;
 use harness::Backend;
 use planner::catalog::{Catalog as PlannerCatalog, Column, CreateTableRequest};
@@ -87,12 +89,10 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Pa
     cat
 }
 
-/// Refresh from the latest committed manifest (what a query bind does) and scan
-/// the table's `value` column, sorted.
+/// Scan the table's `value` column, sorted.
 fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
-    let _ = PlannerCatalog::table(cat, name);
-    let table = cat.binding(name).expect("table bound");
-    let out = table_input(d, &table.parquet, Projection::all(2), false)
+    let parquet = current_parquet(cat, name);
+    let out = table_input(d, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
     let mut values = collect_i64s(&out, 1);
@@ -101,7 +101,7 @@ fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
 }
 
 fn row_groups(cat: &ParquetCatalog, name: &str) -> usize {
-    cat.binding(name).unwrap().parquet.row_groups().len()
+    current_parquet(cat, name).row_groups().len()
 }
 
 // --- behaviours (run on every backend) -------------------------------------

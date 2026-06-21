@@ -11,7 +11,10 @@ use crate::parquet::{
 };
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
-use planner::catalog::{Column, DynamicScanPredicate, Result as CatalogResult, Table};
+use planner::catalog::{
+    Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
+    Table,
+};
 use planner::expression::{CompareType, Expression, TableFilter};
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
@@ -26,16 +29,17 @@ struct PushedPredicate {
     value: Scalar<ArrayRef>,
 }
 
-/// A catalog table backed by a directory of Parquet files. Cloned per-binding
-/// so each query accumulates its own pushed-down predicates via
-/// [`Table::pushdown_filter`] without affecting others.
+/// A catalog table, resolved as a **live handle**: it carries the table's name,
+/// schema, and this query's pushed-down predicates, but *not* a file set. It
+/// pulls the current row groups from the query's [`QueryContext`] every time it
+/// compiles, so a reused (cached) plan always scans the latest committed files.
+/// Cloned per-binding so each query accumulates its own predicates.
 #[derive(Clone, Debug)]
 pub struct TableBinding {
+    /// The catalog name resolved, used to fetch this table's data from the
+    /// query cache at compile time.
+    name: String,
     pub columns: Vec<Column>,
-    /// The table's row-group metadata, read once when the table was defined and
-    /// shared across every binding/query (cheap `Arc` clone). Pruning a binding's
-    /// predicates clones the row-group `Vec` and filters it — no footer re-read.
-    pub parquet: Arc<ParquetTable>,
     /// Single-column predicates pushed down for this binding (recorded here
     /// because the `Table` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
@@ -43,14 +47,29 @@ pub struct TableBinding {
 }
 
 impl TableBinding {
-    /// A binding over one table version's scan view, with no predicates pushed
-    /// yet.
-    pub(super) fn new(columns: Vec<Column>, parquet: Arc<ParquetTable>) -> Self {
+    /// A binding over `name`, with no predicates pushed yet.
+    pub(super) fn new(name: String, columns: Vec<Column>) -> Self {
         Self {
+            name,
             columns,
-            parquet,
             predicates: Vec::new(),
         }
+    }
+
+    /// This table's current committed row groups, from the query context (which
+    /// reloads to the latest version and pins). The context is always our own
+    /// [`ParquetQueryContext`](super::ParquetQueryContext) — a `ParquetCatalog`
+    /// only ever compiles its own bindings — so the downcast is an invariant;
+    /// failing it, or the table having been dropped since planning, is an error,
+    /// never a silent empty scan.
+    fn resolve_files(&self, ctx: &dyn QueryContext) -> CatalogResult<Arc<ParquetTable>> {
+        let ctx = ctx
+            .as_any()
+            .downcast_ref::<super::ParquetQueryContext>()
+            .ok_or_else(|| {
+                CatalogError::Other("query context is not a ParquetQueryContext".into())
+            })?;
+        ctx.parquet(&self.name)
     }
 }
 
@@ -61,7 +80,13 @@ impl Table for TableBinding {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        ctx: &dyn QueryContext,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
+        // The query context hands back this table's latest committed files (it
+        // reloads once and pins), so a reused cached plan scans data committed
+        // since it was planned.
+        let current = self.resolve_files(ctx)?;
+
         // Equality predicates additionally let the decoder skip row groups whose
         // dictionary for that column excludes the constant.
         let eq_predicates: Vec<ScanEqualityPredicate> = self
@@ -74,10 +99,9 @@ impl Table for TableBinding {
             })
             .collect();
 
-        // Prune the (already-materialized) row groups by the pushed-down
-        // predicates' stats. No footer re-read — the row groups were built once
-        // when the table was defined.
-        let parquet = Arc::new(self.pruned_parquet());
+        // Prune the row groups by the pushed-down predicates' stats. No footer
+        // re-read — the cache already holds the materialized row groups.
+        let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -104,10 +128,13 @@ impl Table for TableBinding {
         &self,
         input: RecordBatchOperatorSpec,
         projection: Projection,
-    ) -> RecordBatchOperatorSpec {
-        // Late materialization re-reads rows by their *global* row-group index,
-        // so it uses the full table, not the pruned scan view.
-        materialize(input, self.parquet.clone(), projection)
+        ctx: &dyn QueryContext,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        // Same `ctx` as the scan, so this reads the *same* pinned snapshot —
+        // their global row-group indices must line up. Late materialization
+        // re-reads rows by that global index, so it uses the full table, not the
+        // pruned scan view.
+        Ok(materialize(input, self.resolve_files(ctx)?, projection))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
@@ -138,14 +165,14 @@ impl Table for TableBinding {
 }
 
 impl TableBinding {
-    /// Clone this table's row groups and keep only those that survive this
+    /// Clone `parquet`'s row groups and keep only those that survive this
     /// binding's pushed-down predicates — i.e. what [`Table::compile`] actually
-    /// scans. A min/max stat that proves no row in a group can match drops it; a
-    /// stats-comparison error means "can't prune" (kept) — never wrong, just
-    /// unoptimized. No footer I/O: the row groups were materialized once when the
-    /// table was defined. Exposed so pruning can be asserted directly.
-    pub fn pruned_parquet(&self) -> ParquetTable {
-        let mut parquet = (*self.parquet).clone();
+    /// scans over the table's current files. A min/max stat that proves no row in
+    /// a group can match drops it; a stats-comparison error means "can't prune"
+    /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning
+    /// can be asserted directly.
+    pub fn pruned_parquet(&self, parquet: &ParquetTable) -> ParquetTable {
+        let mut parquet = parquet.clone();
         parquet.row_groups_mut().retain(|rg| {
             !self.predicates.iter().any(|p| {
                 row_group_eliminated(rg.as_ref(), p.column_idx, p.compare_type, &p.value)

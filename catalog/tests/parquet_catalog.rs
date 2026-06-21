@@ -1,3 +1,5 @@
+mod common;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -12,6 +14,7 @@ use tempfile::TempDir;
 
 use catalog::store::ObjectPath;
 use catalog::{ParquetCatalog, TableBinding};
+use common::current_parquet;
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };
@@ -23,8 +26,13 @@ use planner::types::Type;
 /// metadata-fetch dataflow) when the table is defined.
 fn dispatcher() -> DataFlowDispatcher {
     static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
+    // The file cache is process-global and accumulates a resident region per
+    // distinct file scanned across the whole binary; with `PANIC_ON_EVICT` on
+    // (the test default), running out of ring slots panics instead of evicting.
+    // Size it well above the suite's distinct-file count so adding tests doesn't
+    // tip a later one over.
     DISPATCH
-        .get_or_init(|| Dispatch::spin_up(1, 32))
+        .get_or_init(|| Dispatch::spin_up(1, 128))
         .dispatcher()
         .clone()
 }
@@ -129,11 +137,14 @@ fn constant_comparison(
     })))
 }
 
-// Row groups that survive the binding's pushed-down predicates (what `compile`
-// would scan). The row groups were materialized once at create time, so pruning
-// is a pure in-memory filter — no dispatcher needed.
-fn row_group_count(table: &TableBinding) -> usize {
-    table.pruned_parquet().row_groups().len()
+// Row groups that survive `table`'s pushed-down predicates over the table's
+// current files (what `compile` would scan). Pruning is a pure in-memory filter
+// — no dispatcher needed.
+fn row_group_count(catalog: &ParquetCatalog, name: &str, table: &TableBinding) -> usize {
+    table
+        .pruned_parquet(&current_parquet(catalog, name))
+        .row_groups()
+        .len()
 }
 
 #[test]
@@ -156,8 +167,8 @@ fn create_table_without_a_path_makes_an_empty_table() {
     };
     // No path: the table lives under the (in-memory) database root with no data.
     create_table(&catalog, req).unwrap();
-    let table = catalog.binding("t").unwrap();
-    assert!(table.parquet.row_groups().is_empty());
+    assert!(catalog.binding("t").is_some());
+    assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
 
 #[test]
@@ -169,14 +180,8 @@ fn create_table_over_a_missing_path_yields_an_empty_table() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
     create_table(&catalog, create_request("t", bogus, columns)).unwrap();
-    assert!(
-        catalog
-            .binding("t")
-            .unwrap()
-            .parquet
-            .row_groups()
-            .is_empty()
-    );
+    assert!(catalog.binding("t").is_some());
+    assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
 
 #[test]
@@ -232,14 +237,14 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     let mut table = catalog.binding("t").unwrap();
-    assert_eq!(row_group_count(&table), 3);
+    assert_eq!(row_group_count(&catalog, "t", &table), 3);
 
     table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
 
     // Row group whose single value is 20 has min == max == 20 and is pruned.
-    assert_eq!(row_group_count(&table), 2);
+    assert_eq!(row_group_count(&catalog, "t", &table), 2);
 }
 
 /// Each bind hands out a fresh clone, so pushdown applied to one binding
@@ -254,11 +259,11 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
-    assert_eq!(row_group_count(&first), 2);
+    assert_eq!(row_group_count(&catalog, "t", &first), 2);
 
     // A fresh bind starts from the master entry's full row group set.
     let second = catalog.binding("t").unwrap();
-    assert_eq!(row_group_count(&second), 3);
+    assert_eq!(row_group_count(&catalog, "t", &second), 3);
 }
 
 #[test]
@@ -272,7 +277,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
-    assert_eq!(row_group_count(&table), 0);
+    assert_eq!(row_group_count(&catalog, "t", &table), 0);
 }
 
 #[test]
@@ -286,7 +291,7 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
-    assert_eq!(row_group_count(&table), 1);
+    assert_eq!(row_group_count(&catalog, "t", &table), 1);
 }
 
 #[test]
@@ -312,7 +317,7 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
 
-    assert_eq!(row_group_count(&table), 3);
+    assert_eq!(row_group_count(&catalog, "t", &table), 3);
 }
 
 /// Write one Parquet file of `ids` (single row group) into `dir`, mirroring the
@@ -358,12 +363,6 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
         .unwrap()
 }
 
-/// Resolve `name` through the planner trait — what a query does on bind — so the
-/// catalog refreshes its in-memory copy from the latest committed manifest.
-fn resolve(catalog: &ParquetCatalog, name: &str) {
-    let _ = PlannerCatalog::table(catalog, name);
-}
-
 /// A file appended after `CREATE TABLE` becomes visible to new binds, with
 /// global row-group indices kept sequential.
 #[test]
@@ -371,14 +370,13 @@ fn append_data_file_makes_new_file_visible_to_new_binds() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 3);
+    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 3);
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
     append(&catalog, "t", &new_file);
 
-    resolve(&catalog, "t");
-    let table = catalog.binding("t").unwrap();
-    let groups = table.parquet.row_groups();
+    let parquet = current_parquet(&catalog, "t");
+    let groups = parquet.row_groups();
     assert_eq!(groups.len(), 4);
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
 }
@@ -397,8 +395,7 @@ fn append_data_file_is_idempotent_per_path() {
     // Appending the same file again is a no-op (it must not double-count).
     append(&catalog, "t", &new_file);
 
-    resolve(&catalog, "t");
-    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
+    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 4);
 }
 
 /// No table yet (ingest runs before `CREATE TABLE`): there is no handle to
@@ -420,8 +417,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     let extra = write_ids(dir.path(), "extra.parquet", &[40]);
     append(&catalog, "t", &extra);
-    resolve(&catalog, "t");
-    assert_eq!(catalog.binding("t").unwrap().parquet.row_groups().len(), 4);
+    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 4);
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
@@ -433,15 +429,14 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         path: ObjectPath::new("merged.parquet"),
         size: merged_size,
     })];
-    // A losing compacter clones the table out at the same version (inputs still
-    // present) before the winning swap lands.
+    // A losing compacter clones the table out at the version where the inputs
+    // are present, before the winning swap lands.
     let mut loser = catalog.table_handle("t").unwrap();
+    loser.refresh().unwrap();
+    let mut winner = catalog.table_handle("t").unwrap();
+    winner.refresh().unwrap();
     assert!(
-        catalog
-            .table_handle("t")
-            .unwrap()
-            .replace_data_files(&removed, &added)
-            .unwrap(),
+        winner.replace_data_files(&removed, &added).unwrap(),
         "first swap commits"
     );
     // The loser only discovers the inputs are gone after its CAS conflict +
@@ -455,16 +450,37 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         "second swap aborts: its inputs were already swapped out"
     );
 
-    resolve(&catalog, "t");
-    let table = catalog.binding("t").unwrap();
-    let groups = table.parquet.row_groups();
+    let parquet = current_parquet(&catalog, "t");
+    let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].num_rows, 4);
 }
 
+/// A pushed-down predicate prunes against the table's *current* files: a binding
+/// resolved before an append, after a refresh, prunes over the new file set —
+/// the compile path fetches the latest files from the query context, so a reused
+/// (cached) plan's predicates apply to data committed since it was planned.
+#[test]
+fn pushed_predicate_prunes_latest_files_after_refresh() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = catalog.binding("t").unwrap();
+    table
+        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .unwrap();
+    assert_eq!(row_group_count(&catalog, "t", &table), 1);
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
+    append(&catalog, "t", &new_file);
+
+    // `id = 20` still prunes to the single matching row group, now over 4 files.
+    assert_eq!(row_group_count(&catalog, "t", &table), 1);
+}
+
 /// A second catalog over the same persisted root sees another instance's
-/// append at its next bind: `Catalog::table` refreshes from the committed
-/// manifest, so cross-process commits surface without any re-`CREATE`.
+/// append at its next reload: reloading reads the committed manifest, so
+/// cross-process commits surface without any re-`CREATE`.
 #[test]
 fn other_catalog_instance_sees_append_at_next_bind() {
     let (data_dir, columns) = three_row_table();
@@ -475,23 +491,18 @@ fn other_catalog_instance_sees_append_at_next_bind() {
 
     // The reader opens before the new file exists, at version 1.
     let reader = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(reader.binding("t").unwrap().parquet.row_groups().len(), 3);
+    assert_eq!(current_parquet(&reader, "t").row_groups().len(), 3);
 
     let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
     append(&writer, "t", &new_file);
 
-    // Binding through the trait (what a query does) reloads to version 2.
-    assert!(PlannerCatalog::table(&reader, "t").is_some());
-    let table = reader.binding("t").unwrap();
-    assert_eq!(
-        table
-            .parquet
-            .row_groups()
-            .iter()
-            .map(|rg| rg.num_rows)
-            .sum::<i64>(),
-        5
-    );
+    // The reader's next reload picks up version 2 from the committed manifest.
+    let rows = current_parquet(&reader, "t")
+        .row_groups()
+        .iter()
+        .map(|rg| rg.num_rows)
+        .sum::<i64>();
+    assert_eq!(rows, 5);
 }
 
 /// Restart reads the committed manifest, not the directory: files appended
@@ -508,8 +519,7 @@ fn reopened_database_restores_appended_files_from_manifest() {
         append(&catalog, "t", &new_file);
     }
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    let table = reopened.binding("t").unwrap();
-    assert_eq!(table.parquet.row_groups().len(), 4);
+    assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
 }
 
 /// Only committed files exist: after a compaction swap, a leftover input
@@ -536,8 +546,8 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
         .unwrap();
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    let table = reopened.binding("t").unwrap();
-    let groups = table.parquet.row_groups();
+    let parquet = current_parquet(&reopened, "t");
+    let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);
 }

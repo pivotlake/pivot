@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Error;
-use crate::catalog::TableBinding;
 use crate::manifest::{FIRST_VERSION, ManifestEntry, SortBounds, TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
@@ -389,19 +388,23 @@ impl CatalogTable {
         Ok(())
     }
 
-    /// A fresh per-query [`TableBinding`] over a flat scan view of the current
-    /// files: every file's row groups concatenated in manifest order, where a row
-    /// group's global index is simply its position. Derived here (cheap `Arc`
-    /// clones) rather than cached, so the view can never disagree with `files`.
-    pub(super) fn binding(&self) -> TableBinding {
+    /// A flat scan view of the current files: every file's row groups
+    /// concatenated in manifest order, where a row group's global index is
+    /// simply its position. Derived on demand (cheap `Arc` clones) rather than
+    /// cached, so the view can never disagree with `files` — a [`TableBinding`]
+    /// reads this through the catalog every time it compiles, so a reused
+    /// (cached) plan always scans the latest committed files.
+    pub fn parquet(&self) -> Arc<ParquetTable> {
         let row_groups = self
             .files
             .iter()
             .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
-        TableBinding::new(
-            self.manifest.columns.clone(),
-            Arc::new(ParquetTable::new(row_groups)),
-        )
+        Arc::new(ParquetTable::new(row_groups))
+    }
+
+    /// The table's columns (schema), as the planner's [`Column`]s.
+    pub(super) fn columns(&self) -> Vec<Column> {
+        self.manifest.columns.clone()
     }
 }

@@ -34,21 +34,22 @@ mod table;
 
 pub use binding::TableBinding;
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::manifest::{self, CatalogManifest, CatalogManifestTableEntry, TableManifest};
-use crate::parquet::ParquetTableError;
+use crate::parquet::{ParquetTable, ParquetTableError};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use planner::catalog::{
-    Catalog, CreateTableRequest, Error as CatalogError, Result as CatalogResult, Table,
+    Catalog, CreateTableRequest, Error as CatalogError, QueryContext, Result as CatalogResult,
+    Table,
 };
 pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
-use tracing::warn;
 
 const PATH_OPTION: &str = "path";
 /// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
@@ -203,11 +204,8 @@ impl ParquetCatalog {
     /// [`Catalog::table`] *minus the reload*, and typed). Useful for callers
     /// (and tests) that need state the [`Table`] trait does not expose.
     pub fn binding(&self, name: &str) -> Option<TableBinding> {
-        self.tables
-            .read()
-            .unwrap()
-            .get(name)
-            .map(CatalogTable::binding)
+        let columns = self.tables.read().unwrap().get(name)?.columns();
+        Some(TableBinding::new(name.to_string(), columns))
     }
 
     /// The worker pool this catalog fetches footers on — shared with callers
@@ -382,33 +380,21 @@ impl ParquetCatalog {
 }
 
 impl Catalog for ParquetCatalog {
-    /// Resolve `name` to a fresh, independently-mutable [`TableBinding`],
-    /// **reloading first**: a copy of the table is taken and refreshed (one LIST
-    /// to check the latest version; new files' footers fetched only if it
-    /// advanced), so every query starts from the latest committed file list — a
-    /// commit by ingest, a compaction, or another process becomes visible to the
-    /// next query. An advanced copy is swapped back into the map so the next
-    /// resolve starts current. Each binding is its own value, so per-query filter
-    /// pushdown prunes its view without affecting other concurrent queries.
+    /// Resolve `name` to a [`TableBinding`]: it carries the table's schema and
+    /// (after pushdown) this query's predicates, but no file set. The files are
+    /// read from the query's [`ParquetQueryContext`] when it compiles, so a
+    /// reused (cached) plan always scans the latest committed files. Resolving
+    /// here is pure in-memory and does no I/O. Each binding is its own value, so
+    /// per-query filter pushdown prunes its view without affecting other queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        let mut table = self.tables.read().unwrap().get(name)?.clone();
-        let advanced = match table.refresh() {
-            Ok(advanced) => advanced,
-            // Serve the version we have rather than failing the query; the next
-            // resolve retries the reload.
-            Err(e) => {
-                warn!(table = name, error = %e, "table refresh failed; serving last known version");
-                false
-            }
-        };
-        // Take the binding off the copy (it clones only the row-group `Arc`s it
-        // needs), then — if the copy advanced — publish it for the next resolve
-        // by moving it in, no second full clone.
-        let binding = table.binding();
-        if advanced {
-            self.tables.write().unwrap().insert(name.to_string(), table);
-        }
-        Some(Box::new(binding))
+        Some(Box::new(self.binding(name)?))
+    }
+
+    fn query_context(&self) -> Box<dyn QueryContext> {
+        Box::new(ParquetQueryContext {
+            tables: self.tables.clone(),
+            pinned: Mutex::new(HashMap::new()),
+        })
     }
 
     fn create_table(
@@ -417,5 +403,66 @@ impl Catalog for ParquetCatalog {
         dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         Ok(self.create(request, dispatcher)?)
+    }
+}
+
+/// One query's [`QueryContext`]: the concrete context a [`TableBinding`]
+/// downcasts to. The first time a scan asks for a table it reloads the master to
+/// the latest committed version and pins the resulting row groups; later asks
+/// (the same table's late materialize, or a self-join) return that same pinned
+/// `Arc`. So each table reloads at most once per query and every scan of it sees
+/// one consistent snapshot.
+pub(super) struct ParquetQueryContext {
+    tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
+    pinned: Mutex<HashMap<String, Arc<ParquetTable>>>,
+}
+
+impl ParquetQueryContext {
+    /// Table `name`'s current committed row groups — reloaded to the latest
+    /// version and pinned on first ask, returned from the pin thereafter. Errors
+    /// if the table no longer exists (dropped since planning) or the reload
+    /// fails, rather than scanning a stale or empty file set.
+    pub(super) fn parquet(&self, name: &str) -> CatalogResult<Arc<ParquetTable>> {
+        if let Some(parquet) = self.pinned.lock().unwrap().get(name) {
+            return Ok(parquet.clone());
+        }
+
+        let mut table = self
+            .tables
+            .read()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                CatalogError::Other(
+                    format!("table {name:?} no longer exists (dropped since planning?)").into(),
+                )
+            })?;
+        // Reload to the latest committed version, publishing the advanced copy so
+        // a later query's reload finds it current and re-fetches no footers. Held
+        // under no lock — the manifest LIST and footer fetch must not block
+        // another table's resolution on the pin.
+        if table
+            .refresh()
+            .map_err(|e| CatalogError::Other(Box::new(e)))?
+        {
+            self.tables
+                .write()
+                .unwrap()
+                .insert(name.to_string(), table.clone());
+        }
+
+        let parquet = table.parquet();
+        self.pinned
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), parquet.clone());
+        Ok(parquet)
+    }
+}
+
+impl QueryContext for ParquetQueryContext {
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

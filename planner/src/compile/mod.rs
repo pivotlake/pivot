@@ -22,7 +22,7 @@
 mod dummy_scan;
 mod operator;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, QueryContext};
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
@@ -103,8 +103,15 @@ impl Plan {
         &self,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        // A cached plan is re-run through here, so this is where it must pick up
+        // data committed since it was planned. The query context reloads each
+        // table a scan touches to its latest version the first time it compiles —
+        // lazily, and once per table, so a table feeding both a scan and a late
+        // materialize reloads a single time and both read one snapshot.
+        let ctx = self.catalog.query_context();
         let mut slots = DynamicFilterSlots::new();
-        self.root.compile(dispatcher, &self.catalog, &mut slots)
+        self.root
+            .compile(dispatcher, &self.catalog, ctx.as_ref(), &mut slots)
     }
 }
 
@@ -113,21 +120,22 @@ impl PlanNode {
         &self,
         dispatcher: &DataFlowDispatcher,
         catalog: &Arc<dyn Catalog>,
+        ctx: &dyn QueryContext,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, slots)?);
+            inputs.push(input.compile(dispatcher, catalog, ctx, slots)?);
         }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher, slots),
+            crate::Operator::Input(o) => o.compile(dispatcher, ctx, slots),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
-            crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Materialize(o) => o.compile(inputs.remove(0), ctx),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);

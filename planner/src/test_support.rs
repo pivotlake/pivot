@@ -100,6 +100,7 @@ impl Table for TestTable {
         projection: Projection,
         _dynamic_filters: Vec<DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
+        _ctx: &dyn crate::catalog::QueryContext,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         let projected = self
             .batch
@@ -123,7 +124,8 @@ impl Table for TestTable {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
-    ) -> RecordBatchOperatorSpec {
+        _ctx: &dyn crate::catalog::QueryContext,
+    ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("the in-memory test table is never late-materialized")
     }
 }
