@@ -142,10 +142,10 @@ impl PivotQueryHandler {
         }
     }
 
-    /// Plan, compile, and run `query`, timing each phase. When `collect_stats`,
-    /// the dataflow also tallies its IO/CPU work (otherwise that's skipped at no
-    /// cost). Returns the response and the timing + per-dataflow stats.
-    async fn run_query(&self, query: &str, collect_stats: bool) -> Result<(Response, QueryStats)> {
+    /// Plan `query`, then either run it (timing each phase, tallying the
+    /// dataflow's IO/CPU work when `collect_stats`) or — if it turned out to be a
+    /// `SET`/`RESET` — return that for the caller to apply to the connection.
+    async fn run_query(&self, query: &str, collect_stats: bool) -> Result<Outcome> {
         let dispatcher = self.dispatcher.clone();
         let query = query.to_string();
 
@@ -165,6 +165,16 @@ impl PivotQueryHandler {
         .await
         .map_err(Error::PlannerPanic)??;
         let plan_time = started.elapsed();
+
+        // A `SET`/`RESET` is a session command, not a query — DuckDB parsed and
+        // typed it for us, so there's no string-munging here. It compiles to no
+        // dataflow; hand it back for `do_query` to apply to the connection.
+        if let Some(set) = plan.as_set_variable() {
+            return Ok(Outcome::Set {
+                name: set.name.clone(),
+                value: set.value.clone(),
+            });
+        }
 
         // Compile the plan into a fresh dataflow and launch it. `compile` is pure
         // pivot work (no DuckDB), so it runs on any blocking thread without the
@@ -201,7 +211,7 @@ impl PivotQueryHandler {
             fields,
             stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
         ));
-        Ok((
+        Ok(Outcome::Query(
             response,
             QueryStats {
                 plan: plan_time,
@@ -211,6 +221,15 @@ impl PivotQueryHandler {
             },
         ))
     }
+}
+
+/// What [`run_query`](PivotQueryHandler::run_query) resolved a statement to.
+enum Outcome {
+    /// A normal query: its rows plus where its time went.
+    Query(Response, QueryStats),
+    /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
+    /// for `RESET`; the server decides which names actually mean anything.
+    Set { name: String, value: Option<String> },
 }
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
@@ -242,37 +261,31 @@ impl QueryStats {
     }
 }
 
-/// Intercept `SET pivot_stats = on|off` / `RESET pivot_stats`, toggling the
-/// per-connection flag and acking like a normal `SET`. `None` for any other
-/// statement, which then runs as usual.
-fn toggle_stats<C: ClientInfo>(client: &mut C, query: &str) -> Option<Response> {
-    let stmt = query
-        .trim()
-        .trim_end_matches(';')
-        .trim()
-        .to_ascii_lowercase();
-    if stmt == format!("reset {STATS_FLAG}") {
-        client.metadata_mut().remove(STATS_FLAG);
-        return Some(Response::Execution(Tag::new("RESET")));
+/// Apply a `SET`/`RESET` to the connection. pivot only knows [`STATS_FLAG`];
+/// every other name is accepted as a no-op, since clients routinely set GUCs
+/// (`client_encoding`, `application_name`, …) we don't model. Acks with the verb
+/// the client used (`SET`/`RESET`).
+fn apply_set<C: ClientInfo>(client: &mut C, name: &str, value: Option<&str>) -> Response {
+    if name.eq_ignore_ascii_case(STATS_FLAG) {
+        // RESET (no value) or any non-truthy value turns it off.
+        if value.is_some_and(is_truthy) {
+            client
+                .metadata_mut()
+                .insert(STATS_FLAG.to_string(), "on".to_string());
+        } else {
+            client.metadata_mut().remove(STATS_FLAG);
+        }
     }
-    let rest = stmt
-        .strip_prefix("set ")?
-        .trim_start()
-        .strip_prefix(STATS_FLAG)?
-        .trim_start();
-    // `= on` or `to on`
-    let value = rest
-        .strip_prefix('=')
-        .or_else(|| rest.strip_prefix("to "))
-        .map(str::trim)?;
-    if matches!(value, "on" | "true" | "1") {
-        client
-            .metadata_mut()
-            .insert(STATS_FLAG.to_string(), "on".to_string());
-    } else {
-        client.metadata_mut().remove(STATS_FLAG);
-    }
-    Some(Response::Execution(Tag::new("SET")))
+    Response::Execution(Tag::new(if value.is_none() { "RESET" } else { "SET" }))
+}
+
+/// Whether a serialized `SET` value reads as on. Covers the spellings DuckDB may
+/// produce — `true`/`1` for a boolean/int literal, `on`/`yes` for a quoted string.
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "t" | "1" | "on" | "yes"
+    )
 }
 
 /// Whether this connection has `pivot_stats` on.
@@ -289,30 +302,32 @@ impl SimpleQueryHandler for PivotQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // `SET pivot_stats = on` flips the per-connection flag; it isn't a real
-        // query.
-        if let Some(ack) = toggle_stats(client, query) {
-            return Ok(vec![ack]);
-        }
         let with_stats = stats_on(client);
 
         info!(sql = %query, "query received");
-        let (res, stats) = self.run_query(query, with_stats).await.map_err(|e| {
+        let outcome = self.run_query(query, with_stats).await.map_err(|e| {
             warn!(error = %e, sql = %query, "query failed");
             e.into_pgwire()
         })?;
 
-        // Send the breakdown as an INFO notice before the rows; psql prints it.
-        if with_stats {
-            let notice = NoticeResponse::from(ErrorInfo::new(
-                "INFO".to_string(),
-                "00000".to_string(),
-                stats.summary(),
-            ));
-            client
-                .send(PgWireBackendMessage::NoticeResponse(notice))
-                .await?;
-        }
+        let res = match outcome {
+            // `SET pivot_stats = on` (DuckDB-parsed) flips the per-connection flag.
+            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+            Outcome::Query(res, stats) => {
+                // Send the breakdown as an INFO notice before the rows; psql prints it.
+                if with_stats {
+                    let notice = NoticeResponse::from(ErrorInfo::new(
+                        "INFO".to_string(),
+                        "00000".to_string(),
+                        stats.summary(),
+                    ));
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(notice))
+                        .await?;
+                }
+                res
+            }
+        };
 
         info!(sql = %query, "query succeeded");
         Ok(vec![res])

@@ -449,6 +449,39 @@ impl fmt::Display for DummyScan {
     }
 }
 
+/// `SET <name> = <value>` / `RESET <name>` (the latter arrives with no value).
+///
+/// A session knob, not a query: it produces no rows and isn't compiled into a
+/// dataflow. The server inspects it after planning (see
+/// [`Plan::as_set_variable`](crate::Plan::as_set_variable)) and acts on the names
+/// it recognises. `value` is DuckDB's serialized constant (a boolean reads back
+/// as `"true"`/`"false"`); `None` is a `RESET`.
+#[derive(Debug)]
+pub struct SetVariable {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+impl TryFrom<duckdb_operator::SetVariable> for SetVariable {
+    type Error = Error;
+
+    fn try_from(set: duckdb_operator::SetVariable) -> Result<Self, Self::Error> {
+        Ok(SetVariable {
+            name: set.name,
+            value: set.value.map(|v| v.raw_value),
+        })
+    }
+}
+
+impl fmt::Display for SetVariable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.value {
+            Some(v) => write!(f, "Set({} = {v})", self.name),
+            None => write!(f, "Reset({})", self.name),
+        }
+    }
+}
+
 /// An operator in the query plan.
 #[derive(Debug)]
 pub enum Operator {
@@ -460,6 +493,8 @@ pub enum Operator {
     TopN(TopN),
     CreateTable(CreateTable),
     DummyScan(DummyScan),
+    /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
+    SetVariable(SetVariable),
     /// Late-materialization fetch (synthesized by the rewrite, see [`Materialize`]).
     Materialize(Materialize),
 }
@@ -477,6 +512,7 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
             duckdb_operator::Operator::TopN(t) => Operator::TopN(t.try_into()?),
             duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
             duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
+            duckdb_operator::Operator::Set(s) => Operator::SetVariable(s.try_into()?),
             duckdb_operator::Operator::Materialize(m) => Operator::Materialize(m.try_into()?),
             duckdb_operator::Operator::RawInput(_) => {
                 unreachable!("RawInput should be resolved to Input before reaching the planner")
@@ -499,6 +535,7 @@ impl fmt::Display for Operator {
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
+            Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),
         }
     }
