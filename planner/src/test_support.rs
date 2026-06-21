@@ -211,7 +211,7 @@ impl TestingPlanner {
 /// ```
 #[fixture]
 pub fn testing_planner() -> TestingPlanner {
-    let dispatch = Dispatch::spin_up(1, 32);
+    let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(TestCatalog::new());
     catalog.add_table(
         "example_table",

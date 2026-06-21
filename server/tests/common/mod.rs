@@ -53,7 +53,7 @@ pub fn server_port() -> u16 {
         let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         thread::spawn(move || {
-            let dispatch = Dispatch::spin_up(workers, 32);
+            let dispatch = Dispatch::spin_up(workers, 32, None);
             let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

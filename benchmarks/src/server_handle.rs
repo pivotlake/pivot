@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use dispatch::{BUFFER_SIZE, Dispatch};
 use catalog::ParquetCatalog;
+use dispatch::{BUFFER_SIZE, Dispatch};
 use server::Server;
 use tokio::sync::oneshot;
 
@@ -77,7 +77,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
         .parse()
         .expect("valid socket addr");
 
-    let dispatch = Dispatch::spin_up(workers, total_memory_bytes() * 4 / 5 / BUFFER_SIZE);
+    let dispatch = Dispatch::spin_up(workers, total_memory_bytes() * 4 / 5 / BUFFER_SIZE, None);
     let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

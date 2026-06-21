@@ -84,6 +84,32 @@ mod uring_backend {
             Ok(())
         }
 
+        /// Pushes a write of `length` bytes from `src` onto the submission queue
+        /// (does not flush). `src` points into a pinned cache slot. Used to fill
+        /// the on-disk cache after a remote (HTTP) read has landed.
+        pub fn submit_write(
+            &mut self,
+            fd: RawFd,
+            offset: u64,
+            src: *const u8,
+            length: usize,
+            request_id: Identifier,
+        ) -> Result<()> {
+            let write_op = opcode::Write::new(types::Fd(fd), src, length as u32)
+                .offset(offset)
+                .build()
+                .user_data(request_id as u64);
+
+            unsafe {
+                self.ring
+                    .submission()
+                    .push(&write_op)
+                    .map_err(|_| Error::SubmissionQueueFull)?;
+            }
+
+            Ok(())
+        }
+
         /// Flushes the submission queue to the kernel.
         pub fn submit(&mut self) -> io::Result<usize> {
             self.ring.submit()
@@ -124,6 +150,8 @@ mod pread_backend {
         length: usize,
         request_id: Identifier,
         buffer_ptr: *mut u8,
+        /// `true` for a `pwrite` (disk-cache fill), `false` for a `pread`.
+        is_write: bool,
     }
 
     unsafe impl Send for PendingRead {}
@@ -135,7 +163,9 @@ mod pread_backend {
     /// therefore always available immediately after submission.
     pub struct IOBackend {
         pending: VecDeque<PendingRead>,
-        completed: VecDeque<Identifier>,
+        /// Completed ops as `(bytes_transferred, request_id)`, mirroring the
+        /// io_uring backend's `(result, id)` so callers can check the byte count.
+        completed: VecDeque<(i32, Identifier)>,
     }
 
     impl IOBackend {
@@ -162,6 +192,28 @@ mod pread_backend {
                 length,
                 request_id,
                 buffer_ptr: dest,
+                is_write: false,
+            });
+            Ok(())
+        }
+
+        /// Queues a write from `src`; the actual `pwrite` happens at
+        /// [`submit`](Self::submit) time. Mirrors [`submit_read`](Self::submit_read).
+        pub fn submit_write(
+            &mut self,
+            fd: RawFd,
+            offset: u64,
+            src: *const u8,
+            length: usize,
+            request_id: Identifier,
+        ) -> Result<()> {
+            self.pending.push_back(PendingRead {
+                fd,
+                offset,
+                length,
+                request_id,
+                buffer_ptr: src as *mut u8,
+                is_write: true,
             });
             Ok(())
         }
@@ -180,20 +232,25 @@ mod pread_backend {
 
             while let Some(req) = self.pending.pop_front() {
                 // SAFETY: The fd is valid because it's from an open file managed by the reader
-                unsafe {
-                    let buf = std::slice::from_raw_parts_mut(req.buffer_ptr, req.length);
+                let bytes = unsafe {
                     let borrowed_fd = BorrowedFd::borrow_raw(req.fd);
-                    nix::sys::uio::pread(borrowed_fd, buf, req.offset as i64)
-                }?;
+                    if req.is_write {
+                        let buf = std::slice::from_raw_parts(req.buffer_ptr, req.length);
+                        nix::sys::uio::pwrite(borrowed_fd, buf, req.offset as i64)?
+                    } else {
+                        let buf = std::slice::from_raw_parts_mut(req.buffer_ptr, req.length);
+                        nix::sys::uio::pread(borrowed_fd, buf, req.offset as i64)?
+                    }
+                };
 
-                self.completed.push_back(req.request_id);
+                self.completed.push_back((bytes as i32, req.request_id));
             }
 
             Ok(count)
         }
 
         pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
-            Ok(self.completed.drain(..).map(|i| (0, i)).collect())
+            Ok(self.completed.drain(..).collect())
         }
     }
 }

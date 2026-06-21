@@ -1004,7 +1004,7 @@ impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
 // `testing_planner` fixture.
 #[test]
 fn create_table_calls_catalog_once() {
-    let dispatch = Dispatch::spin_up(1, 32);
+    let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
     let mut planner = Planner::new(catalog.clone());
 
@@ -1032,7 +1032,7 @@ fn create_table_calls_catalog_once() {
 
 #[test]
 fn create_table_passes_with_options_to_catalog() {
-    let dispatch = Dispatch::spin_up(1, 32);
+    let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
     let mut planner = Planner::new(catalog.clone());
 

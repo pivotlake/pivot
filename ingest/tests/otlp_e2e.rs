@@ -199,7 +199,7 @@ async fn await_rows(catalog: &ParquetCatalog, expected: i64, timeout: Duration) 
 #[tokio::test(flavor = "multi_thread")]
 async fn logs_sent_over_grpc_are_queryable_after_shutdown() {
     let port = free_port();
-    let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
     let data = tempfile::tempdir().unwrap();
     let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
     create_otel_logs(&catalog, dispatch.dispatcher(), data.path());
@@ -222,7 +222,7 @@ async fn logs_sent_over_grpc_are_queryable_after_shutdown() {
 #[tokio::test(flavor = "multi_thread")]
 async fn flush_timer_makes_logs_queryable_without_shutdown() {
     let port = free_port();
-    let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
     let data = tempfile::tempdir().unwrap();
     let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
     create_otel_logs(&catalog, dispatch.dispatcher(), data.path());
@@ -246,7 +246,7 @@ async fn flush_timer_makes_logs_queryable_without_shutdown() {
 #[tokio::test(flavor = "multi_thread")]
 async fn partitioned_logs_land_one_file_per_service() {
     let port = free_port();
-    let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
     let data = tempfile::tempdir().unwrap();
     let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
     create_partitioned_otel_logs(&catalog, dispatch.dispatcher(), data.path());

@@ -127,6 +127,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
 
 [[package]]
+name = "arrayref"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a2e8124351fda1ef8aaaa3bbd7ebbcb486bbcd4225aca0aa0d84bb2db8fecb"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -940,6 +946,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1233,6 +1253,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1471,6 +1497,7 @@ dependencies = [
  "arrow-array 58.0.0",
  "arrow-buffer 58.0.0",
  "arrow-schema 58.0.0",
+ "blake3",
  "bytes",
  "core_affinity",
  "crossbeam-deque",
@@ -2166,8 +2193,13 @@ checksum = "bfa799dd5ed20a7e349f3b4639aa80d74549c81716d9ec4f994c9b5815598306"
 name = "ingest"
 version = "0.1.0"
 dependencies = [
+ "arrow-arith 58.0.0",
  "arrow-array 58.0.0",
+ "arrow-cast 58.0.0",
+ "arrow-json 58.0.0",
+ "arrow-ord 58.0.0",
  "arrow-schema 58.0.0",
+ "arrow-select 58.0.0",
  "catalog",
  "dispatch",
  "opentelemetry-proto",
@@ -2181,6 +2213,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2853,6 +2886,7 @@ dependencies = [
  "dispatch",
  "duckdb-planner",
  "regex",
+ "serde",
  "thiserror 2.0.18",
 ]
 
@@ -4232,6 +4266,7 @@ version = "1.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
+ "getrandom 0.4.2",
  "js-sys",
  "wasm-bindgen",
 ]

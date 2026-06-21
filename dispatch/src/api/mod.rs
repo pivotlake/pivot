@@ -10,7 +10,7 @@
 //! # use dispatch::*;
 //! # use dispatch::table_input;
 //! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-//! # let dispatch = Dispatch::spin_up(1, 32);
+//! # let dispatch = Dispatch::spin_up(1, 32, None);
 //! let results = table_input(dispatch.dispatcher(), &table, Projection::columns([0]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");

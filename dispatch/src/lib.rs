@@ -29,7 +29,7 @@
 //! # use arrow_array::StringViewArray;
 //! # use dispatch::*;
 //! # use dispatch::table_input;
-//! # let dispatch = Dispatch::spin_up(1, 32);
+//! # let dispatch = Dispatch::spin_up(1, 32, None);
 //! # let dispatcher = dispatch.dispatcher();
 //! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
 //! // SELECT COUNT(*) FROM events WHERE url LIKE '%google%'
@@ -236,9 +236,15 @@ pub struct Dispatch {
 impl Dispatch {
     /// Spawn `worker_count` worker threads (capped by available cores) and return a
     /// `Dispatch` that owns them. `buffers` sets the size of the shared ring (in 2MB
-    /// slots) used for all worker memory contexts. Blocks until every worker has
-    /// finished pre-faulting and is ready for work.
-    pub fn spin_up(worker_count: usize, buffers: usize) -> Self {
+    /// slots) used for all worker memory contexts. `disk_cache` is the optional
+    /// disk cache for remote reads, shared by every worker's requester (`None`
+    /// disables it). Blocks until every worker has finished pre-faulting and is
+    /// ready for work.
+    pub fn spin_up(
+        worker_count: usize,
+        buffers: usize,
+        disk_cache: Option<Arc<crate::io::DiskCache>>,
+    ) -> Self {
         let cores = core_affinity::get_core_ids().unwrap();
         info!("Setting up io...");
 
@@ -260,6 +266,7 @@ impl Dispatch {
                 core,
                 should_exit.clone(),
                 memory_context_factories.pop().unwrap(),
+                disk_cache.clone(),
                 rx,
                 barrier.clone(),
                 waker.clone(),

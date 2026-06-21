@@ -463,7 +463,7 @@ mod tests {
     /// scan (proves the PLAIN int and byte-array encodings are correct).
     #[test]
     fn written_pages_decode_to_original_values() {
-        let dispatch = Dispatch::spin_up(1, RING_BUFFERS);
+        let dispatch = Dispatch::spin_up(1, RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
 
         write_logs(
@@ -505,7 +505,7 @@ mod tests {
             .map(|n| n.get())
             .unwrap_or(1)
             .min(4);
-        let dispatch = Dispatch::spin_up(workers, RING_BUFFERS);
+        let dispatch = Dispatch::spin_up(workers, RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
 
         write_logs(
@@ -527,7 +527,7 @@ mod tests {
     /// so its rows are visible to new binds without re-creating the table.
     #[test]
     fn flushed_file_is_registered_with_catalog_table() {
-        let dispatch = Dispatch::spin_up(2, RING_BUFFERS);
+        let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
@@ -560,7 +560,7 @@ mod tests {
         // 4× the usual test ring: the fused scan→encode dataflow keeps decode
         // and encode in flight together, so decompressed pages (a full ring
         // buffer each, however small the page) queue while workers encode.
-        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
@@ -636,7 +636,7 @@ mod tests {
     /// metadata.
     #[test]
     fn compaction_preserves_partition_and_sort_metadata() {
-        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_partitioned_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
@@ -696,7 +696,7 @@ mod tests {
         use arrow_schema::{DataType, Field, Schema};
         use parquet::arrow::ArrowWriter;
 
-        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let table_dir = db.path().join("events");
         std::fs::create_dir_all(&table_dir).unwrap();
@@ -776,7 +776,7 @@ mod tests {
     /// root — and the server sees the swap at its next bind.
     #[test]
     fn compacter_in_another_process_compacts_the_servers_flushes() {
-        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS);
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
 

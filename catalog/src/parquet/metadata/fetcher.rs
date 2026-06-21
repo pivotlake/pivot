@@ -105,7 +105,9 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
                 FileLocation::Local(Arc::new(fd))
             }
             DataFileSource::Remote { url, auth } => {
-                let remote = Arc::new(RemoteFile::open(url, auth).map_err(crate::parquet::op_err)?);
+                let remote = Arc::new(
+                    RemoteFile::open(url, auth, file_ref.size).map_err(crate::parquet::op_err)?,
+                );
                 FileLocation::Remote(remote)
             }
         };

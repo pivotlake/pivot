@@ -23,6 +23,12 @@ tikv-jemallocator = "0.6.0"
 bytes = "1.11.0"
 libc = "0.2.178"
 
+# Cryptographic hash for the disk cache's content-addressed filenames: a stable
+# spec (identical across versions/platforms) whose collisions can't be crafted,
+# so adversarial object keys can't be made to alias one cache file. Pure-Rust
+# SIMD by default (no cmake/C toolchain), matching the rustls+ring choice below.
+blake3 = "1"
+
 # HTTP(S) source support. rustls is sans-IO: we shuttle ciphertext between the
 # socket (io_uring on Linux, blocking std::net elsewhere) and rustls's in-memory
 # buffers, so TLS works identically on both backends. `ring` keeps the build lean

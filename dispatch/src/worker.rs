@@ -25,7 +25,7 @@
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
-use crate::io::{Completion, IORequester};
+use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use core_affinity::CoreId;
@@ -257,6 +257,7 @@ impl Worker {
         core: CoreId,
         should_exit: Arc<AtomicBool>,
         memory_context_factory: MemoryContextFactory,
+        disk_cache: Option<Arc<DiskCache>>,
         receiver: Receiver<DataFlowBuilder>,
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
@@ -272,8 +273,11 @@ impl Worker {
                 let last_seen_wake_count = waker.wake_count();
                 debug!("Initializing worker waker {:?}", idx);
                 init_worker_waker(&waker);
+                // Give this worker thread a handle to the shared disk cache so
+                // `drop_cache()` can clear it; the requester takes ownership.
+                crate::io::disk_cache::install_worker_disk_cache(disk_cache.clone());
                 let worker = Self {
-                    io: IORequester::new(),
+                    io: IORequester::new(disk_cache),
                     id: core.id,
                     data_flows: HashMap::new(),
                     data_flow_queue: receiver,

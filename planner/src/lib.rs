@@ -73,7 +73,7 @@
 //!
 //! // Wire one parquet directory into the catalog under the name "hits". The
 //! // footers are read once here, over the dispatch worker pool.
-//! let dispatch = Dispatch::spin_up(1, 10);
+//! let dispatch = Dispatch::spin_up(1, 10, None);
 //! let parquet = Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), Path::new("/tmp/hits")).unwrap());
 //! let template = MyTableTemplate {
 //!     parquet,

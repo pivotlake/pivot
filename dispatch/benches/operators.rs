@@ -958,7 +958,7 @@ fn main() {
         total_rows()
     );
 
-    let dispatch = Dispatch::spin_up(workers, buffers);
+    let dispatch = Dispatch::spin_up(workers, buffers, None);
     let dispatcher = dispatch.dispatcher().clone();
 
     let mut c = Criterion::default().configure_from_args();

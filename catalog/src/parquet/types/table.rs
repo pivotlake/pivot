@@ -445,7 +445,7 @@ mod tests {
     fn test_dispatcher() -> &'static DataFlowDispatcher {
         static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
         DISPATCH
-            .get_or_init(|| Dispatch::spin_up(1, 32))
+            .get_or_init(|| Dispatch::spin_up(1, 32, None))
             .dispatcher()
     }
 

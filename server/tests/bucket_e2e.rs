@@ -56,7 +56,7 @@ fn start_server_on(root: &str) -> u16 {
     let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
     let root = root.to_string();
     thread::spawn(move || {
-        let dispatch = Dispatch::spin_up(workers, 32);
+        let dispatch = Dispatch::spin_up(workers, 32, None);
         let catalog = Arc::new(ParquetCatalog::open(&root, dispatch.dispatcher()).unwrap());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
