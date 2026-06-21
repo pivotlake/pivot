@@ -233,6 +233,39 @@ async fn global_min_max_does_not_short_circuit_double_column(#[future] conn: Con
     }
 }
 
+/// An unfiltered global COUNT(*) is answered from the sum of parquet row-group
+/// row counts, with no scan. (The empty-projection scan path returned 0, so
+/// this is both the fix and the optimization.)
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn global_count_star_answers_from_metadata(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_count", dir.path()).await;
+
+    select_one_i64(&conn, "SELECT drop_cache()").await;
+    let count = select_one_i64(&conn, "SELECT COUNT(*) FROM people_count").await;
+    let evicted = select_one_i64(&conn, "SELECT drop_cache()").await;
+
+    assert_eq!(count, 3);
+    assert_eq!(evicted, 0, "count from metadata must not scan any pages");
+}
+
+/// A WHERE clause excludes rows, so the COUNT(*) short-circuit is unsound and
+/// must not fire: the count reflects the filter, not the whole table.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_count_star_is_correct(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_count_filtered", dir.path()).await;
+
+    let count =
+        select_one_i64(&conn, "SELECT COUNT(*) FROM people_count_filtered WHERE id > 1").await;
+
+    assert_eq!(count, 2);
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
