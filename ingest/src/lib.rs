@@ -406,14 +406,16 @@ mod tests {
             .unwrap();
     }
 
-    /// Resolve `name` through the catalog trait — what a query bind does — so the
-    /// catalog refreshes its in-memory copy from the latest committed manifest
-    /// (a writer evolves a cloned-out handle, so the catalog's own copy lags
-    /// until a resolve), then return the typed binding.
-    fn fresh_binding(catalog: &catalog::ParquetCatalog, name: &str) -> catalog::TableBinding {
-        use planner::catalog::Catalog as _;
-        let _ = catalog.table(name);
-        catalog.binding(name).unwrap()
+    /// Refresh `name` to the latest committed manifest (a writer evolves a
+    /// cloned-out handle, so the catalog's own copy lags until a refresh), then
+    /// return its current row groups.
+    fn fresh_parquet(
+        catalog: &catalog::ParquetCatalog,
+        name: &str,
+    ) -> Arc<catalog::parquet::ParquetTable> {
+        let mut table = catalog.table_handle(name).expect("table exists");
+        table.refresh().expect("manifest reload");
+        table.parquet()
     }
 
     /// Load the written directory back into a `ParquetTable`. Drives the
@@ -529,14 +531,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
         create_catalog_table(&catalog, dispatch.dispatcher(), dir.path());
-        assert!(
-            catalog
-                .binding("otel_logs")
-                .unwrap()
-                .parquet
-                .row_groups()
-                .is_empty()
-        );
+        assert!(fresh_parquet(&catalog, "otel_logs").row_groups().is_empty());
 
         flush_each(
             dispatch.dispatcher(),
@@ -545,8 +540,8 @@ mod tests {
             catalog.clone(),
         );
 
-        let table = fresh_binding(&catalog, "otel_logs");
-        let groups = table.parquet.row_groups();
+        let parquet = fresh_parquet(&catalog, "otel_logs");
+        let groups = parquet.row_groups();
         assert_eq!(
             groups.iter().map(|rg| rg.num_rows).sum::<i64>(),
             5,
@@ -596,8 +591,8 @@ mod tests {
         // The merge is a 3→1 swap in the catalog; the three inputs linger on
         // disk as deferred-deletion orphans until their version is pruned.
         assert_eq!(catalog.table_files("otel_logs").unwrap().len(), 1);
-        let table = fresh_binding(&catalog, "otel_logs");
-        let groups = table.parquet.row_groups();
+        let parquet = fresh_parquet(&catalog, "otel_logs");
+        let groups = parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
         assert!(
@@ -614,7 +609,7 @@ mod tests {
         // un-pruned input orphans.
         let batches = table_input(
             dispatch.dispatcher(),
-            &table.parquet,
+            &parquet,
             Projection::all(NUM_LOG_COLUMNS),
             false,
         )
@@ -764,16 +759,12 @@ mod tests {
         // inputs remain as orphans until their version is pruned.
         assert!(on_disk.contains(&files[0].path.as_str().to_string()));
 
-        let table = catalog.binding("events").unwrap();
-        assert_eq!(
-            table
-                .parquet
-                .row_groups()
-                .iter()
-                .map(|rg| rg.num_rows)
-                .sum::<i64>(),
-            3
-        );
+        let rows = fresh_parquet(&catalog, "events")
+            .row_groups()
+            .iter()
+            .map(|rg| rg.num_rows)
+            .sum::<i64>();
+        assert_eq!(rows, 3);
 
         dispatch.exit();
     }
@@ -821,10 +812,9 @@ mod tests {
             .unwrap()
             .block_on(compacter.compact_all());
 
-        // The server's next bind reloads to the compacted version.
-        assert!(planner::catalog::Catalog::table(&*server_catalog, "otel_logs").is_some());
-        let table = server_catalog.binding("otel_logs").unwrap();
-        let groups = table.parquet.row_groups();
+        // The server's next query reloads to the compacted version.
+        let parquet = fresh_parquet(&server_catalog, "otel_logs");
+        let groups = parquet.row_groups();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].num_rows, 9);
         assert!(

@@ -104,6 +104,15 @@ pub fn parquet_table(
     (dir, table)
 }
 
+/// Reload `name` to its latest committed manifest and return its current row
+/// groups for inspection — a query's scan does the same through its query
+/// context; here we drive it on a cloned-out table handle.
+pub fn current_parquet(catalog: &catalog::ParquetCatalog, name: &str) -> Arc<ParquetTable> {
+    let mut table = catalog.table_handle(name).expect("table exists");
+    table.refresh().expect("manifest reload");
+    table.parquet()
+}
+
 /// Load a `ParquetTable` from an already-populated directory. Drives the
 /// metadata-fetch dataflow, so it runs on the coordinator (the test thread), not
 /// inside `run_on_worker`.

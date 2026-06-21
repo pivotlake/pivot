@@ -12,6 +12,7 @@
 //! standalone wrapper structs (rather than blanket impls) because the orphan
 //! rule prevents implementing a foreign trait for `Box<dyn Table>` directly.
 
+use std::any::Any;
 use std::collections::HashMap;
 
 use crate::expression::{CompareType, TableFilter};
@@ -65,6 +66,29 @@ pub struct CreateTableRequest {
     pub if_not_exists: bool,
 }
 
+/// An opaque per-query context, created once per [`Plan::compile`](crate::Plan::compile)
+/// (via [`Catalog::query_context`]) and threaded to every [`Table::compile`]. The
+/// planner treats it as a black box; a backend's [`Table`] downcasts it to its
+/// own concrete context and reads whatever it needs. The catalog, for instance,
+/// uses it to reload + pin each table's files once per query — so a reused
+/// (cached) plan sees data committed since it was planned, and a scan and its
+/// late materialize share one snapshot.
+pub trait QueryContext {
+    /// Downcast hook. The trait carries no behaviour of its own — a backend
+    /// recovers its concrete context from this and reads whatever it needs.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// The default [`QueryContext`]: carries nothing, for backends whose tables are
+/// always current (e.g. in-memory test stubs) and never downcast it.
+pub struct NoQueryContext;
+
+impl QueryContext for NoQueryContext {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A table that the planner can read from.
 ///
 /// Implementations expose two pieces of information: the column list (used
@@ -85,12 +109,17 @@ pub trait Table: Debug + Send + Sync {
     /// row-group ID and per-row index). Backends that don't materialize can
     /// ignore it; the bridge only sets it on a late-materialized query's narrow
     /// scan.
+    /// `ctx` is the per-query [`QueryContext`]; a backend reading mutable storage
+    /// downcasts it to reload itself to the latest committed version before
+    /// scanning, so a reused (cached) plan sees data committed since it was
+    /// planned. Backends with no such notion ignore it.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        ctx: &dyn QueryContext,
     ) -> Result<RecordBatchOperatorSpec>;
 
     /// Return the table's schema.
@@ -114,7 +143,8 @@ pub trait Table: Debug + Send + Sync {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
-    ) -> RecordBatchOperatorSpec {
+        _ctx: &dyn QueryContext,
+    ) -> Result<RecordBatchOperatorSpec> {
         unreachable!("materialize called on a table that does not support late materialization")
     }
 
@@ -179,6 +209,12 @@ pub trait Catalog: Debug + Send + Sync {
     /// per-query filter pushdown can mutate the table without affecting
     /// concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>>;
+
+    /// A fresh [`QueryContext`] for one [`Plan::compile`](crate::Plan::compile).
+    /// Default: an empty context, for always-current backends.
+    fn query_context(&self) -> Box<dyn QueryContext> {
+        Box::new(NoQueryContext)
+    }
 
     /// Compile a `CREATE TABLE` statement into the dataflow that writes the new
     /// table into the catalog.
