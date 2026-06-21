@@ -27,7 +27,7 @@ fn shutdown_signal_drains_all_worker_threads() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let server_thread = thread::spawn(move || {
-        let dispatch = Dispatch::spin_up(workers, 32);
+        let dispatch = Dispatch::spin_up(workers, 32, None);
         let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
         assert_eq!(
             dispatch.workers(),

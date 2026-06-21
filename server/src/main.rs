@@ -34,6 +34,21 @@ struct Args {
     #[arg(long)]
     path: Option<PathBuf>,
 
+    /// Enable the on-disk cache for remote (S3/GCS) object reads, storing cached
+    /// byte ranges under this directory (persists across restarts). Omit to
+    /// disable. Only affects object-store reads; local files are unaffected.
+    #[arg(long, value_name = "DIR")]
+    disk_cache_dir: Option<PathBuf>,
+
+    /// Disk-cache size budget in GiB (only with `--disk-cache-dir`).
+    #[arg(long, default_value_t = 64.0, value_name = "GIB")]
+    disk_cache_gb: f64,
+
+    /// Disk-cache max object count — bounds open file descriptors, one per cached
+    /// object (only with `--disk-cache-dir`). Keep below the process's fd limit.
+    #[arg(long, default_value_t = 65536, value_name = "N")]
+    disk_cache_max_objects: usize,
+
     /// Start an OTLP/gRPC ingest receiver with the built-in default column
     /// layout. Repeatable — pass `--otel` once per receiver (each needs a
     /// distinct `addr` and output dirs).
@@ -184,6 +199,29 @@ pub fn get_total_memory() -> usize {
     .total_memory() as usize
 }
 
+/// Build the remote-read disk cache from the `--disk-cache-*` flags, or `None`
+/// when `--disk-cache-dir` is unset. A failure to open the directory is logged
+/// and downgraded to `None`, so a cache problem never stops the server starting.
+fn build_disk_cache(args: &Args) -> Option<Arc<dispatch::io::DiskCache>> {
+    let dir = args.disk_cache_dir.clone()?;
+    let byte_budget = (args.disk_cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+    match dispatch::io::DiskCache::open(dir.clone(), byte_budget, args.disk_cache_max_objects) {
+        Ok(cache) => {
+            info!(
+                dir = %dir.display(),
+                gib = args.disk_cache_gb,
+                max_objects = args.disk_cache_max_objects,
+                "disk cache enabled"
+            );
+            Some(Arc::new(cache))
+        }
+        Err(e) => {
+            error!(dir = %dir.display(), "failed to open disk cache, continuing without it: {e}");
+            None
+        }
+    }
+}
+
 fn main() -> Result<(), Error> {
     init_tracing();
     let args = Args::parse();
@@ -194,7 +232,8 @@ fn main() -> Result<(), Error> {
             .unwrap_or(1)
     });
     info!(workers, "initialising dispatch");
-    let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE);
+    let disk_cache = build_disk_cache(&args);
+    let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE, disk_cache);
 
     let ingests = args.ingests();
 

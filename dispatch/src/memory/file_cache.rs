@@ -175,6 +175,29 @@ impl MissingBlock {
         self.sub_block_count == 0
     }
 
+    /// Carve out a sub-block covering `[rel_offset, rel_offset + len)` *within*
+    /// this block — both relative to this block's start and both
+    /// `SUB_BLOCK_SIZE`-aligned. The sub-block shares the slot pin, reads into the
+    /// matching slice of the same pinned slot, and [`commit`](Self::commit)s only
+    /// its own sub-blocks.
+    ///
+    /// Used to split one missing run across transports: bytes already in the
+    /// local disk cache are read from there, the holes are fetched over HTTP, and
+    /// each part fills its own slice of the slot.
+    pub fn carve_sub_block(&self, rel_offset: usize, len: usize) -> MissingBlock {
+        debug_assert_eq!(rel_offset % SUB_BLOCK_SIZE, 0);
+        debug_assert_eq!(len % SUB_BLOCK_SIZE, 0);
+        debug_assert!(rel_offset + len <= self.len());
+        MissingBlock {
+            region: self.region,
+            dest: self.dest + rel_offset,
+            slot_idx: self.slot_idx,
+            first_sub_block: self.first_sub_block + rel_offset / SUB_BLOCK_SIZE,
+            sub_block_count: len / SUB_BLOCK_SIZE,
+            _pin: self._pin.clone(),
+        }
+    }
+
     /// The destination to read this block's [`len`](Self::len) bytes into: a
     /// 4 KB-aligned region `[dest, dest+len)` inside the pinned slot — a valid
     /// O_DIRECT target. The slot stays alive for the read because this block
@@ -626,7 +649,11 @@ mod tests {
     fn evicting_a_files_last_region_prunes_its_outer_entry() {
         init_test_free_pool(16);
         let files: Vec<FileLocation> = (0..4)
-            .map(|_| FileLocation::Local(std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap())))
+            .map(|_| {
+                FileLocation::Local(std::sync::Arc::new(
+                    std::fs::File::open("/dev/null").unwrap(),
+                ))
+            })
             .collect();
         for f in &files {
             cache().open_entry(f.clone());
@@ -656,7 +683,9 @@ mod tests {
     #[test]
     fn reading_a_file_after_its_entry_was_pruned_does_not_panic() {
         init_test_free_pool(8);
-        let f = FileLocation::Local(std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()));
+        let f = FileLocation::Local(std::sync::Arc::new(
+            std::fs::File::open("/dev/null").unwrap(),
+        ));
         cache().open_entry(f.clone());
         drop(miss(cache().get_region(&f, 0, 0, SB)));
 

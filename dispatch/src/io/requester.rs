@@ -1,6 +1,7 @@
 use crate::Identifier;
 use crate::io::backend::IOBackend;
-use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
+use crate::io::cached_http::CachedHttpEngine;
+use crate::io::disk_cache::DiskCache;
 use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
@@ -36,39 +37,52 @@ const RING_SIZE: u32 = 64;
 /// Held one per worker.
 pub struct IORequester {
     backend: IOBackend,
-    /// In-flight disk reads, keyed by their `user_data` id.
+    /// In-flight local-file reads, keyed by their backend `user_data` id.
     pending_io_requests: HashMap<Identifier, DataFlowRequest<FsRequest>>,
+    /// Allocates backend disk-op ids — shared by fs reads here and the engine's
+    /// cache-file reads/write-backs, so a completion routes by which map holds it.
     next_id: Identifier,
-
-    /// HTTP transport (shares `backend`'s ring on Linux).
-    http: HttpEngine,
-    /// In-flight HTTP reads, keyed by their engine request id.
-    http_pending: HashMap<Identifier, DataFlowRequest<HttpRequest>>,
-    next_http_id: Identifier,
+    /// Remote reads, optionally served from the on-disk cache. Ring-less like the
+    /// underlying [`HttpEngine`]: it borrows `backend` (and `next_id`) to submit.
+    http: CachedHttpEngine,
 }
 
 impl Default for IORequester {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl IORequester {
-    pub fn new() -> Self {
-        Self::with_http_config(default_client_config())
-    }
-
-    /// Build a requester with a specific rustls client config for the HTTP engine
-    /// (tests inject one trusting a loopback test server).
-    pub fn with_http_config(http_config: Arc<rustls::ClientConfig>) -> Self {
+    /// Build a requester sharing `disk_cache` (or `None` to disable disk caching).
+    pub fn new(disk_cache: Option<Arc<DiskCache>>) -> Self {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             pending_io_requests: Default::default(),
             next_id: 0,
-            http: HttpEngine::new(http_config).expect("Unable to create http engine"),
-            http_pending: Default::default(),
-            next_http_id: 0,
+            http: CachedHttpEngine::with_default_config(disk_cache)
+                .expect("Unable to create http engine"),
         }
+    }
+
+    /// Build a requester with a specific rustls client config for the HTTP engine
+    /// (tests inject one trusting a loopback test server) and an optional cache.
+    pub fn with_config(
+        http_config: Arc<rustls::ClientConfig>,
+        disk_cache: Option<Arc<DiskCache>>,
+    ) -> Self {
+        Self {
+            backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
+            pending_io_requests: Default::default(),
+            next_id: 0,
+            http: CachedHttpEngine::new(http_config, disk_cache)
+                .expect("Unable to create http engine"),
+        }
+    }
+
+    /// Build a requester with a specific HTTP client config and no disk cache.
+    pub fn with_http_config(http_config: Arc<rustls::ClientConfig>) -> Self {
+        Self::with_config(http_config, None)
     }
 
     /// Submits the block's read straight into its (pinned) cache slot and
@@ -90,26 +104,12 @@ impl IORequester {
         Ok(())
     }
 
-    /// Submit an HTTP(S) range read for a remote region. The engine drives
-    /// connect/handshake/request/response on the shared ring (Linux) or
-    /// synchronously (other platforms); the body lands in the block's pinned
-    /// cache slot just like a disk read.
+    /// Submit a read for a remote region, served from the on-disk cache where
+    /// possible (only the missing ranges hit the network). Delegates to the
+    /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
     pub fn request_http(&mut self, request: DataFlowRequest<HttpRequest>) -> Result<()> {
-        let block = &request.request.block;
-        let read = RemoteRead {
-            remote: request.request.remote.clone(),
-            offset: block.file_offset() as u64,
-            len: block.len(),
-            dest: block.dest(),
-        };
-        let id = self.next_http_id;
-        #[cfg(target_os = "linux")]
-        self.http.start(&mut self.backend.ring, id, read)?;
-        #[cfg(not(target_os = "linux"))]
-        self.http.start(id, read)?;
-        self.http_pending.insert(id, request);
-        self.next_http_id += 1;
-        Ok(())
+        self.http
+            .request(&mut self.backend, &mut self.next_id, request)
     }
 
     /// Returns `true` if any read (disk or HTTP) has not yet completed.
@@ -117,20 +117,21 @@ impl IORequester {
         self.has_file_pending() || self.has_http_pending()
     }
 
-    /// Returns `true` if any disk read is in flight.
+    /// Returns `true` if any disk read is in flight — operator reads here, plus
+    /// the engine's cache-file reads / write-backs (all on the shared backend).
     pub fn has_file_pending(&self) -> bool {
-        !self.pending_io_requests.is_empty()
+        !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
     }
 
     /// Returns `true` if any HTTP read is in flight.
     pub fn has_http_pending(&self) -> bool {
-        self.http.has_active()
+        self.http.has_network_pending()
     }
 
     /// Number of HTTP reads issued but not yet completed — the current read-ahead
     /// depth a worker uses to decide whether to submit more.
     pub fn http_in_flight(&self) -> usize {
-        self.http_pending.len()
+        self.http.network_in_flight()
     }
 
     /// Drain finished reads, one per-read result each. The outer `Result` is for
@@ -141,61 +142,52 @@ impl IORequester {
     /// failed read therefore never aborts the drain or tears down the worker —
     /// the worker cancels just the owning dataflow.
     ///
-    /// Disk completions come straight off the ring; HTTP completions are routed
-    /// through the [`HttpEngine`] (which may submit follow-up SQEs, including
-    /// transparent reconnect-and-retry) before the finished ones are harvested.
+    /// The single per-core ring carries everything: this requester's fs reads,
+    /// the [`CachedHttpEngine`]'s cache-file reads / write-backs, and its HTTP
+    /// sockets. We drain it once and route each completion to its owner.
     pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedRead>>> {
         let raw = self.backend.completions()?;
 
-        // HTTP socket CQEs drive the engine first: they may submit follow-up
-        // SQEs and populate the engine's completed/failed lists. A transient
-        // transport error is retried inside the engine; a terminal one lands in
-        // `take_failed` below. On non-Linux the ring is disk-only, so none here.
+        // HTTP socket CQEs drive the engine first: they may submit follow-up SQEs
+        // and populate its completed/failed lists. On non-Linux the ring is
+        // disk-only (the engine runs synchronously), so there are none here.
         #[cfg(target_os = "linux")]
         for &(result, ud) in &raw {
             if (ud as u64) & HTTP_TAG != 0 {
                 self.http
-                    .on_cqe(&mut self.backend.ring, ud as u64, result)?;
+                    .on_socket_completion(&mut self.backend, ud as u64, result)?;
             }
         }
 
         let mut out = Vec::new();
 
-        // Disk reads: one CQE each. A negative result is a failed read — surface
-        // it as an `Err` for just that dataflow rather than aborting the drain.
+        // Backend disk CQEs: this requester's fs reads, or the engine's cache-file
+        // reads / write-backs. Disjoint id spaces, so the id's owning map sorts
+        // them out. A negative result is a failure surfaced to just that dataflow.
         for &(result, ud) in &raw {
             if !disk_completion(ud) {
-                continue;
+                continue; // HTTP socket op, already routed above
             }
-            let request = self.pending_io_requests.remove(&ud).unwrap();
-            if result < 0 {
-                out.push(Err(FailedRead {
-                    data_flow_id: request.data_flow_id,
-                    operator_idx: request.operator_idx,
-                    error: std::io::Error::from_raw_os_error(-result).into(),
-                }));
+            if let Some(request) = self.pending_io_requests.remove(&ud) {
+                if result < 0 {
+                    out.push(Err(FailedRead {
+                        data_flow_id: request.data_flow_id,
+                        operator_idx: request.operator_idx,
+                        error: std::io::Error::from_raw_os_error(-result).into(),
+                    }));
+                } else {
+                    request.request.block.commit();
+                    out.push(Ok(Completion::Fs(request)));
+                }
             } else {
-                request.request.block.commit();
-                out.push(Ok(Completion::Fs(request)));
+                // Not one of ours → a cache-file read or write-back.
+                self.http.complete_disk(ud, result, &mut out);
             }
         }
 
-        // HTTP reads whose body fully landed this pass.
-        for id in self.http.take_completed() {
-            let request = self.http_pending.remove(&id).unwrap();
-            request.request.block.commit();
-            out.push(Ok(Completion::Http(request)));
-        }
-        // HTTP reads that failed terminally (retries exhausted / non-retryable).
-        // The block is left uncommitted.
-        for (id, error) in self.http.take_failed() {
-            let request = self.http_pending.remove(&id).unwrap();
-            out.push(Err(FailedRead {
-                data_flow_id: request.data_flow_id,
-                operator_idx: request.operator_idx,
-                error: error.into(),
-            }));
-        }
+        // HTTP reads the engine finished this pass (and any write-backs they queue).
+        self.http
+            .drain(&mut self.backend, &mut self.next_id, &mut out)?;
 
         Ok(out)
     }
@@ -234,7 +226,7 @@ mod tests {
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use url::Url;
 
@@ -378,6 +370,47 @@ mod tests {
         port
     }
 
+    /// Shared log of the `[start, end]` ranges a recording server was asked for.
+    type RangeLog = Arc<Mutex<Vec<(usize, usize)>>>;
+
+    /// Spawn a server that records every range it's asked for (so a test can
+    /// assert exactly which bytes went to the network) and serves each on one
+    /// keep-alive connection. Returns the port and the shared request log.
+    fn spawn_recording_server() -> (u16, RangeLog) {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_for_thread = log.clone();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            loop {
+                let head = read_head(&mut tls);
+                if head.is_empty() {
+                    break; // client closed the connection
+                }
+                let (start, end) = parse_range(&head);
+                log_for_thread.lock().unwrap().push((start, end));
+                let len = end - start + 1;
+                let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
+                let resp = format!(
+                    "HTTP/1.1 206 Partial Content\r\n\
+                     Content-Length: {len}\r\n\
+                     Content-Range: bytes {start}-{end}/1000000\r\n\
+                     Connection: keep-alive\r\n\r\n"
+                );
+                tls.write_all(resp.as_bytes()).unwrap();
+                tls.write_all(&body).unwrap();
+                tls.flush().unwrap();
+            }
+        });
+
+        (port, log)
+    }
+
     /// Read a request head (up to and including the blank-line terminator).
     fn read_head<R: Read>(r: &mut R) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -462,7 +495,7 @@ mod tests {
         let port = spawn_server(2);
 
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
-        let remote = Arc::new(RemoteFile::open(url, None).unwrap());
+        let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = FileLocation::Remote(remote);
         memory_ctx().file_cache().open_entry(loc.clone());
 
@@ -484,7 +517,7 @@ mod tests {
         let port = spawn_stale_pool_server();
 
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
-        let remote = Arc::new(RemoteFile::open(url, None).unwrap());
+        let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = FileLocation::Remote(remote);
         memory_ctx().file_cache().open_entry(loc.clone());
 
@@ -499,5 +532,127 @@ mod tests {
         // re-issue the (idempotent) range read rather than surfacing an error.
         fetch(&mut requester, &loc, 4096, 4096);
         assert_cached(&loc, 4096, 4096);
+    }
+
+    /// Drive every pending read *and* write-back to completion — `fetch` only
+    /// waits for the reads, but the disk-cache test must let the asynchronous
+    /// write-backs land before it drops the in-memory cache.
+    fn settle(requester: &mut IORequester) {
+        while requester.has_pending() {
+            requester.wait().unwrap();
+            for c in requester.completions().unwrap() {
+                if let Err(e) = c {
+                    panic!("a read failed: {}", e.error);
+                }
+            }
+        }
+    }
+
+    /// A disk cache over `dir`. A second cache over the same dir models a restart.
+    fn cache_in(dir: &tempfile::TempDir) -> Arc<DiskCache> {
+        Arc::new(DiskCache::open(dir.path().to_path_buf(), 1 << 30, 1 << 20).unwrap())
+    }
+
+    /// Register a remote object served by the loopback server on `port`.
+    fn remote_loc(port: u16) -> FileLocation {
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
+        let loc = FileLocation::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()));
+        memory_ctx().file_cache().open_entry(loc.clone());
+        loc
+    }
+
+    fn requester_with(cache: Arc<DiskCache>) -> IORequester {
+        IORequester::with_config(client_config(), Some(cache))
+    }
+
+    /// A read that missed memory but whose bytes are already on disk is served
+    /// from the cache file. The server allows exactly one request, so the second
+    /// read would fail outright if it touched the network.
+    #[test]
+    fn a_read_already_on_disk_skips_the_network() {
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let mut requester = requester_with(cache_in(&dir));
+        let loc = remote_loc(spawn_server(1));
+        fetch(&mut requester, &loc, 0, 4096);
+        settle(&mut requester);
+        memory_ctx().file_cache().clear();
+
+        fetch(&mut requester, &loc, 0, 4096);
+        settle(&mut requester);
+
+        assert_cached(&loc, 0, 4096);
+    }
+
+    /// A partially-cached run fetches only the missing blocks: block 0 is primed
+    /// onto disk, so reading blocks 0–1 asks the network for block 1 alone.
+    #[test]
+    fn a_partial_disk_hit_fetches_only_the_missing_blocks() {
+        const SB: usize = 4096;
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let mut requester = requester_with(cache_in(&dir));
+        let (port, requested) = spawn_recording_server();
+        let loc = remote_loc(port);
+        fetch(&mut requester, &loc, 0, SB);
+        settle(&mut requester);
+        memory_ctx().file_cache().clear();
+
+        fetch(&mut requester, &loc, 0, 2 * SB);
+        settle(&mut requester);
+
+        assert_cached(&loc, 0, 2 * SB);
+        assert_eq!(
+            *requested.lock().unwrap(),
+            vec![(0, SB - 1), (SB, 2 * SB - 1)]
+        );
+    }
+
+    /// A run with cached blocks on both sides of a hole fetches only the interior
+    /// block and reassembles all three correctly — exercising a multi-piece group
+    /// (two cache reads + one HTTP fetch) and disk↔network byte stitching.
+    #[test]
+    fn a_split_read_fetches_only_the_interior_hole() {
+        const SB: usize = 4096;
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let mut requester = requester_with(cache_in(&dir));
+        let (port, requested) = spawn_recording_server();
+        let loc = remote_loc(port);
+        fetch(&mut requester, &loc, 0, SB); // prime block 0
+        settle(&mut requester);
+        fetch(&mut requester, &loc, 2 * SB, SB); // prime block 2, leaving 1 a hole
+        settle(&mut requester);
+        memory_ctx().file_cache().clear();
+
+        fetch(&mut requester, &loc, 0, 3 * SB);
+        settle(&mut requester);
+
+        assert_cached(&loc, 0, 3 * SB);
+        assert_eq!(
+            *requested.lock().unwrap(),
+            vec![(0, SB - 1), (2 * SB, 3 * SB - 1), (SB, 2 * SB - 1)]
+        );
+    }
+
+    /// The cache survives a restart: a fresh cache over the same directory
+    /// reseeds what's on disk (via `SEEK_HOLE`, Linux-only), so a read after the
+    /// restart skips the network the same way an in-process hit would.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_disk_cache_survives_a_restart() {
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let loc = remote_loc(spawn_server(1));
+        let mut before = requester_with(cache_in(&dir));
+        fetch(&mut before, &loc, 0, 4096);
+        settle(&mut before);
+        memory_ctx().file_cache().clear();
+
+        let mut after = requester_with(cache_in(&dir));
+        fetch(&mut after, &loc, 0, 4096);
+        settle(&mut after);
+
+        assert_cached(&loc, 0, 4096);
     }
 }

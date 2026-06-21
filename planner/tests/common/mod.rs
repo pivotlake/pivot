@@ -217,7 +217,7 @@ pub fn testing_planner() -> TestingPlanner {
     // `TestTable::new` calls `ParquetTable::from_directory`, which touches
     // `memory_ctx()` (file cache) and so must run on a worker — see
     // `TestTable::new` for the `run_on_worker` hop.
-    let dispatch = Dispatch::spin_up(1, 32);
+    let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(TestCatalog::new());
     catalog.add_table(
         &dispatch,

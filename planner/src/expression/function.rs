@@ -83,13 +83,16 @@ impl Function {
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
             Function::DatePart(d) => d.compile(),
-            // `drop_cache()` evicts pivot's file cache as a side effect, then
-            // returns the regions dropped. Evaluated over the single `DummyScan`
-            // row on a worker thread (where `memory_ctx` is valid), so the
-            // eviction happens exactly once; the returned array matches the
-            // (one-row) batch.
+            // `drop_cache()` evicts pivot's in-memory file cache *and* the on-disk
+            // cache (so remote reads go cold to the network) as a side effect, then
+            // returns the total entries dropped. Evaluated over the single
+            // `DummyScan` row on a worker thread (where `memory_ctx` and the
+            // worker's disk-cache handle are valid), so the eviction happens
+            // exactly once; the returned array matches the (one-row) batch.
             Function::DropCache => Ok(stateless_expr(|batch: &RecordBatch| {
-                let evicted = dispatch::memory_ctx().file_cache().clear() as i64;
+                let regions = dispatch::memory_ctx().file_cache().clear();
+                let objects = dispatch::io::clear_disk_cache();
+                let evicted = (regions + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
         }

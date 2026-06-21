@@ -223,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
-        let dispatch = Dispatch::spin_up(1, 32);
+        let dispatch = Dispatch::spin_up(1, 32, None);
         let catalog = catalog(&dispatch);
         let server = Server::new(bind(), dispatch, catalog, vec![], 0);
 

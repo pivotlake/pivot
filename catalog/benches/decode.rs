@@ -244,7 +244,7 @@ fn main() {
     let rows = total_rows();
     eprintln!("catalog decode benches: {workers} workers, {buffers} buffers, {rows} rows");
 
-    let dispatch = Dispatch::spin_up(workers, buffers);
+    let dispatch = Dispatch::spin_up(workers, buffers, None);
 
     // Generate the synthetic parquet once, then load the table (the metadata
     // fetch runs on the coordinator, like the test helper).

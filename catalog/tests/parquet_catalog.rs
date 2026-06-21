@@ -32,7 +32,7 @@ fn dispatcher() -> DataFlowDispatcher {
     // Size it well above the suite's distinct-file count so adding tests doesn't
     // tip a later one over.
     DISPATCH
-        .get_or_init(|| Dispatch::spin_up(1, 128))
+        .get_or_init(|| Dispatch::spin_up(1, 128, None))
         .dispatcher()
         .clone()
 }
@@ -362,7 +362,6 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
         .append_data_file(relative, &bytes, None, None)
         .unwrap()
 }
-
 
 /// A file appended after `CREATE TABLE` becomes visible to new binds, with
 /// global row-group indices kept sequential.

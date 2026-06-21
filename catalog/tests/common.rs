@@ -76,7 +76,7 @@ pub fn dispatch(workers: usize) -> DispatchGuard {
 /// a cache slot.
 pub fn dispatch_with_buffers(workers: usize, buffers: usize) -> DispatchGuard {
     init_tracing();
-    DispatchGuard(Some(Dispatch::spin_up(workers, buffers)))
+    DispatchGuard(Some(Dispatch::spin_up(workers, buffers, None)))
 }
 
 pub fn parquet_table(

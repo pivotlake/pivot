@@ -44,7 +44,7 @@ impl Drop for DispatchGuard {
 /// Spin a `Dispatch` up on the calling thread and return a guard for it.
 pub fn dispatch(workers: usize) -> DispatchGuard {
     init_tracing();
-    DispatchGuard(Some(Dispatch::spin_up(workers, 10)))
+    DispatchGuard(Some(Dispatch::spin_up(workers, 10, None)))
 }
 
 pub fn strings_and_ints(names: &[&str], values: &[i64]) -> RecordBatch {

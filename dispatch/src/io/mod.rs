@@ -39,6 +39,11 @@ use url::Url;
 mod requester;
 pub use requester::{Error as IORequesterError, IORequester};
 
+mod cached_http;
+
+pub mod disk_cache;
+pub use disk_cache::{DiskCache, clear_disk_cache};
+
 pub mod http;
 
 /// An open file the engine can read: a local file (the `Arc<File>` keeps the
@@ -137,14 +142,24 @@ pub struct RemoteFile {
     /// freshness is the store's concern), or `None` for a self-authenticating
     /// URL. Read per request, never on the URL's `Hash`/`Eq` path.
     auth: Option<AuthHeader>,
+    /// Stable object identity for the on-disk cache: `host` + path, *without* the
+    /// query string. A presigned URL's signature lives in the query and changes
+    /// every time the catalog re-signs, so it must be excluded — the bytes behind
+    /// `https://host/bucket/key?sig=A` and `...?sig=B` are the same object.
+    cache_identity: String,
+    /// Total object size in bytes (from the store listing). Lets the disk cache
+    /// size its resident-block bitmap exactly, up front.
+    size: u64,
 }
 
 impl RemoteFile {
     /// Parse `url`, resolve its host to a [`SocketAddr`], and intern it. The DNS
     /// lookup happens here (once) so the per-request hot path never blocks on
-    /// resolution. `auth` supplies a fresh `Authorization` header per request,
-    /// or `None` when the URL carries its own auth.
-    pub fn open(url: Url, auth: Option<AuthHeader>) -> std::io::Result<Self> {
+    /// resolution. `auth` supplies a fresh `Authorization` header per request, or
+    /// `None` when the URL carries its own auth; `size` is the object's byte
+    /// length (from the store listing), carried so the disk cache can size its
+    /// bitmap exactly.
+    pub fn open(url: Url, auth: Option<AuthHeader>, size: u64) -> std::io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -174,7 +189,10 @@ impl RemoteFile {
                 )
             })?;
 
-        let mut request_target = url.path().to_string();
+        let path = url.path();
+        let cache_identity = format!("{host}\0{path}");
+
+        let mut request_target = path.to_string();
         if let Some(query) = url.query() {
             request_target.push('?');
             request_target.push_str(query);
@@ -195,6 +213,8 @@ impl RemoteFile {
             request_target,
             is_https,
             auth,
+            cache_identity,
+            size,
         })
     }
 
@@ -202,6 +222,17 @@ impl RemoteFile {
     /// URL is self-authenticating. Cheap and non-blocking — reads a cached token.
     pub fn auth_header(&self) -> Option<Arc<str>> {
         self.auth.as_ref().and_then(|f| f())
+    }
+
+    /// Total object size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Stable identity (`host` + path, no query) for keying the on-disk cache.
+    /// See [`cache_identity`](Self::cache_identity) field docs.
+    pub fn cache_identity(&self) -> &str {
+        &self.cache_identity
     }
 
     pub fn host(&self) -> &str {
