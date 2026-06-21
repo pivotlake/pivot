@@ -9,7 +9,6 @@ use std::fmt;
 use crate::duckdb_bridge::duckdb_types::{LogicalOperatorType, OrderType};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Expression, type_name};
-use crate::types::ScalarValue;
 use custom_deserializer::CustomDeserializer;
 use serde_repr::Deserialize_repr;
 
@@ -171,12 +170,13 @@ pub struct DummyScan {}
 /// DuckDB binds a `SET` of *any* name without validating that the setting
 /// exists — that check only fires at execution, which pivot never runs — so
 /// `name` is whatever the user typed and it's up to the consumer to decide which
-/// names it honours. `value` is the bound constant as DuckDB serialized it (so a
-/// boolean reads back as `"true"`/`"false"`).
+/// names it honours. `value` is the bound constant in string form as DuckDB
+/// serialized it (so a boolean reads back as `"true"`/`"false"`); `None` for a
+/// `RESET`.
 #[derive(CustomDeserializer, Debug)]
 pub struct SetVariable {
     pub name: String,
-    pub value: Option<ScalarValue>,
+    pub value: Option<String>,
 }
 
 /// A logical operator in the query plan. Discriminated by DuckDB's
@@ -328,7 +328,7 @@ impl fmt::Display for Operator {
             }
             Operator::DummyScan(_) => write!(f, "DummyScan"),
             Operator::Set(s) => match &s.value {
-                Some(v) => write!(f, "Set({} = {})", s.name, v.raw_value),
+                Some(v) => write!(f, "Set({} = {v})", s.name),
                 None => write!(f, "Reset({})", s.name),
             },
             Operator::RawMaterialize(m) => {

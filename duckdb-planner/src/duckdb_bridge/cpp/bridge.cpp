@@ -586,16 +586,13 @@ json build_create_table(duckdb::LogicalCreateTable *create_table) {
 // `SET <name> = <value>`. DuckDB's binder builds a LogicalSet for *any* name —
 // it doesn't validate the setting exists until execution, which pivot never runs
 // — so the name comes through verbatim and pivot decides what (if anything) it
-// means. The value is a bound constant, serialized the same `{logical_type,
-// raw_value}` way as any other scalar.
+// means. The value is a bound constant; pivot only ever wants its string form
+// (a boolean reads back as "true"/"false"), so serialize just that, not the
+// `{logical_type, raw_value}` pair every other scalar carries.
 json build_set(duckdb::LogicalSet *set) {
-	json value = {
-		{"logical_type", set->value.type().id()},
-		{"raw_value", set->value.ToString()},
-	};
 	return {
 		{"name", set->name},
-		{"value", value},
+		{"value", set->value.ToString()},
 	};
 }
 

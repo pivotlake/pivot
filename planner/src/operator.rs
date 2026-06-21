@@ -468,7 +468,7 @@ impl TryFrom<duckdb_operator::SetVariable> for SetVariable {
     fn try_from(set: duckdb_operator::SetVariable) -> Result<Self, Self::Error> {
         Ok(SetVariable {
             name: set.name,
-            value: set.value.map(|v| v.raw_value),
+            value: set.value,
         })
     }
 }

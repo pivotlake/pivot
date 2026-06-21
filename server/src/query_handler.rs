@@ -46,7 +46,9 @@ use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::{info, warn};
 
-/// Per-connection flag (a GUC-style name) toggled with `SET pivot_stats = on`.
+/// Per-connection flag (a GUC-style name) toggled with `SET pivot_stats = true`.
+/// (DuckDB's parser rejects the bare Postgres `= on` keyword, so use `= true`,
+/// `= 1`, or quoted `= 'on'`.)
 const STATS_FLAG: &str = "pivot_stats";
 
 thread_local! {
@@ -311,7 +313,7 @@ impl SimpleQueryHandler for PivotQueryHandler {
         })?;
 
         let res = match outcome {
-            // `SET pivot_stats = on` (DuckDB-parsed) flips the per-connection flag.
+            // `SET pivot_stats = true` (DuckDB-parsed) flips the per-connection flag.
             Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
             Outcome::Query(res, stats) => {
                 // Send the breakdown as an INFO notice before the rows; psql prints it.
