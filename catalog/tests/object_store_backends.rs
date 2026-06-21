@@ -87,11 +87,16 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Pa
     cat
 }
 
-/// Refresh from the latest committed manifest (what a query bind does) and scan
-/// the table's `value` column, sorted.
+/// Reload from the latest committed manifest (what a query's scan does through
+/// the query context) and return the table's current row groups.
+fn current_parquet(cat: &ParquetCatalog, name: &str) -> std::sync::Arc<catalog::parquet::ParquetTable> {
+    cat.refresh(name).expect("reload");
+    cat.table_handle(name).expect("table exists").parquet()
+}
+
+/// Scan the table's `value` column, sorted.
 fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
-    PlannerCatalog::refresh(cat, name).unwrap();
-    let parquet = cat.current_parquet(name);
+    let parquet = current_parquet(cat, name);
     let out = table_input(d, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -101,7 +106,7 @@ fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
 }
 
 fn row_groups(cat: &ParquetCatalog, name: &str) -> usize {
-    cat.current_parquet(name).row_groups().len()
+    current_parquet(cat, name).row_groups().len()
 }
 
 // --- behaviours (run on every backend) -------------------------------------

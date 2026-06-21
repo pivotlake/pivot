@@ -50,7 +50,6 @@ use planner::catalog::{
 pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
-use tracing::warn;
 
 const PATH_OPTION: &str = "path";
 /// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
@@ -209,17 +208,21 @@ impl ParquetCatalog {
         Some(TableBinding::new(name.to_string(), columns))
     }
 
-    /// Table `name`'s current committed row groups, read from the master map
-    /// without reloading. The scan path goes through the query cache instead;
-    /// this is for callers (and tests) that just want to inspect what the catalog
-    /// holds right now.
-    pub fn current_parquet(&self, name: &str) -> Arc<ParquetTable> {
-        self.tables
-            .read()
-            .unwrap()
-            .get(name)
-            .map(CatalogTable::parquet)
-            .unwrap_or_else(|| Arc::new(ParquetTable::new(Vec::new())))
+    /// Reload `name`'s master copy to the latest committed version, publishing
+    /// the advanced copy. The scan path reloads through a query's
+    /// [`QueryContext`]; this is the same reload driven directly, for callers
+    /// that hold the catalog outside a compiling query. Errors if the table
+    /// doesn't exist or the reload fails.
+    pub fn refresh(&self, name: &str) -> CatalogResult<()> {
+        self.query_context_inner().parquet(name).map(|_| ())
+    }
+
+    /// A fresh [`ParquetQueryContext`] over this catalog's tables.
+    fn query_context_inner(&self) -> ParquetQueryContext {
+        ParquetQueryContext {
+            tables: self.tables.clone(),
+            pinned: Mutex::new(HashMap::new()),
+        }
     }
 
     /// The worker pool this catalog fetches footers on — shared with callers
@@ -394,32 +397,18 @@ impl ParquetCatalog {
 }
 
 impl Catalog for ParquetCatalog {
-    /// Resolve `name` to a **live** [`TableBinding`]: it carries the table's
-    /// schema and (after pushdown) this query's predicates, but reads its file
-    /// set from the catalog's master map every time it compiles — so a reused
-    /// (cached) plan always scans the latest committed files. The reload itself
-    /// happens in [`refresh`](Catalog::refresh), called once per table at the top
-    /// of `Plan::compile`; resolving here is pure in-memory and does no I/O. Each
-    /// binding is its own value, so per-query filter pushdown prunes its view
-    /// without affecting other concurrent queries.
+    /// Resolve `name` to a [`TableBinding`]: it carries the table's schema and
+    /// (after pushdown) this query's predicates, but no file set. The files are
+    /// read from the query's [`ParquetQueryContext`] when it compiles, so a
+    /// reused (cached) plan always scans the latest committed files. Resolving
+    /// here is pure in-memory and does no I/O. Each binding is its own value, so
+    /// per-query filter pushdown prunes its view without affecting other queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
         Some(Box::new(self.binding(name)?))
     }
 
-    /// Reload `name`'s master copy to the latest committed version (one LIST;
-    /// new files' footers fetched only if it advanced), publishing the advanced
-    /// copy so every later resolve reads it. A refresh error serves the last
-    /// known version rather than failing the query.
-    fn refresh(&self, name: &str) -> CatalogResult<()> {
-        reload_table(&self.tables, name);
-        Ok(())
-    }
-
     fn query_context(&self) -> Box<dyn QueryContext> {
-        Box::new(QueryCache {
-            tables: self.tables.clone(),
-            pinned: Mutex::new(HashMap::new()),
-        })
+        Box::new(self.query_context_inner())
     }
 
     fn create_table(
@@ -431,59 +420,58 @@ impl Catalog for ParquetCatalog {
     }
 }
 
-/// Reload `tables[name]` to its latest committed version (one LIST; new files'
-/// footers fetched only if it advanced), publishing the advanced copy back into
-/// the map. A refresh error logs and leaves the last known version in place, so
-/// a transient store failure never fails the query.
-fn reload_table(tables: &RwLock<HashMap<String, CatalogTable>>, name: &str) {
-    let mut table = match tables.read().unwrap().get(name) {
-        Some(table) => table.clone(),
-        None => return,
-    };
-    match table.refresh() {
-        Ok(true) => {
-            tables.write().unwrap().insert(name.to_string(), table);
-        }
-        Ok(false) => {}
-        Err(e) => {
-            warn!(table = name, error = %e, "table refresh failed; serving last known version");
-        }
-    }
-}
-
 /// One query's [`QueryContext`]: the concrete context a [`TableBinding`]
 /// downcasts to. The first time a scan asks for a table it reloads the master to
 /// the latest committed version and pins the resulting row groups; later asks
 /// (the same table's late materialize, or a self-join) return that same pinned
 /// `Arc`. So each table reloads at most once per query and every scan of it sees
 /// one consistent snapshot.
-pub(super) struct QueryCache {
+pub(super) struct ParquetQueryContext {
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
     pinned: Mutex<HashMap<String, Arc<ParquetTable>>>,
 }
 
-impl QueryCache {
+impl ParquetQueryContext {
     /// Table `name`'s current committed row groups — reloaded to the latest
-    /// version and pinned on first ask, returned from the pin thereafter.
-    pub(super) fn parquet(&self, name: &str) -> Arc<ParquetTable> {
+    /// version and pinned on first ask, returned from the pin thereafter. Errors
+    /// if the table no longer exists (dropped since planning) or the reload
+    /// fails, rather than scanning a stale or empty file set.
+    pub(super) fn parquet(&self, name: &str) -> CatalogResult<Arc<ParquetTable>> {
         let mut pinned = self.pinned.lock().unwrap();
         if let Some(parquet) = pinned.get(name) {
-            return parquet.clone();
+            return Ok(parquet.clone());
         }
-        reload_table(&self.tables, name);
-        let parquet = self
+
+        let mut table = self
             .tables
             .read()
             .unwrap()
             .get(name)
-            .map(CatalogTable::parquet)
-            .unwrap_or_else(|| Arc::new(ParquetTable::new(Vec::new())));
+            .cloned()
+            .ok_or_else(|| {
+                CatalogError::Other(
+                    format!("table {name:?} no longer exists (dropped since planning?)").into(),
+                )
+            })?;
+        // Reload to the latest committed version, publishing the advanced copy so
+        // a later query's reload finds it current and re-fetches no footers.
+        if table
+            .refresh()
+            .map_err(|e| CatalogError::Other(Box::new(e)))?
+        {
+            self.tables
+                .write()
+                .unwrap()
+                .insert(name.to_string(), table.clone());
+        }
+
+        let parquet = table.parquet();
         pinned.insert(name.to_string(), parquet.clone());
-        parquet
+        Ok(parquet)
     }
 }
 
-impl QueryContext for QueryCache {
+impl QueryContext for ParquetQueryContext {
     fn as_any(&self) -> &dyn Any {
         self
     }

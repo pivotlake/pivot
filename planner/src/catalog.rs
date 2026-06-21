@@ -144,7 +144,7 @@ pub trait Table: Debug + Send + Sync {
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
         _ctx: &dyn QueryContext,
-    ) -> RecordBatchOperatorSpec {
+    ) -> Result<RecordBatchOperatorSpec> {
         unreachable!("materialize called on a table that does not support late materialization")
     }
 
@@ -209,15 +209,6 @@ pub trait Catalog: Debug + Send + Sync {
     /// per-query filter pushdown can mutate the table without affecting
     /// concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>>;
-
-    /// Reload `name` to its latest committed version. Default: no-op, for
-    /// backends whose tables are always current (e.g. in-memory test stubs).
-    /// The per-query reloading a compiling plan does goes through
-    /// [`query_cache`](Catalog::query_cache); this is the one-shot primitive
-    /// underneath it (and what callers outside a query use).
-    fn refresh(&self, _name: &str) -> Result<()> {
-        Ok(())
-    }
 
     /// A fresh [`QueryContext`] for one [`Plan::compile`](crate::Plan::compile).
     /// Default: an empty context, for always-current backends.

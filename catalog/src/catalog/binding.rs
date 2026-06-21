@@ -12,7 +12,8 @@ use crate::parquet::{
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
-    Column, DynamicScanPredicate, QueryContext, Result as CatalogResult, Table,
+    Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
+    Table,
 };
 use planner::expression::{CompareType, Expression, TableFilter};
 
@@ -54,18 +55,26 @@ impl TableBinding {
             predicates: Vec::new(),
         }
     }
-}
 
-/// This table's current committed row groups, from the query context (reloaded
-/// to the latest version and pinned there). The context is always our own
-/// [`QueryCache`](super::QueryCache) — a `ParquetCatalog` only ever compiles its
-/// own bindings — so the downcast succeeds; a foreign context or a vanished
-/// table yields an empty table.
-fn parquet_from(ctx: &dyn QueryContext, name: &str) -> Arc<ParquetTable> {
-    ctx.as_any()
-        .downcast_ref::<super::QueryCache>()
-        .map(|cache| cache.parquet(name))
-        .unwrap_or_else(|| Arc::new(ParquetTable::new(Vec::new())))
+    /// This table's current committed row groups, from the query context (which
+    /// reloads to the latest version and pins). The context is always our own
+    /// [`ParquetQueryContext`](super::ParquetQueryContext) — a `ParquetCatalog`
+    /// only ever compiles its own bindings — so the downcast is an invariant;
+    /// failing it, or the table having been dropped since planning, is an error,
+    /// never a silent empty scan.
+    fn resolve_files(&self, ctx: &dyn QueryContext) -> CatalogResult<Arc<ParquetTable>> {
+        let ctx = ctx
+            .as_any()
+            .downcast_ref::<super::ParquetQueryContext>()
+            .ok_or_else(|| {
+                CatalogError::Other(
+                    "query context is not a ParquetQueryContext"
+                        .to_string()
+                        .into(),
+                )
+            })?;
+        ctx.parquet(&self.name)
+    }
 }
 
 impl Table for TableBinding {
@@ -80,7 +89,7 @@ impl Table for TableBinding {
         // The query context hands back this table's latest committed files (it
         // reloads once and pins), so a reused cached plan scans data committed
         // since it was planned.
-        let current = parquet_from(ctx, &self.name);
+        let current = self.resolve_files(ctx)?;
 
         // Equality predicates additionally let the decoder skip row groups whose
         // dictionary for that column excludes the constant.
@@ -124,12 +133,12 @@ impl Table for TableBinding {
         input: RecordBatchOperatorSpec,
         projection: Projection,
         ctx: &dyn QueryContext,
-    ) -> RecordBatchOperatorSpec {
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
         // Same `ctx` as the scan, so this reads the *same* pinned snapshot —
         // their global row-group indices must line up. Late materialization
         // re-reads rows by that global index, so it uses the full table, not the
         // pruned scan view.
-        materialize(input, parquet_from(ctx, &self.name), projection)
+        Ok(materialize(input, self.resolve_files(ctx)?, projection))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {

@@ -377,7 +377,7 @@ impl CatalogTable {
     /// cached, so the view can never disagree with `files` — a [`TableBinding`]
     /// reads this through the catalog every time it compiles, so a reused
     /// (cached) plan always scans the latest committed files.
-    pub(super) fn parquet(&self) -> Arc<ParquetTable> {
+    pub fn parquet(&self) -> Arc<ParquetTable> {
         let row_groups = self
             .files
             .iter()

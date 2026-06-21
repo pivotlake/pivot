@@ -769,7 +769,9 @@ impl Materialize {
         ctx: &dyn QueryContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let projection = DispatchProjection::columns(self.columns.iter().copied());
-        Ok(self.table.materialize(input, projection, ctx))
+        self.table
+            .materialize(input, projection, ctx)
+            .map_err(Error::TableScan)
     }
 }
 

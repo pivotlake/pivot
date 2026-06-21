@@ -85,6 +85,16 @@ fn create(
         .map_err(|e| planner::catalog::Error::Other(Box::new(e)))
 }
 
+/// Reload `name` to its latest committed manifest and return its current row
+/// groups, for inspection.
+fn current_parquet(
+    catalog: &ParquetCatalog,
+    name: &str,
+) -> std::sync::Arc<catalog::parquet::ParquetTable> {
+    catalog.refresh(name).expect("reload");
+    catalog.table_handle(name).expect("table exists").parquet()
+}
+
 #[test]
 fn create_table_with_path_scans_rows() {
     let dispatch = dispatch(1);
@@ -105,7 +115,7 @@ fn create_table_with_path_scans_rows() {
 
     let table = catalog.binding("events").expect("table created");
     assert_eq!(table.columns.len(), 2);
-    let parquet = catalog.current_parquet("events");
+    let parquet = current_parquet(&catalog, "events");
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -143,7 +153,7 @@ fn tables_persist_across_reopen() {
         .binding("events")
         .expect("table reloaded from the manifest");
     assert_eq!(table.columns.len(), 2);
-    let parquet = reopened.current_parquet("events");
+    let parquet = current_parquet(&reopened, "events");
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -163,7 +173,7 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
         // A data-less table: registered, with no row groups (its data lives under
         // `<root>/t`, which fills in once a file is registered there).
         assert!(catalog.binding("t").is_some());
-        assert!(catalog.current_parquet("t").row_groups().is_empty());
+        assert!(current_parquet(&catalog, "t").row_groups().is_empty());
     }
 
     // And it survives a reopen.
@@ -203,8 +213,8 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     )
     .unwrap();
 
-    assert_eq!(catalog.current_parquet("events").row_groups().len(), 8);
-    let parquet = catalog.current_parquet("events");
+    assert_eq!(current_parquet(&catalog, "events").row_groups().len(), 8);
+    let parquet = current_parquet(&catalog, "events");
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
         .collect()
         .unwrap();
@@ -214,7 +224,7 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     // worker's sink finishes empty and worker 0 still commits.
     create(&dispatch, &catalog, rooted_request("empty", columns())).unwrap();
     assert!(catalog.binding("empty").is_some());
-    assert!(catalog.current_parquet("empty").row_groups().is_empty());
+    assert!(current_parquet(&catalog, "empty").row_groups().is_empty());
 }
 
 #[test]

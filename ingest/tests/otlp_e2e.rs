@@ -171,10 +171,11 @@ async fn logs_client(port: u16) -> LogsServiceClient<Channel> {
 /// Total rows visible in `otel_logs` at a fresh bind (refreshes from the latest
 /// committed manifest, then sums the row groups).
 fn table_rows(catalog: &ParquetCatalog) -> i64 {
-    use planner::catalog::Catalog as _;
     catalog.refresh("otel_logs").unwrap();
     catalog
-        .current_parquet("otel_logs")
+        .table_handle("otel_logs")
+        .expect("table exists")
+        .parquet()
         .row_groups()
         .iter()
         .map(|rg| rg.num_rows)
