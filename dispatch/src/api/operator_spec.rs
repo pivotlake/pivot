@@ -64,22 +64,41 @@ impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
 
 impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O, OF> {
     pub fn execute(self) -> DataFlowHandle<O> {
+        self.execute_collecting(false)
+    }
+
+    /// Like [`execute`](Self::execute) but with per-dataflow stats collection
+    /// enabled; read the aggregated tally back via
+    /// [`DataFlowHandle::collect_with_stats`](crate::DataFlowHandle::collect_with_stats).
+    pub fn execute_with_stats(self) -> DataFlowHandle<O> {
+        self.execute_collecting(true)
+    }
+
+    fn execute_collecting(self, collect_stats: bool) -> DataFlowHandle<O> {
         let (tx, rx) = mpsc_channel();
         let (err_tx, err_rx) = std::sync::mpsc::channel();
+        let (stats_tx, stats_rx) = std::sync::mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let waker = self.dispatcher.waker().clone();
         self.dispatcher
             .push_data_flow(self.factories.into_iter().map(|f| {
                 let tx = tx.clone();
                 let build = Box::new(move || Box::new(f).build(tx));
-                DataFlowBuilder::new(build, cancelled.clone(), err_tx.clone())
+                DataFlowBuilder::new(
+                    build,
+                    cancelled.clone(),
+                    err_tx.clone(),
+                    stats_tx.clone(),
+                    collect_stats,
+                )
             }));
         // Close our local copies of the senders so the channels close once
         // every worker drops theirs.
         drop(err_tx);
+        drop(stats_tx);
 
         let (rx, _) = rx.into_parts();
-        DataFlowHandle::new(rx, err_rx, cancelled, waker)
+        DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, waker)
     }
 
     /// Run the dataflow and drain every produced item into a `Vec`. Shortcut

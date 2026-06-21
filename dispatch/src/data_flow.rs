@@ -23,6 +23,7 @@
 use crate::Identifier;
 use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
 use crate::operations::{FinishStatus, Operator};
+use crate::stats::{DataFlowStats, StatsCollector};
 use crate::worker::worker_waker;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
@@ -30,6 +31,7 @@ use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::Instant;
 use std::{panic, result};
 use thiserror::Error;
 use tracing::{debug, error, warn};
@@ -170,6 +172,9 @@ pub struct DataFlow {
     cancelled: Arc<AtomicBool>,
     err_tx: mpsc::Sender<Error>,
     graph: OperatorGraph,
+    /// Collects this worker's execution stats for the dataflow. Inert unless the
+    /// query opted in; driven by the worker through [`stats`](Self::stats).
+    stats: StatsCollector,
 }
 
 impl Debug for DataFlow {
@@ -180,22 +185,32 @@ impl Debug for DataFlow {
 }
 
 impl DataFlow {
+    #[allow(clippy::too_many_arguments)] // wired straight from the builder; each is needed
     pub fn new(
         id: Identifier,
         canceled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<Error>,
         operators: Vec<Box<dyn Operator>>,
         publisher_to_subscriber: HashMap<Identifier, Identifier>,
+        stats_tx: mpsc::Sender<DataFlowStats>,
+        collect_stats: bool,
     ) -> Self {
         Self {
             id,
             graph: OperatorGraph::from_edges(operators, publisher_to_subscriber),
             cancelled: canceled,
             err_tx,
+            stats: StatsCollector::new(stats_tx, collect_stats),
         }
     }
     pub fn id(&self) -> Identifier {
         self.id
+    }
+
+    /// This dataflow's stats collector. The worker records IO/CPU work against it
+    /// (`flow.stats().record_*`) and `report`s it when the dataflow finishes.
+    pub fn stats(&mut self) -> &mut StatsCollector {
+        &mut self.stats
     }
 
     /// Is this dataflow cancelled? This is an AtomicBool that can be set from other workers or from
@@ -227,7 +242,15 @@ impl DataFlow {
     /// Similar to the above function, `try_run_or` will run catch any errors and handle them
     /// appropriately, while also returning a default value if there is indeed an error
     fn try_run_or<R>(&mut self, default: R, f: impl FnOnce(&mut Self) -> Result<R>) -> R {
-        match panic::catch_unwind(AssertUnwindSafe(|| f(self))) {
+        // Every operator step funnels through here, so it's the one place that
+        // can see the dataflow's CPU work (the worker only sees opaque method
+        // calls). `then` skips the clock reads when stats are off.
+        let started = self.stats.enabled().then(Instant::now);
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| f(self)));
+        if let Some(started) = started {
+            self.stats.record_cpu(started.elapsed());
+        }
+        match outcome {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 self.bail_and_cancel(e);
