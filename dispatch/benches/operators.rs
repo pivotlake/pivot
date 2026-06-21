@@ -895,6 +895,55 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
 }
 
 // ---------------------------------------------------------------------------
+// GLOBAL aggregate scenarios (no GROUP BY) — the `aggregate` operator, a
+// straight per-row reduction over a whole column with no hash table. ClickBench
+// q02 (`SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)`) lives here; its hot
+// loop is a column reduction that must stay vectorised. A regression that turns
+// the reduction scalar (e.g. a loop-carried runtime branch the autovectoriser
+// won't lift) ~halves throughput but is invisible to the GROUP BY benches above,
+// which exercise the hash-table path instead.
+// ---------------------------------------------------------------------------
+
+fn bench_aggregate(c: &mut Criterion, d: &DataFlowDispatcher) {
+    let rows = total_rows();
+
+    // q02-shaped: SUM(v0), COUNT(*), and AVG(v1) — which DuckDB lowers to
+    // SUM(v1) + COUNT(v1). Four slots, all reducing the same two i16 columns in
+    // one pass, no grouping. `i64` accumulator (16-bit columns can't overflow it),
+    // matching the planner's width choice for these columns.
+    bench(
+        c,
+        d,
+        "aggregate/global_multi",
+        rows,
+        || {
+            let sch = schema(vec![
+                Field::new("v0", DataType::Int16, false),
+                Field::new("v1", DataType::Int16, false),
+            ]);
+            let mut rng = Rng::new(40);
+            batch_sizes(rows)
+                .map(|n| {
+                    batch(
+                        &sch,
+                        vec![i16_value(&mut rng, n, 2_000), i16_value(&mut rng, n, 2_000)],
+                    )
+                })
+                .collect()
+        },
+        |s| {
+            let slots = vec![
+                AggregationSlot::new(AggregationKind::Sum, 0),
+                AggregationSlot::new(AggregationKind::CountStar, 0),
+                AggregationSlot::new(AggregationKind::Sum, 1),
+                AggregationSlot::new(AggregationKind::Count, 1),
+            ];
+            s.aggregate::<i64>(slots)
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Harness: one shared Dispatch (worker pool) for every scenario.
 // ---------------------------------------------------------------------------
 
@@ -913,6 +962,7 @@ fn main() {
     bench_group_by(&mut c, &dispatcher);
     bench_filter(&mut c, &dispatcher);
     bench_order_by(&mut c, &dispatcher);
+    bench_aggregate(&mut c, &dispatcher);
     c.final_summary();
 
     dispatch.exit();
