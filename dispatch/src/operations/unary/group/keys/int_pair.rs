@@ -5,7 +5,7 @@
 //! which is `Copy`/`Hash`/`Eq` and needs no arena. The aggregate value is the
 //! separate concern of a
 //! [`AggregationValue`](crate::operations::unary::group::values::AggregationValue)
-//! (typically [`DynamicMixed`](crate::operations::unary::group::values::DynamicMixed)).
+//! (typically [`Dynamic`](crate::operations::unary::group::values::Dynamic)).
 
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;

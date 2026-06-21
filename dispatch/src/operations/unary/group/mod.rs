@@ -76,9 +76,9 @@
 //! - [`keys`] — the [`KeyExtractor`] trait and implementations
 //!   ([`IntKeyExtractor`], [`StringKeyExtractor`]), each co-located with its key
 //!   type (e.g. `keys::string` owns [`ArenaKey`])
-//! - [`values`] — the [`AggregationValue`] trait and implementations, each
-//!   co-located with its value/aggregate type (`Count`, `AggregationRow`) plus
-//!   [`AggregationKind`]/[`AggregationSlot`]
+//! - [`values`] — the [`AggregationValue`] trait and its container
+//!   implementations (`Compiled`, `Dynamic`), the per-op folds (`Count`, `Sum`,
+//!   …), plus [`AggregationKind`]/[`AggregationSlot`]
 //! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
 //!   and associated type machinery
 //! - [`merge`] — partition-parallel merge of per-worker tables

@@ -232,7 +232,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             if self.switched_to_radix {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
-                // The value type fixes the fold (Mono is branch-free, DynamicMixed
+                // The value type fixes the fold (Mono is branch-free, Dynamic
                 // dispatches per slot via `merge_config`); the probe just consumes.
                 self.consume_scalared(length, &key_reader, &value_reader, merge_config);
             }
