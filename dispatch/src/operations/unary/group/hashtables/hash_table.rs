@@ -390,7 +390,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         hash: u64,
         key: L,
         value: V,
-        cfg: &V::MergeConfig,
+        ctx: &V::SharedContext,
     ) where
         L: LiveKey<Persisted = K>,
     {
@@ -399,7 +399,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
             key,
             value,
             |value, cell| *cell = value,
-            |value, cell| *cell = cell.merge(value, cfg),
+            |value, cell| *cell = cell.merge(value, ctx),
         );
     }
 
@@ -533,11 +533,9 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
     use crate::operations::unary::group::values::AggregationSlot;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::Field;
-    use std::sync::Arc;
 
     /// A minimal additive [`AggregationValue`] for exercising the probe mechanics:
     /// merging two of these sums their counts.
@@ -546,15 +544,15 @@ mod tests {
 
     impl AggregationValue for Count {
         type Reader<'b> = ();
-        type MergeConfig = ();
+        type SharedContext = ();
         type Columns = ();
         type SortKey = i64;
-        fn merge_config(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
+        type WorkerContext = ();
         fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
-        fn value(_reader: &(), _idx: usize, _arena: &mut WorkerArena) -> Self {
+        fn value(_reader: &(), _idx: usize, _wc: &mut ()) -> Self {
             Count(1)
         }
-        fn merge(self, other: Self, _cfg: &()) -> Self {
+        fn merge(self, other: Self, _ctx: &()) -> Self {
             Count(self.0 + other.0)
         }
         fn sort_key(&self, _slot: usize) -> i64 {
@@ -562,11 +560,7 @@ mod tests {
         }
         fn new_columns(_allocator: &mut SlabAllocator, _rows: usize) {}
         fn push_to(&self, _cols: &mut ()) {}
-        fn finish_columns(
-            _cols: (),
-            _arena: &Arc<SharedArena>,
-            _cfg: &(),
-        ) -> (Vec<Field>, Vec<ArrayRef>) {
+        fn finish_columns(_cols: (), _ctx: &()) -> (Vec<Field>, Vec<ArrayRef>) {
             (Vec::new(), Vec::new())
         }
     }

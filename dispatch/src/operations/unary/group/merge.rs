@@ -88,7 +88,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue, S: TableS
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
-    cfg: &V::MergeConfig,
+    cfg: &V::SharedContext,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let start = (partition * slot_count) >> partition_bits;
@@ -143,7 +143,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue, S: TableSto
     tables: &[&Table<K, V, S>],
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
-    cfg: &V::MergeConfig,
+    cfg: &V::SharedContext,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let end = ((partition + 1) * slot_count) >> partition_bits;
@@ -181,7 +181,7 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue, S: TableStorage<K,
     tables: Vec<&Table<K, V, S>>,
     target: &mut MultiSlabTable<K, V>,
     partition_bits: u32,
-    cfg: &V::MergeConfig,
+    cfg: &V::SharedContext,
 ) {
     merge_within_partition_bounds::<K, V, S>(
         allocator,
@@ -222,7 +222,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &SharedArena,
-    cfg: &V::MergeConfig,
+    cfg: &V::SharedContext,
 ) -> MultiSlabTable<K, V> {
     let partition_bits = num_partitions.trailing_zeros();
     let mut allocator = SlabAllocator::new(true);
@@ -305,10 +305,10 @@ mod tests {
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    // A single `COUNT` slot. Its `MergeConfig` is `((),)` (the op tuple's cfgs).
+    // A single `COUNT` slot. `Compiled` is numeric-only, so its `SharedContext`
+    // is concretely `()`.
     type CountValue = Compiled<(CountSlot,)>;
-    // The `CountValue` merge config: a 1-tuple of the `Count` op's unit cfg.
-    const COUNT_CFG: <CountValue as AggregationValue>::MergeConfig = ((),);
+    const COUNT_CFG: <CountValue as AggregationValue>::SharedContext = ();
 
     fn make_worker_tables(
         state: &RandomState,
@@ -318,7 +318,7 @@ mod tests {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
             arena.clone(),
-            arena.clone(),
+            (),
             RadixConfig::DEFAULT,
         );
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
@@ -510,7 +510,7 @@ mod tests {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
             arena.clone(),
-            arena.clone(),
+            (),
             RadixConfig::DEFAULT,
         );
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));

@@ -101,9 +101,8 @@ fn emit<K, V, Snd>(
     keys: K::Columns,
     values: V::Columns,
     key_arena: &Arc<SharedArena>,
-    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
-    merge_config: &V::MergeConfig,
+    shared_context: &V::SharedContext,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -112,7 +111,7 @@ where
     Snd: Sender<RecordBatch>,
 {
     let (mut fields, mut columns) = keys.finish(key_arena, allocator);
-    let (value_fields, value_columns) = V::finish_columns(values, value_arena, merge_config);
+    let (value_fields, value_columns) = V::finish_columns(values, shared_context);
     fields.extend(value_fields);
     columns.extend(value_columns);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -127,10 +126,9 @@ fn emit_chunks<K, V, Snd, I>(
     mut rows: I,
     total: usize,
     key_arena: &Arc<SharedArena>,
-    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
-    merge_config: &V::MergeConfig,
+    shared_context: &V::SharedContext,
     sender: &mut Snd,
 ) -> Result<()>
 where
@@ -149,15 +147,7 @@ where
             keys.push(&key);
             value.push_to(&mut values);
         }
-        emit::<K, V, Snd>(
-            keys,
-            values,
-            key_arena,
-            value_arena,
-            allocator,
-            merge_config,
-            sender,
-        )?;
+        emit::<K, V, Snd>(keys, values, key_arena, allocator, shared_context, sender)?;
         remaining -= chunk;
     }
     Ok(())
@@ -173,10 +163,9 @@ where
 pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
     key_arena: &Arc<SharedArena>,
-    value_arena: &Arc<SharedArena>,
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
-    merge_config: &V::MergeConfig,
+    shared_context: &V::SharedContext,
     top_k: Option<(usize, usize)>,
     count_only: bool,
     sender: &mut Snd,
@@ -209,10 +198,9 @@ where
                 rows.into_iter(),
                 total,
                 key_arena,
-                value_arena,
                 allocator,
                 key_config,
-                merge_config,
+                shared_context,
                 sender,
             )
         }
@@ -223,10 +211,9 @@ where
                 rows,
                 total,
                 key_arena,
-                value_arena,
                 allocator,
                 key_config,
-                merge_config,
+                shared_context,
                 sender,
             )
         }
