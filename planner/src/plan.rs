@@ -90,7 +90,13 @@ impl PlanNode {
             Operator::TopN(t) if !t.order_bys.is_empty() => {
                 let ob = &t.order_bys[0];
                 match (&ob.direction, &ob.expression) {
-                    (OrderByDirection::Desc, Expression::Ref(r)) => (r.column_idx, t.limit),
+                    // Keep `limit + offset` rows per partition: the downstream
+                    // `LIMIT k OFFSET m` discards the first `m`, so a group pruned
+                    // to only `k` per partition would leave nothing past the
+                    // offset (e.g. ClickBench q38/q39, `LIMIT 10 OFFSET 1000`).
+                    (OrderByDirection::Desc, Expression::Ref(r)) => {
+                        (r.column_idx, t.limit + t.offset)
+                    }
                     _ => return,
                 }
             }
