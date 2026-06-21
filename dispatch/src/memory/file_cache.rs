@@ -605,6 +605,36 @@ mod tests {
         );
     }
 
+    /// Regression for the parquetsink OOM: evicting a file's last cached region
+    /// must drop its outer `file_maps` entry. `file_maps` is keyed by a never-
+    /// reused `FileLocation`, so a lingering empty entry per file leaks unbounded.
+    #[test]
+    fn evicting_a_files_last_region_prunes_its_outer_entry() {
+        init_test_free_pool(16);
+        let files: Vec<FileLocation> = (0..4)
+            .map(|_| FileLocation::Local(std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap())))
+            .collect();
+        for f in &files {
+            cache().open_entry(f.clone());
+            drop(miss(cache().get_region(f, 0, 0, SB)));
+        }
+
+        // Evict each cached region — one reclaim per call, over this test
+        // thread's own cache (memory_ctx is thread-local). Exactly `files.len()`
+        // calls, so we never spin `evict()` on an empty cache.
+        for _ in &files {
+            cache().evict();
+        }
+
+        let file_maps = cache().file_maps.read().unwrap();
+        for f in &files {
+            assert!(
+                !file_maps.contains_key(f),
+                "an evicted file's outer file_maps entry was left behind — leak",
+            );
+        }
+    }
+
     #[test]
     fn region_base_masks_to_two_megabytes() {
         assert_eq!(region_base_of(0), 0);
