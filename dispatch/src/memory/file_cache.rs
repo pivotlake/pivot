@@ -446,14 +446,27 @@ impl FileCache {
                         .set_slot_used(slot_idx, 0, Ordering::Release);
                     continue;
                 };
-                self.file_maps
-                    .read()
-                    .unwrap()
-                    .get(&location)
-                    .unwrap()
-                    .write()
-                    .unwrap()
-                    .remove(&region);
+                let now_empty = {
+                    let file_maps = self.file_maps.read().unwrap();
+                    let mut regions = file_maps.get(&location).unwrap().write().unwrap();
+                    regions.remove(&region);
+                    regions.is_empty()
+                };
+                // Prune the per-file outer entry once its last cached region is
+                // evicted. The map is keyed by `FileLocation` (an `Arc<File>` /
+                // `Arc<RemoteFile>`) and a key is never reused, so without this a
+                // dead entry — pinning its `Arc` and the file/connection it holds —
+                // lingers for every file ever opened, leaking unboundedly under
+                // steady ingest+compaction. Re-check emptiness under the write lock
+                // so a concurrent `get` that just re-cached a region isn't dropped.
+                if now_empty {
+                    let mut file_maps = self.file_maps.write().unwrap();
+                    if let Some(regions) = file_maps.get(&location) {
+                        if regions.read().unwrap().is_empty() {
+                            file_maps.remove(&location);
+                        }
+                    }
+                }
                 return write_buffer;
             }
         }
