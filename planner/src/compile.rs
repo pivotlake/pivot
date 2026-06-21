@@ -11,16 +11,14 @@
 //!
 //! # Organization
 //!
-//! - `operator` (private) — per-operator `compile` impls (one `impl` block
-//!   per [`Operator`](crate::operator::Operator) variant).
+//! This module holds the cross-cutting compile infrastructure: the compile
+//! [`enum@Error`], the [`ExprResult`]/[`ExprFn`] closure types, the
+//! [`DynamicFilterSlots`] registry, and the recursive [`Plan`]/[`PlanNode`]
+//! walk. The per-operator `compile` impls live alongside their AST types in the
+//! [`operator`](crate::operator) submodules, and the per-expression `compile`
+//! impls producing [`ExprFn`]s live in the [`expression`](crate::expression)
+//! submodules, not here.
 //!
-//! The per-expression `compile` impls producing [`ExprFn`]s live alongside
-//! their AST types in the [`expression`](crate::expression) submodules, not
-//! here.
-//!
-
-mod dummy_scan;
-mod operator;
 
 use crate::catalog::{Catalog, QueryContext};
 use crate::expression::Expression;

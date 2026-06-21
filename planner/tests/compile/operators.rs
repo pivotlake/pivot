@@ -725,15 +725,15 @@ fn grouped_min_max(mut testing_planner: TestingPlanner) {
         .collect()
         .unwrap();
 
-    // A single integer key goes through the row-encoded key extractor, whose key
-    // column is named `k0` (multi-key groups would add `k1`, …).
+    // A single integer key uses the dedicated `IntKeyExtractor`, whose key column
+    // is named `key` (multi-key groups use the row encoder's `k0`, `k1`, …).
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["k0"], 1);
+    assert_eq!(rows[0]["key"], 1);
     assert_eq!(rows[0]["v0"], 10); // min
     assert_eq!(rows[0]["v1"], 40); // max
-    assert_eq!(rows[1]["k0"], 2);
+    assert_eq!(rows[1]["key"], 2);
     assert_eq!(rows[1]["v0"], 5); // min
     assert_eq!(rows[1]["v1"], 20); // max
 }
@@ -765,7 +765,7 @@ fn grouped_string_min_and_max(mut testing_planner: TestingPlanner) {
             .collect()
             .unwrap();
         let mut rows = batches_to_json(&results);
-        rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+        rows.sort_by_key(|r| r["key"].as_i64().unwrap());
         rows
     };
 
@@ -840,7 +840,7 @@ fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
         .collect()
         .unwrap();
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
     assert_eq!(rows[0]["v0"], "apple"); // g=1 min
     assert_eq!(rows[0]["v1"], "banana"); // g=1 max
     assert_eq!(rows[1]["v0"], "cherry"); // g=2 min
@@ -856,7 +856,7 @@ fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
         .collect()
         .unwrap();
     let mut mixed_rows = batches_to_json(&mixed);
-    mixed_rows.sort_by_key(|r| r["k0"].as_i64().unwrap());
+    mixed_rows.sort_by_key(|r| r["key"].as_i64().unwrap());
     assert_eq!(mixed_rows[0]["v0"], "apple"); // g=1 min(s)
     assert_eq!(mixed_rows[0]["v1"], 30); // g=1 max(v)
     assert_eq!(mixed_rows[1]["v0"], "cherry"); // g=2 min(s)
