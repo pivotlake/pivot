@@ -6,7 +6,7 @@ description: SSH to the pivotdb benchmark box and run ClickBench performance com
 # Remote performance benchmarking (pivotdb vs DuckDB)
 
 ## The box
-- Find a stopped perf machine (it should be named perf-x) in aws (using aws cli) and start it.
+- Find a stopped perf machine (it should be named perf-x) in aws (using aws cli) and start it (eu-central-1). NEVER use a running machine unless explicitly told to do so.
 - `duckdb` is at `~/.duckdb/cli/1.5.3/duckdb` — **NOT on the default non-interactive PATH**. `cargo` is at `~/.cargo/bin`. Always export both:
   `export PATH=$PATH:$HOME/.duckdb/cli/1.5.3:$HOME/.cargo/bin`
 - Repo: `~/pivotdb` (no `.git` on the box — edit locally and `scp`, or edit in place). Data: `~/hits/*.parquet` (~100M-row ClickBench `hits`). Box has 125GB RAM, 16 cores.
