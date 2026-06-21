@@ -8,7 +8,7 @@
 //! gated so it costs nothing — no clock reads, no counting — when a query didn't
 //! opt in.
 
-use crate::io::DataFlowRequest;
+use crate::io::{DataFlowRequest, ReadLen};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -23,10 +23,14 @@ use std::time::{Duration, Instant};
 pub struct DataFlowStats {
     /// HTTP range reads issued (remote object reads).
     pub http_requests: u64,
+    /// Bytes read over those HTTP reads, summed over every read.
+    pub http_bytes: u64,
     /// Wall time those HTTP reads were in flight, summed over every read.
     pub http_time: Duration,
     /// Filesystem block reads issued (local object reads).
     pub disk_requests: u64,
+    /// Bytes read over those disk reads, summed over every read.
+    pub disk_bytes: u64,
     /// Wall time those disk reads were in flight, summed over every read.
     pub disk_time: Duration,
     /// CPU time spent in this dataflow's operators (decode, group-by, …), summed
@@ -38,8 +42,10 @@ impl DataFlowStats {
     /// Fold one worker's tally into the running total.
     pub fn merge(&mut self, other: &Self) {
         self.http_requests += other.http_requests;
+        self.http_bytes += other.http_bytes;
         self.http_time += other.http_time;
         self.disk_requests += other.disk_requests;
+        self.disk_bytes += other.disk_bytes;
         self.disk_time += other.disk_time;
         self.cpu += other.cpu;
     }
@@ -70,15 +76,16 @@ impl StatsCollector {
         self.stats.is_some()
     }
 
-    /// Count `requests` as HTTP reads issued and stamp each with the issue time,
-    /// so its completion can be billed by [`record_http_time`](Self::record_http_time).
-    pub fn record_issued_http<R>(&mut self, requests: &mut [DataFlowRequest<R>]) {
-        self.record_issued(requests, |s| &mut s.http_requests);
+    /// Count `requests` as HTTP reads issued, total their bytes, and stamp each
+    /// with the issue time, so its completion can be billed by
+    /// [`record_http_time`](Self::record_http_time).
+    pub fn record_issued_http<R: ReadLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
+        self.record_issued(requests, |s| &mut s.http_requests, |s| &mut s.http_bytes);
     }
 
     /// As [`record_issued_http`](Self::record_issued_http), for disk reads.
-    pub fn record_issued_disk<R>(&mut self, requests: &mut [DataFlowRequest<R>]) {
-        self.record_issued(requests, |s| &mut s.disk_requests);
+    pub fn record_issued_disk<R: ReadLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
+        self.record_issued(requests, |s| &mut s.disk_requests, |s| &mut s.disk_bytes);
     }
 
     /// Bill a completed HTTP read's in-flight time, given the `submitted_at` stamp
@@ -106,13 +113,15 @@ impl StatsCollector {
         }
     }
 
-    fn record_issued<R>(
+    fn record_issued<R: ReadLen>(
         &mut self,
         requests: &mut [DataFlowRequest<R>],
         count: impl FnOnce(&mut DataFlowStats) -> &mut u64,
+        bytes: impl FnOnce(&mut DataFlowStats) -> &mut u64,
     ) {
         if let Some(stats) = &mut self.stats {
             *count(stats) += requests.len() as u64;
+            *bytes(stats) += requests.iter().map(|r| r.request.read_len()).sum::<u64>();
             let now = Instant::now();
             for request in requests.iter_mut() {
                 request.submitted_at = Some(now);
