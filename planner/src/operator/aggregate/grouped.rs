@@ -20,7 +20,7 @@
 //!   tuple; every other shape folds each slot by kind in `Dynamic<N>`, in `i128`
 //!   when a slot needs the width (see [`Aggregate`]'s rule) else the narrow `i64`.
 
-use super::{Aggregate, aggregation_slots, sum_reads_wide_column};
+use super::{Aggregate, aggregation_slots, row_key_schema, sum_reads_wide_column};
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::expression::{AggregateFunc, Expression};
 use crate::types::Type;
@@ -29,8 +29,7 @@ use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, IntKeyExtractor,
-    IntPairKeyExtractor, RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema,
-    StringKeyExtractor, SumSlot,
+    IntPairKeyExtractor, RecordBatchOperatorSpec, RowKeyExtractor, StringKeyExtractor, SumSlot,
 };
 use std::sync::Arc;
 
@@ -163,22 +162,27 @@ impl Aggregate {
 
         // The general fallback: encode the whole key tuple into one byte blob.
         // Handles a single non-int/string key, 3+ keys, or mixed types.
-        let Some(schema) = row_key_schema(&keys) else {
+        let Some(schema) = row_key_schema(keys.iter().map(|(_, t)| t)) else {
             return Err(Error::DataTypeNotSupportedForGroupBy(keys[0].1.clone()));
         };
         value!(RowKeyExtractor, schema)
     }
 
     /// Resolve the group keys into `(column, type)` pairs over a (possibly
-    /// re-projected) input, alongside the value slots.
+    /// re-projected) input, materialising any *computed* key (one that is not a
+    /// plain column) into a leading column cast to a canonical `Int64`/`Utf8View`
+    /// so its type is known to the extractor. Returns the shift `n` (the number
+    /// of computed keys) applied to the original columns, so the caller can
+    /// offset its value/aggregate columns; `n` is 0 when every key is already a
+    /// plain column. A computed key mixed with plain keys works the same way: the
+    /// plain keys shift right past the materialised ones.
     ///
-    /// With only plain column keys this is a view over the unchanged input. When
-    /// any key is *computed* (not a column) it is materialised into a leading
-    /// column — cast to a canonical `Int64`/`Utf8View` so its type is known to
-    /// the extractor — and the plain keys and value columns shift right past the
-    /// materialised keys. A computed key mixed with plain keys works the same way
-    /// (e.g. ClickBench Q18 `GROUP BY UserID, extract(minute …), SearchPhrase`).
-    fn keying(&self, input: RecordBatchOperatorSpec) -> Result<Keyed, Error> {
+    /// Shared by the general grouped path and the two-level `COUNT(DISTINCT)`
+    /// lowering, so a computed group key is supported uniformly by both.
+    pub(super) fn materialize_group_keys(
+        &self,
+        input: RecordBatchOperatorSpec,
+    ) -> Result<(RecordBatchOperatorSpec, Vec<(usize, Type)>, usize), Error> {
         let computed: Vec<&Expression> = self
             .groups
             .iter()
@@ -194,7 +198,7 @@ impl Aggregate {
                     _ => unreachable!("no computed keys"),
                 })
                 .collect();
-            return Ok((input, keys, aggregation_slots(&self.expressions)?));
+            return Ok((input, keys, 0));
         }
 
         // Canonical type of each computed key: string keys stay strings, anything
@@ -225,6 +229,13 @@ impl Aggregate {
                 }
             })
             .collect();
+        Ok((input, keys, n))
+    }
+
+    /// [`materialize_group_keys`](Self::materialize_group_keys) plus the value
+    /// slots, each aggregate column shifted right past any materialised keys.
+    fn keying(&self, input: RecordBatchOperatorSpec) -> Result<Keyed, Error> {
+        let (input, keys, n) = self.materialize_group_keys(input)?;
         let slots = aggregation_slots(&self.expressions)?
             .into_iter()
             .map(|s| AggregationSlot::new(s.kind, s.column + n))
@@ -327,30 +338,4 @@ fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
             | (Type::Int32, Type::Int64)
     )
     .then_some(pair)
-}
-
-/// Map the group key types to the arrow types the [`RowKeyExtractor`] encodes, in
-/// key order. Returns `None` if any key has a type the row encoding doesn't
-/// support, so the caller can report it unsupported rather than panicking in
-/// `RowKeySchema::new`.
-fn row_key_schema(keys: &[(usize, Type)]) -> Option<RowKeySchema> {
-    let types = keys
-        .iter()
-        .map(|(_, t)| match t {
-            Type::Int8 => Some(DataType::Int8),
-            Type::Int16 => Some(DataType::Int16),
-            Type::Int32 => Some(DataType::Int32),
-            Type::Int64 => Some(DataType::Int64),
-            Type::Utf8 => Some(DataType::Utf8View),
-            // DATE is days-since-epoch (arrives as Date32 or the parquet-physical
-            // integer); TIMESTAMP is Int64 epoch seconds. The row reader casts each
-            // key column to the schema type, so encoding them as their integer
-            // day/second count is lossless and groups identically. This is what
-            // lets a wide key tuple like `(Int64, Date)` group instead of erroring.
-            Type::Date => Some(DataType::Int32),
-            Type::Timestamp => Some(DataType::Int64),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(RowKeySchema::new(types))
 }
