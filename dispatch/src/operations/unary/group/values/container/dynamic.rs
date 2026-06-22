@@ -25,18 +25,29 @@ use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int16Type, Int32Type, Int64Type};
+use arrow_array::types::{Decimal128Type, Int16Type, Int32Type, Int64Type};
 use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
-/// An integer column bound at one of the three widths, read as `i64`. The width
-/// is a *payload* here, not a cross-product with the op: adding a width is one
-/// more variant in this enum, shared by every numeric op.
+/// An integer column bound at one of the supported widths, read as `i64`. The
+/// width is a *payload* here, not a cross-product with the op: adding a width is
+/// one more variant in this enum, shared by every numeric op.
+///
+/// `Dec128` reads a `Decimal128(38, 0)` column: the Arrow type a *wide* (`i128`)
+/// cell emits for its `COUNT`/`SUM` slots (see [`cell`](super::cell)). It exists
+/// so a two-level aggregate whose inner level is forced wide by a string extreme
+/// (the `COUNT(DISTINCT) + MIN(string)` lowering) can re-read its own numeric
+/// partials in the outer level. A `COUNT` partial, and a `MIN`/`MAX` or `SUM`
+/// partial over the narrow columns that path produces, fit in `i64`, so reading
+/// them as `i64` is exact. (A per-subgroup `SUM` over a 64-bit column could in
+/// principle exceed `i64` and truncate here, the same value the narrow `i64`
+/// accumulator on the single-level path cannot represent either.)
 pub enum NumReader<'b> {
     I16(&'b PrimitiveArray<Int16Type>),
     I32(&'b PrimitiveArray<Int32Type>),
     I64(&'b PrimitiveArray<Int64Type>),
+    Dec128(&'b PrimitiveArray<Decimal128Type>),
 }
 
 impl<'b> NumReader<'b> {
@@ -46,6 +57,7 @@ impl<'b> NumReader<'b> {
             DataType::Int16 => NumReader::I16(col.as_primitive::<Int16Type>()),
             DataType::Int32 => NumReader::I32(col.as_primitive::<Int32Type>()),
             DataType::Int64 => NumReader::I64(col.as_primitive::<Int64Type>()),
+            DataType::Decimal128(_, _) => NumReader::Dec128(col.as_primitive::<Decimal128Type>()),
             other => panic!("numeric aggregate over unsupported column type {other:?}"),
         }
     }
@@ -55,6 +67,7 @@ impl<'b> NumReader<'b> {
             NumReader::I16(a) => IntRead::<Int16Type>::read(a, idx),
             NumReader::I32(a) => IntRead::<Int32Type>::read(a, idx),
             NumReader::I64(a) => IntRead::<Int64Type>::read(a, idx),
+            NumReader::Dec128(a) => (unsafe { a.value_unchecked(idx) }) as i64,
         }
     }
 }

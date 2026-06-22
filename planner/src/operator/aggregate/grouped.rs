@@ -28,7 +28,7 @@ use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
 use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, IntKeyExtractor,
+    AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, GroupLimit, IntKeyExtractor,
     IntPairKeyExtractor, RecordBatchOperatorSpec, RowKeyExtractor, StringKeyExtractor, SumSlot,
 };
 use std::sync::Arc;
@@ -56,122 +56,14 @@ impl Aggregate {
         // re-projected) input. Any computed key has been materialised into a
         // leading column by `keying`, so from here every key is just a column.
         let (input, keys, slots) = self.keying(input)?;
-        let key_cols: Vec<usize> = keys.iter().map(|(col, _)| *col).collect();
-
         let sig = signatures(&self.expressions);
-        let output_limit = self.output_limit;
 
         // Cell width: i128 when a string extreme needs its 128-bit `ArenaKey`
         // cell, or when a SUM reads a 64-bit column; else the narrow i64 entry.
         let wide = slots.iter().any(|s| s.kind.is_string_extreme())
             || sum_reads_wide_column(&self.expressions);
 
-        // Whether every slot folds additively (COUNT/SUM, no MIN/MAX or string
-        // extreme): the `ONLY_ADDITIVE` `Dynamic` drops the per-slot kind dispatch
-        // to a branch-free `+`, recovering the additive fast path (~7% on
-        // low-cardinality grouped aggregates).
-        let all_additive = slots.iter().all(|s| {
-            matches!(
-                s.kind,
-                AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
-            )
-        });
-
-        // `group!` is the single lowering primitive: every arm below picks one
-        // concrete key type `$K`, value type `$V`, and key config `$cfg`, then
-        // calls it. The surrounding `input`/`key_cols`/`slots`/`output_limit` are
-        // captured from this scope — exactly one arm ever runs, so each
-        // moved-once value is consumed at most once.
-        macro_rules! group {
-            ($K:ty, $V:ty, $cfg:expr) => {
-                Ok(input.group_by_aggregate_config::<$K, $V>(key_cols, slots, output_limit, $cfg))
-            };
-        }
-        // Fold each slot by kind (or branch-free `+` when `$add`) in
-        // `Dynamic<N, acc, ADDITIVE>`, dispatched on the slot count N (the inline
-        // cell-array length). Numeric, string (`acc = i128`), and mixed alike,
-        // since `Dynamic` dispatches per slot.
-        macro_rules! arity {
-            ($K:ty, $acc:ty, $add:literal, $cfg:expr) => {
-                match slots.len() {
-                    1 => group!($K, Dynamic<1, $acc, $add>, $cfg),
-                    2 => group!($K, Dynamic<2, $acc, $add>, $cfg),
-                    3 => group!($K, Dynamic<3, $acc, $add>, $cfg),
-                    4 => group!($K, Dynamic<4, $acc, $add>, $cfg),
-                    5 => group!($K, Dynamic<5, $acc, $add>, $cfg),
-                    6 => group!($K, Dynamic<6, $acc, $add>, $cfg),
-                    n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
-                }
-            };
-        }
-        // The generic value fallback: pick the accumulator width and the additive
-        // flag, then dispatch by arity.
-        macro_rules! dynamic {
-            ($K:ty, $cfg:expr) => {
-                match (wide, all_additive) {
-                    (true, true) => arity!($K, i128, true, $cfg),
-                    (true, false) => arity!($K, i128, false, $cfg),
-                    (false, true) => arity!($K, i64, true, $cfg),
-                    (false, false) => arity!($K, i64, false, $cfg),
-                }
-            };
-        }
-        // The value dispatch for a given key: a few signatures are worth a
-        // hand-written, branch-free `Compiled` tuple; everything else folds
-        // per-slot in `Dynamic`. Add a signature here to specialise it.
-        macro_rules! value {
-            ($K:ty, $cfg:expr) => {
-                match sig.as_slice() {
-                    [Sig::Count] => group!($K, Compiled<(CountSlot,)>, $cfg),
-                    [
-                        Sig::Count,
-                        Sig::Sum(Type::Int16),
-                        Sig::Sum(Type::Int16),
-                        Sig::Count,
-                    ] => group!(
-                        $K,
-                        Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>,
-                        $cfg
-                    ),
-                    _ => dynamic!($K, $cfg),
-                }
-            };
-        }
-
-        // A single column keys on its native value directly: the dedicated
-        // int/string extractor is cheaper than byte-encoding one column into the
-        // row key and, unlike the row encoder, radix-partitions.
-        if let [(_, ty)] = keys.as_slice() {
-            match ty {
-                Type::Int8 => return value!(IntKeyExtractor<Int8Type>, ()),
-                Type::Int16 => return value!(IntKeyExtractor<Int16Type>, ()),
-                Type::Int32 => return value!(IntKeyExtractor<Int32Type>, ()),
-                Type::Int64 => return value!(IntKeyExtractor<Int64Type>, ()),
-                Type::Utf8 => return value!(StringKeyExtractor, ()),
-                // Other single-key types fall through to the row encoder below.
-                _ => {}
-            }
-        }
-
-        // Two integer keys pack into the specialised u128 pair extractor.
-        if let Some(pair) = int_pair_keys(&keys) {
-            return match pair {
-                (Type::Int64, Type::Int32) => value!(IntPairKeyExtractor<Int64Type, Int32Type>, ()),
-                (Type::Int32, Type::Int32) => value!(IntPairKeyExtractor<Int32Type, Int32Type>, ()),
-                (Type::Int16, Type::Int32) => value!(IntPairKeyExtractor<Int16Type, Int32Type>, ()),
-                (Type::Int16, Type::Int16) => value!(IntPairKeyExtractor<Int16Type, Int16Type>, ()),
-                (Type::Int64, Type::Int64) => value!(IntPairKeyExtractor<Int64Type, Int64Type>, ()),
-                (Type::Int32, Type::Int64) => value!(IntPairKeyExtractor<Int32Type, Int64Type>, ()),
-                _ => unreachable!("int_pair_keys only returns the arms above"),
-            };
-        }
-
-        // The general fallback: encode the whole key tuple into one byte blob.
-        // Handles a single non-int/string key, 3+ keys, or mixed types.
-        let Some(schema) = row_key_schema(keys.iter().map(|(_, t)| t)) else {
-            return Err(Error::DataTypeNotSupportedForGroupBy(keys[0].1.clone()));
-        };
-        value!(RowKeyExtractor, schema)
+        lower_grouped(input, &keys, slots, &sig, wide, self.output_limit)
     }
 
     /// Resolve the group keys into `(column, type)` pairs over a (possibly
@@ -304,7 +196,7 @@ fn project_keys(
 /// `value!`. `CountStar` and `Count` collapse to one `Count` (both add +1 per
 /// row); a `Sum` carries its column type so the specialisation can fix the read
 /// width.
-enum Sig {
+pub(super) enum Sig {
     Count,
     Sum(Type),
     /// MIN/MAX (and any kind with no compiled specialisation). A distinct
@@ -344,4 +236,135 @@ fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
             | (Type::Int32, Type::Int64)
     )
     .then_some(pair)
+}
+
+/// Lower one grouped-aggregate level to a dispatch operator: pick the key
+/// extractor for `keys` and the value container for `slots`, then build the
+/// `GROUP BY`. The single lowering primitive shared by the general grouped path
+/// ([`Aggregate::compile_grouped`]) and each level of the two-level
+/// `COUNT(DISTINCT)` lowering ([`Aggregate::compile_grouped_mixed_distinct`]).
+///
+/// `keys`/`slots` are already resolved to input column indices and kinds.
+/// `sig` selects a hand-written, branch-free [`Compiled`] tuple for the few
+/// signatures worth specialising; pass an empty slice to always fold per-slot in
+/// [`Dynamic`] (what the two-level path wants, since its synthetic slots match no
+/// specialisation). `wide` requests the `i128` cell (a string extreme needs its
+/// 128-bit `ArenaKey`, or a `SUM` can overflow `i64`); `output_limit` is the
+/// per-partition LIMIT pushed into this level, or `None` to emit every group.
+pub(super) fn lower_grouped(
+    input: RecordBatchOperatorSpec,
+    keys: &[(usize, Type)],
+    slots: Vec<AggregationSlot>,
+    sig: &[Sig],
+    wide: bool,
+    output_limit: Option<GroupLimit>,
+) -> Result<RecordBatchOperatorSpec, Error> {
+    let key_cols: Vec<usize> = keys.iter().map(|(col, _)| *col).collect();
+
+    // Whether every slot folds additively (COUNT/SUM, no MIN/MAX or string
+    // extreme): the `ONLY_ADDITIVE` `Dynamic` drops the per-slot kind dispatch to
+    // a branch-free `+`, recovering the additive fast path (~7% on low-cardinality
+    // grouped aggregates).
+    let all_additive = slots.iter().all(|s| {
+        matches!(
+            s.kind,
+            AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
+        )
+    });
+
+    // `group!` is the single lowering primitive: every arm below picks one
+    // concrete key type `$K`, value type `$V`, and key config `$cfg`, then calls
+    // it. The surrounding `input`/`key_cols`/`slots`/`output_limit` are captured
+    // from this scope; exactly one arm ever runs, so each moved-once value is
+    // consumed at most once.
+    macro_rules! group {
+        ($K:ty, $V:ty, $cfg:expr) => {
+            Ok(input.group_by_aggregate_config::<$K, $V>(key_cols, slots, output_limit, $cfg))
+        };
+    }
+    // Fold each slot by kind (or branch-free `+` when `$add`) in
+    // `Dynamic<N, acc, ADDITIVE>`, dispatched on the slot count N (the inline
+    // cell-array length). Numeric, string (`acc = i128`), and mixed alike, since
+    // `Dynamic` dispatches per slot.
+    macro_rules! arity {
+        ($K:ty, $acc:ty, $add:literal, $cfg:expr) => {
+            match slots.len() {
+                1 => group!($K, Dynamic<1, $acc, $add>, $cfg),
+                2 => group!($K, Dynamic<2, $acc, $add>, $cfg),
+                3 => group!($K, Dynamic<3, $acc, $add>, $cfg),
+                4 => group!($K, Dynamic<4, $acc, $add>, $cfg),
+                5 => group!($K, Dynamic<5, $acc, $add>, $cfg),
+                6 => group!($K, Dynamic<6, $acc, $add>, $cfg),
+                n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+            }
+        };
+    }
+    // The generic value fallback: pick the accumulator width and the additive
+    // flag, then dispatch by arity.
+    macro_rules! dynamic {
+        ($K:ty, $cfg:expr) => {
+            match (wide, all_additive) {
+                (true, true) => arity!($K, i128, true, $cfg),
+                (true, false) => arity!($K, i128, false, $cfg),
+                (false, true) => arity!($K, i64, true, $cfg),
+                (false, false) => arity!($K, i64, false, $cfg),
+            }
+        };
+    }
+    // The value dispatch for a given key: a few signatures are worth a
+    // hand-written, branch-free `Compiled` tuple; everything else folds per-slot
+    // in `Dynamic`. Add a signature here to specialise it.
+    macro_rules! value {
+        ($K:ty, $cfg:expr) => {
+            match sig {
+                [Sig::Count] => group!($K, Compiled<(CountSlot,)>, $cfg),
+                [
+                    Sig::Count,
+                    Sig::Sum(Type::Int16),
+                    Sig::Sum(Type::Int16),
+                    Sig::Count,
+                ] => group!(
+                    $K,
+                    Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>,
+                    $cfg
+                ),
+                _ => dynamic!($K, $cfg),
+            }
+        };
+    }
+
+    // A single column keys on its native value directly: the dedicated
+    // int/string extractor is cheaper than byte-encoding one column into the row
+    // key and, unlike the row encoder, radix-partitions.
+    if let [(_, ty)] = keys {
+        match ty {
+            Type::Int8 => return value!(IntKeyExtractor<Int8Type>, ()),
+            Type::Int16 => return value!(IntKeyExtractor<Int16Type>, ()),
+            Type::Int32 => return value!(IntKeyExtractor<Int32Type>, ()),
+            Type::Int64 => return value!(IntKeyExtractor<Int64Type>, ()),
+            Type::Utf8 => return value!(StringKeyExtractor, ()),
+            // Other single-key types fall through to the row encoder below.
+            _ => {}
+        }
+    }
+
+    // Two integer keys pack into the specialised u128 pair extractor.
+    if let Some(pair) = int_pair_keys(keys) {
+        return match pair {
+            (Type::Int64, Type::Int32) => value!(IntPairKeyExtractor<Int64Type, Int32Type>, ()),
+            (Type::Int32, Type::Int32) => value!(IntPairKeyExtractor<Int32Type, Int32Type>, ()),
+            (Type::Int16, Type::Int32) => value!(IntPairKeyExtractor<Int16Type, Int32Type>, ()),
+            (Type::Int16, Type::Int16) => value!(IntPairKeyExtractor<Int16Type, Int16Type>, ()),
+            (Type::Int64, Type::Int64) => value!(IntPairKeyExtractor<Int64Type, Int64Type>, ()),
+            (Type::Int32, Type::Int64) => value!(IntPairKeyExtractor<Int32Type, Int64Type>, ()),
+            _ => unreachable!("int_pair_keys only returns the arms above"),
+        };
+    }
+
+    // The general fallback: encode the whole key tuple into one byte blob.
+    // Handles a single non-int/string key, 3+ keys, or mixed types.
+    let Some(schema) = row_key_schema(keys.iter().map(|(_, t)| t)) else {
+        return Err(Error::DataTypeNotSupportedForGroupBy(keys[0].1.clone()));
+    };
+    value!(RowKeyExtractor, schema)
 }

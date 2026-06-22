@@ -45,16 +45,12 @@ pub(crate) type DynamicFilterSlots = HashMap<usize, Arc<DynamicFilterSlot>>;
 pub enum Error {
     #[error("Unexpected input Expression {0}")]
     UnexpectedInputExpression(Expression),
-    #[error("Unexpected agg expression: {0:?}")]
-    UnexpectedAggExpression(Expression),
     #[error("Unsupported projection expression: {0:?}")]
     UnsupportedProjectionExpression(Expression),
     #[error("Unsupported order by expression: {0:?}")]
     UnsupportedOrderByExpression(Expression),
     #[error("Unsupported top k expression: {0:?}")]
     UnsupportedTopKExpression(Expression),
-    #[error("Unsupported aggregate functions with {0:?} params")]
-    UnsupportedAggregateGroupAmount(usize),
     #[error("Unsupported aggregate expression: {0:?}")]
     UnsupportedAggregateExpression(Expression),
     #[error("Unsupported aggregate expression amount: {0}")]
