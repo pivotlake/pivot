@@ -1404,6 +1404,125 @@ fn create_table_passes_with_options_to_catalog() {
     );
 }
 
+// A grouped aggregate mixing string MIN(s), COUNT(*) and COUNT(DISTINCT) over a
+// string group key, behind LIKE/<> filters, ordered by the count. Exercises the
+// two-level COUNT(DISTINCT) lowering with a string group key (row-encoded inner
+// key) and string-extreme partials.
+#[rstest]
+fn group_by_string_min_mixed_distinct_filtered_ordered(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "hits",
+        &[
+            (
+                "phrase",
+                Type::Utf8,
+                str_col(vec!["x", "x", "y", "y", "", "z"]),
+            ),
+            (
+                "url",
+                Type::Utf8,
+                str_col(vec!["a", "b", "c.google.d", "d", "e", "f"]),
+            ),
+            (
+                "title",
+                Type::Utf8,
+                str_col(vec![
+                    "Goog news",
+                    "Goog maps",
+                    "Goog x",
+                    "miss",
+                    "Goog z",
+                    "Goog w",
+                ]),
+            ),
+            (
+                "user",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])) as ArrayRef,
+            ),
+        ],
+    );
+
+    let rows = batches_to_json(
+        &testing_planner
+            .planner
+            .plan(
+                "SELECT phrase, MIN(url), MIN(title), COUNT(*) AS c, COUNT(DISTINCT user) \
+                 FROM hits WHERE title LIKE '%Goog%' AND url NOT LIKE '%.google.%' \
+                 AND phrase <> '' GROUP BY phrase ORDER BY c DESC LIMIT 10",
+            )
+            .unwrap()
+            .compile(testing_planner.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap(),
+    );
+
+    // Surviving rows: (x,a,Goog news,u1), (x,b,Goog maps,u2), (z,f,Goog w,u6).
+    // y rows drop (one URL has ".google.", one title misses "Goog"); "" drops.
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["key"], "x");
+    assert_eq!(rows[0]["v0"], "a");
+    assert_eq!(rows[0]["v1"], "Goog maps");
+    assert_eq!(rows[0]["v2"], 2);
+    assert_eq!(rows[0]["v3"], 2);
+    assert_eq!(rows[1]["key"], "z");
+    assert_eq!(
+        (
+            rows[1]["v0"].as_str(),
+            rows[1]["v2"].as_i64(),
+            rows[1]["v3"].as_i64()
+        ),
+        (Some("f"), Some(1), Some(1))
+    );
+}
+
+// A numeric MIN/MAX alongside COUNT(DISTINCT): the two-level lowering re-folds the
+// integer extreme of each subgroup, on the narrow (non-string) cell.
+#[rstest]
+fn group_by_numeric_min_max_mixed_distinct(mut testing_planner: TestingPlanner) {
+    // g: 1,1,1,2,2   v: 30,10,20,7,5   user: 1,1,2,9,9
+    // g=1 -> MIN 10, MAX 30, distinct users {1,2}=2; g=2 -> MIN 5, MAX 7, {9}=1.
+    testing_planner.add_table(
+        "gv",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 1, 2, 2])),
+            ("v", Type::Int32, int_col(vec![30, 10, 20, 7, 5])),
+            ("user", Type::Int32, int_col(vec![1, 1, 2, 9, 9])),
+        ],
+    );
+
+    let mut rows = batches_to_json(
+        &testing_planner
+            .planner
+            .plan("SELECT g, MIN(v), MAX(v), COUNT(DISTINCT user) FROM gv GROUP BY g")
+            .unwrap()
+            .compile(testing_planner.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap(),
+    );
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (
+            rows[0]["v0"].as_i64(),
+            rows[0]["v1"].as_i64(),
+            rows[0]["v2"].as_i64()
+        ),
+        (Some(10), Some(30), Some(2))
+    );
+    assert_eq!(
+        (
+            rows[1]["v0"].as_i64(),
+            rows[1]["v1"].as_i64(),
+            rows[1]["v2"].as_i64()
+        ),
+        (Some(5), Some(7), Some(1))
+    );
+}
+
 #[rstest]
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
     // `stddev` has no pivot lowering (unlike SUM/COUNT/MIN/MAX/AVG), so it must
