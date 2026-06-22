@@ -21,6 +21,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
 
+pub mod cap;
 pub mod cell;
 pub mod container;
 pub mod distinct;

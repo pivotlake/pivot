@@ -34,6 +34,14 @@ webpki-roots = "0.26"
 httparse = "1.9"
 url = "2.5"
 
+# Build-time copy-and-patch stencil compiler (see `build.rs` and the
+# `group::values::cap` module). `cc` drives clang to compile the C stencils into
+# an ELF aarch64 object; `object` parses the `.text` bytes + relocations we bake
+# into the binary as patch tables. Both are build-host only — no runtime dep.
+[build-dependencies]
+cc = "1.2"
+object = { version = "0.36", default-features = false, features = ["read_core", "elf"] }
+
 [features]
 # Exposes `test_utils` and the test-only worker-waker / free-pool helpers so
 # out-of-crate test suites (e.g. catalog's Parquet reader tests) can drive
