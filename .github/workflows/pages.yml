@@ -33,17 +33,10 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_gcp_runner }}
     runs-on: ubuntu-latest
     steps:
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/resume-gcp-runner
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: pivot-ci
-      - name: Resume ci-runner-x86
-        run: |
-          gcloud compute instances resume ci-runner-x86 \
-            --project=pivot-ci --zone=me-west1-c
 
   deploy:
     needs: [start-ci]
