@@ -57,10 +57,10 @@ use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::{
-    AggregateFactory, AggregationKind, AggregationSlot, AggregationValue, Compiled, CopyOutFactory,
-    CountFactory, CountSlot, Distinct, DynamicFilterSlot, FilterFactory, GroupFactory,
-    KeyExtractor, MapFactory, NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy,
-    OrderByLimitFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CountFactory, Distinct,
+    DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory, NullaryFactory,
+    NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory, UnaryFactory, UnaryOperator,
+    UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -523,43 +523,6 @@ impl RecordBatchOperatorSpec {
             worker_count,
             dynamic_filter,
         ))
-    }
-
-    /// Group by a column and count occurrences per group.
-    ///
-    /// The type parameter `K` selects the key extractor for the group column
-    /// (e.g. [`StringKeyExtractor`](crate::operations::StringKeyExtractor) for string
-    /// columns, [`IntKeyExtractor`](crate::operations::IntKeyExtractor) for integers).
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// # use std::sync::Arc;
-    /// # use dispatch::*;
-    /// # use dispatch::table_input;
-    /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// # let dispatch = Dispatch::spin_up(1, 32, None);
-    /// # let dispatcher = dispatch.dispatcher();
-    /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
-    /// // GROUP BY column 0 (string), COUNT(*)
-    /// spec.group_by_count::<StringKeyExtractor>(0)
-    /// # ;
-    /// ```
-    pub fn group_by_count<K: KeyExtractor<Config: Default>>(self, group_column: usize) -> Self {
-        // `COUNT(*)` is one aggregate slot whose column is unused.
-        self.group_by_aggregate::<K, Compiled<(CountSlot,)>>(
-            vec![group_column],
-            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
-            None,
-        )
-    }
-
-    /// GROUP BY one or more key columns with no aggregate — emits one row per
-    /// distinct key (the key column(s) only, no value column). Backs the dedup
-    /// stage of `COUNT(DISTINCT x)`: the per-entry value is zero-sized, so the
-    /// hash-table entry is just hash + key.
-    pub fn group_by_distinct<K: KeyExtractor<Config: Default>>(self, key_cols: Vec<usize>) -> Self {
-        self.group_by_aggregate::<K, Distinct>(key_cols, Vec::new(), None)
     }
 
     /// Global `COUNT(DISTINCT x)`: GROUP BY `key_cols` with no aggregate, emitting
