@@ -34,6 +34,7 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use url::Url;
 
 mod requester;
@@ -363,12 +364,35 @@ impl<R> DataFlowRequest<R> {
     }
 }
 
+/// How one remote read split across the tiers that served it, counted per piece:
+/// each resident piece is a disk-cache read, each hole an HTTP fetch. A read split
+/// across both reports a request and its bytes under each tier, so neither tier's
+/// work is hidden. The byte totals sum to the read's length.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct RemoteReadSplit {
+    pub disk_cache_requests: u64,
+    pub disk_cache_bytes: u64,
+    pub http_requests: u64,
+    pub http_bytes: u64,
+}
+
+/// The in-flight time of one remote read, split across the tiers that served it:
+/// each piece bills the time from the read's submission to that piece landing, to
+/// the cache or the network. Accumulated as the pieces complete and billed when
+/// the read finishes, so a read split across both tiers charges each its own wait.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct RemoteReadTime {
+    pub disk_cache: Duration,
+    pub http: Duration,
+}
+
 /// One completed read drained from [`IORequester::completions`]: either a
 /// filesystem read or an HTTP one, with the originating dataflow/operator
-/// attached and the transport kind preserved in the type.
+/// attached and the transport kind preserved in the type. The HTTP arm also
+/// carries the [`RemoteReadTime`] its pieces accrued, so each tier bills its wait.
 pub enum Completion {
     Fs(DataFlowRequest<FsRequest>),
-    Http(DataFlowRequest<HttpRequest>),
+    Http(DataFlowRequest<HttpRequest>, RemoteReadTime),
 }
 
 /// A read that failed transport-side — an HTTP read that exhausted its retries
