@@ -122,28 +122,36 @@ pub enum Expression {
 }
 
 impl Expression {
-    /// Best-effort static result type of a computed expression, used to pick a
-    /// group-key extractor when grouping on it (e.g. `GROUP BY CASE …`). Returns
-    /// `None` when the type can't be determined cheaply, in which case callers
-    /// fall back to their default.
-    pub fn result_type(&self) -> Option<Type> {
+    /// Static result type of a computed expression, used to pick a group-key
+    /// extractor when grouping on it (e.g. `GROUP BY CASE …`). Errors when the
+    /// type can't be determined statically, so an unclassified key is rejected
+    /// rather than silently mistyped.
+    pub fn result_type(&self) -> Result<Type, compile::Error> {
         match self {
-            Expression::Ref(r) => Some(r.return_type.clone()),
+            Expression::Ref(r) => Ok(r.return_type.clone()),
             Expression::Constant(s) => match s.get().0.data_type() {
                 arrow_schema::DataType::Utf8
                 | arrow_schema::DataType::LargeUtf8
-                | arrow_schema::DataType::Utf8View => Some(Type::Utf8),
-                arrow_schema::DataType::Int8 => Some(Type::Int8),
-                arrow_schema::DataType::Int16 => Some(Type::Int16),
-                arrow_schema::DataType::Int32 => Some(Type::Int32),
-                arrow_schema::DataType::Int64 => Some(Type::Int64),
-                _ => None,
+                | arrow_schema::DataType::Utf8View => Ok(Type::Utf8),
+                arrow_schema::DataType::Int8 => Ok(Type::Int8),
+                arrow_schema::DataType::Int16 => Ok(Type::Int16),
+                arrow_schema::DataType::Int32 => Ok(Type::Int32),
+                arrow_schema::DataType::Int64 => Ok(Type::Int64),
+                _ => Err(compile::Error::IndeterminateResultType(self.clone())),
             },
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
-            Expression::Function(Function::DateTrunc(_)) => Some(Type::Timestamp),
-            _ => None,
+            // `date_trunc` yields a timestamp; `regexp_replace` a string.
+            Expression::Function(Function::DateTrunc(_)) => Ok(Type::Timestamp),
+            Expression::Function(Function::RegexpReplace(_)) => Ok(Type::Utf8),
+            // Integer-valued scalar functions: a date part (`extract(minute …)`),
+            // a byte length, and integer arithmetic (`a * 2`, `ClientIP - 1`).
+            Expression::Function(Function::DatePart(_) | Function::Length(_)) => Ok(Type::Int64),
+            Expression::Function(Function::Arithmetic(_)) => Ok(Type::Int64),
+            // Everything else (comparisons, `contains`, `Divide`'s Float64
+            // quotient, …) has no type we use for grouping.
+            _ => Err(compile::Error::IndeterminateResultType(self.clone())),
         }
     }
 
