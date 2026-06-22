@@ -1,5 +1,13 @@
 //! [`RegexpReplace`] — SQL `regexp_replace(input, pattern, replacement)`,
-//! first-match replacement with a per-worker memoised replacer.
+//! first-match replacement.
+//!
+//! Two engines back this, chosen once per plan: PCRE2 (JIT-compiled to native
+//! code) when it can evaluate the pattern with semantics identical to the
+//! fallback, else the `regex` crate. Both run in *byte* mode (Unicode matching
+//! off), which (a) matches RE2/ClickHouse byte semantics, (b) handles columns
+//! that aren't valid UTF-8, and (c) keeps the two engines in agreement. The
+//! single semantic gap — PCRE2's `$` matches before a trailing newline, the
+//! `regex` crate's does not — is closed by rewriting a trailing `$` to `\z`.
 
 use super::{Error, Expression, constant_string};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
@@ -7,7 +15,8 @@ use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use duckdb_planner::expression as duckdb_expression;
-use regex::Regex;
+use pcre2::bytes::{Regex as Pcre2Regex, RegexBuilder as Pcre2RegexBuilder};
+use regex::bytes::{Regex as BytesRegex, RegexBuilder as BytesRegexBuilder};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -63,140 +72,212 @@ impl Display for RegexpReplace {
     }
 }
 
-/// Translate a PostgreSQL-style `regexp_replace` replacement string (`\N`
-/// group references, `\\` literal backslash, `$` literal) into the `regex`
-/// crate's form (`${N}` group references, `$$` literal dollar). Group
-/// references are emitted braced so a digit following the reference is not
-/// absorbed into the group number.
-fn translate_replacement(replacement: &str) -> String {
-    let mut out = String::with_capacity(replacement.len());
+/// A parsed replacement template: a sequence of literal byte runs and `\N`
+/// group references. Parsed once (PostgreSQL-style `\N`/`\\`/`\$`); applied by
+/// both engines identically, so the replacement is engine-independent.
+enum ReplacementSegment {
+    Literal(Vec<u8>),
+    Group(usize),
+}
+
+fn parse_replacement(replacement: &str) -> Vec<ReplacementSegment> {
+    let mut segments = Vec::new();
+    let mut literal: Vec<u8> = Vec::new();
+    let push_char = |buf: &mut Vec<u8>, c: char| {
+        let mut tmp = [0u8; 4];
+        buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+    };
     let mut chars = replacement.chars();
     while let Some(c) = chars.next() {
         match c {
-            '$' => out.push_str("$$"),
             '\\' => match chars.next() {
+                // `\N` is a group reference (`\0` = the whole match).
                 Some(d @ '0'..='9') => {
-                    out.push_str("${");
-                    out.push(d);
-                    out.push('}');
+                    if !literal.is_empty() {
+                        segments.push(ReplacementSegment::Literal(std::mem::take(&mut literal)));
+                    }
+                    segments.push(ReplacementSegment::Group(d as usize - '0' as usize));
                 }
-                Some('\\') => out.push('\\'),
-                // An escaped dollar is a literal `$`, which is special in the
-                // regex crate's replacement dialect — emit its `$$` escape so
-                // it isn't mis-read as a (here empty, thus deleted) group ref.
-                Some('$') => out.push_str("$$"),
-                // Any other escape is not meaningful in either dialect; keep
-                // the pair as literal text.
+                Some('\\') => literal.push(b'\\'),
+                // An escaped dollar is a literal `$` ($ is never special here).
+                Some('$') => literal.push(b'$'),
                 Some(other) => {
-                    out.push('\\');
-                    out.push(other);
+                    literal.push(b'\\');
+                    push_char(&mut literal, other);
                 }
-                None => out.push('\\'),
+                None => literal.push(b'\\'),
             },
-            c => out.push(c),
+            other => push_char(&mut literal, other),
         }
     }
-    out
+    if !literal.is_empty() {
+        segments.push(ReplacementSegment::Literal(literal));
+    }
+    segments
 }
 
-/// Memoised results cap for [`MemoizedReplacer`], per worker: stop inserting
-/// past this many entries or this many memoised string bytes (lookups
-/// continue), so a high-cardinality column can't grow the memo unboundedly.
-/// Sized small — value distributions are Zipfian, so the first tens of
-/// thousands of entries carry most of the hit rate, while the map itself
-/// (entries plus boxed strings) costs a few times the raw bytes.
-const REGEX_MEMO_MAX_ENTRIES: usize = 1 << 19;
-const REGEX_MEMO_MAX_BYTES: usize = 48 << 20;
-
-/// Per-worker first-match regex replacement with a bounded result memo.
-///
-/// Replacement is pure and expensive (capture extraction runs a backtracking
-/// engine), while real inputs (URLs, paths) repeat heavily, so each result is
-/// memoised. A memo value of `None` means "no match — the input passes through
-/// unchanged", so unmatched rows don't store their text a second time. The
-/// `regex` lives per worker rather than shared: a cloned `Regex` funnels every
-/// thread through one internal cache pool whose atomics dominate the row loop
-/// under contention, whereas a per-worker instance gets the pool's owner fast
-/// path.
-struct MemoizedReplacer {
-    regex: Regex,
-    replacement: String,
-    memo: std::collections::HashMap<Box<str>, Option<Box<str>>, ahash::RandomState>,
-    memo_bytes: usize,
+/// The two interchangeable byte-mode engines. Built per worker (each gets its
+/// own instance, avoiding shared-state contention in the row loop).
+enum Engine {
+    Pcre2(Pcre2Regex),
+    Rust(BytesRegex),
 }
 
-impl MemoizedReplacer {
-    /// Replace the first match of the pattern in `s` (DuckDB semantics without
-    /// the `'g'` option). Returns `None` when nothing matched — the caller
-    /// appends `s` itself, so the passthrough text is never copied — and
-    /// otherwise the replaced text, borrowed from the memo on the hot path.
-    fn replace(&mut self, s: &str) -> Option<std::borrow::Cow<'_, str>> {
-        use std::borrow::Cow;
-        // Probe with `contains_key` first (its borrow ends immediately) so the
-        // mutating insert path below doesn't overlap a live borrow — the
-        // borrow checker can't yet prove a returned `get` borrow is confined
-        // to the hit branch.
-        if self.memo.contains_key(s) {
-            return self.memo.get(s).unwrap().as_deref().map(Cow::Borrowed);
+impl Engine {
+    /// Replace the first match of the pattern in `s`, applying `template`.
+    /// Returns `None` when nothing matched — the caller passes `s` through
+    /// unchanged, so the passthrough text is never copied.
+    fn replace_first(&self, s: &[u8], template: &[ReplacementSegment]) -> Option<Vec<u8>> {
+        // Splice: text before the match + the expanded template + text after.
+        macro_rules! splice {
+            ($whole:expr, $group:expr) => {{
+                let whole = $whole;
+                let mut out = Vec::with_capacity(s.len());
+                out.extend_from_slice(&s[..whole.0]);
+                for segment in template {
+                    match segment {
+                        ReplacementSegment::Literal(bytes) => out.extend_from_slice(bytes),
+                        ReplacementSegment::Group(n) => {
+                            if let Some(bytes) = $group(*n) {
+                                out.extend_from_slice(bytes);
+                            }
+                        }
+                    }
+                }
+                out.extend_from_slice(&s[whole.1..]);
+                Some(out)
+            }};
         }
-        // `replace` returns `Cow::Borrowed` when nothing matched.
-        let entry = match self.regex.replace(s, self.replacement.as_str()) {
-            Cow::Borrowed(_) => None,
-            Cow::Owned(o) => Some(o.into_boxed_str()),
-        };
-        if self.memo.len() < REGEX_MEMO_MAX_ENTRIES && self.memo_bytes < REGEX_MEMO_MAX_BYTES {
-            self.memo_bytes += s.len() + entry.as_deref().map(str::len).unwrap_or(0);
-            self.memo.insert(s.into(), entry);
-            return self.memo.get(s).unwrap().as_deref().map(Cow::Borrowed);
+        match self {
+            Engine::Rust(re) => {
+                let caps = re.captures(s)?;
+                let whole = caps.get(0).unwrap();
+                splice!((whole.start(), whole.end()), |n| caps
+                    .get(n)
+                    .map(|m| m.as_bytes()))
+            }
+            Engine::Pcre2(re) => {
+                let caps = re.captures(s).ok().flatten()?;
+                let whole = caps.get(0).unwrap();
+                splice!((whole.start(), whole.end()), |n| caps
+                    .get(n)
+                    .map(|m| m.as_bytes()))
+            }
         }
-        // Past the cap: serve this result without growing the memo.
-        entry.map(|o| Cow::Owned(o.into_string()))
+    }
+}
+
+fn build_rust(pattern: &str) -> Result<BytesRegex, regex::Error> {
+    BytesRegexBuilder::new(pattern).unicode(false).build()
+}
+
+fn build_pcre2(pattern: &str) -> Result<Pcre2Regex, pcre2::Error> {
+    // `.jit(true)` errors when JIT is unavailable, so a failure here routes us
+    // to the `regex`-crate fallback rather than PCRE2's (slow) interpreter.
+    Pcre2RegexBuilder::new().jit(true).build(pattern)
+}
+
+/// Produce a PCRE2 pattern whose `$` semantics match the `regex` crate (and
+/// RE2): in non-multiline mode the crate's `$` matches end-of-text only,
+/// whereas PCRE2's also matches just before a trailing newline. We rewrite a
+/// single *trailing* `$` to `\z`. Returns `None` when `$` appears anywhere
+/// else (so the caller declines PCRE2 rather than risk a semantic mismatch).
+fn pcre2_equivalent_pattern(pattern: &str) -> Option<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut in_class = false;
+    let mut i = 0;
+    let mut trailing_dollar = None;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 2; // skip the escaped char
+                continue;
+            }
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '$' if !in_class => {
+                if i + 1 == chars.len() {
+                    trailing_dollar = Some(i);
+                } else {
+                    return None; // `$` not at the end — don't accelerate
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    match trailing_dollar {
+        None => Some(pattern.to_string()),
+        Some(idx) => {
+            let mut out: String = chars[..idx].iter().collect();
+            out.push_str("\\z");
+            Some(out)
+        }
     }
 }
 
 impl RegexpReplace {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        // Validate the pattern once at plan-compile time; each worker then
-        // compiles its own `Regex` in the builder below.
-        Regex::new(&self.pattern).map_err(|source| compile::Error::InvalidRegexPattern {
+        // Validate against the fallback engine (also the semantic reference).
+        build_rust(&self.pattern).map_err(|source| compile::Error::InvalidRegexPattern {
             pattern: self.pattern.clone(),
             source,
         })?;
-        let pattern = self.pattern.clone();
-        let replacement = translate_replacement(&self.replacement);
+
+        // Use PCRE2-JIT when it can evaluate this pattern with the same
+        // semantics and JIT is available; otherwise fall back.
+        let pcre2_pattern =
+            pcre2_equivalent_pattern(&self.pattern).filter(|p| build_pcre2(p).is_ok());
+        let use_pcre2 = pcre2_pattern.is_some();
+        let pcre2_pattern = pcre2_pattern.unwrap_or_default();
+        let rust_pattern = self.pattern.clone();
+        let template = Arc::new(parse_replacement(&self.replacement));
         let input_builder = self.input.compile()?;
+
         Ok(Box::new(move || {
-            let mut input_expr = input_builder();
-            let mut replacer = MemoizedReplacer {
-                regex: Regex::new(&pattern).expect("pattern validated at plan compile"),
-                replacement: replacement.clone(),
-                memo: std::collections::HashMap::default(),
-                memo_bytes: 0,
+            let template = template.clone();
+            let engine = if use_pcre2 {
+                match build_pcre2(&pcre2_pattern) {
+                    Ok(re) => Engine::Pcre2(re),
+                    Err(_) => Engine::Rust(
+                        build_rust(&rust_pattern).expect("pattern validated at plan compile"),
+                    ),
+                }
+            } else {
+                Engine::Rust(build_rust(&rust_pattern).expect("pattern validated at plan compile"))
             };
+            let mut input_expr = input_builder();
             Box::new(move |batch: &RecordBatch| {
                 let input = input_expr(batch);
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();
                 let mut out = StringViewBuilder::with_capacity(strings.len());
                 // Values arrive in runs (sessions repeat the same URL), so an
-                // equal-to-previous check skips even the memo hash. `None`
-                // output means "no match, pass the input through".
+                // equal-to-previous check skips even the match. `None` in
+                // `last_out` means "no match — pass the input through".
                 let mut last_in: Option<&str> = None;
-                let mut last_out: Option<String> = None;
-                for v in strings.iter() {
-                    let Some(s) = v else {
+                let mut last_out: Option<Vec<u8>> = None;
+                for value in strings.iter() {
+                    let Some(s) = value else {
                         out.append_null();
                         continue;
                     };
                     if last_in == Some(s) {
-                        out.append_value(last_out.as_deref().unwrap_or(s));
+                        match &last_out {
+                            // SAFETY: bytes came from matching/splicing this
+                            // column's (already `&str`) values.
+                            Some(bytes) => {
+                                out.append_value(unsafe { std::str::from_utf8_unchecked(bytes) })
+                            }
+                            None => out.append_value(s),
+                        }
                         continue;
                     }
                     last_in = Some(s);
-                    match replacer.replace(s) {
-                        Some(replaced) => {
-                            out.append_value(&replaced);
-                            last_out = Some(replaced.into_owned());
+                    match engine.replace_first(s.as_bytes(), &template) {
+                        Some(bytes) => {
+                            out.append_value(unsafe { std::str::from_utf8_unchecked(&bytes) });
+                            last_out = Some(bytes);
                         }
                         None => {
                             out.append_value(s);
@@ -212,6 +293,7 @@ impl RegexpReplace {
 
 #[cfg(test)]
 mod tests {
+    use super::{build_pcre2, build_rust, parse_replacement, pcre2_equivalent_pattern, Engine};
     use crate::test_support::*;
     use crate::types::Type;
     use arrow_array::{ArrayRef, StringViewArray};
@@ -245,8 +327,6 @@ mod tests {
             r"SELECT regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') FROM urls",
         );
 
-        // Group reference `\1` yields the host; the un-matching row (no path)
-        // passes through unchanged.
         let mut got = rows
             .iter_mut()
             .map(|r| r["col0"].as_str().unwrap().to_string())
@@ -265,5 +345,50 @@ mod tests {
         );
 
         assert_eq!(rows[0]["col0"], "bXnana");
+    }
+
+    /// The PCRE2 and `regex`-crate engines must produce identical output for any
+    /// pattern we route to PCRE2 — this guards the byte-mode and `$`→`\z`
+    /// alignment against drift, including multibyte, newline, and invalid-UTF-8
+    /// inputs.
+    #[test]
+    fn engines_agree() {
+        let pattern = r"^https?://(?:www\.)?([^/]+)/.*$";
+        let rust = Engine::Rust(build_rust(pattern).unwrap());
+        let pcre2 = Engine::Pcre2(build_pcre2(&pcre2_equivalent_pattern(pattern).unwrap()).unwrap());
+        let template = parse_replacement(r"\1");
+
+        let cases: Vec<&[u8]> = vec![
+            b"https://www.example.com/path/x",
+            b"http://foo.org/x",
+            b"http://only-host-no-path",
+            b"no-url",
+            b"https://www./x",
+            b"http://host/a\nb",   // embedded newline in the tail
+            b"http://host/path\n", // trailing newline: the PCRE2 `$` quirk
+            "http://\u{0441}\u{0430}\u{0439}\u{0442}.\u{0440}\u{0444}/\u{043f}".as_bytes(),
+            &[104, 116, 116, 112, 58, 47, 47, 120, 46, 99, 111, 109, 47, 0xFF, 0xFE], // invalid UTF-8
+        ];
+        for case in cases {
+            assert_eq!(
+                rust.replace_first(case, &template),
+                pcre2.replace_first(case, &template),
+                "engines disagree on {case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_dollar_rewritten_else_declined() {
+        assert_eq!(
+            pcre2_equivalent_pattern(r"^a([^/]+)/.*$").as_deref(),
+            Some(r"^a([^/]+)/.*\z")
+        );
+        assert_eq!(pcre2_equivalent_pattern("abc").as_deref(), Some("abc"));
+        // `$` not at the end → declined (caller uses the fallback engine).
+        assert_eq!(pcre2_equivalent_pattern("a$b"), None);
+        // Escaped `$` and `$` inside a class are literals, not anchors.
+        assert_eq!(pcre2_equivalent_pattern(r"a\$").as_deref(), Some(r"a\$"));
+        assert_eq!(pcre2_equivalent_pattern("[a$]").as_deref(), Some("[a$]"));
     }
 }
