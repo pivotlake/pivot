@@ -15,6 +15,14 @@ PivotTableCatalogEntry *PivotStorageInfo::AddTableEntry(unique_ptr<PivotTableCat
 	return ptr;
 }
 
+TableFunctionCatalogEntry *PivotStorageInfo::AddFunctionEntry(
+    unique_ptr<TableFunctionCatalogEntry> entry) {
+	auto *ptr = entry.get();
+	function_entries.push_back(std::move(entry));
+	return ptr;
+}
+
 void PivotStorageInfo::ClearTableEntries() {
 	table_entries.clear();
+	function_entries.clear();
 }

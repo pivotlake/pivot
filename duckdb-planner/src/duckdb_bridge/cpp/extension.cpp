@@ -42,4 +42,8 @@ void PivotExtension::Load(ExtensionLoader &loader) {
 	                          });
 	drop_cache.SetStability(FunctionStability::VOLATILE);
 	loader.RegisterFunction(drop_cache);
+
+	// Table functions (e.g. `metadata`) are NOT registered here. They resolve on
+	// demand through the catalog's LookupEntry, which builds their entry from the
+	// Rust provider's registry, so adding one needs no change in this bridge.
 }
