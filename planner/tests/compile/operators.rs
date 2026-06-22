@@ -609,6 +609,76 @@ fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
     assert_eq!(bob["v0"], 1);
 }
 
+// GROUP BY (Int64, Utf8) takes the dedicated int+string key extractor (the int
+// beside the string's arena handle), not the row encoder. Plain LIMIT, no ORDER
+// BY, so any 10 groups suffice.
+#[rstest]
+fn group_by_int64_string_key(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "hits",
+        &[
+            (
+                "id",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![1i64, 1, 2, 2, 3])) as ArrayRef,
+            ),
+            ("name", Type::Utf8, str_col(vec!["a", "a", "b", "c", "c"])),
+        ],
+    );
+
+    let mut rows = batches_to_json(
+        &testing_planner
+            .planner
+            .plan("SELECT id, name, COUNT(*) FROM hits GROUP BY id, name LIMIT 10")
+            .unwrap()
+            .compile(testing_planner.dispatcher())
+            .unwrap()
+            .collect()
+            .unwrap(),
+    );
+    rows.sort_by_key(|r| {
+        (
+            r["k0"].as_i64().unwrap(),
+            r["k1"].as_str().unwrap().to_string(),
+        )
+    });
+
+    // Groups: (1,"a")=2, (2,"b")=1, (2,"c")=1, (3,"c")=1.
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        (
+            rows[0]["k0"].as_i64(),
+            rows[0]["k1"].as_str(),
+            rows[0]["v0"].as_i64()
+        ),
+        (Some(1), Some("a"), Some(2))
+    );
+    assert_eq!(
+        (
+            rows[1]["k0"].as_i64(),
+            rows[1]["k1"].as_str(),
+            rows[1]["v0"].as_i64()
+        ),
+        (Some(2), Some("b"), Some(1))
+    );
+    assert_eq!(
+        (
+            rows[2]["k0"].as_i64(),
+            rows[2]["k1"].as_str(),
+            rows[2]["v0"].as_i64()
+        ),
+        (Some(2), Some("c"), Some(1))
+    );
+    assert_eq!(
+        (
+            rows[3]["k0"].as_i64(),
+            rows[3]["k1"].as_str(),
+            rows[3]["v0"].as_i64()
+        ),
+        (Some(3), Some("c"), Some(1))
+    );
+}
+
 #[rstest]
 fn group_by_int64_and_date_columns(mut testing_planner: TestingPlanner) {
     // A wide key tuple (Int64 id, Date d) routes through the row encoder, which

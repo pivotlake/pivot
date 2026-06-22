@@ -29,7 +29,8 @@ use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, GroupLimit, IntKeyExtractor,
-    IntPairKeyExtractor, RecordBatchOperatorSpec, RowKeyExtractor, StringKeyExtractor, SumSlot,
+    IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec, RowKeyExtractor,
+    StringKeyExtractor, SumSlot,
 };
 use std::sync::Arc;
 
@@ -359,6 +360,32 @@ pub(super) fn lower_grouped(
             (Type::Int32, Type::Int64) => value!(IntPairKeyExtractor<Int32Type, Int64Type>, ()),
             _ => unreachable!("int_pair_keys only returns the arms above"),
         };
+    }
+
+    // One integer key plus one string key, in either order: the dedicated
+    // int+string extractor keys on the native integer beside the string's arena
+    // handle, skipping the row encoder's byte-encode of the tuple (the heaviest
+    // part of the `(Int64, Utf8)` group-by). `STR_FIRST` follows the GROUP BY
+    // order so the leading output column stays the first key. Two integer keys
+    // took the pair extractor above.
+    match keys {
+        [(_, int_ty), (_, Type::Utf8)] => match int_ty {
+            Type::Int8 => return value!(IntStrKeyExtractor<Int8Type, false>, ()),
+            Type::Int16 => return value!(IntStrKeyExtractor<Int16Type, false>, ()),
+            Type::Int32 => return value!(IntStrKeyExtractor<Int32Type, false>, ()),
+            Type::Int64 => return value!(IntStrKeyExtractor<Int64Type, false>, ()),
+            _ => {}
+        },
+        [(_, Type::Utf8), (_, int_ty)] => match int_ty {
+            Type::Int8 => return value!(IntStrKeyExtractor<Int8Type, true>, ()),
+            Type::Int16 => return value!(IntStrKeyExtractor<Int16Type, true>, ()),
+            Type::Int32 => return value!(IntStrKeyExtractor<Int32Type, true>, ()),
+            Type::Int64 => return value!(IntStrKeyExtractor<Int64Type, true>, ()),
+            _ => {}
+        },
+        // Anything else (two non-int/string, 3+ keys) falls through to the row
+        // encoder below.
+        _ => {}
     }
 
     // The general fallback: encode the whole key tuple into one byte blob.

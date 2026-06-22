@@ -79,8 +79,9 @@ use criterion::{BatchSize, Criterion, Throughput, black_box};
 
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
-    Distinct, Dynamic, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, OrderBy,
-    RecordBatchOperatorSpec, StringKeyExtractor, SumSlot, memory_ctx, values_input,
+    Distinct, Dynamic, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
+    OrderBy, RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema, StringKeyExtractor, SumSlot,
+    memory_ctx, values_input,
 };
 
 // ---------------------------------------------------------------------------
@@ -733,6 +734,72 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
     );
+
+    // (j) Composite (i64 id, sparse free-text) key, high cardinality, most phrases
+    //     blank so the key is dominated by the id. Models `GROUP BY id, phrase
+    //     COUNT(*) LIMIT 10` (a plain `First` LIMIT pushdown keeps the output
+    //     tiny so the group-by hot loop dominates rather than the CopyOut). Run
+    //     two ways over identical data, so the pair is a direct A/B:
+    //
+    //     * `_rowkey` byte-encodes the `(Int64, Utf8View)` tuple with the generic
+    //       `RowKeyExtractor` — its `encode_and_hash` shows up alongside the probe
+    //       and merge.
+    //     * `_pair` uses the dedicated `IntStrKeyExtractor`: the native int beside
+    //       the string's arena handle, no row encode.
+    let count_star = || vec![AggregationSlot::new(AggregationKind::CountStar, 0)];
+    bench(
+        c,
+        d,
+        "group_by/int_string_highcard_rowkey",
+        rows,
+        || int_string_dataset(rows),
+        move |s| {
+            s.group_by_aggregate_config::<RowKeyExtractor, Compiled<(CountSlot,)>>(
+                vec![0, 1],
+                count_star(),
+                Some(GroupLimit::First { limit: 10 }),
+                RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]),
+            )
+        },
+    );
+    bench(
+        c,
+        d,
+        "group_by/int_string_highcard_pair",
+        rows,
+        || int_string_dataset(rows),
+        move |s| {
+            s.group_by_aggregate::<IntStrKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
+                vec![0, 1],
+                count_star(),
+                Some(GroupLimit::First { limit: 10 }),
+            )
+        },
+    );
+}
+
+/// The `(i64 id, sparse free-text phrase)` dataset shared by the row-key and
+/// dedicated-extractor variants of the mixed int+string GROUP BY, so the two are
+/// a direct A/B over byte-for-byte identical input.
+fn int_string_dataset(rows: usize) -> Vec<RecordBatch> {
+    let sch = schema(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("phrase", DataType::Utf8View, false),
+    ]);
+    let dict = string_dict((rows * 2 / 100).max(1), "search query ", 20);
+    let block = dict_block(&dict);
+    let mut rng = Rng::new(10);
+    batch_sizes(rows)
+        .map(|n| {
+            batch(
+                &sch,
+                vec![
+                    i64_keys(&mut rng, n, (rows / 8).max(1)),
+                    sparse_string_col(&mut rng, n, &block, 0.85),
+                ],
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -101,10 +101,10 @@ pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, DynamicFilterSlot, Fold, FoldAcc, GroupLimit, HashOnlyIntKeyExtractor,
-    IntKeyExtractor, IntPairKeyExtractor, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead,
-    Nullary, NullaryFactory, NullaryOperatorFactory, Numeric, OpTuple, Operator, OrderBy, Read,
-    Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
-    StringKeyExtractor, Sum, SumSlot, WideSum,
+    IntKeyExtractor, IntPairKeyExtractor, IntRead, IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot,
+    Mono, NoRead, Nullary, NullaryFactory, NullaryOperatorFactory, Numeric, OpTuple, Operator,
+    OrderBy, Read, Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin,
+    StrRead, StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
