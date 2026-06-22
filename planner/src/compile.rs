@@ -63,6 +63,8 @@ pub enum Error {
     UnsupportedExpression(Expression),
     #[error("Unsupported type for group by: {0:?}")]
     DataTypeNotSupportedForGroupBy(Type),
+    #[error("Cannot statically determine the result type of expression: {0:?}")]
+    IndeterminateResultType(Expression),
     #[error("Unsupported expression for contains: {0:?}")]
     UnsupportedExpressionForContainsNeedle(Expression),
     #[error("Unsupported haystack expression for contains: {0:?}")]

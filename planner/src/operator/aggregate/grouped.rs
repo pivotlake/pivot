@@ -201,16 +201,13 @@ impl Aggregate {
             return Ok((input, keys, 0));
         }
 
-        // Canonical type of each computed key: string keys stay strings, anything
-        // else is read as i64 (the type its column is cast to below). The order
-        // matches `computed`, i.e. the order computed keys appear in the GROUP BY.
+        // Canonical type of each computed key (the type its column is cast to
+        // below), derived from the key's static result type. The order matches
+        // `computed`, i.e. the order computed keys appear in the GROUP BY.
         let computed_types: Vec<Type> = computed
             .iter()
-            .map(|g| match g.result_type() {
-                Some(Type::Utf8) => Type::Utf8,
-                _ => Type::Int64,
-            })
-            .collect();
+            .map(|g| canonical_group_key_type(g.result_type()?))
+            .collect::<Result<_, _>>()?;
         let n = computed.len();
         let input = project_keys(input, &computed, &computed_types)?;
 
@@ -244,10 +241,25 @@ impl Aggregate {
     }
 }
 
+/// The column type a computed group key is materialised as. String keys group
+/// on their own value; integer and temporal keys group on the `Int64` they are
+/// cast to (the bit pattern preserves distinctness). Any other result type is
+/// rejected rather than silently coerced to an integer.
+fn canonical_group_key_type(result_type: Type) -> Result<Type, Error> {
+    match result_type {
+        Type::Utf8 => Ok(Type::Utf8),
+        Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 | Type::Date | Type::Timestamp => {
+            Ok(Type::Int64)
+        }
+        other => Err(Error::DataTypeNotSupportedForGroupBy(other)),
+    }
+}
+
 /// Evaluate each `key` per batch, cast it to its canonical `Int64`/`Utf8View`
 /// type, and prepend them as leading columns `k0, k1, …`. The original columns
 /// follow, shifted right by `keys.len()`, so the aggregates can still read their
-/// value columns.
+/// value columns. `types` are the canonical key types from
+/// [`canonical_group_key_type`], so only `Utf8` and `Int64` reach here.
 fn project_keys(
     input: RecordBatchOperatorSpec,
     keys: &[&Expression],
@@ -260,7 +272,10 @@ fn project_keys(
             .iter()
             .map(|t| match t {
                 Type::Utf8 => DataType::Utf8View,
-                _ => DataType::Int64,
+                Type::Int64 => DataType::Int64,
+                other => {
+                    unreachable!("canonical_group_key_type yields only Utf8 or Int64, got {other:?}")
+                }
             })
             .collect(),
     );
