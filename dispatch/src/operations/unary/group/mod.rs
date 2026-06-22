@@ -135,6 +135,21 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A LIMIT pushed down into a grouped aggregate, so each partition emits only
+/// the rows the downstream LIMIT can keep instead of every group.
+///
+/// Both forms are decomposable across the hash-disjoint partitions: the global
+/// answer is recovered by re-applying the same LIMIT (and any ORDER BY) above.
+#[derive(Clone, Copy, Debug)]
+pub enum GroupLimit {
+    /// `ORDER BY <slot> DESC LIMIT n`: keep this partition's top-`n` groups by
+    /// `V::sort_key(value, slot)`.
+    TopK { slot: usize, limit: usize },
+    /// Plain `LIMIT n` with no ORDER BY: keep any `n` groups from this partition
+    /// (SQL leaves which rows arbitrary, so the first `n` encountered suffice).
+    First { limit: usize },
+}
+
 /// Number of hash partitions for the output merge phase.
 /// Each partition is merged independently, enabling parallel output.
 const PARTITIONS: usize = 64;
@@ -174,7 +189,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         key_config: K::Config,
-        top_k: Option<(usize, usize)>,
+        output_limit: Option<GroupLimit>,
         count_only: bool,
         sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
         receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
@@ -207,7 +222,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
                 partition_jobs_injected,
                 key_config,
                 shared_context,
-                top_k,
+                output_limit,
                 count_only,
                 output_allocator: None,
             },
@@ -260,7 +275,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     /// folds existing entries via [`AggregationValue::merge`] and the output
     /// resolves string extremes (it carries the value arena).
     shared_context: V::SharedContext,
-    top_k: Option<(usize, usize)>,
+    output_limit: Option<GroupLimit>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
     count_only: bool,
@@ -290,7 +305,7 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     key_config: K::Config,
     /// The value's shared context, for the partition merge's entry fold + output.
     shared_context: V::SharedContext,
-    top_k: Option<(usize, usize)>,
+    output_limit: Option<GroupLimit>,
     count_only: bool,
 }
 
@@ -322,7 +337,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
             allocator,
             &self.key_config,
             &self.shared_context,
-            self.top_k,
+            self.output_limit,
             self.count_only,
             sender,
         )
@@ -384,7 +399,7 @@ impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutpu
                     num_partitions,
                     key_config: self.key_config.clone(),
                     shared_context: self.shared_context.clone(),
-                    top_k: self.top_k,
+                    output_limit: self.output_limit,
                     count_only: self.count_only,
                 });
             }
@@ -524,7 +539,7 @@ mod tests {
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
-        top_k: Option<(usize, usize)>,
+        output_limit: Option<GroupLimit>,
         radix: RadixConfig,
     ) -> CollectSender {
         init_test_free_pool(64);
@@ -547,7 +562,7 @@ mod tests {
                     key_cols.clone(),
                     value_slots.clone(),
                     K::Config::default(),
-                    top_k,
+                    output_limit,
                     false,
                     tx.clone(),
                     rx_opt.take(),
@@ -774,7 +789,7 @@ mod tests {
             vec![vec![batch_with_column(&values)]],
             vec![0],
             count_slots(),
-            Some((0, 1)),
+            Some(GroupLimit::TopK { slot: 0, limit: 1 }),
             RadixConfig::DEFAULT,
         );
 
@@ -784,6 +799,34 @@ mod tests {
         assert!(
             pairs.iter().all(|&(k, c)| k == 0 || c == 1),
             "every survivor is its partition's max"
+        );
+    }
+
+    #[test]
+    fn first_limit_caps_each_partition_without_sorting() {
+        // A plain LIMIT (no ORDER BY) keeps *any* `limit` groups per partition.
+        // 1000 distinct keys, each once: with `limit = 1` each partition emits at
+        // most one of its groups, so the output is capped at one row per partition
+        // and every survivor is a real (key, count == 1) group.
+        let values: Vec<i32> = (0..1000).collect();
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            vec![vec![batch_with_column(&values)]],
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::First { limit: 1 }),
+            RadixConfig::DEFAULT,
+        );
+
+        let pairs = group_counts(&sender);
+        assert!(!pairs.is_empty(), "some groups kept");
+        assert!(
+            pairs.len() <= PARTITIONS,
+            "at most `limit` rows per partition"
+        );
+        assert!(
+            pairs.iter().all(|&(k, c)| (0..1000).contains(&k) && c == 1),
+            "every survivor is a real group"
         );
     }
 

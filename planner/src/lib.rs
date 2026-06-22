@@ -169,6 +169,8 @@ impl Planner {
         let mut root = PlanNode::try_from(duckdb_plan)?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
+        // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
+        root.annotate_group_limit();
         Ok(Plan {
             catalog: self.catalog.clone(),
             root,

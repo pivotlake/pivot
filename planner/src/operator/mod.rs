@@ -18,6 +18,7 @@ mod create_table;
 mod dummy_scan;
 mod filter;
 mod input;
+mod limit;
 mod materialize;
 mod order_by;
 mod projection;
@@ -29,6 +30,7 @@ pub use create_table::CreateTable;
 pub use dummy_scan::DummyScan;
 pub use filter::Filter;
 pub use input::Input;
+pub use limit::Limit;
 pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
 pub use projection::Projection;
@@ -73,6 +75,7 @@ pub enum Operator {
     Aggregate(Aggregate),
     Filter(Filter),
     TopN(TopN),
+    Limit(Limit),
     CreateTable(CreateTable),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
@@ -92,6 +95,7 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
             duckdb_operator::Operator::Aggregate(a) => Operator::Aggregate(a.try_into()?),
             duckdb_operator::Operator::Filter(f) => Operator::Filter(f.try_into()?),
             duckdb_operator::Operator::TopN(t) => Operator::TopN(t.try_into()?),
+            duckdb_operator::Operator::Limit(l) => Operator::Limit(l.try_into()?),
             duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
             duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
             duckdb_operator::Operator::Set(s) => Operator::SetVariable(s.try_into()?),
@@ -115,6 +119,7 @@ impl fmt::Display for Operator {
             Operator::Aggregate(a) => write!(f, "{a}"),
             Operator::Filter(fl) => write!(f, "{fl}"),
             Operator::TopN(t) => write!(f, "{t}"),
+            Operator::Limit(l) => write!(f, "{l}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),

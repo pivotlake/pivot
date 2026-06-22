@@ -86,10 +86,17 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
         batch: RecordBatch,
         _sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        // The row group column is a RunArray: consecutive rows in the same group
-        // share a single run, so we iterate over runs rather than individual rows.
+        // The row-group column is a `RunArray` (consecutive same-group rows = one
+        // run). The batch may be a logical slice (e.g. a `LIMIT` above the scan),
+        // so walk the *logical* runs via `RunEndBuffer::sliced_values()` — run
+        // ends already adjusted by the slice offset and capped at the slice
+        // length — and map each run to its physical group value from
+        // `get_start_physical_index()`. Reading the raw (physical) `run_ends`
+        // would treat them as logical bounds and overrun the (shorter) sliced
+        // `row_indices`.
         let groups = global_row_group(&batch);
-        let run_ends = groups.run_ends().values();
+        let run_ends = groups.run_ends();
+        let physical_start = run_ends.get_start_physical_index();
         let group_values = groups
             .values()
             .as_any()
@@ -97,16 +104,17 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
             .unwrap();
         let row_indices = row_index(&batch);
 
-        let mut logical_start = 0usize;
-        for (run_idx, &run_end) in run_ends.iter().enumerate() {
-            let logical_end = run_end as usize;
-            let group = group_values.value(run_idx);
+        let mut logical = 0usize;
+        for (run_offset, logical_end) in run_ends.sliced_values().enumerate() {
+            let logical_end = logical_end as usize;
+            let group = group_values.value(physical_start + run_offset);
             let entries = self.pending_row_groups.entry(group).or_default();
-            // Collect every row index that falls within this run.
-            for i in logical_start..logical_end {
-                entries.push(row_indices.value(i));
+            // `row_indices` is logically indexed, so `value(logical)` accounts
+            // for any slice offset.
+            while logical < logical_end {
+                entries.push(row_indices.value(logical));
+                logical += 1;
             }
-            logical_start = logical_end;
         }
         Ok(())
     }
@@ -126,5 +134,73 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
             ))?;
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Materializer;
+    use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
+    use crate::parquet::{ParquetTable, RowGroupRequest};
+    use ahash::HashMap;
+    use arrow::compute::concat_batches;
+    use arrow_array::{RecordBatch, RecordBatchOptions};
+    use arrow_schema::Schema;
+    use dispatch::Projection;
+    use dispatch::test_utils::CollectSender;
+    use std::sync::Arc;
+
+    /// A metadata-only batch (no data columns) tagging `rows` rows with row group
+    /// `group` and row indices `0..rows` — the shape a metadata scan emits.
+    fn meta_batch(group: usize, rows: usize) -> RecordBatch {
+        let empty = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .unwrap();
+        with_row_group_metadata(empty, group, 0)
+    }
+
+    /// Run `batch` through a `Materializer`'s `consume` and return the row indices
+    /// it grouped by row group. The table is unused by `consume` (only `finish`
+    /// reads it), so a dummy empty one suffices.
+    fn consume(batch: RecordBatch) -> HashMap<u32, Vec<u32>> {
+        let mut materializer = Materializer::new(
+            Projection::columns([0]),
+            Arc::new(ParquetTable::new(vec![])),
+        );
+        let mut sink = CollectSender::<RowGroupRequest>::default();
+        dispatch::Unary::consume(&mut materializer, batch, &mut sink).unwrap();
+        materializer.pending_row_groups
+    }
+
+    // Two row groups concatenated → a 2-run RunArray; the materializer recovers
+    // every (group, row_idx) pair.
+    #[test]
+    fn collects_indices_grouped_by_row_group() {
+        let a = meta_batch(5, 6);
+        let batch = concat_batches(&a.schema(), &[a.clone(), meta_batch(8, 6)]).unwrap();
+
+        let out = consume(batch);
+
+        assert_eq!(out[&5], vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(out[&8], vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    // Regression: a logically *sliced* metadata batch (what a LIMIT above the scan
+    // produces) must be decoded by logical run bounds, not the unchanged physical
+    // run_ends — the latter overran the shorter sliced row_idx. The slice spans
+    // into the second run, so it also exercises `get_start_physical_index() > 0`.
+    #[test]
+    fn collects_indices_from_sliced_batch() {
+        let a = meta_batch(5, 6);
+        let batch = concat_batches(&a.schema(), &[a.clone(), meta_batch(8, 6)]).unwrap();
+
+        let sliced = batch.slice(8, 3); // logical rows 8,9,10 → group 8, row_idx 2,3,4
+        let out = consume(sliced);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[&8], vec![2, 3, 4]);
     }
 }

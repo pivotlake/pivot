@@ -79,8 +79,8 @@ use criterion::{BatchSize, Criterion, Throughput, black_box};
 
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
-    Distinct, Dynamic, IntKeyExtractor, IntPairKeyExtractor, OrderBy, RecordBatchOperatorSpec,
-    StringKeyExtractor, SumSlot, memory_ctx, values_input,
+    Distinct, Dynamic, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, OrderBy,
+    RecordBatchOperatorSpec, StringKeyExtractor, SumSlot, memory_ctx, values_input,
 };
 
 // ---------------------------------------------------------------------------
@@ -625,7 +625,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 s.group_by_aggregate::<IntPairKeyExtractor<Int64Type, Int32Type>, Value>(
                     vec![0, 1],
                     slots.clone(),
-                    Some((0, 10)),
+                    Some(GroupLimit::TopK { slot: 0, limit: 10 }),
                 )
             },
         );
@@ -687,7 +687,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<4, i64, true>>(
                         vec![0, 1],
                         slots.clone(),
-                        Some((0, 10)),
+                        Some(GroupLimit::TopK { slot: 0, limit: 10 }),
                     )
             },
         );

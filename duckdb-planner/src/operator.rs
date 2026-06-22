@@ -100,6 +100,16 @@ pub struct TopN {
     pub produces_dynamic_filter: Option<DynamicFilter>,
 }
 
+/// A bare `LIMIT … OFFSET …` with no ORDER BY (an ORDER BY + LIMIT is fused into
+/// [`TopN`] by the optimizer). `limit` is `None` for an offset-only query (no
+/// upper bound); a non-constant (percentage/expression) limit is rejected by the
+/// bridge before it reaches here.
+#[derive(CustomDeserializer, Debug)]
+pub struct Limit {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 /// A single column definition inside a CREATE TABLE statement.
 #[derive(CustomDeserializer, Debug)]
 pub struct CreateTableColumn {
@@ -200,6 +210,8 @@ pub enum Operator {
     Filter(Filter),
     #[type_tag(LogicalOperatorType::LOGICAL_TOP_N)]
     TopN(TopN),
+    #[type_tag(LogicalOperatorType::LOGICAL_LIMIT)]
+    Limit(Limit),
     #[type_tag(LogicalOperatorType::LOGICAL_CREATE_TABLE)]
     CreateTable(CreateTable),
     #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
@@ -230,6 +242,7 @@ impl Operator {
             Operator::Filter(_)
             | Operator::OrderBy(_)
             | Operator::TopN(_)
+            | Operator::Limit(_)
             | Operator::CreateTable(_)
             | Operator::DummyScan(_)
             | Operator::Set(_)
@@ -304,6 +317,17 @@ impl fmt::Display for Operator {
                     t.limit,
                     t.offset,
                     orders.join(", ")
+                )
+            }
+            Operator::Limit(l) => {
+                let limit = l
+                    .limit
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "ALL".to_string());
+                write!(
+                    f,
+                    "Limit(limit: {limit}, offset: {})",
+                    l.offset.unwrap_or(0)
                 )
             }
             Operator::CreateTable(c) => {
