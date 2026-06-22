@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
+use arrow_array::{ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
 use dispatch::Dispatch;
 
 use crate::common::*;
@@ -436,6 +436,38 @@ fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
     assert_eq!(alice["v0"], 2);
     let bob = rows.iter().find(|r| r["key"] == "bob").unwrap();
     assert_eq!(bob["v0"], 1);
+}
+
+#[rstest]
+fn group_by_int64_and_date_columns(mut testing_planner: TestingPlanner) {
+    // A wide key tuple (Int64 id, Date d) routes through the row encoder, which
+    // encodes the Date as its integer day count. (100,10) appears twice,
+    // (100,20) once, (200,10) twice, so the date must be part of the key for
+    // (100,10) and (100,20) to stay distinct.
+    testing_planner.add_table(
+        "idd",
+        &[
+            ("id", Type::Int64, Arc::new(Int64Array::from(vec![100i64, 100, 100, 200, 200])) as ArrayRef),
+            ("d", Type::Date, Arc::new(Date32Array::from(vec![10i32, 10, 20, 10, 10])) as ArrayRef),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT id, d, COUNT(*) FROM idd GROUP BY id, d")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()));
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!((rows[0]["k0"].as_i64(), rows[0]["k1"].as_i64(), rows[0]["v0"].as_i64()), (Some(100), Some(10), Some(2)));
+    assert_eq!((rows[1]["k0"].as_i64(), rows[1]["k1"].as_i64(), rows[1]["v0"].as_i64()), (Some(100), Some(20), Some(1)));
+    assert_eq!((rows[2]["k0"].as_i64(), rows[2]["k1"].as_i64(), rows[2]["v0"].as_i64()), (Some(200), Some(10), Some(2)));
 }
 
 #[rstest]
