@@ -89,6 +89,42 @@ impl ManifestEntry {
             sort_bounds: None,
         }
     }
+
+    /// Whether this file *can* hold a row matching every partition filter — a
+    /// soft test, so it never wrongly drops a file. A filter on a non-partition
+    /// column, an entry with no recorded tuple, or a tuple missing the column all
+    /// keep the entry (absence of a value is not proof of a mismatch). Only a
+    /// recorded partition value that differs from the filter's excludes it. Both
+    /// values are the JSON arrow-json produced (the sink for the tuple, the query
+    /// for the constant), so they compare directly.
+    pub fn maybe_matches_partition(
+        &self,
+        partition_by: &[String],
+        filters: &[PartitionEqFilter],
+    ) -> bool {
+        let Some(tuple) = self.partition.as_ref().and_then(|v| v.as_object()) else {
+            return true;
+        };
+        filters.iter().all(|filter| {
+            !partition_by.iter().any(|c| c == &filter.column)
+                || match tuple.get(&filter.column) {
+                    Some(value) => *value == filter.value,
+                    None => true,
+                }
+        })
+    }
+}
+
+/// A `partition column = constant` predicate the query pushed down, with the
+/// constant already encoded to the JSON shape a partition tuple records (via
+/// arrow-json, the same encoder the sink uses). [`ManifestEntry::maybe_matches_partition`]
+/// uses it to skip a file whose recorded partition value can't match *before*
+/// its footer is fetched — the HTTP a stats prune can't save, since stats live
+/// in the footer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartitionEqFilter {
+    pub column: String,
+    pub value: serde_json::Value,
 }
 
 /// The data files a compaction swap removed at a given table-manifest version,

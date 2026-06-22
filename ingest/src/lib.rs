@@ -415,7 +415,7 @@ mod tests {
     ) -> Arc<catalog::parquet::ParquetTable> {
         let mut table = catalog.table_handle(name).expect("table exists");
         table.refresh().expect("manifest reload");
-        table.parquet()
+        table.parquet(&[]).expect("build scan view")
     }
 
     /// Load the written directory back into a `ParquetTable`. Drives the
