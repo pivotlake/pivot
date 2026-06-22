@@ -6,10 +6,37 @@
 
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/column_definition.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/common/exception.hpp"
 
 using namespace duckdb;
+
+namespace {
+
+// Carries a table function's output schema from the lookup (where Rust supplied
+// it) through to its bind. pivot only plans, never executes, so the bind just
+// republishes that schema and the bind data is a trivial placeholder.
+struct PivotTableFunctionInfo : public TableFunctionInfo {
+	vector<string> names;
+	vector<LogicalType> return_types;
+};
+
+struct PivotTableFunctionBindData : public TableFunctionData {};
+
+unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types,
+                                                   vector<string> &names) {
+	auto &info = input.info->Cast<PivotTableFunctionInfo>();
+	names = info.names;
+	return_types = info.return_types;
+	return make_uniq<PivotTableFunctionBindData>();
+}
+
+} // namespace
 
 PivotSchemaCatalogEntry::PivotSchemaCatalogEntry(Catalog &catalog, CreateSchemaInfo &info)
     : SchemaCatalogEntry(catalog, info) {
@@ -19,6 +46,40 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
                                                          const EntryLookupInfo &lookup_info) {
 	auto &table_name = lookup_info.GetEntryName();
 	auto &pivot_catalog = ParentCatalog().Cast<PivotCatalog>();
+
+	// A table-function reference (e.g. `metadata('t')`): resolve it against the
+	// Rust provider's registry. Unknown names (DuckDB built-ins like
+	// generate_series) return nullptr, so the binder falls through to the system
+	// catalog. The function's schema comes entirely from Rust; nothing about it
+	// is declared in this bridge.
+	if (lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
+		auto function = catalog_get_table_function(*pivot_catalog.catalog_ctx, table_name);
+		if (!function.found) {
+			return nullptr;
+		}
+
+		auto info = make_shared_ptr<PivotTableFunctionInfo>();
+		vector<LogicalType> arguments;
+		for (auto type_id : function.arg_type_ids) {
+			arguments.emplace_back(static_cast<LogicalTypeId>(type_id));
+		}
+		for (const auto &col : function.columns) {
+			info->names.emplace_back(std::string(col.name));
+			info->return_types.emplace_back(
+			    static_cast<LogicalTypeId>(col.duckdb_logical_type_id));
+		}
+
+		TableFunction func(std::string(table_name), std::move(arguments), nullptr,
+		                   pivot_table_function_bind);
+		func.function_info = info;
+
+		CreateTableFunctionInfo create_info(func);
+		auto entry =
+		    make_uniq<TableFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
+		auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
+		return PivotStorageInfo::Get(db_instance).AddFunctionEntry(std::move(entry));
+	}
+
 	auto result = catalog_get_table(*pivot_catalog.catalog_ctx, table_name);
 
 	if (!result.found) {

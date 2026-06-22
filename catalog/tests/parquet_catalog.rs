@@ -15,6 +15,7 @@ use tempfile::TempDir;
 use catalog::store::ObjectPath;
 use catalog::{ParquetCatalog, PartitionEqFilter, TableBinding};
 use common::current_parquet;
+use planner::Planner;
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };
@@ -361,6 +362,117 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
         .expect("table exists")
         .append_data_file(relative, &bytes, None, None)
         .unwrap()
+}
+
+/// Run `sql` through a planner over `catalog` and return the result batches.
+fn run_sql(catalog: &Arc<ParquetCatalog>, sql: &str) -> Vec<RecordBatch> {
+    let mut planner = Planner::new(catalog.clone() as Arc<dyn PlannerCatalog>);
+    planner
+        .plan(sql)
+        .unwrap()
+        .compile(&dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap()
+}
+
+/// Flatten a BIGINT column out of the result batches by name.
+fn i64_column(batches: &[RecordBatch], name: &str) -> Vec<i64> {
+    let idx = batches[0].schema().index_of(name).unwrap();
+    common::collect_i64s(batches, idx)
+}
+
+/// The result's column names, in order.
+fn column_names(batches: &[RecordBatch]) -> Vec<String> {
+    batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
+/// `metadata('t')` reports one row per row group with its stats, read from the
+/// footers (no data scan). `three_row_table` is one file of three single-row
+/// groups, two columns each.
+#[test]
+fn metadata_function_reports_row_group_stats() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let results = run_sql(&catalog, "SELECT * FROM metadata('t')");
+
+    assert_eq!(i64_column(&results, "file_index"), vec![0, 0, 0]);
+    assert_eq!(i64_column(&results, "row_group_index"), vec![0, 1, 2]);
+    assert_eq!(i64_column(&results, "num_rows"), vec![1, 1, 1]);
+    assert_eq!(i64_column(&results, "num_columns"), vec![2, 2, 2]);
+    assert!(
+        i64_column(&results, "compressed_bytes")
+            .iter()
+            .all(|&b| b > 0)
+    );
+}
+
+/// A projected/reordered SELECT over metadata() returns the named columns, not
+/// the first N columns of the full schema (DuckDB prunes/reorders the scan's
+/// output and references it positionally, so the generated batch is projected).
+#[test]
+fn metadata_function_honors_column_projection() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let single = run_sql(&catalog, "SELECT num_rows FROM metadata('t')");
+    let reordered = run_sql(
+        &catalog,
+        "SELECT num_columns, file_index FROM metadata('t')",
+    );
+
+    assert_eq!(single[0].num_columns(), 1);
+    assert_eq!(i64_column(&single, "num_rows"), vec![1, 1, 1]);
+    // Assert width and order, not just by-name lookups, so a projection that
+    // emitted all five columns or the wrong order would fail here.
+    assert_eq!(column_names(&reordered), vec!["num_columns", "file_index"]);
+    assert_eq!(i64_column(&reordered, "num_columns"), vec![2, 2, 2]);
+    assert_eq!(i64_column(&reordered, "file_index"), vec![0, 0, 0]);
+}
+
+/// `metadata()` over a table with no committed files is an empty result that
+/// still carries the full schema (an empty batch, not no batch).
+#[test]
+fn metadata_function_on_empty_table() {
+    let (_dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(
+        &catalog,
+        create_request("t", Path::new("/no/such/dir"), columns),
+    )
+    .unwrap();
+
+    let results = run_sql(&catalog, "SELECT * FROM metadata('t')");
+
+    assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    assert_eq!(results[0].num_columns(), 5);
+}
+
+/// Each file gets its own `file_index`, so the metadata composes with normal SQL
+/// to count files and total rows across an appended file.
+#[test]
+fn metadata_function_numbers_files_distinctly() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
+    append(&catalog, "t", &new_file);
+
+    let results = run_sql(&catalog, "SELECT * FROM metadata('t')");
+
+    assert_eq!(i64_column(&results, "file_index"), vec![0, 0, 0, 1]);
+    // row_group_index is per-file, so it resets to 0 for the appended file's
+    // single row group rather than continuing the global count.
+    assert_eq!(i64_column(&results, "row_group_index"), vec![0, 1, 2, 0]);
+    assert_eq!(i64_column(&results, "num_rows").iter().sum::<i64>(), 5);
 }
 
 /// A file appended after `CREATE TABLE` becomes visible to new binds, with

@@ -1594,6 +1594,163 @@ fn group_by_numeric_min_max_mixed_distinct(mut testing_planner: TestingPlanner) 
 }
 
 #[rstest]
+fn generate_series_emits_inclusive_range(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT * FROM generate_series(1, 5)")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["generate_series"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"generate_series": 1},
+            {"generate_series": 2},
+            {"generate_series": 3},
+            {"generate_series": 4},
+            {"generate_series": 5},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn range_excludes_upper_bound_and_honors_step(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT * FROM range(0, 10, 2)")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["range"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"range": 0},
+            {"range": 2},
+            {"range": 4},
+            {"range": 6},
+            {"range": 8},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn generate_series_streams_across_chunk_boundaries(mut testing_planner: TestingPlanner) {
+    // 20000 rows span several SERIES_CHUNK_ROWS (8192) batches, so this exercises
+    // the multi-poll streaming path, not a single in-memory batch.
+    let results = testing_planner
+        .planner
+        .plan("SELECT count(*), min(generate_series), max(generate_series) FROM generate_series(1, 20000)")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(
+        rows,
+        vec![serde_json::json!({"count": 20000, "min": 1, "max": 20000})]
+    );
+}
+
+#[rstest]
+fn count_star_over_generate_series(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT count(*) FROM generate_series(1, 5)")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows, vec![serde_json::json!({"count": 5})]);
+}
+
+#[rstest]
+fn range_with_single_argument_starts_at_zero(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT * FROM range(5)")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["range"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"range": 0},
+            {"range": 1},
+            {"range": 2},
+            {"range": 3},
+            {"range": 4},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn count_star_over_empty_series(mut testing_planner: TestingPlanner) {
+    // start > stop with a positive step yields no rows; count(*) must still be 0.
+    let results = testing_planner
+        .planner
+        .plan("SELECT count(*) FROM generate_series(5, 1)")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows, vec![serde_json::json!({"count": 0})]);
+}
+
+#[rstest]
+fn generate_series_composes_with_aggregate(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT count(*), sum(generate_series) FROM generate_series(1, 4)")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows, vec![serde_json::json!({"count": 4, "sum": 10})]);
+}
+
+#[rstest]
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
     // `stddev` has no pivot lowering (unlike SUM/COUNT/MIN/MAX/AVG), so it must
     // surface as a plan-conversion error rather than silently mis-aggregating.

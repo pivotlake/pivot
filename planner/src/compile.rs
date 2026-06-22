@@ -89,6 +89,10 @@ pub enum Error {
     CreateTable(#[source] crate::catalog::Error),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
+    #[error("Unsupported table function: {0}")]
+    UnsupportedTableFunction(String),
+    #[error("Invalid argument to table function {function}: {message}")]
+    InvalidTableFunctionArgument { function: String, message: String },
 }
 
 impl Plan {
@@ -139,6 +143,7 @@ impl PlanNode {
 
         match &self.operator {
             crate::Operator::Input(o) => o.compile(dispatcher, ctx, slots),
+            crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, catalog.as_ref(), ctx),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),

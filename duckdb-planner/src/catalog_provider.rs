@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::duckdb_bridge::ffi::CatalogGetTableFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableResult;
 use crate::duckdb_bridge::ffi::DuckDBColumn;
 use crate::expression::TableFilter;
@@ -52,10 +53,28 @@ pub struct OptionalTableWrapper {
     pub table: Option<Box<dyn DuckDBTable>>,
 }
 
+/// A table-valued function the catalog provides, described for DuckDB's binder:
+/// its argument types and full output columns, both as DuckDB logical type id
+/// discriminants. This is all the bridge needs to register and type-check the
+/// function, so the schema is defined once (in the provider) rather than also in
+/// the C++ bridge.
+pub struct TableFunctionDef {
+    pub arg_type_ids: Vec<u8>,
+    pub columns: Vec<DuckDBColumn>,
+}
+
 pub trait DuckDBBind {
     /// Given a table name, return a table/object that implements [`DuckDBTable`] with column definitions.
     /// Returns `None` if the table doesn't exist.
     fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>>;
+
+    /// Given a function name, return its binding signature, or `None` if the
+    /// provider has no such table function. The bridge registers it on demand
+    /// during binding; functions the provider doesn't know (e.g. DuckDB built-ins
+    /// like `generate_series`) return `None` and resolve elsewhere. Default: none.
+    fn table_function(&self, _name: &str) -> Option<TableFunctionDef> {
+        None
+    }
 }
 
 /// Wraps an `Arc<dyn DuckDBBind>` for the C++ bridge.
@@ -90,6 +109,24 @@ pub(crate) fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetT
             found: false,
             columns: Vec::new(),
             table: Box::new(OptionalTableWrapper { table: None }),
+        },
+    }
+}
+
+pub(crate) fn catalog_get_table_function(
+    ctx: &CatalogContext,
+    name: &str,
+) -> CatalogGetTableFunctionResult {
+    match ctx.provider.table_function(name) {
+        Some(def) => CatalogGetTableFunctionResult {
+            found: true,
+            arg_type_ids: def.arg_type_ids,
+            columns: def.columns,
+        },
+        None => CatalogGetTableFunctionResult {
+            found: false,
+            arg_type_ids: Vec::new(),
+            columns: Vec::new(),
         },
     }
 }
