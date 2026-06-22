@@ -12,6 +12,7 @@
 use crate::catalog::Catalog;
 use crate::expression::Expression;
 use crate::operator::{self, Operator, OrderByDirection, SetVariable};
+use dispatch::GroupLimit;
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -148,13 +149,72 @@ impl PlanNode {
                             )) if x.column.return_type == crate::types::Type::Utf8
                         );
                         if !string_extreme {
-                            a.top_k = Some((slot, limit));
+                            a.output_limit = Some(GroupLimit::TopK { slot, limit });
                         }
                     }
                     return;
                 }
                 Step::Stop => return,
             }
+        }
+    }
+
+    /// Detect `grouped Aggregate → (pass-through projections) → Limit k` (a plain
+    /// `LIMIT` with no ORDER BY) and annotate the aggregate with
+    /// [`GroupLimit::First`], so each partition emits at most `k + offset` groups
+    /// instead of every group. With no ordering, SQL leaves which rows the LIMIT
+    /// keeps undefined, so any `k + offset` groups per partition are a valid
+    /// candidate set — the surviving `Limit` trims to the final window.
+    ///
+    /// Mirrors [`annotate_group_topn`](Self::annotate_group_topn) but without a
+    /// sort key: it doesn't need to trace an order column, only to confirm the
+    /// chain `Limit → projections → grouped Aggregate`.
+    pub(crate) fn annotate_group_limit(&mut self) {
+        for child in &mut self.inputs {
+            child.annotate_group_limit();
+        }
+
+        // Keep `limit + offset` per partition: a downstream `OFFSET m` discards
+        // the first `m`, so pruning to only `k` would leave nothing past it.
+        let window = match &self.operator {
+            Operator::Limit(l) => match l.limit {
+                Some(limit) => limit + l.offset,
+                // An offset-only `LIMIT ALL` keeps every group; nothing to prune.
+                None => return,
+            },
+            _ => return,
+        };
+
+        // Walk down single-input pass-through projections until the aggregate.
+        let mut node = match self.inputs.first_mut() {
+            Some(n) => n,
+            None => return,
+        };
+        loop {
+            let is_passthrough_projection = match &node.operator {
+                Operator::Projection(p) => p
+                    .projections
+                    .iter()
+                    .all(|e| matches!(e, Expression::Ref(_))),
+                _ => false,
+            };
+            if is_passthrough_projection {
+                node = match node.inputs.first_mut() {
+                    Some(n) => n,
+                    None => return,
+                };
+                continue;
+            }
+            if let Operator::Aggregate(a) = &mut node.operator {
+                // A `COUNT(DISTINCT)` aggregate lowers to a two-level group-by
+                // whose output isn't this operator's table, so the pushdown
+                // wouldn't be a simple per-partition cap. Leave those alone; the
+                // common multi-aggregate / count grouped path takes the cap.
+                if !a.groups.is_empty() && a.output_limit.is_none() {
+                    a.output_limit = Some(GroupLimit::First { limit: window });
+                }
+            }
+            return;
         }
     }
 }

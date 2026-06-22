@@ -367,6 +367,133 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
     );
 }
 
+// A bare `LIMIT` (no ORDER BY) keeps `limit` arbitrary rows.
+#[rstest]
+fn plain_limit_keeps_limit_rows(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table LIMIT 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 2);
+}
+
+// A `LIMIT` larger than the input returns every row.
+#[rstest]
+fn plain_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table LIMIT 100")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 5);
+}
+
+// `LIMIT … OFFSET …` with no ORDER BY: DuckDB late-materializes this (the narrow
+// scan reads no columns), exercising the metadata-only scan + the row-id ORDER BY
+// strip. example_table's `a` is 1..5 in row order; skipping 2 and taking 2 yields
+// rows 3 and 4 (scan order, which a no-ORDER-BY query may return).
+#[rstest]
+fn plain_limit_with_offset(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT a FROM example_table LIMIT 2 OFFSET 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut got: Vec<i64> = batches_to_json(&results)
+        .iter()
+        .map(|r| r["a"].as_i64().unwrap())
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![3, 4]);
+}
+
+// A grouped aggregate under a plain `LIMIT` (no ORDER BY): the limit pushdown
+// caps each partition, but the surviving `Limit` still bounds the total. 4
+// distinct groups, `LIMIT 2` -> exactly 2 rows.
+#[rstest]
+fn group_by_plain_limit(mut testing_planner: TestingPlanner) {
+    add_events_table(&testing_planner);
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, COUNT(*) FROM events GROUP BY g LIMIT 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 2);
+}
+
+// A two-key (int + string) GROUP BY ordered by `COUNT(*)` DESC with the group
+// keys as tiebreakers, then LIMIT. The count-DESC primary key pushes a top-k
+// into the grouped aggregate; the surviving TopN re-sorts under the full
+// multi-key order.
+#[rstest]
+fn grouped_multikey_order_by_count_desc_limit(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "events",
+        &[
+            ("UserID", Type::Int32, int_col(vec![1, 1, 1, 2, 2, 3])),
+            (
+                "SearchPhrase",
+                Type::Utf8,
+                str_col(vec!["a", "a", "b", "a", "a", "c"]),
+            ),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan(
+            "SELECT UserID, SearchPhrase, COUNT(*) AS c FROM events \
+             GROUP BY UserID, SearchPhrase ORDER BY c DESC, UserID, SearchPhrase LIMIT 10",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    let got: Vec<(i64, String, i64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["k0"].as_i64().unwrap(),
+                r["k1"].as_str().unwrap().to_string(),
+                r["v0"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, "a".to_string(), 2),
+            (2, "a".to_string(), 2),
+            (1, "b".to_string(), 1),
+            (3, "c".to_string(), 1),
+        ]
+    );
+}
+
 // `SELECT *` over a filtered Top-N is exactly the late-materialization shape:
 // DuckDB scans only `a`/`name` for the predicate+sort, then materializes the
 // full row for the survivors. Exercises multi-column materialize + reordering
@@ -1234,3 +1361,5 @@ fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
         .plan("SELECT STDDEV(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }
+
+

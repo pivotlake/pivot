@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crate::parquet::RowGroupFilter;
+use crate::parquet::reading::empty_projection_scan::empty_projection_scan;
 use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
@@ -114,6 +115,15 @@ pub fn table_input_with_filter_and_eq_predicates(
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
+    // A projection with no data columns can't go through the column-driven page
+    // pipeline (it would fetch nothing and emit no rows), so route it to a source
+    // that emits each row group's rows straight from `num_rows` (no IO, no
+    // decode), appending row-group/row-index metadata only when requested. Covers
+    // a late-materialized plain `LIMIT` (metadata, for the downstream
+    // `Materialize`) and any other zero-column scan (a row count).
+    if projection.indices().is_empty() {
+        return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
+    }
     let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
     let siblings = Arc::new(AtomicUsize::new(n));
     // One fetcher handles disk and HTTP row groups, bounding each medium's

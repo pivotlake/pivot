@@ -23,7 +23,7 @@
 use crate::operations::channels::Sender;
 use crate::operations::unary::{self, Unary, UnaryFactory};
 use arrow::array::{Array, ArrayData};
-use arrow_array::{RecordBatch, make_array};
+use arrow_array::{RecordBatch, RecordBatchOptions, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 
 /// Stateless factory — one trivial instance per worker.
@@ -52,7 +52,11 @@ impl Unary<RecordBatch, RecordBatch> for CopyOut {
             .map(|c| Ok(make_array(copy_to_malloc(&c.to_data())?)))
             .collect::<unary::Result<Vec<_>>>()?;
 
-        sender.send(RecordBatch::try_new(schema, columns)?)?;
+        // Carry the row count explicitly: a batch with no columns (e.g. a
+        // metadata-only / row-count scan) has no column lengths to infer it from,
+        // and `RecordBatch::try_new` would reject it.
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        sender.send(RecordBatch::try_new_with_options(schema, columns, &options)?)?;
         Ok(())
     }
 }
@@ -103,6 +107,26 @@ mod tests {
 
     fn schema(fields: Vec<Field>) -> Arc<Schema> {
         Arc::new(Schema::new(fields))
+    }
+
+    // A batch with no columns carries its row count only in metadata, not in
+    // column lengths. CopyOut must preserve it — round-tripping through plain
+    // `RecordBatch::try_new` would drop the count and fail to rebuild the batch
+    // (e.g. a metadata-only / row-count scan feeding `collect`).
+    #[test]
+    fn zero_column_batch_preserves_row_count() {
+        let input = RecordBatch::try_new_with_options(
+            schema(vec![]),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(7)),
+        )
+        .unwrap();
+
+        let out = run_unary(CopyOut, vec![input]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_columns(), 0);
+        assert_eq!(out[0].num_rows(), 7);
     }
 
     #[test]
