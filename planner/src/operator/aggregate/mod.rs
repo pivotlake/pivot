@@ -22,7 +22,8 @@ mod mixed_distinct;
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
 use crate::types::Type;
-use dispatch::{AggregationKind, AggregationSlot, RecordBatchOperatorSpec};
+use arrow_schema::DataType;
+use dispatch::{AggregationKind, AggregationSlot, RecordBatchOperatorSpec, RowKeySchema};
 use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 
@@ -86,7 +87,7 @@ impl Aggregate {
         }
 
         // A grouped aggregate mixing one `COUNT(DISTINCT)` with non-distinct
-        // aggregates (e.g. ClickBench Q9) is also a two-level GROUP BY.
+        // aggregates is also a two-level GROUP BY.
         let n_distinct = self
             .expressions
             .iter()
@@ -173,6 +174,42 @@ fn extreme_kind(
         Type::Int16 | Type::Int32 | Type::Int64 => Some(numeric),
         _ => None,
     }
+}
+
+/// Map group-key types to the arrow types the [`RowKeyExtractor`](dispatch::RowKeyExtractor)
+/// encodes, in key order. Shared by the general grouped path
+/// ([`grouped`](self::grouped)) and the `COUNT(DISTINCT)` two-level lowering
+/// ([`count_distinct`](self::count_distinct)). Returns `None` if any key has a
+/// type the row encoding doesn't support, so the caller reports it unsupported
+/// rather than panicking in `RowKeySchema::new`.
+pub(super) fn row_key_schema<'a>(
+    types: impl IntoIterator<Item = &'a Type>,
+) -> Option<RowKeySchema> {
+    let arrow = types
+        .into_iter()
+        .map(row_key_arrow_type)
+        .collect::<Option<Vec<_>>>()?;
+    Some(RowKeySchema::new(arrow))
+}
+
+/// The arrow type the row encoder uses for one group-key column, or `None` for a
+/// type it can't encode.
+fn row_key_arrow_type(t: &Type) -> Option<DataType> {
+    Some(match t {
+        Type::Int8 => DataType::Int8,
+        Type::Int16 => DataType::Int16,
+        Type::Int32 => DataType::Int32,
+        Type::Int64 => DataType::Int64,
+        Type::Utf8 => DataType::Utf8View,
+        // DATE is days-since-epoch (arrives as Date32 or the parquet-physical
+        // integer); TIMESTAMP is Int64 epoch seconds. The row reader casts each
+        // key column to the schema type, so encoding them as their integer
+        // day/second count is lossless and groups identically. This is what lets
+        // a wide key tuple like `(Int64, Date)` group instead of erroring.
+        Type::Date => DataType::Int32,
+        Type::Timestamp => DataType::Int64,
+        _ => return None,
+    })
 }
 
 /// The accumulator-width rule shared by the global and grouped paths: `i128`

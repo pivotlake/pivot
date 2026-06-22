@@ -13,7 +13,10 @@ use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{Contains, IntKeyExtractor, OrderBy, StringKeyExtractor, values_input};
+use dispatch::{
+    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, IntKeyExtractor, OrderBy,
+    StringKeyExtractor, values_input,
+};
 
 #[test]
 fn count() {
@@ -183,7 +186,11 @@ fn group_by_count_string_keys() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .group_by_count::<StringKeyExtractor>(0)
+        .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
+            vec![0],
+            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            None,
+        )
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()
         .unwrap();
@@ -203,7 +210,11 @@ fn group_by_count_int_keys() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .group_by_count::<IntKeyExtractor<Int64Type>>(0)
+        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
+            vec![0],
+            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            None,
+        )
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()
         .unwrap();

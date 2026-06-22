@@ -79,7 +79,7 @@ use criterion::{BatchSize, Criterion, Throughput, black_box};
 
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
-    Dynamic, IntKeyExtractor, IntPairKeyExtractor, OrderBy, RecordBatchOperatorSpec,
+    Distinct, Dynamic, IntKeyExtractor, IntPairKeyExtractor, OrderBy, RecordBatchOperatorSpec,
     StringKeyExtractor, SumSlot, memory_ctx, values_input,
 };
 
@@ -418,8 +418,12 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         // queries. Without it, every group flows to the output and the CopyOut
         // (ring→heap) copy dominates the profile instead of the group-by.
         |s| {
-            s.group_by_count::<IntKeyExtractor<Int64Type>>(0)
-                .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
+            s.group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
+                vec![0],
+                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                None,
+            )
+            .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
     );
 
@@ -439,7 +443,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| move |b: &RecordBatch| i16_nonzero_mask(b, 0))
-                .group_by_count::<IntKeyExtractor<Int16Type>>(0)
+                .group_by_aggregate::<IntKeyExtractor<Int16Type>, Compiled<(CountSlot,)>>(
+                    vec![0],
+                    vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                    None,
+                )
         },
     );
 
@@ -463,8 +471,12 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         // queries. Without it, every group flows to the output and the CopyOut
         // (ring→heap) copy dominates the profile instead of the group-by.
         |s| {
-            s.group_by_count::<IntKeyExtractor<Int64Type>>(0)
-                .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
+            s.group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
+                vec![0],
+                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                None,
+            )
+            .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
     );
 
@@ -490,8 +502,12 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.group_by_count::<StringKeyExtractor>(0)
-                .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
+            s.group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
+                vec![0],
+                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                None,
+            )
+            .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
     );
 
@@ -513,7 +529,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
-                .group_by_count::<StringKeyExtractor>(0)
+                .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
+                    vec![0],
+                    vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                    None,
+                )
                 .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
     );
@@ -551,7 +571,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     (0..a.len()).map(|i| Some(a.value(i) == 62)).collect()
                 }
             })
-            .group_by_count::<StringKeyExtractor>(1)
+            .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
+                vec![1],
+                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                None,
+            )
             .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
     );
@@ -696,9 +720,17 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.group_by_distinct::<IntPairKeyExtractor<Int32Type, Int64Type>>(vec![0, 1])
-                .group_by_count::<IntKeyExtractor<Int32Type>>(0)
-                .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
+            s.group_by_aggregate::<IntPairKeyExtractor<Int32Type, Int64Type>, Distinct>(
+                vec![0, 1],
+                Vec::new(),
+                None,
+            )
+            .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,)>>(
+                vec![0],
+                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                None,
+            )
+            .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
     );
 }
