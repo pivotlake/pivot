@@ -1,9 +1,10 @@
 use crate::env::get_env_var_with_default;
-use crate::memory::file_cache::FileCache;
+use crate::memory::file_cache::{FileCache, SUB_BLOCKS_PER_BUFFER};
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
 use crate::worker::{NUM_WORKERS, WORKER_IDX};
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 
 static PANIC_ON_EVICT: LazyLock<bool> =
@@ -65,11 +66,13 @@ impl MemoryContextFactory {
     }
 
     pub fn create_memory_ctx(self) -> MemoryContext {
+        let fill = RefCell::new(FillBuffer::new(self.ring.clone()));
         MemoryContext {
             ring: self.ring,
             file_cache: self.file_cache,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
+            fill,
         }
     }
 }
@@ -79,6 +82,53 @@ pub struct MemoryContext {
     file_cache: Arc<FileCache>,
     dirty_pool: FreePool,
     zeroed_pool: FreePool,
+    /// This worker's private fill buffer for packing small cached reads. Holds
+    /// its own [`Ring`] handle so releasing the pin never depends on the
+    /// thread-local context pointer (sound during teardown / test re-init).
+    fill: RefCell<FillBuffer>,
+}
+
+/// Placement of a freshly reserved run inside a worker's fill buffer.
+pub(crate) struct FillRun {
+    pub buffer_index: usize,
+    pub buffer_first_sub_block: usize,
+    pub generation: u64,
+}
+
+/// A worker's private fill buffer: a single ring buffer it bump-packs cached runs
+/// into. While a buffer is current it holds one reader pin (so the CLOCK hand
+/// cannot reclaim it mid-fill); retiring it just drops that pin, turning it into
+/// an ordinary evictable cache buffer.
+struct FillBuffer {
+    ring: Arc<Ring>,
+    buffer_index: Option<usize>,
+    next_sub_block: usize,
+}
+
+impl FillBuffer {
+    fn new(ring: Arc<Ring>) -> Self {
+        FillBuffer {
+            ring,
+            buffer_index: None,
+            next_sub_block: 0,
+        }
+    }
+
+    /// Retire the current buffer by dropping this worker's reader pin, leaving it
+    /// as an evictable cache buffer.
+    fn retire(&mut self) {
+        if let Some(buffer_index) = self.buffer_index.take() {
+            self.ring.slots[buffer_index]
+                .used
+                .fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for FillBuffer {
+    fn drop(&mut self) {
+        self.retire();
+    }
 }
 
 impl MemoryContext {
@@ -183,6 +233,47 @@ impl MemoryContext {
             }
             // Nothing free! Let's evict from page cache
             return self.file_cache.evict();
+        }
+    }
+
+    /// Reserve a contiguous run of `sub_block_count` sub-blocks in this worker's
+    /// fill buffer for a cache miss, acquiring a fresh buffer (possibly evicting)
+    /// when the current one lacks room. A run never exceeds one buffer, since
+    /// callers split reads at 2 MB region boundaries.
+    ///
+    /// The caller records the returned placement in the cache index and reads its
+    /// bytes into the buffer. The fill buffer stays pinned by this worker until it
+    /// fills up, so the run cannot be evicted out from under an in-flight read
+    /// (which also takes its own pin).
+    pub(crate) fn acquire_fill_run(&self, sub_block_count: usize) -> FillRun {
+        debug_assert!(sub_block_count <= SUB_BLOCKS_PER_BUFFER);
+        let mut fill = self.fill.borrow_mut();
+
+        let has_room = fill.buffer_index.is_some()
+            && fill.next_sub_block + sub_block_count <= SUB_BLOCKS_PER_BUFFER;
+        if !has_room {
+            fill.retire();
+            let write_buffer = self.get_write_buffer(false);
+            let buffer_index = write_buffer.slot_idx;
+            self.file_cache.prepare_fill_buffer(buffer_index);
+            // Take the buffer from exclusive (WRITING) to one reader: this worker's
+            // pin. Forget the `WriteBuffer` so its `Drop` does not return the slot
+            // to the free pool — `FillBuffer::retire` releases it instead.
+            self.ring.set_slot_zeroed(buffer_index, false);
+            self.ring.set_slot_used(buffer_index, 1, Ordering::Release);
+            std::mem::forget(write_buffer);
+            fill.buffer_index = Some(buffer_index);
+            fill.next_sub_block = 0;
+        }
+
+        let buffer_index = fill.buffer_index.expect("just ensured a fill buffer");
+        let buffer_first_sub_block = fill.next_sub_block;
+        fill.next_sub_block += sub_block_count;
+        FillRun {
+            buffer_index,
+            buffer_first_sub_block,
+            // Read fresh: the pinned buffer's generation can be bumped by `clear`.
+            generation: self.file_cache.buffer_generation(buffer_index),
         }
     }
 }
