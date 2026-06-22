@@ -1,0 +1,29 @@
+name: Resume GCP runner
+description: >-
+  Resume the suspended self-hosted ci-runner-x86 VM (pivot-ci / me-west1-c)
+  so its gcp-builder runners come online. The box's own hourly suspend-if-unused
+  cron suspends it again once no ci/deploy run is active, so there is no matching
+  stop action.
+
+inputs:
+  credentials_json:
+    description: >-
+      JSON key for a GCP service account with instance-scoped
+      compute.instanceAdmin.v1 on ci-runner-x86 (resume permission).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ inputs.credentials_json }}
+    - uses: google-github-actions/setup-gcloud@v2
+      with:
+        project_id: pivot-ci
+    - name: Resume ci-runner-x86
+      shell: bash
+      run: |
+        gcloud compute instances resume ci-runner-x86 \
+          --project=pivot-ci --zone=me-west1-c
