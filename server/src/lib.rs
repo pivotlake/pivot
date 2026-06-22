@@ -36,7 +36,7 @@
 //! let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
 //! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
-//! let server = Server::new(bind, dispatch, catalog, vec![], 0);
+//! let server = Server::new(bind, dispatch, catalog, vec![], 0, 4);
 //! // Returns when ctrl_c fires, or earlier if a dispatch worker dies.
 //! server.serve(Box::pin(async {
 //!     let _ = tokio::signal::ctrl_c().await;
