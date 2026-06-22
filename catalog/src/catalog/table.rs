@@ -1,11 +1,11 @@
 //! The catalog's master record of one table: its definition plus its current
 //! content — the files at one manifest version.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
-use crate::manifest::{FIRST_VERSION, ManifestEntry, SortBounds, TableManifest};
+use crate::manifest::{FIRST_VERSION, ManifestEntry, PartitionEqFilter, SortBounds, TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use dispatch::DataFlowDispatcher;
@@ -135,6 +135,30 @@ impl CatalogTable {
         };
         self.manifest = manifest;
         self.sync_files_to_manifest()?;
+        Ok(true)
+    }
+
+    /// Reload to the latest version *without* fetching any footers: advance the
+    /// manifest and drop cached files no longer in it, but leave fetching the new
+    /// files' footers to [`parquet`](Self::parquet), which fetches only the
+    /// partitions a query actually scans. The read path uses this; a writer still
+    /// uses [`refresh`](Self::refresh) (it needs every file's row groups to pick
+    /// compaction candidates). Returns whether it
+    /// advanced.
+    pub fn reload_manifest_only(&mut self) -> crate::Result<bool> {
+        let Some(manifest) =
+            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
+        else {
+            return Ok(false);
+        };
+        self.manifest = manifest;
+        let kept: HashSet<&str> = self
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.file.path.as_str())
+            .collect();
+        self.files.retain(|f| kept.contains(f.file.path.as_str()));
         Ok(true)
     }
 
@@ -388,19 +412,47 @@ impl CatalogTable {
         Ok(())
     }
 
-    /// A flat scan view of the current files: every file's row groups
-    /// concatenated in manifest order, where a row group's global index is
-    /// simply its position. Derived on demand (cheap `Arc` clones) rather than
-    /// cached, so the view can never disagree with `files` — a [`TableBinding`]
-    /// reads this through the catalog every time it compiles, so a reused
-    /// (cached) plan always scans the latest committed files.
-    pub fn parquet(&self) -> Arc<ParquetTable> {
-        let row_groups = self
-            .files
+    /// A flat scan view of the files whose recorded partition tuple can still
+    /// match `filters` — every surviving file's row groups concatenated in
+    /// manifest order, where a row group's global index is simply its position.
+    /// Footers are fetched here, and only for the surviving files, so a query
+    /// touching one partition never pays the HTTP to read every other partition's
+    /// footer. Fetched footers are cached in `files`, so a second call in the same
+    /// query (the late materialize after the scan) re-fetches nothing. An empty
+    /// `filters`, or one naming no partition column, keeps every file.
+    ///
+    /// The row group's global index is its position in this returned flat list, so
+    /// a scan and its materialize must build it from the *same* `filters` (they
+    /// do: both go through the binding's predicates) to address the same groups.
+    pub fn parquet(&mut self, filters: &[PartitionEqFilter]) -> crate::Result<Arc<ParquetTable>> {
+        let matching: Vec<ManifestEntry> = self
+            .manifest
+            .entries
             .iter()
+            .filter(|e| e.maybe_matches_partition(&self.manifest.partition_by, filters))
+            .cloned()
+            .collect();
+
+        let to_fetch: Vec<DataFile> = matching
+            .iter()
+            .filter(|e| !self.files.iter().any(|f| f.file.path == e.file.path))
+            .map(|e| {
+                e.file
+                    .clone()
+                    .into_data_file(self.store.as_ref(), &self.location)
+            })
+            .collect::<store::Result<_>>()?;
+        let fetched = crate::parquet::load_table_files(&self.dispatcher, &to_fetch)?;
+        self.files.extend(fetched);
+
+        let by_path: HashMap<&ObjectPath, &TableFile> =
+            self.files.iter().map(|f| (&f.file.path, f)).collect();
+        let row_groups = matching
+            .iter()
+            .filter_map(|e| by_path.get(&e.file.path))
             .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
-        Arc::new(ParquetTable::new(row_groups))
+        Ok(Arc::new(ParquetTable::new(row_groups)))
     }
 
     /// The table's columns (schema), as the planner's [`Column`]s.

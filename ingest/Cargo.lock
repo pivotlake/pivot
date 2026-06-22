@@ -869,6 +869,7 @@ dependencies = [
  "ahash",
  "arrow-array 58.0.0",
  "arrow-buffer 58.0.0",
+ "arrow-json 58.0.0",
  "arrow-ord 58.0.0",
  "arrow-schema 58.0.0",
  "aws-credential-types",
