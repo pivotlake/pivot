@@ -25,7 +25,9 @@ use parquet::file::properties::WriterProperties;
 use catalog::parquet::table_input;
 use catalog::store::ObjectPath;
 use catalog::{FileRef, ParquetCatalog};
-use common::{DispatchGuard, collect_i64s, current_parquet, dispatch_with_buffers, strings_and_ints};
+use common::{
+    DispatchGuard, collect_i64s, current_parquet, dispatch_with_buffers, strings_and_ints,
+};
 use dispatch::Projection;
 use harness::Backend;
 use planner::catalog::{Catalog as PlannerCatalog, Column, CreateTableRequest};

@@ -89,8 +89,9 @@ impl<A: Numeric> Partial<A> {
         match self {
             Partial::Num(total) => num_column::<A>(kind, total),
             Partial::Str(total) => {
-                let arr: ArrayRef =
-                    Arc::new(StringViewArray::from_iter(std::iter::once(total.as_deref())));
+                let arr: ArrayRef = Arc::new(StringViewArray::from_iter(std::iter::once(
+                    total.as_deref(),
+                )));
                 (Field::new(column_name(kind), DataType::Utf8View, true), arr)
             }
         }
@@ -212,7 +213,13 @@ fn reduce_str_column(is_max: bool, arr: &dyn Array) -> Option<String> {
             }
             let v = unsafe { a.value_unchecked(i) };
             acc = Some(match acc {
-                Some(p) => if is_max { p.max(v) } else { p.min(v) },
+                Some(p) => {
+                    if is_max {
+                        p.max(v)
+                    } else {
+                        p.min(v)
+                    }
+                }
                 None => v,
             });
         }

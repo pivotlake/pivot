@@ -498,10 +498,10 @@ impl FileCache {
                 // so a concurrent `get` that just re-cached a region isn't dropped.
                 if now_empty {
                     let mut file_maps = self.file_maps.write().unwrap();
-                    if let Some(regions) = file_maps.get(&location) {
-                        if regions.read().unwrap().is_empty() {
-                            file_maps.remove(&location);
-                        }
+                    if let Some(regions) = file_maps.get(&location)
+                        && regions.read().unwrap().is_empty()
+                    {
+                        file_maps.remove(&location);
                     }
                 }
                 return write_buffer;
