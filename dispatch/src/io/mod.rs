@@ -315,18 +315,18 @@ pub struct HttpRequest {
 /// A read request that knows how many bytes it transfers, so stats can total
 /// the bytes read alongside the request count. Both transports read a
 /// [`MissingBlock`], so both report its byte length.
-pub trait ReadLen {
-    fn read_len(&self) -> u64;
+pub trait ReadyBytesLen {
+    fn ready_bytes_len(&self) -> u64;
 }
 
-impl ReadLen for FsRequest {
-    fn read_len(&self) -> u64 {
+impl ReadyBytesLen for FsRequest {
+    fn ready_bytes_len(&self) -> u64 {
         self.block.len() as u64
     }
 }
 
-impl ReadLen for HttpRequest {
-    fn read_len(&self) -> u64 {
+impl ReadyBytesLen for HttpRequest {
+    fn ready_bytes_len(&self) -> u64 {
         self.block.len() as u64
     }
 }
