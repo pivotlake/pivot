@@ -20,9 +20,9 @@ use std::sync::Arc;
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
 
 /// Disk-backed footer-read blocks outstanding per worker before admitting
-/// another file. One keeps disk reads serial, since io_uring gives a single read
-/// ample depth.
-const MAX_DISK_IN_FLIGHT: usize = 1;
+/// another file. Larger than a column-chunk read's depth: footers are small and
+/// scattered, so keeping many in flight hides per-file read latency.
+const MAX_DISK_IN_FLIGHT: usize = 32;
 /// Remote-backed footer-read blocks outstanding per worker before admitting
 /// another file. Larger, to hide the HTTP round trip each read costs.
 const MAX_HTTP_IN_FLIGHT: usize = 32;
