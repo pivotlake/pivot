@@ -67,6 +67,8 @@ pub struct Server {
     ingests: Vec<IngestConfig>,
     /// Target size for the bundled compacter (`0` = don't run one).
     compact_bytes: u64,
+    /// The compacter's count trigger for sub-target (low-traffic) partitions.
+    compact_min_files: usize,
 }
 
 impl Server {
@@ -82,6 +84,7 @@ impl Server {
         catalog: Arc<ParquetCatalog>,
         ingests: Vec<IngestConfig>,
         compact_bytes: u64,
+        compact_min_files: usize,
     ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
         // handler needs it to compile every plan, and the ingest sources need
@@ -101,6 +104,7 @@ impl Server {
             catalog,
             ingests,
             compact_bytes,
+            compact_min_files,
         }
     }
 
@@ -129,6 +133,7 @@ impl Server {
             self.dispatcher.clone(),
             self.catalog.clone(),
             self.compact_bytes,
+            self.compact_min_files,
         )?);
 
         loop {
@@ -225,7 +230,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let dispatch = Dispatch::spin_up(1, 32, None);
         let catalog = catalog(&dispatch);
-        let server = Server::new(bind(), dispatch, catalog, vec![], 0);
+        let server = Server::new(bind(), dispatch, catalog, vec![], 0, ingest::DEFAULT_MIN_FILES_TO_MERGE);
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;
