@@ -8,7 +8,10 @@ use arrow_array::{Array, BooleanArray, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 
 use common::*;
-use dispatch::{Contains, OrderBy, StringKeyExtractor, values_input};
+use dispatch::{
+    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, OrderBy, StringKeyExtractor,
+    values_input,
+};
 
 #[test]
 fn filter_then_project() {
@@ -102,7 +105,7 @@ fn filter_then_group_by_then_order_by() {
                 }))
             }
         })
-        .group_by_count::<StringKeyExtractor>(0)
+        .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(vec![0], vec![AggregationSlot::new(AggregationKind::CountStar, 0)], None)
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()
         .unwrap();

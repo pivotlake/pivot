@@ -542,6 +542,101 @@ fn group_by_count_distinct(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn group_by_count_distinct_string_key(mut testing_planner: TestingPlanner) {
+    // name: a,a,a,b,b   x: 1,1,2,5,5
+    // distinct x per name: a -> {1,2}=2, b -> {5}=1
+    testing_planner.add_table(
+        "nx",
+        &[
+            ("name", Type::Utf8, str_col(vec!["a", "a", "a", "b", "b"])),
+            ("x", Type::Int32, int_col(vec![1, 1, 2, 5, 5])),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, COUNT(DISTINCT x) FROM nx GROUP BY name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    // A single string key routes through the row encoder, whose key column is
+    // emitted as `k0` (not the single-int/string extractor's `key`).
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["k0"].as_str().unwrap().to_string());
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0]["k0"].as_str(), rows[0]["v0"].as_i64()), (Some("a"), Some(2)));
+    assert_eq!((rows[1]["k0"].as_str(), rows[1]["v0"].as_i64()), (Some("b"), Some(1)));
+}
+
+#[rstest]
+fn group_by_count_distinct_multi_column_key(mut testing_planner: TestingPlanner) {
+    // (g, name): (1,x),(1,x),(2,y)   uid: 10,20,30
+    // distinct uid per (g, name): (1,x) -> {10,20}=2, (2,y) -> {30}=1
+    testing_planner.add_table(
+        "gnx",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2])),
+            ("name", Type::Utf8, str_col(vec!["x", "x", "y"])),
+            ("uid", Type::Int32, int_col(vec![10, 20, 30])),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, name, COUNT(DISTINCT uid) FROM gnx GROUP BY g, name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_str().unwrap().to_string()));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0]["k0"].as_i64(), rows[0]["k1"].as_str(), rows[0]["v0"].as_i64()),
+        (Some(1), Some("x"), Some(2))
+    );
+    assert_eq!(
+        (rows[1]["k0"].as_i64(), rows[1]["k1"].as_str(), rows[1]["v0"].as_i64()),
+        (Some(2), Some("y"), Some(1))
+    );
+}
+
+#[rstest]
+fn group_by_count_distinct_computed_key(mut testing_planner: TestingPlanner) {
+    // GROUP BY a computed key (k * 2) forces the key to be materialised into a
+    // leading column before the two-level dedup.
+    // k: 1,1,2 -> k*2: 2,2,4 ; x: 10,20,30
+    // distinct x per key: 2 -> {10,20}=2, 4 -> {30}=1
+    testing_planner.add_table(
+        "cg",
+        &[
+            ("k", Type::Int32, int_col(vec![1, 1, 2])),
+            ("x", Type::Int32, int_col(vec![10, 20, 30])),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT k * 2 AS p, COUNT(DISTINCT x) FROM cg GROUP BY k * 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["v0"].as_i64().unwrap());
+    let counts: Vec<i64> = rows.iter().map(|r| r["v0"].as_i64().unwrap()).collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(counts, vec![1, 2]);
+}
+
+#[rstest]
 fn global_count_distinct_string(mut testing_planner: TestingPlanner) {
     // example_table.name = alice, bob, charlie, dave, alice -> 4 distinct.
     let results = testing_planner
