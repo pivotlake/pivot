@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       use_gcp_runner:
-        description: "Run the check matrix on the self-hosted GCP runner (ci-runner-x86) instead of GitHub-hosted runners."
+        description: "Run the check matrix on the self-hosted GCP runner (ci-runner-x86). On by default; uncheck to fall back to GitHub-hosted runners."
         type: boolean
-        default: false
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,18 +17,19 @@ env:
   RUSTDOCFLAGS: "-D warnings"
 
 # The self-hosted runners live on the suspended `ci-runner-x86` GCP VM
-# (pivot-ci / me-west1-c) and advertise the `gcp-builder` label. Opting in
-# (workflow_dispatch with use_gcp_runner=true) resumes the VM and routes the
-# matrix there; the box's own hourly suspend-if-unused cron suspends it again once
-# no ci/deploy run is active. Every other trigger (push, PR) stays on
-# GitHub-hosted `ubuntu-latest` and skips the GCP jobs entirely.
+# (pivot-ci / me-west1-c) and advertise the `gcp-builder` label. They are
+# the default: every push and PR resumes the VM and routes the matrix there, and
+# the box's own hourly suspend-if-unused cron suspends it again once no ci/deploy
+# run is active. A manual workflow_dispatch can opt out (use_gcp_runner=false) to
+# fall back to GitHub-hosted `ubuntu-latest` and skip the GCP jobs entirely.
 jobs:
   # Resume the GCP VM so its runners come online before the matrix dispatches.
   # Jobs targeting `gcp-builder` queue until a runner connects, so we only need
   # to kick the VM awake here — no SSH/readiness wait required.
   start-ci:
     name: Start GCP runner
-    if: ${{ inputs.use_gcp_runner }}
+    # Resume on every push/PR; on manual dispatch, only when not opted out.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.use_gcp_runner }}
     runs-on: ubuntu-latest
     steps:
       - name: Authenticate to Google Cloud
@@ -59,10 +60,12 @@ jobs:
         run: echo "cells=$(./ci.sh --matrix)" >> "$GITHUB_OUTPUT"
       - id: runner
         run: |
-          if [ "${{ inputs.use_gcp_runner }}" = "true" ]; then
-            echo "label=gcp-builder" >> "$GITHUB_OUTPUT"
-          else
+          # Default to the self-hosted box; only a dispatch opt-out routes back to
+          # GitHub-hosted runners.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.use_gcp_runner }}" != "true" ]; then
             echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=gcp-builder" >> "$GITHUB_OUTPUT"
           fi
 
   # One job per (check, crate) cell — each runs the same ./ci.sh used locally,

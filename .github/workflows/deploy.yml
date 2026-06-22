@@ -16,9 +16,9 @@ on:
         type: boolean
         default: true
       use_gcp_runner:
-        description: "Build the x86_64 binary on the self-hosted GCP runner (ci-runner-x86) instead of a GitHub-hosted runner. The aarch64 build always uses a hosted arm64 runner."
+        description: "Build the x86_64 binary on the self-hosted GCP runner (ci-runner-x86). On by default; uncheck to use a GitHub-hosted runner. The aarch64 build always uses a hosted arm64 runner."
         type: boolean
-        default: false
+        default: true
 
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
