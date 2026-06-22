@@ -44,7 +44,7 @@ struct Args {
     #[arg(long, default_value_t = 64.0, value_name = "GIB")]
     disk_cache_gb: f64,
 
-    /// Disk-cache max object count — bounds open file descriptors, one per cached
+    /// Disk-cache max object count - bounds open file descriptors, one per cached
     /// object (only with `--disk-cache-dir`). Keep below the process's fd limit.
     #[arg(long, default_value_t = 65536, value_name = "N")]
     disk_cache_max_objects: usize,

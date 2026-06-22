@@ -176,7 +176,7 @@ impl MissingBlock {
     }
 
     /// Carve out a sub-block covering `[rel_offset, rel_offset + len)` *within*
-    /// this block — both relative to this block's start and both
+    /// this block - both relative to this block's start and both
     /// `SUB_BLOCK_SIZE`-aligned. The sub-block shares the slot pin, reads into the
     /// matching slice of the same pinned slot, and [`commit`](Self::commit)s only
     /// its own sub-blocks.
