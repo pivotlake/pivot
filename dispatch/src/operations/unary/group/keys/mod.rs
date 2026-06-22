@@ -60,6 +60,24 @@ pub trait KeyExtractor: Send + 'static {
     /// `!SUPPORTS_RADIX` (the radix scatter path has no such out-of-band count).
     const DEDUP_BY_HASH: bool = false;
 
+    /// `true` if this key can drive the copy-and-patch consume loop: a single
+    /// fixed-width integer key (≤ 8 bytes) stored at offset 8 of the entry, so the
+    /// patched probe's 8-byte key compare is valid. Int-pair / string keys are
+    /// `false` (the pair needs a 16-byte compare skeleton; strings can't JIT).
+    const CAP_KEY: bool = false;
+
+    /// One row's key as a `u64`, zero-extended to match the entry's stored key
+    /// region (low `size_of::<Persisted>()` bytes, the rest zeroed). Only called
+    /// when [`CAP_KEY`](Self::CAP_KEY).
+    #[inline(always)]
+    fn cap_key_u64(_reader: &Self::Reader<'_>, _idx: usize) -> u64 {
+        0
+    }
+
+    /// `true` if the persisted key is a 16-byte int-pair (`u128`) — eligible for
+    /// the copy-and-patch partition merge (`merge_run`, 16-byte key compare).
+    const CAP_MERGE16: bool = false;
+
     /// Runtime configuration threaded from the operator spec to the per-batch
     /// reader and the output columns. Most extractors are fully determined by
     /// their type and use `()`; [`RowKeyExtractor`] carries its key schema here

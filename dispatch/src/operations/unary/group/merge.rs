@@ -32,10 +32,11 @@
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
-use crate::operations::unary::group::hashtables::PartitionBuffers;
+use crate::operations::unary::group::hashtables::{PartitionBuffers, RadixRow};
 use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage,
 };
+use crate::operations::unary::group::values::cap;
 
 /// Collision-to-entry ratio at which we double the target table.
 ///
@@ -232,13 +233,75 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
 
     // 1. Scatter buffers (present only when some worker switched). Each row is
     //    inserted once — the consume phase did no aggregation, so this is the only
-    //    aggregation pass for the scattered rows.
+    //    aggregation pass for the scattered rows. For an additive copy-and-patch
+    //    value with a 16-byte int-pair key, this is the whole probe+merge loop run
+    //    as native code (`merge_run`), per contiguous source chunk; otherwise it's
+    //    the per-element interpreted merge.
+    // Compiled once and cached (NOT per partition — that floods the kernel).
+    let cap_merge: Option<&'static cap::CompiledMergeRun> = if V::CAP && K::CAP_MERGE16 {
+        cap::cached_merge_run(V::cap_nslots())
+    } else {
+        None
+    };
     for wb in buffers {
-        wb.0[partition].for_each(|(hash, key, value)| {
-            grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
-            let live = K::resolve_persisted(key_arena, key);
-            target.merge::<false, _>(hash, live, value, cfg);
-        });
+        let part = &wb.0[partition];
+        match cap_merge {
+            Some(mr) => part.for_each_chunk(|chunk: &[RadixRow<K, V>]| {
+                let mut done = 0usize;
+                while done < chunk.len() {
+                    grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
+                    match target.jit_merge_view() {
+                        Some((
+                            tbuf,
+                            tstride,
+                            tvaloff,
+                            tkeyoff,
+                            mask,
+                            shift,
+                            pre_shift,
+                            max_load,
+                            tlen,
+                        )) => {
+                            let mut ctx = cap::MergeCtx {
+                                tbuf,
+                                tstride,
+                                tvaloff,
+                                tkeyoff,
+                                mask,
+                                shift,
+                                pre_shift,
+                                tlen,
+                                max_load,
+                                sbase: chunk.as_ptr() as *const u8,
+                                sstride: std::mem::size_of::<RadixRow<K, V>>() as u64,
+                                shashoff: std::mem::offset_of!(RadixRow<K, V>, 0) as u64,
+                                skeyoff: std::mem::offset_of!(RadixRow<K, V>, 1) as u64,
+                                svaloff: std::mem::offset_of!(RadixRow<K, V>, 2) as u64,
+                                n: chunk.len() as u64,
+                                start: done as u64,
+                            };
+                            // SAFETY: single-slab target (jit_merge_view), contiguous
+                            // source chunk; all offsets from `offset_of!`/`size_of`.
+                            done = unsafe { mr.run(&mut ctx) } as usize;
+                        }
+                        None => {
+                            // Multi-slab target → finish this chunk per-element.
+                            for r in &chunk[done..] {
+                                grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
+                                let live = K::resolve_persisted(key_arena, r.1);
+                                target.merge::<false, _>(r.0, live, r.2, cfg);
+                            }
+                            done = chunk.len();
+                        }
+                    }
+                }
+            }),
+            None => part.for_each(|(hash, key, value)| {
+                grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
+                let live = K::resolve_persisted(key_arena, key);
+                target.merge::<false, _>(hash, live, value, cfg);
+            }),
+        }
     }
 
     // 2. In-place stacks, slot-range merged at num_partitions. Grouped by size so

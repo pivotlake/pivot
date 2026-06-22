@@ -132,6 +132,19 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     /// here. There is at most one such key (the hash is a bijection), so this
     /// boolean adds 0 or 1 to the distinct count at output.
     zero_hash_seen: bool,
+    /// Copy-and-patch consume (`V::CAP` + `K::CAP_KEY` only): the probe+fold loop
+    /// compiled for this signature, built lazily on the first batch (column widths
+    /// aren't known until then). `None` = not yet tried; `Some(None)` = tried but
+    /// not JIT-able (falls back to the interpreted loop); `Some(Some)` = compiled.
+    cap_consume: Option<Option<crate::operations::unary::group::values::cap::CompiledConsume>>,
+    /// Per-row key scratch for the patched loop (one `u64` per row).
+    cap_keys: Box<[u64]>,
+    /// Copy-and-patch scatter value seed-batch (`V::CAP` only): materialises a
+    /// batch's per-row partial values into `cap_temp` in one native call, so the
+    /// radix scatter reads them instead of calling `value` per row.
+    cap_seed: Option<Option<crate::operations::unary::group::values::cap::CompiledSeed>>,
+    /// Temp `[i64]` the seed-batch writes (`RECORD_BATCH_SIZE * max_slots`).
+    cap_temp: Box<[i64]>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
@@ -159,6 +172,12 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 .unwrap(),
             scratch: K::Scratch::default(),
             zero_hash_seen: false,
+            cap_consume: None,
+            cap_keys: vec![0u64; if V::CAP { RECORD_BATCH_SIZE } else { 0 }].into_boxed_slice(),
+            cap_seed: None,
+            // Up to 6 cells per row (the max grouped-aggregate arity).
+            cap_temp: vec![0i64; if V::CAP { RECORD_BATCH_SIZE * 6 } else { 0 }]
+                .into_boxed_slice(),
         }
     }
 
@@ -229,8 +248,21 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 &mut self.hashes[..length],
             );
 
+            // Compile the scatter value seed-batch once (column widths known now).
+            if V::CAP && self.cap_seed.is_none() {
+                let ops = V::cap_fold_ops(value_slots, &value_reader);
+                self.cap_seed = Some(ops.and_then(|o| {
+                    crate::operations::unary::group::values::cap::compile_seed(&o)
+                }));
+            }
+
             if self.switched_to_radix {
-                self.scatter_range(0, length, &key_reader, &value_reader);
+                self.scatter_range(0, length, &key_reader, &value_reader, merge_config);
+            } else if V::CAP
+                && K::CAP_KEY
+                && self.consume_jit(length, &key_reader, &value_reader, value_slots, merge_config)
+            {
+                // The whole probe+fold loop ran as copy-and-patch native code.
             } else {
                 // The value type fixes the fold (Mono is branch-free, Dynamic
                 // dispatches per slot via `merge_config`); the probe just consumes.
@@ -238,6 +270,78 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             }
         }
         self.scratch = scratch;
+    }
+
+    /// Run the batch through the copy-and-patch consume loop (`V::CAP` + `K::CAP_KEY`).
+    /// The patched function owns the probe+fold: it inserts/folds rows into the
+    /// single-slab in-place table until the table fills, returning the row count
+    /// done; we then grow (or switch to radix) and re-enter for the rest — exactly
+    /// the adaptive strategy [`consume_scalared`](Self::consume_scalared) runs, but
+    /// with the hot loop as native code. Returns `false` (no work done) if the
+    /// signature can't be JIT-compiled, so the caller falls back to the interpreter.
+    fn consume_jit(
+        &mut self,
+        length: usize,
+        key_reader: &K::Reader<'_>,
+        value_reader: &V::Reader<'_>,
+        value_slots: &[AggregationSlot],
+        merge_config: &V::MergeConfig,
+    ) -> bool {
+        use crate::operations::unary::group::values::cap;
+
+        // Compile once for this query (column widths are known now).
+        if self.cap_consume.is_none() {
+            let ops = V::cap_fold_ops(value_slots, value_reader);
+            self.cap_consume = Some(ops.and_then(|o| cap::compile_consume(&o)));
+        }
+        // Borrow the compiled fn out of `self` as a raw pointer so the loop below
+        // can still take `&mut self` (it lives in `self.cap_consume`, never moved).
+        let compiled: *const cap::CompiledConsume = match self.cap_consume.as_ref().unwrap() {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let cols = V::cap_cols(value_reader);
+        for i in 0..length {
+            self.cap_keys[i] = K::cap_key_u64(key_reader, i);
+        }
+        let hashes = self.hashes.as_ptr();
+        let keys = self.cap_keys.as_ptr();
+
+        let mut done = 0usize;
+        while done < length {
+            let (buf, stride, valoff, mask, shift, _pre_shift, max_load, len) = self
+                .tables
+                .last_mut()
+                .unwrap()
+                .jit_view()
+                .expect("in-place consume table is single-slab");
+            let mut ctx = cap::ConsumeCtx {
+                buf,
+                stride,
+                valoff,
+                mask,
+                shift,
+                hashes,
+                keys,
+                cols,
+                n: length as u64,
+                len,
+                max_load,
+                start: done as u64,
+            };
+            // SAFETY: `compiled` is valid for this call (lives in `self.cap_consume`);
+            // all ctx pointers are valid for `length` rows / this single-slab table.
+            done = unsafe { (*compiled).run(&mut ctx) } as usize;
+            if done < length && self.grow_or_switch() {
+                // Switched to radix: scatter the remaining rows and we're done.
+                self.scatter_range(done, length, key_reader, value_reader, merge_config);
+                return true;
+            }
+            // Otherwise the table grew (a fresh single-slab table) — re-enter for
+            // the rest from `done`.
+        }
+        true
     }
 
     /// Row-by-row probe, switching tables (or to radix) when the active table
@@ -285,7 +389,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     hash,
                     key,
                     &mut self.value_arena,
-                    |arena, cell| *cell = V::value(value_reader, i, arena),
+                    |arena, cell| *cell = V::value_cfg(value_reader, i, arena, merge_config),
                     |arena, cell| {
                         *cell = cell.update_from_reader(value_reader, i, arena, merge_config)
                     },
@@ -293,7 +397,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
-                self.scatter_range(i + 1, length, key_reader, value_reader);
+                self.scatter_range(i + 1, length, key_reader, value_reader, merge_config);
                 return;
             }
             i += 1;
@@ -322,6 +426,11 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     }
 
     /// Scatter rows `[start, end)` into per-partition buffers (post-switch).
+    ///
+    /// For a copy-and-patch value (`V::CAP`) the per-row partial values are
+    /// materialised by one native seed-batch call into `cap_temp` (no per-row
+    /// `value` call — the dominant cost on a 100M-row scatter), then read back
+    /// into the buffers; otherwise each row's value is built individually.
     #[inline(always)]
     fn scatter_range(
         &mut self,
@@ -329,8 +438,35 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         end: usize,
         key_reader: &K::Reader<'_>,
         value_reader: &V::Reader<'_>,
+        merge_config: &V::MergeConfig,
     ) {
         let shift = u64::BITS - self.radix_cfg.partitions.trailing_zeros();
+        let n = end - start;
+
+        // Batch-materialise this range's values via the seed-batch, if compiled.
+        let seeded = if V::CAP && matches!(self.cap_seed, Some(Some(_))) {
+            let nslots = V::cap_nslots();
+            let cols = V::cap_cols(value_reader);
+            let seed: *const crate::operations::unary::group::values::cap::CompiledSeed =
+                self.cap_seed.as_ref().unwrap().as_ref().unwrap();
+            for x in &mut self.cap_temp[..n * nslots] {
+                *x = 0;
+            }
+            // SAFETY: `seed` lives in `self.cap_seed`; temp has `n*nslots` cells.
+            unsafe {
+                (*seed).run(
+                    self.cap_temp.as_mut_ptr(),
+                    cols,
+                    n as u64,
+                    (nslots * 8) as u64,
+                    start as u64,
+                );
+            }
+            nslots
+        } else {
+            0
+        };
+
         let Self {
             key_arena,
             value_arena,
@@ -338,6 +474,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             buffers,
             hll,
             hashes,
+            cap_temp,
             ..
         } = self;
         let buffers = buffers.as_mut().unwrap();
@@ -349,7 +486,12 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             // touches the key arena here; a string *extreme* value still persists
             // into the value arena.
             let key = K::live_key(key_reader, i, key_arena).persist();
-            let value = V::value(value_reader, i, value_arena);
+            let value = if seeded != 0 {
+                // SAFETY: `cap_temp[local*nslots..]` is the seeded `[i64; N]`.
+                unsafe { V::cap_from_cells(cap_temp.as_ptr().add((i - start) * seeded)) }
+            } else {
+                V::value_cfg(value_reader, i, value_arena, merge_config)
+            };
             buffers[p].push(allocator, (hash, key, value));
         }
     }

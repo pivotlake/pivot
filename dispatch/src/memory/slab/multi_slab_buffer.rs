@@ -45,6 +45,16 @@ impl<T> MultiSlabBuffer<T> {
         let offset_in_slab = (index % elems_per_slab) * size_of::<T>();
         unsafe { self.slabs[slab_idx].ptr.add(offset_in_slab) as *mut T }
     }
+
+    /// Base pointer iff the whole buffer is one contiguous slab — the precondition
+    /// for the copy-and-patch probe loop, which addresses `base + slot*stride`
+    /// linearly with no per-slot slab div/mod. `None` for a multi-slab buffer.
+    pub fn single_slab_base(&self) -> Option<*mut T> {
+        match self.slabs.as_slice() {
+            [only] => Some(only.ptr as *mut T),
+            _ => None,
+        }
+    }
 }
 
 impl<T> Index<usize> for MultiSlabBuffer<T> {

@@ -399,12 +399,16 @@ impl Aggregate {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
-        use dispatch::{AggregationKind, AggregationSlot, Dynamic, IntPairKeyExtractor};
+        use dispatch::{
+            AggregationKind, AggregationSlot, Dynamic, IntKeyExtractor, IntPairKeyExtractor, Patched,
+        };
 
         // The two-level COUNT(DISTINCT) aggregation is all additive (dedup counts
         // and re-summed partials), so both levels use the `ONLY_ADDITIVE` Dynamic:
         // the const prunes the per-slot Min/Max/string arms, collapsing the fold to
-        // the same branch-free additive codegen as the hand-written `Mono`.
+        // the same branch-free additive codegen as the hand-written `Mono`. (The
+        // per-element-call copy-and-patch `Patched` can't beat this inlined path —
+        // it would need a whole-loop, no-call merge to reach parity.)
         type AddVal<const N: usize> = Dynamic<N, i64, true>;
 
         if self.groups.len() != 1 {
@@ -488,28 +492,29 @@ impl Aggregate {
 
         // group_by_aggregate monomorphised over key type + slot arity.
         macro_rules! grouped {
-            ($spec:expr, $K:ty, $cols:expr, $slots:expr) => {{
+            ($spec:expr, $K:ty, $cols:expr, $slots:expr, $V:ident) => {{
                 let slots = $slots;
                 match slots.len() {
-                    1 => $spec.group_by_aggregate::<$K, AddVal<1>>($cols, slots, None),
-                    2 => $spec.group_by_aggregate::<$K, AddVal<2>>($cols, slots, None),
-                    3 => $spec.group_by_aggregate::<$K, AddVal<3>>($cols, slots, None),
-                    4 => $spec.group_by_aggregate::<$K, AddVal<4>>($cols, slots, None),
-                    5 => $spec.group_by_aggregate::<$K, AddVal<5>>($cols, slots, None),
-                    6 => $spec.group_by_aggregate::<$K, AddVal<6>>($cols, slots, None),
+                    1 => $spec.group_by_aggregate::<$K, $V<1>>($cols, slots, None),
+                    2 => $spec.group_by_aggregate::<$K, $V<2>>($cols, slots, None),
+                    3 => $spec.group_by_aggregate::<$K, $V<3>>($cols, slots, None),
+                    4 => $spec.group_by_aggregate::<$K, $V<4>>($cols, slots, None),
+                    5 => $spec.group_by_aggregate::<$K, $V<5>>($cols, slots, None),
+                    6 => $spec.group_by_aggregate::<$K, $V<6>>($cols, slots, None),
                     n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             }};
         }
         macro_rules! build {
             ($G:ty, $X:ty) => {{
-                let inner = grouped!(
-                    input,
-                    IntPairKeyExtractor<$G, $X>,
-                    vec![g_col, x_col],
-                    inner_slots
-                );
-                Ok(grouped!(inner, IntKeyExtractor<$G>, vec![0], outer_slots))
+                // Inner is high-cardinality additive (scatter+merge-bound) — the
+                // branch-free `ONLY_ADDITIVE` Dynamic is already optimal there. The
+                // outer re-aggregates the inner's ~millions of distinct-pair rows
+                // into a low-card table (consume-bound, single int key) → route it
+                // to the copy-and-patch `Patched` so its probe loop runs as native
+                // code (the JIT genuinely owns q09's hot consume loop).
+                let inner = grouped!(input, IntPairKeyExtractor<$G, $X>, vec![g_col, x_col], inner_slots, AddVal);
+                Ok(grouped!(inner, IntKeyExtractor<$G>, vec![0], outer_slots, Patched))
             }};
         }
         macro_rules! by_x {
@@ -544,7 +549,7 @@ impl Aggregate {
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
             AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, IntPairKeyExtractor,
-            RowKeyExtractor, StrMaxSlot, StrMinSlot, SumSlot,
+            Patched, RowKeyExtractor, StrMaxSlot, StrMinSlot, SumSlot,
         };
 
         // The value type is fixed at plan time. A homogeneous *string* MIN/MAX
@@ -632,6 +637,27 @@ impl Aggregate {
         // `StringCell` conversion fails out on a narrow cell, so the width choice
         // below must widen whenever one is present.
         let has_string_extreme = slots.iter().any(|s| s.kind.is_string_extreme());
+
+        // All-additive (only COUNT/SUM): a zeroed-on-insert cell makes `+=` serve
+        // seed, update and merge alike, so a copy-and-patch `Patched` value folds
+        // the whole signature with branch-free tiles — one runtime mechanism that
+        // replaces the q32 `Compiled` special-case and the `ONLY_ADDITIVE` flag.
+        let all_additive = slots.iter().all(|s| {
+            matches!(
+                s.kind,
+                AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
+            )
+        });
+
+        // CEILING PROBE (q22): `MIN(str), COUNT` is today a per-slot `Dynamic<2,i128>`
+        // dispatch; route it to a branch-free `Compiled<(StrMinSlot, CountSlot)>` to
+        // measure what fully-compiled group values buy over the interpreted fold.
+        let str_min_count = matches!(
+            slots.as_slice(),
+            [a, b]
+                if a.kind == AggregationKind::StrMin
+                    && matches!(b.kind, AggregationKind::CountStar | AggregationKind::Count)
+        );
 
         // Cell width, by the same column-type rule as the global path:
         // i128 only when a SUM reads a 64-bit column, else i64 (narrow entries).
@@ -727,26 +753,38 @@ impl Aggregate {
             };
         }
 
+        // Copy-and-patch additive value, dispatched by arity (cells are `i64`).
+        macro_rules! patched_arity {
+            ($Key:ty) => {
+                match slots.len() {
+                    1 => Ok(input.group_by_aggregate::<$Key, Patched<1>>(key_cols, slots, top_k)),
+                    2 => Ok(input.group_by_aggregate::<$Key, Patched<2>>(key_cols, slots, top_k)),
+                    3 => Ok(input.group_by_aggregate::<$Key, Patched<3>>(key_cols, slots, top_k)),
+                    4 => Ok(input.group_by_aggregate::<$Key, Patched<4>>(key_cols, slots, top_k)),
+                    5 => Ok(input.group_by_aggregate::<$Key, Patched<5>>(key_cols, slots, top_k)),
+                    6 => Ok(input.group_by_aggregate::<$Key, Patched<6>>(key_cols, slots, top_k)),
+                    n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                }
+            };
+        }
+
         // Monomorphise over the two key types, the slot arity (N), and the
-        // accumulator width ($acc). Two numeric signatures are specialised to a
-        // branch-free `Compiled`: q32's `count/sum16/sum16/count`, and a lone
-        // `COUNT`; every other numeric signature is `Dynamic`.
+        // accumulator width ($acc). The inlined specialisations come first — q32's
+        // `count/sum16/sum16/count` and a lone `COUNT` as branch-free `Compiled`
+        // (the per-element-call copy-and-patch can't beat these). A *narrow*
+        // additive signature with no such specialisation folds via the
+        // copy-and-patch `Patched` (beats the per-slot `Dynamic`); the rest is
+        // `Dynamic`.
         macro_rules! by_arity {
             ($a:ty, $b:ty, $acc:ty) => {{
                 type Key = IntPairKeyExtractor<$a, $b>;
-                if matches!(
-                    sig.as_slice(),
-                    [
-                        Sig::Count,
-                        Sig::Sum(Type::Int16),
-                        Sig::Sum(Type::Int16),
-                        Sig::Count,
-                    ]
-                ) {
-                    type V = Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>;
-                    Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
-                } else if matches!(sig.as_slice(), [Sig::Count]) {
+                // (The q32 `count/sum16/sum16/count` shape is all-additive, so it
+                // now folds via the copy-and-patch `Patched` below — the JIT replaces
+                // the old hand-written `Compiled` special-case.)
+                if matches!(sig.as_slice(), [Sig::Count]) {
                     Ok(input.group_by_aggregate::<Key, Compiled<(CountSlot,)>>(key_cols, slots, top_k))
+                } else if all_additive && !wide {
+                    patched_arity!(Key)
                 } else {
                     by_shape!(Key, $acc)
                 }
@@ -800,7 +838,26 @@ impl Aggregate {
                         }
                     };
                 }
+                macro_rules! row_patched_arity {
+                    () => {
+                        match slots.len() {
+                            1 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Patched<1>>(key_cols, slots, top_k, schema)),
+                            2 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Patched<2>>(key_cols, slots, top_k, schema)),
+                            3 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Patched<3>>(key_cols, slots, top_k, schema)),
+                            4 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Patched<4>>(key_cols, slots, top_k, schema)),
+                            5 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Patched<5>>(key_cols, slots, top_k, schema)),
+                            6 => Ok(input.group_by_aggregate_config::<RowKeyExtractor, Patched<6>>(key_cols, slots, top_k, schema)),
+                            n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                        }
+                    };
+                }
                 match shape {
+                    Shape::Numeric if str_min_count => Ok(input
+                        .group_by_aggregate_config::<RowKeyExtractor, Compiled<(StrMinSlot, CountSlot)>>(
+                            key_cols, slots, top_k, schema,
+                        )),
+                    // All-additive narrow → copy-and-patch (not wide: `$acc` is i64).
+                    Shape::Numeric if all_additive && !wide => row_patched_arity!(),
                     Shape::Numeric => row_num_arity!(),
                     Shape::StrMin => row_str_arity!(StrMinSlot),
                     Shape::StrMax => row_str_arity!(StrMaxSlot),

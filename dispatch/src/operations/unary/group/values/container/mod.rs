@@ -9,9 +9,11 @@
 mod compiled;
 mod dynamic;
 mod mono;
+mod patched;
 
 pub use compiled::{
     Compiled, CountSlot, MaxSlot, MinSlot, OpTuple, StrMaxSlot, StrMinSlot, SumSlot,
 };
 pub use dynamic::Dynamic;
 pub use mono::Mono;
+pub use patched::Patched;

@@ -39,6 +39,9 @@ where
     T::Native: PersistedKey + Hash + Eq,
 {
     const SUPPORTS_RADIX: bool = true;
+    // A single fixed-width int (≤ 8 bytes) at entry offset 8 → copy-and-patch
+    // consume's 8-byte key compare is valid (the high pad bytes stay zeroed).
+    const CAP_KEY: bool = std::mem::size_of::<T::Native>() <= 8;
     type Config = ();
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;
@@ -74,6 +77,22 @@ where
         _arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'r> {
         unsafe { reader.value_unchecked(idx) }
+    }
+
+    #[inline(always)]
+    fn cap_key_u64(reader: &Self::Reader<'_>, idx: usize) -> u64 {
+        // Zero-extend the native key's bytes into a u64 (low `size_of` bytes),
+        // matching the entry's stored key region (little-endian; pad stays zero).
+        let v = unsafe { reader.value_unchecked(idx) };
+        let mut out = 0u64;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &v as *const T::Native as *const u8,
+                &mut out as *mut u64 as *mut u8,
+                std::mem::size_of::<T::Native>(),
+            );
+        }
+        out
     }
 
     fn resolve_persisted(_arena: &SharedArena, persisted: T::Native) -> T::Native {
