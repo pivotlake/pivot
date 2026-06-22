@@ -419,38 +419,47 @@ static GetTableFilters split_table_filters(duckdb::LogicalGet &get, DynamicFilte
 	return out;
 }
 
-json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
-               json dynamic_filters) {
+// A LogicalGet's projected output columns, each as a positional BOUND_REF.
+// Shared by base-table (build_get) and table-function (build_table_function_get)
+// gets.
+//
+// A LogicalGet reads `column_ids` off disk but may *output* only a subset /
+// reordering of them, given by `projection_ids` (indices into column_ids).
+// This happens when a filter is pushed all the way into the scan: columns
+// referenced only by that pushed-down predicate are read but not emitted.
+// When `projection_ids` is set, the scan's output order, and therefore the
+// positional indices ColumnBindingResolver assigns to every ref above the
+// scan, follow projection_ids, NOT column_ids, so we serialize in that
+// order. This is the scan-level twin of the LogicalFilter `projection_map`
+// handling in build_plan_node_json (the latter is what actually fixed Q42,
+// where the filter stayed a separate node)
+json build_get_output_columns(duckdb::LogicalGet *get) {
 	json columns = json::array();
 	auto &column_ids = get->GetColumnIds();
-    // A LogicalGet reads `column_ids` off disk but may *output* only a subset /
-    // reordering of them, given by `projection_ids` (indices into column_ids).
-    // This happens when a filter is pushed all the way into the scan: columns
-    // referenced only by that pushed-down predicate are read but not emitted.
-    // When `projection_ids` is set, the scan's output order — and therefore the
-    // positional indices ColumnBindingResolver assigns to every ref above the
-    // scan — follow projection_ids, NOT column_ids, so we serialize in that
-    // order. This is the scan-level twin of the LogicalFilter `projection_map`
-    // handling in build_plan_node_json (the latter is what actually fixed Q42,
-    // where the filter stayed a separate node)
-	auto emit = [&](size_t col_pos, size_t type_pos) {
+	auto emit = [&](size_t column_position, size_t type_position) {
 		json data;
-		data["column_idx"] = column_ids[col_pos].GetPrimaryIndex();
-		data["return_type"] = get->types[type_pos].id();
+		data["column_idx"] = column_ids[column_position].GetPrimaryIndex();
+		data["return_type"] = get->types[type_position].id();
 		json column;
 		column["type"] = static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF);
 		column["data"] = data;
 		columns.push_back(column);
 	};
 	if (!get->projection_ids.empty()) {
-		for (auto pid : get->projection_ids) {
-			emit(pid, pid);
+		for (auto projection_id : get->projection_ids) {
+			emit(projection_id, projection_id);
 		}
 	} else {
 		for (size_t i = 0; i < column_ids.size(); i++) {
 			emit(i, i);
 		}
 	}
+	return columns;
+}
+
+json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+               json dynamic_filters) {
+	json columns = build_get_output_columns(get);
 
 	if (!get->GetTable()) {
 		throw UnsupportedPlanError("LogicalGet without a pivot table entry is not supported");
@@ -466,6 +475,37 @@ json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper
 	    {"dynamic_filters", std::move(dynamic_filters)},
 	    // Flipped to true by build_late_materialization on a late-mat narrow scan.
 	    {"emit_row_group_metadata", false},
+	};
+}
+
+// A LogicalGet over a table-valued function (e.g. `generate_series(1, 10)`, or
+// one of pivot's own metadata functions) rather than a base table: it has no
+// PivotTableCatalogEntry. DuckDB keeps the function name on `get->function` and
+// the bound constant arguments on `get->parameters`, so we serialize those plus
+// the projected output columns. The Rust side regenerates the rows from the name
+// and args, then projects them to `columns`; there is no `table_id` because
+// nothing is read off disk.
+json build_table_function_get(duckdb::LogicalGet *get) {
+	// Only positional `parameters` are serialized. None of pivot's table
+	// functions take named parameters; reject them rather than silently drop a
+	// bound argument (which would compile the function with that argument missing).
+	if (!get->named_parameters.empty()) {
+		throw UnsupportedPlanError("table function " + get->function.name +
+		                           " with named parameters is not supported");
+	}
+
+	json args = json::array();
+	for (auto &param : get->parameters) {
+		args.push_back({
+		    {"logical_type", param.type().id()},
+		    {"raw_value", param.ToString()},
+		});
+	}
+
+	return {
+	    {"function_name", get->function.name},
+	    {"args", std::move(args)},
+	    {"columns", build_get_output_columns(get)},
 	};
 }
 
@@ -836,6 +876,16 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op->Cast<duckdb::LogicalGet>();
+		// A table-valued function (generate_series, pivot's metadata functions)
+		// has no base-table catalog entry. Re-tag it so Rust deserializes a
+		// TableFunctionScan instead of a base-table Input, and serialize the
+		// function name + args rather than a `table_id`.
+		if (!get.GetTable()) {
+			new_operator["type"] =
+			    static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_CHUNK_GET);
+			new_operator["data"] = build_table_function_get(&get);
+			break;
+		}
 		auto split = split_table_filters(get, df_dedup);
 		get_pushed_conditions = std::move(split.conditions);
 		new_operator["data"] = build_get(&get, tables, std::move(split.dynamic_filters));

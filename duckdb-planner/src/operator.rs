@@ -44,6 +44,18 @@ impl fmt::Debug for Input {
     }
 }
 
+/// A scan over a table-valued function (e.g. `generate_series(1, 10)`) rather
+/// than a base table. Carries the function name, its bound constant arguments,
+/// and the projected output columns (positional `BOUND_REF`s, like
+/// [`RawInput`]). The rows are regenerated on the Rust side from the name and
+/// args; there is no `table_id` because nothing is read off disk.
+#[derive(CustomDeserializer, Debug)]
+pub struct TableFunctionScan {
+    pub function_name: String,
+    pub args: Vec<crate::types::ScalarValue>,
+    pub columns: Vec<Expression>,
+}
+
 /// Computes a list of output expressions from its child's columns.
 #[derive(CustomDeserializer, Debug)]
 pub struct Projection {
@@ -200,6 +212,10 @@ pub enum Operator {
     // LogicalGet is deserialized as RawInput, then converted to Input in a
     // post-processing step to attach the DuckDBTable trait object.
     Input(Input),
+    // A table-function get carries no base table, so the bridge re-tags it as
+    // LOGICAL_CHUNK_GET to distinguish it from a base-table `RawInput`.
+    #[type_tag(LogicalOperatorType::LOGICAL_CHUNK_GET)]
+    TableFunctionScan(TableFunctionScan),
     #[type_tag(LogicalOperatorType::LOGICAL_PROJECTION)]
     Projection(Projection),
     #[type_tag(LogicalOperatorType::LOGICAL_ORDER_BY)]
@@ -239,6 +255,7 @@ impl Operator {
             Operator::Projection(p) => Some(p.projections.iter().collect()),
             Operator::Aggregate(a) => Some(a.groups.iter().chain(a.expressions.iter()).collect()),
             Operator::Input(ss) => Some(ss.columns.iter().collect()),
+            Operator::TableFunctionScan(t) => Some(t.columns.iter().collect()),
             Operator::Filter(_)
             | Operator::OrderBy(_)
             | Operator::TopN(_)
@@ -286,6 +303,15 @@ impl fmt::Display for Operator {
                     .collect::<Vec<String>>()
                     .join(", ");
                 write!(f, "Input([{cols}])")
+            }
+            Operator::TableFunctionScan(t) => {
+                let args: Vec<String> = t.args.iter().map(|a| a.raw_value.clone()).collect();
+                write!(
+                    f,
+                    "TableFunctionScan({}({}))",
+                    t.function_name,
+                    args.join(", ")
+                )
             }
             Operator::Projection(p) => {
                 let exprs: Vec<String> = p.projections.iter().map(|e| e.to_string()).collect();

@@ -118,12 +118,12 @@ pub mod types;
 use std::sync::Arc;
 
 use crate::catalog::Catalog;
-pub use operator::{Operator, SetVariable};
+pub use operator::{Operator, SetVariable, TableFunction, TableFunctionSignature};
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;
 
 use crate::catalog::DuckDBCatalogAdapter;
-pub use duckdb_planner::{DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId};
+pub use duckdb_planner::{DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId, ScalarValue};
 
 /// Errors surfaced by [`Planner::plan`].
 #[derive(Debug, Error)]

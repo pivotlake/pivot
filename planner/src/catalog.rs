@@ -16,11 +16,12 @@ use std::any::Any;
 use std::collections::HashMap;
 
 use crate::expression::{CompareType, TableFilter};
+use crate::operator::TableFunction;
 use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
-use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable};
+use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable, TableFunctionDef};
 use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -182,6 +183,19 @@ pub trait Table: Debug + Send + Sync {
     }
 }
 
+/// Convert Pivot columns into the DuckDB-typed columns the binder consumes
+/// (logical type as a `u8` discriminant). Shared by base-table and table-function
+/// binding.
+fn duckdb_columns(columns: &[Column]) -> Vec<DuckDBColumn> {
+    columns
+        .iter()
+        .map(|column| DuckDBColumn {
+            name: column.name.clone(),
+            duckdb_logical_type_id: logical_from_type(&column.col_type) as u8,
+        })
+        .collect()
+}
+
 /// Adapts a Pivot [`Table`] to DuckDB's [`DuckDBTable`] trait,
 /// converting our column types into DuckDB logical types. Required because
 /// Rust's orphan rule prevents implementing a foreign trait for a foreign type.
@@ -198,14 +212,7 @@ impl DuckDBTable for DuckDBTableAdapter {
     }
 
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
-        self.table
-            .columns()
-            .iter()
-            .map(|col| DuckDBColumn {
-                name: col.name.clone(),
-                duckdb_logical_type_id: logical_from_type(&col.col_type) as u8,
-            })
-            .collect()
+        duckdb_columns(&self.table.columns())
     }
 
     fn pushdown_filter(
@@ -254,6 +261,15 @@ pub trait Catalog: Debug + Send + Sync {
         request: CreateTableRequest,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec>;
+
+    /// A backend-specific table-valued function by `name`, or `None`. This is how
+    /// a catalog contributes functions only it can answer (e.g. `metadata`, which
+    /// needs the backend's row-group metadata) without the generic planner
+    /// knowing about them. The generic functions (`generate_series`, `range`) are
+    /// resolved by the planner itself and never reach here. Default: none.
+    fn table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
+        None
+    }
 }
 
 /// Adapts a Pivot [`Catalog`] to DuckDB's [`DuckDBBind`] trait so DuckDB can
@@ -267,5 +283,19 @@ impl DuckDBBind for DuckDBCatalogAdapter {
     fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
         let table = self.catalog.table(name)?;
         Some(Box::new(DuckDBTableAdapter { table }))
+    }
+
+    fn table_function(&self, name: &str) -> Option<TableFunctionDef> {
+        // The function's own signature is the single source of truth; convert its
+        // Pivot types to DuckDB logical type ids for the binder.
+        let signature = self.catalog.table_function(name)?.signature();
+        Some(TableFunctionDef {
+            arg_type_ids: signature
+                .arguments
+                .iter()
+                .map(|arg_type| logical_from_type(arg_type) as u8)
+                .collect(),
+            columns: duckdb_columns(&signature.columns),
+        })
     }
 }

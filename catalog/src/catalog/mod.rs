@@ -30,6 +30,7 @@
 //! pushdown accumulates on that binding alone.
 
 mod binding;
+mod metadata_function;
 mod table;
 
 pub use binding::TableBinding;
@@ -45,6 +46,8 @@ use crate::manifest::{
 use crate::parquet::{ParquetTable, ParquetTableError};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
+use metadata_function::MetadataTableFunction;
+use planner::TableFunction;
 use planner::catalog::{
     Catalog, CreateTableRequest, Error as CatalogError, QueryContext, Result as CatalogResult,
     Table,
@@ -405,6 +408,15 @@ impl Catalog for ParquetCatalog {
         dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         Ok(self.create(request, dispatcher)?)
+    }
+
+    fn table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
+        // `metadata('table')` reports a table's row-group footers; it is
+        // parquet-specific, so it lives here rather than in the generic planner.
+        match name {
+            "metadata" => Some(Box::new(MetadataTableFunction)),
+            _ => None,
+        }
     }
 }
 

@@ -23,6 +23,7 @@ mod materialize;
 mod order_by;
 mod projection;
 mod set_variable;
+mod table_function;
 mod top_n;
 
 pub use aggregate::Aggregate;
@@ -35,6 +36,7 @@ pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
 pub use projection::Projection;
 pub use set_variable::SetVariable;
+pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub use top_n::TopN;
 
 use crate::compile::DynamicFilterSlots;
@@ -70,6 +72,8 @@ pub(super) fn slot_for(slots: &mut DynamicFilterSlots, slot_id: usize) -> Arc<Dy
 #[derive(Debug)]
 pub enum Operator {
     Input(Input),
+    /// A scan over a table-valued function (e.g. `generate_series`).
+    TableFunctionScan(TableFunctionScan),
     Projection(Projection),
     OrderBy(OrderBy),
     Aggregate(Aggregate),
@@ -90,6 +94,9 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
     fn try_from(op: duckdb_operator::Operator) -> Result<Self, Self::Error> {
         Ok(match op {
             duckdb_operator::Operator::Input(s) => Operator::Input(s.try_into()?),
+            duckdb_operator::Operator::TableFunctionScan(t) => {
+                Operator::TableFunctionScan(t.try_into()?)
+            }
             duckdb_operator::Operator::Projection(p) => Operator::Projection(p.try_into()?),
             duckdb_operator::Operator::OrderBy(o) => Operator::OrderBy(o.try_into()?),
             duckdb_operator::Operator::Aggregate(a) => Operator::Aggregate(a.try_into()?),
@@ -114,6 +121,7 @@ impl fmt::Display for Operator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Operator::Input(i) => write!(f, "{i}"),
+            Operator::TableFunctionScan(t) => write!(f, "{t}"),
             Operator::Projection(p) => write!(f, "{p}"),
             Operator::OrderBy(o) => write!(f, "{o}"),
             Operator::Aggregate(a) => write!(f, "{a}"),
