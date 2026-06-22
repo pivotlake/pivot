@@ -24,7 +24,7 @@ use crate::operations::unary::group::hashtables::{Table, TableStorage};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
 use crate::operations::unary::group::values::AggregationValue;
 
-use super::Result;
+use super::{GroupLimit, Result};
 
 /// Rows per output chunk. Each chunk's columns are built into single 2MB slabs,
 /// so the widest column (a `u128` key = 16 bytes) bounds this: `chunk * 16 <= 2MB`.
@@ -156,9 +156,11 @@ where
 /// Convert a completed partition table into output `RecordBatch`es (one per
 /// [`OUTPUT_CHUNK_ROWS`]-row chunk), built into `allocator`'s slab memory.
 ///
-/// `top_k` is `Some((value_slot, limit))` when this group directly feeds an
-/// `ORDER BY <value_slot> DESC LIMIT limit`; only this partition's top-`limit`
-/// rows are emitted in that case.
+/// `output_limit` is set when a LIMIT was pushed into this group: `TopK` emits
+/// only this partition's top-`limit` rows by `sort_key(slot)` (an
+/// `ORDER BY <slot> DESC LIMIT`), `First` emits any `limit` rows (a plain
+/// `LIMIT` with no ORDER BY). Both are sound because the downstream operator
+/// re-applies the same LIMIT (and ordering) across all partitions.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_and_send<K, V, S, Snd>(
     table: Table<K, V, S>,
@@ -166,7 +168,7 @@ pub(crate) fn build_and_send<K, V, S, Snd>(
     allocator: &mut SlabAllocator,
     key_config: &K::Config,
     shared_context: &V::SharedContext,
-    top_k: Option<(usize, usize)>,
+    output_limit: Option<GroupLimit>,
     count_only: bool,
     sender: &mut Snd,
 ) -> Result<()>
@@ -190,13 +192,27 @@ where
         return Ok(());
     }
 
-    match top_k {
-        Some((slot, limit)) if limit < table.len() => {
+    match output_limit {
+        Some(GroupLimit::TopK { slot, limit }) if limit < table.len() => {
             let rows = top_k_rows::<K, V, S>(&table, slot, limit);
             let total = rows.len();
             emit_chunks::<K, V, Snd, _>(
                 rows.into_iter(),
                 total,
+                key_arena,
+                allocator,
+                key_config,
+                shared_context,
+                sender,
+            )
+        }
+        // Plain LIMIT: any `limit` groups satisfy it, so take the first `limit`
+        // the partition's table yields (no sort, no heap).
+        Some(GroupLimit::First { limit }) if limit < table.len() => {
+            let rows = table.iter(0).take(limit).map(|e| (*e.key(), *e.value()));
+            emit_chunks::<K, V, Snd, _>(
+                rows,
+                limit,
                 key_arena,
                 allocator,
                 key_config,

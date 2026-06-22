@@ -53,7 +53,7 @@ impl Aggregate {
         let key_cols: Vec<usize> = keys.iter().map(|(col, _)| *col).collect();
 
         let sig = signatures(&self.expressions);
-        let top_k = self.top_k;
+        let output_limit = self.output_limit;
 
         // Cell width: i128 when a string extreme needs its 128-bit `ArenaKey`
         // cell, or when a SUM reads a 64-bit column; else the narrow i64 entry.
@@ -73,12 +73,12 @@ impl Aggregate {
 
         // `group!` is the single lowering primitive: every arm below picks one
         // concrete key type `$K`, value type `$V`, and key config `$cfg`, then
-        // calls it. The surrounding `input`/`key_cols`/`slots`/`top_k` are
+        // calls it. The surrounding `input`/`key_cols`/`slots`/`output_limit` are
         // captured from this scope — exactly one arm ever runs, so each
         // moved-once value is consumed at most once.
         macro_rules! group {
             ($K:ty, $V:ty, $cfg:expr) => {
-                Ok(input.group_by_aggregate_config::<$K, $V>(key_cols, slots, top_k, $cfg))
+                Ok(input.group_by_aggregate_config::<$K, $V>(key_cols, slots, output_limit, $cfg))
             };
         }
         // Fold each slot by kind (or branch-free `+` when `$add`) in
