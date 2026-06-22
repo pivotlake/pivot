@@ -583,10 +583,25 @@ impl FileCache {
                 continue;
             };
 
-            // Exclusive now (no readers, no other writer). Drop every run this
-            // buffer held from the index, then bump the generation so any reader
-            // still holding a stale run copy fails its post-pin re-check.
-            self.reclaim_buffer(buffer_index);
+            // Exclusive now (no readers, no other writer). Only a buffer that
+            // actually holds runs is a cache buffer we may reclaim. A buffer with
+            // no tenants sitting at `used == 0` is a free slot parked in a worker's
+            // pool; handing it out here would alias the pool's copy, leaving two
+            // owners of one 2 MB slot. Release the write lock without pooling (its
+            // pool listing stays valid) and keep scanning.
+            let tenants = std::mem::take(self.tenants_mut(buffer_index));
+            if tenants.is_empty() {
+                std::mem::forget(write_buffer);
+                memory_ctx()
+                    .ring()
+                    .set_slot_used(buffer_index, 0, Ordering::Release);
+                continue;
+            }
+
+            // Drop every run this buffer held from the index, then bump the
+            // generation so any reader still holding a stale run copy fails its
+            // post-pin re-check.
+            self.drop_tenant_runs(buffer_index, tenants);
             self.buffer_meta(buffer_index)
                 .generation
                 .fetch_add(1, Ordering::Release);
@@ -594,10 +609,10 @@ impl FileCache {
         }
     }
 
-    /// Drop every run packed into `buffer_index` from the index and clear its
-    /// tenant list. The buffer must be held exclusively.
-    fn reclaim_buffer(&self, buffer_index: usize) {
-        let tenants = std::mem::take(self.tenants_mut(buffer_index));
+    /// Drop the given `tenants`' runs (all packed into `buffer_index`) from the
+    /// index, pruning regions and files that become empty. The buffer must be
+    /// held exclusively.
+    fn drop_tenant_runs(&self, buffer_index: usize, tenants: Vec<BufferTenant>) {
         for tenant in tenants {
             let index = self.index.read().unwrap();
             let Some(region_runs) = index.get(&tenant.location) else {
@@ -637,20 +652,19 @@ impl FileCache {
     }
 
     /// Register a [`FileLocation`] (a local fd or a remote object) so its regions
-    /// can be cached. Clears any runs cached under an equal prior registration
-    /// (e.g. a reused fd number) by bumping the holding buffers' generations,
-    /// which invalidates those runs without touching the buffers' contents.
+    /// can be cached. Drops any runs cached under an equal prior registration
+    /// (e.g. a reused fd number) so future reads of the new file miss and re-read.
+    ///
+    /// We do not bump the holding buffers' generations: a buffer is now shared by
+    /// many files, so that would spuriously invalidate unrelated co-tenants.
+    /// Dropping the runs from the index is sufficient. A racing reader of an old
+    /// run necessarily still holds the prior file's handle (so its fd/object is
+    /// unchanged and the cached bytes are still correct), and a genuine buffer
+    /// recycle still bumps the generation via [`evict`](Self::evict). The dropped
+    /// runs become unreferenced bytes in their buffers, reclaimed on eviction.
     pub fn open_entry(&self, location: FileLocation) {
         let mut index = self.index.write().unwrap();
-        if let Some(stale) = index.remove(&location) {
-            for (_, runs) in stale.into_inner().unwrap() {
-                for run in runs {
-                    self.buffer_meta(run.buffer_index as usize)
-                        .generation
-                        .fetch_add(1, Ordering::Release);
-                }
-            }
-        }
+        index.remove(&location);
         index.entry(location).or_default();
     }
 
@@ -673,13 +687,20 @@ impl FileCache {
             }
         }
         for buffer_index in holding_buffers {
-            let meta = self.buffer_meta(buffer_index);
-            meta.generation.fetch_add(1, Ordering::Release);
-            meta.valid.clear();
-            self.tenants_mut(buffer_index).clear();
-            // Returns the buffer to the free pool if it is reclaimable; a worker's
-            // pinned fill buffer fails the write-lock and is left in place.
-            drop(memory_ctx().ring().try_write(buffer_index));
+            // The generation bump is atomic, so it is always safe. Reset the
+            // non-atomic validity/tenants only under an exclusive write lock: a
+            // worker's pinned fill buffer fails `try_write`, and touching its
+            // `valid`/tenants would race the owner. Such a buffer keeps stale
+            // bytes, but its runs are already gone from the drained index and its
+            // owner clears it on the next fill, so leaving it is harmless.
+            self.buffer_meta(buffer_index)
+                .generation
+                .fetch_add(1, Ordering::Release);
+            if let Some(write_buffer) = memory_ctx().ring().try_write(buffer_index) {
+                self.buffer_meta(buffer_index).valid.clear();
+                self.tenants_mut(buffer_index).clear();
+                drop(write_buffer);
+            }
         }
         runs_dropped
     }
@@ -770,17 +791,40 @@ mod tests {
     }
 
     #[test]
-    fn a_reread_after_the_buffer_generation_moves_on_is_a_clean_miss() {
+    fn re_registering_a_file_drops_its_cached_runs() {
         init_test_free_pool(8);
         let file = local_file();
         cache().open_entry(file.clone());
         fill_with(&miss(cache().get_region(&file, 0, 0, 100)), 0x44);
 
-        // Re-registering the file invalidates its runs by bumping their buffers'
-        // generations; the bytes stay put but the post-pin generation check now
-        // fails, so the same read is a clean miss rather than stale data.
+        // Re-registering (e.g. a reused fd) drops the file's runs from the index,
+        // so the same read misses and re-reads rather than serving another file's
+        // bytes.
         cache().open_entry(file.clone());
 
         assert!(!cache().get_region(&file, 0, 0, 100).missing().is_empty());
+    }
+
+    #[test]
+    fn evict_does_not_steal_a_slot_from_the_free_pool() {
+        init_test_free_pool(3);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        // A full-region read fills a buffer; the next region's read retires it, so
+        // there is one evictable cache buffer (holds runs, unpinned) while a seeded
+        // slot still sits free in the pool.
+        fill_with(&miss(cache().get_region(&file, 0, 0, BUFFER_SIZE)), 0x11);
+        fill_with(&miss(cache().get_region(&file, BUFFER_SIZE, 0, 100)), 0x22);
+
+        let evicted = cache().evict();
+        let still_pooled: Vec<usize> =
+            std::iter::from_fn(|| memory_ctx().pop_free_idx(false)).collect();
+
+        assert!(
+            !still_pooled.contains(&evicted.slot_idx),
+            "evict() handed out slot {} while the pool still lists it {:?}: two owners of one ring slot",
+            evicted.slot_idx,
+            still_pooled,
+        );
     }
 }
