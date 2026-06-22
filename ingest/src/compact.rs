@@ -77,7 +77,7 @@ pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 /// the byte trigger (full-size outputs); this count trigger is only the safety
 /// net for a partition whose data trickles in, and a higher bar there means
 /// fewer small sub-target merges.
-const MIN_FILES_TO_MERGE: usize = 32;
+pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 4;
 
 /// Compacts every table of a catalog into target-sized Parquet files,
 /// entirely off the tables' logs: poll, reload, merge what's eligible. Holds
@@ -87,6 +87,10 @@ const MIN_FILES_TO_MERGE: usize = 32;
 pub struct Compacter {
     /// Candidate threshold and merge trigger (see [`DEFAULT_COMPACT_BYTES`]).
     target_bytes: u64,
+    /// Count trigger for a sub-target partition's pile (see
+    /// [`DEFAULT_MIN_FILES_TO_MERGE`]): merge a low-traffic partition's small
+    /// files once this many accumulate, even below `target_bytes`.
+    min_files: usize,
     /// How often to re-check the tables' logs for newly-accumulated files.
     poll_interval: Duration,
     catalog: Arc<ParquetCatalog>,
@@ -96,9 +100,15 @@ pub struct Compacter {
 }
 
 impl Compacter {
-    pub fn new(target_bytes: u64, poll_interval: Duration, catalog: Arc<ParquetCatalog>) -> Self {
+    pub fn new(
+        target_bytes: u64,
+        min_files: usize,
+        poll_interval: Duration,
+        catalog: Arc<ParquetCatalog>,
+    ) -> Self {
         Self {
             target_bytes,
+            min_files: min_files.max(2),
             poll_interval,
             catalog,
             seq: AtomicU64::new(0),
@@ -232,7 +242,7 @@ impl Compacter {
             // accumulates small files forever, which is what bloats a sink to
             // tens of thousands of tiny files. (The merged file is itself a
             // candidate, so it keeps growing toward the target as more arrive.)
-            if batch.len() >= MIN_FILES_TO_MERGE {
+            if batch.len() >= self.min_files {
                 return Some(batch);
             }
         }

@@ -152,6 +152,7 @@ fn start_logs_ingestor(
         dispatch.dispatcher().clone(),
         catalog.clone(),
         0, // no bundled compacter
+        4, // compact_min_files (unused; compacter off)
     )
     .unwrap()
 }

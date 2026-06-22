@@ -77,6 +77,13 @@ struct Args {
     /// `0` disables it — e.g. when a dedicated compacter process owns the job.
     #[arg(long, default_value_t = ingest::DEFAULT_COMPACT_BYTES)]
     compact_bytes: u64,
+
+    /// Compacter count trigger for low-traffic partitions: merge a sub-target
+    /// partition's small files once this many accumulate (even below
+    /// `compact_bytes`). Lower = fewer tiny files per partition, more frequent
+    /// sub-target merges.
+    #[arg(long, default_value_t = ingest::DEFAULT_MIN_FILES_TO_MERGE)]
+    compact_min_files: usize,
 }
 
 impl Args {
@@ -258,7 +265,14 @@ fn main() -> Result<(), Error> {
     };
 
     rt.block_on(async move {
-        let server = Server::new(args.bind, dispatch, catalog, ingests, args.compact_bytes);
+        let server = Server::new(
+            args.bind,
+            dispatch,
+            catalog,
+            ingests,
+            args.compact_bytes,
+            args.compact_min_files,
+        );
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;
         });
