@@ -98,8 +98,8 @@ pub use factory::GroupFactory;
 mod hashtables;
 
 pub use keys::{
-    ArenaKey, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, KeyExtractor,
-    RowKeyExtractor, RowKeySchema, StringKeyExtractor,
+    ArenaKey, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
+    KeyExtractor, RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
@@ -451,7 +451,9 @@ impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutpu
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::group::keys::{IntKeyExtractor, StringKeyExtractor};
+    use crate::operations::unary::group::keys::{
+        IntKeyExtractor, IntStrKeyExtractor, StringKeyExtractor,
+    };
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
@@ -913,6 +915,98 @@ mod tests {
                 (1, "a".to_string(), 2),
                 (1, "b".to_string(), 1),
                 (2, "a".to_string(), 2),
+            ]
+        );
+    }
+
+    /// `IntStrKeyExtractor`: `GROUP BY (Int64, Utf8View)` through the dedicated
+    /// int+string extractor instead of the row encoder. Same groups as
+    /// [`row_key_mixed_int_string_counts`], but keyed on the native int beside the
+    /// string's arena handle.
+    #[test]
+    fn int_string_mixed_counts() {
+        let batch = mixed_key_batch(&[1, 1, 1, 2, 2], &["a", "b", "a", "a", "a"], &[0; 5]);
+        let sender = run_group_full::<
+            IntStrKeyExtractor<arrow_array::types::Int64Type>,
+            Compiled<(CountSlot,)>,
+        >(
+            vec![vec![batch]],
+            vec![0, 1],
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        );
+        assert_eq!(
+            row_key_rows(&sender),
+            vec![
+                (1, "a".to_string(), 2),
+                (1, "b".to_string(), 1),
+                (2, "a".to_string(), 2),
+            ]
+        );
+    }
+
+    /// `IntStrKeyExtractor` across two workers: the same `(int, string)` group is
+    /// seen by both, so the merge must resolve each persisted key through the
+    /// shared arena (the `IntStrResolvedKey` path) and combine. Includes a
+    /// > 12-byte string so the string rides an arena blob, not the inline header.
+    #[test]
+    fn int_string_two_workers_merge() {
+        let long = "a-string-well-over-twelve-bytes";
+        let sender = run_group_full::<
+            IntStrKeyExtractor<arrow_array::types::Int64Type>,
+            Compiled<(CountSlot,)>,
+        >(
+            vec![
+                vec![mixed_key_batch(&[1, 2], &[long, "a"], &[0; 2])],
+                vec![mixed_key_batch(&[1, 1], &[long, "b"], &[0; 2])],
+            ],
+            vec![0, 1],
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        );
+        assert_eq!(
+            row_key_rows(&sender),
+            vec![
+                (1, long.to_string(), 2),
+                (1, "b".to_string(), 1),
+                (2, "a".to_string(), 1),
+            ]
+        );
+    }
+
+    /// `IntStrKeyExtractor` in string-first order: `GROUP BY (name, id)`. The
+    /// output leads with the string column (`k0`), then the int (`k1`), matching
+    /// the GROUP BY order, and groups identically.
+    #[test]
+    fn str_int_mixed_counts() {
+        // (name, id) pairs: (a,1)x2, (a,2)x2, (b,2)x1.
+        let batch = mixed_key_batch(&[1, 2, 1, 2, 2], &["a", "a", "a", "b", "a"], &[0; 5]);
+        let sender = run_group_full::<
+            IntStrKeyExtractor<arrow_array::types::Int64Type, true>,
+            Compiled<(CountSlot,)>,
+        >(
+            vec![vec![batch]],
+            vec![1, 0], // name (string, col 1) first, then id (int, col 0)
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        );
+        let mut rows: Vec<(String, i64, i64)> = sender
+            .string_column(0)
+            .into_iter()
+            .zip(sender.i64_column(1))
+            .zip(sender.i64_column(2))
+            .map(|((name, id), c)| (name, id, c))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), 1, 2),
+                ("a".to_string(), 2, 2),
+                ("b".to_string(), 2, 1),
             ]
         );
     }

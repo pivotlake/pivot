@@ -35,6 +35,9 @@ pub use int::IntKeyExtractor;
 mod int_pair;
 pub use int_pair::IntPairKeyExtractor;
 
+mod int_string;
+pub use int_string::IntStrKeyExtractor;
+
 mod hash_only_int;
 pub use hash_only_int::HashOnlyIntKeyExtractor;
 
