@@ -1,171 +1,163 @@
-//! A CLOCK-based page cache that maps 2 MB file *regions* to ring buffer slots,
-//! with per-slot validity tracked at 4 KB sub-block granularity.
+//! A CLOCK-based page cache that packs file reads into shared 2 MB ring buffers,
+//! with per-buffer validity tracked at 4 KB sub-block granularity.
 //!
-//! Each slot owns a fixed, 2 MB-aligned window of a file (`region_base`), so
-//! every file byte belongs to exactly one slot — cache entries can never
-//! overlap. A slot's [`Entry::valid`] bitmap records which of its 512 × 4 KB
-//! sub-blocks have actually been read from disk; a slot can therefore be
-//! *partially* present and get filled incrementally as different columns touch
-//! different parts of the same window.
+//! A cached read is a *run*: a contiguous span of a file's 4 KB sub-blocks
+//! (within one 2 MB-aligned region) read into a contiguous span of one ring
+//! buffer. Many runs from different files share a buffer. A buffer's
+//! [`Entry::valid`] bitmap records which of its 512 × 4 KB sub-blocks have
+//! actually been read in; a buffer is therefore *partially* present and gets
+//! filled incrementally as more runs are packed into it.
 //!
 //! ## Lifecycle
 //!
-//! A region slot is allocated once (a free ring slot, its bitmap zeroed while
-//! held exclusively) and registered in the map; it then lives as a *readable*
-//! slot (reader-count tracked, never re-taking the ring's `WRITING` bit) until
-//! CLOCK eviction reclaims it. Reads land directly into the slot's holes — the
-//! "mutate a `ReadBuffer` in place" case — which is sound because a fill only
-//! targets sub-blocks that are currently invalid and a reader only reads
-//! sub-blocks it has seen as valid, so they never touch the same bytes. The
-//! `valid` bit is flipped `Release` *after* the bytes land and read `Acquire`
-//! before use.
+//! A worker bump-allocates runs into a private *fill buffer* (a free ring slot it
+//! pins, its bitmap zeroed while held exclusively); when the buffer fills it
+//! drops the pin, leaving a *readable* buffer (reader-count tracked, never
+//! re-taking the ring's `WRITING` bit) until CLOCK eviction reclaims it. Reads
+//! land directly into the buffer's holes — the "mutate a `ReadBuffer` in place"
+//! case — which is sound because a fill only targets sub-blocks that are
+//! currently invalid and a reader only reads sub-blocks it has seen as valid, so
+//! they never touch the same bytes. The `valid` bit is flipped `Release` *after*
+//! the bytes land and read `Acquire` before use. Eviction reclaims a whole buffer
+//! and drops every run packed in it; a per-buffer [`Entry::generation`] bumped on
+//! reclaim lets a reader holding a stale run reference detect the recycle once it
+//! pins the buffer.
 //!
 //! ## Lookups
 //!
 //! [`FileCache::get`] takes a file byte range `[offset, offset + len)` and
-//! returns one [`CacheLookup`] per 2 MB window the range spans (callers never
-//! deal in windows themselves). Each lookup carries the window's `data` (a
-//! zero-copy view into the cache slot) plus its `missing` runs — the
-//! [`MissingBlock`]s the caller must still read. `missing` is empty on a full
-//! hit; otherwise each block covers *whole* sub-blocks and is read straight into
-//! the slot at [`MissingBlock::dest`], then marked valid via
-//! [`MissingBlock::commit`], after which `data` is valid to read.
+//! returns one [`CacheLookup`] per 2 MB region the range spans (callers never
+//! deal in regions themselves). Each lookup carries its `data` (a zero-copy view
+//! into the run's buffer) plus its `missing` runs — the [`MissingBlock`]s the
+//! caller must still read. `missing` is empty on a full hit; otherwise each block
+//! covers *whole* sub-blocks and is read straight into the buffer at
+//! [`MissingBlock::dest`], then marked valid via [`MissingBlock::commit`], after
+//! which `data` is valid to read.
 
 use crate::io::FileLocation;
 use crate::memory::context::memory_ctx;
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::ring::BUFFER_SIZE;
+use crate::memory::write_buffer::WriteBuffer;
 use ahash::HashMap;
 use bytes::Bytes;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Sub-block granularity for validity tracking and disk reads (the direct-I/O
-/// alignment). A read never pulls less than this, and every cached byte range
-/// is rounded out to whole sub-blocks.
+/// Sub-block granularity for validity tracking and direct-I/O reads. A read never
+/// pulls less than this, and every cached byte range is rounded out to whole
+/// sub-blocks.
 const SUB_BLOCK_SIZE: usize = 4096;
-/// Number of 4 KB sub-blocks per 2 MB slot (512).
-const SUB_BLOCKS_PER_SLOT: usize = BUFFER_SIZE / SUB_BLOCK_SIZE;
-/// Number of `u64` words in a slot's validity bitmap (8 → 512 bits).
-const BITMAP_WORDS: usize = SUB_BLOCKS_PER_SLOT / 64;
+/// Number of 4 KB sub-blocks per 2 MB buffer (512).
+pub(crate) const SUB_BLOCKS_PER_BUFFER: usize = BUFFER_SIZE / SUB_BLOCK_SIZE;
+/// Number of `u64` words in a buffer's validity bitmap (8 → 512 bits).
+const BITMAP_WORDS: usize = SUB_BLOCKS_PER_BUFFER / 64;
 
-/// Mask the byte `offset` down to its 2 MB region base.
+/// Mask `offset` down to its 2 MB region base.
 #[inline]
 fn region_base_of(offset: usize) -> usize {
     offset & !(BUFFER_SIZE - 1)
 }
 
-/// Assemble a [`CacheLookup`] for `[start, end)` of a pinned slot caching
-/// `region`, given the slot's already-computed missing sub-block `runs`
-/// (each `[first, last]` inclusive; empty on a full hit). One shared pin keeps
-/// the slot alive for the lookup's `data` *and* every in-flight read targeting
-/// it.
-fn create_cache_lookup_from_missing(
-    buffer: ReadBuffer,
+/// First sub-block index (within a region) of a region-relative byte `offset`.
+#[inline]
+fn sub_block_of(offset: usize) -> usize {
+    offset / SUB_BLOCK_SIZE
+}
+
+/// A cached read: a span of file sub-blocks (relative to its region base) mapped
+/// to a span of buffer sub-blocks, tagged with the buffer generation it was
+/// cached under.
+#[derive(Clone)]
+struct CachedRun {
+    /// First file sub-block of the run, relative to the region base.
+    file_first_sub_block: u32,
+    /// Number of contiguous sub-blocks the run covers.
+    sub_block_count: u32,
+    /// Ring buffer holding the run's bytes.
+    buffer_index: u32,
+    /// First sub-block of the run within that buffer.
+    buffer_first_sub_block: u32,
+    /// Buffer generation when the run was cached (staleness check after pinning).
+    generation: u64,
+}
+
+impl CachedRun {
+    /// One past the run's last file sub-block.
+    fn file_end_sub_block(&self) -> u32 {
+        self.file_first_sub_block + self.sub_block_count
+    }
+
+    /// Does this run cover the whole file sub-block range `[first, last]`?
+    fn covers(&self, first: u32, last: u32) -> bool {
+        self.file_first_sub_block <= first && last < self.file_end_sub_block()
+    }
+}
+
+/// A run packed into a buffer, recorded so eviction can find the run's region in
+/// the index and drop the buffer's runs from it when it reclaims the buffer.
+struct BufferTenant {
+    location: FileLocation,
     region: usize,
-    start: usize,
-    end: usize,
-    runs: Vec<(usize, usize)>,
-) -> CacheLookup {
-    let slot_idx = buffer.slot_idx;
-    let slot_ptr = buffer.ptr as usize;
-
-    let buffer = Arc::new(buffer);
-    let missing = runs
-        .into_iter()
-        .map(|(first, last)| {
-            MissingBlock::new(region, slot_ptr, slot_idx, first, last, buffer.clone())
-        })
-        .collect();
-    let data = Bytes::from_owner(SlotPin(buffer)).slice(start..end);
-    CacheLookup { data, missing }
 }
 
-struct FileCacheEntry {
-    ring_idx: usize,
-}
-
-/// The result of a [`FileCache::get`] over one window: the looked-up bytes
-/// (a zero-copy view into the cache slot) plus the runs still missing from the
-/// slot. `missing` is empty on a full hit; otherwise `data` only becomes valid
-/// once every [`MissingBlock`] has been read & committed.
+/// The result of a [`FileCache::get`] over one region: the looked-up bytes (a
+/// zero-copy view into the run's buffer) plus the runs still missing. `missing`
+/// is empty on a full hit; otherwise `data` only becomes valid once every
+/// [`MissingBlock`] has been read and committed.
 pub struct CacheLookup {
     data: Bytes,
     missing: Vec<MissingBlock>,
 }
 
 impl CacheLookup {
-    /// Runs that must be read & committed before [`data`](Self::into_data) is
+    /// Runs that must be read and committed before [`data`](Self::into_data) is
     /// valid. Empty on a full hit.
     pub fn missing(&self) -> &[MissingBlock] {
         &self.missing
     }
 
-    /// Take the looked-up bytes — valid to read once every [`missing`](Self::missing)
-    /// block has been filled. A zero-copy view into the cache slot, kept alive by
-    /// the returned [`Bytes`].
+    /// Take the looked-up bytes — valid to read once every
+    /// [`missing`](Self::missing) block has been filled. A zero-copy view into the
+    /// run's buffer, kept alive by the returned [`Bytes`].
     pub fn into_data(self) -> Bytes {
         self.data
     }
 }
 
-/// One contiguous run of missing sub-blocks that must be read from disk to
-/// satisfy a lookup. Covers whole sub-blocks, so the read targets [`dest`] (a
-/// region inside the pinned slot) directly — no intermediate buffer — and once
-/// it lands the run is marked valid wholesale via [`commit`].
+/// One contiguous run of missing sub-blocks to read from storage. Covers whole
+/// sub-blocks, so the read targets [`dest`](Self::dest) (a region inside the
+/// pinned buffer) directly — no intermediate buffer — and once it lands the run
+/// is marked valid wholesale via [`commit`](Self::commit).
 ///
-/// Holds an [`Arc`] on the slot pin shared with the lookup's `data`, so the slot
-/// can't be evicted while a read targeting it is in flight — even if the owning
-/// query is cancelled and drops its [`CacheLookup`] first.
-///
-/// [`dest`]: MissingBlock::dest
-/// [`commit`]: MissingBlock::commit
+/// Holds an [`Arc`] on the buffer pin shared with the lookup's `data`, so the
+/// buffer cannot be evicted while a read targeting it is in flight, even if the
+/// owning query is cancelled and drops its [`CacheLookup`] first.
 #[derive(Clone)]
 pub struct MissingBlock {
-    /// 2 MB region base of the file this run lives in. Combined with
-    /// `first_sub_block` it gives the [`file_offset`](Self::file_offset) to read from.
-    region: usize,
-    /// Destination address inside the pinned ring slot (`ptr as usize`).
+    /// File offset to read these bytes from (a multiple of [`SUB_BLOCK_SIZE`]).
+    file_offset: usize,
+    /// Destination address inside the pinned buffer (`ptr as usize`).
     dest: usize,
-    /// Ring slot index whose validity bitmap this run belongs to.
-    slot_idx: usize,
-    /// First sub-block index (within the slot) covered by this run.
-    first_sub_block: usize,
+    /// Buffer holding the destination, whose validity bitmap this run belongs to.
+    buffer_index: usize,
+    /// First sub-block within the buffer covered by this run (for `commit`).
+    buffer_first_sub_block: usize,
     /// How many sub-blocks this run covers.
     sub_block_count: usize,
-    /// Keeps the destination slot pinned for the read's whole lifetime.
+    /// Keeps the destination buffer pinned for the read's whole lifetime.
     _pin: Arc<ReadBuffer>,
 }
 
 impl MissingBlock {
-    /// A block covering sub-blocks `[first_sub_block, last_sub_block]` (inclusive) of the
-    /// slot at `slot_ptr` caching `region`, sharing the region's slot pin.
-    fn new(
-        region: usize,
-        slot_ptr: usize,
-        slot_idx: usize,
-        first_sub_block: usize,
-        last_sub_block: usize,
-        pin: Arc<ReadBuffer>,
-    ) -> Self {
-        MissingBlock {
-            region,
-            dest: slot_ptr + first_sub_block * SUB_BLOCK_SIZE,
-            slot_idx,
-            first_sub_block,
-            sub_block_count: last_sub_block - first_sub_block + 1,
-            _pin: pin,
-        }
-    }
-
-    /// File offset this block's bytes are read from (always a multiple of
+    /// File offset this block's bytes are read from (a multiple of
     /// [`SUB_BLOCK_SIZE`], the direct-I/O alignment).
     pub fn file_offset(&self) -> usize {
-        self.region + self.first_sub_block * SUB_BLOCK_SIZE
+        self.file_offset
     }
 
-    /// Number of bytes to read — a multiple of `SUB_BLOCK_SIZE`.
+    /// Number of bytes to read — a multiple of [`SUB_BLOCK_SIZE`].
     pub fn len(&self) -> usize {
         self.sub_block_count * SUB_BLOCK_SIZE
     }
@@ -175,51 +167,51 @@ impl MissingBlock {
         self.sub_block_count == 0
     }
 
-    /// Carve out a sub-block covering `[rel_offset, rel_offset + len)` *within*
-    /// this block — both relative to this block's start and both
-    /// `SUB_BLOCK_SIZE`-aligned. The sub-block shares the slot pin, reads into the
-    /// matching slice of the same pinned slot, and [`commit`](Self::commit)s only
-    /// its own sub-blocks.
+    /// Carve out a sub-block covering `[relative_offset, relative_offset + len)`
+    /// *within* this block — both relative to this block's start and both
+    /// [`SUB_BLOCK_SIZE`]-aligned. The sub-block shares the buffer pin, reads into
+    /// the matching slice of the same pinned buffer, and
+    /// [`commit`](Self::commit)s only its own sub-blocks.
     ///
-    /// Used to split one missing run across transports: bytes already in the
-    /// local disk cache are read from there, the holes are fetched over HTTP, and
-    /// each part fills its own slice of the slot.
-    pub fn carve_sub_block(&self, rel_offset: usize, len: usize) -> MissingBlock {
-        debug_assert_eq!(rel_offset % SUB_BLOCK_SIZE, 0);
+    /// Used to split one missing run across transports: bytes already in the local
+    /// disk cache are read from there, the holes are fetched over HTTP, and each
+    /// part fills its own slice of the buffer.
+    pub fn carve_sub_block(&self, relative_offset: usize, len: usize) -> MissingBlock {
+        debug_assert_eq!(relative_offset % SUB_BLOCK_SIZE, 0);
         debug_assert_eq!(len % SUB_BLOCK_SIZE, 0);
-        debug_assert!(rel_offset + len <= self.len());
+        debug_assert!(relative_offset + len <= self.len());
         MissingBlock {
-            region: self.region,
-            dest: self.dest + rel_offset,
-            slot_idx: self.slot_idx,
-            first_sub_block: self.first_sub_block + rel_offset / SUB_BLOCK_SIZE,
+            file_offset: self.file_offset + relative_offset,
+            dest: self.dest + relative_offset,
+            buffer_index: self.buffer_index,
+            buffer_first_sub_block: self.buffer_first_sub_block + relative_offset / SUB_BLOCK_SIZE,
             sub_block_count: len / SUB_BLOCK_SIZE,
             _pin: self._pin.clone(),
         }
     }
 
-    /// The destination to read this block's [`len`](Self::len) bytes into: a
-    /// 4 KB-aligned region `[dest, dest+len)` inside the pinned slot — a valid
-    /// O_DIRECT target. The slot stays alive for the read because this block
+    /// The destination to read this block's [`len`](Self::len) bytes into: a 4 KB
+    /// aligned region `[dest, dest + len)` inside the pinned buffer, a valid
+    /// O_DIRECT target. The buffer stays alive for the read because this block
     /// holds a pin (`_pin`), and only this block's (currently invalid) sub-blocks
-    /// live here, so the read never races a reader of the slot's valid bytes.
+    /// live here, so the read never races a reader of the buffer's valid bytes.
     pub fn dest(&self) -> *mut u8 {
         self.dest as *mut u8
     }
 
     /// Mark this block's sub-blocks valid — call once its bytes have been read
-    /// into the slot.
+    /// into the buffer.
     pub fn commit(&self) {
         memory_ctx()
             .file_cache()
-            .entry(self.slot_idx)
+            .entry(self.buffer_index)
             .valid
-            .set(self.first_sub_block, self.sub_block_count);
+            .set(self.buffer_first_sub_block, self.sub_block_count);
     }
 }
 
-/// Owns a slot pin and exposes its 2 MB contents, so a [`Bytes`] can borrow a
-/// slice of the slot zero-copy while keeping the slot pinned.
+/// Owns a buffer pin and exposes its 2 MB contents, so a [`Bytes`] can borrow a
+/// slice of the buffer zero-copy while keeping the buffer pinned.
 struct SlotPin(Arc<ReadBuffer>);
 
 impl AsRef<[u8]> for SlotPin {
@@ -228,28 +220,28 @@ impl AsRef<[u8]> for SlotPin {
     }
 }
 
-/// A slot's validity bitmap: bit `sub_block` set means sub-block `sub_block`
-/// (a 4 KB span of the slot) has been read into it. Keeps all the word/bit
-/// indexing — and the memory ordering that makes the in-place fill sound — in one place.
+/// A buffer's validity bitmap: bit `sub_block` set means that 4 KB sub-block of
+/// the buffer has been read into it. Keeps all the word/bit indexing — and the
+/// memory ordering that makes the in-place fill sound — in one place.
 #[derive(Default)]
 struct ValidBitmap([AtomicU64; BITMAP_WORDS]);
 
 impl ValidBitmap {
-    /// Is sub-block `sub_block` present? `Acquire` pairs with `set`'s `Release`,
-    /// so a reader that observes the bit is guaranteed to see the sub-block's bytes.
+    /// Is `sub_block` present? `Acquire` pairs with `set`'s `Release`, so a reader
+    /// that observes the bit is guaranteed to see the sub-block's bytes.
     fn is_set(&self, sub_block: usize) -> bool {
         self.0[sub_block / 64].load(Ordering::Acquire) & (1 << (sub_block % 64)) != 0
     }
 
-    /// Mark sub-blocks `[first, first + count)` present. `Release` so it only
-    /// becomes visible after the bytes have landed in the slot.
+    /// Mark sub-blocks `[first, first + count)` present. `Release` so they only
+    /// become visible after the bytes have landed in the buffer.
     fn set(&self, first: usize, count: usize) {
         for sub_block in first..first + count {
             self.0[sub_block / 64].fetch_or(1 << (sub_block % 64), Ordering::Release);
         }
     }
 
-    /// Reset every sub-block to absent. Sound only while the slot is held
+    /// Reset every sub-block to absent. Sound only while the buffer is held
     /// exclusively (no concurrent readers).
     fn clear(&self) {
         for word in &self.0 {
@@ -258,25 +250,40 @@ impl ValidBitmap {
     }
 }
 
-/// Per-slot CLOCK metadata + validity.
+/// Per-buffer cache metadata.
 ///
-/// * `ref_bit` – set on access, cleared by the CLOCK sweep.
-/// * `region` – the `(location, region_base)` currently cached here, or `None` if unused.
-/// * `valid` – which of the slot's 4 KB sub-blocks are resident.
+/// * `reference_bit` — set on access, cleared by the CLOCK sweep (second chance).
+/// * `generation` — bumped on each eviction; a [`CachedRun`] records the
+///   generation it was cached under so a reader can detect a recycle that
+///   happened after it copied the run out of the index but before it pinned the
+///   buffer.
+/// * `valid` — which of the buffer's 512 sub-blocks currently hold data.
+/// * `tenants` — the runs packed into this buffer, used to drop them from the
+///   index when the buffer is reclaimed.
+///
+/// The first three fields are atomic, so they are sound to touch through a shared
+/// `&Entry` while the buffer is pinned for reading. `tenants` is the one
+/// non-atomic field, so it sits behind an [`UnsafeCell`]: it is touched only by a
+/// buffer's filling worker (while it holds the pin) and then by the evictor
+/// (after `try_write` succeeds, which can only happen once the fill pin is
+/// dropped). The buffer's `used` atomic orders the hand-off, so the two never
+/// touch the `Vec` concurrently and no lock is needed.
+#[derive(Default)]
 struct Entry {
-    ref_bit: AtomicBool,
-    region: Option<(FileLocation, usize)>,
+    reference_bit: AtomicBool,
+    generation: AtomicU64,
     valid: ValidBitmap,
+    tenants: UnsafeCell<Vec<BufferTenant>>,
 }
 
-/// A CLOCK-eviction region cache over the shared [`Ring`](super::Ring).
-///
-/// Regions are bucketed by [`FileLocation`], so the same cache serves both local
-/// files and remote HTTP objects — only the transport that fills a missing block
-/// differs.
+/// A CLOCK-eviction page cache over the shared [`Ring`](super::Ring), packing
+/// many file reads per 2 MB buffer.
 pub struct FileCache {
-    file_maps: RwLock<HashMap<FileLocation, RwLock<HashMap<usize, FileCacheEntry>>>>,
-    entries: Box<[UnsafeCell<Entry>]>,
+    /// The cache index: file → region → the runs cached for that region.
+    file_maps: RwLock<HashMap<FileLocation, RwLock<HashMap<usize, Vec<CachedRun>>>>>,
+    /// Per-buffer metadata (CLOCK bit, generation, validity, tenant list).
+    entries: Box<[Entry]>,
+    /// CLOCK hand.
     hand: AtomicUsize,
 }
 
@@ -284,27 +291,26 @@ unsafe impl Send for FileCache {}
 unsafe impl Sync for FileCache {}
 
 impl FileCache {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            file_maps: Default::default(),
-            entries: (0..capacity)
-                .map(|_| {
-                    UnsafeCell::new(Entry {
-                        ref_bit: Default::default(),
-                        region: None,
-                        valid: Default::default(),
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            hand: Default::default(),
+    /// A cache over `buffer_count` ring buffers (one [`Entry`] per buffer).
+    pub fn new(buffer_count: usize) -> Self {
+        FileCache {
+            file_maps: RwLock::new(HashMap::default()),
+            entries: (0..buffer_count).map(|_| Entry::default()).collect(),
+            hand: AtomicUsize::new(0),
         }
     }
 
-    /// Look up the file byte range `[offset, offset + len)` of file `fd`. The
+    /// Borrow buffer `buffer`'s [`Entry`]. The atomic fields are always safe to
+    /// touch through the shared reference; mutating `tenants` goes through
+    /// [`tenants_mut`](Self::tenants_mut).
+    fn entry(&self, buffer: usize) -> &Entry {
+        &self.entries[buffer]
+    }
+
+    /// Look up the file byte range `[offset, offset + len)` of `location`. The
     /// range is split across the 2 MB regions it spans, yielding one
     /// [`CacheLookup`] per region in file order — callers never deal in regions
-    /// themselves: read & fill every lookup's [`missing`](CacheLookup::missing)
+    /// themselves: read and fill every lookup's [`missing`](CacheLookup::missing)
     /// blocks, then concatenate the parts' bytes.
     pub fn get(&self, location: &FileLocation, offset: usize, len: usize) -> Vec<CacheLookup> {
         let end = offset + len;
@@ -320,7 +326,7 @@ impl FileCache {
     }
 
     /// Look up `[start, end)` (intra-region byte offsets) of one 2 MB `region`
-    /// of `location`, allocating the slot on a miss. See [`CacheLookup`].
+    /// of `location`, allocating a run on a miss. See [`CacheLookup`].
     fn get_region(
         &self,
         location: &FileLocation,
@@ -330,25 +336,31 @@ impl FileCache {
     ) -> CacheLookup {
         debug_assert!(start < end && end <= BUFFER_SIZE);
         debug_assert_eq!(region_base_of(region), region);
+
+        let first_sub_block = sub_block_of(start) as u32;
+        let last_sub_block = sub_block_of(end - 1) as u32;
+
         loop {
-            // Fast path: the region is already cached — pin it and inspect.
-            if let Some(buffer) = self.get_buffer(location, region) {
-                return self.get_lookup_within_existing_region(buffer, region, start, end);
+            // Fast path: a cached run already covers the whole requested range.
+            if let Some(lookup) =
+                self.resolve_cached_run(location, region, start, end, first_sub_block, last_sub_block)
+            {
+                return lookup;
             }
 
-            // Miss: grab a free write buffer *before* taking the map lock, since
-            // get_write_buffer may evict (which locks the cache itself).
-            let write_buffer = memory_ctx().get_write_buffer(false);
-            let slot_idx = write_buffer.slot_idx;
+            // Miss: bump-allocate one run covering the whole requested sub-block
+            // span in this worker's fill buffer, *before* taking the index lock
+            // (acquiring a fill buffer may evict, which locks the cache itself).
+            let sub_block_count = (last_sub_block - first_sub_block + 1) as usize;
+            let allocation = memory_ctx().allocate_sub_blocks(sub_block_count);
 
-            // Register region → slot, unless another worker beat us to it.
             let file_maps = self.file_maps.read().unwrap();
-            let Some(fd_regions) = file_maps.get(location) else {
-                // The outer entry was pruned (its last region was evicted) after
-                // this file was registered. Re-create it and retry; our unbound
-                // write buffer returns to the pool. The fresh entry is empty, so
-                // the evictor — which only prunes on a region eviction — can't
-                // race it away before we insert below.
+            let Some(file_regions) = file_maps.get(location) else {
+                // The file's entry was pruned (its last run was evicted) after it
+                // was registered. Re-create it and retry; the bytes we reserved in
+                // the fill buffer are simply left unused (reclaimed when the buffer
+                // is evicted). The fresh entry is empty, so the evictor — which
+                // only prunes on eviction — cannot race it away before we insert.
                 drop(file_maps);
                 self.file_maps
                     .write()
@@ -357,278 +369,463 @@ impl FileCache {
                     .or_default();
                 continue;
             };
-            let mut fd_regions = fd_regions.write().unwrap();
-            if fd_regions.contains_key(&region) {
-                // Another worker already cached this region; retry the fast path
-                // to pin theirs. Our write buffer was never bound, so it just
-                // goes back to the free pool unused.
+            let mut file_regions = file_regions.write().unwrap();
+            let region_runs = file_regions.entry(region).or_default();
+            if region_runs
+                .iter()
+                .any(|run| run.covers(first_sub_block, last_sub_block))
+            {
+                // Another worker cached a covering run while we were allocating;
+                // drop ours (the reserved bytes go unused) and retry the fast path.
                 continue;
             }
-            // We won. While the slot is still exclusively held (WRITING, so no
-            // reader can pin it) reset its bitmap and bind its region — set only
-            // now, atomically with the map insert, so a dropped loser never
-            // leaves a dangling region behind.
-            let entry = unsafe { &mut *self.entries[slot_idx].get() };
-            entry.valid.clear();
-            entry.region = Some((location.clone(), region));
-            entry.ref_bit.store(true, Ordering::Relaxed);
 
-            fd_regions.insert(region, FileCacheEntry { ring_idx: slot_idx });
-            // Publish as readable (1 reader = our pin) while still holding the
-            // map lock, so a racing pin_existing waits on the lock rather than
-            // ever seeing a WRITING slot.
-            let buffer = ReadBuffer::from(write_buffer);
-            drop(fd_regions);
+            let cached_run = CachedRun {
+                file_first_sub_block: first_sub_block,
+                sub_block_count: sub_block_count as u32,
+                buffer_index: allocation.buffer_index as u32,
+                buffer_first_sub_block: allocation.buffer_first_sub_block as u32,
+                generation: allocation.generation,
+            };
+            region_runs.push(cached_run.clone());
+            // Record the tenant so eviction can drop this run from the index. Only
+            // this worker (the fill buffer's owner) touches the tenant list now.
+            self.tenants_mut(allocation.buffer_index).push(BufferTenant {
+                location: location.clone(),
+                region,
+            });
+            drop(file_regions);
             drop(file_maps);
-            // Freshly allocated: we just cleared the bitmap, so the whole
-            // requested range is one missing run — no need to walk the bitmap.
-            let run = (start / SUB_BLOCK_SIZE, (end - 1) / SUB_BLOCK_SIZE);
-            return create_cache_lookup_from_missing(buffer, region, start, end, vec![run]);
+
+            // Freshly reserved: every requested sub-block is one missing run.
+            let pin = memory_ctx()
+                .ring()
+                .try_read(allocation.buffer_index)
+                .expect("fill buffer is held in read mode by its owner");
+            return self.build_lookup(pin, region, start, end, &cached_run, &[(
+                first_sub_block,
+                last_sub_block,
+            )]);
         }
     }
 
-    /// Borrow ring slot `idx`'s cache metadata. The atomic `valid`/`ref_bit` are
-    /// always safe to touch; `region` is only mutated while the slot is held
-    /// exclusively (WRITING), which can't coexist with a read pin, so reading it
-    /// under a pin is sound.
-    fn entry(&self, idx: usize) -> &Entry {
-        unsafe { &*self.entries[idx].get() }
-    }
-
-    /// Get the cached buffer for `region` of `location`, or `None` if it isn't
-    /// cached (or a concurrent eviction recycled it between the map lookup and
-    /// the pin).
-    fn get_buffer(&self, location: &FileLocation, region: usize) -> Option<ReadBuffer> {
-        let file_maps = self.file_maps.read().unwrap();
-        // The outer entry may be absent — its last region was evicted and pruned
-        // after registration. Treat that as a plain cache miss; `get_region`
-        // re-creates the entry before caching.
-        let fd_regions = file_maps.get(location)?.read().unwrap();
-        let ring_idx = fd_regions.get(&region)?.ring_idx;
-        let buffer = memory_ctx().ring().try_read(ring_idx)?;
-        // Re-check under the pin: eviction may have recycled the slot for a
-        // different region between the map lookup and the pin. Comparing by
-        // reference avoids cloning the (possibly Arc-backed) location.
-        let entry = self.entry(buffer.ring_idx());
-        if entry
-            .region
-            .as_ref()
-            .is_some_and(|(loc, r)| loc == location && *r == region)
-        {
-            entry.ref_bit.store(true, Ordering::Relaxed);
-            Some(buffer)
-        } else {
-            None
-        }
-    }
-
-    /// Inspect the bitmap of a pinned slot over `[start, end)` and build its
-    /// [`CacheLookup`]: the `[start, end)` bytes plus any missing runs to read
-    /// (none when every sub-block is already valid).
-    fn get_lookup_within_existing_region(
+    /// Fast path: find a cached run covering the whole requested range, pin its
+    /// buffer, confirm it was not recycled, and assemble the [`CacheLookup`].
+    /// Returns `None` (a miss) if no covering run exists or the pin lost a race
+    /// with eviction.
+    fn resolve_cached_run(
         &self,
-        buffer: ReadBuffer,
+        location: &FileLocation,
         region: usize,
         start: usize,
         end: usize,
-    ) -> CacheLookup {
-        let valid = &self.entry(buffer.slot_idx).valid;
+        first_sub_block: u32,
+        last_sub_block: u32,
+    ) -> Option<CacheLookup> {
+        // Copy the covering run out from under the index lock; we re-validate it
+        // against the buffer generation after pinning.
+        let cached_run = {
+            let file_maps = self.file_maps.read().unwrap();
+            let file_regions = file_maps.get(location)?.read().unwrap();
+            file_regions
+                .get(&region)?
+                .iter()
+                .find(|run| run.covers(first_sub_block, last_sub_block))
+                .cloned()?
+        };
 
-        let first_sub_block = start / SUB_BLOCK_SIZE;
-        let last_sub_block = (end - 1) / SUB_BLOCK_SIZE;
+        let pin = memory_ctx().ring().try_read(cached_run.buffer_index as usize)?;
+        // Re-check under the pin: eviction may have recycled the buffer between the
+        // index lookup and the pin. The generation rises on every reclaim, so an
+        // unequal generation means our run no longer lives here.
+        if self
+            .entry(cached_run.buffer_index as usize)
+            .generation
+            .load(Ordering::Acquire)
+            != cached_run.generation
+        {
+            return None;
+        }
+        self.entry(cached_run.buffer_index as usize)
+            .reference_bit
+            .store(true, Ordering::Relaxed);
 
-        // Walk the requested sub-blocks, gathering each maximal run of missing
-        // ones (`[run_first, run_last]`) into a single block to read.
-        let mut runs = Vec::new();
-        let mut run_start: Option<usize> = None;
-        for sub_block in first_sub_block..=last_sub_block {
-            if valid.is_set(sub_block) {
-                if let Some(run_first) = run_start.take() {
-                    runs.push((run_first, sub_block - 1));
+        // Walk the requested sub-blocks, gathering each maximal run of *missing*
+        // ones into a single block to read.
+        let valid = &self.entry(cached_run.buffer_index as usize).valid;
+        let mut missing_file_runs = Vec::new();
+        let mut run_start: Option<u32> = None;
+        for file_sub_block in first_sub_block..=last_sub_block {
+            let buffer_sub_block = self.buffer_sub_block_of(&cached_run, file_sub_block);
+            if valid.is_set(buffer_sub_block) {
+                if let Some(first) = run_start.take() {
+                    missing_file_runs.push((first, file_sub_block - 1));
                 }
             } else {
-                run_start.get_or_insert(sub_block);
+                run_start.get_or_insert(file_sub_block);
             }
         }
-        if let Some(run_first) = run_start.take() {
-            runs.push((run_first, last_sub_block));
+        if let Some(first) = run_start.take() {
+            missing_file_runs.push((first, last_sub_block));
         }
 
-        create_cache_lookup_from_missing(buffer, region, start, end, runs)
+        Some(self.build_lookup(pin, region, start, end, &cached_run, &missing_file_runs))
     }
 
-    /// Evict a slot using the (second-chance) CLOCK algorithm and return it as a
-    /// writable buffer.
+    /// Buffer sub-block holding file sub-block `file_sub_block` of `run`.
+    fn buffer_sub_block_of(&self, run: &CachedRun, file_sub_block: u32) -> usize {
+        (run.buffer_first_sub_block + (file_sub_block - run.file_first_sub_block)) as usize
+    }
+
+    /// Assemble the [`CacheLookup`] for region byte range `[start, end)` served by
+    /// `run` in the pinned buffer, given the file sub-block runs still missing
+    /// (each `[first, last]` inclusive). One shared pin keeps the buffer alive for
+    /// the lookup's `data` and every in-flight read targeting it.
+    fn build_lookup(
+        &self,
+        pin: ReadBuffer,
+        region: usize,
+        start: usize,
+        end: usize,
+        run: &CachedRun,
+        missing_file_runs: &[(u32, u32)],
+    ) -> CacheLookup {
+        let buffer_base = pin.as_slice().as_ptr() as usize;
+        let pin = Arc::new(pin);
+
+        let missing = missing_file_runs
+            .iter()
+            .map(|&(first_file_sub_block, last_file_sub_block)| {
+                let buffer_first_sub_block = self.buffer_sub_block_of(run, first_file_sub_block);
+                let sub_block_count = (last_file_sub_block - first_file_sub_block + 1) as usize;
+                MissingBlock {
+                    file_offset: region + first_file_sub_block as usize * SUB_BLOCK_SIZE,
+                    dest: buffer_base + buffer_first_sub_block * SUB_BLOCK_SIZE,
+                    buffer_index: run.buffer_index as usize,
+                    buffer_first_sub_block,
+                    sub_block_count,
+                    _pin: pin.clone(),
+                }
+            })
+            .collect();
+
+        // The requested bytes sit at the run's buffer offset plus the intra-region
+        // distance from the run's first sub-block.
+        let run_byte_base = run.buffer_first_sub_block as usize * SUB_BLOCK_SIZE;
+        let start_in_buffer = run_byte_base + (start - run.file_first_sub_block as usize * SUB_BLOCK_SIZE);
+        let data = Bytes::from_owner(SlotPin(pin)).slice(start_in_buffer..start_in_buffer + (end - start));
+        CacheLookup { data, missing }
+    }
+
+    /// Prepare a freshly acquired buffer to become a worker's fill buffer: drop
+    /// any stale validity and tenants. Takes the buffer's [`WriteBuffer`] so the
+    /// exclusive (WRITING) hold that makes resetting the non-atomic tenants sound
+    /// is witnessed at the call site: `try_write` is the only way to obtain one,
+    /// and no other accessor can win it while it is held.
+    // The `&mut` is a capability token for that exclusive hold; the handle itself
+    // is not mutated here.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(crate) fn prepare_fill_buffer(&self, write_buffer: &mut WriteBuffer) {
+        let entry = self.entry(write_buffer.slot_idx);
+        entry.valid.clear();
+        entry.reference_bit.store(true, Ordering::Relaxed);
+        self.tenants_mut(write_buffer.slot_idx).clear();
+    }
+
+    /// The current generation of `buffer` — the tag a run allocated into it must
+    /// carry so a later read detects a recycle. Read fresh on each allocation: the
+    /// buffer is pinned by its filling worker, but `clear` can still bump it, so a
+    /// cached copy would go stale.
+    pub(crate) fn buffer_generation(&self, buffer: usize) -> u64 {
+        self.entry(buffer).generation.load(Ordering::Acquire)
+    }
+
+    /// Mutable access to buffer `buffer`'s tenant list. Sound only for the buffer's
+    /// filling worker (while it holds the pin) or the evictor (after `try_write`),
+    /// which the `used` atomic keeps from overlapping. See [`Entry::tenants`].
+    #[allow(clippy::mut_from_ref)]
+    fn tenants_mut(&self, buffer: usize) -> &mut Vec<BufferTenant> {
+        unsafe { &mut *self.entry(buffer).tenants.get() }
+    }
+
+    /// Evict a buffer using the (second-chance) CLOCK algorithm and return it as a
+    /// writable buffer. Drops every run the reclaimed buffer held from the index
+    /// and bumps its generation so stale [`CachedRun`] copies are detected.
     pub fn evict(&self) -> crate::memory::write_buffer::WriteBuffer {
         loop {
-            let slot_idx = self.hand.fetch_add(1, Ordering::Relaxed) % memory_ctx().ring().len();
-            // Give recently-used slots a second chance: clear the ref bit and
-            // skip; an unreferenced slot we can write-lock gets evicted.
-            if self.entry(slot_idx).ref_bit.swap(false, Ordering::Relaxed) {
+            let buffer_index =
+                self.hand.fetch_add(1, Ordering::Relaxed) % memory_ctx().ring().len();
+            // Give recently-used buffers a second chance: clear the ref bit and
+            // skip; an unreferenced buffer we can write-lock gets evicted.
+            if self
+                .entry(buffer_index)
+                .reference_bit
+                .swap(false, Ordering::Relaxed)
+            {
                 continue;
             }
-            if let Some(write_buffer) = memory_ctx().ring().try_write(slot_idx) {
-                // Exclusive now. Only *cache regions* are ours to reclaim. A slot
-                // with no bound region is a free buffer parked in a pool (every
-                // slot is pre-faulted into a pool at startup, and freed buffers
-                // return there). Handing one out here would alias the pool's copy
-                // — two owners of one 2 MB slot — which orphans the slot's
-                // `fd_regions` entry and livelocks `get_region`. Release it without
-                // pooling it (its pool listing stays valid) and keep scanning.
-                let entry = unsafe { &mut *self.entries[slot_idx].get() };
-                let Some((location, region)) = entry.region.take() else {
-                    std::mem::forget(write_buffer);
-                    memory_ctx()
-                        .ring()
-                        .set_slot_used(slot_idx, 0, Ordering::Release);
-                    continue;
-                };
-                let now_empty = {
-                    let file_maps = self.file_maps.read().unwrap();
-                    let mut regions = file_maps.get(&location).unwrap().write().unwrap();
-                    regions.remove(&region);
-                    regions.is_empty()
-                };
-                // Prune the per-file outer entry once its last cached region is
-                // evicted. The map is keyed by `FileLocation` (an `Arc<File>` /
-                // `Arc<RemoteFile>`) and a key is never reused, so without this a
-                // dead entry — pinning its `Arc` and the file/connection it holds —
-                // lingers for every file ever opened, leaking unboundedly under
-                // steady ingest+compaction. Re-check emptiness under the write lock
-                // so a concurrent `get` that just re-cached a region isn't dropped.
-                if now_empty {
-                    let mut file_maps = self.file_maps.write().unwrap();
-                    if let Some(regions) = file_maps.get(&location)
-                        && regions.read().unwrap().is_empty()
-                    {
-                        file_maps.remove(&location);
+            let Some(write_buffer) = memory_ctx().ring().try_write(buffer_index) else {
+                continue;
+            };
+
+            // Exclusive now (no readers, no other writer). Only a buffer that
+            // actually holds runs is a cache buffer we may reclaim. A buffer with
+            // no tenants sitting at `used == 0` is a free slot parked in a worker's
+            // pool; handing it out here would alias the pool's copy, leaving two
+            // owners of one 2 MB slot. Release the write lock without pooling (its
+            // pool listing stays valid) and keep scanning.
+            let tenants = std::mem::take(self.tenants_mut(buffer_index));
+            if tenants.is_empty() {
+                std::mem::forget(write_buffer);
+                memory_ctx()
+                    .ring()
+                    .set_slot_used(buffer_index, 0, Ordering::Release);
+                continue;
+            }
+
+            // Drop every run this buffer held from the index, then bump the
+            // generation so any reader still holding a stale run copy fails its
+            // post-pin re-check.
+            self.drop_tenant_runs(buffer_index, tenants);
+            self.entry(buffer_index)
+                .generation
+                .fetch_add(1, Ordering::Release);
+            return write_buffer;
+        }
+    }
+
+    /// Drop the given `tenants`' runs (all packed into `buffer_index`) from the
+    /// index, pruning regions and files that become empty. The buffer must be
+    /// held exclusively.
+    fn drop_tenant_runs(&self, buffer_index: usize, tenants: Vec<BufferTenant>) {
+        for tenant in tenants {
+            let file_maps = self.file_maps.read().unwrap();
+            let Some(region_runs) = file_maps.get(&tenant.location) else {
+                continue;
+            };
+            let became_empty = {
+                let mut region_runs = region_runs.write().unwrap();
+                if let Some(runs) = region_runs.get_mut(&tenant.region) {
+                    // Reclaiming the whole buffer kills every run packed into it,
+                    // so drop the region's runs that live here and keep the rest
+                    // (they live in other, still-valid buffers).
+                    runs.retain(|run| run.buffer_index as usize != buffer_index);
+                    if runs.is_empty() {
+                        region_runs.remove(&tenant.region);
                     }
                 }
-                return write_buffer;
+                region_runs.is_empty()
+            };
+            drop(file_maps);
+
+            // Prune the per-file outer entry once its last region is gone. The map
+            // is keyed by `FileLocation` (an `Arc<File>` / `Arc<RemoteFile>`) whose
+            // key is never reused, so without this a dead entry — pinning its `Arc`
+            // and the file/connection it holds — lingers for every file ever
+            // opened, leaking unboundedly under steady ingest and compaction.
+            // Re-check emptiness under the write lock so a concurrent insert is not
+            // dropped.
+            if became_empty {
+                let mut file_maps = self.file_maps.write().unwrap();
+                if let Some(region_runs) = file_maps.get(&tenant.location)
+                    && region_runs.read().unwrap().is_empty()
+                {
+                    file_maps.remove(&tenant.location);
+                }
             }
         }
     }
 
     /// Register a [`FileLocation`] (a local fd or a remote object) so its regions
-    /// can be cached. Clears any stale entries from a previous registration of an
-    /// equal location (e.g. a reused fd number).
+    /// can be cached. Drops any runs cached under an equal prior registration
+    /// (e.g. a reused fd number) so future reads of the new file miss and re-read.
+    ///
+    /// We do not bump the holding buffers' generations: a buffer is now shared by
+    /// many files, so that would spuriously invalidate unrelated co-tenants.
+    /// Dropping the runs from the index is sufficient. A racing reader of an old
+    /// run necessarily still holds the prior file's handle (so its fd/object is
+    /// unchanged and the cached bytes are still correct), and a genuine buffer
+    /// recycle still bumps the generation via [`evict`](Self::evict). The dropped
+    /// runs become unreferenced bytes in their buffers, reclaimed on eviction.
     pub fn open_entry(&self, location: FileLocation) {
         let mut file_maps = self.file_maps.write().unwrap();
-        if let Some(stale) = file_maps.remove(&location) {
-            for (_, FileCacheEntry { ring_idx }) in stale.into_inner().unwrap() {
-                unsafe { &mut *self.entries[ring_idx].get() }.region = None;
-                drop(memory_ctx().ring().try_write(ring_idx));
-            }
-        }
-        file_maps.insert(location, Default::default());
+        file_maps.remove(&location);
+        file_maps.entry(location).or_default();
     }
 
-    /// Evict every cached region: unbind all `(fd, region) → slot` mappings,
-    /// reset each slot's metadata, and return the ring slots to the free pool —
-    /// so subsequent reads miss and re-read from disk. Registered file
-    /// descriptors stay open (their region maps are just emptied). Returns the
-    /// number of regions evicted.
-    ///
-    /// Intended for benchmarking true cold reads (`SELECT drop_cache()`). Sound
-    /// only while no query is in flight: it write-locks and recycles every bound
-    /// slot, which must not race a reader holding a pin.
+    /// Drop every cached run so subsequent reads miss and re-read from storage,
+    /// returning the number of runs dropped. Bumps the generation of each holding
+    /// buffer (invalidating stale run copies), clears its validity and tenants,
+    /// and returns it to the free pool unless a worker still pins it as a fill
+    /// buffer. Intended for benchmarking true cold reads (`SELECT drop_cache()`);
+    /// sound only while no query is in flight.
     pub fn clear(&self) -> usize {
-        let file_maps = self.file_maps.read().unwrap();
-        let mut evicted = 0;
-        for fd_regions in file_maps.values() {
-            for (_region, FileCacheEntry { ring_idx }) in fd_regions.write().unwrap().drain() {
-                let entry = unsafe { &mut *self.entries[ring_idx].get() };
-                entry.region = None;
-                entry.valid.clear();
-                entry.ref_bit.store(false, Ordering::Relaxed);
-                // Acquiring then dropping the write buffer returns the slot to
-                // the free pool (same recycle path as `open_file_entry`).
-                drop(memory_ctx().ring().try_write(ring_idx));
-                evicted += 1;
+        let mut file_maps = self.file_maps.write().unwrap();
+        let mut runs_dropped = 0;
+        let mut holding_buffers = std::collections::HashSet::new();
+        for (_location, file_regions) in file_maps.drain() {
+            for (_region, runs) in file_regions.into_inner().unwrap() {
+                for run in runs {
+                    runs_dropped += 1;
+                    holding_buffers.insert(run.buffer_index as usize);
+                }
             }
         }
-        evicted
+        for buffer in holding_buffers {
+            // The generation bump is atomic, so it is always safe. Reset the
+            // non-atomic validity/tenants only under an exclusive write lock: a
+            // worker's pinned fill buffer fails `try_write`, and touching its
+            // `valid`/tenants would race the owner. Such a buffer keeps stale
+            // bytes, but its runs are already gone from the drained index and its
+            // owner clears it on the next fill, so leaving it is harmless.
+            self.entry(buffer).generation.fetch_add(1, Ordering::Release);
+            if let Some(write_buffer) = memory_ctx().ring().try_write(buffer) {
+                self.entry(buffer).valid.clear();
+                self.tenants_mut(buffer).clear();
+                drop(write_buffer);
+            }
+        }
+        runs_dropped
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::context::{init_test_free_pool, memory_ctx};
+    use crate::memory::context::init_test_free_pool;
+    use std::fs::File;
 
-    const SB: usize = SUB_BLOCK_SIZE;
-
-    /// A local location used as the cache key throughout these tests. One
-    /// shared open file, so every call keys the same cache bucket.
-    #[allow(non_snake_case)]
-    fn FD() -> FileLocation {
-        use std::sync::OnceLock;
-        static FILE: OnceLock<std::sync::Arc<std::fs::File>> = OnceLock::new();
-        FileLocation::Local(
-            FILE.get_or_init(|| std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()))
-                .clone(),
-        )
+    /// A fresh local file location: a distinct `/dev/null` fd, so every call is a
+    /// distinct cache key.
+    fn local_file() -> FileLocation {
+        FileLocation::Local(Arc::new(File::open("/dev/null").unwrap()))
     }
 
     fn cache() -> &'static FileCache {
         memory_ctx().file_cache()
     }
 
-    /// Assert the lookup has holes (some sub-blocks missing) and return it.
+    /// Assert the lookup has missing runs and return it.
     fn miss(lookup: CacheLookup) -> CacheLookup {
         assert!(!lookup.missing().is_empty(), "expected a miss");
         lookup
     }
 
-    /// Assert the lookup is a full hit (no holes) and take its bytes.
+    /// Assert the lookup is a full hit and take its bytes.
     fn hit(lookup: CacheLookup) -> Bytes {
         assert!(lookup.missing().is_empty(), "expected a hit");
         lookup.into_data()
     }
 
-    /// Simulate a completed read: write `byte` into the block's slot region,
-    /// then mark it valid — what the IO path does (read into `dest`, `commit`).
-    fn read_and_commit(block: &MissingBlock, byte: u8) {
-        unsafe { std::ptr::write_bytes(block.dest(), byte, block.len()) };
-        block.commit();
+    /// Read `byte` into every missing block of `lookup` and commit it (what the IO
+    /// path does once a read lands).
+    fn fill_with(lookup: &CacheLookup, byte: u8) {
+        for block in lookup.missing() {
+            unsafe { std::ptr::write_bytes(block.dest(), byte, block.len()) };
+            block.commit();
+        }
     }
 
-    /// A deterministic byte for intra-slot offset `off`, so a filled slot's
-    /// contents are predictable for any slice.
-    fn pattern_at(off: usize) -> u8 {
-        off.wrapping_mul(7).wrapping_add(1) as u8
+    /// 4 KB sub-block size, aliased for brevity in range arithmetic.
+    const SB: usize = SUB_BLOCK_SIZE;
+
+    /// A position-dependent byte, so any offset or reassembly bug corrupts the
+    /// expected pattern.
+    fn pattern_at(file_offset: usize) -> u8 {
+        (file_offset % 251) as u8
     }
 
-    /// Read the pattern into every missing block of `miss` and commit it,
-    /// deriving each block's intra-slot offset from its public `file_offset`.
-    fn fill_pattern(region_base: usize, miss: &CacheLookup) {
-        for block in miss.missing() {
-            let slot_off = block.file_offset() - region_base;
+    /// Fill every missing block with [`pattern_at`] keyed by absolute file offset,
+    /// then commit it.
+    fn fill_pattern(lookup: &CacheLookup) {
+        for block in lookup.missing() {
             for i in 0..block.len() {
-                unsafe { *block.dest().add(i) = pattern_at(slot_off + i) };
+                unsafe { *block.dest().add(i) = pattern_at(block.file_offset() + i) };
             }
             block.commit();
         }
     }
 
-    fn assert_pattern(bytes: &[u8], slot_start: usize) {
-        for (i, &b) in bytes.iter().enumerate() {
-            assert_eq!(b, pattern_at(slot_start + i), "byte {i}");
+    /// Assert `bytes` carries the pattern starting at absolute file offset
+    /// `file_start`.
+    fn assert_pattern(bytes: &[u8], file_start: usize) {
+        for (i, &byte) in bytes.iter().enumerate() {
+            assert_eq!(byte, pattern_at(file_start + i), "byte {i}");
         }
     }
 
-    /// Regression for the parquetsink OOM: the CLOCK evictor must not reclaim a
-    /// ring slot that is still sitting in the free pool. When it does, that one
-    /// 2 MB slot is owned by both the pool and the evictor — and once the evicted
-    /// copy is installed as a cache region, the pool re-issues it, orphaning the
-    /// `fd_regions` entry and livelocking `get_region`.
+    #[test]
+    fn misses_then_fills_then_hits_the_same_bytes() {
+        init_test_free_pool(8);
+        let file = local_file();
+        cache().open_entry(file.clone());
+
+        let lookup = miss(cache().get_region(&file, 0, 0, 10));
+        fill_with(&lookup, 0xAB);
+        drop(lookup);
+
+        assert_eq!(&hit(cache().get_region(&file, 0, 0, 10))[..], &[0xAB; 10]);
+    }
+
+    #[test]
+    fn packs_distinct_files_into_shared_buffers_without_mixing_bytes() {
+        init_test_free_pool(8);
+        let file_one = local_file();
+        let file_two = local_file();
+        cache().open_entry(file_one.clone());
+        cache().open_entry(file_two.clone());
+
+        fill_with(&miss(cache().get_region(&file_one, 0, 0, 100)), 0xAA);
+        fill_with(&miss(cache().get_region(&file_two, 0, 0, 100)), 0xBB);
+
+        assert_eq!(&hit(cache().get_region(&file_one, 0, 0, 100))[..], &[0xAA; 100]);
+        assert_eq!(&hit(cache().get_region(&file_two, 0, 0, 100))[..], &[0xBB; 100]);
+    }
+
+    #[test]
+    fn dropping_a_runs_buffer_misses_on_reread_without_panicking() {
+        init_test_free_pool(8);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        fill_with(&miss(cache().get_region(&file, 0, 0, 100)), 0x33);
+        assert_eq!(&hit(cache().get_region(&file, 0, 0, 100))[..], &[0x33; 100]);
+
+        // `clear` drops every run and bumps the holding buffers' generations, the
+        // same index/generation effect a CLOCK eviction has on the runs it drops.
+        let dropped = cache().clear();
+
+        assert_eq!(dropped, 1, "the one cached run was dropped");
+        assert!(
+            !cache().get_region(&file, 0, 0, 100).missing().is_empty(),
+            "the run is gone, so the re-read misses and re-creates the entry",
+        );
+    }
+
+    #[test]
+    fn re_registering_a_file_drops_its_cached_runs() {
+        init_test_free_pool(8);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        fill_with(&miss(cache().get_region(&file, 0, 0, 100)), 0x44);
+
+        // Re-registering (e.g. a reused fd) drops the file's runs from the index,
+        // so the same read misses and re-reads rather than serving another file's
+        // bytes.
+        cache().open_entry(file.clone());
+
+        assert!(!cache().get_region(&file, 0, 0, 100).missing().is_empty());
+    }
+
     #[test]
     fn evict_does_not_steal_a_slot_from_the_free_pool() {
-        init_test_free_pool(2);
-        cache().open_entry(FD());
-        // A real cached region: its set ref_bit makes the CLOCK hand skip it, so
-        // the evictor reaches a slot that is still in the pool.
-        drop(miss(cache().get_region(&FD(), 0, 0, SB)));
+        init_test_free_pool(3);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        // A full-region read fills a buffer; the next region's read retires it, so
+        // there is one evictable cache buffer (holds runs, unpinned) while a seeded
+        // slot still sits free in the pool.
+        fill_with(&miss(cache().get_region(&file, 0, 0, BUFFER_SIZE)), 0x11);
+        fill_with(&miss(cache().get_region(&file, BUFFER_SIZE, 0, 100)), 0x22);
 
         let evicted = cache().evict();
         let still_pooled: Vec<usize> =
@@ -642,64 +839,50 @@ mod tests {
         );
     }
 
-    /// Regression for the parquetsink OOM: evicting a file's last cached region
-    /// must drop its outer `file_maps` entry. `file_maps` is keyed by a never-
-    /// reused `FileLocation`, so a lingering empty entry per file leaks unbounded.
+    /// Regression for the parquetsink OOM: evicting a file's last cached run must
+    /// drop its outer `file_maps` entry. The map is keyed by a never-reused
+    /// `FileLocation`, so a lingering empty entry per file leaks unbounded.
     #[test]
     fn evicting_a_files_last_region_prunes_its_outer_entry() {
-        init_test_free_pool(16);
-        let files: Vec<FileLocation> = (0..4)
-            .map(|_| {
-                FileLocation::Local(std::sync::Arc::new(
-                    std::fs::File::open("/dev/null").unwrap(),
-                ))
-            })
-            .collect();
-        for f in &files {
-            cache().open_entry(f.clone());
-            drop(miss(cache().get_region(f, 0, 0, SB)));
-        }
+        init_test_free_pool(4);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        // Fill a buffer with file's region, then a second file's read retires it,
+        // leaving file's run in an evictable (unpinned) cache buffer.
+        fill_with(&miss(cache().get_region(&file, 0, 0, BUFFER_SIZE)), 0x11);
+        let other = local_file();
+        cache().open_entry(other.clone());
+        fill_with(&miss(cache().get_region(&other, 0, 0, 100)), 0x22);
 
-        // Evict each cached region — one reclaim per call, over this test
-        // thread's own cache (memory_ctx is thread-local). Exactly `files.len()`
-        // calls, so we never spin `evict()` on an empty cache.
-        for _ in &files {
-            cache().evict();
-        }
+        cache().evict();
 
-        let file_maps = cache().file_maps.read().unwrap();
-        for f in &files {
-            assert!(
-                !file_maps.contains_key(f),
-                "an evicted file's outer file_maps entry was left behind — leak",
-            );
-        }
+        assert!(
+            !cache().file_maps.read().unwrap().contains_key(&file),
+            "evicting a file's last region must prune its outer file_maps entry (leak)",
+        );
     }
 
-    /// Regression: a registered file's reads call `get_region` many times while
-    /// the evictor may prune its entry between them (last region evicted). The
-    /// read path must re-create the entry and report a miss, not `unwrap`/`expect`
-    /// on the now-absent map entry.
+    /// Regression: the read path must tolerate the evictor pruning a file's entry
+    /// between reads, re-creating it and reporting a miss rather than panicking on
+    /// the now-absent map entry.
     #[test]
     fn reading_a_file_after_its_entry_was_pruned_does_not_panic() {
-        init_test_free_pool(8);
-        let f = FileLocation::Local(std::sync::Arc::new(
-            std::fs::File::open("/dev/null").unwrap(),
-        ));
-        cache().open_entry(f.clone());
-        drop(miss(cache().get_region(&f, 0, 0, SB)));
-
-        // Evict the only cached region — the prune drops f's outer entry.
+        init_test_free_pool(4);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        fill_with(&miss(cache().get_region(&file, 0, 0, BUFFER_SIZE)), 0x55);
+        let other = local_file();
+        cache().open_entry(other.clone());
+        fill_with(&miss(cache().get_region(&other, 0, 0, 100)), 0x66);
         cache().evict();
         assert!(
-            !cache().file_maps.read().unwrap().contains_key(&f),
-            "evicting the last region should prune the entry",
+            !cache().file_maps.read().unwrap().contains_key(&file),
+            "precondition: evicting the last region prunes the entry",
         );
 
-        // Reading f again must tolerate the absent entry: re-create it + miss.
-        drop(miss(cache().get_region(&f, 0, 0, SB)));
+        assert!(!cache().get_region(&file, 0, 0, BUFFER_SIZE).missing().is_empty());
         assert!(
-            cache().file_maps.read().unwrap().contains_key(&f),
+            cache().file_maps.read().unwrap().contains_key(&file),
             "re-reading a pruned file should re-create its entry",
         );
     }
@@ -713,228 +896,122 @@ mod tests {
     }
 
     #[test]
-    fn miss_then_fill_then_hit() {
-        init_test_free_pool(8);
-        cache().open_entry(FD());
-
-        // A fresh region: looking up the first sub-block misses with one block.
-        let region = miss(cache().get_region(&FD(), 0, 0, 10));
-        assert_eq!(region.missing().len(), 1);
-        let block = region.missing()[0].clone();
-        assert_eq!(
-            (block.first_sub_block, block.sub_block_count, block.len()),
-            (0, 1, SB)
-        );
-
-        // Read a pattern into that sub-block, drop the pin, and look up again.
-        read_and_commit(&block, 0xAB);
-        drop(region);
-
-        let bytes = hit(cache().get_region(&FD(), 0, 0, 10));
-        assert_eq!(&bytes[..], &[0xAB; 10]);
-    }
-
-    #[test]
     fn coalesces_contiguous_missing_sub_blocks_into_one_block() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
+        let file = local_file();
+        cache().open_entry(file.clone());
 
-        // Range spanning three sub-blocks, none present → a single coalesced run.
-        let region = miss(cache().get_region(&FD(), 0, 0, 2 * SB + 1));
-        assert_eq!(region.missing().len(), 1);
-        let block = &region.missing()[0];
-        assert_eq!(
-            (block.first_sub_block, block.sub_block_count, block.len()),
-            (0, 3, 3 * SB)
-        );
+        let lookup = miss(cache().get_region(&file, 0, 0, 2 * SB + 1));
+
+        assert_eq!(lookup.missing().len(), 1);
+        assert_eq!(lookup.missing()[0].file_offset(), 0);
+        assert_eq!(lookup.missing()[0].len(), 3 * SB);
     }
 
     #[test]
-    fn partial_validity_only_reports_the_holes() {
+    fn a_run_reports_only_its_uncommitted_sub_blocks_as_holes() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
+        let file = local_file();
+        cache().open_entry(file.clone());
 
-        // Fill sub-block 0 only.
-        let region = miss(cache().get_region(&FD(), 0, 0, 10));
-        read_and_commit(&region.missing()[0].clone(), 1);
-        drop(region);
+        // Reserve a three-sub-block run and commit only its middle sub-block.
+        let lookup = miss(cache().get_region(&file, 0, 0, 3 * SB));
+        let middle = lookup.missing()[0].carve_sub_block(SB, SB);
+        unsafe { std::ptr::write_bytes(middle.dest(), 0xCD, middle.len()) };
+        middle.commit();
+        drop(lookup);
 
-        // Now ask for sub-blocks 0..=2; only 1 and 2 are missing, coalesced.
-        let region = miss(cache().get_region(&FD(), 0, 0, 2 * SB + 1));
-        assert_eq!(region.missing().len(), 1);
-        let block = &region.missing()[0];
-        assert_eq!((block.first_sub_block, block.sub_block_count), (1, 2));
+        // The covering run now hits, reporting the two flanking holes separately.
+        let reread = miss(cache().get_region(&file, 0, 0, 3 * SB));
+
+        assert_eq!(reread.missing().len(), 2);
+        assert_eq!(reread.missing()[0].file_offset(), 0);
+        assert_eq!(reread.missing()[0].len(), SB);
+        assert_eq!(reread.missing()[1].file_offset(), 2 * SB);
+        assert_eq!(reread.missing()[1].len(), SB);
     }
 
-    #[test]
-    fn distinct_regions_use_distinct_slots() {
-        init_test_free_pool(8);
-        cache().open_entry(FD());
-
-        let r0 = miss(cache().get_region(&FD(), 0, 0, 10));
-        let r1 = miss(cache().get_region(&FD(), BUFFER_SIZE, 0, 10));
-        assert_ne!(r0.missing()[0].slot_idx, r1.missing()[0].slot_idx);
-    }
-
-    #[test]
-    fn second_column_in_same_region_shares_the_slot() {
-        init_test_free_pool(8);
-        cache().open_entry(FD());
-
-        // Two disjoint ranges within the same 2 MB region resolve to one slot.
-        let a = miss(cache().get_region(&FD(), 0, 0, 10));
-        let b = miss(cache().get_region(&FD(), 0, 5 * SB, 5 * SB + 10));
-        assert_eq!(a.missing()[0].slot_idx, b.missing()[0].slot_idx);
-        // ...and a's fill doesn't satisfy b's distant sub-block.
-        assert_eq!(b.missing()[0].first_sub_block, 5);
-    }
-
-    /// A hit returns the exact byte contents that were read in, reassembled
-    /// across several sub-blocks.
     #[test]
     fn hit_reassembles_bytes_across_sub_blocks() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
-        let region = miss(cache().get_region(&FD(), 0, SB - 5, 2 * SB + 5));
-        fill_pattern(0, &region);
-        drop(region);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        fill_pattern(&miss(cache().get_region(&file, 0, SB - 5, 2 * SB + 5)));
 
-        let bytes = hit(cache().get_region(&FD(), 0, SB - 5, 2 * SB + 5));
+        let bytes = hit(cache().get_region(&file, 0, SB - 5, 2 * SB + 5));
 
-        assert_pattern(&bytes, SB - 5);
         assert_eq!(bytes.len(), SB + 10);
+        assert_pattern(&bytes, SB - 5);
     }
 
-    /// A lookup returns exactly its requested `[start, end)` byte sub-slice, not
-    /// the whole (4 KB-rounded) sub-block it lives in.
     #[test]
     fn hit_returns_the_exact_requested_byte_range() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
-        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 0, SB)));
+        let file = local_file();
+        cache().open_entry(file.clone());
+        fill_pattern(&miss(cache().get_region(&file, 0, 0, SB)));
 
-        let bytes = hit(cache().get_region(&FD(), 0, 3, 9));
+        let bytes = hit(cache().get_region(&file, 0, 3, 9));
 
         assert_eq!(bytes.len(), 6);
         assert_pattern(&bytes, 3);
     }
 
-    /// Bytes committed by one lookup serve a later, differently-aligned lookup
-    /// that overlaps them.
     #[test]
     fn committed_bytes_serve_an_overlapping_later_lookup() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
-        let first = miss(cache().get_region(&FD(), 0, 0, 2 * SB));
-        fill_pattern(0, &first);
-        drop(first);
+        let file = local_file();
+        cache().open_entry(file.clone());
+        fill_pattern(&miss(cache().get_region(&file, 0, 0, 2 * SB)));
 
-        let bytes = hit(cache().get_region(&FD(), 0, SB / 2, SB + SB / 2));
+        let bytes = hit(cache().get_region(&file, 0, SB / 2, SB + SB / 2));
 
         assert_pattern(&bytes, SB / 2);
     }
 
-    /// The real IO path: take the bytes straight off the `CacheLookup` after
-    /// filling its own blocks (no second lookup).
     #[test]
     fn into_data_yields_the_freshly_filled_range() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
+        let file = local_file();
+        cache().open_entry(file.clone());
 
-        let region = miss(cache().get_region(&FD(), 0, 10, SB + 10));
-        fill_pattern(0, &region);
-        let bytes = region.into_data();
+        let lookup = miss(cache().get_region(&file, 0, 10, SB + 10));
+        fill_pattern(&lookup);
+        let bytes = lookup.into_data();
 
         assert_eq!(bytes.len(), SB);
         assert_pattern(&bytes, 10);
     }
 
-    /// Validity gaps split into separate runs, and filling them all makes the
-    /// whole range hit with the right bytes.
     #[test]
-    fn interleaved_gaps_split_then_fill_to_a_full_hit() {
+    fn get_splits_a_range_across_regions() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
-        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 0, 1))); // sub-block 0
-        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 2 * SB, 2 * SB + 1))); // sub-block 2
+        let file = local_file();
+        cache().open_entry(file.clone());
 
-        let gaps = miss(cache().get_region(&FD(), 0, 0, 4 * SB));
-        fill_pattern(0, &gaps);
-        drop(gaps);
-        let bytes = hit(cache().get_region(&FD(), 0, 0, 4 * SB));
-
-        assert_pattern(&bytes, 0);
-    }
-
-    /// Re-registering a file descriptor forgets everything previously cached for
-    /// it, so the next lookup re-reads.
-    #[test]
-    fn reopening_a_file_forgets_its_cached_regions() {
-        init_test_free_pool(8);
-        cache().open_entry(FD());
-        fill_pattern(0, &miss(cache().get_region(&FD(), 0, 0, SB)));
-
-        cache().open_entry(FD());
-
-        assert!(!cache().get_region(&FD(), 0, 0, SB).missing().is_empty());
-    }
-
-    /// The public range API hides bucketing: a range within one 2 MB window is a
-    /// single lookup; one straddling a window boundary splits into two, in order.
-    #[test]
-    fn get_splits_a_range_across_buckets() {
-        init_test_free_pool(8);
-        cache().open_entry(FD());
-
-        let within_one = cache().get(&FD(), 100, SB);
-        let across_two = cache().get(&FD(), BUFFER_SIZE - SB, 2 * SB);
+        let within_one = cache().get(&file, 100, SB);
+        let across_two = cache().get(&file, BUFFER_SIZE - SB, 2 * SB);
 
         assert_eq!(within_one.len(), 1);
         assert_eq!(across_two.len(), 2);
     }
 
-    /// A range straddling a *cached* window and an *uncached* one: the first part
-    /// hits, the second misses, and assembling them yields the right bytes.
     #[test]
-    fn get_spanning_cached_and_uncached_windows() {
+    fn get_spanning_cached_and_uncached_regions() {
         init_test_free_pool(8);
-        cache().open_entry(FD());
-        fill_pattern(
-            0,
-            &miss(cache().get_region(&FD(), 0, BUFFER_SIZE - SB, BUFFER_SIZE)),
-        );
+        let file = local_file();
+        cache().open_entry(file.clone());
+        fill_pattern(&miss(cache().get_region(&file, 0, BUFFER_SIZE - SB, BUFFER_SIZE)));
 
-        let parts = cache().get(&FD(), BUFFER_SIZE - SB, 2 * SB);
-        assert!(parts[0].missing().is_empty()); // cached window: full hit
-        assert!(!parts[1].missing().is_empty()); // uncached window: has holes
-        fill_pattern(BUFFER_SIZE, &parts[1]);
+        let parts = cache().get(&file, BUFFER_SIZE - SB, 2 * SB);
+        assert!(parts[0].missing().is_empty(), "cached region: full hit");
+        assert!(!parts[1].missing().is_empty(), "uncached region: has holes");
+        fill_pattern(&parts[1]);
 
-        let mut it = parts.into_iter();
-        let hit = it.next().unwrap().into_data();
-        let filled = it.next().unwrap().into_data();
-        assert_pattern(&hit, BUFFER_SIZE - SB);
-        assert_pattern(&filled, 0);
-    }
-
-    /// One window with *some sub-blocks cached and some not* is a single lookup
-    /// that reports only the holes in `missing`; its `into_data` returns the
-    /// cached bytes and the freshly-filled bytes together.
-    #[test]
-    fn a_partially_cached_window_is_one_miss_that_keeps_the_cached_bytes() {
-        init_test_free_pool(8);
-        cache().open_entry(FD());
-        read_and_commit(
-            &miss(cache().get_region(&FD(), 0, 0, 1)).missing()[0].clone(),
-            0xAA,
-        );
-
-        let m = miss(cache().get_region(&FD(), 0, 0, 2 * SB));
-        assert_eq!(m.missing().len(), 1);
-        assert_eq!(m.missing()[0].file_offset(), SB); // only the hole (sub-block 1)
-        read_and_commit(&m.missing()[0].clone(), 0xBB);
-        let bytes = m.into_data();
-
-        assert!(bytes[..SB].iter().all(|&b| b == 0xAA)); // cached sub-block kept
-        assert!(bytes[SB..].iter().all(|&b| b == 0xBB)); // hole freshly filled
+        let mut parts = parts.into_iter();
+        let cached = parts.next().unwrap().into_data();
+        let filled = parts.next().unwrap().into_data();
+        assert_pattern(&cached, BUFFER_SIZE - SB);
+        assert_pattern(&filled, BUFFER_SIZE);
     }
 }

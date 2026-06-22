@@ -1,9 +1,10 @@
 use crate::env::get_env_var_with_default;
-use crate::memory::file_cache::FileCache;
+use crate::memory::file_cache::{FileCache, SUB_BLOCKS_PER_BUFFER};
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
 use crate::worker::{NUM_WORKERS, WORKER_IDX};
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 
 static PANIC_ON_EVICT: LazyLock<bool> =
@@ -65,11 +66,13 @@ impl MemoryContextFactory {
     }
 
     pub fn create_memory_ctx(self) -> MemoryContext {
+        let allocator = RefCell::new(SubBlockAllocator::new(self.ring.clone()));
         MemoryContext {
             ring: self.ring,
             file_cache: self.file_cache,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
+            allocator,
         }
     }
 }
@@ -79,6 +82,11 @@ pub struct MemoryContext {
     file_cache: Arc<FileCache>,
     dirty_pool: FreePool,
     zeroed_pool: FreePool,
+    /// This worker's private sub-block allocator for packing small cached reads
+    /// into ring buffers. Holds its own [`Ring`] handle so releasing the pin never
+    /// depends on the thread-local context pointer (sound during teardown / test
+    /// re-init). Defined below [`MemoryContext`]'s `impl`.
+    allocator: RefCell<SubBlockAllocator>,
 }
 
 impl MemoryContext {
@@ -184,6 +192,92 @@ impl MemoryContext {
             // Nothing free! Let's evict from page cache
             return self.file_cache.evict();
         }
+    }
+
+    /// Allocate a contiguous run of `sub_block_count` sub-blocks in this worker's
+    /// current buffer for a cache miss, acquiring a fresh buffer (possibly
+    /// evicting) when the current one lacks room. A run never exceeds one buffer,
+    /// since callers split reads at 2 MB region boundaries.
+    ///
+    /// The caller records the returned allocation in the cache index and reads its
+    /// bytes into the buffer. The buffer stays pinned by this worker until it
+    /// fills up, so the run cannot be evicted out from under an in-flight read
+    /// (which also takes its own pin).
+    pub(crate) fn allocate_sub_blocks(&self, sub_block_count: usize) -> SubBlockAllocation {
+        debug_assert!(sub_block_count <= SUB_BLOCKS_PER_BUFFER);
+        let mut allocator = self.allocator.borrow_mut();
+
+        let has_room = allocator.buffer_index.is_some()
+            && allocator.next_sub_block + sub_block_count <= SUB_BLOCKS_PER_BUFFER;
+        if !has_room {
+            allocator.retire();
+            let mut write_buffer = self.get_write_buffer(false);
+            let buffer_index = write_buffer.slot_idx;
+            self.file_cache.prepare_fill_buffer(&mut write_buffer);
+            // Take the buffer from exclusive (WRITING) to one reader: this worker's
+            // pin. Forget the `WriteBuffer` so its `Drop` does not return the slot
+            // to the free pool — `SubBlockAllocator::retire` releases it instead.
+            self.ring.set_slot_zeroed(buffer_index, false);
+            self.ring.set_slot_used(buffer_index, 1, Ordering::Release);
+            std::mem::forget(write_buffer);
+            allocator.buffer_index = Some(buffer_index);
+            allocator.next_sub_block = 0;
+        }
+
+        let buffer_index = allocator.buffer_index.expect("just ensured a buffer");
+        let buffer_first_sub_block = allocator.next_sub_block;
+        allocator.next_sub_block += sub_block_count;
+        SubBlockAllocation {
+            buffer_index,
+            buffer_first_sub_block,
+            // Read fresh: the pinned buffer's generation can be bumped by `clear`.
+            generation: self.file_cache.buffer_generation(buffer_index),
+        }
+    }
+}
+
+/// Where [`MemoryContext::allocate_sub_blocks`] put a run: the ring buffer holding
+/// it, the sub-block offset within that buffer, and the buffer's generation at
+/// allocation time (the tag the run is cached under).
+pub(crate) struct SubBlockAllocation {
+    pub buffer_index: usize,
+    pub buffer_first_sub_block: usize,
+    pub generation: u64,
+}
+
+/// A worker's private bump allocator for cached runs: it owns the current ring
+/// buffer (one slot it holds a reader pin on, so the CLOCK hand cannot reclaim it
+/// while it is being filled) and the bump offset into it. [`retire`](Self::retire)
+/// drops the pin, turning the buffer into an ordinary evictable cache buffer.
+struct SubBlockAllocator {
+    ring: Arc<Ring>,
+    buffer_index: Option<usize>,
+    next_sub_block: usize,
+}
+
+impl SubBlockAllocator {
+    fn new(ring: Arc<Ring>) -> Self {
+        SubBlockAllocator {
+            ring,
+            buffer_index: None,
+            next_sub_block: 0,
+        }
+    }
+
+    /// Retire the current buffer by dropping this worker's reader pin, leaving it
+    /// as an evictable cache buffer.
+    fn retire(&mut self) {
+        if let Some(buffer_index) = self.buffer_index.take() {
+            self.ring.slots[buffer_index]
+                .used
+                .fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for SubBlockAllocator {
+    fn drop(&mut self) {
+        self.retire();
     }
 }
 
