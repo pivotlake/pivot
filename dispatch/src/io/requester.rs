@@ -39,7 +39,7 @@ pub struct IORequester {
     backend: IOBackend,
     /// In-flight local-file reads, keyed by their backend `user_data` id.
     pending_io_requests: HashMap<Identifier, DataFlowRequest<FsRequest>>,
-    /// Allocates backend disk-op ids — shared by fs reads here and the engine's
+    /// Allocates backend disk-op ids - shared by fs reads here and the engine's
     /// cache-file reads/write-backs, so a completion routes by which map holds it.
     next_id: Identifier,
     /// Remote reads, optionally served from the on-disk cache. Ring-less like the
@@ -117,7 +117,7 @@ impl IORequester {
         self.has_file_pending() || self.has_http_pending()
     }
 
-    /// Returns `true` if any disk read is in flight — operator reads here, plus
+    /// Returns `true` if any disk read is in flight - operator reads here, plus
     /// the engine's cache-file reads / write-backs (all on the shared backend).
     pub fn has_file_pending(&self) -> bool {
         !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
@@ -534,7 +534,7 @@ mod tests {
         assert_cached(&loc, 4096, 4096);
     }
 
-    /// Drive every pending read *and* write-back to completion — `fetch` only
+    /// Drive every pending read *and* write-back to completion - `fetch` only
     /// waits for the reads, but the disk-cache test must let the asynchronous
     /// write-backs land before it drops the in-memory cache.
     fn settle(requester: &mut IORequester) {
@@ -609,7 +609,7 @@ mod tests {
     }
 
     /// A run with cached blocks on both sides of a hole fetches only the interior
-    /// block and reassembles all three correctly — exercising a multi-piece group
+    /// block and reassembles all three correctly - exercising a multi-piece group
     /// (two cache reads + one HTTP fetch) and disk↔network byte stitching.
     #[test]
     fn a_split_read_fetches_only_the_interior_hole() {

@@ -142,10 +142,14 @@ pub struct RemoteFile {
     /// freshness is the store's concern), or `None` for a self-authenticating
     /// URL. Read per request, never on the URL's `Hash`/`Eq` path.
     auth: Option<AuthHeader>,
-    /// Stable object identity for the on-disk cache: `host` + path, *without* the
-    /// query string. A presigned URL's signature lives in the query and changes
-    /// every time the catalog re-signs, so it must be excluded — the bytes behind
-    /// `https://host/bucket/key?sig=A` and `...?sig=B` are the same object.
+    /// Stable object identity for the on-disk cache: the authority (`host` plus
+    /// any non-default port) + path, *without* the query string. S3 presigns its
+    /// read URLs, so the query holds a SigV4 signature that changes every time the
+    /// catalog re-signs; excluding it keeps `https://host/bucket/key?sig=A` and
+    /// `...?sig=B` mapped to one cache file. (GCS reads use a stable URL with a
+    /// `Bearer` header, so their query is empty anyway.) Including the port keeps
+    /// two endpoints that share a host but differ by port (e.g. two MinIO
+    /// instances) on separate cache files.
     cache_identity: String,
     /// Total object size in bytes (from the store listing). Lets the disk cache
     /// size its resident-block bitmap exactly, up front.
@@ -190,7 +194,6 @@ impl RemoteFile {
             })?;
 
         let path = url.path();
-        let cache_identity = format!("{host}\0{path}");
 
         let mut request_target = path.to_string();
         if let Some(query) = url.query() {
@@ -204,6 +207,11 @@ impl RemoteFile {
             Some(port) => format!("{host}:{port}"),
             None => host.clone(),
         };
+
+        // Key the disk cache by the authority (host plus any non-default port) and
+        // path, so two endpoints sharing a host but on different ports never
+        // collide onto one cache file.
+        let cache_identity = format!("{host_header}\0{path}");
 
         Ok(Self {
             id: NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed),
@@ -229,7 +237,7 @@ impl RemoteFile {
         self.size
     }
 
-    /// Stable identity (`host` + path, no query) for keying the on-disk cache.
+    /// Stable identity (authority + path, no query) for keying the on-disk cache.
     /// See [`cache_identity`](Self::cache_identity) field docs.
     pub fn cache_identity(&self) -> &str {
         &self.cache_identity

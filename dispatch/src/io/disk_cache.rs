@@ -1,11 +1,11 @@
 //! A persistent, disk-backed second tier for remote (HTTP) object reads.
 //!
 //! The in-memory [`FileCache`](crate::memory::file_cache::FileCache) caches 2 MB
-//! regions of every file — local or remote — in RAM. For remote objects that's
+//! regions of every file - local or remote - in RAM. For remote objects that's
 //! the *only* thing standing between a query and a network round-trip to S3/GCS.
 //! This disk cache adds a tier *below* RAM and *above* HTTP: fetched byte ranges
 //! are mirrored into a local file per object, so a later read of the same range
-//! — in this process or after a restart — comes off local disk instead of the
+//! (in this process or after a restart) comes off local disk instead of the
 //! network.
 //!
 //! ## Where it plugs in
@@ -21,11 +21,11 @@
 //! ## Layout
 //!
 //! One **sparse** file per object under the cache directory, named by a stable
-//! 128-bit hash of the object's identity (`host` + path, never the presign
-//! query). The file mirrors the object's byte layout: object byte `X` lives at
-//! file offset `X`, so only fetched ranges consume disk. A 128-bit digest makes
+//! 128-bit hash of the object's identity (its authority + path, never the
+//! presign query). The file mirrors the object's byte layout: object byte `X`
+//! lives at file offset `X`, so only fetched ranges consume disk. A 128-bit digest makes
 //! a filename collision between two distinct objects astronomically unlikely, so
-//! the name alone identifies the object — no on-disk identity check needed.
+//! the name alone identifies the object - no on-disk identity check needed.
 //!
 //! ## Validity
 //!
@@ -33,16 +33,16 @@
 //! object. On Linux that bitmap is reseeded from the file's hole structure
 //! (`SEEK_DATA`/`SEEK_HOLE`) the first time the object is touched, so the cache
 //! survives restarts with the data file as its own index. On other platforms
-//! (dev only) the bitmap starts empty — correct, just no cross-restart reuse.
+//! (dev only) the bitmap starts empty - correct, just no cross-restart reuse.
 //!
 //! ## Eviction
 //!
 //! Whole-object LRU under two limits: a resident-byte budget (caps disk use) and
-//! a max object count (caps in-memory entries and, critically, open fds — one per
+//! a max object count (caps in-memory entries and, critically, open fds - one per
 //! object; the byte budget alone wouldn't bound these, since many small objects
-//! stay under it while the count grows). Only *idle* objects are evicted — ones
+//! stay under it while the count grows). Only *idle* objects are evicted - ones
 //! no in-flight read or write-back still references (tracked by the object's
-//! `Arc` strong count) — so an actively-read object is never pulled out from
+//! `Arc` strong count) - so an actively-read object is never pulled out from
 //! under its readers. Both are therefore soft caps the in-flight working set may
 //! briefly exceed.
 
@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::warn;
 
-/// Disk-cache block granularity — matches the file cache's `SUB_BLOCK_SIZE` and
+/// Disk-cache block granularity - matches the file cache's `SUB_BLOCK_SIZE` and
 /// the direct-I/O alignment. Every cached range is a whole number of these.
 const BLOCK_SIZE: usize = 4096;
 
@@ -65,7 +65,7 @@ const BLOCK_SIZE: usize = 4096;
 /// file is found again after a restart) and cryptographic, so even adversarial
 /// object keys can't be *crafted* to collide onto one file: hitting a specific
 /// identity needs a second-preimage (~2^128, infeasible). The key alone
-/// identifies the object — no stored identity to verify against.
+/// identifies the object - no stored identity to verify against.
 fn hash_identity(identity: &str) -> u128 {
     let digest = blake3::hash(identity.as_bytes());
     let mut first16 = [0u8; 16];
@@ -84,7 +84,7 @@ pub struct Segment {
 /// A fixed atomic bitmap over a file's 4 KB blocks: bit `b` set means block `b`
 /// (bytes `[b*BLOCK_SIZE, (b+1)*BLOCK_SIZE)`) is resident on disk. Sized to the
 /// object up front from its known length, so it never grows and its bits flip
-/// lock-free — like the file cache's `ValidBitmap`.
+/// lock-free - like the file cache's `ValidBitmap`.
 struct BlockBitmap {
     words: Box<[AtomicU64]>,
 }
@@ -140,11 +140,9 @@ pub struct Object {
     file: Arc<File>,
     path: PathBuf,
     present: BlockBitmap,
-    /// The owning cache's global byte counter, bumped alongside `bytes` so the
-    /// budget tracks write-backs, not just the bytes found resident at open.
-    total: Arc<AtomicU64>,
-    /// Resident bytes attributed to this object (for the budget). Snapshotted at
-    /// eviction; `evicted` then stops further accounting.
+    /// Resident bytes attributed to this object (for the budget). The cache's
+    /// global total is summed from these under its lock, so this is the single
+    /// source of truth for the object's size; `evicted` then stops accounting.
     bytes: AtomicU64,
     /// CLOCK-free LRU: the global tick at the last access.
     last_used: AtomicU64,
@@ -155,7 +153,7 @@ pub struct Object {
 
 impl Object {
     /// The cache file descriptor. Valid for as long as the caller holds the
-    /// `Arc<Object>` it came from — even across an eviction, since the eviction
+    /// `Arc<Object>` it came from - even across an eviction, since the eviction
     /// only unlinks the path while outstanding `Arc`s keep the file open.
     pub fn fd(&self) -> RawFd {
         self.file.as_raw_fd()
@@ -163,7 +161,7 @@ impl Object {
 
     /// Split `[file_offset, file_offset + len)` into maximal present/absent runs
     /// against the resident bitmap. `len` and `file_offset` are `BLOCK_SIZE`
-    /// multiples (guaranteed by the caller — a `MissingBlock` is always block
+    /// multiples (guaranteed by the caller - a `MissingBlock` is always block
     /// aligned).
     pub fn split_into_segments(&self, file_offset: usize, len: usize) -> Vec<Segment> {
         debug_assert_eq!(file_offset % BLOCK_SIZE, 0);
@@ -196,8 +194,9 @@ impl Object {
     }
 
     /// Mark `[file_offset, file_offset + len)` resident after a write-back has
-    /// durably landed. Returns the bytes newly added to the global total (zero if
-    /// the object was evicted meanwhile, or the blocks were already present).
+    /// durably landed. Returns the bytes newly added to this object's resident set
+    /// (zero if the object was evicted meanwhile, or the blocks were already
+    /// present) so the caller can fold them into the cache's global budget.
     pub fn mark_present(&self, file_offset: usize, len: usize) -> u64 {
         if self.evicted.load(Ordering::Acquire) {
             return 0;
@@ -206,7 +205,6 @@ impl Object {
         let count = len / BLOCK_SIZE;
         let added = self.present.set_range(first_block, count) as u64 * BLOCK_SIZE as u64;
         self.bytes.fetch_add(added, Ordering::Relaxed);
-        self.total.fetch_add(added, Ordering::Relaxed);
         added
     }
 }
@@ -216,18 +214,26 @@ pub struct DiskCache {
     /// Resident-byte budget (caps disk usage).
     byte_budget: u64,
     /// Max number of cached objects (caps in-memory entries *and* open file
-    /// descriptors — one per object). The byte budget alone doesn't bound these:
+    /// descriptors - one per object). The byte budget alone doesn't bound these:
     /// many small objects stay under it while the count, and the fds, grow
     /// unbounded under churn.
     max_objects: usize,
     objects: RwLock<HashMap<u128, Arc<Object>>>,
-    total_bytes: Arc<AtomicU64>,
+    /// Resident-byte total for the budget, maintained incrementally: opens and
+    /// write-backs add, eviction subtracts. Exact in normal operation; a `clear`
+    /// racing an in-flight write-back can leave it high, which `needs_recompute`
+    /// flags for the next eviction to reconcile.
+    total_bytes: AtomicU64,
+    /// Set by [`clear`](Self::clear) - the only operation that drops objects whose
+    /// write-back bytes may still be in flight - to tell the next eviction to
+    /// reconcile `total_bytes` against the live set once, healing that drift.
+    needs_recompute: AtomicBool,
     tick: AtomicU64,
 }
 
 impl DiskCache {
     /// Open the disk cache at `dir` with a resident-byte budget and a max object
-    /// count (which bounds open fds — keep it below the process's fd limit). The
+    /// count (which bounds open fds - keep it below the process's fd limit). The
     /// server builds one from its `--disk-cache-*` flags and hands it to
     /// [`Dispatch::spin_up`](crate::Dispatch::spin_up).
     pub fn open(dir: PathBuf, byte_budget: u64, max_objects: usize) -> std::io::Result<Self> {
@@ -243,7 +249,8 @@ impl DiskCache {
             byte_budget,
             max_objects,
             objects: RwLock::new(HashMap::default()),
-            total_bytes: Arc::new(AtomicU64::new(0)),
+            total_bytes: AtomicU64::new(0),
+            needs_recompute: AtomicBool::new(false),
             tick: AtomicU64::new(0),
         })
     }
@@ -258,14 +265,14 @@ impl DiskCache {
         let identity = remote.cache_identity();
         let key = hash_identity(identity);
 
-        // Fast path: already cached — a read lock so concurrent hits don't
+        // Fast path: already cached - a read lock so concurrent hits don't
         // serialize.
         if let Some(obj) = self.objects.read().unwrap().get(&key) {
             obj.last_used.store(self.advance_tick(), Ordering::Relaxed);
             return Some(obj.clone());
         }
 
-        // Miss: open the file and reseed its bitmap *without* holding the lock —
+        // Miss: open the file and reseed its bitmap *without* holding the lock -
         // this does I/O (open + SEEK_HOLE) and must not block other workers.
         let obj = match self.create_object(key, remote.size()) {
             Ok(obj) => obj,
@@ -284,11 +291,14 @@ impl DiskCache {
                 .store(self.advance_tick(), Ordering::Relaxed);
             return Some(existing.clone());
         }
+        // Account the object's reseeded bytes up front so the lock-free counter
+        // stays accurate; `evict_locked` then trims only if a cap is exceeded.
         self.total_bytes
             .fetch_add(obj.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
         objects.insert(key, obj.clone());
         evict_locked(
             &self.total_bytes,
+            &self.needs_recompute,
             self.byte_budget,
             self.max_objects,
             &mut objects,
@@ -296,10 +306,22 @@ impl DiskCache {
         Some(obj)
     }
 
+    /// Fold a write-back's just-landed range into the cache: mark it resident on
+    /// `object` and add the new bytes to the global budget, evicting if that
+    /// pushes us over. The object owns its own resident-byte count; the cache owns
+    /// the global total, so the delta is applied here rather than inside `Object`.
+    pub(crate) fn mark_resident(&self, object: &Object, file_offset: usize, len: usize) {
+        let added = object.mark_present(file_offset, len);
+        if added > 0 {
+            self.total_bytes.fetch_add(added, Ordering::Relaxed);
+            self.enforce_budget();
+        }
+    }
+
     /// Bring the cache back within its byte budget by evicting idle objects. Cheap
     /// when already under it (one atomic load, no lock). Called after a write-back
     /// grows the resident set. The object-count cap is enforced at
-    /// [`open_object`](Self::open_object) instead — that's the only place the count
+    /// [`open_object`](Self::open_object) instead - that's the only place the count
     /// grows.
     pub(crate) fn enforce_budget(&self) {
         if self.total_bytes.load(Ordering::Relaxed) <= self.byte_budget {
@@ -307,17 +329,20 @@ impl DiskCache {
         }
         evict_locked(
             &self.total_bytes,
+            &self.needs_recompute,
             self.byte_budget,
             self.max_objects,
             &mut self.objects.write().unwrap(),
         );
     }
 
-    /// Drop every cached object — unlink its file and forget it — so subsequent
+    /// Drop every cached object - unlink its file and forget it - so subsequent
     /// reads miss the disk cache and re-fetch from the network. Returns the number
     /// of objects dropped. Backs the `drop_cache()` benchmarking hook for true
-    /// cold reads; sound only while no read is in flight (it unlinks files that
-    /// in-flight reads might still be using).
+    /// cold reads. An in-flight read keeps its file alive through its own `Arc`
+    /// (the fd outlives the unlink). A write-back landing concurrently can add its
+    /// bytes back after we reset the total, so we flag `needs_recompute`; the next
+    /// eviction reconciles the total against the live set, healing that drift.
     pub fn clear(&self) -> usize {
         let mut objects = self.objects.write().unwrap();
         let dropped = objects.len();
@@ -326,6 +351,7 @@ impl DiskCache {
             let _ = std::fs::remove_file(&obj.path);
         }
         self.total_bytes.store(0, Ordering::Relaxed);
+        self.needs_recompute.store(true, Ordering::Relaxed);
         dropped
     }
 
@@ -346,7 +372,6 @@ impl DiskCache {
             file: Arc::new(file),
             path,
             present,
-            total: self.total_bytes.clone(),
             bytes: AtomicU64::new(resident_bytes),
             last_used: AtomicU64::new(0),
             evicted: AtomicBool::new(false),
@@ -362,14 +387,26 @@ impl DiskCache {
 /// read or write-back is using its file. Because clones can only be made under
 /// the lock we hold, the count can't grow underneath us, so an idle object is
 /// safe to drop (closing its fd). An object actively being read therefore can't
-/// be evicted — both limits are soft caps the in-flight working set may briefly
+/// be evicted - both limits are soft caps the in-flight working set may briefly
 /// exceed.
 fn evict_locked(
     total_bytes: &AtomicU64,
+    needs_recompute: &AtomicBool,
     byte_budget: u64,
     max_objects: usize,
     objects: &mut HashMap<u128, Arc<Object>>,
 ) {
+    // A `clear()` may have left `total_bytes` overstated (a write-back's add that
+    // landed after it reset the total to zero). It flags that, so reconcile to the
+    // live-set sum once here - at most once per `clear()`, so the common,
+    // unflagged path stays O(1).
+    if needs_recompute.swap(false, Ordering::Relaxed) {
+        let live: u64 = objects
+            .values()
+            .map(|o| o.bytes.load(Ordering::Relaxed))
+            .sum();
+        total_bytes.store(live, Ordering::Relaxed);
+    }
     while total_bytes.load(Ordering::Relaxed) > byte_budget || objects.len() > max_objects {
         let victim = objects
             .iter()
@@ -429,7 +466,7 @@ fn open_cache_file(path: &Path) -> std::io::Result<File> {
 }
 
 /// Mark `present`'s blocks resident from the file's hole structure via
-/// `SEEK_DATA`/`SEEK_HOLE` — the data file is its own index, so the cache
+/// `SEEK_DATA`/`SEEK_HOLE` - the data file is its own index, so the cache
 /// survives restarts. Only the allocated (data) extents are marked present.
 #[cfg(target_os = "linux")]
 fn reseed_bitmap(present: &BlockBitmap, file: &File) {
@@ -461,8 +498,8 @@ fn reseed_bitmap(_present: &BlockBitmap, _file: &File) {}
 
 thread_local! {
     /// This worker thread's handle to the shared disk cache (or `None`). Set once
-    /// at worker startup so worker-thread code — e.g. the `drop_cache()` SQL
-    /// function — can reach it without threading it through every call site, the
+    /// at worker startup so worker-thread code - e.g. the `drop_cache()` SQL
+    /// function - can reach it without threading it through every call site, the
     /// same pattern as the worker waker.
     static WORKER_DISK_CACHE: RefCell<Option<Arc<DiskCache>>> = const { RefCell::new(None) };
 }
@@ -569,6 +606,13 @@ mod tests {
             .present
     }
 
+    /// Open `path`, mark its first block resident (folding it into the budget),
+    /// then drop the handle so the object is idle and eligible for eviction.
+    fn prime(cache: &DiskCache, path: &str) {
+        let object = cache.open_object(&remote(path)).unwrap();
+        cache.mark_resident(&object, 0, BLOCK_SIZE);
+    }
+
     #[test]
     fn a_hole_marked_present_becomes_resident() {
         let dir = tempfile::tempdir().unwrap();
@@ -585,14 +629,8 @@ mod tests {
         // One block of byte budget, no object-count limit (isolating the byte cap).
         let cache =
             DiskCache::open(dir.path().to_path_buf(), BLOCK_SIZE as u64, usize::MAX).unwrap();
-        cache
-            .open_object(&remote("/a"))
-            .unwrap()
-            .mark_present(0, BLOCK_SIZE);
-        cache
-            .open_object(&remote("/b"))
-            .unwrap()
-            .mark_present(0, BLOCK_SIZE);
+        prime(&cache, "/a");
+        prime(&cache, "/b");
 
         cache.enforce_budget();
 
@@ -605,11 +643,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path().to_path_buf(), 0, usize::MAX).unwrap();
         let in_use = cache.open_object(&remote("/held")).unwrap();
-        in_use.mark_present(0, BLOCK_SIZE);
-        cache
-            .open_object(&remote("/idle"))
-            .unwrap()
-            .mark_present(0, BLOCK_SIZE);
+        cache.mark_resident(&in_use, 0, BLOCK_SIZE);
+        prime(&cache, "/idle");
 
         cache.enforce_budget();
 
@@ -618,18 +653,17 @@ mod tests {
     }
 
     /// The object-count cap evicts idle LRU objects even when the byte budget is
-    /// nowhere near hit — bounding open fds / in-memory entries under churn. With
+    /// nowhere near hit - bounding open fds / in-memory entries under churn. With
     /// a huge byte budget but a 2-object cap, opening a 3rd object must drop the
     /// least-recently-used one (so its file is unlinked, leaving 2 on disk).
     #[test]
     fn over_object_count_evicts_idle_objects() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path().to_path_buf(), 1 << 30, 2).unwrap();
+        // The count cap is byte-independent, so just opening each object (which
+        // creates its file) drives the eviction.
         for name in ["/a", "/b", "/c"] {
-            cache
-                .open_object(&remote(name))
-                .unwrap()
-                .mark_present(0, BLOCK_SIZE);
+            cache.open_object(&remote(name)).unwrap();
         }
 
         let files = std::fs::read_dir(dir.path()).unwrap().count();
