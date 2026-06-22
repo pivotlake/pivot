@@ -67,17 +67,10 @@ jobs:
     if: ${{ inputs.use_gcp_runner && inputs.build_x86_64 }}
     runs-on: ubuntu-latest
     steps:
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/resume-gcp-runner
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: staging-404314
-      - name: Resume ci-runner2
-        run: |
-          gcloud compute instances resume ci-runner2 \
-            --project=staging-404314 --zone=me-west1-c
 
   deploy:
     needs: [matrix, start-ci]
