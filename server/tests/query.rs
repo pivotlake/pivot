@@ -183,13 +183,18 @@ async fn filtered_min_max_does_not_short_circuit(#[future] conn: Conn) {
     create_people_table(&conn, "people_minmax_filtered", dir.path()).await;
 
     select_one_i64(&conn, "SELECT drop_cache()").await;
-    let rows =
-        select_rows(&conn, "SELECT MIN(id), MAX(id) FROM people_minmax_filtered WHERE id > 1")
-            .await;
+    let rows = select_rows(
+        &conn,
+        "SELECT MIN(id), MAX(id) FROM people_minmax_filtered WHERE id > 1",
+    )
+    .await;
     let evicted = select_one_i64(&conn, "SELECT drop_cache()").await;
 
     assert_eq!(rows, vec![vec![Some("2".into()), Some("3".into())]]);
-    assert!(evicted >= 1, "a filtered aggregate must scan, not read stats");
+    assert!(
+        evicted >= 1,
+        "a filtered aggregate must scan, not read stats"
+    );
 }
 
 /// Regression: the metadata short-circuit only fires for integer/temporal
@@ -213,15 +218,19 @@ async fn global_min_max_does_not_short_circuit_double_column(#[future] conn: Con
     .await
     .unwrap();
 
-    let result = conn.simple_query("SELECT MIN(f), MAX(f) FROM doubles").await;
+    let result = conn
+        .simple_query("SELECT MIN(f), MAX(f) FROM doubles")
+        .await;
 
     if let Ok(msgs) = result {
         let rows: Vec<Vec<Option<String>>> = msgs
             .into_iter()
             .filter_map(|m| match m {
-                SimpleQueryMessage::Row(r) => {
-                    Some((0..r.len()).map(|i| r.get(i).map(|s| s.to_string())).collect())
-                }
+                SimpleQueryMessage::Row(r) => Some(
+                    (0..r.len())
+                        .map(|i| r.get(i).map(|s| s.to_string()))
+                        .collect(),
+                ),
                 _ => None,
             })
             .collect();
@@ -260,8 +269,11 @@ async fn filtered_count_star_is_correct(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_count_filtered", dir.path()).await;
 
-    let count =
-        select_one_i64(&conn, "SELECT COUNT(*) FROM people_count_filtered WHERE id > 1").await;
+    let count = select_one_i64(
+        &conn,
+        "SELECT COUNT(*) FROM people_count_filtered WHERE id > 1",
+    )
+    .await;
 
     assert_eq!(count, 2);
 }

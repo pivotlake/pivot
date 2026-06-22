@@ -128,10 +128,10 @@ impl PlanNode {
         // statistics). It must run before the child scan is compiled, since
         // succeeding means no scan happens at all. `try_compile_from_stats`
         // checks the rest of the shape (single bare-scan child, no predicates).
-        if let crate::Operator::Aggregate(agg) = &self.operator {
-            if let Some(spec) = agg.try_compile_from_stats(&self.inputs, dispatcher, ctx)? {
-                return Ok(spec);
-            }
+        if let crate::Operator::Aggregate(agg) = &self.operator
+            && let Some(spec) = agg.try_compile_from_stats(&self.inputs, dispatcher, ctx)?
+        {
+            return Ok(spec);
         }
 
         let mut inputs = Vec::with_capacity(self.inputs.len());

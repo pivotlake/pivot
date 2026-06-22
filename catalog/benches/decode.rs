@@ -2,24 +2,23 @@
 //! that dominates "decode-bound" queries. Profiling the real ClickBench-style
 //! queries showed that for many of them the dispatch *operator* is a sliver and
 //! the wall-time is spent in the scan: snappy-decompressing pages and decoding
-//! them into Arrow. Examples measured on a c8g.4xlarge:
-//!   * a `LIKE '%x%'` scan over the long URL column — ~73% `snap::decompress`,
-//!   * `ORDER BY <string/time> LIMIT 10` — 33–46% `snap::decompress`,
-//! with `RleDecoder::read`, the `bytes_view` plain/dict decoders, and
-//! `PrimitiveDict` making up most of the rest. None of that is exercised by the
-//! `dispatch` operator benches (which run on pre-built in-memory batches), so
-//! this bench covers the other half: the column reader.
+//! them into Arrow. Examples measured on a c8g.4xlarge: a `LIKE '%x%'` scan over
+//! the long URL column spent ~73% in `snap::decompress`, and an `ORDER BY
+//! <string/time> LIMIT 10` spent 33-46%, with `RleDecoder::read`, the
+//! `bytes_view` plain/dict decoders, and `PrimitiveDict` making up most of the
+//! rest. None of that is exercised by the `dispatch` operator benches (which run
+//! on pre-built in-memory batches), so this bench covers the other half: the
+//! column reader.
 //!
 //! It generates its own SNAPPY + dictionary Parquet file in a tempdir (no
 //! dependency on the 14 GB hits dataset), shaped to the measured statistics of
 //! the real columns so the encoding the writer picks — and therefore the decode
-//! path the reader takes — matches:
-//!   * `url`          — long (~88 B avg), high-cardinality strings → too many
-//!                      distinct per row group to dictionary-encode, so PLAIN
-//!                      byte-array pages (the URL/q20/q33 scan shape).
-//!   * `search_phrase`— ~87% empty, the rest ~31 B; low distinct per row group →
-//!                      DICTIONARY + RLE (the SearchPhrase/q12/q24 scan shape).
-//!   * `event_time`   — `i64` (the timestamp columns behind q24/q26/q42).
+//! path the reader takes matches. The `url` column is long (~88 B avg),
+//! high-cardinality strings, with too many distinct values per row group to
+//! dictionary-encode, so it lands in PLAIN byte-array pages (the URL/q20/q33 scan
+//! shape). `search_phrase` is ~87% empty and otherwise ~31 B, with low distinct
+//! per row group, so DICTIONARY + RLE (the SearchPhrase/q12/q24 scan shape).
+//! `event_time` is `i64` (the timestamp columns behind q24/q26/q42).
 //!
 //! Then it scans one column at a time with `table_input(..).collect()`, driving
 //! fetch → snappy-decompress → decode → Arrow materialize.
