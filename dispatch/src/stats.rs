@@ -8,7 +8,7 @@
 //! gated so it costs nothing — no clock reads, no counting — when a query didn't
 //! opt in.
 
-use crate::io::{DataFlowRequest, ReadLen};
+use crate::io::{DataFlowRequest, ReadyBytesLen};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -79,12 +79,12 @@ impl StatsCollector {
     /// Count `requests` as HTTP reads issued, total their bytes, and stamp each
     /// with the issue time, so its completion can be billed by
     /// [`record_http_time`](Self::record_http_time).
-    pub fn record_issued_http<R: ReadLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
+    pub fn record_issued_http<R: ReadyBytesLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
         self.record_issued(requests, |s| &mut s.http_requests, |s| &mut s.http_bytes);
     }
 
     /// As [`record_issued_http`](Self::record_issued_http), for disk reads.
-    pub fn record_issued_disk<R: ReadLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
+    pub fn record_issued_disk<R: ReadyBytesLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
         self.record_issued(requests, |s| &mut s.disk_requests, |s| &mut s.disk_bytes);
     }
 
@@ -113,7 +113,7 @@ impl StatsCollector {
         }
     }
 
-    fn record_issued<R: ReadLen>(
+    fn record_issued<R: ReadyBytesLen>(
         &mut self,
         requests: &mut [DataFlowRequest<R>],
         count: impl FnOnce(&mut DataFlowStats) -> &mut u64,
@@ -121,7 +121,10 @@ impl StatsCollector {
     ) {
         if let Some(stats) = &mut self.stats {
             *count(stats) += requests.len() as u64;
-            *bytes(stats) += requests.iter().map(|r| r.request.read_len()).sum::<u64>();
+            *bytes(stats) += requests
+                .iter()
+                .map(|r| r.request.ready_bytes_len())
+                .sum::<u64>();
             let now = Instant::now();
             for request in requests.iter_mut() {
                 request.submitted_at = Some(now);
