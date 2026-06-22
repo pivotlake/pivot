@@ -343,14 +343,19 @@ impl Worker {
             }
 
             while let Some(mut requests) = flow.get_next_http_request() {
-                flow.stats().record_issued_http(&mut requests);
+                flow.stats().stamp_issued(&mut requests);
                 for r in requests {
                     // Submitting a remote read can fail (socket exhaustion, TLS
-                    // setup). Fail just this dataflow rather than propagating —
-                    // that would panic the worker and take the whole server down.
-                    if let Err(e) = self.io.request_http(r) {
-                        flow.bail_and_cancel(e.into());
-                        continue 'flows;
+                    // setup). Fail just this dataflow rather than propagating, which
+                    // would panic the worker and take the whole server down. The
+                    // disk cache resolves how each read splits across tiers, so the
+                    // per-tier counts come from what it returns.
+                    match self.io.request_http(r) {
+                        Ok(split) => flow.stats().record_issued_remote(split),
+                        Err(e) => {
+                            flow.bail_and_cancel(e.into());
+                            continue 'flows;
+                        }
                     }
                 }
 
@@ -388,9 +393,9 @@ impl Worker {
                         data_flow.process_fs(r.operator_idx, r.request);
                     }
                 }
-                Ok(Completion::Http(r)) => {
+                Ok(Completion::Http(r, time)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_http_time(r.submitted_at);
+                        data_flow.stats().record_remote_time(time);
                         data_flow.process_http(r.operator_idx, r.request);
                     }
                 }

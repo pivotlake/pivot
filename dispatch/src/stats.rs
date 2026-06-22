@@ -8,25 +8,36 @@
 //! gated so it costs nothing — no clock reads, no counting — when a query didn't
 //! opt in.
 
-use crate::io::{DataFlowRequest, ReadyBytesLen};
+use crate::io::{DataFlowRequest, ReadyBytesLen, RemoteReadSplit, RemoteReadTime};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Execution counters for one dataflow, summed across the workers that ran it.
 ///
-/// All three of `cpu`, `http_time`, and `disk_time` are *sums* (over workers,
-/// and — for the IO times — over in-flight reads), so they can each exceed the
-/// query's wall time. The shape they reveal is the point: a high `*_time`
-/// relative to `cpu` means the dataflow spent its time waiting on reads, and
-/// `*_time / *_requests` is the average read latency.
+/// The `cpu` and `*_time` figures are sums (over workers, and for the IO times
+/// over in-flight reads), so they can each exceed the query's wall time. The
+/// shape they reveal is the point: a high `*_time` relative to `cpu` means the
+/// dataflow spent its time waiting on reads, and `*_time / *_requests` is the
+/// average read latency. A remote read split across tiers counts each piece in
+/// its own tier, so the http and disk-cache counters never hide each other.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct DataFlowStats {
-    /// HTTP range reads issued (remote object reads).
+    /// HTTP fetches issued, one per hole piece of a remote read. A read split
+    /// across the cache and the network counts a fetch here and a cache read under
+    /// `disk_cache_requests`. Pairs with `http_time` for an average fetch latency.
     pub http_requests: u64,
-    /// Bytes read over those HTTP reads, summed over every read.
+    /// Bytes fetched over the network (the hole pieces), summed over every fetch.
     pub http_bytes: u64,
-    /// Wall time those HTTP reads were in flight, summed over every read.
+    /// Wall time the network fetches were in flight, summed over every fetch.
     pub http_time: Duration,
+    /// Cache-file reads issued, one per resident piece of a remote read (a hit
+    /// serving a read or part of one). Pairs with `disk_cache_time`.
+    pub disk_cache_requests: u64,
+    /// Bytes served from the on-disk cache file (the resident pieces), summed over
+    /// every cache read.
+    pub disk_cache_bytes: u64,
+    /// Wall time the cache-file reads were in flight, summed over every cache read.
+    pub disk_cache_time: Duration,
     /// Filesystem block reads issued (local object reads).
     pub disk_requests: u64,
     /// Bytes read over those disk reads, summed over every read.
@@ -44,6 +55,9 @@ impl DataFlowStats {
         self.http_requests += other.http_requests;
         self.http_bytes += other.http_bytes;
         self.http_time += other.http_time;
+        self.disk_cache_requests += other.disk_cache_requests;
+        self.disk_cache_bytes += other.disk_cache_bytes;
+        self.disk_cache_time += other.disk_cache_time;
         self.disk_requests += other.disk_requests;
         self.disk_bytes += other.disk_bytes;
         self.disk_time += other.disk_time;
@@ -76,27 +90,58 @@ impl StatsCollector {
         self.stats.is_some()
     }
 
-    /// Count `requests` as HTTP reads issued, total their bytes, and stamp each
-    /// with the issue time, so its completion can be billed by
-    /// [`record_http_time`](Self::record_http_time).
-    pub fn record_issued_http<R: ReadyBytesLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
-        self.record_issued(requests, |s| &mut s.http_requests, |s| &mut s.http_bytes);
+    /// Stamp each read with its issue time so its completion can bill the read's
+    /// in-flight latency. Shared by the local-filesystem and remote submit paths.
+    pub fn stamp_issued<R>(&mut self, requests: &mut [DataFlowRequest<R>]) {
+        if self.stats.is_some() {
+            let now = Instant::now();
+            for request in requests.iter_mut() {
+                request.submitted_at = Some(now);
+            }
+        }
     }
 
-    /// As [`record_issued_http`](Self::record_issued_http), for disk reads.
+    /// Count `requests` as local-filesystem reads issued, total their bytes, and
+    /// stamp them for [`record_disk_time`](Self::record_disk_time).
     pub fn record_issued_disk<R: ReadyBytesLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
-        self.record_issued(requests, |s| &mut s.disk_requests, |s| &mut s.disk_bytes);
+        if let Some(stats) = &mut self.stats {
+            stats.disk_requests += requests.len() as u64;
+            stats.disk_bytes += requests
+                .iter()
+                .map(|r| r.request.ready_bytes_len())
+                .sum::<u64>();
+        }
+        self.stamp_issued(requests);
     }
 
-    /// Bill a completed HTTP read's in-flight time, given the `submitted_at` stamp
-    /// [`record_issued_http`](Self::record_issued_http) left on it.
-    pub fn record_http_time(&mut self, submitted_at: Option<Instant>) {
-        self.record_io_time(submitted_at, |s| &mut s.http_time);
+    /// Count one remote read's per-piece split: each piece adds a request and its
+    /// bytes under the tier that served it (the on-disk cache or the network).
+    /// Unlike the disk path this can't count at stamp time, since how a read
+    /// splits across the tiers is known only once the cache is consulted.
+    pub fn record_issued_remote(&mut self, split: RemoteReadSplit) {
+        if let Some(stats) = &mut self.stats {
+            stats.disk_cache_requests += split.disk_cache_requests;
+            stats.disk_cache_bytes += split.disk_cache_bytes;
+            stats.http_requests += split.http_requests;
+            stats.http_bytes += split.http_bytes;
+        }
     }
 
-    /// As [`record_http_time`](Self::record_http_time), for a disk read.
+    /// Bill a completed remote read's in-flight time, each piece's wait charged to
+    /// the tier that served it (see [`RemoteReadTime`]).
+    pub fn record_remote_time(&mut self, time: RemoteReadTime) {
+        if let Some(stats) = &mut self.stats {
+            stats.http_time += time.http;
+            stats.disk_cache_time += time.disk_cache;
+        }
+    }
+
+    /// Bill a completed local-filesystem read's in-flight time, from the
+    /// `submitted_at` stamp [`record_issued_disk`](Self::record_issued_disk) left.
     pub fn record_disk_time(&mut self, submitted_at: Option<Instant>) {
-        self.record_io_time(submitted_at, |s| &mut s.disk_time);
+        if let (Some(stats), Some(submitted_at)) = (&mut self.stats, submitted_at) {
+            stats.disk_time += submitted_at.elapsed();
+        }
     }
 
     /// Add `elapsed` to the dataflow's operator CPU time.
@@ -110,35 +155,6 @@ impl StatsCollector {
     pub fn report(&self) {
         if let Some(stats) = self.stats {
             let _ = self.tx.send(stats);
-        }
-    }
-
-    fn record_issued<R: ReadyBytesLen>(
-        &mut self,
-        requests: &mut [DataFlowRequest<R>],
-        count: impl FnOnce(&mut DataFlowStats) -> &mut u64,
-        bytes: impl FnOnce(&mut DataFlowStats) -> &mut u64,
-    ) {
-        if let Some(stats) = &mut self.stats {
-            *count(stats) += requests.len() as u64;
-            *bytes(stats) += requests
-                .iter()
-                .map(|r| r.request.ready_bytes_len())
-                .sum::<u64>();
-            let now = Instant::now();
-            for request in requests.iter_mut() {
-                request.submitted_at = Some(now);
-            }
-        }
-    }
-
-    fn record_io_time(
-        &mut self,
-        submitted_at: Option<Instant>,
-        field: impl FnOnce(&mut DataFlowStats) -> &mut Duration,
-    ) {
-        if let (Some(stats), Some(submitted_at)) = (&mut self.stats, submitted_at) {
-            *field(stats) += submitted_at.elapsed();
         }
     }
 }
