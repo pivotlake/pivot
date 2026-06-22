@@ -26,5 +26,5 @@ pub mod store;
 pub mod test_support;
 
 pub use catalog::{CatalogTable, Error, ParquetCatalog, Result, TableBinding};
-pub use manifest::{ManifestEntry, SortBounds};
+pub use manifest::{ManifestEntry, PartitionEqFilter, SortBounds};
 pub use store::FileRef;

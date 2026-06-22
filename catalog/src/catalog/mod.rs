@@ -39,7 +39,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::manifest::{self, CatalogManifest, CatalogManifestTableEntry, TableManifest};
+use crate::manifest::{
+    self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
+};
 use crate::parquet::{ParquetTable, ParquetTableError};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
@@ -406,6 +408,11 @@ impl Catalog for ParquetCatalog {
     }
 }
 
+/// One pinned scan view per `(table name, partition filter)`. The filter
+/// half is each `(column, JSON constant)` sorted, the hashable form of the
+/// predicates.
+type PinnedScanViews = HashMap<(String, Vec<(String, String)>), Arc<ParquetTable>>;
+
 /// One query's [`QueryContext`]: the concrete context a [`TableBinding`]
 /// downcasts to. The first time a scan asks for a table it reloads the master to
 /// the latest committed version and pins the resulting row groups; later asks
@@ -414,19 +421,41 @@ impl Catalog for ParquetCatalog {
 /// one consistent snapshot.
 pub(super) struct ParquetQueryContext {
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    pinned: Mutex<HashMap<String, Arc<ParquetTable>>>,
+    /// One pinned scan view per `(table, its partition filter)`. The key groups
+    /// exactly the asks that must agree: a scan and its later materialize share a
+    /// `(name, filters)`, so they pin the same view and address the same row-group
+    /// indices. Different filters (a self-join's branches) get their own views,
+    /// which is correct — they never share an index space. The filter half is each
+    /// `(column, JSON constant)` sorted, the hashable form of the predicates.
+    pinned: Mutex<PinnedScanViews>,
 }
 
 impl ParquetQueryContext {
-    /// Table `name`'s current committed row groups — reloaded to the latest
-    /// version and pinned on first ask, returned from the pin thereafter. Errors
-    /// if the table no longer exists (dropped since planning) or the reload
-    /// fails, rather than scanning a stale or empty file set.
-    pub(super) fn parquet(&self, name: &str) -> CatalogResult<Arc<ParquetTable>> {
-        if let Some(parquet) = self.pinned.lock().unwrap().get(name) {
+    /// Table `name`'s committed row groups for the files that can match
+    /// `partition_filters` — the partition-pruned scan view, pinned on first ask
+    /// and returned from the pin thereafter. Footers are fetched lazily here, only
+    /// for the surviving partitions, so a one-partition query never reads every
+    /// other partition's footer. Errors if the table no longer exists (dropped
+    /// since planning) or the reload fails, rather than scanning a stale or empty
+    /// file set.
+    pub(super) fn parquet(
+        &self,
+        name: &str,
+        partition_filters: impl Iterator<Item = PartitionEqFilter>,
+    ) -> CatalogResult<Arc<ParquetTable>> {
+        let filters: Vec<PartitionEqFilter> = partition_filters.collect();
+        let mut key_filters: Vec<(String, String)> = filters
+            .iter()
+            .map(|f| (f.column.clone(), f.value.to_string()))
+            .collect();
+        key_filters.sort(); // filter order doesn't change the view
+        let key = (name.to_string(), key_filters);
+        if let Some(parquet) = self.pinned.lock().unwrap().get(&key) {
             return Ok(parquet.clone());
         }
 
+        // Build the view: take the master copy, advance its manifest (no footer
+        // I/O), then fetch footers for just the surviving partitions.
         let mut table = self
             .tables
             .read()
@@ -438,25 +467,16 @@ impl ParquetQueryContext {
                     format!("table {name:?} no longer exists (dropped since planning?)").into(),
                 )
             })?;
-        // Reload to the latest committed version, publishing the advanced copy so
-        // a later query's reload finds it current and re-fetches no footers. Held
-        // under no lock — the manifest LIST and footer fetch must not block
-        // another table's resolution on the pin.
-        if table
-            .refresh()
-            .map_err(|e| CatalogError::Other(Box::new(e)))?
-        {
-            self.tables
-                .write()
-                .unwrap()
-                .insert(name.to_string(), table.clone());
-        }
-
-        let parquet = table.parquet();
-        self.pinned
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), parquet.clone());
+        table
+            .reload_manifest_only()
+            .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        let parquet = table
+            .parquet(&filters)
+            .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        // Publish the warmed copy (advanced version + the footers just fetched) so
+        // a later query starts current and re-fetches nothing it already holds.
+        self.tables.write().unwrap().insert(name.to_string(), table);
+        self.pinned.lock().unwrap().insert(key, parquet.clone());
         Ok(parquet)
     }
 }

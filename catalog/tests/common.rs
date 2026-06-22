@@ -110,7 +110,7 @@ pub fn parquet_table(
 pub fn current_parquet(catalog: &catalog::ParquetCatalog, name: &str) -> Arc<ParquetTable> {
     let mut table = catalog.table_handle(name).expect("table exists");
     table.refresh().expect("manifest reload");
-    table.parquet()
+    table.parquet(&[]).expect("build scan view")
 }
 
 /// Load a `ParquetTable` from an already-populated directory. Drives the

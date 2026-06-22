@@ -5,11 +5,13 @@
 
 use std::sync::Arc;
 
+use crate::manifest::PartitionEqFilter;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
-use arrow_array::{Array, ArrayRef, Scalar};
+use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
+use arrow_schema::{Field, Schema};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
     Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
@@ -69,8 +71,52 @@ impl TableBinding {
             .ok_or_else(|| {
                 CatalogError::Other("query context is not a ParquetQueryContext".into())
             })?;
-        ctx.parquet(&self.name)
+        ctx.parquet(&self.name, self.partition_filters())
     }
+
+    /// This binding's pushed equality predicates as partition filters: the column
+    /// name and the constant encoded to JSON. The catalog intersects these with
+    /// the table's partition columns, so yielding every equality predicate (not
+    /// just ones on partition columns, which the binding can't tell apart) is fine
+    /// — a non-partition column prunes no files. A constant arrow-json can't encode
+    /// is dropped (it just won't prune files).
+    fn partition_filters(&self) -> impl Iterator<Item = PartitionEqFilter> + '_ {
+        self.predicates
+            .iter()
+            .filter(|p| matches!(p.compare_type, CompareType::Equal))
+            .filter_map(|p| {
+                Some(PartitionEqFilter {
+                    column: self.columns.get(p.column_idx)?.name.clone(),
+                    value: scalar_to_json(&p.value)?,
+                })
+            })
+    }
+}
+
+/// Encode a one-element scalar to JSON exactly as the partitioning sink encodes a
+/// partition tuple (both via arrow-json), so the query's constant and the file's
+/// recorded value compare as equal `serde_json::Value`s for any type — strings,
+/// integers, bools alike. `None` if arrow-json can't encode the type, which just
+/// means the constant prunes no files.
+fn scalar_to_json(scalar: &Scalar<ArrayRef>) -> Option<serde_json::Value> {
+    let array = scalar.get().0;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "v",
+            array.data_type().clone(),
+            true,
+        )])),
+        vec![array.slice(0, 1)],
+    )
+    .ok()?;
+
+    let mut buffer = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(&mut buffer);
+    writer.write(&batch).ok()?;
+    writer.finish().ok()?;
+    // arrow-json emits a JSON array of row objects; we wrote exactly one row.
+    let rows: serde_json::Value = serde_json::from_slice(&buffer).ok()?;
+    rows.as_array()?.first()?.as_object()?.get("v").cloned()
 }
 
 impl Table for TableBinding {
@@ -239,5 +285,25 @@ impl TableBinding {
             })
         });
         parquet
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scalar_to_json;
+    use arrow_array::{ArrayRef, BooleanArray, Int32Array, Scalar, StringViewArray};
+    use std::sync::Arc;
+
+    // DuckDB pushes a string constant as a StringViewArray, so the partition
+    // value the sink stamped (a JSON string) and this constant must encode alike.
+    #[test]
+    fn encodes_scalars_as_the_partition_tuples_json() {
+        let utf8view = Scalar::new(Arc::new(StringViewArray::from(vec!["svc-a"])) as ArrayRef);
+        let int32 = Scalar::new(Arc::new(Int32Array::from(vec![7])) as ArrayRef);
+        let boolean = Scalar::new(Arc::new(BooleanArray::from(vec![true])) as ArrayRef);
+
+        assert_eq!(scalar_to_json(&utf8view), Some(serde_json::json!("svc-a")));
+        assert_eq!(scalar_to_json(&int32), Some(serde_json::json!(7)));
+        assert_eq!(scalar_to_json(&boolean), Some(serde_json::json!(true)));
     }
 }
