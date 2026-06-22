@@ -123,19 +123,14 @@ impl PlanNode {
         ctx: &dyn QueryContext,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Peephole: an unfiltered global MIN/MAX over plain columns is fully
-        // determined by table metadata (e.g. parquet row-group statistics).
-        // It must run before the child scan is compiled, since succeeding means
-        // no scan happens at all.
+        // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
+        // fully determined by table metadata (e.g. parquet row-group
+        // statistics). It must run before the child scan is compiled, since
+        // succeeding means no scan happens at all. `try_compile_from_stats`
+        // checks the rest of the shape (single bare-scan child, no predicates).
         if let crate::Operator::Aggregate(agg) = &self.operator {
-            if let [child] = self.inputs.as_slice() {
-                if let crate::Operator::Input(scan) = &child.operator {
-                    if child.inputs.is_empty() {
-                        if let Some(spec) = agg.try_compile_from_stats(scan, dispatcher, ctx)? {
-                            return Ok(spec);
-                        }
-                    }
-                }
+            if let Some(spec) = agg.try_compile_from_stats(&self.inputs, dispatcher, ctx)? {
+                return Ok(spec);
             }
         }
 
