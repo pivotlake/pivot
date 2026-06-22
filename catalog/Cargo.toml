@@ -11,6 +11,9 @@ arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-ord = { path = "../arrow-rs/arrow-ord" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
+# Encode a pushed-down constant to the same JSON a partition tuple is stamped
+# with (ingest uses arrow-json too), so partition pruning compares like for like.
+arrow-json = { path = "../arrow-rs/arrow-json" }
 thiserror = "2.0.18"
 tracing = "0.1"
 bytes = "1.11.0"

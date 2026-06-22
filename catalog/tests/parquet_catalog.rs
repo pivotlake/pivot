@@ -13,7 +13,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 use catalog::store::ObjectPath;
-use catalog::{ParquetCatalog, TableBinding};
+use catalog::{ParquetCatalog, PartitionEqFilter, TableBinding};
 use common::current_parquet;
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
@@ -550,4 +550,143 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);
+}
+
+/// Write `file_name` into `dir` with one row group per value in `ids`, so a file
+/// can hold several row groups that all share one `id` (the shape the partition
+/// writer emits: one file per partition value, many row groups inside it).
+fn write_ids_one_group_each(dir: &Path, file_name: &str, ids: &[i32]) {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batches: Vec<RecordBatch> = ids
+        .iter()
+        .map(|i| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![*i]))]).unwrap()
+        })
+        .collect();
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.join(file_name)).unwrap(),
+        schema,
+        Some(props),
+    )
+    .unwrap();
+    for batch in &batches {
+        writer.write(batch).unwrap();
+    }
+    writer.close().unwrap();
+}
+
+/// A file whose every row group shares one partition value is fully pruned by a
+/// filter on the partition column: each row group has min == max == that value,
+/// so the existing min/max stats prune drops the whole irrelevant file without
+/// any partition-specific read path. This is why partition_by needs no special
+/// pruning today — one-partition-per-file makes it fall out of stats pruning.
+#[test]
+fn filter_on_partition_column_prunes_whole_single_partition_file() {
+    let dir = TempDir::new().unwrap();
+    write_ids_one_group_each(dir.path(), "part-1.parquet", &[1, 1, 1]);
+    write_ids_one_group_each(dir.path(), "part-2.parquet", &[2, 2, 2]);
+    let columns = vec![Column {
+        name: "id".to_string(),
+        col_type: Type::Int32,
+    }];
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let mut table = catalog.binding("t").unwrap();
+    assert_eq!(row_group_count(&catalog, "t", &table), 6);
+
+    table
+        .pushdown_filter(col_eq_filter(0, int_constant(1)))
+        .unwrap();
+
+    // `id = 1` excludes the part-2 file's three row groups entirely; only the
+    // part-1 file's three survive.
+    assert_eq!(row_group_count(&catalog, "t", &table), 3);
+}
+
+/// A table partitioned by `name` with one committed file per partition: a
+/// one-row-group `keep` file and a three-row-group `drop` file, each tagged with
+/// its partition tuple. The distinct group counts let a build's group count name
+/// exactly which files it fetched. Files are written *after* `CREATE TABLE` (over
+/// an empty dir) so they arrive through the partition-recording append, not as
+/// untagged create-time discoveries.
+fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
+    let dir = TempDir::new().unwrap();
+    let request = CreateTableRequest {
+        name: "p".to_string(),
+        columns: vec![
+            Column {
+                name: "id".to_string(),
+                col_type: Type::Int32,
+            },
+            Column {
+                name: "name".to_string(),
+                col_type: Type::Utf8,
+            },
+        ],
+        options: HashMap::from([
+            ("path".to_string(), dir.path().to_string_lossy().into_owned()),
+            ("partition_by".to_string(), "name".to_string()),
+        ]),
+        if_not_exists: false,
+    };
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, request).unwrap();
+
+    write_ids_one_group_each(dir.path(), "keep.parquet", &[1]);
+    write_ids_one_group_each(dir.path(), "drop.parquet", &[2, 2, 2]);
+    let mut table = catalog.table_handle("p").unwrap();
+    table
+        .append_data_file(
+            ObjectPath::new("keep.parquet"),
+            &std::fs::read(dir.path().join("keep.parquet")).unwrap(),
+            Some(serde_json::json!({ "name": "keep" })),
+            None,
+        )
+        .unwrap();
+    table
+        .append_data_file(
+            ObjectPath::new("drop.parquet"),
+            &std::fs::read(dir.path().join("drop.parquet")).unwrap(),
+            Some(serde_json::json!({ "name": "drop" })),
+            None,
+        )
+        .unwrap();
+    (dir, catalog)
+}
+
+fn name_eq(value: &str) -> PartitionEqFilter {
+    PartitionEqFilter {
+        column: "name".to_string(),
+        value: serde_json::json!(value),
+    }
+}
+
+#[test]
+fn partition_filter_builds_only_the_matching_partitions_files() {
+    let (_dir, catalog) = table_partitioned_by_name();
+
+    let mut table = catalog.table_handle("p").unwrap();
+    table.reload_manifest_only().unwrap();
+    let kept = table.parquet(&[name_eq("keep")]).unwrap();
+
+    // Only the one-group `keep` file is fetched; the three-group `drop` file is
+    // skipped before its footer is read.
+    assert_eq!(kept.row_groups().len(), 1);
+}
+
+#[test]
+fn no_partition_filter_builds_every_partitions_files() {
+    let (_dir, catalog) = table_partitioned_by_name();
+
+    let mut table = catalog.table_handle("p").unwrap();
+    table.reload_manifest_only().unwrap();
+    let all = table.parquet(&[]).unwrap();
+
+    // Without a filter both files are fetched: keep's 1 group + drop's 3.
+    assert_eq!(all.row_groups().len(), 4);
 }
