@@ -30,7 +30,7 @@ const RING_SIZE: u32 = 64;
 ///
 /// A single per-core io_uring serves **both** disk reads and HTTP(S) range reads
 /// (the standard io_uring pattern): file reads are one SQE→one CQE, while HTTP
-/// reads are driven by the ring-less [`HttpEngine`], which submits its socket SQEs
+/// reads are driven by the ring-less `HttpEngine`, which submits its socket SQEs
 /// onto this same ring. Completions are disambiguated by the `HTTP_TAG` bit in
 /// `user_data`.
 ///
@@ -43,7 +43,7 @@ pub struct IORequester {
     /// cache-file reads/write-backs, so a completion routes by which map holds it.
     next_id: Identifier,
     /// Remote reads, optionally served from the on-disk cache. Ring-less like the
-    /// underlying [`HttpEngine`]: it borrows `backend` (and `next_id`) to submit.
+    /// underlying `HttpEngine`: it borrows `backend` (and `next_id`) to submit.
     http: CachedHttpEngine,
 }
 

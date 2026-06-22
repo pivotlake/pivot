@@ -1,7 +1,7 @@
 //! [`StrMin<A>`](StrMin) / [`StrMax<A>`](StrMax) — string extremes, folding the
 //! `&str` their [`Read`](super::super::read::StrRead) *borrows* from the column.
 //!
-//! The accumulator is the plain cell width `A`: an [`ArenaKey`] is just a 128-bit
+//! The accumulator is the plain cell width `A`: an `ArenaKey` is just a 128-bit
 //! value, so a string extreme rides the same `A` (`= i128`) cell a numeric slot
 //! uses — no separate cell type, no container reinterpret. Viewing those 128 bits
 //! as a key is *this op's* business, via [`StringCell`] (the identity for `i128`,

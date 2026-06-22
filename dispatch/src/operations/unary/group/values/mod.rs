@@ -8,11 +8,11 @@
 //!
 //! It is built from one trait and two containers:
 //!
-//! - an **[`Aggregation`]** op — fully typed to its own input array and cell
+//! - an **`Aggregation`** op — fully typed to its own input array and cell
 //!   ([`Count`], [`Sum<T>`](Sum), [`Min<T>`](Min), [`Max<T>`](Max), [`StrMin`],
 //!   [`StrMax`]).
-//! - **containers** — [`Compiled`](container::Compiled) (a fixed *numeric* tuple
-//!   of ops, branch-free) and [`Dynamic`](container::Dynamic) (a runtime
+//! - **containers** — [`Compiled`] (a fixed *numeric* tuple
+//!   of ops, branch-free) and [`Dynamic`] (a runtime
 //!   signature folded per slot, generic over the width — the path for any string
 //!   extreme).
 
@@ -36,7 +36,7 @@ pub use read::{IntRead, NoRead, Read, StrRead};
 
 /// Which per-group aggregate a value slot computes during consume — a pure
 /// descriptor the planner attaches to each slot. It tells the numeric
-/// [`Dynamic`](container::Dynamic) fallback what to read (a `COUNT` reads no
+/// [`Dynamic`] fallback what to read (a `COUNT` reads no
 /// column; everything else reads its column) and how to fold.
 ///
 /// `Avg` is not represented: `AVG(c)` is lowered to `sum(c)` + `count(c)` with a
@@ -145,7 +145,7 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
     /// The shared, read-side context [`merge`](Self::merge)/[`finish_columns`](Self::finish_columns)
-    /// resolve through (slot kinds for [`Dynamic`](container::Dynamic) + the value
+    /// resolve through (slot kinds for [`Dynamic`] + the value
     /// arena for a string extreme; `()` otherwise). It builds the per-worker
     /// [`WorkerContext`](Self::WorkerContext); see [`SharedContext`].
     type SharedContext: SharedContext<Worker = Self::WorkerContext>;
@@ -195,7 +195,7 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     fn push_to(&self, cols: &mut Self::Columns);
     /// Materialise the columns and their fields. `ctx` backs the zero-copy
     /// `StringView` output of a string extreme (numeric columns ignore it) and
-    /// carries the per-slot descriptor a runtime value ([`Dynamic`](container::Dynamic))
+    /// carries the per-slot descriptor a runtime value ([`Dynamic`])
     /// needs to pick each slot's output type.
     fn finish_columns(
         cols: Self::Columns,

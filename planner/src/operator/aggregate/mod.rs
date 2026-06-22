@@ -36,9 +36,8 @@ pub struct Aggregate {
     pub expressions: Vec<Expression>,
     /// A LIMIT pushed into this grouped aggregate by the plan-rewrite passes:
     /// [`GroupLimit::TopK`] for an `ORDER BY <slot> DESC LIMIT k` feeding it (see
-    /// [`annotate_group_topn`](crate::PlanNode::annotate_group_topn)),
-    /// [`GroupLimit::First`] for a plain `LIMIT k`
-    /// ([`annotate_group_limit`](crate::PlanNode::annotate_group_limit)). The
+    /// `PlanNode::annotate_group_topn`), [`GroupLimit::First`] for a plain
+    /// `LIMIT k` (`PlanNode::annotate_group_limit`). The
     /// group operator then emits only each partition's kept rows instead of
     /// every group.
     pub output_limit: Option<GroupLimit>,
@@ -184,8 +183,8 @@ fn extreme_kind(
 
 /// Map group-key types to the arrow types the [`RowKeyExtractor`](dispatch::RowKeyExtractor)
 /// encodes, in key order. Shared by the general grouped path
-/// ([`grouped`](self::grouped)) and the `COUNT(DISTINCT)` two-level lowering
-/// ([`count_distinct`](self::count_distinct)). Returns `None` if any key has a
+/// ([`grouped`]) and the `COUNT(DISTINCT)` two-level lowering
+/// ([`count_distinct`]). Returns `None` if any key has a
 /// type the row encoding doesn't support, so the caller reports it unsupported
 /// rather than panicking in `RowKeySchema::new`.
 pub(super) fn row_key_schema<'a>(

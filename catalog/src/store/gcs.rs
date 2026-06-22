@@ -35,7 +35,7 @@ const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 pub struct GcsStore {
     bucket: String,
     prefix: String,
-    /// JSON API origin (scheme + host[:port], no trailing slash). The real
+    /// JSON API origin (scheme + `host[:port]`, no trailing slash). The real
     /// service by default; an emulator when `STORAGE_EMULATOR_HOST` is set.
     endpoint: String,
     /// Shared token state. An `Arc` so [`source`](Self::source) can hand workers

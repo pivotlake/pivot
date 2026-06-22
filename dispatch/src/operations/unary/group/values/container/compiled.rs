@@ -13,7 +13,7 @@
 //! [`Dynamic`](super::Dynamic) path instead.
 //!
 //! There is no per-slot trait and no plumbing trait: a slot's behaviour *is* its
-//! [`Read`] plus its [`Fold`]/[`FoldAcc`], so [`impl_compiled!`] emits the whole
+//! [`Read`] plus its [`Fold`]/[`FoldAcc`], so `impl_compiled!` emits the whole
 //! [`AggregationValue`] impl for each arity directly, calling those — `R::read` to
 //! pull the value, `F::seed`/`update`/`merge`/`finish` to fold it — unrolled over
 //! the tuple, with the reader/config/column shapes as literal tuples. The lone
