@@ -12,7 +12,7 @@ use crate::operations::unary::group::hashtables::RadixConfig;
 use crate::operations::unary::group::hashtables::{
     AggregatedTableOutput, AggregationValue, KeyExtractor,
 };
-use crate::operations::unary::group::{AggregationSlot, Group, PartitionJob};
+use crate::operations::unary::group::{AggregationSlot, Group, GroupLimit, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
@@ -36,7 +36,7 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue> {
     key_cols: Vec<usize>,
     value_slots: Vec<AggregationSlot>,
     key_config: K::Config,
-    top_k: Option<(usize, usize)>,
+    output_limit: Option<GroupLimit>,
     count_only: bool,
     hash_state: RandomState,
     injector: Arc<Injector<PartitionJob<K, V>>>,
@@ -55,7 +55,7 @@ impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         key_config: K::Config,
-        top_k: Option<(usize, usize)>,
+        output_limit: Option<GroupLimit>,
         count_only: bool,
         worker_count: usize,
         buffers: usize,
@@ -74,7 +74,7 @@ impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
             key_cols: key_cols.clone(),
             value_slots: value_slots.clone(),
             key_config: key_config.clone(),
-            top_k,
+            output_limit,
             count_only,
             hash_state: hash_state.clone(),
             injector: injector.clone(),
@@ -99,7 +99,7 @@ impl<K: KeyExtractor, V: AggregationValue> UnaryFactory<RecordBatch, RecordBatch
             self.key_cols,
             self.value_slots,
             self.key_config,
-            self.top_k,
+            self.output_limit,
             self.count_only,
             self.sender,
             self.receiver.take(),

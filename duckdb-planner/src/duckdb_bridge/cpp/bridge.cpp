@@ -8,6 +8,7 @@
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
@@ -545,6 +546,28 @@ json build_top_n(duckdb::LogicalTopN *top_n, DynamicFilterDedup &df_dedup) {
 	    };
 }
 
+// A bare LIMIT/OFFSET (no ORDER BY; an ORDER BY + LIMIT is fused into LogicalTopN
+// upstream). pivot only handles constant bounds — a percentage or expression
+// limit can't be a fixed row count, so reject it rather than emit a wrong plan.
+// An absent LIMIT (offset-only query) serializes as a null limit, which the Rust
+// side reads as "unbounded".
+json build_limit(duckdb::LogicalLimit *limit) {
+    auto bound_to_json = [](const duckdb::BoundLimitNode &node, const char *what) -> json {
+        switch (node.Type()) {
+        case duckdb::LimitNodeType::CONSTANT_VALUE:
+            return json(node.GetConstantValue());
+        case duckdb::LimitNodeType::UNSET:
+            return json(nullptr);
+        default:
+            throw UnsupportedPlanError(std::string("Unsupported non-constant LIMIT ") + what);
+        }
+    };
+    return {
+        {"limit", bound_to_json(limit->limit_val, "value")},
+        {"offset", bound_to_json(limit->offset_val, "offset")},
+    };
+}
+
 string create_table_option_to_string(duckdb::ParsedExpression &expr) {
     if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
         auto &value = expr.Cast<duckdb::ConstantExpression>().value;
@@ -745,6 +768,28 @@ static bool is_late_materialization_join(duckdb::LogicalComparisonJoin &join) {
 	return false;
 }
 
+// Whether an already-built node is a late-mat Materialize whose narrow scan
+// reads no data columns. That's the shape of a plain LIMIT (no ORDER BY/filter
+// key): the narrow Get carried only the row-id, which strip_trailing_rowid
+// removed, leaving an empty projection. DuckDB also synthesizes a row-id ORDER BY
+// above the join in that case — see late_materialization.cpp — which pivot can't
+// run (its materializer drops the row id) and doesn't need (materialized rows
+// come back in scan/row-id order anyway), so the caller drops it.
+static bool is_materialize_over_empty_scan(const json &node) {
+	if (!node.contains("name") || node["name"] != "Materialize") {
+		return false;
+	}
+	const json *cur = &node;
+	while (cur->contains("inputs") && !(*cur)["inputs"].empty()) {
+		cur = &(*cur)["inputs"][0];
+		if (cur->at("operator").at("type").get<uint8_t>() ==
+		    static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_GET)) {
+			return cur->at("operator").at("data").at("columns").empty();
+		}
+	}
+	return false;
+}
+
 json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
                           DynamicFilterDedup &df_dedup) {
 	// DuckDB's late_materialization optimizer rewrites a wide Top-N/Limit scan
@@ -797,6 +842,13 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: {
+		// Drop the row-id ORDER BY DuckDB synthesizes above a late-materialized
+		// plain LIMIT (see is_materialize_over_empty_scan): pivot can't run it and
+		// doesn't need it. Returns the Materialize child directly; the ORDER BY is
+		// a pass-through, so the parent's column positions are unchanged.
+		if (!inputs.empty() && is_materialize_over_empty_scan(inputs[0])) {
+			return inputs[0];
+		}
 		new_operator["data"] = build_order_by(&op->Cast<duckdb::LogicalOrder>());
 		break;
 	}
@@ -810,6 +862,10 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
 		new_operator["data"] = build_top_n(&op->Cast<duckdb::LogicalTopN>(), df_dedup);
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_LIMIT: {
+		new_operator["data"] = build_limit(&op->Cast<duckdb::LogicalLimit>());
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE: {

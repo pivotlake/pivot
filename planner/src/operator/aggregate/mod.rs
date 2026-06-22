@@ -23,7 +23,9 @@ use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
 use crate::types::Type;
 use arrow_schema::DataType;
-use dispatch::{AggregationKind, AggregationSlot, RecordBatchOperatorSpec, RowKeySchema};
+use dispatch::{
+    AggregationKind, AggregationSlot, GroupLimit, RecordBatchOperatorSpec, RowKeySchema,
+};
 use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 
@@ -32,17 +34,21 @@ use std::fmt;
 pub struct Aggregate {
     pub groups: Vec<Expression>,
     pub expressions: Vec<Expression>,
-    /// Set by the `group → TopN` detection pass to `Some((value_slot, limit))`
-    /// when this grouped aggregate feeds an `ORDER BY <slot> DESC LIMIT limit`,
-    /// so the group operator emits only each partition's top-`limit` rows.
-    pub top_k: Option<(usize, usize)>,
+    /// A LIMIT pushed into this grouped aggregate by the plan-rewrite passes:
+    /// [`GroupLimit::TopK`] for an `ORDER BY <slot> DESC LIMIT k` feeding it (see
+    /// [`annotate_group_topn`](crate::PlanNode::annotate_group_topn)),
+    /// [`GroupLimit::First`] for a plain `LIMIT k`
+    /// ([`annotate_group_limit`](crate::PlanNode::annotate_group_limit)). The
+    /// group operator then emits only each partition's kept rows instead of
+    /// every group.
+    pub output_limit: Option<GroupLimit>,
 }
 
 impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
     type Error = super::Error;
     fn try_from(a: duckdb_operator::Aggregate) -> Result<Self, Self::Error> {
         Ok(Aggregate {
-            top_k: None,
+            output_limit: None,
             groups: a
                 .groups
                 .into_iter()

@@ -58,9 +58,9 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CountFactory, Distinct,
-    DynamicFilterSlot, FilterFactory, GroupFactory, KeyExtractor, MapFactory, NullaryFactory,
-    NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory, UnaryFactory, UnaryOperator,
-    UnaryOperatorFactory,
+    DynamicFilterSlot, FilterFactory, GroupFactory, GroupLimit, KeyExtractor, MapFactory,
+    NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory, UnaryFactory,
+    UnaryOperator, UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -525,6 +525,17 @@ impl RecordBatchOperatorSpec {
         ))
     }
 
+    /// SQL `LIMIT … OFFSET …` with no ORDER BY: keep `limit` rows after skipping
+    /// the first `offset`, in arbitrary (input) order. Implemented as a degenerate
+    /// [`order_by_limit_offset`](Self::order_by_limit_offset) with no sort keys —
+    /// each worker truncates to `limit + offset` rows, then a single collector
+    /// concatenates and applies the global offset/limit. Reusing that operator
+    /// inherits its pipeline-breaker wiring (including the unconditional
+    /// finish-notify that avoids the empty-partition lost-wakeup).
+    pub fn limit(self, limit: usize, offset: usize) -> Self {
+        self.order_by_limit_offset(vec![], limit, offset, None)
+    }
+
     /// Global `COUNT(DISTINCT x)`: GROUP BY `key_cols` with no aggregate, emitting
     /// only each hash partition's distinct-key count (one `Int64` row) rather than
     /// the keys. Partitions are hash-disjoint, so a downstream global `SUM` over
@@ -555,9 +566,14 @@ impl RecordBatchOperatorSpec {
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
-        top_k: Option<(usize, usize)>,
+        output_limit: Option<GroupLimit>,
     ) -> Self {
-        self.group_by_aggregate_config::<K, V>(key_cols, value_slots, top_k, K::Config::default())
+        self.group_by_aggregate_config::<K, V>(
+            key_cols,
+            value_slots,
+            output_limit,
+            K::Config::default(),
+        )
     }
 
     /// [`group_by_aggregate`](Self::group_by_aggregate) with an explicit key
@@ -568,7 +584,7 @@ impl RecordBatchOperatorSpec {
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
-        top_k: Option<(usize, usize)>,
+        output_limit: Option<GroupLimit>,
         key_config: K::Config,
     ) -> Self {
         let worker_count = self.worker_count();
@@ -577,7 +593,7 @@ impl RecordBatchOperatorSpec {
             key_cols,
             value_slots,
             key_config,
-            top_k,
+            output_limit,
             false,
             worker_count,
             buffers,

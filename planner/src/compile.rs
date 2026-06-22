@@ -146,6 +146,7 @@ impl PlanNode {
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
+            crate::Operator::Limit(o) => o.compile(inputs.remove(0)),
             crate::Operator::Materialize(o) => o.compile(inputs.remove(0), ctx),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
