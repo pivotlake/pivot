@@ -342,6 +342,13 @@ fn row_key_schema(keys: &[(usize, Type)]) -> Option<RowKeySchema> {
             Type::Int32 => Some(DataType::Int32),
             Type::Int64 => Some(DataType::Int64),
             Type::Utf8 => Some(DataType::Utf8View),
+            // DATE is days-since-epoch (arrives as Date32 or the parquet-physical
+            // integer); TIMESTAMP is Int64 epoch seconds. The row reader casts each
+            // key column to the schema type, so encoding them as their integer
+            // day/second count is lossless and groups identically. This is what
+            // lets a wide key tuple like `(Int64, Date)` group instead of erroring.
+            Type::Date => Some(DataType::Int32),
+            Type::Timestamp => Some(DataType::Int64),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
