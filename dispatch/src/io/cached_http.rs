@@ -3,7 +3,7 @@
 //! Every remote read becomes one [`RequestedRead`], satisfied by one or more
 //! pieces and completed once every piece has landed:
 //!
-//! * With a [`DiskCache`], the requested run is split against what's on disk —
+//! * With a [`DiskCache`], the requested run is split against what's on disk -
 //!   resident pieces are read from the local cache file, holes are fetched over
 //!   HTTP and written back.
 //! * With no cache, it's a single piece fetched from the network.
@@ -67,9 +67,8 @@ struct RequestedRead {
 struct CacheRead {
     read: Identifier,
     block: MissingBlock,
-    /// Keeps the cache file open for the read's lifetime (`Some` whenever there's
-    /// a resident block to read).
-    _object: Option<Arc<Object>>,
+    /// Keeps the cache file open for the read's lifetime.
+    _object: Arc<Object>,
 }
 
 /// One piece fetched over HTTP. `object` is `Some` when it should be written back
@@ -120,14 +119,13 @@ impl CachedHttpEngine {
         disk_id: &mut Identifier,
         request: DataFlowRequest<HttpRequest>,
     ) -> Result<()> {
-        // The cache file for this object (its fd serves resident pieces), or `None`
-        // to read straight from the network. `fd` is only used for resident pieces,
-        // which only exist when `object` is `Some`, so the `None` default is dead.
+        // The cache file for this object, or `None` to read straight from the
+        // network. A resident segment is only ever produced for a `Some` object,
+        // so its fd is read inside the resident branch below.
         let object = self
             .disk_cache
             .as_deref()
             .and_then(|dc| dc.open_object(&request.request.remote));
-        let fd = object.as_ref().map(|o| o.fd()).unwrap_or_default();
         let segments = match &object {
             Some(obj) => obj.split_into_segments(
                 request.request.block.file_offset(),
@@ -150,11 +148,15 @@ impl CachedHttpEngine {
                 .block
                 .carve_sub_block(seg.rel_offset, seg.len);
             if seg.present {
-                // Resident on disk: read it from the cache file into the slot.
+                // Resident on disk: read it from the cache file into the slot. A
+                // resident segment is only ever produced for a `Some` object.
+                let object = object
+                    .clone()
+                    .expect("a resident segment implies a cache object");
                 let id = *disk_id;
                 *disk_id += 1;
                 backend.submit_read(
-                    fd,
+                    object.fd(),
                     block.file_offset() as u64,
                     block.dest(),
                     block.len(),
@@ -165,7 +167,7 @@ impl CachedHttpEngine {
                     CacheRead {
                         read,
                         block,
-                        _object: object.clone(),
+                        _object: object,
                     },
                 );
             } else {
@@ -228,7 +230,7 @@ impl CachedHttpEngine {
     }
 
     /// Feed an HTTP socket completion to the engine (it may submit follow-up SQEs,
-    /// including transparent reconnect-and-retry). Linux only — elsewhere the
+    /// including transparent reconnect-and-retry). Linux only - elsewhere the
     /// engine runs synchronously and never produces ring completions.
     #[cfg(target_os = "linux")]
     pub fn on_socket_completion(
@@ -241,27 +243,26 @@ impl CachedHttpEngine {
         Ok(())
     }
 
-    /// Handle a finished backend disk op that belongs to this engine — a
+    /// Handle a finished backend disk op that belongs to this engine - a
     /// cache-file read (advances its read) or a write-back (records the bytes
     /// resident). The caller has already ruled out its own fs reads.
     pub fn complete_disk(&mut self, id: Identifier, result: i32, out: &mut Vec<ReadResult>) {
         if let Some(cache_read) = self.cache_reads.remove(&id) {
             self.complete_cache_read(cache_read, result, out);
         } else if let Some(write) = self.cache_writes.remove(&id) {
-            // Only record the bytes resident if the *whole* range landed — a
+            // Only record the bytes resident if the *whole* range landed - a
             // short/failed write must not mark blocks present that a later read
-            // would then serve as garbage. A grown resident set may need eviction.
-            if result >= 0 && result as usize == write.len {
-                let added = write.object.mark_present(write.file_offset, write.len);
-                if added > 0
-                    && let Some(dc) = self.disk_cache.as_deref()
-                {
-                    dc.enforce_budget();
-                }
+            // would then serve as garbage. Folding the new bytes into the budget
+            // (and any eviction) is the cache's job.
+            if result >= 0
+                && result as usize == write.len
+                && let Some(dc) = self.disk_cache.as_deref()
+            {
+                dc.mark_resident(&write.object, write.file_offset, write.len);
             }
         } else {
             // The requester only delegates ids that aren't its fs reads, so an id
-            // unknown to both maps means a completion was tracked nowhere — a bug.
+            // unknown to both maps means a completion was tracked nowhere - a bug.
             debug_assert!(false, "disk completion id {id} belongs to no in-flight op");
         }
     }
@@ -275,10 +276,9 @@ impl CachedHttpEngine {
         disk_id: &mut Identifier,
         out: &mut Vec<ReadResult>,
     ) -> Result<()> {
-        let mut queued_writeback = false;
         for id in self.http.take_completed() {
             if let Some(http_read) = self.http_reads.remove(&id) {
-                queued_writeback |= self.complete_http_read(backend, disk_id, http_read, out)?;
+                self.complete_http_read(backend, disk_id, http_read, out)?;
             }
         }
         for (id, error) in self.http.take_failed() {
@@ -291,11 +291,6 @@ impl CachedHttpEngine {
                     error: error.into(),
                 }));
             }
-        }
-        // Flush only if we queued write-backs (executing them synchronously on the
-        // non-Linux pread backend; queueing SQEs on Linux).
-        if queued_writeback {
-            backend.submit()?;
         }
         Ok(())
     }
@@ -326,12 +321,25 @@ impl CachedHttpEngine {
         result: i32,
         out: &mut Vec<ReadResult>,
     ) {
-        if result < 0 {
+        // A negative result is an error; a non-negative result shorter than the
+        // block left the slot only partially filled. Either way the bytes the
+        // bitmap promised aren't all there, so fail the read rather than commit and
+        // serve stale slot bytes - symmetric with the write-back's `result == len`
+        // guard.
+        if result < 0 || result as usize != cache_read.block.len() {
             if let Some((data_flow_id, operator_idx)) = self.fail_read(cache_read.read) {
+                let error = if result < 0 {
+                    std::io::Error::from_raw_os_error(-result)
+                } else {
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "short read from disk cache",
+                    )
+                };
                 out.push(Err(FailedRead {
                     data_flow_id,
                     operator_idx,
-                    error: std::io::Error::from_raw_os_error(-result).into(),
+                    error: error.into(),
                 }));
             }
             return;
@@ -342,19 +350,18 @@ impl CachedHttpEngine {
         }
     }
 
-    /// An HTTP piece landed: commit it, queue a write-back into the cache file if
-    /// it came from a cached read, and advance its read. Returns whether a
-    /// write-back was queued (so the caller knows to flush the backend).
+    /// An HTTP piece landed: commit it, queue (and flush) a write-back into the
+    /// cache file if it came from a cached read, and advance its read.
     fn complete_http_read(
         &mut self,
         backend: &mut IOBackend,
         disk_id: &mut Identifier,
         http_read: HttpRead,
         out: &mut Vec<ReadResult>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         http_read.block.commit();
 
-        let queued = if let Some(object) = http_read.object {
+        if let Some(object) = http_read.object {
             let id = *disk_id;
             *disk_id += 1;
             backend.submit_write(
@@ -364,6 +371,10 @@ impl CachedHttpEngine {
                 http_read.block.len(),
                 id,
             )?;
+            // Flush each write-back as it's queued: a burst of completed reads can
+            // queue more write-backs than the ring's submission queue holds, the
+            // same reason `request` flushes each segment.
+            backend.submit()?;
             self.cache_writes.insert(
                 id,
                 CacheWrite {
@@ -373,15 +384,12 @@ impl CachedHttpEngine {
                     _block: http_read.block,
                 },
             );
-            true
-        } else {
-            false
-        };
+        }
 
         if let Some(request) = self.record_piece(http_read.read) {
             out.push(Ok(Completion::Http(request)));
         }
-        Ok(queued)
+        Ok(())
     }
 
     /// Record one piece of requested read `read` as landed; returns the original
@@ -389,6 +397,7 @@ impl CachedHttpEngine {
     /// sub-block). Yields `None` if the read already failed.
     fn record_piece(&mut self, read: Identifier) -> Option<DataFlowRequest<HttpRequest>> {
         let r = self.requested_reads.get_mut(&read)?;
+        debug_assert!(r.remaining > 0, "record_piece: no pieces left");
         r.remaining -= 1;
         if r.remaining == 0 {
             Some(self.requested_reads.remove(&read).unwrap().request)
