@@ -25,7 +25,7 @@ use crate::io::IORequesterError as Error;
 use crate::io::backend::IOBackend;
 use crate::io::disk_cache::{DiskCache, Object, Segment};
 use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
-use crate::io::{Completion, DataFlowRequest, FailedRead, HttpRequest};
+use crate::io::{Completion, DataFlowRequest, FailedRead, HttpRequest, RemoteReadSplit, RemoteReadTime};
 use crate::memory::file_cache::MissingBlock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,6 +61,9 @@ pub(crate) struct CachedHttpEngine {
 struct RequestedRead {
     remaining: usize,
     request: DataFlowRequest<HttpRequest>,
+    /// In-flight time accrued so far, per tier: each piece adds its own wait as it
+    /// lands, and the total bills the dataflow's stats once the read completes.
+    time: RemoteReadTime,
 }
 
 /// One piece read from the local cache file.
@@ -118,7 +121,7 @@ impl CachedHttpEngine {
         backend: &mut IOBackend,
         disk_id: &mut Identifier,
         request: DataFlowRequest<HttpRequest>,
-    ) -> Result<()> {
+    ) -> Result<RemoteReadSplit> {
         // The cache file for this object, or `None` to read straight from the
         // network. A resident segment is only ever produced for a `Some` object,
         // so its fd is read inside the resident branch below.
@@ -142,12 +145,19 @@ impl CachedHttpEngine {
         let read = self.next_read_id;
         self.next_read_id += 1;
 
+        // Count each piece against the tier that serves it: a resident segment is
+        // one cache-file read, a hole one HTTP fetch. A read split across both
+        // reports under each tier so neither's work is hidden.
+        let mut split = RemoteReadSplit::default();
+
         for seg in &segments {
             let block = request
                 .request
                 .block
                 .carve_sub_block(seg.rel_offset, seg.len);
             if seg.present {
+                split.disk_cache_requests += 1;
+                split.disk_cache_bytes += seg.len as u64;
                 // Resident on disk: read it from the cache file into the slot. A
                 // resident segment is only ever produced for a `Some` object.
                 let object = object
@@ -173,6 +183,8 @@ impl CachedHttpEngine {
             } else {
                 // A hole (or an uncached read): fetch over HTTP, written back once
                 // it lands iff there's a cache object.
+                split.http_requests += 1;
+                split.http_bytes += seg.len as u64;
                 let id = self.next_http_id;
                 self.next_http_id += 1;
                 let remote_read = RemoteRead {
@@ -205,9 +217,10 @@ impl CachedHttpEngine {
             RequestedRead {
                 remaining: segments.len(),
                 request,
+                time: RemoteReadTime::default(),
             },
         );
-        Ok(())
+        Ok(split)
     }
 
     /// Hand a remote read to the engine (ring-driven on Linux, synchronous else).
@@ -345,8 +358,8 @@ impl CachedHttpEngine {
             return;
         }
         cache_read.block.commit();
-        if let Some(request) = self.record_piece(cache_read.read) {
-            out.push(Ok(Completion::Http(request)));
+        if let Some((request, time)) = self.finish_piece(cache_read.read, true) {
+            out.push(Ok(Completion::Http(request, time)));
         }
     }
 
@@ -386,21 +399,36 @@ impl CachedHttpEngine {
             );
         }
 
-        if let Some(request) = self.record_piece(http_read.read) {
-            out.push(Ok(Completion::Http(request)));
+        if let Some((request, time)) = self.finish_piece(http_read.read, false) {
+            out.push(Ok(Completion::Http(request, time)));
         }
         Ok(())
     }
 
-    /// Record one piece of requested read `read` as landed; returns the original
-    /// request once the last piece lands (the pieces have already committed every
-    /// sub-block). Yields `None` if the read already failed.
-    fn record_piece(&mut self, read: Identifier) -> Option<DataFlowRequest<HttpRequest>> {
+    /// Record one piece of requested read `read` as landed, adding its in-flight
+    /// time (submission to now) to the tier that served it - the disk cache when
+    /// `from_disk_cache`, else the network. Returns the original request and the
+    /// read's accumulated per-tier time once the last piece lands (the pieces have
+    /// already committed every sub-block). Yields `None` if the read already failed.
+    fn finish_piece(
+        &mut self,
+        read: Identifier,
+        from_disk_cache: bool,
+    ) -> Option<(DataFlowRequest<HttpRequest>, RemoteReadTime)> {
         let r = self.requested_reads.get_mut(&read)?;
-        debug_assert!(r.remaining > 0, "record_piece: no pieces left");
+        debug_assert!(r.remaining > 0, "finish_piece: no pieces left");
+        if let Some(submitted_at) = r.request.submitted_at {
+            let elapsed = submitted_at.elapsed();
+            if from_disk_cache {
+                r.time.disk_cache += elapsed;
+            } else {
+                r.time.http += elapsed;
+            }
+        }
         r.remaining -= 1;
         if r.remaining == 0 {
-            Some(self.requested_reads.remove(&read).unwrap().request)
+            let finished = self.requested_reads.remove(&read).unwrap();
+            Some((finished.request, finished.time))
         } else {
             None
         }

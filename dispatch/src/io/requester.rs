@@ -2,7 +2,7 @@ use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
-use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest};
+use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteReadSplit};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -107,7 +107,10 @@ impl IORequester {
     /// Submit a read for a remote region, served from the on-disk cache where
     /// possible (only the missing ranges hit the network). Delegates to the
     /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
-    pub fn request_http(&mut self, request: DataFlowRequest<HttpRequest>) -> Result<()> {
+    pub fn request_http(
+        &mut self,
+        request: DataFlowRequest<HttpRequest>,
+    ) -> Result<RemoteReadSplit> {
         self.http
             .request(&mut self.backend, &mut self.next_id, request)
     }
@@ -445,10 +448,23 @@ mod tests {
     /// Fetch `[offset, offset + len)` of `loc` via the requester and block until
     /// it completes.
     fn fetch(requester: &mut IORequester, loc: &FileLocation, offset: usize, len: usize) {
+        fetch_split(requester, loc, offset, len);
+    }
+
+    /// Fetch `[offset, offset + len)` of `loc` and block until it completes,
+    /// returning the per-tier read split summed over the read's blocks (disk-cache
+    /// hits versus network fetches).
+    fn fetch_split(
+        requester: &mut IORequester,
+        loc: &FileLocation,
+        offset: usize,
+        len: usize,
+    ) -> RemoteReadSplit {
         let FileLocation::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
         let lookups = memory_ctx().file_cache().get(loc, offset, len);
+        let mut split = RemoteReadSplit::default();
         let mut submitted = 0;
         for lookup in &lookups {
             for block in lookup.missing() {
@@ -456,15 +472,18 @@ mod tests {
                     remote: remote.clone(),
                     block: block.clone(),
                 };
-                requester
+                let piece = requester
                     .request_http(DataFlowRequest::new(0, 0, req))
                     .unwrap();
+                split.disk_cache_requests += piece.disk_cache_requests;
+                split.disk_cache_bytes += piece.disk_cache_bytes;
+                split.http_requests += piece.http_requests;
+                split.http_bytes += piece.http_bytes;
                 submitted += 1;
             }
         }
-        assert!(submitted > 0, "expected a cache miss to drive over http");
+        assert!(submitted > 0, "expected blocks to read");
 
-        // Drive completions until everything submitted has landed.
         let mut completed = 0;
         while completed < submitted {
             if requester.has_pending() {
@@ -472,8 +491,8 @@ mod tests {
             }
             completed += requester.completions().unwrap().len();
         }
-        // Keep the lookups' pins alive until after the reads committed.
         drop(lookups);
+        split
     }
 
     /// Assert `[offset, offset + len)` of `loc` is now a full cache hit holding
@@ -582,6 +601,52 @@ mod tests {
         settle(&mut requester);
 
         assert_cached(&loc, 0, 4096);
+    }
+
+    /// The read split bills a cold read to the network and the same range, once
+    /// resident on disk, to the disk cache with nothing over the network.
+    #[test]
+    fn the_read_split_attributes_each_tier() {
+        const SB: usize = 4096;
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let mut requester = requester_with(cache_in(&dir));
+        let loc = remote_loc(spawn_server(1));
+
+        let cold = fetch_split(&mut requester, &loc, 0, SB);
+        settle(&mut requester);
+        memory_ctx().file_cache().clear();
+        let warm = fetch_split(&mut requester, &loc, 0, SB);
+        settle(&mut requester);
+
+        assert_eq!((cold.http_requests, cold.http_bytes), (1, SB as u64));
+        assert_eq!(cold.disk_cache_requests, 0);
+        assert_eq!((warm.disk_cache_requests, warm.disk_cache_bytes), (1, SB as u64));
+        assert_eq!(warm.http_requests, 0);
+    }
+
+    /// A read split across cached blocks and a hole counts each piece in its own
+    /// tier: the two resident blocks as disk-cache reads, the hole as one network
+    /// fetch, with bytes to match. Neither tier's work is hidden behind the other.
+    #[test]
+    fn a_split_read_counts_each_piece_in_its_tier() {
+        const SB: usize = 4096;
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let mut requester = requester_with(cache_in(&dir));
+        let (port, _requested) = spawn_recording_server();
+        let loc = remote_loc(port);
+        fetch(&mut requester, &loc, 0, SB); // prime block 0
+        settle(&mut requester);
+        fetch(&mut requester, &loc, 2 * SB, SB); // prime block 2, leaving 1 a hole
+        settle(&mut requester);
+        memory_ctx().file_cache().clear();
+
+        let split = fetch_split(&mut requester, &loc, 0, 3 * SB);
+        settle(&mut requester);
+
+        assert_eq!((split.disk_cache_requests, split.disk_cache_bytes), (2, 2 * SB as u64));
+        assert_eq!((split.http_requests, split.http_bytes), (1, SB as u64));
     }
 
     /// A partially-cached run fetches only the missing blocks: block 0 is primed
