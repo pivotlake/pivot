@@ -76,20 +76,4 @@ impl<T: Copy> SlabVec<T> {
             }
         }
     }
-
-    /// Visit each backing chunk as a contiguous slice (insertion order). Lets the
-    /// copy-and-patch merge address a whole chunk linearly in native code.
-    #[inline(always)]
-    pub fn for_each_chunk(&self, mut f: impl FnMut(&[T])) {
-        let n = self.chunks.len();
-        for (ci, chunk) in self.chunks.iter().enumerate() {
-            let len = if ci + 1 == n {
-                self.last_len
-            } else {
-                Self::CHUNK_CAP
-            };
-            let base = chunk.ptr_at_index(0) as *const T;
-            f(unsafe { std::slice::from_raw_parts(base, len) });
-        }
-    }
 }

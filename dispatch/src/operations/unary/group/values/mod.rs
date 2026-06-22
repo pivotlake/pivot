@@ -21,7 +21,6 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
 
-pub mod cap;
 pub mod cell;
 pub mod container;
 pub mod distinct;
@@ -30,7 +29,7 @@ pub mod read;
 
 pub use cell::{Cell, Numeric};
 pub use container::{
-    Compiled, CountSlot, Dynamic, Patched, MaxSlot, MinSlot, Mono, OpTuple, StrMaxSlot, StrMinSlot, SumSlot,
+    Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, StrMaxSlot, StrMinSlot, SumSlot,
 };
 pub use distinct::Distinct;
 pub use fold::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
@@ -139,71 +138,8 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
         self.merge(Self::value(reader, idx, arena), cfg)
     }
 
-    /// Materialise a new group from row `idx`, with the [`MergeConfig`](Self::MergeConfig)
-    /// in hand — the consume seed and the radix scatter use this so a runtime value
-    /// ([`Patched`](container::Patched)) can reach its compiled fold (which the
-    /// cfg-less [`value`](Self::value) can't). Defaults to `value`.
-    #[inline(always)]
-    fn value_cfg(
-        reader: &Self::Reader<'_>,
-        idx: usize,
-        arena: &mut WorkerArena,
-        _cfg: &Self::MergeConfig,
-    ) -> Self {
-        Self::value(reader, idx, arena)
-    }
-
-    /// `true` if this value's fold is a copy-and-patch ([`cap`]) candidate — the
-    /// consume path then assembles the whole probe+fold loop as native code
-    /// ([`Patched`](container::Patched)). Other values keep the interpreted loop.
-    const CAP: bool = false;
-
-    /// The additive [`FoldOp`](cap::FoldOp) per slot for this batch (slot kinds +
-    /// the reader's column widths), or `None` if the signature isn't all-additive.
-    /// Used to compile the consume fold tiles. Only meaningful when [`CAP`](Self::CAP).
-    #[inline(always)]
-    fn cap_fold_ops(
-        _slots: &[AggregationSlot],
-        _reader: &Self::Reader<'_>,
-    ) -> Option<Vec<cap::FoldOp>> {
-        None
-    }
-
-    /// The per-slot column base pointers the compiled fold indexes per row (the
-    /// `cols` argument of the patched loop). Only meaningful when [`CAP`](Self::CAP).
-    #[inline(always)]
-    fn cap_cols(_reader: &Self::Reader<'_>) -> *const *const u8 {
-        std::ptr::null()
-    }
-
-    /// Slot count `N` — the per-row cell stride (`N*8` bytes) for the scatter
-    /// seed-batch temp array. Only meaningful when [`CAP`](Self::CAP).
-    #[inline(always)]
-    fn cap_nslots() -> usize {
-        0
-    }
-
-    /// Reconstruct a value from `N` contiguous `i64` cells the seed-batch wrote.
-    /// Only called when [`CAP`](Self::CAP); `p` points at `[i64; N]`.
-    ///
-    /// # Safety
-    /// `p` is a valid `[i64; N]` for this signature (the seed-batch temp slot).
-    #[inline(always)]
-    unsafe fn cap_from_cells(_p: *const i64) -> Self {
-        unreachable!("cap_from_cells called on a non-CAP value")
-    }
-
     /// Combine two partial group values — the partition merge and the radix fold.
     fn merge(self, other: Self, cfg: &Self::MergeConfig) -> Self;
-
-    /// Fold `other` into `self` in place — the hot partition-merge path calls this
-    /// on the matched cell so a runtime value ([`Patched`](container::Patched)) can
-    /// write its compiled combine straight through the cell pointer (no by-value
-    /// copy, no store-back). Defaults to `*self = self.merge(other)`.
-    #[inline(always)]
-    fn merge_in_place(&mut self, other: &Self, cfg: &Self::MergeConfig) {
-        *self = (*self).merge(*other, cfg);
-    }
 
     /// This group's value for slot `slot`, as an `ORDER BY` sort key.
     fn sort_key(&self, slot: usize) -> Self::SortKey;

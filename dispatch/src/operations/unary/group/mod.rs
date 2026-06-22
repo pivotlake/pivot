@@ -104,7 +104,6 @@ pub use keys::{
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric, OpTuple,
-    Patched,
     Read, StrMax, StrMaxSlot, StrMin, StrMinSlot, StrRead, Sum, SumSlot, WideSum,
 };
 
@@ -438,9 +437,7 @@ impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutpu
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::group::keys::{
-        IntKeyExtractor, IntPairKeyExtractor, StringKeyExtractor,
-    };
+    use crate::operations::unary::group::keys::{IntKeyExtractor, StringKeyExtractor};
     use crate::operations::unary::group::values::Sum;
     use crate::operations::unary::test_utils::{CollectSender, run_consumers};
     use arrow_array::types::Int32Type;
@@ -652,125 +649,6 @@ mod tests {
             .collect();
         pairs.sort();
         pairs
-    }
-
-    // ---- Patched (copy-and-patch) value matches the additive interpreter ----
-
-    fn i32_keyed_triples(sender: &CollectSender) -> Vec<(i32, i64, i64)> {
-        let mut v: Vec<_> = sender
-            .i32_column(0)
-            .into_iter()
-            .zip(sender.i64_column(1))
-            .zip(sender.i64_column(2))
-            .map(|((k, a), b)| (k, a, b))
-            .collect();
-        v.sort();
-        v
-    }
-
-    fn count_sum_slots() -> Vec<AggregationSlot> {
-        vec![
-            AggregationSlot::new(AggregationKind::CountStar, 0),
-            AggregationSlot::new(AggregationKind::Sum, 1),
-        ]
-    }
-
-    #[test]
-    fn patched_count_sum_in_place() {
-        let keys: Vec<i32> = (0..300).chain(0..300).chain(0..300).collect();
-        let vals: Vec<i32> = keys.iter().map(|k| k * 2 + 1).collect();
-
-        let sender = run_group_full::<IntExtractor, Patched<2>>(
-            vec![vec![keyed_i32_batch(&keys, &vals)]],
-            vec![0],
-            count_sum_slots(),
-            None,
-            RadixConfig::DEFAULT,
-        );
-
-        let expected: Vec<(i32, i64, i64)> =
-            (0..300).map(|k| (k, 3, 3 * (2 * k as i64 + 1))).collect();
-        assert_eq!(i32_keyed_triples(&sender), expected);
-    }
-
-    /// Two `Int32` key columns + an `Int32` value column.
-    fn pair_keyed_batch(k0: &[i32], k1: &[i32], vals: &[i32]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("k0", DataType::Int32, false),
-            Field::new("k1", DataType::Int32, false),
-            Field::new("val", DataType::Int32, false),
-        ]));
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(Int32Array::from(k0.to_vec())),
-            Arc::new(Int32Array::from(k1.to_vec())),
-            Arc::new(Int32Array::from(vals.to_vec())),
-        ];
-        RecordBatch::try_new(schema, cols).unwrap()
-    }
-
-    #[test]
-    fn patched_pair_key_radix_uses_merge_run() {
-        // Int-PAIR key → IntPairKeyExtractor (CAP_MERGE16) → the high-card radix
-        // merge runs as the native whole-loop `merge_run` (16-byte key). Small radix
-        // forces the switch; COUNT(*),SUM(val=col 2).
-        let radix = RadixConfig {
-            switch_threshold: 256,
-            partitions: 16,
-        };
-        let k0: Vec<i32> = (0..500).chain(0..500).collect();
-        let k1: Vec<i32> = k0.iter().map(|_| 7).collect(); // same second key
-        let vals: Vec<i32> = k0.iter().map(|k| k + 3).collect();
-        let worker = || vec![pair_keyed_batch(&k0, &k1, &vals)];
-
-        let sender = run_group_full::<IntPairKeyExtractor<Int32Type, Int32Type>, Patched<2>>(
-            vec![worker(), worker()],
-            vec![0, 1],
-            vec![
-                AggregationSlot::new(AggregationKind::CountStar, 0),
-                AggregationSlot::new(AggregationKind::Sum, 2),
-            ],
-            None,
-            radix,
-        );
-
-        // Each (k0,7) appears 2×/worker × 2 workers = 4×, value k0+3.
-        let mut got: Vec<(i32, i32, i64, i64)> = sender
-            .i32_column(0)
-            .into_iter()
-            .zip(sender.i32_column(1))
-            .zip(sender.i64_column(2))
-            .zip(sender.i64_column(3))
-            .map(|(((a, b), c), d)| (a, b, c, d))
-            .collect();
-        got.sort();
-        let expected: Vec<(i32, i32, i64, i64)> =
-            (0..500).map(|k| (k, 7, 4, 4 * (k as i64 + 3))).collect();
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn patched_count_sum_through_radix() {
-        // Small radix forces the in-place→scatter switch + per-partition merge —
-        // exercising the C&P fold (consume + scatter) and the C&P merge tile.
-        let radix = RadixConfig {
-            switch_threshold: 256,
-            partitions: 16,
-        };
-        let keys: Vec<i32> = (0..500).chain(0..500).collect();
-        let vals: Vec<i32> = keys.iter().map(|k| k + 7).collect();
-        let worker = || vec![keyed_i32_batch(&keys, &vals)];
-
-        let sender = run_group_full::<IntExtractor, Patched<2>>(
-            vec![worker(), worker()],
-            vec![0],
-            count_sum_slots(),
-            None,
-            radix,
-        );
-
-        let expected: Vec<(i32, i64, i64)> =
-            (0..500).map(|k| (k, 4, 4 * (k as i64 + 7))).collect();
-        assert_eq!(i32_keyed_triples(&sender), expected);
     }
 
     #[test]

@@ -76,9 +76,6 @@ where
     B::Native: IntBits,
 {
     const SUPPORTS_RADIX: bool = true;
-    // The persisted key is a 16-byte `u128` → eligible for the copy-and-patch
-    // partition merge (16-byte key compare).
-    const CAP_MERGE16: bool = true;
     type Config = ();
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;

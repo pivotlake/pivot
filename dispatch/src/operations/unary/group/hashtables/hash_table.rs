@@ -51,12 +51,7 @@ impl<P: PersistedKey + PartialEq> LiveKey for P {
 ///
 /// `hash == 0` marks an empty slot. Real zero hashes are remapped to 1
 /// by [`BaseHashTable::merge`] to preserve this invariant.
-///
-/// `#[repr(C)]` fixes the field order — `hash@0`, then `key`, then `value` — so the
-/// copy-and-patch consume loop ([`cap`](super::super::values::cap)) can address
-/// `hash@0` / `key@8` directly and read the real `value` offset via `offset_of!`.
 #[derive(Copy, Clone, Default)]
-#[repr(C)]
 pub struct Entry<K: PersistedKey, V: AggregationValue> {
     hash: u64,
     key: K,
@@ -282,47 +277,6 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V, MultiSlabBuffer<E
             collisions: 0,
         }
     }
-
-    /// The raw layout a copy-and-patch probe loop needs to own this table —
-    /// `(base, stride, valoff, mask, shift, pre_shift, max_load, len_ptr)` — or
-    /// `None` if the buffer spans more than one slab (the patched loop addresses
-    /// `base + slot*stride` linearly). `offset_of!` reads the real `value` offset,
-    /// so the asm bakes no layout. `len_ptr` aliases `length` (`usize == u64`).
-    #[allow(clippy::type_complexity)]
-    pub fn jit_view(&mut self) -> Option<(*mut u8, u64, u64, u64, u64, u64, u64, *mut u64)> {
-        let base = self.buffer.single_slab_base()? as *mut u8;
-        Some((
-            base,
-            std::mem::size_of::<Entry<K, V>>() as u64,
-            std::mem::offset_of!(Entry<K, V>, value) as u64,
-            self.mask as u64,
-            self.shift as u64,
-            self.pre_shift as u64,
-            self.max_load as u64,
-            &mut self.length as *mut usize as *mut u64,
-        ))
-    }
-
-    /// Like [`jit_view`](Self::jit_view) but for the merge target: also returns the
-    /// key offset, and `keyoff` lets the patched merge write/compare the persisted
-    /// key. `(base, stride, valoff, keyoff, mask, shift, pre_shift, max_load, len)`.
-    #[allow(clippy::type_complexity)]
-    pub fn jit_merge_view(
-        &mut self,
-    ) -> Option<(*mut u8, u64, u64, u64, u64, u64, u64, u64, *mut u64)> {
-        let base = self.buffer.single_slab_base()? as *mut u8;
-        Some((
-            base,
-            std::mem::size_of::<Entry<K, V>>() as u64,
-            std::mem::offset_of!(Entry<K, V>, value) as u64,
-            std::mem::offset_of!(Entry<K, V>, key) as u64,
-            self.mask as u64,
-            self.shift as u64,
-            self.pre_shift as u64,
-            self.max_load as u64,
-            &mut self.length as *mut usize as *mut u64,
-        ))
-    }
 }
 
 impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>>
@@ -445,9 +399,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
             key,
             value,
             |value, cell| *cell = value,
-            // In-place so a runtime value (`Patched`) folds via its compiled merge
-            // tile straight through the cell — no by-value copy, no store-back.
-            |value, cell| cell.merge_in_place(&value, cfg),
+            |value, cell| *cell = cell.merge(value, cfg),
         );
     }
 
