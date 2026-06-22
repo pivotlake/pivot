@@ -472,13 +472,9 @@ fn open_cache_file(path: &Path) -> std::io::Result<File> {
 fn reseed_bitmap(present: &BlockBitmap, file: &File) {
     use nix::unistd::{Whence, lseek};
     let mut off: i64 = 0;
-    loop {
-        // SEEK_DATA returns the next offset >= `off` holding data, or ENXIO once
-        // past the last data extent.
-        let data = match lseek(file, off, Whence::SeekData) {
-            Ok(d) => d,
-            Err(_) => break, // ENXIO: no more data
-        };
+    // SEEK_DATA returns the next offset >= `off` holding data, or ENXIO once
+    // past the last data extent (ending the loop).
+    while let Ok(data) = lseek(file, off, Whence::SeekData) {
         let hole = match lseek(file, data, Whence::SeekHole) {
             Ok(h) => h,
             Err(_) => break,

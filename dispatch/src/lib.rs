@@ -200,8 +200,8 @@ impl DataFlowDispatcher {
     /// finished. The fan-out sibling of [`run_on_worker`](Self::run_on_worker):
     /// builds one [`OneShotNullary`](crate::operations::nullary::OneShotNullary)
     /// per worker (each gets its own clone of `f`), so `f` executes on a thread
-    /// that has a live [`MemoryContext`] — e.g. to touch per-worker ring/free-pool
-    /// state such as [`memory_ctx().zero_dirty_buffers()`](crate::memory::MemoryContext::zero_dirty_buffers).
+    /// that has a live `MemoryContext` — e.g. to touch per-worker ring/free-pool
+    /// state such as `memory_ctx().zero_dirty_buffers()`.
     pub fn run_on_workers<F>(&self, f: F)
     where
         F: Fn() + Clone + Send + 'static,

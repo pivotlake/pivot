@@ -49,7 +49,7 @@ pub trait FoldAcc: Send + Sync + 'static {
     type SharedContext: Clone + Send + Sync + 'static;
     /// The per-worker write state [`seed`](Fold::seed)/[`update`](Fold::update)
     /// fold into during consume: `()` for a numeric op (it persists nothing), the
-    /// concrete [`WorkerArena`] for a string extreme (it stores winners). A
+    /// concrete `WorkerArena` for a string extreme (it stores winners). A
     /// numeric op's `()` lets consume thread `&mut ()` — free, since a `()`
     /// reference can't alias the table the probe loop mutates.
     type WorkerContext;

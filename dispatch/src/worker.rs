@@ -328,7 +328,7 @@ impl Worker {
     }
 
     /// Submit HTTP reads from dataflows onto the same ring until this worker has
-    /// [`HTTP_INFLIGHT_TARGET`] reads in flight or no more requests remain. Gated
+    /// `HTTP_INFLIGHT_TARGET` reads in flight or no more requests remain. Gated
     /// on HTTP activity only (not disk) so the two queues fill independently.
     ///
     /// Remote objects sit behind ~tens-of-ms RTTs, so a deep read-ahead is what

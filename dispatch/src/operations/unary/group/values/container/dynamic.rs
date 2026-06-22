@@ -125,7 +125,7 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
     type Reader<'b> = [BoundSlot<'b>; N];
     /// The per-slot kinds (which op merges/renders each cell) and the value arena
     /// (which a string extreme resolves its keys through). It spawns a per-worker
-    /// [`WorkerArena`] via [`SharedContext::worker`].
+    /// [`WorkerArena`] via [`SharedContext::worker`](super::super::SharedContext::worker).
     type SharedContext = (Arc<[AggregationSlot]>, Arc<SharedArena>);
     type Columns = [SlabColumn<A>; N];
     type SortKey = i128;

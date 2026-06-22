@@ -4,7 +4,7 @@
 //! blanket bound with nothing to implement. *How* cells combine is the
 //! [`Fold`](super::fold)'s job (plain `Ord::min` / `+` for the numeric folds, an
 //! arena compare for the string ones) — never the cell's. The only thing a
-//! numeric width owns is how it renders to Arrow ([`NumericArrow`]), since that
+//! numeric width owns is how it renders to Arrow (`NumericArrow`), since that
 //! genuinely depends on the width (`i64 → Int64`, `i128 → Decimal128`). The
 //! [`Numeric`] bound alias bundles that with the std arithmetic the numeric folds
 //! lean on, so a fold can just say `A: Numeric`.
@@ -27,7 +27,7 @@ impl<T: Copy + Default + Send + Sync + 'static> Cell for T {}
 
 /// A numeric aggregate cell (`i64` narrow / `i128` wide): a [`Cell`] that adds
 /// (`+`), orders (`Ord`), builds from a per-row `i64` and widens to `i128`, and
-/// renders to Arrow ([`NumericArrow`]). A bound alias — no methods of its own, so
+/// renders to Arrow (`NumericArrow`). A bound alias — no methods of its own, so
 /// the numeric folds combine with std ops, not cell methods.
 pub trait Numeric: Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<i128> {
     /// The Arrow primitive whose `Native` is this width.

@@ -1,5 +1,5 @@
 //! The two [`AggregationValue`](super::AggregationValue) containers built on
-//! [`Slot`]s (each a [`Read`](super::read::Read) + [`Fold`](super::fold::Fold)):
+//! `Slot`s (each a [`Read`](super::read::Read) + [`Fold`](super::fold::Fold)):
 //!
 //! - [`Compiled`] — a fixed tuple of slots; branch-free, any mix (numeric and/or
 //!   string), each slot reading its own typed array.
