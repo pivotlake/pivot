@@ -545,7 +545,7 @@ impl Aggregate {
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
             AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, IntPairKeyExtractor,
-            Patched, RowKeyExtractor, StrMaxSlot, StrMinSlot, SumSlot,
+            Patched, RowKeyExtractor, StrMaxSlot, StrMinSlot,
         };
 
         // The value type is fixed at plan time. A homogeneous *string* MIN/MAX
@@ -604,24 +604,18 @@ impl Aggregate {
         // value (`Dynamic`, or a `Compiled` tuple for a string extreme) below.
         enum Sig {
             Count,
-            Sum(Type),
-            /// MIN/MAX (and any other kind with no compiled specialisation). A
-            /// distinct variant so these never match a compiled Count/Sum shape
-            /// — doing so would monomorphise the wrong op and silently compute a
-            /// count/sum instead of the extreme. Always routes to the fallback.
+            /// `SUM`, or any other kind. The only compiled specialisation left here
+            /// is a lone `COUNT`; every other signature routes to `Patched`/`Dynamic`
+            /// by shape, so `SUM` and the extremes need no further distinction.
             Other,
         }
         let sig: Vec<Sig> = self
             .expressions
             .iter()
             .map(|e| match e {
-                Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
-                    Sig::Sum(a.column.return_type.clone())
-                }
                 Expression::AggregateFunc(
                     AggregateFunc::CountStar(_) | AggregateFunc::Count(_),
                 ) => Sig::Count,
-                // MIN/MAX: no compiled shape yet → fallback (see `Sig::Other`).
                 _ => Sig::Other,
             })
             .collect();
@@ -741,24 +735,14 @@ impl Aggregate {
         }
 
         // Monomorphise over the two key types, the slot arity (N), and the
-        // accumulator width ($acc). Two numeric signatures are specialised to a
-        // branch-free `Compiled`: q32's `count/sum16/sum16/count`, and a lone
-        // `COUNT`; every other numeric signature is `Dynamic`.
+        // accumulator width ($acc). A lone `COUNT` stays a branch-free `Compiled`;
+        // every other all-additive narrow signature — including q32's
+        // `count/sum16/sum16/count` — folds via copy-and-patch (`Patched`, chosen
+        // in `num_arity!` by `use_patched`); the rest is `Dynamic`.
         macro_rules! by_arity {
             ($a:ty, $b:ty, $acc:ty) => {{
                 type Key = IntPairKeyExtractor<$a, $b>;
-                if matches!(
-                    sig.as_slice(),
-                    [
-                        Sig::Count,
-                        Sig::Sum(Type::Int16),
-                        Sig::Sum(Type::Int16),
-                        Sig::Count,
-                    ]
-                ) {
-                    type V = Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>;
-                    Ok(input.group_by_aggregate::<Key, V>(key_cols, slots, top_k))
-                } else if matches!(sig.as_slice(), [Sig::Count]) {
+                if matches!(sig.as_slice(), [Sig::Count]) {
                     Ok(input.group_by_aggregate::<Key, Compiled<(CountSlot,)>>(key_cols, slots, top_k))
                 } else {
                     by_shape!(Key, $acc)
