@@ -4,7 +4,6 @@ use super::{Aggregate, aggregation_slots, sum_reads_wide_column};
 use crate::catalog::QueryContext;
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
-use crate::operator::Input;
 use crate::types::Type;
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -43,10 +42,23 @@ impl Aggregate {
     /// miss returns `None` and the ordinary scan-based path runs.
     pub(crate) fn try_compile_from_stats(
         &self,
-        scan: &Input,
+        inputs: &[crate::PlanNode],
         dispatcher: &DataFlowDispatcher,
         ctx: &dyn QueryContext,
     ) -> Result<Option<RecordBatchOperatorSpec>, Error> {
+        // Only fires on an aggregate sitting directly on a bare scan (a single
+        // Input child with no children of its own), so the table's metadata
+        // describes exactly the rows the aggregate would see.
+        let [child] = inputs else {
+            return Ok(None);
+        };
+        let crate::Operator::Input(scan) = &child.operator else {
+            return Ok(None);
+        };
+        if !child.inputs.is_empty() {
+            return Ok(None);
+        }
+
         if !self.groups.is_empty() || self.expressions.is_empty() {
             return Ok(None);
         }
