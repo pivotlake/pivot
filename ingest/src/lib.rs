@@ -52,7 +52,9 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-pub use compact::{Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL};
+pub use compact::{
+    Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
+};
 pub use otel::{ConfigError, DEFAULT_OTLP_ADDR, OtelConfig, Signal};
 
 use crate::otel::OtelServer;
@@ -85,11 +87,13 @@ impl Ingestor {
     /// [`shutdown`](Self::shutdown) is then a no-op.
     /// `compact_bytes` sizes the bundled, catalog-wide [`Compacter`] (`0`
     /// skips it — e.g. when a dedicated compacter process owns the job).
+    /// `compact_min_files` is its count trigger for sub-target partitions.
     pub fn start(
         configs: Vec<IngestConfig>,
         dispatcher: DataFlowDispatcher,
         catalog: Arc<ParquetCatalog>,
         compact_bytes: u64,
+        compact_min_files: usize,
     ) -> std::io::Result<Self> {
         let (shutdown_tx, _) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -103,6 +107,7 @@ impl Ingestor {
         if compact_bytes > 0 {
             let compacter = Arc::new(Compacter::new(
                 compact_bytes,
+                compact_min_files,
                 DEFAULT_COMPACT_POLL,
                 catalog.clone(),
             ));
@@ -581,7 +586,12 @@ mod tests {
             .filter(|e| e.path().is_file())
             .map(|e| e.metadata().unwrap().len())
             .sum();
-        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), catalog.clone());
+        let compacter = Compacter::new(
+            total,
+            DEFAULT_MIN_FILES_TO_MERGE,
+            std::time::Duration::from_secs(1),
+            catalog.clone(),
+        );
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -656,7 +666,12 @@ mod tests {
             .filter(|e| e.path().is_file())
             .map(|e| e.metadata().unwrap().len())
             .sum();
-        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), catalog.clone());
+        let compacter = Compacter::new(
+            total,
+            DEFAULT_MIN_FILES_TO_MERGE,
+            std::time::Duration::from_secs(1),
+            catalog.clone(),
+        );
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -737,7 +752,12 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), catalog.clone());
+        let compacter = Compacter::new(
+            total,
+            DEFAULT_MIN_FILES_TO_MERGE,
+            std::time::Duration::from_secs(1),
+            catalog.clone(),
+        );
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -805,7 +825,12 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let compacter = Compacter::new(total, std::time::Duration::from_secs(1), compacter_catalog);
+        let compacter = Compacter::new(
+            total,
+            DEFAULT_MIN_FILES_TO_MERGE,
+            std::time::Duration::from_secs(1),
+            compacter_catalog,
+        );
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
