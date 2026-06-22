@@ -60,6 +60,29 @@ fn scan_column_subset() {
     assert_eq!(vals, vec![10, 20, 30]);
 }
 
+// Regression: a projection with no data columns must still emit one row per
+// table row. The column-driven page pipeline produces nothing for zero columns
+// (no pages → no decoder), so a bare empty projection silently returned zero
+// rows; it now routes to the dedicated empty-projection scan, and the row count
+// survives CopyOut (which feeds `collect`).
+#[test]
+fn scan_empty_projection_emits_row_count() {
+    let dispatch = dispatch(1);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]))],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+
+    let results = table_input(&dispatch, &table, Projection::all(0), false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
+    assert!(results.iter().all(|b| b.num_columns() == 0));
+}
+
 #[test]
 fn scan_multiple_parquet_files() {
     let dispatch = dispatch(1);

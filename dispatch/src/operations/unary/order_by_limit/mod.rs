@@ -131,6 +131,17 @@ fn get_top_k_from_single(
     fetch: usize,
     skip: usize,
 ) -> Result<RecordBatch> {
+    // No sort keys → a plain LIMIT/OFFSET: any rows satisfy it, so keep the
+    // first `fetch` rows of the batch then drop the leading `skip`, as a cheap
+    // O(1) logical slice (no sort kernel — `lexsort_to_indices` rejects an empty
+    // column list anyway). Downstream consumers handle logically-sliced arrays
+    // (e.g. the materializer walks `RunEndBuffer::sliced_values()`).
+    if order_by.is_empty() {
+        let end = batch.num_rows().min(fetch);
+        let skip = skip.min(end);
+        return Ok(batch.slice(skip, end - skip));
+    }
+
     let sort_columns: Vec<SortColumn> = order_by
         .iter()
         .map(|ob| {
