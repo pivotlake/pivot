@@ -399,13 +399,14 @@ impl Aggregate {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         use crate::expression::AggregateFunc;
         use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
-        use dispatch::{AggregationKind, AggregationSlot, Dynamic, IntPairKeyExtractor};
+        use dispatch::{AggregationKind, AggregationSlot, IntPairKeyExtractor, Patched};
 
         // The two-level COUNT(DISTINCT) aggregation is all additive (dedup counts
-        // and re-summed partials), so both levels use the `ONLY_ADDITIVE` Dynamic:
-        // the const prunes the per-slot Min/Max/string arms, collapsing the fold to
-        // the same branch-free additive codegen as the hand-written `Mono`.
-        type AddVal<const N: usize> = Dynamic<N, i64, true>;
+        // and re-summed partials), so both levels use the copy-and-patch `Patched`
+        // value: the in-place outer folds via one assembled machine-code loop, and
+        // the high-cardinality inner scatters then merges by elementwise add (both
+        // branch-free, no per-slot dispatch).
+        type AddVal<const N: usize> = Patched<N>;
 
         if self.groups.len() != 1 {
             return Err(Error::UnsupportedAggregateGroupAmount(self.groups.len()));
@@ -544,7 +545,7 @@ impl Aggregate {
         use arrow_array::types::{Int16Type, Int32Type, Int64Type};
         use dispatch::{
             AggregationKind, AggregationSlot, Compiled, CountSlot, Dynamic, IntPairKeyExtractor,
-            RowKeyExtractor, StrMaxSlot, StrMinSlot, SumSlot,
+            Patched, RowKeyExtractor, StrMaxSlot, StrMinSlot, SumSlot,
         };
 
         // The value type is fixed at plan time. A homogeneous *string* MIN/MAX
@@ -658,37 +659,49 @@ impl Aggregate {
             Shape::Numeric
         };
 
+        // An all-additive (`COUNT`/`SUM`) signature over narrow (`i64`) cells folds
+        // by copy-and-patch (`Patched<N>`) instead of the per-slot `Dynamic` match:
+        // the consume path assembles one machine-code loop per signature. A wide
+        // (`i128`) sum or any numeric extreme stays on `Dynamic`.
+        let use_patched = !wide
+            && slots.iter().all(|s| {
+                matches!(
+                    s.kind,
+                    AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
+                )
+            });
+
         // Numeric value: `Dynamic<N, acc>`, folding each slot by its kind,
         // dispatched by arity. One arm runs, so it consumes `input`/`key_cols`/
         // `slots` exactly once.
         macro_rules! num_arity {
             ($Key:ty, $acc:ty) => {
-                match slots.len() {
-                    1 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<1, $acc>>(key_cols, slots, top_k))
+                if use_patched {
+                    match slots.len() {
+                        1 => Ok(input.group_by_aggregate::<$Key, Patched<1>>(key_cols, slots, top_k)),
+                        2 => Ok(input.group_by_aggregate::<$Key, Patched<2>>(key_cols, slots, top_k)),
+                        3 => Ok(input.group_by_aggregate::<$Key, Patched<3>>(key_cols, slots, top_k)),
+                        4 => Ok(input.group_by_aggregate::<$Key, Patched<4>>(key_cols, slots, top_k)),
+                        5 => Ok(input.group_by_aggregate::<$Key, Patched<5>>(key_cols, slots, top_k)),
+                        6 => Ok(input.group_by_aggregate::<$Key, Patched<6>>(key_cols, slots, top_k)),
+                        n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                     }
-                    2 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<2, $acc>>(key_cols, slots, top_k))
+                } else {
+                    match slots.len() {
+                        1 => Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<1, $acc>>(key_cols, slots, top_k)),
+                        2 => Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<2, $acc>>(key_cols, slots, top_k)),
+                        3 => Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<3, $acc>>(key_cols, slots, top_k)),
+                        4 => Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<4, $acc>>(key_cols, slots, top_k)),
+                        5 => Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<5, $acc>>(key_cols, slots, top_k)),
+                        6 => Ok(input
+                            .group_by_aggregate::<$Key, Dynamic<6, $acc>>(key_cols, slots, top_k)),
+                        n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                     }
-                    3 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<3, $acc>>(key_cols, slots, top_k))
-                    }
-                    4 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<4, $acc>>(key_cols, slots, top_k))
-                    }
-                    5 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<5, $acc>>(key_cols, slots, top_k))
-                    }
-                    6 => {
-                        Ok(input
-                            .group_by_aggregate::<$Key, Dynamic<6, $acc>>(key_cols, slots, top_k))
-                    }
-                    n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             };
         }

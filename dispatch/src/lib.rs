@@ -100,7 +100,7 @@ pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, DynamicFilterSlot, Fold, FoldAcc, HashOnlyIntKeyExtractor, IntKeyExtractor,
     IntPairKeyExtractor, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Nullary,
-    NullaryFactory, NullaryOperatorFactory, Numeric, OpTuple, Operator, OrderBy, Read,
+    NullaryFactory, NullaryOperatorFactory, Numeric, OpTuple, Operator, OrderBy, Patched, Read,
     Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMaxSlot, StrMin,
     StrMinSlot, StrRead, StringKeyExtractor, Sum, SumSlot, WideSum,
 };

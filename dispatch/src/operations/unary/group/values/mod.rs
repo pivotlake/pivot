@@ -30,7 +30,8 @@ pub mod read;
 
 pub use cell::{Cell, Numeric};
 pub use container::{
-    Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, StrMaxSlot, StrMinSlot, SumSlot,
+    Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, Patched, StrMaxSlot, StrMinSlot,
+    SumSlot,
 };
 pub use distinct::Distinct;
 pub use fold::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
@@ -119,6 +120,20 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
 
     /// Bind `batch`'s value columns for the configured `slots`.
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
+
+    /// A per-batch copy-and-patch fold, when this value supports one (additive
+    /// numeric — [`Patched`](container::Patched)). `Some` means the consume path
+    /// can probe a run of rows to their cells and fold the whole run in one
+    /// machine-code pass with no per-row dispatch; `None` (the default) keeps the
+    /// per-row [`value`](Self::value)/[`update_from_reader`](Self::update_from_reader)
+    /// path. The cells handed to the returned fold are `*mut i64` — only a value
+    /// whose cell is `[i64; _]` (i.e. `Patched`) may return `Some`.
+    fn batch_fold<'b>(
+        _reader: &Self::Reader<'b>,
+        _cfg: &Self::MergeConfig,
+    ) -> Option<cap::BatchFold> {
+        None
+    }
 
     /// Materialise a brand-new group from row `idx` — the consume path's new-key
     /// case, and the radix scatter. `arena` is the value arena a string extreme

@@ -454,6 +454,41 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         }
     }
 
+    /// Probe for `hash`/`key` and return a raw pointer to its value cell, creating
+    /// a `Default` (additive-identity) entry if the key is new. Unlike
+    /// [`probe_fold`](Self::probe_fold) this does *not* fold — it decouples the
+    /// probe from the fold so a whole run of rows can be resolved to their cells
+    /// and then folded in one pass (the copy-and-patch consume path). The returned
+    /// pointer is valid until the table grows or is dropped; callers must fold the
+    /// run before the next [`resize_with`](Self::resize_with)/table switch.
+    #[inline(always)]
+    pub fn probe_cell<const COUNT_COLLISIONS: bool, L>(&mut self, mut hash: u64, key: L) -> *mut V
+    where
+        L: LiveKey<Persisted = K>,
+    {
+        if hash == 0 {
+            hash = 1;
+        }
+        let mut idx = self.slot_for(hash);
+        loop {
+            let entry = &mut self.buffer[idx];
+            if entry.hash == 0 {
+                entry.hash = hash;
+                entry.key = key.persist();
+                entry.value = V::default();
+                self.length += 1;
+                return &mut entry.value;
+            }
+            if entry.hash == hash && key.eq_persisted(&entry.key) {
+                return &mut entry.value;
+            }
+            if COUNT_COLLISIONS {
+                self.collisions += 1;
+            }
+            idx = (idx + 1) & self.mask;
+        }
+    }
+
     /// Rehash all entries into a new buffer of `new_size` slots.
     ///
     /// Replaces the current buffer with `buffer` (which must be zeroed and

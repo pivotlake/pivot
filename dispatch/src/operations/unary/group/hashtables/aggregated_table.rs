@@ -123,6 +123,12 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     radix_cfg: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
+    /// Scratch for the copy-and-patch consume path: each row's resolved value-cell
+    /// pointer, stored as an address so the field stays `Send`. Filled by the probe
+    /// run, then consumed by the JIT fold (see [`consume_batch_jit`]).
+    ///
+    /// [`consume_batch_jit`]: AggregatedTable::consume_batch_jit
+    cells: Box<[usize; RECORD_BATCH_SIZE]>,
     /// Per-worker reusable key-extraction scratch (e.g. the row extractor's
     /// encode buffers). Lent to the reader each batch and reused, never
     /// reallocated. `()` for extractors that read columns directly.
@@ -154,6 +160,10 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             switched_to_radix: false,
             radix_cfg: radix,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            cells: vec![0usize; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
@@ -231,6 +241,13 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
 
             if self.switched_to_radix {
                 self.scatter_range(0, length, &key_reader, &value_reader);
+            } else if !K::DEDUP_BY_HASH
+                && let Some(bf) = V::batch_fold(&value_reader, merge_config)
+            {
+                // Additive numeric value: probe a run of rows to their cells, then
+                // fold the whole run with one copy-and-patch machine-code pass — no
+                // per-row dispatch (see `Patched`).
+                self.consume_batch_jit(length, &key_reader, &value_reader, &bf);
             } else {
                 // The value type fixes the fold (Mono is branch-free, Dynamic
                 // dispatches per slot via `merge_config`); the probe just consumes.
@@ -297,6 +314,60 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 return;
             }
             i += 1;
+        }
+    }
+
+    /// Copy-and-patch consume: probe a run of rows to their value cells, then fold
+    /// the whole run in one machine-code pass with no per-row dispatch.
+    ///
+    /// The fold is split from the probe so the inner loop carries no per-row call.
+    /// A run extends until the active table overflows (its cell pointers stay valid
+    /// until then); the run is folded, and only then does the table grow — or, for
+    /// a radix-eligible key, switch to scatter for the rest of the batch.
+    #[inline(always)]
+    fn consume_batch_jit<'b>(
+        &mut self,
+        length: usize,
+        key_reader: &K::Reader<'b>,
+        value_reader: &V::Reader<'b>,
+        bf: &crate::operations::unary::group::values::cap::BatchFold,
+    ) {
+        const L1_DISTANCE: usize = 16;
+        const L2_DISTANCE: usize = 48;
+        let mut i = 0;
+        while i < length {
+            let run_start = i;
+            loop {
+                let hash = self.hashes[i];
+                let cell = {
+                    let table = self.tables.last_mut().unwrap();
+                    if i + L2_DISTANCE < length {
+                        table.prefetch_l2(self.hashes[i + L2_DISTANCE]);
+                    }
+                    if i + L1_DISTANCE < length {
+                        table.prefetch(self.hashes[i + L1_DISTANCE]);
+                    }
+                    let key = K::live_key(key_reader, i, &mut self.key_arena);
+                    table.probe_cell::<false, _>(hash, key)
+                };
+                self.cells[i] = cell as *mut i64 as usize;
+                i += 1;
+                if i >= length || self.tables.last().unwrap().undersized() {
+                    break;
+                }
+            }
+            // Fold the run [run_start, i). The stored addresses are exactly the
+            // `*mut i64` cell bases (Patched is `repr(transparent)` over `[i64; N]`).
+            // SAFETY: those cells are live in the current table until the grow
+            // below, and the bound columns have at least `i` elements.
+            unsafe {
+                let cells_ptr = (self.cells.as_ptr() as *const *mut i64).add(run_start);
+                bf.run(cells_ptr, run_start, i - run_start);
+            }
+            if i < length && self.tables.last().unwrap().undersized() && self.grow_or_switch() {
+                self.scatter_range(i, length, key_reader, value_reader);
+                return;
+            }
         }
     }
 

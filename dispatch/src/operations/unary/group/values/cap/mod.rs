@@ -59,6 +59,19 @@ pub enum FoldOp {
 }
 
 impl FoldOp {
+    /// The fold a value slot of `kind` over a column of byte-`width` (`0` for
+    /// `COUNT`) needs — `None` if it isn't an additive numeric the stencils cover.
+    pub fn from_slot(kind: super::AggregationKind, width: u8) -> Option<FoldOp> {
+        use super::AggregationKind::{Count, CountStar, Sum};
+        Some(match (kind, width) {
+            (CountStar | Count, _) => FoldOp::Count,
+            (Sum, 2) => FoldOp::SumI16,
+            (Sum, 4) => FoldOp::SumI32,
+            (Sum, 8) => FoldOp::SumI64,
+            _ => return None,
+        })
+    }
+
     fn stencil(self) -> &'static OpStencil {
         match self {
             FoldOp::Count => &OP_COUNT,
@@ -92,6 +105,44 @@ impl CompiledFold {
     #[inline(always)]
     pub fn func(&self) -> FoldFn {
         unsafe { std::mem::transmute::<*const u8, FoldFn>(self.exec.ptr()) }
+    }
+}
+
+/// A per-batch fold ready to run: the assembled loop's entry point plus this
+/// batch's per-slot column bases and widths.
+///
+/// The entry point is a plain function pointer; the executable memory it lives in
+/// is owned elsewhere (a [`CompiledFold`] cached for the query), so a `BatchFold`
+/// is cheap to build per batch. [`run`](Self::run) folds a contiguous run of rows,
+/// advancing the column bases so the loop's row index lines up with the columns.
+pub struct BatchFold {
+    func: FoldFn,
+    bases: Vec<*const u8>,
+    widths: Vec<u8>,
+}
+
+impl BatchFold {
+    pub fn new(func: FoldFn, bases: Vec<*const u8>, widths: Vec<u8>) -> Self {
+        Self { func, bases, widths }
+    }
+
+    /// Fold rows `[start, start + n)`. `cells` must point at row `start`'s cell
+    /// pointer (i.e. already offset by `start`); each `cells[j]` is row
+    /// `start + j`'s group cell. The loop reads column element `j`, so we advance
+    /// each base by `start` elements first.
+    ///
+    /// # Safety
+    /// `cells[0..n]` must be valid `*mut i64` group-cell pointers and the bound
+    /// columns must have at least `start + n` elements.
+    #[inline]
+    pub unsafe fn run(&self, cells: *const *mut i64, start: usize, n: usize) {
+        let cols: Vec<*const u8> = self
+            .bases
+            .iter()
+            .zip(&self.widths)
+            .map(|(&b, &w)| if w == 0 { b } else { unsafe { b.add(start * w as usize) } })
+            .collect();
+        unsafe { (self.func)(cells, cols.as_ptr(), n as u64) };
     }
 }
 

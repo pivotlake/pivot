@@ -104,7 +104,7 @@ pub use keys::{
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric, OpTuple,
-    Read, StrMax, StrMaxSlot, StrMin, StrMinSlot, StrRead, Sum, SumSlot, WideSum,
+    Patched, Read, StrMax, StrMaxSlot, StrMin, StrMinSlot, StrRead, Sum, SumSlot, WideSum,
 };
 
 use crate::memory::SlabAllocator;
@@ -762,6 +762,71 @@ mod tests {
         );
 
         assert_eq!(group_counts(&sender), vec![(1, 40), (2, 20), (3, 10)]);
+    }
+
+    #[test]
+    fn patched_sum_per_group_via_jit() {
+        // The copy-and-patch consume path (Patched value): same SUM-per-group as
+        // above, folded by the assembled machine-code loop instead of Dynamic.
+        let batch = keyed_i32_batch(&[1, 2, 1, 3, 3], &[10, 20, 30, 5, 5]);
+        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 1)];
+
+        let sender = run_group_full::<IntExtractor, Patched<1>>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        assert_eq!(group_counts(&sender), vec![(1, 40), (2, 20), (3, 10)]);
+    }
+
+    #[test]
+    fn patched_counts_survive_in_place_stack_growth() {
+        // Enough distinct keys to overflow the in-place table mid-batch: the JIT
+        // consume must fold each run before the table grows, keeping cells valid.
+        let mut values: Vec<i32> = (0..3000).collect();
+        values.extend(0..3000);
+
+        let sender = run_group_full::<IntExtractor, Patched<1>>(
+            vec![vec![batch_with_column(&values)]],
+            vec![0],
+            count_slots(),
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        assert_eq!(
+            group_counts(&sender),
+            (0..3000).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn patched_radix_scatter_and_merge() {
+        // A small radix config forces the switch to scatter; Patched's per-row
+        // value() materialises each scattered row and the merge folds them by
+        // elementwise add (no JIT on this path) — must still be correct.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+        };
+        let mut values: Vec<i32> = (0..500).collect();
+        values.extend(0..500);
+
+        let sender = run_group_full::<IntExtractor, Patched<1>>(
+            vec![vec![batch_with_column(&values)]],
+            vec![0],
+            count_slots(),
+            None,
+            radix,
+        );
+
+        assert_eq!(
+            group_counts(&sender),
+            (0..500).map(|k| (k, 2)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
