@@ -628,7 +628,7 @@ mod uring_engine {
 
         /// Fold `size` freshly transferred bytes into the connection's request
         /// state, returning whether the response body is now complete. Errors
-        /// (an EOF mid-body, a parse failure) are surfaced to [`on_cqe`], which
+        /// (an EOF mid-body, a parse failure) are surfaced to [`on_cqe`](Self::on_cqe), which
         /// turns them into a retry or a recorded failure.
         fn advance(&mut self, idx: usize, size: usize) -> Result<bool> {
             let conn = self.conns[idx].as_mut().unwrap();
