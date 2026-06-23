@@ -7,10 +7,14 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/exception.hpp"
 
 using namespace duckdb;
@@ -34,6 +38,15 @@ unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctio
 	names = info.names;
 	return_types = info.return_types;
 	return make_uniq<PivotTableFunctionBindData>();
+}
+
+// Body of a pivot scalar function stub. It never runs: pivot re-plans the call
+// into its own expression, and the only pivot scalar (drop_cache) is VOLATILE so
+// the optimizer can't fold it. Emits a constant NULL so DuckDB has a valid,
+// type-agnostic result if it ever does evaluate the call.
+void pivot_scalar_function_stub(DataChunk &, ExpressionState &, Vector &result) {
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, true);
 }
 
 } // namespace
@@ -78,6 +91,34 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		    make_uniq<TableFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
 		auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
 		return PivotStorageInfo::Get(db_instance).AddFunctionEntry(std::move(entry));
+	}
+
+	// A scalar-function reference (e.g. `drop_cache()`): same idea as table
+	// functions. Unknown names (DuckDB's own built-ins like `+`/`length`) return
+	// nullptr and resolve against the system catalog.
+	if (lookup_info.GetCatalogType() == CatalogType::SCALAR_FUNCTION_ENTRY) {
+		auto function = catalog_get_scalar_function(*pivot_catalog.catalog_ctx, table_name);
+		if (!function.found) {
+			return nullptr;
+		}
+
+		vector<LogicalType> arguments;
+		for (auto type_id : function.arg_type_ids) {
+			arguments.emplace_back(static_cast<LogicalTypeId>(type_id));
+		}
+		LogicalType return_type(static_cast<LogicalTypeId>(function.return_type_id));
+
+		ScalarFunction func(std::string(table_name), std::move(arguments), return_type,
+		                    pivot_scalar_function_stub);
+		if (function.is_volatile) {
+			func.SetStability(FunctionStability::VOLATILE);
+		}
+
+		CreateScalarFunctionInfo create_info(func);
+		auto entry =
+		    make_uniq<ScalarFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
+		auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
+		return PivotStorageInfo::Get(db_instance).AddScalarFunctionEntry(std::move(entry));
 	}
 
 	auto result = catalog_get_table(*pivot_catalog.catalog_ctx, table_name);

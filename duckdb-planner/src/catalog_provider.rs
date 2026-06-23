@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::duckdb_bridge::ffi::CatalogGetScalarFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableResult;
 use crate::duckdb_bridge::ffi::DuckDBColumn;
@@ -63,6 +64,16 @@ pub struct TableFunctionDef {
     pub columns: Vec<DuckDBColumn>,
 }
 
+/// A scalar function the provider defines, described for DuckDB's binder: its
+/// argument types and return type (DuckDB logical type id discriminants), plus
+/// whether it must be marked `VOLATILE` so the optimizer can't fold the call
+/// away before pivot re-plans it.
+pub struct ScalarFunctionDef {
+    pub arg_type_ids: Vec<u8>,
+    pub return_type_id: u8,
+    pub is_volatile: bool,
+}
+
 pub trait DuckDBBind {
     /// Given a table name, return a table/object that implements [`DuckDBTable`] with column definitions.
     /// Returns `None` if the table doesn't exist.
@@ -73,6 +84,13 @@ pub trait DuckDBBind {
     /// during binding; functions the provider doesn't know (e.g. DuckDB built-ins
     /// like `generate_series`) return `None` and resolve elsewhere. Default: none.
     fn table_function(&self, _name: &str) -> Option<TableFunctionDef> {
+        None
+    }
+
+    /// Like [`table_function`](Self::table_function), but for scalar functions
+    /// (e.g. `drop_cache`). Names the provider doesn't define return `None` and
+    /// resolve against DuckDB's own built-ins. Default: none.
+    fn scalar_function(&self, _name: &str) -> Option<ScalarFunctionDef> {
         None
     }
 }
@@ -127,6 +145,26 @@ pub(crate) fn catalog_get_table_function(
             found: false,
             arg_type_ids: Vec::new(),
             columns: Vec::new(),
+        },
+    }
+}
+
+pub(crate) fn catalog_get_scalar_function(
+    ctx: &CatalogContext,
+    name: &str,
+) -> CatalogGetScalarFunctionResult {
+    match ctx.provider.scalar_function(name) {
+        Some(def) => CatalogGetScalarFunctionResult {
+            found: true,
+            arg_type_ids: def.arg_type_ids,
+            return_type_id: def.return_type_id,
+            is_volatile: def.is_volatile,
+        },
+        None => CatalogGetScalarFunctionResult {
+            found: false,
+            arg_type_ids: Vec::new(),
+            return_type_id: 0,
+            is_volatile: false,
         },
     }
 }
