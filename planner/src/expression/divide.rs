@@ -79,6 +79,7 @@ mod tests {
             Box::new(Expression::Ref(Ref {
                 column_idx: idx,
                 return_type: Type::Int64,
+                name: None,
             }))
         };
         let divide = Divide {

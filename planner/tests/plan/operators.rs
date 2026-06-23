@@ -23,9 +23,22 @@ fn simple_select(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b FROM example_table")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int32, #1:Int32)
-      Input([#0:Int32, #1:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32, b:Int32)
+      Input([a:Int32, b:Int32])
+    ");
+}
+
+#[rstest]
+fn explain_wraps_the_explained_plan(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("EXPLAIN SELECT a, b FROM example_table")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Explain
+      Projection(a:Int32, b:Int32)
+        Input([a:Int32, b:Int32])
     ");
 }
 
@@ -36,10 +49,10 @@ fn filter(mut testing_planner: TestingPlanner) {
         .plan("SELECT a FROM example_table WHERE a <> b")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
-    Projection(#0:Int32)
+    Projection(a:Int32)
       Projection(#0:Int32)
-        Filter(#0:Int32 <> #1:Int32 -> Boolean)
-          Input([#0:Int32, #1:Int32])
+        Filter(a:Int32 <> b:Int32 -> Boolean)
+          Input([a:Int32, b:Int32])
     ");
 }
 
@@ -49,10 +62,10 @@ fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    TopN(limit: 2, offset: 0, order: #0:Int32 DESC)
-      Projection(#0:Int32)
-        Input([#0:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    TopN(limit: 2, offset: 0, order: pv.main.example_table.a:Int32 DESC)
+      Projection(a:Int32)
+        Input([a:Int32])
     ");
 }
 
@@ -62,10 +75,10 @@ fn order_by_without_limit_produces_order_by(mut testing_planner: TestingPlanner)
         .planner
         .plan("SELECT a FROM example_table ORDER BY a DESC")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    OrderBy(#0:Int32 DESC)
-      Projection(#0:Int32)
-        Input([#0:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    OrderBy(pv.main.example_table.a:Int32 DESC)
+      Projection(a:Int32)
+        Input([a:Int32])
     ");
 }
 
@@ -75,11 +88,11 @@ fn simple_aggregate(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT COUNT(*) FROM example_table WHERE a <> 0")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int64)
+    assert_snapshot!(plan.to_string(), @"
+    Projection(count_star():Int64)
       Aggregate(groups: [], exprs: [count_star()])
-        Filter(#0:Int32 <> 0:Int32 -> Boolean)
-          Input([#0:Int32])
+        Filter(a:Int32 <> 0:Int32 -> Boolean)
+          Input([a:Int32])
     ");
 }
 
@@ -89,10 +102,10 @@ fn aggregate_with_single_group(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int32, #1:Int64)
-      Aggregate(groups: [#0:Int32], exprs: [count_star()])
-        Input([#0:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32, count_star():Int64)
+      Aggregate(groups: [a:Int32], exprs: [count_star()])
+        Input([a:Int32])
     ");
 }
 
@@ -102,10 +115,10 @@ fn aggregate_with_multiple_groups(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a, b, COUNT(*) FROM example_table GROUP BY a, b")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int32, #1:Int32, #2:Int64)
-      Aggregate(groups: [#0:Int32, #1:Int32], exprs: [count_star()])
-        Input([#0:Int32, #1:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32, b:Int32, count_star():Int64)
+      Aggregate(groups: [a:Int32, b:Int32], exprs: [count_star()])
+        Input([a:Int32, b:Int32])
     ");
 }
 
@@ -118,9 +131,9 @@ fn input_references_correct_columns(mut testing_planner: TestingPlanner) {
     // `a` is column #0 and `c` is column #2 in the table; the Input scans
     // those two source columns, while the Projection references them by
     // their positions in the Input's output (#0 and #1).
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int32, #1:Int32)
-      Input([#0:Int32, #2:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32, c:Int32)
+      Input([a:Int32, c:Int32])
     ");
 }
 
@@ -156,12 +169,12 @@ fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
-    TopN(limit: 2, offset: 0, order: #0:Int32 DESC)
-      Projection(#0:Int32)
+    assert_snapshot!(plan.to_string(), @"
+    TopN(limit: 2, offset: 0, order: pv.main.example_table.a:Int32 DESC)
+      Projection(a:Int32)
         Projection(#0:Int32)
-          Filter(#0:Int32 <> #1:Int32 -> Boolean)
-            Input([#0:Int32, #1:Int32])
+          Filter(a:Int32 <> b:Int32 -> Boolean)
+            Input([a:Int32, b:Int32])
     ");
 }
 

@@ -131,6 +131,7 @@ fn constant_comparison(
         left: Box::new(Expression::Ref(Ref {
             column_idx,
             return_type: Type::Int32,
+            name: None,
         })),
         right: Box::new(Expression::Constant(constant)),
         compare_type,
