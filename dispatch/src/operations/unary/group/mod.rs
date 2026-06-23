@@ -103,7 +103,7 @@ pub use keys::{
 };
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric, OpTuple,
+    Dynamic, Fold, IntRead, Max, MaxSlot, Min, MinSlot, NoRead, Numeric, OpTuple,
     Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, WideSum, WorkerContext,
 };
 
