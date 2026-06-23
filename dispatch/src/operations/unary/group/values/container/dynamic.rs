@@ -149,28 +149,36 @@ impl SharedContext for DynShared {
         }
     }
     fn worker(&self) -> DynWorker {
+        // Fixed-size buffers sized to the largest window a single finalize can see
+        // (a chunk is at most one record batch). Recording is then a branchless
+        // indexed write — no `Vec::push` capacity test on the hot path.
+        let buf = || vec![(std::ptr::null_mut::<u8>(), 0u32); crate::RECORD_BATCH_SIZE].into_boxed_slice();
         DynWorker {
             arena: WorkerArena::new(self.arena.clone()),
-            seeds: Vec::new(),
-            updates: Vec::new(),
+            seeds: buf(),
+            seeds_len: 0,
+            updates: buf(),
+            updates_len: 0,
         }
     }
 }
 
 /// The per-worker write state for the deferred [`Dynamic`] consume: the string
-/// arena, plus the two batch-scoped buffers of `(cell, row)` the probe records
-/// into. The cell pointers are type-erased (`*mut u8`);
+/// arena, plus two fixed-size `(cell, row)` buffers the probe records into, each
+/// with its own running length. The cell pointers are type-erased (`*mut u8`);
 /// [`finalize_batch`](AggregationValue::finalize_batch) casts each back to the
-/// concrete value, which it alone knows. Drained and cleared each batch, so the
-/// capacity is reused.
+/// concrete value, which it alone knows. The lengths reset to 0 each window, so
+/// the allocations are reused and recording stays a branchless indexed write.
 ///
 /// The recorded pointers are stable: a hash-table entry lives in slab memory, so
 /// growing the table stack never moves it, and the buffers are always emptied
 /// before the batch's reader is dropped.
 pub struct DynWorker {
     arena: WorkerArena,
-    seeds: Vec<(*mut u8, u32)>,
-    updates: Vec<(*mut u8, u32)>,
+    seeds: Box<[(*mut u8, u32)]>,
+    seeds_len: usize,
+    updates: Box<[(*mut u8, u32)]>,
+    updates_len: usize,
 }
 
 // The raw cell pointers live and die within a single worker's batch (recorded and
@@ -271,7 +279,11 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
         if EAGER {
             *cell = Self::value(reader, idx, wc);
         } else {
-            wc.seeds.push((cell as *mut Self as *mut u8, idx as u32));
+            // Branchless append: the window is at most `RECORD_BATCH_SIZE` rows, so
+            // `seeds_len` never reaches the buffer length.
+            let n = wc.seeds_len;
+            unsafe { *wc.seeds.get_unchecked_mut(n) = (cell as *mut Self as *mut u8, idx as u32) };
+            wc.seeds_len = n + 1;
         }
     }
 
@@ -284,7 +296,9 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
         ctx: &Self::SharedContext,
     ) {
         if !EAGER {
-            wc.updates.push((cell as *mut Self as *mut u8, idx as u32));
+            let n = wc.updates_len;
+            unsafe { *wc.updates.get_unchecked_mut(n) = (cell as *mut Self as *mut u8, idx as u32) };
+            wc.updates_len = n + 1;
             return;
         }
         // MEASUREMENT eager baseline: the original per-row, per-slot fold.
@@ -345,8 +359,12 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
         let DynWorker {
             arena,
             seeds,
+            seeds_len,
             updates,
+            updates_len,
         } = wc;
+        let seeds = &seeds[..*seeds_len];
+        let updates = &updates[..*updates_len];
         let shared = &ctx.arena;
         let mut na = ();
         // Cache-blocking: a tile's touched value cells (at most `TILE` lines) stay
@@ -506,8 +524,8 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
             }
             start += TILE;
         }
-        seeds.clear();
-        updates.clear();
+        *seeds_len = 0;
+        *updates_len = 0;
     }
 
     #[inline(always)]
