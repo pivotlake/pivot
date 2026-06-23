@@ -9,9 +9,9 @@ fn ref_column(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int32)
-      Input([#0:Int32])
+      Input([a:Int32])
     ");
 }
 
@@ -26,7 +26,7 @@ fn compare_notequal_columns(mut testing_planner: TestingPlanner) {
     Projection(#0:Int32)
       Projection(#0:Int32)
         Filter(#0:Int32 <> #1:Int32 -> Boolean)
-          Input([#0:Int32, #1:Int32])
+          Input([a:Int32, b:Int32])
     ");
 }
 
@@ -41,7 +41,7 @@ fn compare_equal_columns(mut testing_planner: TestingPlanner) {
     Projection(#0:Int32)
       Projection(#0:Int32)
         Filter(#0:Int32 = #1:Int32 -> Boolean)
-          Input([#0:Int32, #1:Int32])
+          Input([a:Int32, b:Int32])
     ");
 }
 
@@ -52,10 +52,10 @@ fn compare_equal_constant(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a = 5")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int32)
       Filter(#0:Int32 = 5:Int32 -> Boolean)
-        Input([#0:Int32])
+        Input([a:Int32])
     ");
 }
 
@@ -66,10 +66,10 @@ fn constant_integer(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT a FROM example_table WHERE a <> 5")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int32)
       Filter(#0:Int32 <> 5:Int32 -> Boolean)
-        Input([#0:Int32])
+        Input([a:Int32])
     ");
 }
 
@@ -81,10 +81,10 @@ fn constant_string(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT name FROM example_table WHERE name <> 'alice'")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Utf8)
       Filter(#0:Utf8 <> alice:Utf8View -> Boolean)
-        Input([#3:Utf8])
+        Input([name:Utf8])
     ");
 }
 
@@ -96,11 +96,11 @@ fn aggregate_count_star(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT COUNT(*) FROM example_table WHERE a <> 0")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int64)
       Aggregate(groups: [], exprs: [count_star()])
         Filter(#0:Int32 <> 0:Int32 -> Boolean)
-          Input([#0:Int32])
+          Input([a:Int32])
     ");
 }
 
@@ -112,10 +112,10 @@ fn function_contains(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT name FROM example_table WHERE contains(name, 'ali')")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Utf8)
       Filter(contains(#0:Utf8, ali:Utf8View))
-        Input([#3:Utf8])
+        Input([name:Utf8])
     ");
 }
 
@@ -137,10 +137,10 @@ fn function_minute(mut testing_planner: TestingPlanner) {
         .planner
         .plan("SELECT extract(minute FROM EventTime) AS m, COUNT(*) FROM events GROUP BY m")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int64, #1:Int64)
       Aggregate(groups: [minute(#0:Timestamp)], exprs: [count_star()])
-        Input([#0:Timestamp])
+        Input([EventTime:Timestamp])
     ");
 }
 
@@ -154,9 +154,9 @@ fn case_expression_group_key(mut testing_planner: TestingPlanner) {
              FROM example_table GROUP BY 1",
         )
         .unwrap();
-    assert_snapshot!(plan.to_string(), @r"
+    assert_snapshot!(plan.to_string(), @"
     Projection(#0:Utf8, #1:Int64)
       Aggregate(groups: [CASE WHEN #0:Int32 < 3:Int32 -> Boolean THEN low:Utf8View ELSE high:Utf8View END], exprs: [count_star()])
-        Input([#0:Int32])
+        Input([a:Int32])
     ");
 }

@@ -38,7 +38,7 @@ fn explain_emits_plan_text_without_running_the_query(mut testing_planner: Testin
         lines,
         vec![
             "Projection(#0:Int32, #1:Int32)",
-            "  Input([#0:Int32, #1:Int32])",
+            "  Input([a:Int32, b:Int32])",
         ]
     );
 }
