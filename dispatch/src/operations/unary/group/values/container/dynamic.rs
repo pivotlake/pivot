@@ -35,7 +35,7 @@ use std::sync::Arc;
 /// one more variant in this enum, shared by every numeric op.
 ///
 /// `Dec128` reads a `Decimal128(38, 0)` column: the Arrow type a *wide* (`i128`)
-/// cell emits for its `COUNT`/`SUM` slots (see [`cell`](super::cell)). It exists
+/// cell emits for its `COUNT`/`SUM` slots (see [`cell`](super::super::cell)). It exists
 /// so a two-level aggregate whose inner level is forced wide by a string extreme
 /// (the `COUNT(DISTINCT) + MIN(string)` lowering) can re-read its own numeric
 /// partials in the outer level. A `COUNT` partial, and a `MIN`/`MAX` or `SUM`
