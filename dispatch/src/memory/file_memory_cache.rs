@@ -707,7 +707,29 @@ impl FileMemoryCache {
     /// map (only those still pointing at this slot) and bumps the slot's generation
     /// so a reader pinning a surviving placement resolves to a miss.
     pub fn evict(&self) -> WriteBuffer {
+        // TEMPORARY livelock guard. When a query's working set exceeds the ring,
+        // every worker spins here finding nothing evictable (perf proved ~98% CPU
+        // in this loop, ~0 forward progress, and the loop has no cancellation
+        // point). After 100 fruitless iterations, warn and sleep to give peer
+        // workers / ingest a chance to release slots; if a full ring sweep after
+        // the sleep still finds nothing, the cache is genuinely exhausted, so
+        // panic to abort the offending query rather than peg all cores forever.
+        let mut iterations: u64 = 0;
+        let mut panic_at: Option<u64> = None;
         loop {
+            iterations += 1;
+            if panic_at.is_none() && iterations == 100 {
+                tracing::warn!(iterations, "FileCache::evict: no memory left to evict, sleeping");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                panic_at = Some(iterations + memory_ctx().ring().len() as u64);
+            } else if panic_at.is_some_and(|limit| iterations >= limit) {
+                panic!(
+                    "FileCache::evict: still no evictable memory after sleeping \
+                     ({iterations} iterations) — aborting query (cache exhausted \
+                     by an oversized working set)"
+                );
+            }
+
             let slot_idx = self.hand.fetch_add(1, Ordering::Relaxed) % memory_ctx().ring().len();
             let entry = self.entry(slot_idx);
             // Give recently-used slots a second chance.
