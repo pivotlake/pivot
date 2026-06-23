@@ -407,7 +407,10 @@ impl FileMemoryCache {
         let mut block_in_file = first_block_in_file;
         while block_in_file <= last_block_in_file {
             match self.classify_next_run(location, block_in_file, last_block_in_file, offset, end) {
-                Resolved::Present { lookup, next_block_in_file } => {
+                Resolved::Present {
+                    lookup,
+                    next_block_in_file,
+                } => {
                     block_in_file = next_block_in_file;
                     lookups.push(lookup);
                 }
@@ -458,7 +461,8 @@ impl FileMemoryCache {
             // Stale (recycled) or contended extent: treat its covered span as a
             // miss; `allocate_run` removes the dead extent under the write lock.
             return Resolved::Miss {
-                block_count: extent.last_block_in_file().min(last_block_in_file) - block_in_file + 1,
+                block_count: extent.last_block_in_file().min(last_block_in_file) - block_in_file
+                    + 1,
             };
         }
 
@@ -496,7 +500,8 @@ impl FileMemoryCache {
 
         let run_end = extent.last_block_in_file().min(last_block_in_file);
         // Slot sub-block holding file block `b`.
-        let sub_block_of = |b: usize| extent.sub_block_in_slot as usize + (b - extent.first_block_in_file);
+        let sub_block_of =
+            |b: usize| extent.sub_block_in_slot as usize + (b - extent.first_block_in_file);
         let first_sub_block = sub_block_of(block_in_file);
 
         let first_valid = entry.valid.is_set(first_sub_block);
@@ -535,7 +540,8 @@ impl FileMemoryCache {
         end: usize,
     ) -> Option<(usize, CacheLookup)> {
         let fill_cursor = memory_ctx().fill_cursor();
-        if fill_cursor.buffer.is_none() || fill_cursor.next_sub_block as usize == SUB_BLOCKS_PER_SLOT
+        if fill_cursor.buffer.is_none()
+            || fill_cursor.next_sub_block as usize == SUB_BLOCKS_PER_SLOT
         {
             // May evict (touching the maps), so hold no map lock here.
             self.rotate_fill_buffer(fill_cursor);
@@ -707,7 +713,35 @@ impl FileMemoryCache {
     /// map (only those still pointing at this slot) and bumps the slot's generation
     /// so a reader pinning a surviving placement resolves to a miss.
     pub fn evict(&self) -> WriteBuffer {
+        // TEMPORARY livelock guard. When a query's working set exceeds the ring,
+        // every worker spins here finding nothing evictable (perf proved ~98% CPU
+        // in this loop, ~0 forward progress, and the loop has no cancellation
+        // point). After two full ring sweeps find nothing (a healthy CLOCK finds a
+        // victim within ~2 sweeps, so this is clearly abnormal), warn and sleep to
+        // give peer workers / ingest a chance to release slots; if one more sweep
+        // after the sleep still finds nothing, the cache is genuinely exhausted, so
+        // panic to abort the offending query rather than peg all cores forever.
+        let ring_len = memory_ctx().ring().len() as u64;
+        let warn_at = 2 * ring_len;
+        let mut iterations: u64 = 0;
+        let mut panic_at: Option<u64> = None;
         loop {
+            iterations += 1;
+            if panic_at.is_none() && iterations == warn_at {
+                tracing::warn!(
+                    iterations,
+                    "FileCache::evict: no memory left to evict, sleeping"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                panic_at = Some(iterations + ring_len);
+            } else if panic_at.is_some_and(|limit| iterations >= limit) {
+                panic!(
+                    "FileCache::evict: still no evictable memory after sleeping \
+                     ({iterations} iterations) — aborting query (cache exhausted \
+                     by an oversized working set)"
+                );
+            }
+
             let slot_idx = self.hand.fetch_add(1, Ordering::Relaxed) % memory_ctx().ring().len();
             let entry = self.entry(slot_idx);
             // Give recently-used slots a second chance.
@@ -885,7 +919,14 @@ fn build_lookup(
     offset: usize,
     end: usize,
 ) -> CacheLookup {
-    let data = slice_run_bytes(&pin, first_block_in_file, first_sub_block, block_count, offset, end);
+    let data = slice_run_bytes(
+        &pin,
+        first_block_in_file,
+        first_sub_block,
+        block_count,
+        offset,
+        end,
+    );
     let missing = if needs_read {
         vec![MissingBlock::new(
             first_block_in_file * SUB_BLOCK_SIZE,
@@ -1040,7 +1081,10 @@ mod tests {
         let b = &b[0].missing()[0];
         assert_eq!(a.slot_idx, b.slot_idx, "should share the fill slot");
         assert_eq!(a.first_sub_block, 0);
-        assert_eq!(b.first_sub_block, 1, "second read packed right after the first");
+        assert_eq!(
+            b.first_sub_block, 1,
+            "second read packed right after the first"
+        );
     }
 
     #[test]
