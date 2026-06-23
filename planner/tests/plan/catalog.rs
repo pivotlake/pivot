@@ -111,9 +111,9 @@ fn catalog_resolves_named_table() {
 
     let plan = planner.plan("SELECT a, b FROM t").unwrap();
 
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int32, #1:Int32)
-      Input([#0:Int32, #1:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32, b:Int32)
+      Input([a:Int32, b:Int32])
     ");
 }
 
@@ -150,13 +150,13 @@ fn pushdown_rejected_keeps_filter_operator() {
     let plan = planner.plan("SELECT a FROM t WHERE a <> 0").unwrap();
 
     let received = table.received.lock().unwrap();
-    assert_snapshot!(pushdown_snapshot(&received), @"#0:Int32 <> 0:Int32 -> Boolean");
+    assert_snapshot!(pushdown_snapshot(&received), @"a:Int32 <> 0:Int32 -> Boolean");
     drop(received);
 
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int32)
-      Filter(#0:Int32 <> 0:Int32 -> Boolean)
-        Input([#0:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32)
+      Filter(a:Int32 <> 0:Int32 -> Boolean)
+        Input([a:Int32])
     ");
 }
 
@@ -171,12 +171,12 @@ fn pushdown_accepted_drops_filter_operator() {
     let plan = planner.plan("SELECT a FROM t WHERE a <> 0").unwrap();
 
     let received = table.received.lock().unwrap();
-    assert_snapshot!(pushdown_snapshot(&received), @"#0:Int32 <> 0:Int32 -> Boolean");
+    assert_snapshot!(pushdown_snapshot(&received), @"a:Int32 <> 0:Int32 -> Boolean");
     drop(received);
 
-    assert_snapshot!(plan.to_string(), @r"
-    Projection(#0:Int32)
-      Input([#0:Int32])
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32)
+      Input([a:Int32])
     ");
 }
 

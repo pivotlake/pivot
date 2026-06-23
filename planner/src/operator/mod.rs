@@ -16,6 +16,7 @@
 mod aggregate;
 mod create_table;
 mod dummy_scan;
+mod explain;
 mod filter;
 mod input;
 mod limit;
@@ -29,6 +30,7 @@ mod top_n;
 pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
 pub use dummy_scan::DummyScan;
+pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
 pub use limit::Limit;
@@ -86,6 +88,8 @@ pub enum Operator {
     SetVariable(SetVariable),
     /// Late-materialization fetch (synthesized by the rewrite, see [`Materialize`]).
     Materialize(Materialize),
+    /// `EXPLAIN <query>`: renders its child plan as text (see [`Explain`]).
+    Explain(Explain),
 }
 
 impl TryFrom<duckdb_operator::Operator> for Operator {
@@ -105,6 +109,7 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
             duckdb_operator::Operator::Limit(l) => Operator::Limit(l.try_into()?),
             duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
             duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
+            duckdb_operator::Operator::Explain(e) => Operator::Explain(e.try_into()?),
             duckdb_operator::Operator::Set(s) => Operator::SetVariable(s.try_into()?),
             duckdb_operator::Operator::Materialize(m) => Operator::Materialize(m.try_into()?),
             duckdb_operator::Operator::RawInput(_) => {
@@ -132,6 +137,7 @@ impl fmt::Display for Operator {
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),
+            Operator::Explain(e) => write!(f, "{e}"),
         }
     }
 }
