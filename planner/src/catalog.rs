@@ -21,7 +21,9 @@ use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
-use duckdb_planner::catalog_provider::{DuckDBBind, DuckDBTable, TableFunctionDef};
+use duckdb_planner::catalog_provider::{
+    DuckDBBind, DuckDBTable, ScalarFunctionDef, TableFunctionDef,
+};
 use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -296,6 +298,22 @@ impl DuckDBBind for DuckDBCatalogAdapter {
                 .map(|arg_type| logical_from_type(arg_type) as u8)
                 .collect(),
             columns: duckdb_columns(&signature.columns),
+        })
+    }
+
+    fn scalar_function(&self, name: &str) -> Option<ScalarFunctionDef> {
+        // Pivot's own scalar functions (e.g. drop_cache) are generic, not
+        // catalog-specific, so their signatures live in the planner rather than
+        // on the catalog.
+        let signature = crate::expression::builtin_scalar_function(name)?;
+        Some(ScalarFunctionDef {
+            arg_type_ids: signature
+                .arguments
+                .iter()
+                .map(|arg_type| logical_from_type(arg_type) as u8)
+                .collect(),
+            return_type_id: logical_from_type(&signature.return_type) as u8,
+            is_volatile: signature.volatile,
         })
     }
 }

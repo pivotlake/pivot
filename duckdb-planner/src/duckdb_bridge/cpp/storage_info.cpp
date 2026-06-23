@@ -22,7 +22,15 @@ TableFunctionCatalogEntry *PivotStorageInfo::AddFunctionEntry(
 	return ptr;
 }
 
+ScalarFunctionCatalogEntry *PivotStorageInfo::AddScalarFunctionEntry(
+    unique_ptr<ScalarFunctionCatalogEntry> entry) {
+	auto *ptr = entry.get();
+	scalar_function_entries.push_back(std::move(entry));
+	return ptr;
+}
+
 void PivotStorageInfo::ClearTableEntries() {
 	table_entries.clear();
 	function_entries.clear();
+	scalar_function_entries.clear();
 }

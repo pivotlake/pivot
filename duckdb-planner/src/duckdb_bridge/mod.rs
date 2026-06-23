@@ -8,8 +8,8 @@
 pub mod duckdb_types;
 
 use crate::catalog_provider::{
-    CatalogContext, OptionalTableWrapper, catalog_get_table, catalog_get_table_function,
-    pushdown_filter,
+    CatalogContext, OptionalTableWrapper, catalog_get_scalar_function, catalog_get_table,
+    catalog_get_table_function, pushdown_filter,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -46,6 +46,17 @@ pub mod ffi {
         pub columns: Vec<DuckDBColumn>,
     }
 
+    /// Result of a catalog scalar-function lookup: the function's argument and
+    /// return types (DuckDB logical type id discriminants) and whether it must be
+    /// registered `VOLATILE`, or `found = false` if the provider has no such
+    /// function.
+    struct CatalogGetScalarFunctionResult {
+        pub found: bool,
+        pub arg_type_ids: Vec<u8>,
+        pub return_type_id: u8,
+        pub is_volatile: bool,
+    }
+
     extern "Rust" {
         type CatalogContext;
         type OptionalTableWrapper;
@@ -54,6 +65,10 @@ pub mod ffi {
             ctx: &CatalogContext,
             name: &str,
         ) -> CatalogGetTableFunctionResult;
+        fn catalog_get_scalar_function(
+            ctx: &CatalogContext,
+            name: &str,
+        ) -> CatalogGetScalarFunctionResult;
         fn pushdown_filter(table: &mut OptionalTableWrapper, filters_json: &str) -> Result<bool>;
     }
 
