@@ -874,6 +874,13 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 		new_operator["data"] = json::object();
 		break;
 	}
+	case duckdb::LogicalOperatorType::LOGICAL_EXPLAIN: {
+		// `EXPLAIN <query>` wraps the optimized plan as its single child (already
+		// built into `inputs` above). No payload: pivot renders that child plan
+		// as text rather than running it.
+		new_operator["data"] = json::object();
+		break;
+	}
 	case duckdb::LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op->Cast<duckdb::LogicalGet>();
 		// A table-valued function (generate_series, pivot's metadata functions)

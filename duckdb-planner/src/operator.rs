@@ -186,6 +186,13 @@ impl fmt::Debug for Materialize {
 #[derive(CustomDeserializer, Debug)]
 pub struct DummyScan {}
 
+/// `EXPLAIN <query>`. DuckDB wraps the optimized plan in a `LOGICAL_EXPLAIN`
+/// whose single child is the plan being explained; the bridge emits that child
+/// as this node's input. Carries no payload: the consumer renders the child
+/// plan as text instead of running it.
+#[derive(CustomDeserializer, Debug)]
+pub struct Explain {}
+
 /// `SET <name> = <value>` (and, relabelled by the bridge, `RESET <name>`, which
 /// arrives with `value = None`).
 ///
@@ -232,6 +239,8 @@ pub enum Operator {
     CreateTable(CreateTable),
     #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
     DummyScan(DummyScan),
+    #[type_tag(LogicalOperatorType::LOGICAL_EXPLAIN)]
+    Explain(Explain),
     // The bridge tags both SET and RESET as LOGICAL_SET (RESET carries no value).
     #[type_tag(LogicalOperatorType::LOGICAL_SET)]
     Set(SetVariable),
@@ -262,6 +271,7 @@ impl Operator {
             | Operator::Limit(_)
             | Operator::CreateTable(_)
             | Operator::DummyScan(_)
+            | Operator::Explain(_)
             | Operator::Set(_)
             | Operator::Materialize(_)
             | Operator::RawMaterialize(_)
@@ -377,6 +387,7 @@ impl fmt::Display for Operator {
                 )
             }
             Operator::DummyScan(_) => write!(f, "DummyScan"),
+            Operator::Explain(_) => write!(f, "Explain"),
             Operator::Set(s) => match &s.value {
                 Some(v) => write!(f, "Set({} = {v})", s.name),
                 None => write!(f, "Reset({})", s.name),

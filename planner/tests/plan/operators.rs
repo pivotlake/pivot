@@ -30,6 +30,19 @@ fn simple_select(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn explain_wraps_the_explained_plan(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("EXPLAIN SELECT a, b FROM example_table")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @r"
+    Explain
+      Projection(#0:Int32, #1:Int32)
+        Input([#0:Int32, #1:Int32])
+    ");
+}
+
+#[rstest]
 fn filter(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .planner

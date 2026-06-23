@@ -15,6 +15,19 @@ fn seq_scan(mut planner: PlannerContext) {
 }
 
 #[rstest]
+fn explain_wraps_the_optimized_plan(mut planner: PlannerContext) {
+    let plan = planner
+        .plan("EXPLAIN SELECT score, age FROM users")
+        .unwrap()
+        .to_string();
+    assert_snapshot!(plan, @r"
+    Explain
+      Projection(#0:INTEGER, #1:INTEGER)
+        Input([#2:INTEGER, #3:INTEGER])
+    ");
+}
+
+#[rstest]
 fn get_with_column_subset(mut planner: PlannerContext) {
     let plan = planner
         .plan("SELECT score, age FROM users")

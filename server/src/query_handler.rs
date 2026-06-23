@@ -76,6 +76,7 @@ fn plan_is_cacheable(plan: &planner::Plan) -> bool {
             | Operator::Aggregate(_)
             | Operator::OrderBy(_)
             | Operator::TopN(_)
+            | Operator::Explain(_)
     )
 }
 

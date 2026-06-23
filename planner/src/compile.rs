@@ -136,6 +136,18 @@ impl PlanNode {
             return Ok(spec);
         }
 
+        // EXPLAIN renders its (already-optimized) child plan as text and emits
+        // that. The child is formatted here, not compiled, so the explained
+        // query never runs. This must happen before the input-compile loop below.
+        if let crate::Operator::Explain(explain) = &self.operator {
+            let plan_text = self
+                .inputs
+                .first()
+                .map(PlanNode::to_string)
+                .unwrap_or_default();
+            return explain.compile(dispatcher, plan_text);
+        }
+
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             inputs.push(input.compile(dispatcher, catalog, ctx, slots)?);
@@ -158,6 +170,8 @@ impl PlanNode {
                 o.compile(dispatcher, catalog)
             }
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
+            // EXPLAIN is handled above, before inputs are compiled.
+            crate::Operator::Explain(_) => unreachable!("Explain is compiled before its inputs"),
             // SET/RESET is intercepted by the server after planning (it toggles
             // session state, not data), so it should never reach compilation.
             crate::Operator::SetVariable(_) => Err(Error::SetVariableNotCompilable),

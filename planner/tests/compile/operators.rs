@@ -19,6 +19,31 @@ fn str_col(values: Vec<&'static str>) -> ArrayRef {
 }
 
 #[rstest]
+fn explain_emits_plan_text_without_running_the_query(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("EXPLAIN SELECT a, b FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let lines: Vec<String> = batches_to_json(&results)
+        .into_iter()
+        .map(|row| row["QUERY PLAN"].as_str().unwrap().to_string())
+        .collect();
+
+    assert_eq!(
+        lines,
+        vec![
+            "Projection(#0:Int32, #1:Int32)",
+            "  Input([#0:Int32, #1:Int32])",
+        ]
+    );
+}
+
+#[rstest]
 fn select_column_subset(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .planner
