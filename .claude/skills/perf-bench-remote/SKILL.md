@@ -58,7 +58,9 @@ The suite lives in `~/pivotdb/benchmarks`. Query/oracle pairs are `clickbench/qN
   `benchmark.sh` drives pivot via `just pgo-use run` (**needs a PGO profile first**, see below) and DuckDB via `run-duckdb.sh`.
 
 ## PGO build (what `benchmark.sh` expects)
-Generate the merged profile once with a representative workload, then `benchmark.sh` / `just pgo-use` reuse it. The representative workload is at `~/hits-pgo-subset`. NEVER use that directory for ACTUAL perf numbers, only for creating a pgo build.
+Generate the merged profile once with a representative workload, then `benchmark.sh` / `just pgo-use` reuse it. The representative workload is at `~/hits-pgo-subset`. 
+NEVER use that directory for ACTUAL perf numbers, only for creating a pgo build. You should use the COMPLETE dataset for any actual measurement (~100m rows). For parquets,
+ensure their origin is from clickbench (ie don't use a parquet created from duckdb)
 
 ```bash
 cd ~/pivotdb/benchmarks
