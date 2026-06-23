@@ -420,6 +420,41 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
             return;
         }
 
+        // Hoist the `NumReader` column-width match out of the per-row loop: match
+        // it once per slot, then run a monomorphic typed gather. Left in the inner
+        // loop it was ~25% of finalize (a per-element branch before each value
+        // read). `$Op` is the numeric fold for the slot.
+        macro_rules! num_seed {
+            ($s:expr, $r:expr, $Op:ty) => {{
+                match $r {
+                    NumReader::I16(a) => for &(ptr, row) in seeds {
+                        unsafe { (*(ptr as *mut Self)).cells[$s] = <$Op>::seed(IntRead::<Int16Type>::read(a, row as usize), &mut na) };
+                    },
+                    NumReader::I32(a) => for &(ptr, row) in seeds {
+                        unsafe { (*(ptr as *mut Self)).cells[$s] = <$Op>::seed(IntRead::<Int32Type>::read(a, row as usize), &mut na) };
+                    },
+                    NumReader::I64(a) => for &(ptr, row) in seeds {
+                        unsafe { (*(ptr as *mut Self)).cells[$s] = <$Op>::seed(IntRead::<Int64Type>::read(a, row as usize), &mut na) };
+                    },
+                }
+            }};
+        }
+        macro_rules! num_update {
+            ($s:expr, $r:expr, $Op:ty) => {{
+                match $r {
+                    NumReader::I16(a) => for &(ptr, row) in updates {
+                        unsafe { let c = (*(ptr as *mut Self)).cells[$s]; (*(ptr as *mut Self)).cells[$s] = <$Op>::update(c, IntRead::<Int16Type>::read(a, row as usize), &mut na, &()) };
+                    },
+                    NumReader::I32(a) => for &(ptr, row) in updates {
+                        unsafe { let c = (*(ptr as *mut Self)).cells[$s]; (*(ptr as *mut Self)).cells[$s] = <$Op>::update(c, IntRead::<Int32Type>::read(a, row as usize), &mut na, &()) };
+                    },
+                    NumReader::I64(a) => for &(ptr, row) in updates {
+                        unsafe { let c = (*(ptr as *mut Self)).cells[$s]; (*(ptr as *mut Self)).cells[$s] = <$Op>::update(c, IntRead::<Int64Type>::read(a, row as usize), &mut na, &()) };
+                    },
+                }
+            }};
+        }
+
         // One aggregation at a time over the whole window. The window is small
         // (one consume chunk), so its touched cells are cache-resident across the
         // N passes; no prefetch is warranted.
@@ -438,15 +473,9 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
                 BoundSlot::Count => for &(ptr, _) in seeds {
                     unsafe { (*(ptr as *mut Self)).cells[s] = Count::<A>::seed((), &mut na) };
                 },
-                BoundSlot::Sum(r) => for &(ptr, row) in seeds {
-                    unsafe { (*(ptr as *mut Self)).cells[s] = Sum::<A>::seed(r.read(row as usize), &mut na) };
-                },
-                BoundSlot::Min(r) => for &(ptr, row) in seeds {
-                    unsafe { (*(ptr as *mut Self)).cells[s] = Min::<A>::seed(r.read(row as usize), &mut na) };
-                },
-                BoundSlot::Max(r) => for &(ptr, row) in seeds {
-                    unsafe { (*(ptr as *mut Self)).cells[s] = Max::<A>::seed(r.read(row as usize), &mut na) };
-                },
+                BoundSlot::Sum(r) => num_seed!(s, r, Sum::<A>),
+                BoundSlot::Min(r) => num_seed!(s, r, Min::<A>),
+                BoundSlot::Max(r) => num_seed!(s, r, Max::<A>),
                 BoundSlot::StrMin(a) => for &(ptr, row) in seeds {
                     unsafe { (*(ptr as *mut Self)).cells[s] = StrMin::<A>::seed(StrRead::read(a, row as usize), arena) };
                 },
@@ -466,24 +495,9 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
                         (*(ptr as *mut Self)).cells[s] = Count::<A>::update(c, (), &mut na, &());
                     }
                 },
-                BoundSlot::Sum(r) => for &(ptr, row) in updates {
-                    unsafe {
-                        let c = (*(ptr as *mut Self)).cells[s];
-                        (*(ptr as *mut Self)).cells[s] = Sum::<A>::update(c, r.read(row as usize), &mut na, &());
-                    }
-                },
-                BoundSlot::Min(r) => for &(ptr, row) in updates {
-                    unsafe {
-                        let c = (*(ptr as *mut Self)).cells[s];
-                        (*(ptr as *mut Self)).cells[s] = Min::<A>::update(c, r.read(row as usize), &mut na, &());
-                    }
-                },
-                BoundSlot::Max(r) => for &(ptr, row) in updates {
-                    unsafe {
-                        let c = (*(ptr as *mut Self)).cells[s];
-                        (*(ptr as *mut Self)).cells[s] = Max::<A>::update(c, r.read(row as usize), &mut na, &());
-                    }
-                },
+                BoundSlot::Sum(r) => num_update!(s, r, Sum::<A>),
+                BoundSlot::Min(r) => num_update!(s, r, Min::<A>),
+                BoundSlot::Max(r) => num_update!(s, r, Max::<A>),
                 BoundSlot::StrMin(a) => for &(ptr, row) in updates {
                     unsafe {
                         let c = (*(ptr as *mut Self)).cells[s];

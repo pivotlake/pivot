@@ -84,6 +84,10 @@ impl Aggregate {
                 AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
             )
         });
+        // MEASUREMENT: force the general (non-`ONLY_ADDITIVE`) lowering, so the eager
+        // baseline loses its branch-free additive fold and is comparable to the
+        // additive-agnostic deferred path.
+        let all_additive = all_additive && std::env::var_os("PIVOT_GB_NONADDITIVE").is_none();
 
         // `group!` is the single lowering primitive: every arm below picks one
         // concrete key type `$K`, value type `$V`, and key config `$cfg`, then
