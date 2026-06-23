@@ -39,6 +39,9 @@ pub struct Ref {
     pub column_idx: usize,
     /// The column's logical type (e.g. `INTEGER`, `VARCHAR`).
     pub return_type: LogicalTypeId,
+    /// The column's source name carried over from DuckDB's binding, or `None`
+    /// when the reference has no alias. Display-only.
+    pub name: Option<String>,
 }
 
 /// A binary comparison expression (e.g. `<>`, `=`).

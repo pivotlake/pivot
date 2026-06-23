@@ -121,10 +121,19 @@ std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalo
 	    new DuckPlannerContext(std::move(catalog)));
 }
 
+// The column's source name (the binding's alias, which the binder/optimizer
+// carry through column resolution), or null when it has none. Lets the Rust
+// side render a plan with real names instead of positional `#idx` references.
+static json ref_name(const duckdb::Expression &expr) {
+	const auto &alias = expr.GetAlias();
+	return alias.empty() ? json(nullptr) : json(alias);
+}
+
 json build_ref_expression(duckdb::BoundReferenceExpression *ref) {
 	return {
 	    {"column_idx", ref->index},
 	    {"return_type", ref->return_type.id()},
+	    {"name", ref_name(*ref)},
 	};
 }
 
@@ -132,6 +141,7 @@ json build_column_ref_expression(duckdb::BoundColumnRefExpression *col_ref) {
 	return {
 	    {"column_idx", col_ref->binding.column_index.GetIndex()},
 	    {"return_type", col_ref->return_type.id()},
+	    {"name", ref_name(*col_ref)},
 	};
 }
 
@@ -398,6 +408,12 @@ static void emit_table_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_id
 
 	duckdb::ColumnBinding binding(get.table_index, duckdb::ProjectionIndex(proj_idx));
 	auto col_ref = duckdb::make_uniq<duckdb::BoundColumnRefExpression>(get.types[proj_idx], binding);
+	// Tag the synthetic ref with the table's column name so a pushed-down
+	// `col op const` filter renders as `col = 5`, not `#idx = 5`, in a plan dump.
+	auto storage_idx = get.GetColumnIds()[proj_idx].GetPrimaryIndex();
+	if (storage_idx < get.names.size()) {
+		col_ref->SetAlias(get.names[storage_idx]);
+	}
 	auto expr = filter.ToExpression(*col_ref);
 	conditions.push_back(build_expression(expr.get()));
 }
@@ -871,6 +887,13 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN: {
 		// The single-row source under a FROM-less SELECT (e.g.
 		// `SELECT drop_cache()`). No payload — pivot emits one empty row.
+		new_operator["data"] = json::object();
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_EXPLAIN: {
+		// `EXPLAIN <query>` wraps the optimized plan as its single child (already
+		// built into `inputs` above). No payload: pivot renders that child plan
+		// as text rather than running it.
 		new_operator["data"] = json::object();
 		break;
 	}

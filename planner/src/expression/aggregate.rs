@@ -103,13 +103,13 @@ impl Display for AggregateFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AggregateFunc::CountStar(_) => f.write_str("count_star()"),
-            AggregateFunc::Sum(a) => write!(f, "sum(#{})", a.column.column_idx),
-            AggregateFunc::Avg(a) => write!(f, "avg(#{})", a.column.column_idx),
-            AggregateFunc::Min(a) => write!(f, "min(#{})", a.column.column_idx),
-            AggregateFunc::Max(a) => write!(f, "max(#{})", a.column.column_idx),
-            AggregateFunc::Count(a) => write!(f, "count(#{})", a.column.column_idx),
+            AggregateFunc::Sum(a) => write!(f, "sum({})", a.column.name_or_index()),
+            AggregateFunc::Avg(a) => write!(f, "avg({})", a.column.name_or_index()),
+            AggregateFunc::Min(a) => write!(f, "min({})", a.column.name_or_index()),
+            AggregateFunc::Max(a) => write!(f, "max({})", a.column.name_or_index()),
+            AggregateFunc::Count(a) => write!(f, "count({})", a.column.name_or_index()),
             AggregateFunc::CountDistinct(a) => {
-                write!(f, "count(distinct #{})", a.column.column_idx)
+                write!(f, "count(distinct {})", a.column.name_or_index())
             }
         }
     }

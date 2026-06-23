@@ -521,6 +521,7 @@ fn in_list_compare_in_compiles_to_membership_mask() {
         input: Box::new(Expression::Ref(Ref {
             column_idx: 0,
             return_type: Type::Int16,
+            name: None,
         })),
         values: vec![constant(-1), constant(6)],
     };

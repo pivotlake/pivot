@@ -56,10 +56,21 @@ impl TryFrom<duckdb_operator::Input> for Input {
 
 impl fmt::Display for Input {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Resolve each scanned column's positional index back to its real name
+        // from the table schema, so a plan dump reads like the source query
+        // (e.g. `Input([URL:Utf8])`) rather than `Input([#2:Utf8])`. Falls back
+        // to the bare reference for the COUNT(*) sentinel index or any non-`Ref`.
+        let schema = self.table.columns();
         let cols = self
             .columns
             .iter()
-            .map(|c| c.to_string())
+            .map(|c| match c {
+                Expression::Ref(r) => match schema.get(r.column_idx) {
+                    Some(column) => format!("{}:{}", column.name, r.return_type),
+                    None => r.to_string(),
+                },
+                _ => c.to_string(),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         write!(f, "Input([{cols}])")
