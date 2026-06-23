@@ -68,27 +68,17 @@ impl NullaryFactory<RecordBatch> for DummyScanNullaryFactory {
     fn build_nullary(self) -> Self::Nullary {
         DummyScanDispatchOperator {
             emitted: self.emitted,
-            ran: false,
         }
     }
 }
 
 struct DummyScanDispatchOperator {
     emitted: Arc<AtomicBool>,
-    ran: bool,
 }
 
 impl Nullary<RecordBatch> for DummyScanDispatchOperator {
     fn run<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> NullaryResult<WorkStatus> {
-        if self.ran {
-            return Ok(WorkStatus::Pending);
-        }
-        self.ran = true;
-
-        // The first worker to win the swap emits the single empty row the dummy
-        // scan stands for; the rest emit nothing, so the parent projection runs
-        // exactly once.
-        if !self.emitted.swap(true, Ordering::SeqCst) {
+        if !self.emitted.swap(true, Ordering::Relaxed) {
             let batch = RecordBatch::try_new_with_options(
                 Arc::new(Schema::empty()),
                 vec![],
@@ -96,15 +86,13 @@ impl Nullary<RecordBatch> for DummyScanDispatchOperator {
             )
             .expect("empty single-row batch is always well-formed");
             sender.send(batch)?;
+            Ok(WorkStatus::Ran)
+        } else {
+            Ok(WorkStatus::Pending)
         }
-
-        Ok(WorkStatus::Ran)
     }
 
-    // No IO: `next_*_requests` / `process_*_response` use the `Nullary` trait
-    // defaults (none / unreachable).
-
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> NullaryResult<bool> {
-        Ok(self.ran)
+        Ok(self.emitted.load(Ordering::Relaxed))
     }
 }
