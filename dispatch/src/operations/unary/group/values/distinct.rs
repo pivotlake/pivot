@@ -32,6 +32,18 @@ impl AggregationValue for Distinct {
     }
 
     #[inline(always)]
+    fn consume_seed(_cell: &mut Self, _reader: &(), _idx: usize, _wc: &mut ()) {
+        // Keys-only: the empty-slot insert is the whole work; the value is `Distinct`.
+    }
+
+    #[inline(always)]
+    fn consume_update(_cell: &mut Self, _reader: &(), _idx: usize, _wc: &mut (), _ctx: &()) {
+        // No accumulator — a repeated key contributes nothing.
+    }
+
+    fn finalize_batch(_wc: &mut (), _reader: &(), _ctx: &()) {}
+
+    #[inline(always)]
     fn merge(self, _other: Self, _ctx: &()) -> Self {
         // No accumulator — both sides are the same (distinct) key.
         self

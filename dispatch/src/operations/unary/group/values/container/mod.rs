@@ -8,8 +8,6 @@
 
 mod compiled;
 mod dynamic;
-mod mono;
 
 pub use compiled::{Compiled, CountSlot, MaxSlot, MinSlot, OpTuple, SumSlot};
 pub use dynamic::Dynamic;
-pub use mono::Mono;

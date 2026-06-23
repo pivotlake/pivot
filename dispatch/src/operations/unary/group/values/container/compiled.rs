@@ -118,6 +118,11 @@ macro_rules! impl_compiled {
         where
             $($R: Read, $F: FoldAcc<SharedContext = (), WorkerContext = ()> + for<'b> Fold<$R::Val<'b>>, $F::Acc: Into<i128>,)+
         {
+            // MEASUREMENT: force the compiled baseline in-place too, so its consume
+            // does the full aggregation (radix + disabled-merge would otherwise make
+            // a high-card baseline scatter-only and skip the work being compared).
+            const RADIX_SCATTER: bool = false;
+
             type Reader<'b> = ($($R::Input<'b>,)+);
             type SharedContext = ();
             type Columns = ($(SlabColumn<$F::Acc>,)+);
@@ -135,17 +140,26 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
-            fn update_from_reader(
-                self,
+            fn consume_seed(cell: &mut Self, reader: &Self::Reader<'_>, idx: usize, wc: &mut ()) {
+                *cell = Self::value(reader, idx, wc);
+            }
+
+            #[inline(always)]
+            fn consume_update(
+                cell: &mut Self,
                 reader: &Self::Reader<'_>,
                 idx: usize,
                 wc: &mut (),
                 ctx: &(),
-            ) -> Self {
-                Self {
-                    accs: ($($F::update(self.accs.$idx, $R::read(&reader.$idx, idx), wc, ctx),)+),
-                }
+            ) {
+                let prev = *cell;
+                *cell = Self {
+                    accs: ($($F::update(prev.accs.$idx, $R::read(&reader.$idx, idx), wc, ctx),)+),
+                };
             }
+
+            // Eager: each row folds in place during the probe, nothing to finalize.
+            fn finalize_batch(_wc: &mut (), _reader: &Self::Reader<'_>, _ctx: &()) {}
 
             #[inline(always)]
             fn merge(self, other: Self, ctx: &()) -> Self {

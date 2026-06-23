@@ -45,7 +45,7 @@ mod group;
 pub use group::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, Fold, FoldAcc, GroupFactory, GroupLimit, HashOnlyIntKeyExtractor, IntKeyExtractor,
-    IntPairKeyExtractor, IntRead, KeyExtractor, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric,
+    IntPairKeyExtractor, IntRead, KeyExtractor, Max, MaxSlot, Min, MinSlot, NoRead, Numeric,
     OpTuple, Read, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead, StringKeyExtractor, Sum,
     SumSlot, WideSum,
 };

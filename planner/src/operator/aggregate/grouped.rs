@@ -61,6 +61,14 @@ impl Aggregate {
         let sig = signatures(&self.expressions);
         let output_limit = self.output_limit;
 
+        // MEASUREMENT A/B toggle: with `PIVOT_GB_COMPILED` set, the q30/q31/q32
+        // signature keeps its hand-written `Compiled` lowering (the baseline);
+        // unset, it falls through to the deferred `Dynamic` path being measured.
+        let use_compiled = std::env::var_os("PIVOT_GB_COMPILED").is_some();
+        // MEASUREMENT baseline: route the deferred `Dynamic` to its eager (original
+        // in-place) consume instead.
+        let use_eager = std::env::var_os("PIVOT_GB_OLDDYNAMIC").is_some();
+
         // Cell width: i128 when a string extreme needs its 128-bit `ArenaKey`
         // cell, or when a SUM reads a 64-bit column; else the narrow i64 entry.
         let wide = slots.iter().any(|s| s.kind.is_string_extreme())
@@ -92,27 +100,38 @@ impl Aggregate {
         // cell-array length). Numeric, string (`acc = i128`), and mixed alike,
         // since `Dynamic` dispatches per slot.
         macro_rules! arity {
-            ($K:ty, $acc:ty, $add:literal, $cfg:expr) => {
+            ($K:ty, $acc:ty, $add:literal, $eager:literal, $cfg:expr) => {
                 match slots.len() {
-                    1 => group!($K, Dynamic<1, $acc, $add>, $cfg),
-                    2 => group!($K, Dynamic<2, $acc, $add>, $cfg),
-                    3 => group!($K, Dynamic<3, $acc, $add>, $cfg),
-                    4 => group!($K, Dynamic<4, $acc, $add>, $cfg),
-                    5 => group!($K, Dynamic<5, $acc, $add>, $cfg),
-                    6 => group!($K, Dynamic<6, $acc, $add>, $cfg),
+                    1 => group!($K, Dynamic<1, $acc, $add, $eager>, $cfg),
+                    2 => group!($K, Dynamic<2, $acc, $add, $eager>, $cfg),
+                    3 => group!($K, Dynamic<3, $acc, $add, $eager>, $cfg),
+                    4 => group!($K, Dynamic<4, $acc, $add, $eager>, $cfg),
+                    5 => group!($K, Dynamic<5, $acc, $add, $eager>, $cfg),
+                    6 => group!($K, Dynamic<6, $acc, $add, $eager>, $cfg),
                     n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
                 }
             };
         }
         // The generic value fallback: pick the accumulator width and the additive
-        // flag, then dispatch by arity.
+        // flag, then dispatch by arity. The `EAGER` const picks the consume strategy
+        // (deferred default; the `PIVOT_GB_OLDDYNAMIC` MEASUREMENT baseline folds in
+        // place) — chosen here so each build monomorphises one straight-line path.
+        macro_rules! arity_add {
+            ($K:ty, $acc:ty, $add:literal, $cfg:expr) => {
+                if use_eager {
+                    arity!($K, $acc, $add, true, $cfg)
+                } else {
+                    arity!($K, $acc, $add, false, $cfg)
+                }
+            };
+        }
         macro_rules! dynamic {
             ($K:ty, $cfg:expr) => {
                 match (wide, all_additive) {
-                    (true, true) => arity!($K, i128, true, $cfg),
-                    (true, false) => arity!($K, i128, false, $cfg),
-                    (false, true) => arity!($K, i64, true, $cfg),
-                    (false, false) => arity!($K, i64, false, $cfg),
+                    (true, true) => arity_add!($K, i128, true, $cfg),
+                    (true, false) => arity_add!($K, i128, false, $cfg),
+                    (false, true) => arity_add!($K, i64, true, $cfg),
+                    (false, false) => arity_add!($K, i64, false, $cfg),
                 }
             };
         }
@@ -123,12 +142,16 @@ impl Aggregate {
             ($K:ty, $cfg:expr) => {
                 match sig.as_slice() {
                     [Sig::Count] => group!($K, Compiled<(CountSlot,)>, $cfg),
+                    // MEASUREMENT A/B: the (Count, Sum16, Sum16, Count) `Compiled`
+                    // arm for q30/q31/q32 is the baseline, kept only when
+                    // `PIVOT_GB_COMPILED` is set; otherwise these route through the
+                    // deferred `Dynamic` path being measured.
                     [
                         Sig::Count,
                         Sig::Sum(Type::Int16),
                         Sig::Sum(Type::Int16),
                         Sig::Count,
-                    ] => group!(
+                    ] if use_compiled => group!(
                         $K,
                         Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>,
                         $cfg

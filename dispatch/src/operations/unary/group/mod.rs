@@ -103,7 +103,7 @@ pub use keys::{
 };
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric, OpTuple,
+    Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, NoRead, Numeric, OpTuple,
     Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, WideSum, WorkerContext,
 };
 
@@ -199,9 +199,10 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         // A string extreme persists its winner lazily during the in-place fold, so
         // it must not take the radix scatter path (which materialises — and thus
-        // persists — every row's string before any comparison). Disable the switch
-        // when any value slot is a string extreme; numeric signatures keep radix.
-        let radix = if value_slots.iter().any(|s| s.kind.is_string_extreme()) {
+        // persists — every row's string before any comparison). A deferred value
+        // (`!V::RADIX_SCATTER`) likewise stays in place: its scatter path isn't
+        // ported. Otherwise numeric signatures keep radix.
+        let radix = if !V::RADIX_SCATTER || value_slots.iter().any(|s| s.kind.is_string_extreme()) {
             radix.without_radix()
         } else {
             radix
@@ -251,9 +252,12 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
     }
 
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
-        let tables = self.aggregated_table.flush();
-        self.sender.send(tables).unwrap();
-        Ok(Some(self.outputter))
+        // MEASUREMENT: the merge/output phase is disabled so the consume phase can
+        // be timed in isolation. Results are intentionally incorrect — per-worker
+        // partials are never merged and nothing is emitted downstream. Still flush
+        // the table so the worker arenas are returned to the shared pool.
+        let _ = self.aggregated_table.flush();
+        Ok(None)
     }
 }
 

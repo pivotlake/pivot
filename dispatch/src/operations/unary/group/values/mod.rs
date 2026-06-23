@@ -29,7 +29,7 @@ pub mod fold;
 pub mod read;
 
 pub use cell::{Cell, Numeric};
-pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, SumSlot};
+pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, SumSlot};
 pub use distinct::Distinct;
 pub use fold::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
 pub use read::{IntRead, NoRead, Read, StrRead};
@@ -134,14 +134,25 @@ impl WorkerContext for WorkerArena {
 /// The per-group value stored in a GROUP BY hash table — read from input rows,
 /// folded with other rows and partials, and emitted as the result's value columns.
 ///
-/// Reading and folding are separate so a string extreme can persist lazily: a new
-/// group materialises with [`value`](Self::value), an existing group folds the
-/// next row with [`update_from_reader`](Self::update_from_reader) (which can skip
-/// persisting a row that doesn't win), and two finished partials combine with
-/// [`merge`](Self::merge) (no new materialisation). For values whose fold is the
-/// same elementwise op for rows and partials, `update_from_reader` defaults to
-/// merging the row in.
+/// The in-place consume path folds through [`consume_seed`](Self::consume_seed)
+/// (the probe's empty-slot branch) and [`consume_update`](Self::consume_update)
+/// (its key-match branch), then [`finalize_batch`](Self::finalize_batch) at the end
+/// of each batch. An *eager* value folds straight into the cell in those two calls
+/// and leaves `finalize_batch` empty; a *deferred* value (see
+/// [`Dynamic`](container::Dynamic)) instead records the matched cell into its
+/// [`WorkerContext`](Self::WorkerContext) and applies a whole batch's seeds/updates
+/// in `finalize_batch`, once per slot rather than once per row.
+///
+/// [`value`](Self::value) materialises a standalone group value from one row (the
+/// radix scatter path, and an eager container's `consume_seed`); two finished
+/// partials combine with [`merge`](Self::merge).
 pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
+    /// Whether a worker holding this value may switch to the radix scatter path.
+    /// `true` for an eager value; a deferred value sets it `false` (its scatter
+    /// path is not ported yet), so the worker always folds in place. This is the
+    /// value-side counterpart to [`KeyExtractor::SUPPORTS_RADIX`](super::keys::KeyExtractor::SUPPORTS_RADIX).
+    const RADIX_SCATTER: bool = true;
+
     /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
     /// The shared, read-side context [`merge`](Self::merge)/[`finish_columns`](Self::finish_columns)
@@ -163,24 +174,31 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// Bind `batch`'s value columns for the configured `slots`.
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
 
-    /// Materialise a brand-new group from row `idx` — the consume path's new-key
-    /// case, and the radix scatter. `wc` is the per-worker write state a string
-    /// extreme persists its winning string into; numeric cells ignore it.
+    /// Materialise a brand-new group from row `idx` — the radix scatter, and an
+    /// eager container's [`consume_seed`](Self::consume_seed). `wc` is the
+    /// per-worker write state a string extreme persists its winning string into;
+    /// numeric cells ignore it.
     fn value(reader: &Self::Reader<'_>, idx: usize, wc: &mut Self::WorkerContext) -> Self;
 
-    /// Fold row `idx` into this (existing) group. Defaults to merging the row's
-    /// [`value`](Self::value) in; a string extreme overrides it to compare against
-    /// the current extreme (resolved via `ctx`) and persist only when it wins.
-    #[inline(always)]
-    fn update_from_reader(
-        self,
+    /// Seed a freshly inserted group `cell` from row `idx` (the probe's empty-slot
+    /// branch). An eager value folds in place now; a deferred value records
+    /// `(cell, idx)` into `wc` for [`finalize_batch`](Self::finalize_batch).
+    fn consume_seed(cell: &mut Self, reader: &Self::Reader<'_>, idx: usize, wc: &mut Self::WorkerContext);
+
+    /// Fold row `idx` into the existing group `cell` (the probe's key-match
+    /// branch). Eager or deferred, as [`consume_seed`](Self::consume_seed).
+    fn consume_update(
+        cell: &mut Self,
         reader: &Self::Reader<'_>,
         idx: usize,
         wc: &mut Self::WorkerContext,
         ctx: &Self::SharedContext,
-    ) -> Self {
-        self.merge(Self::value(reader, idx, wc), ctx)
-    }
+    );
+
+    /// Apply a batch's recorded seeds/updates to the table, once per slot (the
+    /// per-row kind dispatch hoisted out of the probe loop). Empty for an eager
+    /// value, which already folded each row in place.
+    fn finalize_batch(wc: &mut Self::WorkerContext, reader: &Self::Reader<'_>, ctx: &Self::SharedContext);
 
     /// Combine two partial group values — the partition merge and the radix fold.
     fn merge(self, other: Self, ctx: &Self::SharedContext) -> Self;

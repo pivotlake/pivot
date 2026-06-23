@@ -29,7 +29,7 @@ use dispatch::{AggregationKind, AggregationSlot, Dynamic, IntKeyExtractor, IntPa
 /// re-summed partials), so both levels use the `ONLY_ADDITIVE` `Dynamic`: the
 /// const prunes the per-slot Min/Max/string arms, collapsing the fold to the
 /// same branch-free additive codegen as a hand-written `Mono`.
-type AddVal<const N: usize> = Dynamic<N, i64, true>;
+type AddVal<const N: usize, const EAGER: bool> = Dynamic<N, i64, true, EAGER>;
 
 impl Aggregate {
     pub(super) fn compile_grouped_mixed_distinct(
@@ -52,18 +52,33 @@ impl Aggregate {
         } = self.plan_two_level()?;
         let x_col = x.column_idx;
 
-        // group_by_aggregate monomorphised over key type + slot arity.
-        macro_rules! grouped {
-            ($spec:expr, $K:ty, $cols:expr, $slots:expr) => {{
+        // MEASUREMENT baseline: route both levels' `Dynamic` to the eager (original
+        // in-place) consume instead of the deferred path.
+        let use_eager = std::env::var_os("PIVOT_GB_OLDDYNAMIC").is_some();
+
+        // group_by_aggregate monomorphised over key type + slot arity, and over the
+        // `EAGER` consume-strategy const (chosen once here so each build is straight
+        // line).
+        macro_rules! grouped_eager {
+            ($spec:expr, $K:ty, $cols:expr, $slots:expr, $eager:literal) => {{
                 let slots = $slots;
                 match slots.len() {
-                    1 => $spec.group_by_aggregate::<$K, AddVal<1>>($cols, slots, None),
-                    2 => $spec.group_by_aggregate::<$K, AddVal<2>>($cols, slots, None),
-                    3 => $spec.group_by_aggregate::<$K, AddVal<3>>($cols, slots, None),
-                    4 => $spec.group_by_aggregate::<$K, AddVal<4>>($cols, slots, None),
-                    5 => $spec.group_by_aggregate::<$K, AddVal<5>>($cols, slots, None),
-                    6 => $spec.group_by_aggregate::<$K, AddVal<6>>($cols, slots, None),
+                    1 => $spec.group_by_aggregate::<$K, AddVal<1, $eager>>($cols, slots, None),
+                    2 => $spec.group_by_aggregate::<$K, AddVal<2, $eager>>($cols, slots, None),
+                    3 => $spec.group_by_aggregate::<$K, AddVal<3, $eager>>($cols, slots, None),
+                    4 => $spec.group_by_aggregate::<$K, AddVal<4, $eager>>($cols, slots, None),
+                    5 => $spec.group_by_aggregate::<$K, AddVal<5, $eager>>($cols, slots, None),
+                    6 => $spec.group_by_aggregate::<$K, AddVal<6, $eager>>($cols, slots, None),
                     n => return Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                }
+            }};
+        }
+        macro_rules! grouped {
+            ($spec:expr, $K:ty, $cols:expr, $slots:expr) => {{
+                if use_eager {
+                    grouped_eager!($spec, $K, $cols, $slots, true)
+                } else {
+                    grouped_eager!($spec, $K, $cols, $slots, false)
                 }
             }};
         }

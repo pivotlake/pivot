@@ -552,6 +552,13 @@ mod tests {
         fn value(_reader: &(), _idx: usize, _wc: &mut ()) -> Self {
             Count(1)
         }
+        fn consume_seed(cell: &mut Self, _reader: &(), _idx: usize, _wc: &mut ()) {
+            *cell = Count(1);
+        }
+        fn consume_update(cell: &mut Self, _reader: &(), _idx: usize, _wc: &mut (), _ctx: &()) {
+            cell.0 += 1;
+        }
+        fn finalize_batch(_wc: &mut (), _reader: &(), _ctx: &()) {}
         fn merge(self, other: Self, _ctx: &()) -> Self {
             Count(self.0 + other.0)
         }

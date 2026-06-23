@@ -43,6 +43,23 @@ use std::sync::Arc;
 /// too low and a few-thousand-group aggregation regresses into a 4096-way radix.)
 const SWITCH_THRESHOLD: usize = 32768;
 
+/// Sub-window size for the in-place consume: each window is probed and then folded
+/// (`finalize_batch`) before the next, so a deferred value's seed/update buffers
+/// stay small and the cells it folds are still cache-hot from the probe. Smaller
+/// than [`RECORD_BATCH_SIZE`] so the per-window working set stays cache-resident.
+/// MEASUREMENT: overridable via `PIVOT_CHUNK` to sweep sizes without rebuilding.
+fn consume_chunk() -> usize {
+    use std::sync::OnceLock;
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("PIVOT_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(64)
+    })
+}
+
 /// Tunable thresholds for the in-place→radix switch. Production uses
 /// [`DEFAULT`](RadixConfig::DEFAULT); tests build small configs so the radix path
 /// (scatter buffers + an N-way merge) fits the test slab pool.
@@ -234,9 +251,24 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             if self.switched_to_radix {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
-                // The value type fixes the fold (Mono is branch-free, Dynamic
-                // dispatches per slot via `shared_context`); the probe just consumes.
-                self.consume_scalared(length, &key_reader, &value_reader, shared_context);
+                // Probe + finalize in small sub-windows. A deferred value (Dynamic)
+                // records each chunk's matched cells, then `finalize_batch` folds
+                // them while they are still cache-hot from the probe and the
+                // seed/update buffers are still tiny. An eager value folds in place
+                // during the probe and its `finalize_batch` is a no-op, so chunking
+                // is free for it (same total probe work).
+                let chunk = consume_chunk();
+                let mut start = 0;
+                while start < length {
+                    if self.switched_to_radix {
+                        self.scatter_range(start, length, &key_reader, &value_reader);
+                        break;
+                    }
+                    let end = (start + chunk).min(length);
+                    self.consume_scalared(start, end, length, &key_reader, &value_reader, shared_context);
+                    V::finalize_batch(&mut self.worker_context, &value_reader, shared_context);
+                    start = end;
+                }
             }
         }
         self.scratch = scratch;
@@ -249,6 +281,8 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     #[inline(always)]
     fn consume_scalared<'b>(
         &mut self,
+        start: usize,
+        end: usize,
         length: usize,
         key_reader: &K::Reader<'b>,
         value_reader: &V::Reader<'b>,
@@ -256,8 +290,8 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     ) {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
-        let mut i = 0;
-        while i < length {
+        let mut i = start;
+        while i < end {
             let hash = self.hashes[i];
             // Keys-only exact COUNT(DISTINCT): a 0 hash collides with the
             // empty-slot sentinel, so don't store it (the table would remap it to
@@ -291,13 +325,15 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     hash,
                     key,
                     &mut self.worker_context,
-                    |wc, cell| *cell = V::value(value_reader, i, wc),
-                    |wc, cell| *cell = cell.update_from_reader(value_reader, i, wc, shared_context),
+                    |wc, cell| V::consume_seed(cell, value_reader, i, wc),
+                    |wc, cell| V::consume_update(cell, value_reader, i, wc, shared_context),
                 );
                 table.undersized()
             };
             if overflowed && self.grow_or_switch() {
-                self.scatter_range(i + 1, length, key_reader, value_reader);
+                // Scatter only the rest of this chunk; `consume_window`'s loop sees
+                // `switched_to_radix` and scatters the remaining chunks.
+                self.scatter_range(i + 1, end, key_reader, value_reader);
                 return;
             }
             i += 1;
