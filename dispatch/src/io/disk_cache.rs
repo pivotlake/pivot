@@ -6,7 +6,8 @@
 //! This disk cache adds a tier *below* RAM and *above* HTTP: fetched byte ranges
 //! are mirrored into a local file per object, so a later read of the same range
 //! (in this process or after a restart) comes off local disk instead of the
-//! network.
+//! network. On restart [`open`](DiskCache::open) reloads the existing files into
+//! the cache's *tracked, budgeted* set, so they're reused yet can't leak.
 //!
 //! ## Where it plugs in
 //!
@@ -31,9 +32,13 @@
 //!
 //! Which 4 KB blocks are resident is tracked by an in-memory [`BlockBitmap`] per
 //! object. On Linux that bitmap is reseeded from the file's hole structure
-//! (`SEEK_DATA`/`SEEK_HOLE`) the first time the object is touched, so the cache
-//! survives restarts with the data file as its own index. On other platforms
-//! (dev only) the bitmap starts empty - correct, just no cross-restart reuse.
+//! (`SEEK_DATA`/`SEEK_HOLE`), so the cache survives restarts with the data file as
+//! its own index: [`open`](DiskCache::open) reloads every existing file into the
+//! tracked, budgeted set up front and evicts back to budget, so a prior run's
+//! cache is reused but still bounded (leaving the files untracked instead would
+//! put them beyond the budget's reach - an unbounded disk leak). On other
+//! platforms (dev only) the bitmap can't be reseeded, so old files are dropped at
+//! open instead.
 //!
 //! ## Eviction
 //!
@@ -238,13 +243,7 @@ impl DiskCache {
     /// [`Dispatch::spin_up`](crate::Dispatch::spin_up).
     pub fn open(dir: PathBuf, byte_budget: u64, max_objects: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        // On platforms without SEEK_HOLE reseed we can't trust an old file's
-        // contents, so start clean rather than risk accounting drift.
-        #[cfg(not(target_os = "linux"))]
-        for entry in std::fs::read_dir(&dir)?.flatten() {
-            let _ = std::fs::remove_file(entry.path());
-        }
-        Ok(Self {
+        let cache = Self {
             dir,
             byte_budget,
             max_objects,
@@ -252,7 +251,85 @@ impl DiskCache {
             total_bytes: AtomicU64::new(0),
             needs_recompute: AtomicBool::new(false),
             tick: AtomicU64::new(0),
-        })
+        };
+        // Reload a previous run's files so the cache persists across restarts - and,
+        // crucially, do it by *tracking* them. The budgets only govern objects in
+        // `objects`, and `evict_locked` only reclaims tracked ones; a file left on
+        // disk but never re-tracked is invisible to the budget and can never be
+        // evicted. Under churn (ingest writing new files, compaction deleting them)
+        // the objects backing deleted remote files are never re-read, so leaving
+        // them untracked leaked them across every restart - unbounded, until the
+        // disk filled (76 GB under a 48 GB budget on the OTLP sink). Registering
+        // every existing file up front, then evicting to budget, keeps a restart's
+        // cache warm yet bounded.
+        #[cfg(target_os = "linux")]
+        cache.reload_existing()?;
+        // Off Linux there's no SEEK_HOLE reseed to recover an old file's resident
+        // bytes, so we can't account or reuse it - drop them rather than track a
+        // file we'd score as empty (which would leave its real bytes off the budget).
+        #[cfg(not(target_os = "linux"))]
+        for entry in std::fs::read_dir(&cache.dir)?.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+        Ok(cache)
+    }
+
+    /// Register every cache file already on disk (a previous run's) as a tracked
+    /// object, then evict back down to the byte and object budgets. Tracking is
+    /// what makes them reclaimable - an untracked file is beyond the budget's reach
+    /// and would leak across restarts. Files load oldest-first so the newest take
+    /// the highest LRU recency and survive the trim, and evicting after each insert
+    /// holds the open-fd count to `max_objects` even over a huge directory.
+    #[cfg(target_os = "linux")]
+    fn reload_existing(&self) -> std::io::Result<()> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)?.flatten() {
+            let path = entry.path();
+            // Cache files are named `{key:032x}`; anything else isn't one of ours.
+            let Some(key) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| u128::from_str_radix(n, 16).ok())
+            else {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            };
+            let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+            files.push((key, path, mtime));
+        }
+        // Oldest first: each newer file then takes a higher LRU tick, so when the
+        // running total tips over budget the eviction below sheds the oldest.
+        files.sort_by_key(|(_, _, mtime)| *mtime);
+
+        let mut objects = self.objects.write().unwrap();
+        for (key, path, _) in files {
+            let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else {
+                continue;
+            };
+            // `create_object` opens this same path (it derives it from the key),
+            // reseeds the bitmap from the file's holes, and counts its resident
+            // bytes - exactly what a live miss does.
+            match self.create_object(key, size) {
+                Ok(obj) => {
+                    self.total_bytes
+                        .fetch_add(obj.bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+                    obj.last_used.store(self.advance_tick(), Ordering::Relaxed);
+                    objects.insert(key, obj);
+                    evict_locked(
+                        &self.total_bytes,
+                        &self.needs_recompute,
+                        self.byte_budget,
+                        self.max_objects,
+                        &mut objects,
+                    );
+                }
+                // A file we can't open or reseed is useless - drop it.
+                Err(_) => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn advance_tick(&self) -> u64 {
@@ -687,5 +764,46 @@ mod tests {
         assert_eq!(dropped, 2);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         assert!(!resident(&cache, "/a")); // re-opens cold (file was unlinked)
+    }
+
+    /// A previous run's files are reloaded into the tracked, budgeted set, so the
+    /// cache persists across a restart - and, being tracked, they stay bounded:
+    /// eviction trims the directory back to the byte budget instead of the files
+    /// leaking untracked forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_reloads_previous_files_and_bounds_them_to_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three cache files of one resident block each, as a prior run would leave.
+        for k in 0..3u128 {
+            std::fs::write(dir.path().join(format!("{k:032x}")), vec![1u8; BLOCK_SIZE]).unwrap();
+        }
+
+        // A two-block budget: reopen keeps the two newest, evicts the LRU one.
+        let cache =
+            DiskCache::open(dir.path().to_path_buf(), 2 * BLOCK_SIZE as u64, usize::MAX).unwrap();
+
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        assert_eq!(
+            cache.total_bytes.load(Ordering::Relaxed),
+            2 * BLOCK_SIZE as u64
+        );
+    }
+
+    /// Off Linux there's no SEEK_HOLE reseed to recover a file's resident bytes, so
+    /// a prior run's files are dropped at open rather than tracked as empty.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn open_drops_previous_files_without_seek_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("0000000000000000000000000000002a"),
+            b"stale",
+        )
+        .unwrap();
+
+        let _cache = DiskCache::open(dir.path().to_path_buf(), 1 << 30, 1 << 20).unwrap();
+
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
