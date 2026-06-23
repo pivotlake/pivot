@@ -192,6 +192,16 @@ impl WorkerContext for DynWorker {
     }
 }
 
+/// MEASUREMENT A/B: when `PIVOT_FINALIZE_ENTRY` is set, `finalize_batch` folds one
+/// recorded entry at a time (all N slots per row → one pointer deref and one
+/// recorded-array read per row) instead of one aggregation at a time (N passes,
+/// re-dereferencing each cell per slot).
+fn finalize_per_entry() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("PIVOT_FINALIZE_ENTRY").is_some())
+}
+
 impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const EAGER: bool>
     AggregationValue for Dynamic<N, A, ONLY_ADDITIVE, EAGER>
 {
@@ -367,11 +377,52 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
         let updates = &updates[..*updates_len];
         let shared = &ctx.arena;
         let mut na = ();
-        // Cache-blocking: a tile's touched value cells (at most `TILE` lines) stay
-        // L1-resident across the N per-aggregation passes, so each cell line loads
-        // once per phase instead of once per slot — the difference between eager's
-        // 1x and a naive per-slot finalize's Nx entry touches. `TILE` lines is
-        // ~32 KB, about half of L1.
+
+        // MEASUREMENT A/B: per-entry finalize — one recorded row at a time, folding
+        // all N slots into its cell in a single visit (one pointer deref / recorded
+        // read per row), at the cost of a per-row per-slot kind match.
+        if finalize_per_entry() {
+            for &(ptr, row) in seeds {
+                let cell = ptr as *mut Self;
+                #[allow(clippy::needless_range_loop)]
+                for s in 0..N {
+                    unsafe {
+                        (*cell).cells[s] = match &reader[s] {
+                            BoundSlot::Count => Count::<A>::seed((), &mut na),
+                            BoundSlot::Sum(r) => Sum::<A>::seed(r.read(row as usize), &mut na),
+                            BoundSlot::Min(r) => Min::<A>::seed(r.read(row as usize), &mut na),
+                            BoundSlot::Max(r) => Max::<A>::seed(r.read(row as usize), &mut na),
+                            BoundSlot::StrMin(a) => StrMin::<A>::seed(StrRead::read(a, row as usize), arena),
+                            BoundSlot::StrMax(a) => StrMax::<A>::seed(StrRead::read(a, row as usize), arena),
+                        };
+                    }
+                }
+            }
+            for &(ptr, row) in updates {
+                let cell = ptr as *mut Self;
+                #[allow(clippy::needless_range_loop)]
+                for s in 0..N {
+                    unsafe {
+                        let c = (*cell).cells[s];
+                        (*cell).cells[s] = match &reader[s] {
+                            BoundSlot::Count => Count::<A>::update(c, (), &mut na, &()),
+                            BoundSlot::Sum(r) => Sum::<A>::update(c, r.read(row as usize), &mut na, &()),
+                            BoundSlot::Min(r) => Min::<A>::update(c, r.read(row as usize), &mut na, &()),
+                            BoundSlot::Max(r) => Max::<A>::update(c, r.read(row as usize), &mut na, &()),
+                            BoundSlot::StrMin(a) => StrMin::<A>::update(c, StrRead::read(a, row as usize), arena, shared),
+                            BoundSlot::StrMax(a) => StrMax::<A>::update(c, StrRead::read(a, row as usize), arena, shared),
+                        };
+                    }
+                }
+            }
+            *seeds_len = 0;
+            *updates_len = 0;
+            return;
+        }
+
+        // One aggregation at a time over the whole window. The window is small
+        // (one consume chunk), so its touched cells are cache-resident across the
+        // N passes; no prefetch is warranted.
         //
         // SAFETY (both phases): each pointer addresses a live hash-table entry in
         // slab memory (stable across table growth) and the buffers are drained
@@ -379,150 +430,73 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool, const E
         // occurrence) and the seed phase fully precedes the update phase, so every
         // update folds onto a materialised cell; seeds touch distinct cells, updates
         // to one cell stay in row order.
-        const TILE: usize = 512;
 
         // Seed phase: materialise each first-seen group's cells.
-        let mut start = 0;
-        while start < seeds.len() {
-            let tile = &seeds[start..(start + TILE).min(seeds.len())];
-            #[allow(clippy::needless_range_loop)]
-            for s in 0..N {
-                match &reader[s] {
-                    BoundSlot::Count => {
-                        for &(ptr, _) in tile {
-                            unsafe { (*(ptr as *mut Self)).cells[s] = Count::<A>::seed((), &mut na) };
-                        }
-                    }
-                    BoundSlot::Sum(r) => {
-                        for &(ptr, row) in tile {
-                            unsafe {
-                                (*(ptr as *mut Self)).cells[s] = Sum::<A>::seed(r.read(row as usize), &mut na)
-                            };
-                        }
-                    }
-                    BoundSlot::Min(r) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    (*(ptr as *mut Self)).cells[s] = Min::<A>::seed(r.read(row as usize), &mut na)
-                                };
-                            }
-                        }
-                    }
-                    BoundSlot::Max(r) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    (*(ptr as *mut Self)).cells[s] = Max::<A>::seed(r.read(row as usize), &mut na)
-                                };
-                            }
-                        }
-                    }
-                    BoundSlot::StrMin(a) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    (*(ptr as *mut Self)).cells[s] = StrMin::<A>::seed(StrRead::read(a, row as usize), arena)
-                                };
-                            }
-                        }
-                    }
-                    BoundSlot::StrMax(a) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    (*(ptr as *mut Self)).cells[s] = StrMax::<A>::seed(StrRead::read(a, row as usize), arena)
-                                };
-                            }
-                        }
-                    }
-                }
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..N {
+            match &reader[s] {
+                BoundSlot::Count => for &(ptr, _) in seeds {
+                    unsafe { (*(ptr as *mut Self)).cells[s] = Count::<A>::seed((), &mut na) };
+                },
+                BoundSlot::Sum(r) => for &(ptr, row) in seeds {
+                    unsafe { (*(ptr as *mut Self)).cells[s] = Sum::<A>::seed(r.read(row as usize), &mut na) };
+                },
+                BoundSlot::Min(r) => for &(ptr, row) in seeds {
+                    unsafe { (*(ptr as *mut Self)).cells[s] = Min::<A>::seed(r.read(row as usize), &mut na) };
+                },
+                BoundSlot::Max(r) => for &(ptr, row) in seeds {
+                    unsafe { (*(ptr as *mut Self)).cells[s] = Max::<A>::seed(r.read(row as usize), &mut na) };
+                },
+                BoundSlot::StrMin(a) => for &(ptr, row) in seeds {
+                    unsafe { (*(ptr as *mut Self)).cells[s] = StrMin::<A>::seed(StrRead::read(a, row as usize), arena) };
+                },
+                BoundSlot::StrMax(a) => for &(ptr, row) in seeds {
+                    unsafe { (*(ptr as *mut Self)).cells[s] = StrMax::<A>::seed(StrRead::read(a, row as usize), arena) };
+                },
             }
-            start += TILE;
         }
 
         // Update phase: fold repeat occurrences onto their (already seeded) cells.
-        let mut start = 0;
-        while start < updates.len() {
-            let tile = &updates[start..(start + TILE).min(updates.len())];
-            #[allow(clippy::needless_range_loop)]
-            for s in 0..N {
-                match &reader[s] {
-                    BoundSlot::Count => {
-                        for &(ptr, _) in tile {
-                            unsafe {
-                                let c = (*(ptr as *mut Self)).cells[s];
-                                (*(ptr as *mut Self)).cells[s] = Count::<A>::update(c, (), &mut na, &());
-                            }
-                        }
+        #[allow(clippy::needless_range_loop)]
+        for s in 0..N {
+            match &reader[s] {
+                BoundSlot::Count => for &(ptr, _) in updates {
+                    unsafe {
+                        let c = (*(ptr as *mut Self)).cells[s];
+                        (*(ptr as *mut Self)).cells[s] = Count::<A>::update(c, (), &mut na, &());
                     }
-                    BoundSlot::Sum(r) => {
-                        for &(ptr, row) in tile {
-                            unsafe {
-                                let c = (*(ptr as *mut Self)).cells[s];
-                                (*(ptr as *mut Self)).cells[s] = Sum::<A>::update(c, r.read(row as usize), &mut na, &());
-                            }
-                        }
+                },
+                BoundSlot::Sum(r) => for &(ptr, row) in updates {
+                    unsafe {
+                        let c = (*(ptr as *mut Self)).cells[s];
+                        (*(ptr as *mut Self)).cells[s] = Sum::<A>::update(c, r.read(row as usize), &mut na, &());
                     }
-                    BoundSlot::Min(r) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    let c = (*(ptr as *mut Self)).cells[s];
-                                    (*(ptr as *mut Self)).cells[s] = Min::<A>::update(c, r.read(row as usize), &mut na, &());
-                                }
-                            }
-                        }
+                },
+                BoundSlot::Min(r) => for &(ptr, row) in updates {
+                    unsafe {
+                        let c = (*(ptr as *mut Self)).cells[s];
+                        (*(ptr as *mut Self)).cells[s] = Min::<A>::update(c, r.read(row as usize), &mut na, &());
                     }
-                    BoundSlot::Max(r) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    let c = (*(ptr as *mut Self)).cells[s];
-                                    (*(ptr as *mut Self)).cells[s] = Max::<A>::update(c, r.read(row as usize), &mut na, &());
-                                }
-                            }
-                        }
+                },
+                BoundSlot::Max(r) => for &(ptr, row) in updates {
+                    unsafe {
+                        let c = (*(ptr as *mut Self)).cells[s];
+                        (*(ptr as *mut Self)).cells[s] = Max::<A>::update(c, r.read(row as usize), &mut na, &());
                     }
-                    BoundSlot::StrMin(a) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    let c = (*(ptr as *mut Self)).cells[s];
-                                    (*(ptr as *mut Self)).cells[s] = StrMin::<A>::update(c, StrRead::read(a, row as usize), arena, shared);
-                                }
-                            }
-                        }
+                },
+                BoundSlot::StrMin(a) => for &(ptr, row) in updates {
+                    unsafe {
+                        let c = (*(ptr as *mut Self)).cells[s];
+                        (*(ptr as *mut Self)).cells[s] = StrMin::<A>::update(c, StrRead::read(a, row as usize), arena, shared);
                     }
-                    BoundSlot::StrMax(a) => {
-                        if ONLY_ADDITIVE {
-                            unreachable!()
-                        } else {
-                            for &(ptr, row) in tile {
-                                unsafe {
-                                    let c = (*(ptr as *mut Self)).cells[s];
-                                    (*(ptr as *mut Self)).cells[s] = StrMax::<A>::update(c, StrRead::read(a, row as usize), arena, shared);
-                                }
-                            }
-                        }
+                },
+                BoundSlot::StrMax(a) => for &(ptr, row) in updates {
+                    unsafe {
+                        let c = (*(ptr as *mut Self)).cells[s];
+                        (*(ptr as *mut Self)).cells[s] = StrMax::<A>::update(c, StrRead::read(a, row as usize), arena, shared);
                     }
-                }
+                },
             }
-            start += TILE;
         }
         *seeds_len = 0;
         *updates_len = 0;
