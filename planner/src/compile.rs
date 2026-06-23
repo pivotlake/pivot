@@ -24,7 +24,7 @@ use crate::catalog::{Catalog, QueryContext};
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
-use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, BooleanArray, Datum, RecordBatch, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, RecordBatchOperatorSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -189,6 +189,20 @@ pub type ExprEvalFn = Box<dyn FnMut(&RecordBatch) -> ExprResult + Send>;
 /// dispatch's [`filter`](dispatch::RecordBatchOperatorSpec::filter) /
 /// [`project`](dispatch::RecordBatchOperatorSpec::project) APIs.
 pub type ExprFn = Box<dyn Fn() -> ExprEvalFn + Send + Sync>;
+
+/// A selection-aware boolean evaluator. Given the running filter mask, it
+/// returns `selection AND predicate` directly: it computes the predicate only
+/// at the set positions and leaves `false` elsewhere, so the result already
+/// folds the selection in (no separate AND needed). A `None` selection means
+/// every row is still alive (the predicate is the first condition), so it is
+/// evaluated densely. Only the scan predicates (`contains`) provide this; every
+/// other predicate is evaluated densely and ANDed by
+/// [`Filter`](crate::operator::Filter).
+pub type SelectedEvalFn =
+    Box<dyn FnMut(&RecordBatch, Option<&BooleanArray>) -> BooleanArray + Send>;
+
+/// Builder for [`SelectedEvalFn`], called once per worker. Mirrors [`ExprFn`].
+pub type SelectedFn = Box<dyn Fn() -> SelectedEvalFn + Send + Sync>;
 
 /// Wraps a stateless expression closure into the builder pattern (closure returning closure).
 pub(crate) fn stateless_expr<F>(f: F) -> ExprFn

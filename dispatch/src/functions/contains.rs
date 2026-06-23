@@ -74,7 +74,21 @@ impl Contains {
     /// (common with dictionary-encoded or sliced data) avoid redundant work.
     pub fn run(&mut self, col: &StringViewArray) -> BooleanArray {
         self.run_find_on_underlying_buffers(col);
-        self.create_bitmask(col)
+        self.create_bitmask(col, None)
+    }
+
+    /// Like [`run`](Self::run), but only inspects rows where `selection` is set
+    /// (i.e. `true` and non-null); every other row is left `false`. The result
+    /// is therefore `selection AND contains`, used by the filter operator to run
+    /// the substring scan only over the rows that survived the cheaper
+    /// predicates.
+    pub fn run_selected(
+        &mut self,
+        col: &StringViewArray,
+        selection: &BooleanArray,
+    ) -> BooleanArray {
+        self.run_find_on_underlying_buffers(col);
+        self.create_bitmask(col, Some(selection))
     }
 
     /// Run find on underlying buffers *if this is the first time we've seen them*.
@@ -113,7 +127,11 @@ impl Contains {
     /// *buffer-backed* (a pointer into a data buffer). Inline strings are checked
     /// directly with the finder; buffer-backed strings are checked via a binary
     /// search over the pre-computed needle offsets for their buffer.
-    fn create_bitmask(&self, array: &StringViewArray) -> BooleanArray {
+    fn create_bitmask(
+        &self,
+        array: &StringViewArray,
+        selection: Option<&BooleanArray>,
+    ) -> BooleanArray {
         let needle_len = self.finder.needle().len();
         let empty = BufferFindOffsets::default();
 
@@ -139,6 +157,12 @@ impl Contains {
         bitmap.append_n(row_count, false);
 
         for (i, &view) in array.views().iter().enumerate() {
+            // Skip rows the caller already excluded; they stay `false`. A null
+            // selection bit (an excluded row) is treated the same as `false`.
+            if selection.is_some_and(|s| !(s.is_valid(i) && s.value(i))) {
+                continue;
+            }
+
             let len = view as u32;
 
             let found = if len as usize > MAX_INLINE_STRING_VIEW {
@@ -163,12 +187,38 @@ impl Contains {
 #[cfg(test)]
 mod tests {
     use super::Contains;
-    use arrow_array::StringViewArray;
+    use arrow_array::{BooleanArray, StringViewArray};
 
     fn run(needle: &str, values: &[&str]) -> Vec<bool> {
         let array = StringViewArray::from_iter_values(values.iter().copied());
         let result = Contains::new(needle).run(&array);
         (0..result.len()).map(|i| result.value(i)).collect()
+    }
+
+    fn run_selected(needle: &str, values: &[&str], selection: &[Option<bool>]) -> Vec<bool> {
+        let array = StringViewArray::from_iter_values(values.iter().copied());
+        let selection = BooleanArray::from(selection.to_vec());
+        let result = Contains::new(needle).run_selected(&array, &selection);
+        (0..result.len()).map(|i| result.value(i)).collect()
+    }
+
+    #[test]
+    fn selected_skips_unselected_rows() {
+        let values = ["world a", "world b", "world c"];
+
+        // Middle row matches but is not selected; it must come back false.
+        let result = run_selected("world", &values, &[Some(true), Some(false), Some(true)]);
+
+        assert_eq!(result, vec![true, false, true]);
+    }
+
+    #[test]
+    fn selected_treats_null_selection_as_excluded() {
+        let values = ["world a", "world b"];
+
+        let result = run_selected("world", &values, &[Some(true), None]);
+
+        assert_eq!(result, vec![true, false]);
     }
 
     #[test]

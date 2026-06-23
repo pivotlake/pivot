@@ -1,10 +1,10 @@
 //! [`Contains`] — SQL `contains(haystack, needle)` substring search.
 
 use super::{Error, Expression};
-use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
+use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult, SelectedEvalFn, SelectedFn};
 use crate::types::Type;
 use arrow_array::cast::AsArray;
-use arrow_array::{ArrayRef, Datum, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, Datum, RecordBatch};
 use dispatch::Contains as DispatchContains;
 use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
@@ -41,7 +41,11 @@ impl Display for Contains {
 }
 
 impl Contains {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    /// Validate the haystack (a `Utf8` column reference) and extract the
+    /// constant needle, returning the haystack's builder and the needle string.
+    /// Shared by [`compile`](Self::compile) and
+    /// [`compile_selected`](Self::compile_selected).
+    fn validated_parts(&self) -> Result<(ExprFn, String), compile::Error> {
         match self.haystack.as_ref() {
             Expression::Ref(r) if r.return_type == Type::Utf8 => {}
             expr => {
@@ -53,7 +57,6 @@ impl Contains {
 
         let haystack_builder = self.haystack.compile()?;
 
-        // Extract the needle string from the constant expression
         let needle_str: String = match self.needle.as_ref() {
             Expression::Constant(scalar) => {
                 let (arr, _) = scalar.get();
@@ -70,18 +73,42 @@ impl Contains {
                 ));
             }
         };
+
+        Ok((haystack_builder, needle_str))
+    }
+
+    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+        let (haystack_builder, needle_str) = self.validated_parts()?;
         Ok(Box::new(move || {
             let mut haystack_expr = haystack_builder();
             let mut contains = DispatchContains::new(&needle_str);
             Box::new(move |batch: &RecordBatch| {
                 let haystack = haystack_expr(batch);
                 let (arr, _) = haystack.as_datum().get();
-                let col = arr
-                    .as_any()
-                    .downcast_ref::<arrow_array::StringViewArray>()
-                    .unwrap();
+                let col = arr.as_string_view();
                 ExprResult::Array(Arc::new(contains.run(col)) as ArrayRef)
             }) as ExprEvalFn
+        }))
+    }
+
+    /// Selection-aware variant of [`compile`](Self::compile): the substring scan
+    /// runs only over the rows set in the filter mask, returning `selection AND
+    /// contains`. A `None` selection scans every row (no mask yet). See
+    /// [`SelectedFn`].
+    pub fn compile_selected(&self) -> Result<SelectedFn, compile::Error> {
+        let (haystack_builder, needle_str) = self.validated_parts()?;
+        Ok(Box::new(move || {
+            let mut haystack_expr = haystack_builder();
+            let mut contains = DispatchContains::new(&needle_str);
+            Box::new(move |batch: &RecordBatch, selection: Option<&BooleanArray>| {
+                let haystack = haystack_expr(batch);
+                let (arr, _) = haystack.as_datum().get();
+                let col = arr.as_string_view();
+                match selection {
+                    Some(selection) => contains.run_selected(col, selection),
+                    None => contains.run(col),
+                }
+            }) as SelectedEvalFn
         }))
     }
 }

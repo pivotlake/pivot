@@ -45,7 +45,7 @@ pub use not::Not;
 pub use reference::Ref;
 pub use regexp::RegexpReplace;
 
-use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
+use crate::compile::{self, ExprFn, ExprResult, SelectedFn, stateless_expr};
 use crate::types::{self, Type, build_scalar_value};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_array::cast::AsArray;
@@ -152,6 +152,69 @@ impl Expression {
             // Everything else (comparisons, `contains`, `Divide`'s Float64
             // quotient, …) has no type we use for grouping.
             _ => Err(compile::Error::IndeterminateResultType(self.clone())),
+        }
+    }
+
+    /// Whether evaluating this predicate scans string contents anywhere in its
+    /// expression tree (substring search via `contains`/`LIKE '%..%'`, or a
+    /// `regexp_replace`). These cost far more per row than a column comparison,
+    /// so [`Filter`](crate::operator::Filter) runs the cheap predicates first;
+    /// the running mask they build then lets a selection-aware scan (see
+    /// [`compile_selected`](Self::compile_selected)) inspect only the surviving
+    /// rows, while any other expensive predicate simply runs last.
+    pub(crate) fn is_expensive_predicate(&self) -> bool {
+        match self {
+            Expression::Ref(_) | Expression::Constant(_) | Expression::AggregateFunc(_) => false,
+            // Recurse into a function's arguments so a string scan nested inside
+            // another function (e.g. `length(regexp_replace(col, ...))`) is still
+            // flagged expensive.
+            Expression::Function(func) => match func {
+                Function::Contains(_) | Function::RegexpReplace(_) => true,
+                Function::Length(l) => l.input.is_expensive_predicate(),
+                Function::Arithmetic(a) => {
+                    a.left.is_expensive_predicate() || a.right.is_expensive_predicate()
+                }
+                Function::Divide(d) => {
+                    d.left.is_expensive_predicate() || d.right.is_expensive_predicate()
+                }
+                Function::DatePart(d) => d.source.is_expensive_predicate(),
+                Function::DateTrunc(d) => d.source.is_expensive_predicate(),
+                Function::DropCache => false,
+            },
+            Expression::Compare(c) => {
+                c.left.is_expensive_predicate() || c.right.is_expensive_predicate()
+            }
+            Expression::Between(b) => {
+                b.input.is_expensive_predicate()
+                    || b.lower.is_expensive_predicate()
+                    || b.upper.is_expensive_predicate()
+            }
+            Expression::Conjunction(c) => {
+                c.children.iter().any(Expression::is_expensive_predicate)
+            }
+            Expression::InList(i) => {
+                i.input.is_expensive_predicate()
+                    || i.values.iter().any(Expression::is_expensive_predicate)
+            }
+            Expression::Case(c) => {
+                c.else_expr.is_expensive_predicate()
+                    || c.checks.iter().any(|check| {
+                        check.when.is_expensive_predicate()
+                            || check.then.is_expensive_predicate()
+                    })
+            }
+            Expression::Not(n) => n.input.is_expensive_predicate(),
+        }
+    }
+
+    /// A selection-aware evaluator for this predicate, if it can run over only
+    /// the rows set in the filter mask. Only the substring scan (`contains`)
+    /// supports this today; everything else returns `None` and is evaluated
+    /// densely. See [`SelectedFn`] and [`Filter`](crate::operator::Filter).
+    pub(crate) fn compile_selected(&self) -> Option<Result<SelectedFn, compile::Error>> {
+        match self {
+            Expression::Function(Function::Contains(c)) => Some(c.compile_selected()),
+            _ => None,
         }
     }
 
