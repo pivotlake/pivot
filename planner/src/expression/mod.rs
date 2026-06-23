@@ -38,7 +38,7 @@ pub use contains::Contains;
 pub use date_part::{DatePart, DatePartKind};
 pub use date_trunc::DateTrunc;
 pub use divide::Divide;
-pub use function::Function;
+pub use function::{Function, ScalarFunctionSignature, builtin_scalar_function};
 pub use in_list::InList;
 pub use length::Length;
 pub use not::Not;

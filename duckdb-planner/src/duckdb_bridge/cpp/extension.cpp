@@ -6,9 +6,6 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include "duckdb/common/types/value.hpp"
-#include "duckdb/common/types/vector.hpp"
 
 using namespace duckdb;
 
@@ -31,19 +28,8 @@ void PivotExtension::Load(ExtensionLoader &loader) {
 	ext->create_transaction_manager = create_pivot_transaction_manager;
 	StorageExtension::Register(DBConfig::GetConfig(db), "pivotdb", ext);
 
-	// Register `drop_cache()` so the binder accepts `SELECT drop_cache()`. The
-	// body never runs — pivot only *optimizes* through DuckDB, then re-plans:
-	// the call comes through as an ordinary scalar-function expression over a
-	// DummyScan, which pivot's planner maps to its own `drop_cache` expression.
-	// Marked VOLATILE so the optimizer can't constant-fold the no-arg call away.
-	ScalarFunction drop_cache("drop_cache", {}, LogicalType::BIGINT,
-	                          [](DataChunk &, ExpressionState &, Vector &result) {
-		                          result.Reference(Value::BIGINT(0));
-	                          });
-	drop_cache.SetStability(FunctionStability::VOLATILE);
-	loader.RegisterFunction(drop_cache);
-
-	// Table functions (e.g. `metadata`) are NOT registered here. They resolve on
-	// demand through the catalog's LookupEntry, which builds their entry from the
-	// Rust provider's registry, so adding one needs no change in this bridge.
+	// No functions are registered here. Pivot's own scalar and table functions
+	// (drop_cache, metadata, ...) resolve on demand through the catalog's
+	// LookupEntry, which builds their entry from the Rust provider's registry, so
+	// adding one needs no change in this bridge.
 }

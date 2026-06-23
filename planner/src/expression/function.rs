@@ -5,10 +5,38 @@ use super::{
     Arithmetic, Contains, DatePart, DatePartKind, DateTrunc, Divide, Error, Length, RegexpReplace,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
+use crate::types::Type;
 use arrow_array::{Int64Array, RecordBatch};
 use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
+
+/// The binding signature of a pivot-defined scalar function: argument types,
+/// return type, and whether DuckDB must leave the call un-folded. The bridge
+/// reads this to register the function for DuckDB's binder, so a pivot scalar
+/// function needs no C++ registration.
+pub struct ScalarFunctionSignature {
+    pub arguments: Vec<Type>,
+    pub return_type: Type,
+    /// `true` marks the function `VOLATILE` so DuckDB can't constant-fold the
+    /// call away before pivot re-plans it (e.g. a no-arg `drop_cache()`).
+    pub volatile: bool,
+}
+
+/// The binding signature for a pivot-defined scalar function `name`, or `None`
+/// for names pivot doesn't define (DuckDB's own built-ins like `+`/`length`,
+/// which DuckDB binds itself and pivot only intercepts at compile time). The
+/// compile-time mapping of the same names lives in [`Function::try_from`].
+pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
+    match name {
+        "drop_cache" => Some(ScalarFunctionSignature {
+            arguments: vec![],
+            return_type: Type::Int64,
+            volatile: true,
+        }),
+        _ => None,
+    }
+}
 
 /// A scalar function call (e.g. `year`, `substring`).
 #[derive(Debug, Clone)]
