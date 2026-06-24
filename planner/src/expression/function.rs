@@ -34,6 +34,17 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Int64,
             volatile: true,
         }),
+        // `now()`: current wall-clock time. VOLATILE so DuckDB can't fold the
+        // call into its own `TIMESTAMP WITH TIME ZONE` constant; pivot evaluates
+        // it instead, returning a `TIMESTAMP` (epoch seconds) like the rest of
+        // its time path. (The bare `CURRENT_TIMESTAMP` keyword is a separate
+        // DuckDB value-function that yields a TZ type pivot doesn't model, so
+        // only the `now()` call form is intercepted here.)
+        "now" => Some(ScalarFunctionSignature {
+            arguments: vec![],
+            return_type: Type::Timestamp,
+            volatile: true,
+        }),
         _ => None,
     }
 }
@@ -54,6 +65,10 @@ pub enum Function {
     ///
     /// [`DummyScan`]: crate::operator::DummyScan
     DropCache,
+    /// `now()` yields the wall-clock time captured once when the query
+    /// compiles, so every row of the statement sees the same instant. Result is
+    /// a `TIMESTAMP` (epoch seconds).
+    Now,
 }
 
 impl TryFrom<duckdb_expression::Function> for Function {
@@ -76,6 +91,16 @@ impl TryFrom<duckdb_expression::Function> for Function {
                 }
                 Ok(Function::DropCache)
             }
+            "now" => {
+                if !f.params.is_empty() {
+                    return Err(Error::InvalidParameterCount {
+                        function: f.function,
+                        expected: 0,
+                        actual: f.params.len(),
+                    });
+                }
+                Ok(Function::Now)
+            }
             // `extract(<part> FROM ts)` lowers to a function named after the
             // part (`minute`, `year`, `dayofweek`, …).
             name => match DatePartKind::from_function_name(name) {
@@ -97,6 +122,7 @@ impl Display for Function {
             Function::DateTrunc(dt) => write!(f, "{dt}"),
             Function::DatePart(d) => write!(f, "{d}"),
             Function::DropCache => write!(f, "drop_cache()"),
+            Function::Now => write!(f, "now()"),
         }
     }
 }
@@ -123,6 +149,19 @@ impl Function {
                 let evicted = (extents + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
+            // Capture the instant once, here at compile time, so every worker and
+            // every row of the statement observes the same `now()` (epoch seconds,
+            // matching how pivot stores timestamps elsewhere). Negative (pre-epoch)
+            // clocks are clamped to 0, which can't happen on a sane host.
+            Function::Now => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or(0);
+                Ok(stateless_expr(move |batch: &RecordBatch| {
+                    ExprResult::Array(Arc::new(Int64Array::from(vec![now_secs; batch.num_rows()])))
+                }))
+            }
         }
     }
 }
@@ -140,5 +179,23 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0]["col0"].as_i64().unwrap() >= 0);
+    }
+
+    #[rstest]
+    fn now_returns_current_epoch_seconds(mut testing_planner: TestingPlanner) {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let rows = run(&mut testing_planner, "SELECT now()");
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(rows.len(), 1);
+        let now = rows[0]["col0"].as_i64().unwrap();
+        assert!((before..=after).contains(&now), "{now} not in [{before}, {after}]");
     }
 }

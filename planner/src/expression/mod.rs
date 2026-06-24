@@ -142,8 +142,8 @@ impl Expression {
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
-            // `date_trunc` yields a timestamp; `regexp_replace` a string.
-            Expression::Function(Function::DateTrunc(_)) => Ok(Type::Timestamp),
+            // `date_trunc` and `now()` yield a timestamp; `regexp_replace` a string.
+            Expression::Function(Function::DateTrunc(_) | Function::Now) => Ok(Type::Timestamp),
             Expression::Function(Function::RegexpReplace(_)) => Ok(Type::Utf8),
             // Integer-valued scalar functions: a date part (`extract(minute …)`),
             // a byte length, and integer arithmetic (`a * 2`, `ClientIP - 1`).
