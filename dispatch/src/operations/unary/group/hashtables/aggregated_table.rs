@@ -7,8 +7,8 @@
 //! cardinality, and every string group-by).
 //!
 //! Once that table would grow past [`SWITCH_THRESHOLD`] (≈ where it stops fitting
-//! L2) *and* the key is radix-eligible ([`KeyExtractor::SUPPORTS_RADIX`] — ints
-//! yes, strings never), the worker **drops off to radix**: it stops aggregating
+//! L2) *and* the key has real bytes to scatter (every key but the hash-only
+//! `COUNT(DISTINCT)` one), the worker **drops off to radix**: it stops aggregating
 //! and instead *scatters* every remaining row into one of [`RADIX_PARTITIONS`]
 //! per-partition buffers by the top hash bits — no probing on the hot path. The
 //! aggregation moves to the merge phase, where each partition is small enough to
@@ -206,10 +206,6 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         shared_context: &V::SharedContext,
     ) {
         let length = batch.num_rows();
-        debug_assert!(
-            !(K::DEDUP_BY_HASH && K::SUPPORTS_RADIX),
-            "DEDUP_BY_HASH requires the in-place path (no radix scatter)"
-        );
 
         // Lend the reusable scratch to the reader for this batch. Taking it out of
         // `self` (it goes back at the end) means the reader borrows a local, not
@@ -231,21 +227,21 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 &mut self.hashes[..length],
             );
 
-            if self.switched_to_radix {
+            // A worker that switched to a *scatter* radix route (fixed-width keys)
+            // scatters whole batches raw. Abandon-route keys (long strings) and
+            // not-yet-switched workers keep probing/aggregating in `consume_scalared`.
+            if self.switched_to_radix && !K::RADIX_ABANDON {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
-                // The value type fixes the fold (Mono is branch-free, Dynamic
-                // dispatches per slot via `shared_context`); the probe just consumes.
                 self.consume_scalared(length, &key_reader, &value_reader, shared_context);
             }
         }
         self.scratch = scratch;
     }
 
-    /// Row-by-row probe, switching tables (or to radix) when the active table
-    /// overflows mid-batch. On switch, the remaining rows are scattered. A
-    /// two-level software prefetch (DRAM→L2 far, L2→L1 near) hides the per-row
-    /// probe latency on the large in-place tables this path handles.
+    /// Row-by-row probe, growing or abandoning the active table when it overflows
+    /// mid-batch. A two-level software prefetch (DRAM→L2 far, L2→L1 near) hides the
+    /// per-row probe latency on the large in-place tables this path handles.
     #[inline(always)]
     fn consume_scalared<'b>(
         &mut self,
@@ -296,7 +292,11 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                 );
                 table.undersized()
             };
-            if overflowed && self.grow_or_switch() {
+            // On overflow take the radix route. For a scatter-route key this returns
+            // `true`: scatter the rest of the batch raw and stop probing. For an
+            // abandon-route key (or a plain in-place grow) it returns `false` and we
+            // keep probing into the reset/grown table.
+            if overflowed && self.grow_or_radix() {
                 self.scatter_range(i + 1, length, key_reader, value_reader);
                 return;
             }
@@ -304,28 +304,45 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         }
     }
 
-    /// Active table is full: either grow the stack (4x) or, for a radix-eligible
-    /// key that would grow past [`SWITCH_THRESHOLD`], switch to scatter. Returns
-    /// `true` if it switched.
+    /// Active table is full. For a radix-eligible key past [`SWITCH_THRESHOLD`],
+    /// take the radix route and return whether the caller should now *scatter* the
+    /// rest of the batch raw:
+    /// - abandon route (long strings): drain this window's deduplicated entries to
+    ///   the partition buffers and clear the table for reuse; keep probing (returns
+    ///   `false`).
+    /// - scatter route (fixed-width keys): allocate buffers and signal the caller to
+    ///   append raw rows (returns `true`).
+    ///
+    /// Otherwise (not radix-eligible / below threshold) grow the stack 4x.
     #[inline(always)]
-    fn grow_or_switch(&mut self) -> bool {
+    fn grow_or_radix(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
-        if K::SUPPORTS_RADIX && next_size > self.radix_cfg.switch_threshold {
+        // A key with real bytes (`!DEDUP_BY_HASH`) is radix-eligible; a hash-only
+        // key has nothing to scatter and always grows in place.
+        if K::DEDUP_BY_HASH || next_size <= self.radix_cfg.switch_threshold {
+            self.tables
+                .push(BaseHashTable::multi_slab(&mut self.allocator, next_size, 0));
+            return false;
+        }
+        if self.buffers.is_none() {
             self.buffers = Some(
                 (0..self.radix_cfg.partitions)
                     .map(|_| SlabVec::new())
                     .collect(),
             );
-            self.switched_to_radix = true;
-            true
-        } else {
-            self.tables
-                .push(BaseHashTable::multi_slab(&mut self.allocator, next_size, 0));
+        }
+        self.switched_to_radix = true;
+        if K::RADIX_ABANDON {
+            self.abandon_active_table();
             false
+        } else {
+            true
         }
     }
 
-    /// Scatter rows `[start, end)` into per-partition buffers (post-switch).
+    /// Scatter rows `[start, end)` into per-partition buffers (raw, post-switch),
+    /// the radix route for fixed-width keys: a cheap append (no probe, no per-row
+    /// dedup), with deduplication deferred to the merge.
     #[inline(always)]
     fn scatter_range(
         &mut self,
@@ -349,13 +366,37 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             let hash = hashes[i];
             hll.add(hash);
             let p = (hash >> shift) as usize;
-            // Only a numeric signature ever radixes (a string extreme disables the
-            // switch), so `value` persists nothing into `worker_context` here even
-            // when it is a `Dynamic`'s `WorkerArena` (the string arms are dead).
             let key = K::live_key(key_reader, i, key_arena).persist();
             let value = V::value(value_reader, i, worker_context);
             buffers[p].push(allocator, (hash, key, value));
         }
+    }
+
+    /// Drain the active table's aggregated entries into the per-partition scatter
+    /// buffers (routing each by the same top hash bits the merge partitions on),
+    /// then clear it for reuse. Unlike scattering raw rows, the entries here are
+    /// already deduplicated for this window, so only one entry per distinct key
+    /// moves, and its key handle is already persisted, so no string is recopied.
+    /// The merge folds these per-window partials together across all windows.
+    #[inline(always)]
+    fn abandon_active_table(&mut self) {
+        let shift = u64::BITS - self.radix_cfg.partitions.trailing_zeros();
+        let Self {
+            tables,
+            buffers,
+            allocator,
+            hll,
+            ..
+        } = self;
+        let table = tables.last_mut().unwrap();
+        let buffers = buffers.as_mut().unwrap();
+        for entry in table.iter(0) {
+            let hash = entry.hash();
+            hll.add(hash);
+            let p = (hash >> shift) as usize;
+            buffers[p].push(allocator, (hash, *entry.key(), *entry.value()));
+        }
+        table.clear();
     }
 
     /// Finalize: hand back this worker's in-place stack plus, if it switched, its

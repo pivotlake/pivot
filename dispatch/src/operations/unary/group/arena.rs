@@ -85,13 +85,23 @@ impl SharedArena {
         let _ = ptr;
     }
 
-    /// Convert all registered buffers into Arrow Buffers for zero-copy StringViewArray output.
-    /// The `Arc<SharedArena>` keeps ring memory alive as long as any Arrow Buffer exists.
-    pub fn to_arrow_buffers(self: &Arc<Self>) -> Vec<Buffer> {
+    /// Wrap every registered ring buffer as a shared `Arc<[Buffer]>` for zero-copy
+    /// `StringViewArray` output. Each `Buffer` holds a clone of the owning
+    /// `Arc<SharedArena>`, so the ring memory stays alive as long as any output
+    /// array points into it. Valid once consume has finished and `next_idx` is final.
+    pub fn to_arrow_buffers(self: &Arc<Self>) -> Arc<[Buffer]> {
         let count = self.next_idx.load(Ordering::Acquire) as usize;
         (0..count)
             .map(|i| {
                 let ptr = unsafe { *self.ptrs[i].get() };
+                // Each slot in `0..next_idx` is fully written by the time consume
+                // finishes; a null here means this ran before a `take_buffer` that
+                // reserved slot `i` stored its pointer (a caller-contract violation),
+                // which `new_unchecked` would turn into silent UB.
+                debug_assert!(
+                    !ptr.is_null(),
+                    "arena buffer {i} read before its pointer was stored"
+                );
                 unsafe {
                     Buffer::from_custom_allocation(
                         NonNull::new_unchecked(ptr),

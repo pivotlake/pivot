@@ -38,7 +38,6 @@ impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for IntKeyExtractor<T>
 where
     T::Native: PersistedKey + Hash + Eq,
 {
-    const SUPPORTS_RADIX: bool = true;
     type Config = ();
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;
@@ -100,6 +99,7 @@ impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumn<T> {
     fn finish(
         self,
         _arena: &Arc<SharedArena>,
+        _output_buffers: &Arc<[arrow_buffer::Buffer]>,
         _allocator: &mut SlabAllocator,
     ) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![Field::new("key", T::DATA_TYPE, false)];
