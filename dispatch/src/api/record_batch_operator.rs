@@ -560,27 +560,11 @@ impl RecordBatchOperatorSpec {
     }
 
     /// GROUP BY one or more key columns computing one or more aggregate value
-    /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key
-    /// shape, `V` the aggregate shape (e.g. its arity).
-    pub fn group_by_aggregate<K: KeyExtractor<Config: Default>, V: AggregationValue>(
-        self,
-        key_cols: Vec<usize>,
-        value_slots: Vec<AggregationSlot>,
-        output_limit: Option<GroupLimit>,
-    ) -> Self {
-        self.group_by_aggregate_config::<K, V>(
-            key_cols,
-            value_slots,
-            output_limit,
-            K::Config::default(),
-        )
-    }
-
-    /// [`group_by_aggregate`](Self::group_by_aggregate) with an explicit key
-    /// extractor configuration (e.g. a [`RowKeySchema`](crate::RowKeySchema)).
-    /// Extractors whose key shape is fully determined by their type use the
-    /// config-free form above.
-    pub fn group_by_aggregate_config<K: KeyExtractor, V: AggregationValue>(
+    /// slots (`COUNT(*)`/`SUM`/`COUNT(col)`) per group. `K` selects the key shape,
+    /// `V` the aggregate shape (e.g. its arity). `key_config` configures the key
+    /// extractor (e.g. a [`RowKeySchema`](crate::RowKeySchema)); pass `()` for the
+    /// extractors whose key shape is fully determined by their type.
+    pub fn group_by_aggregate<K: KeyExtractor, V: AggregationValue>(
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
