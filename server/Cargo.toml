@@ -21,10 +21,28 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sysinfo = "0.38.0"
+# Only pulled in by the `perf` feature, for SIGINT-ing the `perf record` child
+# so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
+libc = { version = "0.2", optional = true }
+
+[features]
+# Staging-only per-query `perf record` profiling: when on, a session that runs
+# `SET perf = 1` profiles each of its queries (one report per query) into the
+# directory named by `PIVOT_PERF_DIR`. Without this feature every profiling path
+# is compiled out and `SET perf = 1` is an accepted no-op, so there is no
+# overhead in a normal build.
+perf = ["dep:libc", "dispatch/perf"]
 
 [[bin]]
 name = "pivotdb-server"
 path = "src/main.rs"
+
+# Optimized like release but with debuginfo, so `perf` can resolve inlined
+# frames and line numbers. Build the server for profiling with
+# `cargo build --profile profiling --features perf`; plain `--release` stays lean.
+[profile.profiling]
+inherits = "release"
+debug = true
 
 [dev-dependencies]
 tokio-postgres = "0.7"

@@ -81,6 +81,11 @@ pub struct DataFlowBuilder {
     stats_tx: mpsc::Sender<DataFlowStats>,
     /// Whether the query opted into per-dataflow stats collection
     collect_stats: bool,
+    /// Whether this dataflow is profiled: it runs exclusively (the worker pauses
+    /// other dataflows) while a `perf` capture is in progress. Set when the
+    /// launching dispatcher was marked (see [`with_profiling`](Self::with_profiling)).
+    #[cfg(feature = "perf")]
+    profiled: bool,
     /// The last operator in the dataflow
     build: Box<dyn FnOnce() -> Chain + Send>,
 }
@@ -98,8 +103,18 @@ impl DataFlowBuilder {
             err_tx,
             stats_tx,
             collect_stats,
+            #[cfg(feature = "perf")]
+            profiled: false,
             build,
         }
+    }
+
+    /// Mark this builder's dataflow profiled, so it runs exclusively while a
+    /// `perf` capture is in progress.
+    #[cfg(feature = "perf")]
+    pub fn with_profiling(mut self, profiled: bool) -> Self {
+        self.profiled = profiled;
+        self
     }
 
     /// Build the full operator chain and convert it into an executable `DataFlow`.
@@ -114,11 +129,14 @@ impl DataFlowBuilder {
             Error::PanicOnBuild(msg.to_string())
         })?;
 
-        Ok(chain.into_data_flow(
+        let data_flow = chain.into_data_flow(
             self.cancelled,
             self.err_tx,
             self.stats_tx,
             self.collect_stats,
-        ))
+        );
+        #[cfg(feature = "perf")]
+        let data_flow = data_flow.with_profiling(self.profiled);
+        Ok(data_flow)
     }
 }

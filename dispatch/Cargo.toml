@@ -45,6 +45,11 @@ url = "2.5"
 # out-of-crate test suites (e.g. catalog's Parquet reader tests) can drive
 # single operators. Enabled only via those crates' dev-dependencies.
 test-util = []
+# Per-query `perf` profiling support (used by the server's `perf` feature): a
+# worker-tid registry + a "run only the profiled dataflow" gate in the worker
+# loop. Off by default: no per-dataflow state, zero hot-loop overhead. Pulls
+# nix's `process` feature for `gettid`.
+perf = ["nix/process"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
