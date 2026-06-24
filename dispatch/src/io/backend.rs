@@ -128,11 +128,85 @@ mod uring_backend {
         /// HTTP range read) could not be mapped back to its connection and
         /// retried. The caller interprets the sign per request instead.
         pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
-            Ok(self
-                .ring
-                .completion()
-                .map(|cqe| (cqe.result(), cqe.user_data() as Identifier))
-                .collect())
+            let mut out = Vec::new();
+            loop {
+                let dropped = {
+                    let mut cq = self.ring.completion();
+                    for cqe in &mut cq {
+                        out.push((cqe.result(), cqe.user_data() as Identifier));
+                    }
+                    cq.overflow()
+                    // `cq` drops here, publishing the consumed head so the kernel can
+                    // refill the ring (and accept the backlog flushed below).
+                };
+                // A kernel without `IORING_FEAT_NODROP` silently *drops* completions it
+                // can't fit. They're gone, so surface it loudly rather than losing reads.
+                if dropped > 0 {
+                    return Err(io::Error::other(format!(
+                        "io_uring dropped {dropped} completions: ring oversubscribed"
+                    )));
+                }
+                // A NODROP kernel instead parks the surplus in an overflow backlog
+                // (flagged by `IORING_SQ_CQ_OVERFLOW`) and only moves it into the CQ on
+                // the next `io_uring_enter`. We've just drained the CQ, so flush the
+                // backlog and reap it. Without this, a worker that has stopped
+                // submitting (e.g. spinning on a pipeline breaker's finish) would never
+                // enter the ring again and would stall forever on reads that landed.
+                if !self.ring.submission().cq_overflow() {
+                    break;
+                }
+                self.ring.submit()?;
+            }
+            Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        use std::time::Duration;
+
+        /// Submitting more reads than the completion queue can hold makes the kernel
+        /// park the surplus in its overflow backlog; a single drain must still recover
+        /// every completion (by flushing the backlog), or a worker that has stopped
+        /// submitting would stall forever on reads that already landed. Regression for
+        /// the `SELECT *` row-group-fetcher livelock.
+        #[test]
+        fn completions_recover_an_overflowed_backlog() {
+            // SQ of 4 → CQ of 8 (io_uring's 2x default).
+            let mut backend = IOBackend::new(4).unwrap();
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(&vec![7u8; 256 * 1024]).unwrap();
+            let fd = tmp.as_file().as_raw_fd();
+
+            // More reads than the CQ holds, so the rest must overflow into the backlog.
+            const N: usize = 20;
+            let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; 4096]).collect();
+            let mut id = 0;
+            while id < N {
+                let dest = bufs[id].as_mut_ptr();
+                match backend.submit_read(fd, (id * 4096) as u64, dest, 4096, id as Identifier) {
+                    Ok(()) => id += 1,
+                    // SQ (depth 4) full: flush it to the kernel and retry the push.
+                    Err(_) => {
+                        backend.submit().unwrap();
+                    }
+                }
+            }
+            // Fill the CQ, then let the remaining reads complete into the backlog.
+            backend.submit_and_wait(8).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(
+                backend.ring.submission().cq_overflow(),
+                "test did not actually overflow the completion queue"
+            );
+
+            let recovered = backend.completions().unwrap();
+
+            assert_eq!(recovered.len(), N, "overflow backlog was not fully recovered");
+            assert!(recovered.iter().all(|&(res, _)| res == 4096));
         }
     }
 }
