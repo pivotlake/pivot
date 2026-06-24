@@ -19,7 +19,7 @@ tracing = "0.1"
 bytes = "1.11.0"
 crossbeam-deque = "0.8.6"
 ahash = "0.8.12"
-snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "1e20a92f7bcad208bf6869f5394101288850ee2e" }
+snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "b896aa24d6c85fa1b40f8746c3cc2185ca4084b9" }
 # Catalog metadata is serialized as JSON: the `_pivot_manifest.json` database
 # manifest and the `_pivot_tables/<table>/<version>.json` table-manifest versions.
 serde = { version = "1", features = ["derive"] }
