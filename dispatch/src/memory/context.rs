@@ -1,9 +1,9 @@
 use crate::env::get_env_var_with_default;
-use crate::memory::file_cache::FileCache;
+use crate::memory::file_memory_cache::{FileMemoryCache, FillCursor};
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
 use crate::worker::{NUM_WORKERS, WORKER_IDX};
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::{Arc, LazyLock};
 
 static PANIC_ON_EVICT: LazyLock<bool> =
@@ -26,7 +26,7 @@ pub fn memory_ctx() -> &'static MemoryContext {
     unsafe { &*MEMORY_CTX_PTR.get() }
 }
 
-/// True when a [`MemoryContext`] is installed on the current thread — i.e. the
+/// True when a [`MemoryContext`] is installed on the current thread - i.e. the
 /// caller is running on a dispatch worker (or a test that called
 /// `init_test_free_pool`). Worker-only APIs that reach into the per-thread
 /// memory context use this to fail with a clear message instead of letting
@@ -37,7 +37,7 @@ pub fn has_memory_context() -> bool {
 
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
-    file_cache: Arc<FileCache>,
+    file_memory_cache: Arc<FileMemoryCache>,
     dirty_pool_factory: PoolFactory,
     zeroed_pool_factory: PoolFactory,
 }
@@ -50,14 +50,14 @@ impl MemoryContextFactory {
         );
 
         let ring = Arc::new(Ring::new(buffers).unwrap());
-        let file_cache = Arc::new(FileCache::new(buffers));
+        let file_memory_cache = Arc::new(FileMemoryCache::new(buffers));
         let mut zeroed_pool_factories = PoolFactory::create_many(count);
         let mut dirty_pool_factories = PoolFactory::create_many(count);
 
         (0..count)
             .map(|_| Self {
                 ring: ring.clone(),
-                file_cache: file_cache.clone(),
+                file_memory_cache: file_memory_cache.clone(),
                 dirty_pool_factory: dirty_pool_factories.pop().unwrap(),
                 zeroed_pool_factory: zeroed_pool_factories.pop().unwrap(),
             })
@@ -67,18 +67,25 @@ impl MemoryContextFactory {
     pub fn create_memory_ctx(self) -> MemoryContext {
         MemoryContext {
             ring: self.ring,
-            file_cache: self.file_cache,
+            file_memory_cache: self.file_memory_cache,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
+            fill_cursor: UnsafeCell::new(FillCursor::empty()),
         }
     }
 }
 
 pub struct MemoryContext {
     ring: Arc<Ring>,
-    file_cache: Arc<FileCache>,
+    file_memory_cache: Arc<FileMemoryCache>,
     dirty_pool: FreePool,
     zeroed_pool: FreePool,
+    /// This worker's bump cursor for packing missed reads into a shared fill buffer
+    /// (see [`FileMemoryCache`]). Per-thread, so interior-mutable without a lock - the
+    /// `&'static MemoryContext` is really thread-local, so there is never a second
+    /// accessor. Mirrors the `UnsafeCell` discipline the file cache uses for its
+    /// per-slot metadata.
+    fill_cursor: UnsafeCell<FillCursor>,
 }
 
 impl MemoryContext {
@@ -95,12 +102,20 @@ impl MemoryContext {
         }
     }
 
-    pub fn file_cache(&self) -> &FileCache {
-        self.file_cache.as_ref()
+    pub fn file_memory_cache(&self) -> &FileMemoryCache {
+        self.file_memory_cache.as_ref()
     }
 
     pub fn ring(&self) -> &Ring {
         self.ring.as_ref()
+    }
+
+    /// This worker's fill cursor (the bump allocator the file cache packs missed
+    /// reads into). Sound because the context is per-thread, so the returned `&mut`
+    /// never aliases another accessor on the same thread.
+    #[allow(clippy::mut_from_ref)] // interior mutability; per-thread, single accessor
+    pub(crate) fn fill_cursor(&self) -> &mut FillCursor {
+        unsafe { &mut *self.fill_cursor.get() }
     }
 
     /// Return a buffer index to the pool.
@@ -132,7 +147,7 @@ impl MemoryContext {
     /// Pop a dirty buffer from this worker's local deque only (no stealing).
     ///
     /// Used by background buffer-clean passes that should not pull buffers off
-    /// peer workers — see [`crate::worker::Worker`]'s `clear_dirty_buffer_or_park`.
+    /// peer workers - see [`crate::worker::Worker`]'s `clear_dirty_buffer_or_park`.
     pub fn pop_dirty_buffer(&self) -> Option<WriteBuffer> {
         self.dirty_pool
             .pop(false)
@@ -159,9 +174,9 @@ impl MemoryContext {
 
     /// Acquire a [`WriteBuffer`] from the free pool, falling back to eviction.
     ///
-    /// When `prefer_zeroed` is true, tries the zeroed pool first — use this when the caller
+    /// When `prefer_zeroed` is true, tries the zeroed pool first - use this when the caller
     /// needs zeroed memory so we can skip a memset. When false, tries the
-    /// dirty pool first — use this when the caller will overwrite the buffer entirely
+    /// dirty pool first - use this when the caller will overwrite the buffer entirely
     /// (e.g. decompression, I/O reads) to preserve zeroed buffers for those who need them.
     /// Either way, the other pool is used as a fallback if the preferred one is empty.
     ///
@@ -182,7 +197,7 @@ impl MemoryContext {
                 panic!("Evicting");
             }
             // Nothing free! Let's evict from page cache
-            return self.file_cache.evict();
+            return self.file_memory_cache.evict();
         }
     }
 }
@@ -207,7 +222,7 @@ pub fn init_test_free_pool(dirty_count: usize) {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for [`MemoryContext`] — the zeroed/dirty pair, fallback rules,
+    //! Tests for [`MemoryContext`] - the zeroed/dirty pair, fallback rules,
     //! and the buffer accessors. Single-pool routing lives in
     //! [`crate::memory::free_pool`]'s tests; here we only exercise behaviour
     //! that comes from owning *both* pools (plus the ring and file cache).
