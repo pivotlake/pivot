@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::{
+    ArrayRef, Date32Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+};
 use dispatch::Dispatch;
 
 use crate::common::*;
@@ -16,6 +18,10 @@ fn int_col(values: Vec<i32>) -> ArrayRef {
 
 fn str_col(values: Vec<&'static str>) -> ArrayRef {
     Arc::new(StringViewArray::from(values))
+}
+
+fn int16_col(values: Vec<i16>) -> ArrayRef {
+    Arc::new(Int16Array::from(values))
 }
 
 #[rstest]
@@ -817,17 +823,18 @@ fn group_by_count_distinct_string_key(mut testing_planner: TestingPlanner) {
         .collect()
         .unwrap();
 
-    // A single string key routes through the row encoder, whose key column is
-    // emitted as `k0` (not the single-int/string extractor's `key`).
+    // A single string group key counts through the dedicated `StringKeyExtractor`
+    // (the same extractor a plain `GROUP BY name` uses), whose key column is
+    // emitted as `key`.
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["k0"].as_str().unwrap().to_string());
+    rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
     assert_eq!(rows.len(), 2);
     assert_eq!(
-        (rows[0]["k0"].as_str(), rows[0]["v0"].as_i64()),
+        (rows[0]["key"].as_str(), rows[0]["v0"].as_i64()),
         (Some("a"), Some(2))
     );
     assert_eq!(
-        (rows[1]["k0"].as_str(), rows[1]["v0"].as_i64()),
+        (rows[1]["key"].as_str(), rows[1]["v0"].as_i64()),
         (Some("b"), Some(1))
     );
 }
@@ -993,6 +1000,126 @@ fn group_by_mixed_distinct(mut testing_planner: TestingPlanner) {
     assert_eq!(rows[1]["key"], 2);
     let v2 = vals(&rows[1]);
     assert!(v2.contains(&7) && v2.contains(&1), "g=2 {v2:?}");
+}
+
+#[rstest]
+fn group_by_two_counts_mixed_distinct(mut testing_planner: TestingPlanner) {
+    // COUNT(*) and COUNT(w) compute the same per-row count, so they share one
+    // inner partial and the outer re-folds each.
+    // g: 1,1,2,2  x: 10,10,20,30  w (no nulls): 4,6,8,9
+    //   g=1 -> count=2, count=2, distinct({10})=1
+    //   g=2 -> count=2, count=2, distinct({20,30})=2
+    testing_planner.add_table(
+        "cc",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 2])),
+            ("x", Type::Int32, int_col(vec![10, 10, 20, 30])),
+            ("w", Type::Int32, int_col(vec![4, 6, 8, 9])),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, COUNT(*), COUNT(w), COUNT(DISTINCT x) FROM cc GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    assert_eq!(
+        (
+            rows[0]["v0"].as_i64(),
+            rows[0]["v1"].as_i64(),
+            rows[0]["v2"].as_i64()
+        ),
+        (Some(2), Some(2), Some(1))
+    );
+    assert_eq!(
+        (
+            rows[1]["v0"].as_i64(),
+            rows[1]["v1"].as_i64(),
+            rows[1]["v2"].as_i64()
+        ),
+        (Some(2), Some(2), Some(2))
+    );
+}
+
+#[rstest]
+fn group_by_count_two_int16_sums_coalesce(mut testing_planner: TestingPlanner) {
+    // COUNT(*) and COUNT(c) fold to the same count, so the entry keeps three slots
+    // [Count, SUM(i16), SUM(i16)] and the output re-expands the shared count into
+    // both the v0 and v3 positions.
+    // g: 1,1,2  a: 10,20,30  b: 1,2,3  c (no nulls): 7,8,9
+    testing_planner.add_table(
+        "cs",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2])),
+            ("a", Type::Int16, int16_col(vec![10, 20, 30])),
+            ("b", Type::Int16, int16_col(vec![1, 2, 3])),
+            ("c", Type::Int16, int16_col(vec![7, 8, 9])),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, COUNT(*), SUM(a), SUM(b), COUNT(c) FROM cs GROUP BY g")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    let row = |r: &serde_json::Value| {
+        ["v0", "v1", "v2", "v3"]
+            .iter()
+            .map(|c| r[*c].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(row(&rows[0]), vec![2, 30, 3, 2]);
+    assert_eq!(row(&rows[1]), vec![1, 30, 3, 1]);
+}
+
+#[rstest]
+fn group_order_by_sum_with_coalesced_count_limit(mut testing_planner: TestingPlanner) {
+    // COUNT(c) coalesces into COUNT(*), narrowing the entry, while ORDER BY SUM(a)
+    // LIMIT sorts/limits on a later aggregate: the coalesced output must still order
+    // correctly (and any pushed-down Top-K slot remaps through the dedup).
+    // g:1,1,2,3  a:10,20,5,7  -> sums g1=30, g3=7, g2=5 ; DESC LIMIT 2 keeps g1, g3
+    testing_planner.add_table(
+        "tk",
+        &[
+            ("g", Type::Int32, int_col(vec![1, 1, 2, 3])),
+            ("a", Type::Int32, int_col(vec![10, 20, 5, 7])),
+            ("c", Type::Int32, int_col(vec![1, 1, 1, 1])),
+        ],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan(
+            "SELECT g, COUNT(*), COUNT(c), SUM(a) AS s FROM tk GROUP BY g ORDER BY s DESC LIMIT 2",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0]["key"].as_i64(), rows[0]["v2"].as_i64()),
+        (Some(1), Some(30))
+    );
+    assert_eq!(
+        (rows[1]["key"].as_i64(), rows[1]["v2"].as_i64()),
+        (Some(3), Some(7))
+    );
 }
 
 // ---------------------------------------------------------------------------

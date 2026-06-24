@@ -109,6 +109,7 @@ fn filter_then_group_by_then_order_by() {
             vec![0],
             vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
             None,
+            (),
         )
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()

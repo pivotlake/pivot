@@ -423,6 +423,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 vec![0],
                 vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                 None,
+                (),
             )
             .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
@@ -448,6 +449,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     vec![0],
                     vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                     None,
+                    (),
                 )
         },
     );
@@ -476,6 +478,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 vec![0],
                 vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                 None,
+                (),
             )
             .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
@@ -507,6 +510,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 vec![0],
                 vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                 None,
+                (),
             )
             .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
@@ -534,6 +538,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     vec![0],
                     vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                     None,
+                    (),
                 )
                 .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
@@ -576,6 +581,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 vec![1],
                 vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                 None,
+                (),
             )
             .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
@@ -627,6 +633,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     vec![0, 1],
                     slots.clone(),
                     Some(GroupLimit::TopK { slot: 0, limit: 10 }),
+                    (),
                 )
             },
         );
@@ -689,6 +696,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                         vec![0, 1],
                         slots.clone(),
                         Some(GroupLimit::TopK { slot: 0, limit: 10 }),
+                        (),
                     )
             },
         );
@@ -725,11 +733,13 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 vec![0, 1],
                 Vec::new(),
                 None,
+                (),
             )
             .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,)>>(
                 vec![0],
                 vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
                 None,
+                (),
             )
             .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         },
@@ -754,7 +764,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         rows,
         || int_string_dataset(rows),
         move |s| {
-            s.group_by_aggregate_config::<RowKeyExtractor, Compiled<(CountSlot,)>>(
+            s.group_by_aggregate::<RowKeyExtractor, Compiled<(CountSlot,)>>(
                 vec![0, 1],
                 count_star(),
                 Some(GroupLimit::First { limit: 10 }),
@@ -773,6 +783,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 vec![0, 1],
                 count_star(),
                 Some(GroupLimit::First { limit: 10 }),
+                (),
             )
         },
     );

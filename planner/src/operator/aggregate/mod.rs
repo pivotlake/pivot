@@ -6,18 +6,18 @@
 //!
 //! | query shape | strategy |
 //! |---|---|
-//! | `COUNT(DISTINCT x)` alone | [`count_distinct`] |
-//! | grouped, one `COUNT(DISTINCT)` + other aggregates | [`mixed_distinct`] |
+//! | `COUNT(DISTINCT x)` alone, no GROUP BY | [`global_distinct`] |
+//! | grouped, one `COUNT(DISTINCT)` (alone or with other aggregates) | [`grouped_distinct`] |
 //! | no GROUP BY | [`global`] |
 //! | any other GROUP BY (incl. a computed key) | [`grouped`] |
 //!
 //! The shared expression→slot lowering and accumulator-width rule live here,
 //! since the global and grouped paths both use them.
 
-mod count_distinct;
 mod global;
+mod global_distinct;
 mod grouped;
-mod mixed_distinct;
+mod grouped_distinct;
 
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
@@ -83,16 +83,17 @@ impl Aggregate {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // `COUNT(DISTINCT x)` as the sole aggregate lowers to a two-level GROUP
-        // BY (both the global and single-key forms route here).
+        // `COUNT(DISTINCT x)` as the sole aggregate with no GROUP BY: a dedicated
+        // single-level global fast path.
         if let [Expression::AggregateFunc(AggregateFunc::CountDistinct(a))] =
             self.expressions.as_slice()
+            && self.groups.is_empty()
         {
-            return self.compile_count_distinct(input, a);
+            return self.compile_global_distinct(input, a);
         }
 
-        // A grouped aggregate mixing one `COUNT(DISTINCT)` with non-distinct
-        // aggregates is also a two-level GROUP BY.
+        // One `COUNT(DISTINCT)` over a GROUP BY, alone or mixed with non-distinct
+        // aggregates, lowers to a two-level GROUP BY.
         let n_distinct = self
             .expressions
             .iter()
@@ -104,7 +105,7 @@ impl Aggregate {
             })
             .count();
         if !self.groups.is_empty() && n_distinct == 1 {
-            return self.compile_grouped_mixed_distinct(input);
+            return self.compile_grouped_distinct(input);
         }
 
         if self.groups.is_empty() {
@@ -184,7 +185,7 @@ fn extreme_kind(
 /// Map group-key types to the arrow types the [`RowKeyExtractor`](dispatch::RowKeyExtractor)
 /// encodes, in key order. Shared by the general grouped path
 /// ([`grouped`]) and the `COUNT(DISTINCT)` two-level lowering
-/// ([`count_distinct`]). Returns `None` if any key has a
+/// ([`grouped_distinct`]). Returns `None` if any key has a
 /// type the row encoding doesn't support, so the caller reports it unsupported
 /// rather than panicking in `RowKeySchema::new`.
 pub(super) fn row_key_schema<'a>(
