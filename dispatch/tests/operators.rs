@@ -7,15 +7,17 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::types::Int64Type;
-use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::types::{Int32Type, Int64Type};
+use arrow_array::{
+    BooleanArray, Date32Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, IntKeyExtractor, OrderBy,
-    StringKeyExtractor, values_input,
+    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, IntKeyExtractor,
+    IntPairKeyExtractor, OrderBy, StringKeyExtractor, values_input,
 };
 
 #[test]
@@ -222,6 +224,39 @@ fn group_by_count_int_keys() {
         .unwrap();
 
     assert_eq!(collect_i64s(&results, 1), vec![3, 3, 2]);
+}
+
+// A DATE + INT group key packs into the u128 pair extractor: the DATE column
+// arrives as `Date32`, so the extractor must cast it to its `Int32` day count
+// before packing (a direct downcast would panic).
+#[test]
+fn group_by_count_date_int_pair_keys() {
+    let dispatch = dispatch(1);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("day", DataType::Date32, false),
+            Field::new("cat", DataType::Int32, false),
+        ])),
+        vec![
+            Arc::new(Date32Array::from(vec![10, 10, 20, 10, 20])),
+            Arc::new(Int32Array::from(vec![1, 1, 2, 1, 2])),
+        ],
+    )
+    .unwrap();
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .group_by_aggregate::<IntPairKeyExtractor<Int32Type, Int32Type>, Compiled<(CountSlot,)>>(
+            vec![0, 1],
+            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            None,
+            (),
+        )
+        .order_by_limit(vec![OrderBy::new(2, true, false)], 10)
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 2), vec![3, 2]);
 }
 
 // A plain `LIMIT` must abandon its upstream once satisfied, not drain the whole

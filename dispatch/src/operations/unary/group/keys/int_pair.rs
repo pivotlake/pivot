@@ -44,13 +44,29 @@ fn pack<A: IntBits, B: IntBits>(a: A, b: B) -> u128 {
     ((a.to_u64() as u128) << 64) | (b.to_u64() as u128)
 }
 
-/// Per-batch reader for the pair extractor: the two key columns.
-pub struct PairReader<'b, A: ArrowPrimitiveType, B: ArrowPrimitiveType> {
-    a: &'b PrimitiveArray<A>,
-    b: &'b PrimitiveArray<B>,
+/// Downcast `array` to `P`, casting first if its runtime type differs from `P`'s
+/// (e.g. a DATE arriving as `Date32` rather than its parquet-physical `Int32`),
+/// mirroring the row encoder. The owned array keeps its buffers alive for the
+/// reader's lifetime.
+fn bind_primitive<P: ArrowPrimitiveType>(array: &ArrayRef) -> PrimitiveArray<P> {
+    if array.data_type() == &P::DATA_TYPE {
+        array.as_primitive::<P>().clone()
+    } else {
+        arrow::compute::cast(array, &P::DATA_TYPE)
+            .expect("int-pair key column cast failed")
+            .as_primitive::<P>()
+            .clone()
+    }
 }
 
-impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> PairReader<'_, A, B>
+/// Per-batch reader for the pair extractor: the two key columns, owned so a cast
+/// column (e.g. DATE → `Int32`) outlives the borrow of the input batch.
+pub struct PairReader<A: ArrowPrimitiveType, B: ArrowPrimitiveType> {
+    a: PrimitiveArray<A>,
+    b: PrimitiveArray<B>,
+}
+
+impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> PairReader<A, B>
 where
     A::Native: IntBits,
     B::Native: IntBits,
@@ -80,7 +96,7 @@ where
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
     type PersistedLiveKey<'a> = u128;
-    type Reader<'b> = PairReader<'b, A, B>;
+    type Reader<'b> = PairReader<A, B>;
     type Columns = IntPairKeyColumns<A, B>;
     type Scratch = ();
 
@@ -90,8 +106,8 @@ where
         _config: &(),
         _scratch: &'b mut (),
     ) -> Self::Reader<'b> {
-        let a = batch.column(key_cols[0]).as_primitive::<A>();
-        let b = batch.column(key_cols[1]).as_primitive::<B>();
+        let a = bind_primitive::<A>(batch.column(key_cols[0]));
+        let b = bind_primitive::<B>(batch.column(key_cols[1]));
         PairReader { a, b }
     }
 

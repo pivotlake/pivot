@@ -352,7 +352,15 @@ fn signatures(exprs: &[Expression]) -> Vec<Sig> {
 /// monomorphised the pair extractor for; `None` routes to the row fallback.
 fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
     let [(_, a), (_, b)] = keys else { return None };
-    let pair = (a.clone(), b.clone());
+    // DATE/TIMESTAMP pack as their physical integer width (days/seconds since
+    // epoch); the pair extractor casts the column the same way the row encoder
+    // does, so they reach the fast u128 path beside plain integer keys.
+    let pack_as_int = |t: &Type| match t {
+        Type::Date => Type::Int32,
+        Type::Timestamp => Type::Int64,
+        other => other.clone(),
+    };
+    let pair = (pack_as_int(a), pack_as_int(b));
     matches!(
         pair,
         (Type::Int64, Type::Int32)
