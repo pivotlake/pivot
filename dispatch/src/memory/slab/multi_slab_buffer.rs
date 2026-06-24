@@ -45,6 +45,15 @@ impl<T> MultiSlabBuffer<T> {
         let offset_in_slab = (index % elems_per_slab) * size_of::<T>();
         unsafe { self.slabs[slab_idx].ptr.add(offset_in_slab) as *mut T }
     }
+
+    /// Zero every backing slab, returning the buffer to its as-created state. Used
+    /// to reuse a hash table's storage after its entries have been drained
+    /// elsewhere, without reallocating from the slab pool.
+    pub fn zero_out(&mut self) {
+        for slab in &mut self.slabs {
+            slab.zero_out();
+        }
+    }
 }
 
 impl<T> Index<usize> for MultiSlabBuffer<T> {

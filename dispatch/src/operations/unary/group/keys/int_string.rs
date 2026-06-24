@@ -1,16 +1,19 @@
-//! `GROUP BY (integer, string)` — one integer key column followed by one
+//! `GROUP BY (integer, string)`: one integer key column followed by one
 //! `Utf8View` key column.
 //!
 //! The dedicated alternative to the generic [`RowKeyExtractor`] for this common
-//! two-column shape (e.g. `GROUP BY UserID, SearchPhrase`). Rather than
-//! byte-encoding the tuple into one row blob and hashing the blob, the persisted
-//! key is the native integer sitting beside the string's [`ArenaKey`]: the
-//! integer is compared and emitted directly, and the string persists into /
-//! resolves from the shared arena exactly as [`StringKeyExtractor`] does.
-//! `eq_persisted` checks the (cheap, `Copy`) integer first and short-circuits
-//! before touching the string. Like the string and row extractors it never
-//! radix-scatters (a scatter would eagerly persist every row's string), so it
-//! folds in place.
+//! two-column shape. Rather than byte-encoding the tuple into one row blob and
+//! hashing the blob, the persisted key is the native integer sitting beside the
+//! string's [`ArenaKey`]: the integer is compared and emitted directly, and the
+//! string persists into / resolves from the shared arena exactly as
+//! [`StringKeyExtractor`] does. `eq_persisted` checks the (cheap, `Copy`) integer
+//! first and short-circuits before touching the string.
+//!
+//! Because the key carries an out-of-line string, it radix-scatters exactly like
+//! [`StringKeyExtractor`] (`RADIX_ABANDON` is `true`):
+//! on overflow the active table is abandoned, draining one deduplicated entry per
+//! distinct key, so each string is persisted once instead of re-copied for every
+//! occurrence.
 //!
 //! [`RowKeyExtractor`]: super::RowKeyExtractor
 //! [`StringKeyExtractor`]: super::StringKeyExtractor
@@ -24,7 +27,7 @@ use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
-use arrow_buffer::ScalarBuffer;
+use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -39,8 +42,8 @@ use std::sync::Arc;
 /// an `ArenaKey` field directly: a `u128` is 16-byte aligned, which would pad
 /// `{ int, ArenaKey }` out to 32 bytes (8 int + 8 pad + 16 handle). Splitting it
 /// keeps the struct 8-byte aligned and packs it to 24, shrinking every hash-table
-/// `Entry` — the table probe and merge (the dominant cost of this group-by) touch
-/// fewer cache lines per entry.
+/// `Entry`, so the table probe and merge (the dominant cost of this group-by)
+/// touch fewer cache lines per entry.
 pub struct IntStrKey<N> {
     int: N,
     string: [u64; 2],
@@ -57,7 +60,17 @@ impl<N: Default> Default for IntStrKey<N> {
         Self::from_parts(N::default(), ArenaKey::default())
     }
 }
-impl<N: Copy + Default + Send + Sync + 'static> PersistedKey for IntStrKey<N> {}
+impl<N: Copy + Default + Send + Sync + 'static> PersistedKey for IntStrKey<N> {
+    const HAS_BLOB: bool = true;
+
+    #[inline(always)]
+    fn prefetch_blob(&self, arena: &SharedArena) {
+        let key = self.string_key();
+        if !key.is_inline() {
+            arena.prefetch(key.buffer_index(), key.offset());
+        }
+    }
+}
 
 impl<N> IntStrKey<N> {
     #[inline(always)]
@@ -132,11 +145,10 @@ pub struct IntStrReader<'b, T: ArrowPrimitiveType> {
 
 /// `GROUP BY` over one integer column and one string column, in either order.
 /// `STR_FIRST` selects which `key_col` is which and the emitted column order:
-/// `false` = `(integer, string)` (e.g. `GROUP BY UserID, SearchPhrase`), `true` =
-/// `(string, integer)` (e.g. the `(SearchPhrase, UserID)` inner key of a
-/// `COUNT(DISTINCT)` lowering). The persisted key, hash, and equality are
-/// order-independent; only the column the integer/string is read from and the
-/// output column order change.
+/// `false` = `(integer, string)`, `true` = `(string, integer)` (the order a
+/// `COUNT(DISTINCT)` lowering produces for its inner key). The persisted key,
+/// hash, and equality are order-independent; only the column the integer/string
+/// is read from and the output column order change.
 pub struct IntStrKeyExtractor<T: ArrowPrimitiveType, const STR_FIRST: bool = false>(PhantomData<T>);
 
 // `PhantomData<T>` is only a type tag; the extractor holds no `T` value.
@@ -150,6 +162,10 @@ impl<T: ArrowPrimitiveType + Send + 'static, const STR_FIRST: bool> KeyExtractor
 where
     T::Native: Copy + Default + Hash + Eq + Send + Sync,
 {
+    // Equivalent to `StringKeyExtractor`: the key owns an out-of-line string, so
+    // abandon (dedup during the scan) persists each string once rather than
+    // re-copying it for every occurrence the way raw scatter would.
+    const RADIX_ABANDON: bool = true;
     type Config = ();
     type Persisted = IntStrKey<T::Native>;
     type LiveKey<'a, 'b> = IntStrLiveKey<'a, 'b, T::Native>;
@@ -251,16 +267,19 @@ impl<T: ArrowPrimitiveType, const STR_FIRST: bool> KeyColumns for IntStrKeyColum
 
     fn finish(
         self,
-        arena: &Arc<SharedArena>,
+        _arena: &Arc<SharedArena>,
+        output_buffers: &Arc<[Buffer]>,
         _allocator: &mut SlabAllocator,
     ) -> (Vec<Field>, Vec<ArrayRef>) {
         let len = self.views.len();
         let views = ScalarBuffer::<u128>::new(self.views.into_buffer(), 0, len);
-        let buffers = arena.to_arrow_buffers();
-        // Safety: views were built from valid ArenaKeys; SharedArena (via Arc in
-        // each Buffer) keeps the ring memory alive as long as the array exists.
-        let strings: ArrayRef =
-            Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
+        // Share the one buffer list built for this output phase: cloning the
+        // `Arc<[Buffer]>` is a single bump, vs. re-wrapping every arena buffer per
+        // batch. Safe: views were built from valid ArenaKeys, and the shared
+        // buffers (via their `Arc<SharedArena>`) keep the ring memory alive.
+        let strings: ArrayRef = Arc::new(unsafe {
+            StringViewArray::new_unchecked(views, output_buffers.clone(), None)
+        });
         let ints: ArrayRef = self.ints.into_array(None);
         let int_type = T::DATA_TYPE;
         // Emit in GROUP BY order, naming columns positionally (`k0`, `k1`) like the
