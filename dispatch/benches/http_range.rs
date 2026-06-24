@@ -278,7 +278,7 @@ fn run_batch(
 
     for _ in 0..reads {
         let off = offset.fetch_add(block as u64, Ordering::Relaxed) as usize;
-        let lookups = memory_ctx().file_cache().get(loc, off, block);
+        let lookups = memory_ctx().file_memory_cache().get(loc, off, block);
         for lookup in &lookups {
             for missing in lookup.missing() {
                 bytes += missing.len();
@@ -312,7 +312,7 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
     let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}/obj")).unwrap();
     let remote = Arc::new(RemoteFile::open(url, None, 1_000_000_000_000).unwrap());
     let loc = FileLocation::Remote(remote.clone());
-    memory_ctx().file_cache().open_entry(loc.clone());
+    memory_ctx().file_memory_cache().open_entry(loc.clone());
 
     let mut requester = IORequester::with_http_config(client_config());
     let block = block_bytes();
@@ -332,7 +332,7 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
         // amortised and we measure the steady-state request hot path.
         b.iter_batched(
             || {
-                memory_ctx().file_cache().clear();
+                memory_ctx().file_memory_cache().clear();
             },
             |_| {
                 let bytes = run_batch(&mut requester, &loc, &remote, reads, block, &offset);

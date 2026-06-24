@@ -90,9 +90,9 @@ impl Function {
             // worker's disk-cache handle are valid), so the eviction happens
             // exactly once; the returned array matches the (one-row) batch.
             Function::DropCache => Ok(stateless_expr(|batch: &RecordBatch| {
-                let regions = dispatch::memory_ctx().file_cache().clear();
+                let extents = dispatch::memory_ctx().file_memory_cache().clear();
                 let objects = dispatch::io::clear_disk_cache();
-                let evicted = (regions + objects) as i64;
+                let evicted = (extents + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
         }

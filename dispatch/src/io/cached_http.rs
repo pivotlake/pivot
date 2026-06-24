@@ -28,7 +28,7 @@ use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
 use crate::io::{
     Completion, DataFlowRequest, FailedRead, HttpRequest, RemoteReadSplit, RemoteReadTime,
 };
-use crate::memory::file_cache::MissingBlock;
+use crate::memory::file_memory_cache::MissingBlock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
