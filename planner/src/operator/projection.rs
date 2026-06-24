@@ -2,7 +2,7 @@
 
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::expression::Expression;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
 use arrow_schema::{Field, Schema};
 use dispatch::RecordBatchOperatorSpec;
 use duckdb_planner::operator as duckdb_operator;
@@ -90,12 +90,31 @@ impl Projection {
 
         Ok(input.project(move || {
             let mut evals: Vec<ExprEvalFn> = builders.iter().map(|b| b()).collect();
+            // A constant projection (e.g. `SELECT 1`) evaluates to the same scalar for
+            // every batch, but each output column must match the batch's row count, so
+            // the scalar has to be broadcast to a full-length array. That array depends
+            // only on the row count, so build it once per projection and reuse it (a
+            // cheap `Arc` clone) whenever the next batch has the same length — batches
+            // are usually uniform, so it's built once and cloned thereafter.
+            let mut const_cols: Vec<Option<(usize, ArrayRef)>> = vec![None; evals.len()];
             move |batch: RecordBatch| {
+                let num_rows = batch.num_rows();
                 let columns: Vec<ArrayRef> = evals
                     .iter_mut()
-                    .map(|eval| match eval(&batch) {
+                    .enumerate()
+                    .map(|(i, eval)| match eval(&batch) {
                         ExprResult::Array(a) => a,
-                        ExprResult::Scalar(s) => s.into_inner(),
+                        ExprResult::Scalar(s) => const_cols[i]
+                            .as_ref()
+                            .filter(|(len, _)| *len == num_rows)
+                            .map(|(_, arr)| arr.clone())
+                            .unwrap_or_else(|| {
+                                let indices = UInt32Array::from(vec![0u32; num_rows]);
+                                let arr =
+                                    arrow::compute::take(&s.into_inner(), &indices, None).unwrap();
+                                const_cols[i] = Some((num_rows, arr.clone()));
+                                arr
+                            }),
                     })
                     .collect();
                 let fields: Vec<Field> = columns
