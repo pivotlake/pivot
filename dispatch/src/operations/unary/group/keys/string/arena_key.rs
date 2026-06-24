@@ -89,4 +89,13 @@ impl ArenaKey {
     }
 }
 
-impl PersistedKey for ArenaKey {}
+impl PersistedKey for ArenaKey {
+    const HAS_BLOB: bool = true;
+
+    #[inline(always)]
+    fn prefetch_blob(&self, arena: &SharedArena) {
+        if !self.is_inline() {
+            arena.prefetch(self.buffer_index(), self.offset());
+        }
+    }
+}

@@ -26,6 +26,7 @@ use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
 use ahash::RandomState;
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_buffer::Buffer;
 use arrow_schema::Field;
 use std::sync::Arc;
 
@@ -50,17 +51,25 @@ pub use row::{RowKeyExtractor, RowKeySchema};
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
 pub trait KeyExtractor: Send + 'static {
-    /// Whether this key may switch from in-place aggregation to radix scatter at
-    /// high cardinality. Strings stay in-place (deferred dedup would store every
-    /// occurrence un-deduped); fixed-width integer keys switch.
-    const SUPPORTS_RADIX: bool = false;
+    /// Which radix route a key takes once its in-place table outgrows the
+    /// cache-resident size: `true` = *abandon* (keep deduplicating in the bounded
+    /// table, flushing each window's distinct partials to the partition buffers),
+    /// `false` = *scatter* (append raw rows to the partition buffers, dedup only
+    /// in the merge). Abandon pays off only when it avoids a per-occurrence
+    /// out-of-line copy (long string keys); fixed-width keys scatter's cheap
+    /// append wins, so this stays `false`.
+    ///
+    /// Radix applies to every key with real bytes to scatter. A key that dedups
+    /// purely by hash ([`DEDUP_BY_HASH`](Self::DEDUP_BY_HASH)) has none, so it
+    /// stays fully in-place regardless of this flag.
+    const RADIX_ABANDON: bool = false;
 
     /// When `true`, the persisted key is a zero-sized `()` and dedup is purely by
     /// the (bijective) hash, so a hash of 0 — which the table reserves as its
     /// empty-slot sentinel — cannot be remapped without aliasing a real key.
     /// [`AggregatedTable`](super::hashtables::AggregatedTable) instead counts the
-    /// single 0-hash key out of band (it never reaches the table). Implies
-    /// `!SUPPORTS_RADIX` (the radix scatter path has no such out-of-band count).
+    /// single 0-hash key out of band (it never reaches the table). Such a key has
+    /// no bytes to scatter, so it never takes the radix path.
     const DEDUP_BY_HASH: bool = false;
 
     /// Runtime configuration threaded from the operator spec to the per-batch
@@ -142,9 +151,14 @@ pub trait KeyColumns {
     /// Materialise the key columns. Takes the arena (for zero-copy string views)
     /// and the chunk's allocator (for builders whose size is only known at
     /// decode time, e.g. the row extractor's per-field decoded columns).
+    /// `output_buffers` is the arena's ring buffers wrapped as Arrow `Buffer`s,
+    /// built once for the whole output phase and shared by every batch; string
+    /// keys emit zero-copy views into it (cloning the `Arc` is one bump); keys
+    /// with no out-of-line bytes ignore it.
     fn finish(
         self,
         arena: &Arc<SharedArena>,
+        output_buffers: &Arc<[Buffer]>,
         allocator: &mut SlabAllocator,
     ) -> (Vec<Field>, Vec<ArrayRef>);
 }

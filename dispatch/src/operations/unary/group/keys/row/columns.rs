@@ -88,9 +88,13 @@ impl FieldBuilder {
     }
 
     /// Finish this builder into its arrow column and the matching schema field.
-    /// String columns emit zero-copy views into the shared `arena` buffers.
+    /// String columns emit zero-copy views into the shared output buffers.
     #[inline]
-    fn into_field(self, name: String, arena: &Arc<SharedArena>) -> (Field, ArrayRef) {
+    fn into_field(
+        self,
+        name: String,
+        output_buffers: &Arc<[arrow_buffer::Buffer]>,
+    ) -> (Field, ArrayRef) {
         let (dt, array): (DataType, ArrayRef) = match self {
             FieldBuilder::I8(b) => (DataType::Int8, b.into_array(None)),
             FieldBuilder::I16(b) => (DataType::Int16, b.into_array(None)),
@@ -103,11 +107,14 @@ impl FieldBuilder {
             FieldBuilder::Str(views) => {
                 let len = views.len();
                 let views = ScalarBuffer::<u128>::new(views.into_buffer(), 0, len);
-                let buffers = arena.to_arrow_buffers();
-                // Safety: views built from valid blob slices; the Arc'd arena keeps
-                // the ring memory alive as long as the array exists.
-                let array: ArrayRef =
-                    Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
+                // Safety: views built from valid blob slices; the shared buffers
+                // (Arc-holding the arena) keep the ring memory alive as long as the
+                // array exists. Every batch shares the one `Arc<[Buffer]>` built for
+                // this output phase, so the downstream concat/take reuse it instead
+                // of rebuilding the buffer list per batch.
+                let array: ArrayRef = Arc::new(unsafe {
+                    StringViewArray::new_unchecked(views, output_buffers.clone(), None)
+                });
                 (DataType::Utf8View, array)
             }
         };
@@ -145,6 +152,7 @@ impl KeyColumns for RowKeyColumns {
     fn finish(
         self,
         arena: &Arc<SharedArena>,
+        output_buffers: &Arc<[arrow_buffer::Buffer]>,
         allocator: &mut SlabAllocator,
     ) -> (Vec<Field>, Vec<ArrayRef>) {
         let rows = self.keys.len();
@@ -182,7 +190,7 @@ impl KeyColumns for RowKeyColumns {
         let mut fields = Vec::with_capacity(builders.len());
         let mut columns = Vec::with_capacity(builders.len());
         for (i, builder) in builders.into_iter().enumerate() {
-            let (field, array) = builder.into_field(format!("k{i}"), arena);
+            let (field, array) = builder.into_field(format!("k{i}"), output_buffers);
             fields.push(field);
             columns.push(array);
         }

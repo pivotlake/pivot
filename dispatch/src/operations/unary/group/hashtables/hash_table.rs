@@ -4,6 +4,7 @@
 
 use crate::memory::MultiSlabBuffer;
 use crate::memory::SlabAllocator;
+use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
 use std::mem;
@@ -30,7 +31,19 @@ pub trait LiveKey {
 
 /// A key that has been persisted in the HashTable. Any PersistedKey can be referenced from within
 /// the HashTable as long as the HashTable is alive
-pub trait PersistedKey: Copy + Clone + Default {}
+pub trait PersistedKey: Copy + Clone + Default {
+    /// Whether this key holds out-of-line data (an arena string blob) that
+    /// `eq_persisted` will chase. `true` for string-bearing keys, `false` for
+    /// fixed-width integer keys. Used to decide whether the merge's blob prefetch
+    /// is worth its per-row cost (it is only when there's actually a cold blob).
+    const HAS_BLOB: bool = false;
+
+    /// Prefetch the arena blob this key's `eq_persisted` will read, hiding the
+    /// scattered cache miss of a non-inline string before the `memcmp`. No-op for
+    /// keys with no out-of-line data (integers, inline strings).
+    #[inline(always)]
+    fn prefetch_blob(&self, _arena: &SharedArena) {}
+}
 
 /// We reimplement LiveKey for any PersistentKey to allow saving an already persisted key within
 /// the HashTable (for example, if it was saved in another HashTable's arena previously)
@@ -276,6 +289,16 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V, MultiSlabBuffer<E
             _phantom: PhantomData,
             collisions: 0,
         }
+    }
+
+    /// Empty the table in place (zero every slot and reset the counters), keeping
+    /// its capacity and backing slabs. Used by the radix "abandon" path: once the
+    /// table's aggregated entries have been drained into the scatter buffers, the
+    /// same storage is reused for the next window instead of reallocating.
+    pub fn clear(&mut self) {
+        self.buffer.zero_out();
+        self.length = 0;
+        self.collisions = 0;
     }
 }
 

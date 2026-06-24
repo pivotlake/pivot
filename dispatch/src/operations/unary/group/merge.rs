@@ -34,7 +34,8 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, Table, TableStorage,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, PersistedKey, Table,
+    TableStorage,
 };
 
 /// Collision-to-entry ratio at which we double the target table.
@@ -232,13 +233,61 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
 
     // 1. Scatter buffers (present only when some worker switched). Each row is
     //    inserted once — the consume phase did no aggregation, so this is the only
-    //    aggregation pass for the scattered rows.
+    //    aggregation pass for the scattered rows. The compare inside `merge` chases
+    //    the scattered row's string blob, which has no locality (rows land here in
+    //    scatter order, not by key), so it misses cold. Warm it a window ahead off
+    //    the handle in hand, and warm the target slot it will probe. (The target's
+    //    own blob is left alone: hot keys repeat, so resident entries stay warm.)
+    const SCATTER_PREFETCH_AHEAD: usize = 16;
+    // The scatter-merge prefetch only pays off when its reads are genuinely cold:
+    // the target slot is worth prefetching only when the per-partition target is
+    // too large to stay cache-resident (high cardinality), and a string key's
+    // arena blob is cold regardless. For a fixed-width key with a small (cache-hot)
+    // target the prefetch is pure overhead (it chases slots already resident), so
+    // scan plainly there.
+    const TARGET_PREFETCH_MIN_SLOTS: usize = 16384;
+    let merge_prefetch =
+        <K::Persisted as PersistedKey>::HAS_BLOB || cap > TARGET_PREFETCH_MIN_SLOTS;
+    // `num_partitions` may be coarser than the scatter bucket count: at moderate
+    // cardinality the output sizes the merge from the exact HLL estimate so each
+    // job folds a contiguous *range* of scatter buckets (a `PARTITIONS`-way merge
+    // rather than a `RADIX_PARTITIONS`-way one), avoiding thousands of tiny merge
+    // jobs. The range is contiguous because buckets and partitions both key on the
+    // top hash bits; `stride == 1` (one bucket per partition) at high cardinality.
+    let scatter_buckets = buffers.first().map_or(num_partitions, |b| b.0.len());
+    // The fold below visits buckets `[0, num_partitions * stride)`; for that to be
+    // every bucket, `num_partitions` must divide `scatter_buckets` evenly. Both are
+    // powers of two with `num_partitions <= scatter_buckets`, so it holds. A count
+    // that didn't divide would silently drop the tail buckets' rows, so guard it.
+    debug_assert!(
+        scatter_buckets % num_partitions == 0,
+        "merge partitions ({num_partitions}) must evenly divide scatter buckets ({scatter_buckets})"
+    );
+    let stride = (scatter_buckets / num_partitions).max(1);
+    let bucket_lo = partition * stride;
+    let bucket_hi = bucket_lo + stride;
     for wb in buffers {
-        wb.0[partition].for_each(|(hash, key, value)| {
-            grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
-            let live = K::resolve_persisted(key_arena, key);
-            target.merge::<false, _>(hash, live, value, cfg);
-        });
+        for bucket in bucket_lo..bucket_hi {
+            if merge_prefetch {
+                wb.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                    |(hash, key, value), ahead| {
+                        if let Some((ahead_hash, ahead_key, _)) = ahead {
+                            ahead_key.prefetch_blob(key_arena);
+                            target.prefetch(*ahead_hash);
+                        }
+                        grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
+                        let live = K::resolve_persisted(key_arena, key);
+                        target.merge::<false, _>(hash, live, value, cfg);
+                    },
+                );
+            } else {
+                wb.0[bucket].for_each(|(hash, key, value)| {
+                    grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
+                    let live = K::resolve_persisted(key_arena, key);
+                    target.merge::<false, _>(hash, live, value, cfg);
+                });
+            }
+        }
     }
 
     // 2. In-place stacks, slot-range merged at num_partitions. Grouped by size so

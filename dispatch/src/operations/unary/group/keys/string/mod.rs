@@ -10,7 +10,7 @@ use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
-use arrow_buffer::ScalarBuffer;
+use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -23,6 +23,9 @@ use std::sync::Arc;
 pub struct StringKeyExtractor;
 
 impl KeyExtractor for StringKeyExtractor {
+    // Long string keys benefit from abandon (dedup-during-scan avoids copying every
+    // occurrence into the arena); fixed-width keys scatter instead.
+    const RADIX_ABANDON: bool = true;
     type Config = ();
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;
@@ -69,8 +72,16 @@ impl KeyExtractor for StringKeyExtractor {
     }
 }
 
-/// Emits the string key column as a zero-copy `StringViewArray` whose views
-/// point into the shared arena's ring buffers.
+/// Emits the string key column as a zero-copy `StringViewArray` whose views point
+/// into the shared arena's ring buffers.
+///
+/// All output batches share the one `Arc<[Buffer]>` built once for the output
+/// phase (see [`OutputAccumulator`](super::super::super::output::OutputAccumulator)),
+/// so each batch only clones that `Arc` (a single refcount bump) rather than
+/// re-wrapping every arena buffer. The downstream `concat`/`take` (arrow-select)
+/// detect the shared `Arc` and reuse it, so a high-partition-count result never
+/// rebuilds the buffer list, keeping the whole output path off the millions of
+/// per-buffer refcount operations a naive per-batch wrap would cost.
 pub struct StringKeyColumn {
     views: SlabColumn<u128>,
 }
@@ -95,16 +106,22 @@ impl KeyColumns for StringKeyColumn {
 
     fn finish(
         self,
-        arena: &Arc<SharedArena>,
+        _arena: &Arc<SharedArena>,
+        output_buffers: &Arc<[Buffer]>,
         _allocator: &mut SlabAllocator,
     ) -> (Vec<Field>, Vec<ArrayRef>) {
         let len = self.views.len();
         let views = ScalarBuffer::<u128>::new(self.views.into_buffer(), 0, len);
-        let buffers = arena.to_arrow_buffers();
-        // Safety: views were built from valid ArenaKeys; SharedArena (via Arc in
-        // each Buffer) keeps the ring memory alive as long as the array exists.
-        let keys: ArrayRef =
-            Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
+        // Zero-copy: the views already point into the arena, and every output batch
+        // shares the one `Arc<[Buffer]>` built for this output phase. Cloning the
+        // `Arc` is a single refcount bump, and the downstream `concat`/`take`
+        // fast-paths reuse it (see arrow-select), so the buffer list is never
+        // rebuilt per batch.
+        // Safety: views were built from valid ArenaKeys, and the shared buffers (via
+        // their `Arc<SharedArena>`) keep the ring memory alive as long as the array.
+        let keys: ArrayRef = Arc::new(unsafe {
+            StringViewArray::new_unchecked(views, output_buffers.clone(), None)
+        });
         let fields = vec![Field::new("key", DataType::Utf8View, false)];
         (fields, vec![keys])
     }
