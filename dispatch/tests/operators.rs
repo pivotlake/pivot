@@ -190,6 +190,7 @@ fn group_by_count_string_keys() {
             vec![0],
             vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
             None,
+            (),
         )
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()
@@ -214,6 +215,7 @@ fn group_by_count_int_keys() {
             vec![0],
             vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
             None,
+            (),
         )
         .order_by_limit(vec![OrderBy::new(1, true, false)], 10)
         .collect()
