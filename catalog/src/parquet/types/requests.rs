@@ -8,9 +8,9 @@ use dispatch::memory::{CacheLookup, memory_ctx};
 /// Tracks the IO state for a single column chunk within a row group.
 ///
 /// The chunk's byte range is looked up in the file cache as one
-/// [`CacheLookup`] per cache bucket it spans. Each lookup's
+/// [`CacheLookup`] per contiguous cached/missing run it resolves to. Each lookup's
 /// [`missing`](CacheLookup::missing)
-/// [`MissingBlock`](dispatch::memory::file_cache::MissingBlock)s (empty when the
+/// [`MissingBlock`](dispatch::memory::file_memory_cache::MissingBlock)s (empty when the
 /// part is fully resident) are queued for IO. Once every block has been filled,
 /// the parts' data is concatenated in file order into the column's `Vec<Bytes>`.
 struct ColumnRequest {
@@ -30,7 +30,7 @@ impl ColumnRequest {
         let col_start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
         let len = meta.total_compressed_size as usize;
 
-        let parts = memory_ctx().file_cache().get(location, col_start, len);
+        let parts = memory_ctx().file_memory_cache().get(location, col_start, len);
         for lookup in &parts {
             for block in lookup.missing() {
                 match location {
