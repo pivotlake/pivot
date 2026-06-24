@@ -52,6 +52,13 @@ use tracing::{info, warn};
 /// `= 1`, or quoted `= 'on'`.)
 const STATS_FLAG: &str = "pivot_stats";
 
+/// Per-connection flag toggled with `SET perf = 1`: while on, each query the
+/// session runs is profiled with its own `perf record` (see [`crate::perf`]),
+/// provided the server was started with `PIVOT_PERF_DIR`. Only recognised with
+/// the `perf` feature; otherwise `SET perf = …` is an accepted no-op.
+#[cfg(feature = "perf")]
+const PERF_FLAG: &str = "perf";
+
 thread_local! {
     /// One [`planner::Planner`] (and its non-`Send` DuckDB context) per
     /// tokio blocking-pool thread, lazily initialised on first use. The
@@ -177,7 +184,12 @@ impl PivotQueryHandler {
     /// Plan `query`, then either run it (timing each phase, tallying the
     /// dataflow's IO/CPU work when `collect_stats`) or — if it turned out to be a
     /// `SET`/`RESET` — return that for the caller to apply to the connection.
-    async fn run_query(&self, query: &str, collect_stats: bool) -> Result<Outcome> {
+    async fn run_query(
+        &self,
+        query: &str,
+        collect_stats: bool,
+        with_perf: bool,
+    ) -> Result<Outcome> {
         let dispatcher = self.dispatcher.clone();
         let query = query.to_string();
 
@@ -222,6 +234,22 @@ impl PivotQueryHandler {
                 value: set.value.clone(),
             });
         }
+
+        // When the session ran `SET perf = 1`, start a `perf record` scoped to the
+        // worker threads and mark this query's dataflows profiled. Marking them
+        // makes the workers run *only* this dataflow for its duration (other
+        // queries / ingest on the pool pause), so the capture is just this
+        // dataflow. The guard SIGINT-flushes the report when `run_query` returns
+        // (covering cancel/error), and the exclusive mode lifts as the dataflows
+        // finish. Compiled out without the feature.
+        #[cfg(feature = "perf")]
+        let (dispatcher, _perf_guard) = match with_perf.then(|| crate::perf::start(&query)).flatten()
+        {
+            Some(guard) => (dispatcher.with_profiling(true), Some(guard)),
+            None => (dispatcher, None),
+        };
+        #[cfg(not(feature = "perf"))]
+        let _ = with_perf;
 
         // Compile the plan into a fresh dataflow and launch it. `compile` is pure
         // pivot work (no DuckDB), so it runs on any blocking thread without the
@@ -330,6 +358,16 @@ fn apply_set<C: ClientInfo>(client: &mut C, name: &str, value: Option<&str>) -> 
             client.metadata_mut().remove(STATS_FLAG);
         }
     }
+    #[cfg(feature = "perf")]
+    if name.eq_ignore_ascii_case(PERF_FLAG) {
+        if value.is_some_and(is_truthy) {
+            client
+                .metadata_mut()
+                .insert(PERF_FLAG.to_string(), "on".to_string());
+        } else {
+            client.metadata_mut().remove(PERF_FLAG);
+        }
+    }
     Response::Execution(Tag::new(if value.is_none() { "RESET" } else { "SET" }))
 }
 
@@ -347,6 +385,12 @@ fn stats_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(STATS_FLAG).is_some_and(|v| v == "on")
 }
 
+/// Whether this connection has `perf` on (set via `SET perf = 1`).
+#[cfg(feature = "perf")]
+fn perf_on<C: ClientInfo>(client: &C) -> bool {
+    client.metadata().get(PERF_FLAG).is_some_and(|v| v == "on")
+}
+
 #[async_trait]
 impl SimpleQueryHandler for PivotQueryHandler {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -357,9 +401,13 @@ impl SimpleQueryHandler for PivotQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let with_stats = stats_on(client);
+        #[cfg(feature = "perf")]
+        let with_perf = perf_on(client);
+        #[cfg(not(feature = "perf"))]
+        let with_perf = false;
 
         info!(sql = %query, "query received");
-        let outcome = self.run_query(query, with_stats).await.map_err(|e| {
+        let outcome = self.run_query(query, with_stats, with_perf).await.map_err(|e| {
             warn!(error = %e, sql = %query, "query failed");
             e.into_pgwire()
         })?;
