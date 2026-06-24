@@ -25,7 +25,7 @@
 mod backend;
 
 use crate::Identifier;
-use crate::memory::file_cache::MissingBlock;
+use crate::memory::file_memory_cache::MissingBlock;
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -38,7 +38,7 @@ use std::time::Duration;
 use url::Url;
 
 mod requester;
-pub use requester::{Error as IORequesterError, IORequester};
+pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
 
 mod cached_http;
 
@@ -52,7 +52,7 @@ pub mod http;
 /// cached region — still references it), or a remote HTTP(S) object fetched
 /// via range requests.
 ///
-/// This is also the key the [`FileCache`](crate::memory::file_cache::FileCache)
+/// This is also the key the [`FileMemoryCache`](crate::memory::file_memory_cache::FileMemoryCache)
 /// uses to bucket 2 MB regions, so it must be cheap to `Hash`/`Eq` — the
 /// cache's pin re-check runs on every hit. `Local` compares the raw fd (an
 /// `i32`; stable while the `Arc<File>` is held, and holding it in the key means

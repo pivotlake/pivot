@@ -1,6 +1,6 @@
 //! A persistent, disk-backed second tier for remote (HTTP) object reads.
 //!
-//! The in-memory [`FileCache`](crate::memory::file_cache::FileCache) caches 2 MB
+//! The in-memory [`FileMemoryCache`](crate::memory::file_memory_cache::FileMemoryCache) caches 2 MB
 //! regions of every file - local or remote - in RAM. For remote objects that's
 //! the *only* thing standing between a query and a network round-trip to S3/GCS.
 //! This disk cache adds a tier *below* RAM and *above* HTTP: fetched byte ranges
@@ -12,7 +12,7 @@
 //! ## Where it plugs in
 //!
 //! Entirely inside [`IORequester`](crate::io::IORequester): when a remote
-//! [`MissingBlock`](crate::memory::file_cache::MissingBlock) needs filling, the
+//! [`MissingBlock`](crate::memory::file_memory_cache::MissingBlock) needs filling, the
 //! requester asks the disk cache which sub-ranges are already on disk
 //! ([`Object::split_into_segments`]). Present sub-ranges are read from the cache file
 //! (a plain filesystem read into the same pinned slot); absent ones are fetched

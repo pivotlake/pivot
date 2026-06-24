@@ -48,11 +48,17 @@ impl Deref for ReadBuffer {
 
 /// Decrements the slot's reader count. When the last `ReadBuffer` for a slot is dropped,
 /// the count reaches 0 and the slot becomes reclaimable.
+///
+/// The decrement is `Release` (not `Relaxed`): the file cache packs many tenants into a
+/// shared slot, and the filler writes that slot's tenant list while holding a read pin. The
+/// evictor reads the list only after `try_write` succeeds (`used == 0`, AcqRel). Releasing
+/// here is what lets that Acquire observe the filler's tenant writes - the publication edge
+/// for shared state written by a reader and read by the next writer. See `FileMemoryCache::evict`.
 impl Drop for ReadBuffer {
     fn drop(&mut self) {
         memory_ctx().ring().slots[self.slot_idx]
             .used
-            .fetch_sub(1, Ordering::Relaxed);
+            .fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -60,7 +66,7 @@ impl Drop for ReadBuffer {
 /// exclusive write mode to shared read mode.
 ///
 /// The `WriteBuffer` is forgotten (its `Drop` is skipped) and the slot's `used`
-/// count is set to 1 (one reader). The pointer is reused as-is — no copy occurs.
+/// count is set to 1 (one reader). The pointer is reused as-is - no copy occurs.
 ///
 /// The slot is also marked **not zeroed**: a buffer only becomes a `ReadBuffer`
 /// once it has been (or is about to be) filled with data, so its `zeroed` flag
@@ -68,7 +74,7 @@ impl Drop for ReadBuffer {
 /// onto a data-bearing slot; when that slot is later evicted and reused as a
 /// "pre-zeroed" write buffer (e.g. a group-by hash table that relies on
 /// `hash == 0` empty slots), the allocator trusts the flag, skips zeroing, and
-/// hands out uninitialized memory — defeating the empty-slot sentinel and
+/// hands out uninitialized memory - defeating the empty-slot sentinel and
 /// sending the linear probe into an infinite loop.
 impl From<WriteBuffer> for ReadBuffer {
     fn from(value: WriteBuffer) -> Self {
@@ -89,7 +95,7 @@ mod tests {
     use crate::memory_ctx;
 
     /// A slot that has been filled and handed out for reading must no longer
-    /// claim to be zeroed — otherwise the next caller that re-acquires it as a
+    /// claim to be zeroed - otherwise the next caller that re-acquires it as a
     /// "pre-zeroed" buffer (e.g. a group-by hash table relying on `hash == 0`
     /// empty slots) gets uninitialized memory.
     #[test]

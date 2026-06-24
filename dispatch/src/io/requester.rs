@@ -23,7 +23,10 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-const RING_SIZE: u32 = 64;
+/// Number of submission-queue entries in each worker's io_uring. The completion
+/// queue is twice this (the io_uring default), which bounds how many reads may be
+/// outstanding before completions overflow it - see callers that batch submissions.
+pub const RING_SIZE: u32 = 64;
 
 /// Bridges dataflow operators and the I/O backend, holding state on outstanding
 /// requests and returning responses together with the original requested context.
@@ -463,7 +466,7 @@ mod tests {
         let FileLocation::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
-        let lookups = memory_ctx().file_cache().get(loc, offset, len);
+        let lookups = memory_ctx().file_memory_cache().get(loc, offset, len);
         let mut split = RemoteReadSplit::default();
         let mut submitted = 0;
         for lookup in &lookups {
@@ -498,7 +501,7 @@ mod tests {
     /// Assert `[offset, offset + len)` of `loc` is now a full cache hit holding
     /// the expected pattern.
     fn assert_cached(loc: &FileLocation, offset: usize, len: usize) {
-        let hit = memory_ctx().file_cache().get(loc, offset, len);
+        let hit = memory_ctx().file_memory_cache().get(loc, offset, len);
         assert_eq!(hit.len(), 1);
         assert!(hit[0].missing().is_empty(), "expected a cache hit");
         let bytes = hit.into_iter().next().unwrap().into_data();
@@ -516,7 +519,7 @@ mod tests {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = FileLocation::Remote(remote);
-        memory_ctx().file_cache().open_entry(loc.clone());
+        memory_ctx().file_memory_cache().open_entry(loc.clone());
 
         let mut requester = IORequester::with_http_config(client_config());
 
@@ -538,7 +541,7 @@ mod tests {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
         let loc = FileLocation::Remote(remote);
-        memory_ctx().file_cache().open_entry(loc.clone());
+        memory_ctx().file_memory_cache().open_entry(loc.clone());
 
         let mut requester = IORequester::with_http_config(client_config());
 
@@ -576,7 +579,7 @@ mod tests {
     fn remote_loc(port: u16) -> FileLocation {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let loc = FileLocation::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()));
-        memory_ctx().file_cache().open_entry(loc.clone());
+        memory_ctx().file_memory_cache().open_entry(loc.clone());
         loc
     }
 
@@ -595,7 +598,7 @@ mod tests {
         let loc = remote_loc(spawn_server(1));
         fetch(&mut requester, &loc, 0, 4096);
         settle(&mut requester);
-        memory_ctx().file_cache().clear();
+        memory_ctx().file_memory_cache().clear();
 
         fetch(&mut requester, &loc, 0, 4096);
         settle(&mut requester);
@@ -615,7 +618,7 @@ mod tests {
 
         let cold = fetch_split(&mut requester, &loc, 0, SB);
         settle(&mut requester);
-        memory_ctx().file_cache().clear();
+        memory_ctx().file_memory_cache().clear();
         let warm = fetch_split(&mut requester, &loc, 0, SB);
         settle(&mut requester);
 
@@ -643,7 +646,7 @@ mod tests {
         settle(&mut requester);
         fetch(&mut requester, &loc, 2 * SB, SB); // prime block 2, leaving 1 a hole
         settle(&mut requester);
-        memory_ctx().file_cache().clear();
+        memory_ctx().file_memory_cache().clear();
 
         let split = fetch_split(&mut requester, &loc, 0, 3 * SB);
         settle(&mut requester);
@@ -667,7 +670,7 @@ mod tests {
         let loc = remote_loc(port);
         fetch(&mut requester, &loc, 0, SB);
         settle(&mut requester);
-        memory_ctx().file_cache().clear();
+        memory_ctx().file_memory_cache().clear();
 
         fetch(&mut requester, &loc, 0, 2 * SB);
         settle(&mut requester);
@@ -694,7 +697,7 @@ mod tests {
         settle(&mut requester);
         fetch(&mut requester, &loc, 2 * SB, SB); // prime block 2, leaving 1 a hole
         settle(&mut requester);
-        memory_ctx().file_cache().clear();
+        memory_ctx().file_memory_cache().clear();
 
         fetch(&mut requester, &loc, 0, 3 * SB);
         settle(&mut requester);
@@ -718,7 +721,7 @@ mod tests {
         let mut before = requester_with(cache_in(&dir));
         fetch(&mut before, &loc, 0, 4096);
         settle(&mut before);
-        memory_ctx().file_cache().clear();
+        memory_ctx().file_memory_cache().clear();
 
         let mut after = requester_with(cache_in(&dir));
         fetch(&mut after, &loc, 0, 4096);
