@@ -1911,3 +1911,38 @@ fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
         .plan("SELECT STDDEV(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }
+
+#[rstest]
+fn projection_of_constant_broadcasts_to_every_row(mut testing_planner: TestingPlanner) {
+    // Regression: `SELECT <constant>, <col>` takes the general projection path (the
+    // literal is not a plain column ref). The constant evaluates to a single scalar
+    // and must be broadcast to the batch's row count; before the fix it stayed
+    // length-1, so assembling the output RecordBatch panicked with
+    // "all columns in a record batch must have the same length". This is the path the
+    // duckdb RemoveDerivedGroups optimizer exposes for `GROUP BY <const>` (e.g. q34).
+    let results = testing_planner
+        .planner
+        .plan("SELECT 1, name FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    // Every output column must be the full batch length (the invariant that failed).
+    for batch in &results {
+        for col in batch.columns() {
+            assert_eq!(col.len(), batch.num_rows());
+        }
+    }
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 5, "all example_table rows returned");
+    // The constant column is 1 for every row (broadcast, not a single 1).
+    let keys: Vec<String> = rows[0].as_object().unwrap().keys().cloned().collect();
+    assert!(
+        keys.iter()
+            .any(|k| rows.iter().all(|r| r[k].as_i64() == Some(1))),
+        "a column should be the constant 1 broadcast to all rows"
+    );
+}
