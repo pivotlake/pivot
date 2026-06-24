@@ -45,9 +45,14 @@
 
 use crate::data_flow::WorkStatus;
 use crate::io::{FsRequest, HttpRequest};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use thiserror::Error;
 
 pub mod channels;
+
+mod abandoned;
+pub use abandoned::AbandonedOperator;
 
 pub mod in_memory;
 pub use in_memory::{Forward, InjectorSourceFactory};
@@ -130,5 +135,19 @@ pub trait Operator {
     /// Try to steal work from a peer worker's channel. Default: no stealing.
     fn try_steal_work(&mut self) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
+    }
+
+    /// A flag this operator raises to ask the `DataFlow` to abandon everything
+    /// *upstream* of it, used by `LIMIT` to stop the scan once it has buffered
+    /// enough rows, without disturbing operators downstream of it (e.g. a
+    /// `GROUP BY` over a `LIMIT` subquery).
+    ///
+    /// Returning `Some` is a *capability* declaration, made once at build time:
+    /// the `DataFlow` records the flag and polls only it, so operators that
+    /// never cancel upstream (the default `None`) cost nothing in the hot loop.
+    /// The flag's *value* is the runtime trigger: `false` until the operator
+    /// decides its upstream is no longer needed.
+    fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
     }
 }

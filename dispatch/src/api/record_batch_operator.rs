@@ -58,9 +58,9 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CountFactory, Distinct,
-    DynamicFilterSlot, FilterFactory, GroupFactory, GroupLimit, KeyExtractor, MapFactory,
-    NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory, UnaryFactory,
-    UnaryOperator, UnaryOperatorFactory,
+    DynamicFilterSlot, FilterFactory, GroupFactory, GroupLimit, KeyExtractor, LimitFactory,
+    MapFactory, NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -526,14 +526,20 @@ impl RecordBatchOperatorSpec {
     }
 
     /// SQL `LIMIT … OFFSET …` with no ORDER BY: keep `limit` rows after skipping
-    /// the first `offset`, in arbitrary (input) order. Implemented as a degenerate
-    /// [`order_by_limit_offset`](Self::order_by_limit_offset) with no sort keys —
-    /// each worker truncates to `limit + offset` rows, then a single collector
-    /// concatenates and applies the global offset/limit. Reusing that operator
-    /// inherits its pipeline-breaker wiring (including the unconditional
-    /// finish-notify that avoids the empty-partition lost-wakeup).
+    /// the first `offset`, in arbitrary (input) order.
+    ///
+    /// Unlike an `ORDER BY … LIMIT`, this terminates early: once `limit + offset`
+    /// rows have been buffered across all workers it stops, emits, and abandons
+    /// the scan feeding it (see [`LimitFactory`] and the `limit` operator module).
+    /// So `SELECT * FROM huge LIMIT 1` reads only as far as the first row group,
+    /// not the whole table.
     pub fn limit(self, limit: usize, offset: usize) -> Self {
-        self.order_by_limit_offset(vec![], limit, offset, None)
+        let worker_count = self.worker_count();
+        self.unary(LimitFactory::create_for_workers(
+            limit,
+            offset,
+            worker_count,
+        ))
     }
 
     /// Global `COUNT(DISTINCT x)`: GROUP BY `key_cols` with no aggregate, emitting

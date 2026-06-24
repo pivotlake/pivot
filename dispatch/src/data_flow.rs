@@ -22,7 +22,7 @@
 
 use crate::Identifier;
 use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
-use crate::operations::{FinishStatus, Operator};
+use crate::operations::{AbandonedOperator, FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::worker::worker_waker;
 use ahash::HashMap;
@@ -160,6 +160,32 @@ impl OperatorGraph {
         }
         Ok(ControlFlow::Continue(()))
     }
+
+    /// Abandon every operator transitively *upstream* of `node` (its publishers,
+    /// their publishers, and so on) by replacing each with an
+    /// [`AbandonedOperator`] and marking it finished. The node itself and
+    /// everything downstream are left running. Used by a satisfied `LIMIT` to
+    /// stop and free the scan feeding it.
+    ///
+    /// This walks `back_edges`, which is sound while the graph is a linear chain
+    /// (the documented invariant): there, the publishers reachable from `node`
+    /// are reachable *only* through `node`, so none is also feeding a live
+    /// downstream branch. A future DAG (e.g. a join) would need a
+    /// reachable-only-through-`node` check before abandoning a shared ancestor.
+    fn abandon_ancestors(&mut self, node: usize) {
+        let mut stack: Vec<usize> = self.back_edges[node].clone();
+        while let Some(idx) = stack.pop() {
+            let already_abandoned = self.operators[idx].finished;
+            if already_abandoned {
+                // Guards against re-visiting on a DAG and against re-abandoning
+                // across repeated calls; on a chain it simply never triggers.
+                continue;
+            }
+            self.operators[idx].operator = Box::new(AbandonedOperator);
+            self.operators[idx].finished = true;
+            stack.extend(self.back_edges[idx].iter().copied());
+        }
+    }
 }
 
 /// A graph of operators executed by a single worker.
@@ -172,6 +198,11 @@ pub struct DataFlow {
     cancelled: Arc<AtomicBool>,
     err_tx: mpsc::Sender<Error>,
     graph: OperatorGraph,
+    /// Operators that can ask to abandon their upstream, paired with the flag
+    /// they raise to do so (see [`Operator::upstream_cancel_flag`]). Collected
+    /// once at construction so the hot loop only polls the (usually empty) list,
+    /// never every operator. An entry is dropped once it has fired.
+    upstream_cancellers: Vec<(usize, Arc<AtomicBool>)>,
     /// Collects this worker's execution stats for the dataflow. Inert unless the
     /// query opted in; driven by the worker through [`stats`](Self::stats).
     stats: StatsCollector,
@@ -195,9 +226,17 @@ impl DataFlow {
         stats_tx: mpsc::Sender<DataFlowStats>,
         collect_stats: bool,
     ) -> Self {
+        let graph = OperatorGraph::from_edges(operators, publisher_to_subscriber);
+        let upstream_cancellers = graph
+            .operators
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, node)| node.operator.upstream_cancel_flag().map(|flag| (idx, flag)))
+            .collect();
         Self {
             id,
-            graph: OperatorGraph::from_edges(operators, publisher_to_subscriber),
+            graph,
+            upstream_cancellers,
             cancelled: canceled,
             err_tx,
             stats: StatsCollector::new(stats_tx, collect_stats),
@@ -305,6 +344,31 @@ impl DataFlow {
         })
     }
 
+    /// Honour any pending upstream-cancellation request: for each operator that
+    /// has raised its [`upstream_cancel_flag`](Operator::upstream_cancel_flag)
+    /// (e.g. a satisfied `LIMIT`), abandon everything upstream of it. Operators
+    /// downstream are left running.
+    ///
+    /// Called once per worker-loop iteration. When no operator can cancel
+    /// upstream (the common case) `upstream_cancellers` is empty and this is a
+    /// single `is_empty` check.
+    pub fn cancel_upstream_if_requested(&mut self) {
+        if self.upstream_cancellers.is_empty() {
+            return;
+        }
+        // Retain only the cancellers that haven't fired yet; abandon the
+        // ancestors of the ones that have, so each request is acted on once.
+        let graph = &mut self.graph;
+        self.upstream_cancellers.retain(|(node, flag)| {
+            if flag.load(Ordering::Relaxed) {
+                graph.abandon_ancestors(*node);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// Notify the operator that requested it that one of its filesystem reads
     /// has landed (already committed into the cache slot by the requester).
     pub fn process_fs(&mut self, node_id: Identifier, request: FsRequest) {
@@ -401,5 +465,81 @@ impl DataFlow {
                 })
                 .map(|c| c.break_value())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test operator distinguishable from [`AbandonedOperator`]: it always
+    /// reports it `Ran` and never finishes on its own, so a node still holding
+    /// one is visibly "live".
+    struct LiveOperator;
+    impl Operator for LiveOperator {
+        fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
+            Ok(WorkStatus::Ran)
+        }
+        fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
+            Ok(vec![])
+        }
+        fn process_fs_response(&mut self, _request: FsRequest) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_response(
+            &mut self,
+            _request: HttpRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
+            Ok(FinishStatus::Pending)
+        }
+    }
+
+    /// Build a linear chain `0 -> 1 -> ... -> n-1` of [`LiveOperator`]s, where
+    /// node 0 is the source and node n-1 is the leaf.
+    fn live_chain(n: usize) -> OperatorGraph {
+        let operators: Vec<Box<dyn Operator>> = (0..n)
+            .map(|_| Box::new(LiveOperator) as Box<dyn Operator>)
+            .collect();
+        let publisher_to_subscriber: HashMap<Identifier, Identifier> =
+            (0..n - 1).map(|i| (i, i + 1)).collect();
+        OperatorGraph::from_edges(operators, publisher_to_subscriber)
+    }
+
+    fn is_abandoned(graph: &mut OperatorGraph, idx: usize) -> bool {
+        // An abandoned node is inert: marked finished, reports no CPU work, and
+        // immediately finishes. A LiveOperator does the opposite.
+        graph.operators[idx].finished
+            && graph.operators[idx].operator.run_cpu_work().unwrap() == WorkStatus::Pending
+            && graph.operators[idx].operator.try_finish().unwrap() == FinishStatus::Done
+    }
+
+    #[test]
+    fn abandon_ancestors_tears_down_upstream_only() {
+        // Chain: 0 (source) -> 1 -> 2 (limit) -> 3 (downstream, e.g. GROUP BY).
+        let mut graph = live_chain(4);
+
+        graph.abandon_ancestors(2);
+
+        // Everything upstream of the limit is abandoned and freed.
+        assert!(is_abandoned(&mut graph, 0));
+        assert!(is_abandoned(&mut graph, 1));
+        // The limit and everything downstream keep running.
+        assert!(!is_abandoned(&mut graph, 2));
+        assert!(!is_abandoned(&mut graph, 3));
+    }
+
+    #[test]
+    fn abandon_ancestors_of_leaf_spares_nothing_downstream() {
+        // The whole chain is upstream of the leaf, so all but the leaf go.
+        let mut graph = live_chain(3);
+
+        graph.abandon_ancestors(2);
+
+        assert!(is_abandoned(&mut graph, 0));
+        assert!(is_abandoned(&mut graph, 1));
+        assert!(!is_abandoned(&mut graph, 2));
     }
 }
