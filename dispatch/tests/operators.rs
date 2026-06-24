@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema};
 use common::*;
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, IntKeyExtractor, OrderBy,
-    StringKeyExtractor, values_input,
+    RowKeyExtractor, RowKeySchema, StringKeyExtractor, values_input,
 };
 
 #[test]
@@ -284,4 +284,29 @@ fn limit_with_idle_parked_workers_completes() {
             "LIMIT 1 with {workers} workers must emit one row"
         );
     }
+}
+
+#[test]
+fn group_by_count_row_key_with_string_field() {
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(
+        &["alice", "bob", "alice", "carol", "bob", "alice"],
+        &[10, 20, 10, 40, 20, 10],
+    );
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .group_by_aggregate::<RowKeyExtractor, Compiled<(CountSlot,)>>(
+            vec![0, 1],
+            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            None,
+            RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]),
+        )
+        .order_by_limit(vec![OrderBy::new(2, true, false)], 10)
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_strings(&results, 0), vec!["alice", "bob", "carol"]);
+    assert_eq!(collect_i64s(&results, 1), vec![10, 20, 40]);
+    assert_eq!(collect_i64s(&results, 2), vec![3, 2, 1]);
 }

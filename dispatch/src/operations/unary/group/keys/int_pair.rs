@@ -75,7 +75,6 @@ where
     A::Native: IntBits,
     B::Native: IntBits,
 {
-    const SUPPORTS_RADIX: bool = true;
     type Config = ();
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
@@ -151,6 +150,7 @@ where
     fn finish(
         self,
         _arena: &Arc<SharedArena>,
+        _output_buffers: &Arc<[arrow_buffer::Buffer]>,
         _allocator: &mut SlabAllocator,
     ) -> (Vec<Field>, Vec<ArrayRef>) {
         let fields = vec![

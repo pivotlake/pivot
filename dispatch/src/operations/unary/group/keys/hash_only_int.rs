@@ -114,6 +114,7 @@ impl KeyColumns for NoKeyColumns {
     fn finish(
         self,
         _arena: &Arc<SharedArena>,
+        _output_buffers: &Arc<[arrow_buffer::Buffer]>,
         _allocator: &mut SlabAllocator,
     ) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
