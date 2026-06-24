@@ -447,8 +447,7 @@ static GetTableFilters split_table_filters(duckdb::LogicalGet &get, DynamicFilte
 // positional indices ColumnBindingResolver assigns to every ref above the
 // scan, follow projection_ids, NOT column_ids, so we serialize in that
 // order. This is the scan-level twin of the LogicalFilter `projection_map`
-// handling in build_plan_node_json (the latter is what actually fixed Q42,
-// where the filter stayed a separate node)
+// handling in build_plan_node_json.
 json build_get_output_columns(duckdb::LogicalGet *get) {
 	json columns = json::array();
 	auto &column_ids = get->GetColumnIds();

@@ -59,9 +59,8 @@
 //! with bounded iterations and/or fewer rows, e.g.
 //! `PIVOT_BENCH_ROWS=4000000 … --bench "group_by/string_highcard" --sample-size 20`.
 //!
-//! VALIDATION — these scenarios were profiled against the matching real queries
-//! (`perf record` of `pivot-bench` over the hits dataset) on a c8g.4xlarge. With
-//! the ORDER BY count DESC LIMIT 10 cap (below) the integer high-card GROUP BY
+//! VALIDATION — these scenarios were profiled against the matching real queries.
+//! With the ORDER BY count DESC LIMIT 10 cap (below) the integer high-card GROUP BY
 //! lines up with the real query: merge + consume dominate (~70%), `memset`/output
 //! a few percent — matching the real profile. The cap matters: without it every
 //! group reaches the output and the ring→heap `CopyOut` copy dominates instead of
@@ -1009,8 +1008,8 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
 
 // ---------------------------------------------------------------------------
 // GLOBAL aggregate scenarios (no GROUP BY) — the `aggregate` operator, a
-// straight per-row reduction over a whole column with no hash table. ClickBench
-// q02 (`SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth)`) lives here; its hot
+// straight per-row reduction over a whole column with no hash table. A
+// multi-aggregate global reduction (e.g. `SUM, COUNT(*), AVG`) lives here; its hot
 // loop is a column reduction that must stay vectorised. A regression that turns
 // the reduction scalar (e.g. a loop-carried runtime branch the autovectoriser
 // won't lift) ~halves throughput but is invisible to the GROUP BY benches above,
@@ -1020,7 +1019,7 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
 fn bench_aggregate(c: &mut Criterion, d: &DataFlowDispatcher) {
     let rows = total_rows();
 
-    // q02-shaped: SUM(v0), COUNT(*), and AVG(v1) — which DuckDB lowers to
+    // SUM(v0), COUNT(*), and AVG(v1) — which DuckDB lowers to
     // SUM(v1) + COUNT(v1). Four slots, all reducing the same two i16 columns in
     // one pass, no grouping. `i64` accumulator (16-bit columns can't overflow it),
     // matching the planner's width choice for these columns.

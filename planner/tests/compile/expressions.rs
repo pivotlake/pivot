@@ -283,7 +283,7 @@ fn group_by_computed_key_avg(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn group_by_plain_and_computed_key(mut testing_planner: TestingPlanner) {
     use arrow_array::Int64Array;
-    // A plain column key mixed with a computed key (ClickBench Q18 shape). Groups
+    // A plain column key mixed with a computed key. Groups
     // (uid, minute): (1,0)=v[10]; (1,1)=v[20,40]; (2,2)=v[30]. The multi-key row
     // encoder names the two key columns k0, k1.
     testing_planner.add_table(

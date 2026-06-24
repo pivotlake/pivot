@@ -94,7 +94,7 @@ impl PlanNode {
                     // Keep `limit + offset` rows per partition: the downstream
                     // `LIMIT k OFFSET m` discards the first `m`, so a group pruned
                     // to only `k` per partition would leave nothing past the
-                    // offset (e.g. ClickBench q38/q39, `LIMIT 10 OFFSET 1000`).
+                    // offset (e.g. `LIMIT 10 OFFSET 1000`).
                     (OrderByDirection::Desc, Expression::Ref(r)) => {
                         (r.column_idx, t.limit + t.offset)
                     }

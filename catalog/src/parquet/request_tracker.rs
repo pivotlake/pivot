@@ -555,7 +555,7 @@ mod tests {
 
     /// A request with more queued reads than one submission batch holds is handed
     /// out in capped passes (never overrunning the ring) and fully drained across
-    /// them. Regression for the `SELECT *` materialize livelock.
+    /// them.
     #[test]
     fn take_fs_requests_caps_each_batch_and_drains_the_rest() {
         init_test_free_pool(8);
