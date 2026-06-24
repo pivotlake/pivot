@@ -127,7 +127,7 @@ async fn select_one_i64(client: &Client, sql: &str) -> i64 {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
-async fn drop_cache_evicts_file_cache(#[future] conn: Conn) {
+async fn drop_cache_evicts_file_memory_cache(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_drop_cache", dir.path()).await;
 

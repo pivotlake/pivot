@@ -200,7 +200,9 @@ impl FooterRead {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
     fn start(file: FileRef, location: FileLocation, size: usize) -> Self {
-        memory_ctx().file_cache().open_entry(location.clone());
+        memory_ctx()
+            .file_memory_cache()
+            .open_entry(location.clone());
         let mut request = Self {
             file,
             location,
@@ -239,7 +241,9 @@ impl FooterRead {
             self.pending_fs.is_empty() && self.pending_http.is_empty(),
             "read_region over un-drained pending reads"
         );
-        self.lookups = memory_ctx().file_cache().get(&self.location, offset, len);
+        self.lookups = memory_ctx()
+            .file_memory_cache()
+            .get(&self.location, offset, len);
         self.remaining = 0;
         for lookup in &self.lookups {
             for block in lookup.missing() {
