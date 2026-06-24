@@ -497,6 +497,17 @@ impl Worker {
         self.data_flows.retain(|_, d| !d.cancelled())
     }
 
+    /// Let any operator that's done with its upstream (e.g. a satisfied `LIMIT`)
+    /// abandon the scan feeding it, freeing its in-flight buffers and stopping
+    /// further reads. Distinct from [`clear_cancelled_dataflows`](Self::clear_cancelled_dataflows):
+    /// that tears down a whole query, this prunes only one query's upstream while
+    /// the rest keeps running.
+    fn cancel_upstream_in_dataflows(&mut self) {
+        for flow in self.data_flows.values_mut() {
+            flow.cancel_upstream_if_requested();
+        }
+    }
+
     fn try_receiving_new_dataflow(&mut self) {
         if let Ok(builder) = self.data_flow_queue.try_recv() {
             debug!("Received data flow...");
@@ -525,6 +536,10 @@ impl Worker {
             self.try_receiving_new_dataflow();
 
             self.clear_cancelled_dataflows();
+
+            // Prune any abandoned upstream before submitting IO, so a satisfied
+            // LIMIT's scan issues no further reads.
+            self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
             self.saturate_io()?;

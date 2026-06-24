@@ -21,6 +21,8 @@ use crate::operations::channels::Sender;
 use crate::operations::{Unary, unary};
 use std::marker::PhantomData;
 use std::mem;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 /// Accumulates input items during the consuming phase.
 ///
@@ -35,6 +37,24 @@ pub trait Consumer<I, O> {
 
     /// Transition from consuming to outputting. Called once after all input is drained.
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>>;
+
+    /// Whether this consumer can still use more input. Default `true`; a
+    /// consumer that fills up early (e.g. a satisfied `LIMIT`) returns `false`
+    /// to stop being fed. See [`Unary::ready_for_more_work`].
+    fn ready_for_more_work(&mut self) -> bool {
+        true
+    }
+
+    /// Whether this consumer is done consuming before its input drains.
+    /// See [`Unary::finished_consuming`].
+    fn finished_consuming(&self) -> bool {
+        false
+    }
+
+    /// See [`Operator::upstream_cancel_flag`](crate::operations::Operator::upstream_cancel_flag).
+    fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
 }
 
 /// Emits final results after the consuming phase is complete.
@@ -63,7 +83,13 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
     fn consume<S: Sender<O>>(&mut self, object: I, sender: &mut S) -> unary::Result<()> {
         match self {
             PipelineBreaker::Consuming(c) => c.consume(object, sender),
-            _ => panic!("Consume called after outputting began"),
+            // A breaker that finished *early* (e.g. a satisfied `LIMIT`) can still
+            // have input sitting in its channel when it transitions to output:
+            // it stopped consuming before draining, and its upstream is being
+            // abandoned. That input is surplus to the result already decided, so
+            // drop it. (A breaker that finishes the normal way drains first, so
+            // it never reaches here.)
+            _ => Ok(()),
         }
     }
 
@@ -76,6 +102,30 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
                 Ok(WorkStatus::Ran)
             }
             _ => Ok(WorkStatus::Pending),
+        }
+    }
+
+    fn ready_for_more_work(&mut self) -> bool {
+        match self {
+            PipelineBreaker::Consuming(c) => c.ready_for_more_work(),
+            // Past the consuming phase, `ready_for_more_work` instead gates
+            // whether the worker calls `run` to drain the outputter, so it
+            // must stay `true` here, or the output would never be emitted.
+            _ => true,
+        }
+    }
+
+    fn finished_consuming(&self) -> bool {
+        match self {
+            PipelineBreaker::Consuming(c) => c.finished_consuming(),
+            _ => true,
+        }
+    }
+
+    fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            PipelineBreaker::Consuming(c) => c.upstream_cancel_flag(),
+            _ => None,
         }
     }
 

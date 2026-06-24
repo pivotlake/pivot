@@ -223,3 +223,60 @@ fn group_by_count_int_keys() {
 
     assert_eq!(collect_i64s(&results, 1), vec![3, 3, 2]);
 }
+
+// A plain `LIMIT` must abandon its upstream once satisfied, not drain the whole
+// input. A counting filter sits *beneath* `LIMIT 1` while we feed 10k batches:
+// with early termination the filter runs only a handful of times before the
+// scan is torn down; without it, it would run once per batch.
+#[test]
+fn limit_abandons_upstream_after_reaching_count() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dispatch = dispatch(1);
+    let batches: Vec<RecordBatch> = (0..10_000).map(|i| strings_and_ints(&["x"], &[i])).collect();
+    let consumed = Arc::new(AtomicUsize::new(0));
+
+    let counter = consumed.clone();
+    let results = values_input(&dispatch, batches)
+        .record_batches()
+        .filter(move || {
+            let counter = counter.clone();
+            move |batch: &RecordBatch| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                BooleanArray::from(vec![true; batch.num_rows()])
+            }
+        })
+        .limit(1, 0)
+        .collect()
+        .unwrap();
+
+    let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+    let filtered = consumed.load(Ordering::Relaxed);
+    assert_eq!(total_rows, 1, "LIMIT 1 emits exactly one row");
+    assert!(
+        filtered < 100,
+        "filter ran {filtered} times for LIMIT 1 over 10k batches: upstream was not abandoned",
+    );
+}
+
+// Multi-worker LIMIT with far more workers than input batches: most workers get
+// no row group and park while one produces the result and trips the limit. The
+// worker that latches the limit must wake the parked peers so they abandon their
+// own (now-unneeded) upstream and flush, or the assembler waits forever. Run
+// across several worker counts to shake out that lost-wakeup.
+#[test]
+fn limit_with_idle_parked_workers_completes() {
+    for workers in [2, 4, 8, 16] {
+        let dispatch = dispatch(workers);
+        let batches: Vec<RecordBatch> = (0..3).map(|i| strings_and_ints(&["x"], &[i])).collect();
+
+        let results = values_input(&dispatch, batches)
+            .record_batches()
+            .limit(1, 0)
+            .collect()
+            .unwrap();
+
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "LIMIT 1 with {workers} workers must emit one row");
+    }
+}

@@ -61,7 +61,7 @@ use crate::io::{FsRequest, HttpRequest};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use thiserror::Error;
 
 use super::channels::{Receiver, Sender};
@@ -87,9 +87,11 @@ mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 
 mod copy_out;
+mod limit;
 mod order_by_limit;
 
 pub use copy_out::CopyOutFactory;
+pub use limit::LimitFactory;
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
 #[derive(Debug, Error)]
@@ -171,6 +173,25 @@ pub trait Unary<I, O> {
     fn finish<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<bool> {
         Ok(true)
     }
+
+    /// Whether this transform is done consuming *before* its input has run dry,
+    /// e.g. a `LIMIT` that has already buffered enough rows. The default is
+    /// `false`: an operator finishes only when its input channel drains.
+    ///
+    /// When `true`, [`UnaryOperator::try_finish`] proceeds to finalization even
+    /// though items may remain in the input channel; those leftovers are simply
+    /// never consumed (the matching scan is abandoned, see
+    /// [`Operator::upstream_cancel_flag`](super::Operator::upstream_cancel_flag)).
+    fn finished_consuming(&self) -> bool {
+        false
+    }
+
+    /// See [`Operator::upstream_cancel_flag`](super::Operator::upstream_cancel_flag).
+    /// Wired through the wrapping [`UnaryOperator`] so a transform can ask the
+    /// dataflow to abandon its upstream.
+    fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
 }
 
 /// Wires a [`Unary`] transform to a receiver (input channel) and sender (output channel),
@@ -237,7 +258,12 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
     }
 
     fn try_finish(&mut self) -> super::Result<FinishStatus> {
-        if !self.receiver.is_empty() {
+        // Normally an operator finishes only once its input has drained. A
+        // transform that has decided to stop early (e.g. a satisfied `LIMIT`)
+        // signals `finished_consuming` so we proceed regardless: the unconsumed
+        // tail belongs to a scan that's being abandoned anyway.
+        let done_consuming = || self.receiver.is_empty() || self.unary.finished_consuming();
+        if !done_consuming() {
             return Ok(FinishStatus::Pending);
         }
 
@@ -257,10 +283,11 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
 
         if ready {
             // Race guard: a peer may have stolen work into our channel between
-            // the is_empty() check above and the decrement. Re-check and back
-            // off if new work appeared. Relaxed ordering suffices because the
-            // channel ops themselves provide Acquire/Release on the data.
-            if !self.receiver.is_empty() {
+            // the emptiness check above and the decrement. Re-check and back
+            // off if new work appeared (unless we're finishing early, in which
+            // case we don't care about leftover input). Relaxed ordering
+            // suffices because the channel ops themselves provide Acquire/Release.
+            if !done_consuming() {
                 self.notified_finished = false;
                 self.siblings_left.fetch_add(1, Ordering::Relaxed);
                 return Ok(FinishStatus::Pending);
@@ -292,5 +319,9 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
             }
             None => Ok(WorkStatus::Pending),
         }
+    }
+
+    fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.unary.upstream_cancel_flag()
     }
 }
