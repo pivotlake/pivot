@@ -70,11 +70,14 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
 }
 
 /// Builds a new [`Schema`] containing only the fields selected by `projection`.
+///
+/// Indices that fall outside the schema (e.g. selecting from a table with no
+/// fields) are skipped rather than panicking.
 fn project_schema(schema: &Schema, projection: &Projection) -> Schema {
     let fields: Vec<_> = projection
         .indices()
         .iter()
-        .map(|&i| schema.field(i).clone())
+        .filter_map(|&i| schema.fields().get(i).cloned())
         .collect();
 
     Schema::new(fields)
@@ -475,5 +478,17 @@ mod tests {
         let out = run_unary_to_completion(new_decoder(&table, 2), vec![page]);
 
         assert_eq!(out.len(), 2);
+    }
+
+    /// Projecting a column index beyond a fieldless schema (selecting from a
+    /// table with no fields) must not panic; it yields an empty schema.
+    #[test]
+    fn test_project_schema_index_past_empty_schema() {
+        let schema = Schema::empty();
+        let projection = Projection::all(1);
+
+        let projected = super::project_schema(&schema, &projection);
+
+        assert_eq!(projected.fields().len(), 0);
     }
 }
