@@ -256,6 +256,8 @@ fn group_by_count_date_int_pair_keys() {
         .collect()
         .unwrap();
 
+    assert_eq!(collect_i32s(&results, 0), vec![10, 20]);
+    assert_eq!(collect_i32s(&results, 1), vec![1, 2]);
     assert_eq!(collect_i64s(&results, 2), vec![3, 2]);
 }
 
