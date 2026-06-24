@@ -364,6 +364,14 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
         .unwrap()
 }
 
+/// A catalog with the condition cache forced on (it is opt-in by default), for
+/// the cache tests.
+fn enabled_cache_catalog() -> ParquetCatalog {
+    let mut catalog = ParquetCatalog::new(dispatcher());
+    catalog.set_condition_cache_enabled(true);
+    catalog
+}
+
 /// Run `sql` through a planner over `catalog` and return the result batches.
 fn run_sql(catalog: &Arc<ParquetCatalog>, sql: &str) -> Vec<RecordBatch> {
     let mut planner = Planner::new(catalog.clone() as Arc<dyn PlannerCatalog>);
@@ -805,4 +813,204 @@ fn no_partition_filter_builds_every_partitions_files() {
 
     // Without a filter both files are fetched: keep's 1 group + drop's 3.
     assert_eq!(all.row_groups().len(), 4);
+}
+
+/// Write a SNAPPY parquet file of one `id` (Int32) column, one row group per
+/// value (so a filter selects a subset of row groups and rows).
+fn write_snappy_ids(dir: &Path, ids: &[i32]) {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.join("data.parquet")).unwrap(),
+        schema.clone(),
+        Some(props),
+    )
+    .unwrap();
+    for &id in ids {
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![id]))])
+                .unwrap();
+        writer.write(&batch).unwrap();
+    }
+    writer.close().unwrap();
+}
+
+/// Write a SNAPPY parquet file: one row group of `rows` ascending `id` values,
+/// across several data pages (small page-size limit), so a sparse filter leaves
+/// most pages with no survivors.
+fn write_snappy_one_group_many_pages(dir: &Path, rows: i32) {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_data_page_row_count_limit(4096)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.join("data.parquet")).unwrap(),
+        schema.clone(),
+        Some(props),
+    )
+    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(0..rows))]).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Regression: replaying cached survivors into a row group with many pages where
+/// only the last few rows survive must complete and stay correct (early it
+/// stalled the decode pipeline). Mirrors the ClickBench shape where a selective
+/// filter leaves most pages empty.
+#[test]
+fn replay_with_sparse_survivors_across_pages_completes_and_is_correct() {
+    let dir = TempDir::new().unwrap();
+    write_snappy_one_group_many_pages(dir.path(), 100_000);
+    let columns = vec![Column {
+        name: "id".to_string(),
+        col_type: Type::Int32,
+    }];
+    let catalog = Arc::new(enabled_cache_catalog());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let first = collect_i32(&run_sql(&catalog, "SELECT id FROM t WHERE id > 99995"));
+    assert_eq!(first, vec![99996, 99997, 99998, 99999]);
+
+    let replayed = collect_i32(&run_sql(&catalog, "SELECT id FROM t WHERE id > 99995"));
+    assert_eq!(replayed, vec![99996, 99997, 99998, 99999]);
+}
+
+/// Write a SNAPPY file with many small row groups (one per `group_rows` chunk),
+/// to exercise replay across more row groups than the file cache has slots.
+fn write_snappy_many_groups(dir: &Path, rows: i32, group_rows: usize) {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(Some(group_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.join("data.parquet")).unwrap(),
+        schema.clone(),
+        Some(props),
+    )
+    .unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(0..rows))]).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Regression at scale: replay over many row groups (more than the file cache has
+/// slots) must complete. If replay leaked a cache slot per row group, the ring
+/// would exhaust and the fetcher would livelock.
+#[test]
+fn replay_over_many_row_groups_completes() {
+    let dir = TempDir::new().unwrap();
+    write_snappy_many_groups(dir.path(), 100_000, 200); // 500 row groups
+    let columns = vec![Column {
+        name: "id".to_string(),
+        col_type: Type::Int32,
+    }];
+    let catalog = Arc::new(enabled_cache_catalog());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let first = collect_i32(&run_sql(&catalog, "SELECT id FROM t WHERE id > 99996"));
+    assert_eq!(first, vec![99997, 99998, 99999]);
+
+    let replayed = collect_i32(&run_sql(&catalog, "SELECT id FROM t WHERE id > 99996"));
+    assert_eq!(replayed, vec![99997, 99998, 99999]);
+}
+
+/// Write a SNAPPY file with one string column `s` over many pages: mostly `"x"`,
+/// with `"google"` at a few scattered rows (the selective-`LIKE` shape of q21).
+fn write_snappy_strings(dir: &Path, rows: usize) {
+    use arrow_array::StringViewArray;
+    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, false)]));
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_data_page_row_count_limit(4096)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.join("data.parquet")).unwrap(),
+        schema.clone(),
+        Some(props),
+    )
+    .unwrap();
+    let values: Vec<&str> = (0..rows)
+        .map(|i| if i % 9999 == 0 { "google" } else { "x" })
+        .collect();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringViewArray::from(values))]).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+/// Regression: replay of a selective `LIKE` over a string column across many
+/// pages must complete and stay correct (the ClickBench q21/q22 shape, which
+/// stalled the decode pipeline at scale).
+#[test]
+fn replay_string_like_filter_completes_and_is_correct() {
+    let dir = TempDir::new().unwrap();
+    write_snappy_strings(dir.path(), 100_000); // "google" at rows 0, 9999, ... → 11 matches
+    let columns = vec![Column {
+        name: "s".to_string(),
+        col_type: Type::Utf8,
+    }];
+    let catalog = Arc::new(enabled_cache_catalog());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let count_first = run_sql(&catalog, "SELECT COUNT(*) AS c FROM t WHERE s LIKE '%google%'");
+    let first = common::extract_count(&count_first);
+    assert_eq!(first, 11);
+
+    let count_replay = run_sql(&catalog, "SELECT COUNT(*) AS c FROM t WHERE s LIKE '%google%'");
+    assert_eq!(common::extract_count(&count_replay), 11);
+}
+
+/// Sorted `id` (Int32) values across the result batches.
+fn collect_i32(batches: &[RecordBatch]) -> Vec<i32> {
+    let idx = batches[0].schema().index_of("id").unwrap();
+    let mut values: Vec<i32> = batches
+        .iter()
+        .flat_map(|b| {
+            let a = b.column(idx).as_any().downcast_ref::<Int32Array>().unwrap();
+            (0..a.len()).map(|i| a.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    values.sort();
+    values
+}
+
+/// A filtered scan records its surviving rows in the condition cache, and still
+/// returns the right rows: the populate path runs the scan in metadata mode and
+/// strips those columns back off, so the query output is unchanged. A repeat is
+/// gated off the populate path (already cached) and stays correct.
+#[test]
+fn filtered_query_populates_condition_cache_and_returns_correct_rows() {
+    let dir = TempDir::new().unwrap();
+    write_snappy_ids(dir.path(), &[1, 2, 3, 4, 5]);
+    let columns = vec![Column {
+        name: "id".to_string(),
+        col_type: Type::Int32,
+    }];
+    let catalog = Arc::new(enabled_cache_catalog());
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let first = collect_i32(&run_sql(&catalog, "SELECT id FROM t WHERE id > 2"));
+
+    assert_eq!(first, vec![3, 4, 5]);
+    assert_eq!(catalog.condition_cache().populated_count(), 1);
+
+    // The second run takes the replay path (the filter is already populated): it
+    // feeds each row group its cached survivors instead of re-recording them, and
+    // still returns the right rows. `populated_count` staying 1 confirms no
+    // re-population happened.
+    let second = collect_i32(&run_sql(&catalog, "SELECT id FROM t WHERE id > 2"));
+
+    assert_eq!(second, vec![3, 4, 5]);
+    assert_eq!(catalog.condition_cache().populated_count(), 1);
 }

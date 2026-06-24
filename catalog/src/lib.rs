@@ -16,6 +16,7 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 mod catalog;
+mod condition_cache;
 mod manifest;
 pub mod parquet;
 pub mod store;
@@ -26,5 +27,6 @@ pub mod store;
 pub mod test_support;
 
 pub use catalog::{CatalogTable, Error, ParquetCatalog, Result, TableBinding};
+pub use condition_cache::QueryConditionCache;
 pub use manifest::{ManifestEntry, PartitionEqFilter, SortBounds};
 pub use store::FileRef;

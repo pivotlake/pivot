@@ -1,11 +1,17 @@
 use arrow_array::types::Int32Type;
 use arrow_array::{Array, Int32Array, RecordBatch, RunArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema};
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::{Arc, LazyLock};
 
 const GLOBAL_ROW_GROUP_OFFSET_FROM_END: usize = 2;
 
 const ROW_OFFSET_FROM_END: usize = 1;
+
+/// How many trailing columns [`with_row_group_metadata`] appends (the global
+/// row-group column and the per-row index column).
+pub const METADATA_COLUMN_COUNT: usize = 2;
 
 static GLOBAL_ROW_GROUP_FIELD: LazyLock<Arc<Field>> = LazyLock::new(|| {
     let run_ends = Field::new("run_ends", DataType::Int32, false);
@@ -35,6 +41,45 @@ pub fn row_index(batch: &RecordBatch) -> &UInt32Array {
         .as_any()
         .downcast_ref::<UInt32Array>()
         .expect("Metadata not set correctly")
+}
+
+/// Append each row's index to `out`, keyed by its global row group, for a batch
+/// carrying the row-group metadata columns. Used to recover "which rows of which
+/// group are present" from a (possibly filtered) batch.
+///
+/// The row-group column is a `RunArray` (consecutive same-group rows form one
+/// run). A batch may be a logical *slice* (e.g. a `LIMIT` above the scan), so we
+/// walk the *logical* runs via `RunEndBuffer::sliced_values()` (run ends already
+/// adjusted for the slice offset and capped at its length) and map each run to
+/// its physical group value via `get_start_physical_index()`. Reading the raw
+/// (physical) `run_ends` would treat them as logical bounds and overrun the
+/// shorter sliced row-index array.
+pub fn accumulate_row_indices<S: BuildHasher>(
+    batch: &RecordBatch,
+    out: &mut HashMap<u32, Vec<u32>, S>,
+) {
+    let groups = global_row_group(batch);
+    let run_ends = groups.run_ends();
+    let physical_start = run_ends.get_start_physical_index();
+    let group_values = groups
+        .values()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    let row_indices = row_index(batch);
+
+    let mut logical = 0usize;
+    for (run_offset, logical_end) in run_ends.sliced_values().enumerate() {
+        let logical_end = logical_end as usize;
+        let group = group_values.value(physical_start + run_offset);
+        let entries = out.entry(group).or_default();
+        // `row_indices` is logically indexed, so `value(logical)` accounts for
+        // any slice offset.
+        while logical < logical_end {
+            entries.push(row_indices.value(logical));
+            logical += 1;
+        }
+    }
 }
 
 /// Add row group metadata to the record batch, receiving a new RecordBatch with a column for global

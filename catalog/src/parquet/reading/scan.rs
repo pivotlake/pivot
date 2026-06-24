@@ -18,10 +18,12 @@ use dispatch::{
     UnaryOperatorFactory, return_to_worker_mpsc, stealable,
 };
 
+use crate::QueryConditionCache;
 use crate::parquet::{
-    CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
+    CompressedPage, ConditionPopulatorFactory, DecoderFactory, DecompressedPage,
+    DecompressorFactory, IndexerFactory, MaterializerFactory, ParquetTable, RowGroupBuffer,
+    RowGroupFetcherFactory, RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate,
+    ScanOrder,
 };
 
 /// Append the index → decompress → decode stages onto a source of
@@ -79,6 +81,7 @@ pub fn table_input(
         None,
         None,
         Arc::new(Vec::new()),
+        None,
     )
 }
 
@@ -99,12 +102,14 @@ pub fn table_input_with_filter(
         filter,
         None,
         Arc::new(Vec::new()),
+        None,
     )
 }
 
-/// Like [`table_input`] but with both a dynamic [`RowGroupFilter`] and
-/// pushed-down equality predicates (the decoder pruning row groups by
-/// dictionary contents). Either can be inert (`None` / empty `Vec`).
+/// Like [`table_input`] but with a dynamic [`RowGroupFilter`], pushed-down
+/// equality predicates (the decoder pruning row groups by dictionary contents),
+/// and an optional condition-cache replay (each row group decodes only the rows a
+/// previous run recorded as surviving the filter `u64`). Any of them can be inert.
 pub fn table_input_with_filter_and_eq_predicates(
     dispatcher: &DataFlowDispatcher,
     table: &Arc<ParquetTable>,
@@ -113,6 +118,7 @@ pub fn table_input_with_filter_and_eq_predicates(
     filter: Option<RowGroupFilter>,
     scan_order: Option<ScanOrder>,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    condition_replay: Option<(Arc<QueryConditionCache>, u64)>,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
     // A projection with no data columns can't go through the column-driven page
@@ -124,7 +130,8 @@ pub fn table_input_with_filter_and_eq_predicates(
     if projection.indices().is_empty() {
         return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
     }
-    let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
+    let injector =
+        RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order, condition_replay);
     let siblings = Arc::new(AtomicUsize::new(n));
     // One fetcher handles disk and HTTP row groups, bounding each medium's
     // in-flight count separately.
@@ -188,4 +195,40 @@ pub fn materialize(
         false,
         Arc::new(Vec::new()),
     )
+}
+
+/// Chain a [`ConditionPopulatorFactory`] onto a post-filter scan spec: it records
+/// which rows survived `filter_id` into `cache` (publishing once all workers
+/// finish) and forwards the rows on. `strip_metadata` drops the row-group
+/// metadata columns the populate path added (a plain filter wants its original
+/// schema back) or keeps them for a downstream materialize.
+///
+/// Mirrors [`materialize`]'s bridging: split the upstream spec into its
+/// per-worker heads and wrap each with one populator sibling. The
+/// [`UnaryOperator`](dispatch)'s `siblings` counter drives *when* `finish` runs;
+/// the populator's own internal counter (also the worker count) elects the
+/// sibling that publishes.
+pub fn populate_condition_cache(
+    spec: RecordBatchOperatorSpec,
+    cache: Arc<QueryConditionCache>,
+    filter_id: u64,
+    strip_metadata: bool,
+) -> RecordBatchOperatorSpec {
+    let (dispatcher, mut heads) = spec.into_parts();
+    let n = dispatcher.worker_count();
+    let populator = ConditionPopulatorFactory::new(cache, filter_id, n, strip_metadata);
+    let siblings = Arc::new(AtomicUsize::new(n));
+
+    let factories: Vec<_> = stealable::<RecordBatch>(n)
+        .into_iter()
+        .map(|channel| {
+            UnaryOperatorFactory::new(
+                RecordBatchFactoryBridge::new(heads.pop_front().unwrap()),
+                populator.clone(),
+                channel,
+                siblings.clone(),
+            )
+        })
+        .collect();
+    RecordBatchOperatorSpec::from_spec(OperatorSpec::new(dispatcher, factories))
 }

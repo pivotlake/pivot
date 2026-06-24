@@ -126,6 +126,7 @@ impl Table for TableBinding {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        replay_condition_filter: Option<u64>,
         ctx: &dyn QueryContext,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         // The query context hands back this table's latest committed files (it
@@ -148,6 +149,20 @@ impl Table for TableBinding {
         // Prune the row groups by the pushed-down predicates' stats. No footer
         // re-read — the cache already holds the materialized row groups.
         let parquet = Arc::new(self.pruned_parquet(&current));
+
+        // When replaying, feed each row group its cached survivors. The row-group
+        // index the cache is keyed by is the position in this same pruned list,
+        // and the populate run pruned identically (same predicates, same version),
+        // so the indices line up. The cache lives on the catalog, reached through
+        // the (downcast) query context.
+        let condition_replay = replay_condition_filter.and_then(|filter_id| {
+            let cache = ctx
+                .as_any()
+                .downcast_ref::<super::ParquetQueryContext>()?
+                .condition_cache();
+            Some((cache, filter_id))
+        });
+
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
@@ -159,6 +174,7 @@ impl Table for TableBinding {
             row_group_filter_from(dynamic_filters),
             scan_order,
             Arc::new(eq_predicates),
+            condition_replay,
         ))
     }
 

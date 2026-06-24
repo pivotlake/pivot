@@ -26,11 +26,15 @@ pub use decoding::{DecoderFactory, RowGroupDecoderError, ScanEqualityPredicate};
 mod materializer;
 pub use materializer::MaterializerFactory;
 
+mod condition_populator;
+pub use condition_populator::ConditionPopulatorFactory;
+
 mod record_batch_metadata;
 
 mod empty_projection_scan;
 
 mod scan;
 pub use scan::{
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    materialize, populate_condition_cache, table_input, table_input_with_filter,
+    table_input_with_filter_and_eq_predicates,
 };

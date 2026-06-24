@@ -128,6 +128,18 @@ pub struct ParquetCatalog {
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
     dispatcher: DataFlowDispatcher,
+
+    /// Cross-query cache of which rows survive a filter, keyed per
+    /// `(filter, global row group)`. Lives on the catalog because it is keyed by
+    /// table-wide row groups, and the catalog (refreshed, never recreated) shares
+    /// the process lifetime. Sound because those row groups are immutable. See
+    /// [`QueryConditionCache`](crate::condition_cache::QueryConditionCache).
+    condition_cache: Arc<crate::condition_cache::QueryConditionCache>,
+    /// Whether the condition cache is consulted/populated when compiling filters.
+    /// Opt-in (env `PIVOT_ENABLE_CONDITION_CACHE`) because a filter under an
+    /// `ORDER BY ... LIMIT` pipeline breaker currently stalls the replay scan; a
+    /// catalog property rather than a raw env read so tests can force it on.
+    condition_cache_enabled: bool,
 }
 
 impl std::fmt::Debug for ParquetCatalog {
@@ -150,6 +162,8 @@ impl ParquetCatalog {
             tables: Arc::new(RwLock::new(HashMap::new())),
             store: Arc::new(LocalStore::new(root)),
             dispatcher,
+            condition_cache: Arc::default(),
+            condition_cache_enabled: condition_cache_enabled_by_default(),
         }
     }
 
@@ -172,6 +186,8 @@ impl ParquetCatalog {
             tables: Arc::new(RwLock::new(tables)),
             store,
             dispatcher: dispatcher.clone(),
+            condition_cache: Arc::default(),
+            condition_cache_enabled: condition_cache_enabled_by_default(),
         })
     }
 
@@ -384,6 +400,26 @@ impl ParquetCatalog {
     }
 }
 
+impl ParquetCatalog {
+    /// The cross-query condition cache. Exposed for tests and introspection; the
+    /// query path reaches it through the [`ParquetQueryContext`].
+    pub fn condition_cache(&self) -> &crate::condition_cache::QueryConditionCache {
+        &self.condition_cache
+    }
+
+    /// Turn the condition cache on (it is opt-in by default). For tests and for a
+    /// server that wants it without the env flag.
+    pub fn set_condition_cache_enabled(&mut self, enabled: bool) {
+        self.condition_cache_enabled = enabled;
+    }
+}
+
+/// Whether the condition cache is on by default for a freshly constructed
+/// catalog: opt-in via the `PIVOT_ENABLE_CONDITION_CACHE` env var.
+fn condition_cache_enabled_by_default() -> bool {
+    std::env::var_os("PIVOT_ENABLE_CONDITION_CACHE").is_some()
+}
+
 impl Catalog for ParquetCatalog {
     /// Resolve `name` to a [`TableBinding`]: it carries the table's schema and
     /// (after pushdown) this query's predicates, but no file set. The files are
@@ -399,6 +435,8 @@ impl Catalog for ParquetCatalog {
         Box::new(ParquetQueryContext {
             tables: self.tables.clone(),
             pinned: Mutex::new(HashMap::new()),
+            condition_cache: self.condition_cache.clone(),
+            condition_cache_enabled: self.condition_cache_enabled,
         })
     }
 
@@ -440,6 +478,12 @@ pub(super) struct ParquetQueryContext {
     /// which is correct — they never share an index space. The filter half is each
     /// `(column, JSON constant)` sorted, the hashable form of the predicates.
     pinned: Mutex<PinnedScanViews>,
+    /// The catalog's condition cache (shared `Arc`). Used here to invalidate it
+    /// when a table reload advances the version, and to populate/consult it for
+    /// the query being compiled.
+    condition_cache: Arc<crate::condition_cache::QueryConditionCache>,
+    /// Snapshot of the catalog's enablement flag (see [`ParquetCatalog`]).
+    condition_cache_enabled: bool,
 }
 
 impl ParquetQueryContext {
@@ -479,9 +523,15 @@ impl ParquetQueryContext {
                     format!("table {name:?} no longer exists (dropped since planning?)").into(),
                 )
             })?;
-        table
+        let version_advanced = table
             .reload_manifest_only()
             .map_err(|e| CatalogError::Other(Box::new(e)))?;
+        if version_advanced {
+            // The "global row group" is a positional index over the table's files;
+            // a new committed version can shift it, so any cached survivors keyed
+            // by that index are no longer safe to replay.
+            self.condition_cache.clear();
+        }
         let parquet = table
             .parquet(&filters)
             .map_err(|e| CatalogError::Other(Box::new(e)))?;
@@ -491,10 +541,46 @@ impl ParquetQueryContext {
         self.pinned.lock().unwrap().insert(key, parquet.clone());
         Ok(parquet)
     }
+
+    /// The condition cache (shared `Arc`), so a binding can replay cached
+    /// survivors when it compiles a scan under an already-populated filter.
+    pub(super) fn condition_cache(&self) -> Arc<crate::condition_cache::QueryConditionCache> {
+        self.condition_cache.clone()
+    }
 }
 
 impl QueryContext for ParquetQueryContext {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn condition_cache_enabled(&self) -> bool {
+        // Opt-in (see `ParquetCatalog::condition_cache_enabled`). The cache gives a
+        // real win on filter queries (e.g. ClickBench q20, ~2.1x hot via replay),
+        // but a filter feeding an `ORDER BY ... LIMIT` pipeline breaker (q21/q22)
+        // currently stalls the replay scan, so it stays behind a flag.
+        self.condition_cache_enabled
+    }
+
+    fn is_condition_populated(&self, filter_id: u64) -> bool {
+        self.condition_cache.is_populated(filter_id)
+    }
+
+    fn is_condition_skipped(&self, filter_id: u64) -> bool {
+        self.condition_cache.is_skipped(filter_id)
+    }
+
+    fn populate_condition_cache(
+        &self,
+        input: RecordBatchOperatorSpec,
+        filter_id: u64,
+        strip_metadata: bool,
+    ) -> RecordBatchOperatorSpec {
+        crate::parquet::populate_condition_cache(
+            input,
+            self.condition_cache.clone(),
+            filter_id,
+            strip_metadata,
+        )
     }
 }

@@ -67,31 +67,48 @@ impl fmt::Display for Input {
 }
 
 impl Input {
+    /// The scan's real data column indices (DuckDB's `usize::MAX` "no column"
+    /// sentinel, used by `COUNT(*)` scans, dropped).
+    fn data_column_indices(&self) -> Result<Vec<usize>, Error> {
+        self.columns
+            .iter()
+            .filter_map(|e| match e {
+                Expression::Ref(r) if r.column_idx == usize::MAX => None,
+                Expression::Ref(r) => Some(Ok(r.column_idx)),
+                _ => Some(Err(Error::UnexpectedInputExpression(e.clone()))),
+            })
+            .collect()
+    }
+
+    /// Whether this scan reads at least one real data column. The condition-cache
+    /// populate path needs one: it strips the two metadata columns back off, which
+    /// a zero-data-column (e.g. `COUNT(*)`) scan can't survive.
+    pub(crate) fn has_data_columns(&self) -> bool {
+        self.data_column_indices().is_ok_and(|c| !c.is_empty())
+    }
+
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         ctx: &dyn QueryContext,
         slots: &mut DynamicFilterSlots,
+        // Emit row-group metadata even if the plan didn't ask for it. Set when a
+        // `Filter` above this scan populates the condition cache and needs the
+        // `(global_row_group, row_idx)` columns to attribute survivors.
+        force_row_group_metadata: bool,
+        // When `Some(id)`, replay the cached survivors for filter `id` (a previous
+        // run of the same query recorded them) so only those rows are decoded.
+        replay_condition_filter: Option<u64>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let column_indices: Vec<usize> = self
-            .columns
-            .iter()
-            .filter_map(|e| match e {
-                // DuckDB emits column_idx == usize::MAX as a sentinel for
-                // "no column needed" (e.g. COUNT(*) scans). Skip these.
-                Expression::Ref(r) if r.column_idx == usize::MAX => None,
-                Expression::Ref(r) => Some(Ok(r.column_idx)),
-                _ => Some(Err(Error::UnexpectedInputExpression(e.clone()))),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let projection = DispatchProjection::columns(column_indices);
+        let projection = DispatchProjection::columns(self.data_column_indices()?);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
         self.table
             .compile(
                 dispatcher,
                 projection,
                 dynamic_filters,
-                self.emit_row_group_metadata,
+                self.emit_row_group_metadata || force_row_group_metadata,
+                replay_condition_filter,
                 ctx,
             )
             .map_err(Error::TableScan)

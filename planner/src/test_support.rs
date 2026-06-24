@@ -100,6 +100,7 @@ impl Table for TestTable {
         projection: Projection,
         _dynamic_filters: Vec<DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
+        _replay_condition_filter: Option<u64>,
         _ctx: &dyn crate::catalog::QueryContext,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         let projected = self

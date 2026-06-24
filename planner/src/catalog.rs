@@ -81,6 +81,45 @@ pub trait QueryContext {
     /// Downcast hook. The trait carries no behaviour of its own — a backend
     /// recovers its concrete context from this and reads whatever it needs.
     fn as_any(&self) -> &dyn Any;
+
+    /// Whether this backend has a condition cache at all. The compiler only runs
+    /// the populate path (which forces a metadata-mode scan and relies on
+    /// [`populate_condition_cache`](Self::populate_condition_cache) to strip those
+    /// columns back off) when this is `true`, so a backend that ignores the cache
+    /// is never left with unstripped metadata columns. Default `false`.
+    fn condition_cache_enabled(&self) -> bool {
+        false
+    }
+
+    /// Whether the backend's condition cache already holds the survivors for the
+    /// filter identified by `filter_id`. When `true`, the compiler skips
+    /// populating it again (and the extra metadata-mode scan that entails).
+    /// Backends without such a cache return `false`.
+    fn is_condition_populated(&self, _filter_id: u64) -> bool {
+        false
+    }
+
+    /// Whether `filter_id` was judged not worth caching (too many survivors). When
+    /// `true`, the compiler neither populates nor replays it — it takes the plain
+    /// scan path. Backends without a cache return `false`.
+    fn is_condition_skipped(&self, _filter_id: u64) -> bool {
+        false
+    }
+
+    /// Wrap a post-filter scan spec with an operator that records which rows
+    /// survived the filter (keyed by `filter_id`) into the backend's condition
+    /// cache, so a repeat of the same query can replay them. `strip_metadata`
+    /// drops the row-group metadata columns the populate path added (a plain
+    /// filter wants its original schema back) versus leaving them for a downstream
+    /// materialize. Backends without a cache return `input` unchanged.
+    fn populate_condition_cache(
+        &self,
+        input: RecordBatchOperatorSpec,
+        _filter_id: u64,
+        _strip_metadata: bool,
+    ) -> RecordBatchOperatorSpec {
+        input
+    }
 }
 
 /// The default [`QueryContext`]: carries nothing, for backends whose tables are
@@ -117,12 +156,18 @@ pub trait Table: Debug + Send + Sync {
     /// downcasts it to reload itself to the latest committed version before
     /// scanning, so a reused (cached) plan sees data committed since it was
     /// planned. Backends with no such notion ignore it.
+    /// `replay_condition_filter`, when `Some(id)`, asks the scan to replay the
+    /// rows a previous run recorded for that filter in the condition cache: it
+    /// feeds the cached surviving row indices into each row group so only those
+    /// rows are decoded. The filter above still runs, so this is a pure
+    /// optimization; backends without a condition cache ignore it.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
+        replay_condition_filter: Option<u64>,
         ctx: &dyn QueryContext,
     ) -> Result<RecordBatchOperatorSpec>;
 

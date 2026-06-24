@@ -113,7 +113,7 @@ impl Plan {
         let ctx = self.catalog.query_context();
         let mut slots = DynamicFilterSlots::new();
         self.root
-            .compile(dispatcher, &self.catalog, ctx.as_ref(), &mut slots)
+            .compile(dispatcher, &self.catalog, ctx.as_ref(), &mut slots, false)
     }
 }
 
@@ -124,6 +124,9 @@ impl PlanNode {
         catalog: &Arc<dyn Catalog>,
         ctx: &dyn QueryContext,
         slots: &mut DynamicFilterSlots,
+        // Whether this node's parent is a `Filter`. Used so the condition cache
+        // fires only at the *outermost* filter of a stacked-filter chain.
+        parent_is_filter: bool,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
         // fully determined by table metadata (e.g. parquet row-group
@@ -136,13 +139,58 @@ impl PlanNode {
             return Ok(spec);
         }
 
+        // Condition cache: the *outermost* `Filter` of a chain of one or more
+        // `Filter`s sitting on a table scan (DuckDB may emit the `WHERE` as
+        // several stacked filters). Firing at the outermost — `!parent_is_filter`
+        // — captures the rows the *whole* filter keeps, not a sub-filter's. On the
+        // first run the scan emits row-group metadata so the survivors can be
+        // recorded; on a repeat the scan replays only those rows.
+        if ctx.condition_cache_enabled()
+            && !parent_is_filter
+            && matches!(self.operator, crate::Operator::Filter(_))
+            && let Some((scan_node, filters)) = collect_filter_chain(self)
+            && let crate::Operator::Input(scan) = &scan_node.operator
+            && scan.has_data_columns()
+        {
+            let filter_id = condition_filter_id(self);
+            // A filter judged non-selective on a previous run is left out of the
+            // cache: fall through to the plain scan path (no populate, no replay).
+            if !ctx.is_condition_skipped(filter_id) {
+                let replay = ctx.is_condition_populated(filter_id);
+                // Replaying injects the cached survivors (no metadata needed). First
+                // sight forces row-group metadata so the populator above the chain
+                // can attribute survivors, then strips it back off.
+                let force_metadata = !replay && !scan.emit_row_group_metadata;
+                let scan_spec = scan.compile(
+                    dispatcher,
+                    ctx,
+                    slots,
+                    force_metadata,
+                    replay.then_some(filter_id),
+                )?;
+                // Rebuild the chain innermost-first (filters are outermost-first).
+                let mut spec = scan_spec;
+                for filter in filters.iter().rev() {
+                    spec = filter.compile(spec)?;
+                }
+                return Ok(if replay {
+                    // The filters above re-run over the already-surviving rows (a
+                    // no-op), so replay stays a pure optimization.
+                    spec
+                } else {
+                    ctx.populate_condition_cache(spec, filter_id, force_metadata)
+                });
+            }
+        }
+
+        let child_parent_is_filter = matches!(self.operator, crate::Operator::Filter(_));
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, ctx, slots)?);
+            inputs.push(input.compile(dispatcher, catalog, ctx, slots, child_parent_is_filter)?);
         }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher, ctx, slots),
+            crate::Operator::Input(o) => o.compile(dispatcher, ctx, slots, false, None),
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, catalog.as_ref(), ctx),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
@@ -161,6 +209,42 @@ impl PlanNode {
             // SET/RESET is intercepted by the server after planning (it toggles
             // session state, not data), so it should never reach compilation.
             crate::Operator::SetVariable(_) => Err(Error::SetVariableNotCompilable),
+        }
+    }
+}
+
+/// A stable identity for a `Filter`-over-scan subtree, used as the condition
+/// cache key. Hashes the node's textual plan (its `Display`, which recurses
+/// through the filter conditions and the scan's columns), so two runs of the same
+/// query agree and different filters don't collide. Table *version* is not folded
+/// in: the cache is cleared whenever a table's files change (see
+/// `QueryConditionCache::clear`), so every live entry already matches the current
+/// data.
+fn condition_filter_id(node: &PlanNode) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    node.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// If `node` is a chain of one or more `Filter`s ending in an `Input`, return the
+/// `Input` node and the filters (outermost first). `None` for any other shape
+/// (e.g. a projection between filters), so the condition cache only engages when
+/// the filters sit directly on the scan and together form the whole `WHERE`.
+fn collect_filter_chain(node: &PlanNode) -> Option<(&PlanNode, Vec<&crate::operator::Filter>)> {
+    let mut filters = Vec::new();
+    let mut current = node;
+    loop {
+        match &current.operator {
+            crate::Operator::Filter(filter) => {
+                let [child] = current.inputs.as_slice() else {
+                    return None;
+                };
+                filters.push(filter);
+                current = child;
+            }
+            crate::Operator::Input(_) if !filters.is_empty() => return Some((current, filters)),
+            _ => return None,
         }
     }
 }

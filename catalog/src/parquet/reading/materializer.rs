@@ -8,12 +8,12 @@
 //! downstream Parquet reader can fetch only the rows that passed a filter,
 //! reading them sequentially within each row group for optimal IO.
 
-use crate::parquet::reading::record_batch_metadata::{global_row_group, row_index};
+use crate::parquet::reading::record_batch_metadata::accumulate_row_indices;
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::projection::Projection;
 use crate::parquet::{ParquetTable, RowGroupRequest};
 use ahash::HashMap;
-use arrow_array::{Array, RecordBatch, UInt32Array};
+use arrow_array::RecordBatch;
 use dispatch::Sender;
 use dispatch::{Unary, UnaryFactory};
 use std::mem;
@@ -86,36 +86,7 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
         batch: RecordBatch,
         _sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        // The row-group column is a `RunArray` (consecutive same-group rows = one
-        // run). The batch may be a logical slice (e.g. a `LIMIT` above the scan),
-        // so walk the *logical* runs via `RunEndBuffer::sliced_values()` — run
-        // ends already adjusted by the slice offset and capped at the slice
-        // length — and map each run to its physical group value from
-        // `get_start_physical_index()`. Reading the raw (physical) `run_ends`
-        // would treat them as logical bounds and overrun the (shorter) sliced
-        // `row_indices`.
-        let groups = global_row_group(&batch);
-        let run_ends = groups.run_ends();
-        let physical_start = run_ends.get_start_physical_index();
-        let group_values = groups
-            .values()
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .unwrap();
-        let row_indices = row_index(&batch);
-
-        let mut logical = 0usize;
-        for (run_offset, logical_end) in run_ends.sliced_values().enumerate() {
-            let logical_end = logical_end as usize;
-            let group = group_values.value(physical_start + run_offset);
-            let entries = self.pending_row_groups.entry(group).or_default();
-            // `row_indices` is logically indexed, so `value(logical)` accounts
-            // for any slice offset.
-            while logical < logical_end {
-                entries.push(row_indices.value(logical));
-                logical += 1;
-            }
-        }
+        accumulate_row_indices(&batch, &mut self.pending_row_groups);
         Ok(())
     }
 

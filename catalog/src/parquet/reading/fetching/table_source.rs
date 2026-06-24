@@ -86,11 +86,21 @@ impl RowGroupInjectorFactory {
     /// `scan_order` is set (a Top-N boundary on one key), row groups are pushed
     /// in that key's order so the most-promising are stolen first and the
     /// boundary prunes the rest; otherwise they're pushed in file order.
+    ///
+    /// When `condition_replay` is set, this is a replay scan: only the row groups
+    /// a previous run recorded survivors for are pushed, each seeded with those
+    /// surviving row indices so the decoder produces just those rows. A row group
+    /// absent from the cache had no matches on the populate run (the cache records
+    /// every group with at least one survivor), so it is skipped entirely. This
+    /// mirrors late materialization's survivor-only re-fetch rather than scanning
+    /// every row group, which is both the win and what keeps the working set
+    /// bounded. The `Filter` above still runs (a no-op over already-surviving rows).
     pub fn new(
         table: &Arc<ParquetTable>,
         projection: Projection,
         filter: Option<RowGroupFilter>,
         scan_order: Option<ScanOrder>,
+        condition_replay: Option<(Arc<crate::QueryConditionCache>, u64)>,
     ) -> Self {
         let injector = Arc::new(Injector::new());
         let order = match scan_order {
@@ -98,7 +108,17 @@ impl RowGroupInjectorFactory {
             None => (0..table.row_groups.len()).collect(),
         };
         for row_group_idx in order {
-            injector.push(QueryRowGroupMetadata::new(table, row_group_idx, None));
+            match &condition_replay {
+                Some((cache, filter_id)) => match cache.lookup(*filter_id, row_group_idx as u32) {
+                    Some(survivors) => injector.push(QueryRowGroupMetadata::new(
+                        table,
+                        row_group_idx,
+                        Some(survivors.to_vec()),
+                    )),
+                    None => continue, // no survivors recorded for this group: skip it
+                },
+                None => injector.push(QueryRowGroupMetadata::new(table, row_group_idx, None)),
+            }
         }
         Self {
             row_groups: injector,
