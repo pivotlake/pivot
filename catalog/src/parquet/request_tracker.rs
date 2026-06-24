@@ -15,7 +15,7 @@ use std::collections::HashMap;
 /// Most reads to hand the worker for submission in one pass. The worker submits a
 /// whole returned batch to its io_uring at once and only reaps (and submits the next
 /// batch) once the ring drains, so a batch larger than the ring's completion queue
-/// overflows it — and while the worker is busy finishing rather than entering the
+/// overflows it - and while the worker is busy finishing rather than entering the
 /// ring, the overflowed completions are never flushed, so the fetcher waits forever
 /// on reads that already landed. Containment dedup (see [`schedule_or_join`]) keeps
 /// the common case small, but a genuine burst of distinct reads (a very wide table,
@@ -25,23 +25,30 @@ use std::collections::HashMap;
 /// Tied to the ring rather than a magic number: io_uring sizes the completion queue
 /// at twice the submission queue ([`RING_SIZE`]), and the worker only submits a new
 /// batch once the ring has drained, so an outstanding batch of `RING_SIZE` reads can
-/// never overflow the CQ — it uses half its capacity, leaving headroom for the
+/// never overflow the CQ - it uses half its capacity, leaving headroom for the
 /// engine's own cache-file reads on the shared ring. The remaining reads stay queued
 /// and drain over the next passes.
 ///
 /// [`schedule_or_join`]: RequestTracker::schedule_or_join
 const MAX_SUBMIT_BATCH: usize = RING_SIZE as usize;
 
-/// Identity of one cache-block read: which file, and the exact byte run
-/// (`offset`, `len`). Hashable, so it can key the routing map and a completion can
-/// be matched back to it. `len` is part of the identity (a completion must name
-/// the exact run that was submitted); deduplication, though, is by *containment*,
-/// not equality - see [`RequestTracker::find_containing_read`].
+/// Identity of one cache-block read: which file, the byte run (`offset`, `len`),
+/// and `dest` - the cache-slot address the read fills. Hashable, so it can key the
+/// routing map and a completion can be matched back to it.
+///
+/// `dest` is what makes the identity *physical*: two reads of the same file run can
+/// land in different cache slots (e.g. a re-`open_entry`d file allocates fresh),
+/// and only `dest` tells them apart. Deduplication is by *containment* on `dest`
+/// (see [`RequestTracker::find_containing_read`]): a read is folded onto another
+/// only when it fills the same bytes of the same slot, so it can never be folded
+/// onto a read filling a different slot - which a file-range-only match could do.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReadRequest {
     pub location: FileLocation,
     pub offset: usize,
     pub len: usize,
+    /// Address of the cache slot region this read fills (`MissingBlock::dest`).
+    pub dest: usize,
 }
 
 impl ReadRequest {
@@ -51,6 +58,7 @@ impl ReadRequest {
             location: FileLocation::Local(req.file.clone()),
             offset: req.block.file_offset(),
             len: req.block.len(),
+            dest: req.block.dest() as usize,
         }
     }
 
@@ -60,12 +68,13 @@ impl ReadRequest {
             location: FileLocation::Remote(req.remote.clone()),
             offset: req.block.file_offset(),
             len: req.block.len(),
+            dest: req.block.dest() as usize,
         }
     }
 }
 
 /// A request that exposes the not-yet-submitted reads it has generated, for the
-/// tracker to drain. The two vectors are mutually exclusive in practice — a
+/// tracker to drain. The two vectors are mutually exclusive in practice - a
 /// request reads one file, which is local xor remote.
 pub(crate) trait PendingRequest {
     fn pending_fs(&mut self) -> &mut Vec<FsRequest>;
@@ -90,7 +99,7 @@ pub(crate) struct RequestTracker<T: PendingRequest> {
     /// [`take_fs_requests`](Self::take_fs_requests) / `take_http_requests`).
     pending_fs: Vec<FsRequest>,
     pending_http: Vec<HttpRequest>,
-    /// Submitted-but-not-landed reads, per medium — the fetcher caps disk and
+    /// Submitted-but-not-landed reads, per medium - the fetcher caps disk and
     /// HTTP separately since their latencies differ.
     disk_in_flight: usize,
     http_in_flight: usize,
@@ -191,23 +200,36 @@ impl<T: PendingRequest> RequestTracker<T> {
         true
     }
 
-    /// The in-flight read of `read`'s file that fully contains it (`read`'s byte
-    /// range inside it), or `None`. A contained read is satisfied by its container:
-    /// it refills into the same slot the container is already filling, so the
-    /// container landing fills its bytes too.
+    /// The in-flight read of `read`'s file whose slot region fully contains
+    /// `read`'s, or `None`. We fold `read` onto it (issue no IO) and let it fill
+    /// `read`'s bytes - which is sound only if they fill the *same* cache slot.
+    ///
+    /// Containment is therefore on `dest` (the slot address), NOT the file range.
+    /// They usually agree: a second reader of a block refills into the slot the
+    /// first reader already mapped it to. But the file's extent map can be wiped
+    /// (`open_entry` re-registers the file, `drop_cache` drains it) while a read is
+    /// in flight, after which a re-read of the same file range *misses* and lands in
+    /// a different slot - so file-range matching would wrongly fold it on:
+    ///
+    /// ```text
+    ///   A: get(block0) -> miss -> slot S1; A's read in flight, S1 not yet filled
+    ///   *** extent map wiped: "block0 -> S1" forgotten ***
+    ///   B: get(block0) -> miss (block0's slot forgotten) -> fresh slot S2
+    ///   file-range match: B's range == A's range -> fold B onto A   [WRONG]
+    ///       A fills S1; S2 is never written; B reads S2 -> garbage.
+    ///   dest match: A fills S1, B fills S2 -> disjoint -> B issued -> correct.
+    /// ```
     ///
     /// A linear scan over that file's in-flight reads (the inner map). That set is
     /// small, and `routing` is the single source of truth for what's scheduled, so
-    /// scanning it avoids a second index to keep in lock-step. Any container is
-    /// equally correct: while a read is in flight its slot is pinned, so every read
-    /// touching a given block maps to that block's one cache slot.
+    /// scanning it avoids a second index to keep in lock-step.
     fn find_containing_read(&self, read: &ReadRequest) -> Option<ReadRequest> {
         self.routing
             .get(&read.location)?
             .keys()
             .find(|scheduled| {
-                scheduled.offset <= read.offset
-                    && scheduled.offset + scheduled.len >= read.offset + read.len
+                scheduled.dest <= read.dest
+                    && scheduled.dest + scheduled.len >= read.dest + read.len
             })
             .cloned()
     }
@@ -226,14 +248,10 @@ impl<T: PendingRequest> RequestTracker<T> {
         self.pending_http.drain(..n).collect()
     }
 
-    /// A read landed: drop its in-flight charge (the medium is the read's own
-    /// location) and return every slot waiting on it — the caller advances each.
-    /// The read was registered when staged, so its entry is present.
+    /// A read landed: return every slot waiting on it (the caller advances each)
+    /// and drop its in-flight charge. Only *submitted* reads ever complete - a
+    /// deduped read never reaches the ring - so its routing entry is present.
     pub fn complete(&mut self, read: &ReadRequest) -> Vec<usize> {
-        match read.location {
-            FileLocation::Local(_) => self.disk_in_flight -= 1,
-            FileLocation::Remote(_) => self.http_in_flight -= 1,
-        }
         let file = self
             .routing
             .get_mut(&read.location)
@@ -243,6 +261,12 @@ impl<T: PendingRequest> RequestTracker<T> {
         // an empty map per file ever read.
         if file.is_empty() {
             self.routing.remove(&read.location);
+        }
+        // Drop the charge only after confirming the read was in flight, so the
+        // counter can't underflow ahead of the guards above.
+        match read.location {
+            FileLocation::Local(_) => self.disk_in_flight -= 1,
+            FileLocation::Remote(_) => self.http_in_flight -= 1,
         }
         waiters
     }
@@ -269,7 +293,7 @@ impl<T: PendingRequest> RequestTracker<T> {
         self.http_in_flight
     }
 
-    /// No reads are in flight — every admitted request has drained.
+    /// No reads are in flight - every admitted request has drained.
     pub fn is_idle(&self) -> bool {
         self.disk_in_flight == 0 && self.http_in_flight == 0
     }
@@ -278,6 +302,7 @@ impl<T: PendingRequest> RequestTracker<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dispatch::memory::file_memory_cache::MissingBlock;
     use dispatch::memory::{init_test_free_pool, memory_ctx};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -318,7 +343,7 @@ mod tests {
     }
 
     /// Wrap a cache missing-block as a local `FsRequest`.
-    fn as_fs_request(location: &FileLocation, block: dispatch::memory::file_memory_cache::MissingBlock) -> FsRequest {
+    fn as_fs_request(location: &FileLocation, block: MissingBlock) -> FsRequest {
         match location {
             FileLocation::Local(file) => FsRequest {
                 file: file.clone(),
@@ -328,17 +353,13 @@ mod tests {
         }
     }
 
-    /// The first fs read a `get` of `[offset, offset+len)` produces — the
+    /// The first fs read a `get` of `[offset, offset+len)` produces - the
     /// descriptor a single-block column lookup would yield.
     fn fs_read(location: &FileLocation, offset: usize, len: usize) -> FsRequest {
-        let lookups = memory_ctx().file_memory_cache().get(location, offset, len);
-        let block = lookups
-            .iter()
-            .flat_map(|lookup| lookup.missing())
+        fs_reads(location, offset, len)
+            .into_iter()
             .next()
             .expect("an uncached range yields a missing block")
-            .clone();
-        as_fs_request(location, block)
     }
 
     /// *All* fs reads a column-style `get` of `[offset, offset+len)` produces. A
@@ -397,6 +418,32 @@ mod tests {
         assert_eq!(tracker.take_fs_requests().len(), 1);
         assert_eq!(tracker.disk_in_flight(), 1);
         assert_eq!(tracker.complete(&big), vec![big_slot, inner_slot]);
+    }
+
+    #[test]
+    fn a_reread_into_a_different_slot_is_not_folded_onto_the_stale_read() {
+        init_test_free_pool(8);
+        let (location, _dir) = registered_file();
+        // Read [0,4096), then drop the file's cached extents so the same range
+        // re-reads into a *different* slot. Same file range, different memory: the
+        // second read must NOT be folded onto the first - doing so would credit it
+        // when the first's slot fills and leave its own slot full of garbage.
+        let first = fs_read(&location, 0, 4096);
+        memory_ctx().file_memory_cache().open_entry(location.clone());
+        let second = fs_read(&location, 0, 4096);
+        assert_ne!(
+            ReadRequest::of_fs(&first).dest,
+            ReadRequest::of_fs(&second).dest,
+            "re-read after open_entry should land in a different slot",
+        );
+
+        let mut tracker = RequestTracker::default();
+        tracker.admit_request(TestRequest::with_fs(vec![first]));
+        tracker.admit_request(TestRequest::with_fs(vec![second]));
+
+        // Two distinct physical reads, each filling its own slot.
+        assert_eq!(tracker.take_fs_requests().len(), 2);
+        assert_eq!(tracker.disk_in_flight(), 2);
     }
 
     #[test]
