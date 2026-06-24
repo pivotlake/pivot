@@ -73,6 +73,8 @@ mod api;
 mod data_flow;
 mod functions;
 mod operations;
+#[cfg(feature = "perf")]
+mod profiler;
 mod scan;
 mod stats;
 
@@ -87,6 +89,8 @@ pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
+#[cfg(feature = "perf")]
+pub use profiler::worker_tids;
 pub use scan::{Projection, ROW_GROUP_IDX_FIELD, ROW_IDX_FIELD, trailing_metadata_columns};
 pub use stats::DataFlowStats;
 
@@ -150,6 +154,29 @@ pub struct DataFlowDispatcher {
     /// kick idle workers out of their park; worker threads access the same
     /// instance through their thread-local [`crate::worker::worker_waker`].
     waker: Arc<WorkerWaker>,
+    /// Whether every dataflow launched through this handle is marked profiled.
+    /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling))
+    /// so profiling — and the exclusive execution it triggers — is scoped to one
+    /// query's dataflows; `false` on the shared handle.
+    #[cfg(feature = "perf")]
+    profiled: bool,
+}
+
+#[cfg(feature = "perf")]
+impl DataFlowDispatcher {
+    /// Return a clone of this dispatcher that marks every dataflow it launches as
+    /// profiled. Clone the shared handle, call this, and compile/execute through
+    /// the result so only that query's dataflows are profiled (and run
+    /// exclusively while they do).
+    pub fn with_profiling(mut self, profiled: bool) -> Self {
+        self.profiled = profiled;
+        self
+    }
+
+    /// Whether this handle marks its dataflows profiled.
+    pub(crate) fn profiled(&self) -> bool {
+        self.profiled
+    }
 }
 
 impl DataFlowDispatcher {
@@ -280,6 +307,8 @@ impl Dispatch {
                 senders,
                 buffers,
                 waker: waker.clone(),
+                #[cfg(feature = "perf")]
+                profiled: false,
             },
             handles: threads,
             shutdown: Shutdown {

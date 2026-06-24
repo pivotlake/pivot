@@ -206,12 +206,30 @@ pub struct DataFlow {
     /// Collects this worker's execution stats for the dataflow. Inert unless the
     /// query opted in; driven by the worker through [`stats`](Self::stats).
     stats: StatsCollector,
+    /// Whether this dataflow is being profiled. While any profiled dataflow is
+    /// live the worker runs *only* profiled dataflows (see
+    /// [`crate::profiler`]), so a `perf` capture isn't polluted by other work
+    /// sharing the pool. Set when the launching dispatcher was marked (see
+    /// [`DataFlowDispatcher::with_profiling`](crate::DataFlowDispatcher::with_profiling)).
+    #[cfg(feature = "perf")]
+    profiled: bool,
 }
 
 impl Debug for DataFlow {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut debug_struct = f.debug_struct("Dataflow");
         debug_struct.field("id", &self.id).finish()
+    }
+}
+
+#[cfg(feature = "perf")]
+impl Drop for DataFlow {
+    fn drop(&mut self) {
+        // Release this dataflow's hold on exclusive execution once it finishes
+        // (or is cancelled/dropped), paired with the bump in `with_profiling`.
+        if self.profiled {
+            crate::profiler::PROFILED_FLOWS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -240,10 +258,30 @@ impl DataFlow {
             cancelled: canceled,
             err_tx,
             stats: StatsCollector::new(stats_tx, collect_stats),
+            #[cfg(feature = "perf")]
+            profiled: false,
         }
     }
     pub fn id(&self) -> Identifier {
         self.id
+    }
+
+    /// Mark this dataflow profiled. Bumps the global live-profiled count (paired
+    /// with the decrement in [`Drop`]) so the worker switches to running only
+    /// profiled dataflows while this one exists.
+    #[cfg(feature = "perf")]
+    pub fn with_profiling(mut self, profiled: bool) -> Self {
+        if profiled {
+            crate::profiler::PROFILED_FLOWS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.profiled = profiled;
+        self
+    }
+
+    /// Whether this dataflow is profiled (and so runs exclusively).
+    #[cfg(feature = "perf")]
+    pub fn is_profiled(&self) -> bool {
+        self.profiled
     }
 
     /// This dataflow's stats collector. The worker records IO/CPU work against it
