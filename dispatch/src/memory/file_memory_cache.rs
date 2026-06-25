@@ -109,10 +109,6 @@ pub struct FillCursor {
     buffer: Option<Arc<ReadBuffer>>,
     /// Ring slot index of `buffer`.
     slot_idx: usize,
-    /// `buffer`'s start address, cached so the hot path skips a deref.
-    slot_ptr: usize,
-    /// The slot's `generation` snapshotted when this buffer was taken.
-    generation: u32,
     /// Bump pointer: the next free sub-block in `buffer` (0..=512).
     next_sub_block: u16,
 }
@@ -123,8 +119,6 @@ impl FillCursor {
         FillCursor {
             buffer: None,
             slot_idx: 0,
-            slot_ptr: 0,
-            generation: 0,
             next_sub_block: 0,
         }
     }
@@ -188,20 +182,18 @@ pub struct MissingBlock {
 
 impl MissingBlock {
     /// A block covering `sub_block_count` sub-blocks starting at `first_sub_block`
-    /// of the slot at `slot_ptr`, whose bytes come from `file_offset`, sharing the
-    /// slot pin.
+    /// of the slot `pin` holds, whose bytes come from `file_offset`. The slot index
+    /// and base address are read from `pin`, so the read target can't drift from it.
     fn new(
         file_offset: usize,
-        slot_ptr: usize,
-        slot_idx: usize,
         first_sub_block: usize,
         sub_block_count: usize,
         pin: Arc<ReadBuffer>,
     ) -> Self {
         MissingBlock {
             file_offset,
-            dest: slot_ptr + first_sub_block * SUB_BLOCK_SIZE,
-            slot_idx,
+            dest: pin.ptr as usize + first_sub_block * SUB_BLOCK_SIZE,
+            slot_idx: pin.slot_idx,
             first_sub_block,
             sub_block_count,
             _pin: pin,
@@ -219,7 +211,7 @@ impl MissingBlock {
         self.sub_block_count * SUB_BLOCK_SIZE
     }
 
-    /// Whether this block covers zero bytes.
+    /// Whether this block covers zero bytes. Pairs with [`len`](Self::len).
     pub fn is_empty(&self) -> bool {
         self.sub_block_count == 0
     }
@@ -548,11 +540,9 @@ impl FileMemoryCache {
         }
         let start_sub_block = fill_cursor.next_sub_block as usize;
         let want = block_count.min(SUB_BLOCKS_PER_SLOT - start_sub_block);
-        let slot_idx = fill_cursor.slot_idx;
-        let generation = fill_cursor.generation;
 
         // Claim the free prefix of the run under the file's write lock, re-creating
-        // the file's entry if it was pruned (same retry shape as the old miss path).
+        // the file's entry if a concurrent eviction pruned it.
         let claimed = loop {
             let file_maps = self.file_maps.read().unwrap();
             let Some(extents_lock) = file_maps.get(location) else {
@@ -571,7 +561,7 @@ impl FileMemoryCache {
                 // between the two ever unwind, a tenant-without-extent is harmless
                 // (the evictor skips it) whereas an extent-without-tenant would leak
                 // (the evictor only prunes runs it finds in the tenant list).
-                self.tenants_mut(slot_idx).push(Tenant {
+                self.tenants_mut(fill_cursor.slot_idx).push(Tenant {
                     location: location.clone(),
                     first_block_in_file,
                 });
@@ -579,15 +569,22 @@ impl FileMemoryCache {
                     first_block_in_file,
                     Extent {
                         first_block_in_file,
-                        slot_idx: slot_idx as u32,
+                        slot_idx: fill_cursor.slot_idx as u32,
                         sub_block_in_slot: start_sub_block as u16,
                         block_count: claimed as u16,
-                        generation,
+                        // The cursor pins this slot, so its generation can't be
+                        // recycled out from under us; read the live value.
+                        generation: self
+                            .entry(fill_cursor.slot_idx)
+                            .generation
+                            .load(Ordering::Acquire),
                     },
                 );
                 // Mark the slot referenced so a freshly packed run survives one CLOCK
-                // sweep, the way the old positional region-bind did on its slot.
-                self.entry(slot_idx).ref_bit.store(true, Ordering::Relaxed);
+                // sweep before becoming eligible for eviction.
+                self.entry(fill_cursor.slot_idx)
+                    .ref_bit
+                    .store(true, Ordering::Relaxed);
             }
             break claimed;
         };
@@ -652,21 +649,15 @@ impl FileMemoryCache {
     fn rotate_fill_buffer(&self, fill_cursor: &mut FillCursor) {
         let write_buffer = memory_ctx().get_write_buffer(false);
         let slot_idx = write_buffer.slot_idx;
-        let slot_ptr = write_buffer.ptr as usize;
         let entry = self.entry(slot_idx);
         // Exclusively held (WRITING): reset metadata before any reader can pin it.
         entry.valid.clear();
         self.tenants_mut(slot_idx).clear();
         entry.bound.store(true, Ordering::Relaxed);
-        // The slot's generation was already bumped by whoever recycled it (eviction
-        // or `clear`); snapshot it so this fill's extents carry the live value.
-        let generation = entry.generation.load(Ordering::Acquire);
         let buffer = ReadBuffer::from(write_buffer); // used=1, Release; non-zeroed
 
         fill_cursor.buffer = Some(Arc::new(buffer));
         fill_cursor.slot_idx = slot_idx;
-        fill_cursor.slot_ptr = slot_ptr;
-        fill_cursor.generation = generation;
         fill_cursor.next_sub_block = 0;
     }
 
@@ -730,13 +721,13 @@ impl FileMemoryCache {
             if panic_at.is_none() && iterations == warn_at {
                 tracing::warn!(
                     iterations,
-                    "FileCache::evict: no memory left to evict, sleeping"
+                    "FileMemoryCache::evict: no memory left to evict, sleeping"
                 );
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 panic_at = Some(iterations + ring_len);
             } else if panic_at.is_some_and(|limit| iterations >= limit) {
                 panic!(
-                    "FileCache::evict: still no evictable memory after sleeping \
+                    "FileMemoryCache::evict: still no evictable memory after sleeping \
                      ({iterations} iterations) — aborting query (cache exhausted \
                      by an oversized working set)"
                 );
@@ -930,8 +921,6 @@ fn build_lookup(
     let missing = if needs_read {
         vec![MissingBlock::new(
             first_block_in_file * SUB_BLOCK_SIZE,
-            pin.ptr as usize,
-            pin.slot_idx,
             first_sub_block,
             block_count,
             pin,
