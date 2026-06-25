@@ -32,6 +32,17 @@ use std::collections::HashMap;
 /// [`schedule_or_join`]: RequestTracker::schedule_or_join
 const MAX_SUBMIT_BATCH: usize = RING_SIZE as usize;
 
+/// Take up to [`MAX_SUBMIT_BATCH`] reads off the front of `pending`, leaving the rest
+/// queued. Takes the whole vec without copying when it already fits in one batch (the
+/// common case); only a genuine overflow pays the front-drain.
+fn take_batch<R>(pending: &mut Vec<R>) -> Vec<R> {
+    if pending.len() <= MAX_SUBMIT_BATCH {
+        std::mem::take(pending)
+    } else {
+        pending.drain(..MAX_SUBMIT_BATCH).collect()
+    }
+}
+
 /// Identity of one cache-block read: which file, the byte run (`offset`, `len`),
 /// and `dest` - the cache-slot address the read fills. Hashable, so it can key the
 /// routing map and a completion can be matched back to it.
@@ -185,12 +196,8 @@ impl<T: PendingRequest> RequestTracker<T> {
     /// add `slot` to that read's waiter list (it is advanced once when that read
     /// lands) and submit nothing. Otherwise `read` is new: route it and submit it.
     fn schedule_or_join(&mut self, read: ReadRequest, slot: usize) -> bool {
-        if let Some(container) = self.find_containing_read(&read) {
-            self.routing
-                .get_mut(&read.location)
-                .and_then(|file| file.get_mut(&container))
-                .expect("an in-flight read is always in `routing`")
-                .push(slot);
+        if let Some(waiters) = self.find_containing_read(&read) {
+            waiters.push(slot);
             return false;
         }
         self.routing
@@ -200,9 +207,11 @@ impl<T: PendingRequest> RequestTracker<T> {
         true
     }
 
-    /// The in-flight read of `read`'s file whose slot region fully contains
-    /// `read`'s, or `None`. We fold `read` onto it (issue no IO) and let it fill
-    /// `read`'s bytes - which is sound only if they fill the *same* cache slot.
+    /// The waiter list of the in-flight read of `read`'s file whose slot region
+    /// fully contains `read`'s, or `None`. We fold `read` onto that read (issue no
+    /// IO) and let it fill `read`'s bytes - which is sound only if they fill the
+    /// *same* cache slot. Returns the list directly so the caller pushes its waiter
+    /// without re-finding the entry.
     ///
     /// Containment is therefore on `dest` (the slot address), NOT the file range.
     /// They usually agree: a second reader of a block refills into the slot the
@@ -223,29 +232,27 @@ impl<T: PendingRequest> RequestTracker<T> {
     /// A linear scan over that file's in-flight reads (the inner map). That set is
     /// small, and `routing` is the single source of truth for what's scheduled, so
     /// scanning it avoids a second index to keep in lock-step.
-    fn find_containing_read(&self, read: &ReadRequest) -> Option<ReadRequest> {
+    fn find_containing_read(&mut self, read: &ReadRequest) -> Option<&mut Vec<usize>> {
         self.routing
-            .get(&read.location)?
-            .keys()
-            .find(|scheduled| {
+            .get_mut(&read.location)?
+            .iter_mut()
+            .find(|(scheduled, _)| {
                 scheduled.dest <= read.dest
                     && scheduled.dest + scheduled.len >= read.dest + read.len
             })
-            .cloned()
+            .map(|(_, waiters)| waiters)
     }
 
     /// Take up to [`MAX_SUBMIT_BATCH`] of the deduped reads queued for submission to
     /// the ring; the rest stay queued for the next pass so we never overrun the ring.
     pub fn take_fs_requests(&mut self) -> Vec<FsRequest> {
-        let n = self.pending_fs.len().min(MAX_SUBMIT_BATCH);
-        self.pending_fs.drain(..n).collect()
+        take_batch(&mut self.pending_fs)
     }
 
     /// Take up to [`MAX_SUBMIT_BATCH`] of the deduped remote reads queued for
     /// submission; the rest stay queued for the next pass.
     pub fn take_http_requests(&mut self) -> Vec<HttpRequest> {
-        let n = self.pending_http.len().min(MAX_SUBMIT_BATCH);
-        self.pending_http.drain(..n).collect()
+        take_batch(&mut self.pending_http)
     }
 
     /// A read landed: return every slot waiting on it (the caller advances each)
