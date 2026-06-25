@@ -182,20 +182,18 @@ pub struct MissingBlock {
 
 impl MissingBlock {
     /// A block covering `sub_block_count` sub-blocks starting at `first_sub_block`
-    /// of the slot at `slot_ptr`, whose bytes come from `file_offset`, sharing the
-    /// slot pin.
+    /// of the slot `pin` holds, whose bytes come from `file_offset`. The slot index
+    /// and base address are read from `pin`, so the read target can't drift from it.
     fn new(
         file_offset: usize,
-        slot_ptr: usize,
-        slot_idx: usize,
         first_sub_block: usize,
         sub_block_count: usize,
         pin: Arc<ReadBuffer>,
     ) -> Self {
         MissingBlock {
             file_offset,
-            dest: slot_ptr + first_sub_block * SUB_BLOCK_SIZE,
-            slot_idx,
+            dest: pin.ptr as usize + first_sub_block * SUB_BLOCK_SIZE,
+            slot_idx: pin.slot_idx,
             first_sub_block,
             sub_block_count,
             _pin: pin,
@@ -213,7 +211,7 @@ impl MissingBlock {
         self.sub_block_count * SUB_BLOCK_SIZE
     }
 
-    /// Whether this block covers zero bytes.
+    /// Whether this block covers zero bytes. Pairs with [`len`](Self::len).
     pub fn is_empty(&self) -> bool {
         self.sub_block_count == 0
     }
@@ -923,8 +921,6 @@ fn build_lookup(
     let missing = if needs_read {
         vec![MissingBlock::new(
             first_block_in_file * SUB_BLOCK_SIZE,
-            pin.ptr as usize,
-            pin.slot_idx,
             first_sub_block,
             block_count,
             pin,
