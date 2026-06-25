@@ -227,8 +227,11 @@ impl Drop for DataFlow {
     fn drop(&mut self) {
         // Release this dataflow's hold on exclusive execution once it finishes
         // (or is cancelled/dropped), paired with the bump in `with_profiling`.
-        if self.profiled {
-            crate::profiler::PROFILED_FLOWS.fetch_sub(1, Ordering::Relaxed);
+        if self.profiled && crate::profiler::PROFILED_FLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
+            // Exclusive mode just lifted. A worker that parked while holding only
+            // non-profiled (paused) dataflows got no channel send to wake it, so
+            // notify unconditionally or it sleeps until the next unrelated wake.
+            worker_waker().notify();
         }
     }
 }
@@ -268,9 +271,11 @@ impl DataFlow {
 
     /// Mark this dataflow profiled. Bumps the global live-profiled count (paired
     /// with the decrement in [`Drop`]) so the worker switches to running only
-    /// profiled dataflows while this one exists.
+    /// profiled dataflows while this one exists. Call exactly once per dataflow
+    /// (it is not idempotent): a second `true` call leaks a count that never
+    /// drops, wedging exclusive mode on. `pub(crate)`: only the builder uses it.
     #[cfg(feature = "perf")]
-    pub fn with_profiling(mut self, profiled: bool) -> Self {
+    pub(crate) fn with_profiling(mut self, profiled: bool) -> Self {
         if profiled {
             crate::profiler::PROFILED_FLOWS.fetch_add(1, Ordering::Relaxed);
         }

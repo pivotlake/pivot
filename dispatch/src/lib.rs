@@ -156,7 +156,7 @@ pub struct DataFlowDispatcher {
     waker: Arc<WorkerWaker>,
     /// Whether every dataflow launched through this handle is marked profiled.
     /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling))
-    /// so profiling — and the exclusive execution it triggers — is scoped to one
+    /// so profiling (and the exclusive execution it triggers) is scoped to one
     /// query's dataflows; `false` on the shared handle.
     #[cfg(feature = "perf")]
     profiled: bool,

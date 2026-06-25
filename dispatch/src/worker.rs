@@ -309,15 +309,20 @@ impl Worker {
         })
     }
 
+    /// Whether the worker should skip `flow` this pass: a `perf` capture is in
+    /// progress and `flow` is not the dataflow being profiled, so it pauses while
+    /// the profiled dataflow runs alone (see [`crate::profiler`]).
+    #[cfg(feature = "perf")]
+    fn paused_for_profiling(flow: &DataFlow) -> bool {
+        crate::profiler::profiling_active() && !flow.is_profiled()
+    }
+
     /// Submit disk reads from dataflows until the disk queue is busy or no more
     /// requests remain.
     fn saturate_io(&mut self) -> Result<()> {
-        // Don't read ahead for paused (non-profiled) dataflows during a capture.
-        #[cfg(feature = "perf")]
-        let exclusive = crate::profiler::profiling_active();
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
-            if exclusive && !flow.is_profiled() {
+            if Self::paused_for_profiling(flow) {
                 continue;
             }
             if self.io.has_file_pending() {
@@ -348,11 +353,9 @@ impl Worker {
     /// small files, where the whole query becomes round-trip bound.
     fn saturate_http(&mut self) -> Result<()> {
         const HTTP_INFLIGHT_TARGET: usize = 100;
-        #[cfg(feature = "perf")]
-        let exclusive = crate::profiler::profiling_active();
         'flows: for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
-            if exclusive && !flow.is_profiled() {
+            if Self::paused_for_profiling(flow) {
                 continue;
             }
             if self.io.http_in_flight() >= HTTP_INFLIGHT_TARGET {
@@ -388,11 +391,9 @@ impl Worker {
     fn step_run_ready_cpu_work(&mut self) {
         // While a `perf` capture is in progress, run only the profiled dataflow
         // so the profile isn't polluted by other queries / ingest on the pool.
-        #[cfg(feature = "perf")]
-        let exclusive = crate::profiler::profiling_active();
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
-            if exclusive && !flow.is_profiled() {
+            if Self::paused_for_profiling(flow) {
                 continue;
             }
             if let WorkStatus::Ran = flow.run_ready_cpu_work() {
@@ -463,11 +464,9 @@ impl Worker {
 
     /// Attempt to steal work from sibling workers' channels when this worker is idle.
     fn try_steal_work(&mut self) {
-        #[cfg(feature = "perf")]
-        let exclusive = crate::profiler::profiling_active();
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
-            if exclusive && !flow.is_profiled() {
+            if Self::paused_for_profiling(flow) {
                 continue;
             }
             if let WorkStatus::Ran = flow.try_stealing_work() {
