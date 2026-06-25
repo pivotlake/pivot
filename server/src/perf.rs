@@ -4,7 +4,7 @@
 //! `PIVOT_PERF_DIR` set, each query spawns its own `perf record` scoped to the
 //! dispatch worker threads (`-t <tids>`). The query's dataflows are marked
 //! profiled, which makes the workers run *only* that dataflow for its duration
-//! (other queries and ingest encode on the pool pause — see
+//! (other queries and ingest encode on the pool pause; see
 //! [`dispatch::DataFlowDispatcher::with_profiling`]). So the recording captures
 //! just the dataflow under study: nothing else runs on the worker threads, and
 //! non-worker threads (ingest receive/decode) aren't recorded at all. One fresh
@@ -95,6 +95,9 @@ pub fn start(sql: &str) -> Option<PerfGuard> {
     let report = config
         .dir
         .join(format!("pivotdb-{}-{seq}.perf.data", millis()));
+    // Clear any leftover at this path (possible after a restart resets SEQ) so
+    // `wait_for_attach`'s file-exists check can't false-positive on a stale file.
+    let _ = std::fs::remove_file(&report);
 
     let child = Command::new("perf")
         .arg("record")
@@ -110,9 +113,12 @@ pub fn start(sql: &str) -> Option<PerfGuard> {
         }
     };
 
-    wait_for_attach(&report);
-    info!(report = %report.display(), %sql, "profiling query with perf");
-    Some(PerfGuard { child, report })
+    // Own the child in the guard immediately, before the fallible wait/log below,
+    // so any panic still SIGINTs and reaps perf rather than leaking it.
+    let guard = PerfGuard { child, report };
+    wait_for_attach(&guard.report);
+    info!(report = %guard.report.display(), %sql, "profiling query with perf");
+    Some(guard)
 }
 
 /// Block (briefly) until `perf` has created its output file, our proxy for "it

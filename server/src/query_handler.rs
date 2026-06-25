@@ -239,15 +239,25 @@ impl PivotQueryHandler {
         // worker threads and mark this query's dataflows profiled. Marking them
         // makes the workers run *only* this dataflow for its duration (other
         // queries / ingest on the pool pause), so the capture is just this
-        // dataflow. The guard SIGINT-flushes the report when `run_query` returns
-        // (covering cancel/error), and the exclusive mode lifts as the dataflows
-        // finish. Compiled out without the feature.
+        // dataflow, and exclusive mode lifts as the dataflows finish. `start`
+        // runs on a blocking thread (it sleeps waiting for perf to attach); the
+        // guard is stopped off the reactor after drain (its `child.wait()` blocks
+        // until the report flushes). On error/cancel the guard instead drops in
+        // this async frame, which is rare. Compiled out without the feature.
         #[cfg(feature = "perf")]
-        let (dispatcher, _perf_guard) =
-            match with_perf.then(|| crate::perf::start(&query)).flatten() {
+        let (dispatcher, mut perf_guard) = if with_perf {
+            let sql = query.clone();
+            let guard = tokio::task::spawn_blocking(move || crate::perf::start(&sql))
+                .await
+                .ok()
+                .flatten();
+            match guard {
                 Some(guard) => (dispatcher.with_profiling(true), Some(guard)),
                 None => (dispatcher, None),
-            };
+            }
+        } else {
+            (dispatcher, None)
+        };
         #[cfg(not(feature = "perf"))]
         let _ = with_perf;
 
@@ -278,6 +288,14 @@ impl PivotQueryHandler {
             .map_err(Error::WorkerPanic)??;
         let exec_time = started.elapsed();
         guard.defuse();
+
+        // Stop perf off the reactor: `child.wait()` blocks until the report is
+        // flushed (seconds for a large capture), which would otherwise stall this
+        // tokio worker thread.
+        #[cfg(feature = "perf")]
+        if let Some(perf) = perf_guard.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
+        }
 
         let fields = batches
             .first()
