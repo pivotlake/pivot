@@ -37,16 +37,15 @@
 //!
 //! - [`FilterFactory`] — Keeps rows matching a boolean mask.
 //! - [`MapFactory`] — Transforms each batch (column selection, computation).
-//! - [`CountFactory`] — Counts rows, coordinating across workers for the total.
 //! - [`OrderByLimitFactory`] — Top-N sort across workers.
 //! - [`GroupFactory`] — Hash-based group-by with aggregation.
 
 mod group;
 pub use group::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, Fold, GroupFactory, GroupLimit, HashOnlyIntKeyExtractor, IntKeyExtractor,
+    Dynamic, Fold, FoldAcc, GroupFactory, GroupLimit, HashOnlyIntKeyExtractor, IntKeyExtractor,
     IntPairKeyExtractor, IntRead, IntStrKeyExtractor, KeyExtractor, Max, MaxSlot, Min, MinSlot,
-    NoRead, Numeric, OpTuple, Read, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
+    Mono, NoRead, Numeric, OpTuple, Read, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
     StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 
@@ -70,9 +69,6 @@ use crate::worker::worker_waker;
 
 mod pipeline_breaker;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
-
-mod count;
-pub use count::CountFactory;
 
 mod aggregate;
 pub use aggregate::AggregateFactory;

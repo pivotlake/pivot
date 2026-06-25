@@ -5,15 +5,15 @@
 //! [`CountSlot`]/[`SumSlot`]/… — a whole op with its own input array and its own
 //! cell, so a `Compiled` mixes integer families freely (a `SUM` beside a `MAX`),
 //! each reading its *own typed array* with no per-row dispatch. It is
-//! **numeric-only**: its ops are contextless numeric [`Fold`]s (they take no arena),
-//! so the impl fixes both [`AggregationValue`] contexts to `()` — the
-//! `WorkerContext` consume passes (`&mut ()`) and the `SharedContext` merge/finish
-//! pass (`&()`) are inert. A signature carrying a string extreme — which needs a
-//! real `WorkerArena` to store winners — takes the [`Dynamic`](super::Dynamic) path
-//! instead.
+//! **numeric-only**: every op's [`WorkerContext`](super::super::fold::FoldAcc::WorkerContext)
+//! and [`SharedContext`](super::super::fold::FoldAcc::SharedContext) is `()`, so
+//! both its value contexts are concretely `()` — consume threads `&mut ()` (free)
+//! and merge/finish thread `&()`. A signature carrying a string extreme — which
+//! needs a real `WorkerArena` to store winners — takes the
+//! [`Dynamic`](super::Dynamic) path instead.
 //!
 //! There is no per-slot trait and no plumbing trait: a slot's behaviour *is* its
-//! [`Read`] plus its [`Fold`], so `impl_compiled!` emits the whole
+//! [`Read`] plus its [`Fold`]/[`FoldAcc`], so `impl_compiled!` emits the whole
 //! [`AggregationValue`] impl for each arity directly, calling those — `R::read` to
 //! pull the value, `F::seed`/`update`/`merge`/`finish` to fold it — unrolled over
 //! the tuple, with the reader/config/column shapes as literal tuples. The lone
@@ -28,7 +28,7 @@
 //! until plan time) fall back to [`Dynamic`](super::Dynamic).
 
 use super::super::cell::Cell;
-use super::super::fold::{Count, Fold, Max, Min, Sum};
+use super::super::fold::{Count, Fold, FoldAcc, Max, Min, Sum};
 use super::super::read::{IntRead, NoRead, Read};
 use super::super::{AggregationSlot, AggregationValue};
 use crate::arrays::SlabColumn;
@@ -97,28 +97,26 @@ impl<Ops: OpTuple> Default for Compiled<Ops> {
 /// and the whole [`AggregationValue`] impl for the `Compiled` over it. Each method
 /// unrolls the obvious per-slot call — `R::read` to pull the value,
 /// `F::seed`/`update`/`merge`/`finish` to fold it — and writes the
-/// reader / config / column shapes as literal tuples. The slot's read and fold are
-/// tied by `for<'b> R: Read<Val<'b> = F::Val>`: every row a `Read` yields is
-/// exactly what its `Fold` consumes. Both `F::Val` and `F::Acc` are lifetime-free
-/// (a numeric op folds an owned `()`/`i64`), so the cell tuple names `F::Acc`
-/// directly — no `'static` pin, no monomorphiser loop (the borrowed `&str` that
-/// caused one belongs to a string extreme, which `Compiled` never carries).
+/// reader / config / column shapes as literal tuples. The lifetime-free
+/// `F::Acc`/`SharedContext`/`merge`/… come from `FoldAcc`; only `seed`/`update` (which take
+/// the read value) need the `for<'b> Fold<…>` bound a borrowed `&str` forces.
 macro_rules! impl_compiled {
     ($($R:ident $F:ident $idx:tt),+) => {
         impl<$($R, $F),+> OpTuple for ($(Pair<$R, $F>,)+)
         where
-            $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>,)+
+            $($R: Read, $F: FoldAcc + for<'b> Fold<$R::Val<'b>>,)+
         {
             type Accs = ($($F::Acc,)+);
         }
 
-        // `Compiled` is numeric-only — its ops are contextless numeric `Fold`s — so
-        // both its value contexts are concretely `()`: the `&mut ()` consume passes
-        // and the `&()` merge/finish pass are inert (the fold ops take no context).
-        // A signature with a string extreme takes the `Dynamic` path instead.
+        // `Compiled` is numeric-only — every op's `WorkerContext`/`SharedContext`
+        // is `()` — so both its contexts are concretely `()`: consume threads
+        // `&mut ()` (free) and merge/finish thread `&()`. A signature with a string
+        // extreme takes the `Dynamic` path instead, whose contexts are a real
+        // `WorkerArena` / `(slots, Arc<SharedArena>)`.
         impl<$($R, $F),+> AggregationValue for Compiled<($(Pair<$R, $F>,)+)>
         where
-            $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
+            $($R: Read, $F: FoldAcc<SharedContext = (), WorkerContext = ()> + for<'b> Fold<$R::Val<'b>>, $F::Acc: Into<i128>,)+
         {
             type Reader<'b> = ($($R::Input<'b>,)+);
             type SharedContext = ();
@@ -132,8 +130,8 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
-            fn value(reader: &Self::Reader<'_>, idx: usize, _wc: &mut ()) -> Self {
-                Self { accs: ($($F::seed($R::read(&reader.$idx, idx)),)+) }
+            fn value(reader: &Self::Reader<'_>, idx: usize, wc: &mut ()) -> Self {
+                Self { accs: ($($F::seed($R::read(&reader.$idx, idx), wc),)+) }
             }
 
             #[inline(always)]
@@ -141,23 +139,24 @@ macro_rules! impl_compiled {
                 self,
                 reader: &Self::Reader<'_>,
                 idx: usize,
-                _wc: &mut (),
-                _ctx: &(),
+                wc: &mut (),
+                ctx: &(),
             ) -> Self {
                 Self {
-                    accs: ($($F::update(self.accs.$idx, $R::read(&reader.$idx, idx)),)+),
+                    accs: ($($F::update(self.accs.$idx, $R::read(&reader.$idx, idx), wc, ctx),)+),
                 }
             }
 
             #[inline(always)]
-            fn merge(self, other: Self, _ctx: &()) -> Self {
-                Self { accs: ($($F::merge(self.accs.$idx, other.accs.$idx),)+) }
+            fn merge(self, other: Self, ctx: &()) -> Self {
+                Self { accs: ($($F::merge(self.accs.$idx, other.accs.$idx, ctx),)+) }
             }
 
             #[inline(always)]
             fn sort_key(&self, slot: usize) -> i128 {
                 // Widen the cell directly — a numeric extreme/sum/count to its
-                // `ORDER BY` key.
+                // `ORDER BY` key; a string extreme's raw bits are inert (the
+                // planner never pushes a top-k onto one), same as `Dynamic`.
                 match slot {
                     $($idx => self.accs.$idx.into(),)+
                     _ => unreachable!("sort_key slot {slot} out of range"),
@@ -175,12 +174,12 @@ macro_rules! impl_compiled {
 
             fn finish_columns(
                 cols: Self::Columns,
-                _ctx: &(),
+                ctx: &(),
             ) -> (Vec<Field>, Vec<ArrayRef>) {
                 let mut fields = Vec::new();
                 let mut arrays = Vec::new();
                 $(
-                    let (f, a) = $F::finish(&format!("v{}", $idx), cols.$idx);
+                    let (f, a) = $F::finish(&format!("v{}", $idx), cols.$idx, ctx);
                     fields.push(f);
                     arrays.push(a);
                 )+

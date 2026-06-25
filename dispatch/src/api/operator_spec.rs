@@ -197,7 +197,7 @@ pub fn values_input<T: Send + 'static>(
 
 impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
     /// Re-enter [`RecordBatchOperatorSpec`](super::record_batch_operator::RecordBatchOperatorSpec) so the RB-only fluent methods
-    /// (`.count()`, `.order_by_limit()`, `.group_by_aggregate()`, …) can be
+    /// (`.aggregate()`, `.order_by_limit()`, `.group_by_aggregate()`, …) can be
     /// chained after a `.map()` whose output type is `RecordBatch`.
     pub fn record_batches(self) -> super::record_batch_operator::RecordBatchOperatorSpec {
         super::record_batch_operator::RecordBatchOperatorSpec::from_spec(self)
