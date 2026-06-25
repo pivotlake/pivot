@@ -79,13 +79,13 @@ fn contains_then_group_by(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
+    rows.sort_by_key(|r| r["name"].as_str().unwrap().to_string());
 
     // alice (2 rows), charlie (1), dave (1) all contain "a"; bob does not.
     assert_eq!(rows.len(), 3);
-    let alice = rows.iter().find(|r| r["key"] == "alice").unwrap();
-    assert_eq!(alice["v0"], 2);
-    assert!(rows.iter().all(|r| r["key"] != "bob"));
+    let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
+    assert_eq!(alice["count_star()"], 2);
+    assert!(rows.iter().all(|r| r["name"] != "bob"));
 }
 
 #[rstest]
@@ -112,18 +112,18 @@ fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["m"].as_i64().unwrap());
 
     // Minutes 0 and 2 occur once; minute 1 occurs twice.
     assert_eq!(rows.len(), 3);
     assert_eq!(
         rows.iter()
-            .map(|r| r["key"].as_i64().unwrap())
+            .map(|r| r["m"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
-    let minute_one = rows.iter().find(|r| r["key"] == 1).unwrap();
-    assert_eq!(minute_one["v0"], 2);
+    let minute_one = rows.iter().find(|r| r["m"] == 1).unwrap();
+    assert_eq!(minute_one["count_star()"], 2);
 }
 
 /// A table with a minute-of-hour computed group key (`EventTime` 0,90,150,3690 →
@@ -161,18 +161,18 @@ fn group_by_computed_key_sum(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["m"].as_i64().unwrap());
 
     assert_eq!(
         rows.iter()
-            .map(|r| r["key"].as_i64().unwrap())
+            .map(|r| r["m"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
     // minute 1 = 20 + 40 = 60.
     assert_eq!(
         rows.iter()
-            .map(|r| r["v0"].as_i64().unwrap())
+            .map(|r| r["sum(v)"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![10, 60, 30]
     );
@@ -192,18 +192,18 @@ fn group_by_computed_key_min_max(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["m"].as_i64().unwrap());
 
     // minute 1 = {20, 40}; the others are singletons.
     assert_eq!(
         rows.iter()
-            .map(|r| r["v0"].as_i64().unwrap())
+            .map(|r| r["min(v)"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![10, 20, 30]
     );
     assert_eq!(
         rows.iter()
-            .map(|r| r["v1"].as_i64().unwrap())
+            .map(|r| r["max(v)"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![10, 40, 30]
     );
@@ -223,23 +223,23 @@ fn group_by_computed_key_multi_agg(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["m"].as_i64().unwrap());
 
     assert_eq!(
         rows.iter()
-            .map(|r| r["v0"].as_i64().unwrap())
+            .map(|r| r["sum(v)"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![10, 60, 30] // sum
     );
     assert_eq!(
         rows.iter()
-            .map(|r| r["v1"].as_i64().unwrap())
+            .map(|r| r["count_star()"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![1, 2, 1] // count(*)
     );
     assert_eq!(
         rows.iter()
-            .map(|r| r["v2"].as_i64().unwrap())
+            .map(|r| r["max(v)"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![10, 40, 30] // max
     );
@@ -263,20 +263,8 @@ fn group_by_computed_key_avg(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let rows = batches_to_json(&results);
-    // Ordered by minute; the second column is the average (the divide projection
-    // renames columns, so read it by position). minute 1 = avg(20, 40) = 30.
-    let avgs: Vec<f64> = rows
-        .iter()
-        .map(|r| {
-            r.as_object()
-                .unwrap()
-                .values()
-                .nth(1)
-                .unwrap()
-                .as_f64()
-                .unwrap()
-        })
-        .collect();
+    // Ordered by minute; `a` is the AVG alias. minute 1 = avg(20, 40) = 30.
+    let avgs: Vec<f64> = rows.iter().map(|r| r["a"].as_f64().unwrap()).collect();
     assert_eq!(avgs, vec![10.0, 30.0, 30.0]);
 }
 
@@ -317,23 +305,23 @@ fn group_by_plain_and_computed_key(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()));
+    rows.sort_by_key(|r| (r["uid"].as_i64().unwrap(), r["m"].as_i64().unwrap()));
 
     assert_eq!(
         rows.iter()
-            .map(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()))
+            .map(|r| (r["uid"].as_i64().unwrap(), r["m"].as_i64().unwrap()))
             .collect::<Vec<_>>(),
         vec![(1, 0), (1, 1), (2, 2)]
     );
     assert_eq!(
         rows.iter()
-            .map(|r| r["v0"].as_i64().unwrap())
+            .map(|r| r["sum(v)"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![10, 60, 30] // sum
     );
     assert_eq!(
         rows.iter()
-            .map(|r| r["v1"].as_i64().unwrap())
+            .map(|r| r["count_star()"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![1, 2, 1] // count(*)
     );
@@ -371,17 +359,17 @@ fn group_by_column_and_arithmetic_key(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()));
+    rows.sort_by_key(|r| (r["a"].as_i64().unwrap(), r["d"].as_i64().unwrap()));
 
     assert_eq!(
         rows.iter()
-            .map(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()))
+            .map(|r| (r["a"].as_i64().unwrap(), r["d"].as_i64().unwrap()))
             .collect::<Vec<_>>(),
         vec![(1, 4), (1, 5), (2, 6)]
     );
     assert_eq!(
         rows.iter()
-            .map(|r| r["v0"].as_i64().unwrap())
+            .map(|r| r["count_star()"].as_i64().unwrap())
             .collect::<Vec<_>>(),
         vec![2, 1, 1]
     );
@@ -443,17 +431,17 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
             .collect()
             .unwrap();
 
-        // The computed projection names its columns col0 (the extracted value)
-        // and col1 (the source EventTime). Map each row's timestamp to its
+        // The select item aliases are `v` (the extracted value) and `t`
+        // (the source EventTime). Map each row's timestamp to its
         // value, then compare against the expectation (row order isn't fixed).
         let rows = batches_to_json(&results);
         for (i, &t) in timestamps.iter().enumerate() {
             let row = rows
                 .iter()
-                .find(|r| r["col1"].as_i64().unwrap() == t)
+                .find(|r| r["t"].as_i64().unwrap() == t)
                 .unwrap_or_else(|| panic!("{part}: no row for ts {t}"));
             assert_eq!(
-                row["col0"].as_i64().unwrap(),
+                row["v"].as_i64().unwrap(),
                 expected[i],
                 "extract({part} FROM {t})"
             );
@@ -556,7 +544,7 @@ fn case_expression_in_projection(mut testing_planner: TestingPlanner) {
 
     let mut labels = batches_to_json(&results)
         .iter()
-        .map(|r| r["col0"].as_str().unwrap().to_string())
+        .map(|r| only_column(r).as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     labels.sort();
     assert_eq!(labels, vec!["high", "high", "high", "low", "low"]);
@@ -581,13 +569,13 @@ fn case_expression_multi_arm_group_key(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
+    rows.sort_by_key(|r| r["c"].as_str().unwrap().to_string());
     let counts: Vec<(String, i64)> = rows
         .iter()
         .map(|r| {
             (
-                r["key"].as_str().unwrap().to_string(),
-                r["v0"].as_i64().unwrap(),
+                r["c"].as_str().unwrap().to_string(),
+                r["count_star()"].as_i64().unwrap(),
             )
         })
         .collect();
@@ -616,19 +604,19 @@ fn arithmetic_in_projection(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["(a + 1)"].as_i64().unwrap());
 
     assert_eq!(rows.len(), 5);
     // First row: a=1, b=10.
-    assert_eq!(rows[0]["col0"], 2); // 1 + 1
-    assert_eq!(rows[0]["col1"], 8); // 10 - 2
-    assert_eq!(rows[0]["col2"], 22); // (1 + 10) * 2
-    assert_eq!(rows[0]["col3"], 5000000001i64); // 1 + 5000000000
+    assert_eq!(rows[0]["(a + 1)"], 2); // 1 + 1
+    assert_eq!(rows[0]["(b - 2)"], 8); // 10 - 2
+    assert_eq!(rows[0]["((a + b) * 2)"], 22); // (1 + 10) * 2
+    assert_eq!(rows[0]["(a + 5000000000)"], 5000000001i64); // 1 + 5000000000
     // Last row: a=5, b=50.
-    assert_eq!(rows[4]["col0"], 6);
-    assert_eq!(rows[4]["col1"], 48);
-    assert_eq!(rows[4]["col2"], 110);
-    assert_eq!(rows[4]["col3"], 5000000005i64);
+    assert_eq!(rows[4]["(a + 1)"], 6);
+    assert_eq!(rows[4]["(b - 2)"], 48);
+    assert_eq!(rows[4]["((a + b) * 2)"], 110);
+    assert_eq!(rows[4]["(a + 5000000000)"], 5000000005i64);
 }
 
 #[rstest]
@@ -664,11 +652,14 @@ fn length_counts_bytes(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["i"].as_i64().unwrap());
 
     // length() counts bytes, not characters: "héllo" is 6 bytes (é is 2),
     // "日本語abc" is 12 bytes (three 3-byte CJK chars + "abc").
-    let lengths: Vec<i64> = rows.iter().map(|r| r["col1"].as_i64().unwrap()).collect();
+    let lengths: Vec<i64> = rows
+        .iter()
+        .map(|r| r["length(s)"].as_i64().unwrap())
+        .collect();
     assert_eq!(lengths, vec![5, 6, 0, 12]);
 }
 
@@ -707,16 +698,19 @@ fn arithmetic_does_not_truncate_floats(mut testing_planner: TestingPlanner) {
 
     let mut rows = batches_to_json(&results);
     rows.sort_by(|x, y| {
-        x["col0"]
+        only_column(x)
             .as_f64()
             .unwrap()
-            .partial_cmp(&y["col0"].as_f64().unwrap())
+            .partial_cmp(&only_column(y).as_f64().unwrap())
             .unwrap()
     });
 
     // f ∈ {1.5, 2.5, 3.5} + n ∈ {10, 20, 30} → {11.5, 22.5, 33.5}; an Int64
     // coercion would truncate to {11.0, 22.0, 33.0}.
-    let sums: Vec<f64> = rows.iter().map(|r| r["col0"].as_f64().unwrap()).collect();
+    let sums: Vec<f64> = rows
+        .iter()
+        .map(|r| only_column(r).as_f64().unwrap())
+        .collect();
     assert_eq!(sums, vec![11.5, 22.5, 33.5]);
 }
 
@@ -770,13 +764,22 @@ fn regexp_replace_extracts_group(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["i"].as_i64().unwrap());
 
     // `\1` substitutes the captured group; a row without a match passes
     // through unchanged.
-    assert_eq!(rows[0]["col1"], "example.com");
-    assert_eq!(rows[1]["col1"], "foo.org");
-    assert_eq!(rows[2]["col1"], "no-match-here");
+    assert_eq!(
+        rows[0][r#"regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1')"#],
+        "example.com"
+    );
+    assert_eq!(
+        rows[1][r#"regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1')"#],
+        "foo.org"
+    );
+    assert_eq!(
+        rows[2][r#"regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1')"#],
+        "no-match-here"
+    );
 }
 
 #[rstest]
@@ -803,7 +806,7 @@ fn regexp_replace_first_match_only(mut testing_planner: TestingPlanner) {
 
     // Without the 'g' option only the first occurrence is replaced.
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["col0"], "baa");
+    assert_eq!(*only_column(&rows[0]), "baa");
 }
 
 #[rstest]
@@ -833,7 +836,7 @@ fn regexp_replace_escaped_dollar_is_literal(mut testing_planner: TestingPlanner)
     let rows = batches_to_json(&results);
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["col0"], "$");
+    assert_eq!(*only_column(&rows[0]), "$");
 }
 
 #[rstest]

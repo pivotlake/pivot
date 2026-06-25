@@ -139,6 +139,6 @@ mod tests {
         let rows = run(&mut testing_planner, "SELECT drop_cache()");
 
         assert_eq!(rows.len(), 1);
-        assert!(rows[0]["col0"].as_i64().unwrap() >= 0);
+        assert!(only_column(&rows[0]).as_i64().unwrap() >= 0);
     }
 }

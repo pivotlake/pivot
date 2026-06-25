@@ -105,7 +105,7 @@ mod tests {
             "SELECT CASE WHEN a < 3 THEN 'low' ELSE 'high' END FROM example_table",
         )
         .iter()
-        .map(|r| r["col0"].as_str().unwrap().to_string())
+        .map(|r| only_column(r).as_str().unwrap().to_string())
         .collect::<Vec<_>>();
 
         labels.sort();

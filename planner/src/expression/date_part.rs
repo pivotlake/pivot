@@ -285,6 +285,6 @@ mod tests {
             "SELECT extract(year FROM EventTime) FROM ts",
         );
 
-        assert_eq!(rows[0]["col0"], 2024);
+        assert_eq!(*only_column(&rows[0]), 2024);
     }
 }
