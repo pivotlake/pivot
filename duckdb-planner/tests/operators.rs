@@ -145,7 +145,7 @@ fn large_limit_offset_still_fuses_into_top_n(mut planner: PlannerContext) {
     // `limit + offset` here (10010) is past DuckDB's stock Top-N threshold, so
     // upstream would emit a LogicalLimit over a LogicalOrder. Our optimizer
     // patch (src/optimizer/topn_optimizer.cpp) drops that bail-out, so it stays
-    // a TopN — the only shape Pivot's bridge translates. Guards ClickBench Q41.
+    // a TopN — the only shape Pivot's bridge translates.
     let plan = planner
         .plan("SELECT score, age, COUNT(*) AS c FROM users GROUP BY score, age ORDER BY c DESC LIMIT 10 OFFSET 10000")
         .unwrap()

@@ -1202,8 +1202,8 @@ fn global_avg_is_lowered_to_sum_and_count(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn global_sum_count_avg_together(mut testing_planner: TestingPlanner) {
-    // The multi-aggregate global path with a SUM, a COUNT(*) and an AVG mixed
-    // (q02's shape). Must compile and run end-to-end; count = 5 and avg(b) over
+    // The multi-aggregate global path with a SUM, a COUNT(*) and an AVG mixed.
+    // Must compile and run end-to-end; count = 5 and avg(b) over
     // [10,20,30,40,50] = 30.0 (sum(a) is a Decimal128, skipped by the f64 scan).
     let results = testing_planner
         .planner

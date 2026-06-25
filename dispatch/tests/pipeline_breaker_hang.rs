@@ -52,7 +52,7 @@ impl Consumer<i64, i64> for SilentBreaker {
 /// Emits nothing; returns `false` (still working) a few times, then `true`.
 /// No sends means no send-notifies during the flush, so `wake_count` doesn't
 /// advance and a worker that parks on one of these `false` steps has
-/// `last_seen == wake_count` — and without the fix sleeps forever.
+/// `last_seen == wake_count` — and would otherwise sleep forever.
 struct SilentOutputter {
     steps_left: u32,
 }

@@ -501,8 +501,6 @@ mod tests {
 
     /// Regression: after handling a buffer-boundary overflow, the decoder must
     /// not re-enter the overflow path on subsequent successful decodes.
-    /// With the old code the stale `overflowed` flag caused a spurious
-    /// `push_from_bitpack_overflow` call that read past the end of the data.
     #[test]
     fn test_bitpacked_cross_buffer_with_remaining_groups() {
         init_test_free_pool(4);

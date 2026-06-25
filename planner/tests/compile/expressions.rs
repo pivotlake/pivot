@@ -249,8 +249,8 @@ fn group_by_computed_key_multi_agg(mut testing_planner: TestingPlanner) {
 fn group_by_computed_key_avg(mut testing_planner: TestingPlanner) {
     minute_grouped_table(&mut testing_planner, "ev");
 
-    // AVG over a computed key errored before computed keys were folded into the
-    // general grouped path (DuckDB lowers it to sum+count over the key column).
+    // AVG over a computed group key, lowered by DuckDB to sum+count over the
+    // key column.
     let results = testing_planner
         .planner
         .plan(
@@ -283,7 +283,7 @@ fn group_by_computed_key_avg(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn group_by_plain_and_computed_key(mut testing_planner: TestingPlanner) {
     use arrow_array::Int64Array;
-    // A plain column key mixed with a computed key (ClickBench Q18 shape). Groups
+    // A plain column key mixed with a computed key. Groups
     // (uid, minute): (1,0)=v[10]; (1,1)=v[20,40]; (2,2)=v[30]. The multi-key row
     // encoder names the two key columns k0, k1.
     testing_planner.add_table(

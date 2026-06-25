@@ -713,10 +713,10 @@ impl FileMemoryCache {
     /// map (only those still pointing at this slot) and bumps the slot's generation
     /// so a reader pinning a surviving placement resolves to a miss.
     pub fn evict(&self) -> WriteBuffer {
-        // TEMPORARY livelock guard. When a query's working set exceeds the ring,
-        // every worker spins here finding nothing evictable (perf proved ~98% CPU
-        // in this loop, ~0 forward progress, and the loop has no cancellation
-        // point). After two full ring sweeps find nothing (a healthy CLOCK finds a
+        // Livelock guard. When a query's working set exceeds the ring, every
+        // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
+        // progress, and the loop has no cancellation point). After two full ring
+        // sweeps find nothing (a healthy CLOCK finds a
         // victim within ~2 sweeps, so this is clearly abnormal), warn and sleep to
         // give peer workers / ingest a chance to release slots; if one more sweep
         // after the sleep still finds nothing, the cache is genuinely exhausted, so
@@ -1253,8 +1253,8 @@ mod tests {
         assert!(has_misses(&cache().get(&FD(), 0, SB)));
     }
 
-    /// Regression for the parquetsink OOM: the CLOCK evictor must not reclaim a ring
-    /// slot that is still parked in the free pool (unbound).
+    /// The CLOCK evictor must not reclaim a ring slot that is still parked in
+    /// the free pool (unbound).
     #[test]
     fn evict_does_not_steal_a_slot_from_the_free_pool() {
         init_test_free_pool(2);

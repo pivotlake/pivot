@@ -68,7 +68,7 @@ fn iso_week(days: i64) -> i64 {
 
 /// Which field of a timestamp a [`DatePart`] extracts. DuckDB lowers
 /// `extract(<part> FROM ts)` to a scalar function named after the part (e.g.
-/// `minute`, `year`); this enumerates the parts we evaluate from `EventTime`'s
+/// `minute`, `year`); this enumerates the parts we evaluate from a timestamp's
 /// Int64 epoch-seconds representation. See [`DatePart`]'s compile impl for the
 /// per-part arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,7 +160,7 @@ impl DatePartKind {
 }
 
 /// SQL `extract(<part> FROM source)` — a timestamp field accessor. DuckDB
-/// lowers each part to a scalar function (`minute`, `year`, …); `EventTime` is
+/// lowers each part to a scalar function (`minute`, `year`, …); a timestamp is
 /// stored as Int64 epoch *seconds* (see [`Type::Timestamp`]), so every part is
 /// a pure integer computation. See its compile impl.
 ///
@@ -199,7 +199,7 @@ impl Display for DatePart {
 
 impl DatePart {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        // EventTime is stored as Int64 epoch *seconds* (UTC), so every part is a
+        // A timestamp is stored as Int64 epoch *seconds* (UTC), so every part is a
         // pure integer computation. Euclidean div/rem keep the time-of-day and
         // calendar fields well-defined for pre-epoch (negative) timestamps,
         // matching DuckDB's `extract(<part> FROM ...)`.
