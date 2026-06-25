@@ -858,7 +858,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
                     contains.run(col)
                 }
             })
-            .count()
+            .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
         },
     );
 
@@ -879,7 +879,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
-                .count()
+                .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
         },
     );
 
@@ -903,7 +903,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(move || move |b: &RecordBatch| i64_eq_mask(b, 0, target))
-                    .count()
+                    .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
             },
         );
     }
