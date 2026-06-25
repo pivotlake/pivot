@@ -46,7 +46,9 @@ impl Projection {
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Fast path: every projection is a plain column reference, so we can
-        // select columns zero-copy and preserve the input schema's fields.
+        // select columns zero-copy and preserve the input schema's fields. The
+        // query's client-facing column names are stamped on once at the plan
+        // root (see `Plan::compile`), so intermediate field names don't matter.
         if let Some(idxs) = self
             .projections
             .iter()

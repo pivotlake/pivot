@@ -329,7 +329,7 @@ mod tests {
 
         let mut got = rows
             .iter_mut()
-            .map(|r| r["col0"].as_str().unwrap().to_string())
+            .map(|r| only_column(r).as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         got.sort();
         assert_eq!(got, vec!["example.com", "foo.org", "no-url-here"]);
@@ -344,7 +344,7 @@ mod tests {
             "SELECT regexp_replace(url, 'a', 'X') FROM urls",
         );
 
-        assert_eq!(rows[0]["col0"], "bXnana");
+        assert_eq!(*only_column(&rows[0]), "bXnana");
     }
 
     /// The PCRE2 and `regex`-crate engines must produce identical output for any

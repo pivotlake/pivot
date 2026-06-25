@@ -38,11 +38,11 @@
 //!
 //! let mut ctx = PlannerContext::new(Arc::new(MyCatalog));
 //!
-//! // Plan a query — returns a PlanNode tree.
+//! // Plan a query; the returned PlannedQuery's `root` is the PlanNode tree.
 //! let plan = ctx.plan("SELECT name FROM users").unwrap();
 //!
 //! // Pattern-match on the operator to extract details.
-//! match &plan.operator {
+//! match &plan.root.operator {
 //!     Operator::Projection(p) => assert_eq!(p.projections.len(), 1),
 //!     other => println!("unexpected root: {other}"),
 //! }
@@ -121,11 +121,36 @@ impl BridgeErrorPayload {
     }
 }
 
+/// A successfully planned query: the operator tree plus the result column names
+/// DuckDB resolved for the client, in select order (e.g. `["hour",
+/// "count_star()"]`). `output_names` may be empty when the bridge could not
+/// recover them, in which case the caller keeps the operators' own names.
+pub struct PlannedQuery {
+    pub root: PlanNode,
+    pub output_names: Vec<String>,
+}
+
+impl std::fmt::Display for PlannedQuery {
+    /// Renders the plan tree (the `root`); the resolved `output_names` are
+    /// omitted, matching how the higher-level `Plan` displays as its root.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.root)
+    }
+}
+
+/// Deserialized `data` payload of a successful plan: the operator tree under
+/// `plan`, alongside the client-facing `output_names`.
+#[derive(CustomDeserializer)]
+struct SuccessPayload {
+    plan: PlanNode,
+    output_names: Vec<String>,
+}
+
 /// Internal wrapper for the JSON response from the C++ bridge, which is
-/// either a successfully planned [`PlanNode`] or a structured bridge error.
+/// either a successfully planned query or a structured bridge error.
 #[derive(CustomDeserializer)]
 enum PlanResult {
-    Success(PlanNode),
+    Success(SuccessPayload),
     Error(BridgeErrorPayload),
 }
 
@@ -146,17 +171,20 @@ impl PlannerContext {
     /// Plan a SQL query: sends the query to DuckDB, deserializes the JSON
     /// logical plan into a [`PlanNode`] tree, and attaches the `DuckDBTable`
     /// trait objects to each `Input` node.
-    pub fn plan(&mut self, query: &str) -> Result<PlanNode, Error> {
+    pub fn plan(&mut self, query: &str) -> Result<PlannedQuery, Error> {
         let result = ffi::extract_plan(self.cxx_context.pin_mut(), query);
         let plan: PlanResult = serde_json::from_str(&result.json)?;
         match plan {
-            PlanResult::Success(plan) => {
+            PlanResult::Success(payload) => {
                 let tables: Vec<Box<dyn catalog_provider::DuckDBTable>> = result
                     .tables
                     .into_iter()
                     .map(|ot| ot.table.expect("planner returned an unbound table"))
                     .collect();
-                Ok(plan.resolve_inputs(tables))
+                Ok(PlannedQuery {
+                    root: payload.plan.resolve_inputs(tables),
+                    output_names: payload.output_names,
+                })
             }
             PlanResult::Error(err) => Err(err.into_error()),
         }

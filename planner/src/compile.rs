@@ -112,9 +112,69 @@ impl Plan {
         // materialize reloads a single time and both read one snapshot.
         let ctx = self.catalog.query_context();
         let mut slots = DynamicFilterSlots::new();
-        self.root
-            .compile(dispatcher, &self.catalog, ctx.as_ref(), &mut slots)
+        let compiled = self
+            .root
+            .compile(dispatcher, &self.catalog, ctx.as_ref(), &mut slots)?;
+        Ok(stamp_output_names(compiled, &self.output_names))
     }
+}
+
+/// Stamp DuckDB's client-facing result column names onto the compiled plan's
+/// output. Naming happens once here, at the root, rather than inside each
+/// operator: the operators are free to use whatever intermediate field names
+/// are convenient, and the query's actual output schema is fixed up last.
+///
+/// The names are DuckDB's select-list order, which the output columns follow.
+/// Only the leading `names.len()` fields are renamed, so a wider output (an
+/// operator that appends trailing bookkeeping columns) keeps its extra fields;
+/// a narrower one than DuckDB reported is left untouched rather than risk
+/// mislabeling.
+fn stamp_output_names(spec: RecordBatchOperatorSpec, names: &[String]) -> RecordBatchOperatorSpec {
+    if names.is_empty() {
+        return spec;
+    }
+    let names = Arc::new(names.to_vec());
+    spec.project(move || {
+        let names = names.clone();
+        move |batch: RecordBatch| {
+            let schema = batch.schema();
+            let fields = schema.fields();
+            // Fewer columns than DuckDB reported names (e.g. EXPLAIN emits one
+            // column where DuckDB resolves two): leave the batch untouched.
+            if fields.len() < names.len() {
+                return batch;
+            }
+            // Already correctly named (a plain `SELECT a, b` or `SELECT *`):
+            // skip the rebuild and pass the batch through zero-copy.
+            if names
+                .iter()
+                .zip(fields.iter())
+                .all(|(name, field)| field.name() == name)
+            {
+                return batch;
+            }
+            // `with_name` preserves each field's data type, nullability, and
+            // metadata (e.g. an extension-type annotation); only the leading
+            // `names.len()` fields are renamed, so trailing fields are reused
+            // by their `Arc` rather than rebuilt.
+            let renamed: Vec<arrow_schema::FieldRef> = fields
+                .iter()
+                .enumerate()
+                .map(|(i, field)| match names.get(i) {
+                    Some(name) => Arc::new(field.as_ref().clone().with_name(name.clone())),
+                    None => field.clone(),
+                })
+                .collect();
+            let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+                renamed,
+                schema.metadata().clone(),
+            ));
+            // We own `batch`, so move its column arrays out (there is at least
+            // one, since `fields.len() >= names.len() >= 1`) instead of cloning.
+            let (_, columns, _) = batch.into_parts();
+            RecordBatch::try_new(new_schema, columns).unwrap()
+        }
+    })
 }
 
 impl PlanNode {

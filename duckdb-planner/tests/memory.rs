@@ -69,7 +69,7 @@ fn no_memory_leak_across_repeated_plans() {
                     let plan = ctx
                         .plan("SELECT id, name FROM users WHERE age <> 0")
                         .unwrap();
-                    assert!(matches!(&plan.operator, Operator::Projection(_)));
+                    assert!(matches!(&plan.root.operator, Operator::Projection(_)));
                     if i > 0 && i % 10_000 == 0 {
                         let rss = get_rss_bytes();
                         let growth = rss.saturating_sub(rss_before);

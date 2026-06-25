@@ -36,8 +36,8 @@ fn catalog_column_types_propagate(mut planner: PlannerContext) {
 fn input_holds_catalog_table(mut planner: PlannerContext) {
     let plan = planner.plan("SELECT id FROM users").unwrap();
 
-    let Operator::Input(input) = &plan.inputs[0].operator else {
-        panic!("expected Input, got {}", plan.inputs[0].operator)
+    let Operator::Input(input) = &plan.root.inputs[0].operator else {
+        panic!("expected Input, got {}", plan.root.inputs[0].operator)
     };
 
     let cols = input.table.duckdb_typed_columns();

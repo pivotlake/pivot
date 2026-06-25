@@ -106,11 +106,11 @@ mod tests {
             "SELECT date_trunc('minute', EventTime) FROM events",
         );
 
-        rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+        rows.sort_by_key(|r| only_column(r).as_i64().unwrap());
 
         assert_eq!(
             rows.iter()
-                .map(|r| r["col0"].as_i64().unwrap())
+                .map(|r| only_column(r).as_i64().unwrap())
                 .collect::<Vec<_>>(),
             vec![0, 60, 120, 3660]
         );
