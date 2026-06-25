@@ -14,7 +14,7 @@
 //!   ([`IntKeyExtractor`]/[`StringKeyExtractor`]); two integer keys pack into
 //!   [`IntPairKeyExtractor`]; anything else (3+ keys, mixed types) byte-encodes
 //!   the tuple with [`RowKeyExtractor`]. *Computed* keys (`date_trunc(...)`,
-//!   `ClientIP - 1`, `CASE …`) are first materialised into leading columns (see
+//!   `ip - 1`, `CASE …`) are first materialised into leading columns (see
 //!   [`Aggregate::materialize_group_keys`]), so from the dispatch's view every
 //!   key is a column.
 //! * **value** — recognised signatures lower to a branch-free [`Compiled`]

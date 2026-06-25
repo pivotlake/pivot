@@ -243,8 +243,7 @@ async fn global_min_max_does_not_short_circuit_double_column(#[future] conn: Con
 }
 
 /// An unfiltered global COUNT(*) is answered from the sum of parquet row-group
-/// row counts, with no scan. (The empty-projection scan path returned 0, so
-/// this is both the fix and the optimization.)
+/// row counts, with no scan.
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

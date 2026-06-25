@@ -171,8 +171,7 @@ mod uring_backend {
         /// Submitting more reads than the completion queue can hold makes the kernel
         /// park the surplus in its overflow backlog; a single drain must still recover
         /// every completion (by flushing the backlog), or a worker that has stopped
-        /// submitting would stall forever on reads that already landed. Regression for
-        /// the `SELECT *` row-group-fetcher livelock.
+        /// submitting would stall forever on reads that already landed.
         #[test]
         fn completions_recover_an_overflowed_backlog() {
             // SQ of 4 → CQ of 8 (io_uring's 2x default).

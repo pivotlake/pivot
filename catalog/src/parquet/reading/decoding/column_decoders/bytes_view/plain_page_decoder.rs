@@ -309,8 +309,6 @@ mod tests {
 
     /// Regression: skip with a string body crossing a buffer boundary must
     /// correctly count the boundary value and the values skipped before it.
-    /// Without the fix, size is never decremented for either, causing
-    /// subsequent reads to return the wrong values.
     #[test]
     fn test_skip_with_body_crossing_boundary() {
         init_test_free_pool(4);

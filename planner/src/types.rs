@@ -37,7 +37,7 @@ pub enum Type {
     Int64,
     /// DuckDB `HUGEINT` — the result type of `SUM` over integers. Pivot's
     /// executor emits `SUM` as a `Decimal128(38, 0)` column matching this
-    /// width, so large sums (e.g. `SUM(UserID)`) stay exact.
+    /// width, so large sums (e.g. `SUM(user_id)`) stay exact.
     Int128,
     /// DuckDB `DOUBLE` — the result type of `AVG`.
     Float64,
@@ -50,7 +50,7 @@ pub enum Type {
     /// small integer (days), so the executor sees an integer column; the type
     /// exists so `DATE` columns/constants survive plan translation and compare.
     Date,
-    /// DuckDB `TIMESTAMP` — the type of `EventTime` and the result of
+    /// DuckDB `TIMESTAMP` — the type of a timestamp column and the result of
     /// `date_trunc`. The source parquet stores it as packed epoch *seconds* in
     /// an `Int64` column, so the executor treats it as `Int64` seconds.
     Timestamp,
@@ -162,7 +162,7 @@ pub fn build_scalar_value(
         // DuckDB serialises a DATE constant as "YYYY-MM-DD"; let arrow parse it
         // to a Date32 (days since epoch). Comparisons coerce both sides to a
         // common numeric type, so this lines up with the integer day-count the
-        // parquet stores for `EventDate`.
+        // parquet stores for a `DATE` column.
         Type::Date => {
             let strs = arrow_array::StringArray::from(vec![raw_value.clone()]);
             let casted =

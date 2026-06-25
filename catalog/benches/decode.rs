@@ -1,8 +1,8 @@
 //! Microbenchmarks for the Parquet **decompression + decoding** path — the work
-//! that dominates "decode-bound" queries. Profiling the real ClickBench-style
+//! that dominates "decode-bound" queries. Profiling the real analytical
 //! queries showed that for many of them the dispatch *operator* is a sliver and
 //! the wall-time is spent in the scan: snappy-decompressing pages and decoding
-//! them into Arrow. Examples measured on a c8g.4xlarge: a `LIKE '%x%'` scan over
+//! them into Arrow. For example, a `LIKE '%x%'` scan over
 //! the long URL column spent ~73% in `snap::decompress`, and an `ORDER BY
 //! <string/time> LIMIT 10` spent 33-46%, with `RleDecoder::read`, the
 //! `bytes_view` plain/dict decoders, and `PrimitiveDict` making up most of the
@@ -11,14 +11,14 @@
 //! column reader.
 //!
 //! It generates its own SNAPPY + dictionary Parquet file in a tempdir (no
-//! dependency on the 14 GB hits dataset), shaped to the measured statistics of
+//! dependency on a 14 GB dataset), shaped to the measured statistics of
 //! the real columns so the encoding the writer picks — and therefore the decode
 //! path the reader takes matches. The `url` column is long (~88 B avg),
 //! high-cardinality strings, with too many distinct values per row group to
-//! dictionary-encode, so it lands in PLAIN byte-array pages (the URL/q20/q33 scan
+//! dictionary-encode, so it lands in PLAIN byte-array pages (the long-URL scan
 //! shape). `search_phrase` is ~87% empty and otherwise ~31 B, with low distinct
-//! per row group, so DICTIONARY + RLE (the SearchPhrase/q12/q24 scan shape).
-//! `event_time` is `i64` (the timestamp columns behind q24/q26/q42).
+//! per row group, so DICTIONARY + RLE (the search-phrase scan shape).
+//! `event_time` is `i64` (the timestamp columns).
 //!
 //! Then it scans one column at a time with `table_input(..).collect()`, driving
 //! fetch → snappy-decompress → decode → Arrow materialize.
@@ -180,8 +180,8 @@ fn write_parquet(dir: &TempDir, rows: usize) {
     )
     .unwrap();
 
-    // Real-data stats (measured on the hits dataset): URL ≈ rows×18/100 distinct
-    // (~5.5 rows/group), ~88 B; SearchPhrase ≈ rows×6/100 distinct, ~87% empty,
+    // Real-data stats: URL ≈ rows×18/100 distinct
+    // (~5.5 rows/group), ~88 B; search_phrase ≈ rows×6/100 distinct, ~87% empty,
     // ~31 B non-empty.
     let url_dict = string_dict((rows * 18 / 100).max(1), "http://example.com/path", 88);
     let phrase_dict = string_dict((rows * 6 / 100).max(1), "search query ", 31);
@@ -226,12 +226,12 @@ fn bench_decode(c: &mut Criterion, dispatch: &Dispatch, table: &Arc<ParquetTable
     };
 
     // Long high-cardinality strings → PLAIN byte-array pages + snappy (the URL /
-    // `LIKE` / q33 scan: decompress-dominated).
+    // `LIKE` scan: decompress-dominated).
     scenario("decode/url", Projection::columns([0]));
     // Mostly-empty, low-distinct strings → DICTIONARY + RLE + snappy (the
-    // SearchPhrase / order-by q12/q24/q25 scan).
+    // search_phrase / order-by scan).
     scenario("decode/search_phrase", Projection::columns([1]));
-    // `i64` timestamps (the EventTime column behind q24/q26/q42).
+    // `i64` timestamps (the event_time column).
     scenario("decode/event_time", Projection::columns([2]));
     // All three columns at once — a fuller scan.
     scenario("decode/all", Projection::all(3));

@@ -1,10 +1,9 @@
 //! Map operator: apply a 1→1 transform `F: FnMut(I) -> O` and forward the
 //! output downstream.
 //!
-//! Generic over both the input and the output type, so it covers what
-//! `project` used to do for `RecordBatch → RecordBatch` *and* the
-//! cross-type case (the old `for_each` use case, but with one item per call
-//! instead of a callback-driven N).
+//! Generic over both the input and the output type, so it covers
+//! `RecordBatch → RecordBatch` transforms *and* the cross-type case (one item
+//! per call instead of a callback-driven N).
 //!
 //! The output type lives in the closure signature, which means every `send`
 //! downstream is monomorphized — no dyn dispatch.

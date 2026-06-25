@@ -176,8 +176,8 @@ fn create_table_without_a_path_makes_an_empty_table() {
 #[test]
 fn create_table_over_a_missing_path_yields_an_empty_table() {
     // A location with no files yields an empty table — the same as a relative or
-    // no-path location. The catalog no longer eagerly stats the path (which only
-    // made sense for a local store; on a bucket an absolute path is just a key).
+    // no-path location. The catalog does not stat the path (which only makes
+    // sense for a local store; on a bucket an absolute path is just a key).
     let (_dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");

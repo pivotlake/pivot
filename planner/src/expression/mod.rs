@@ -146,7 +146,7 @@ impl Expression {
             Expression::Function(Function::DateTrunc(_)) => Ok(Type::Timestamp),
             Expression::Function(Function::RegexpReplace(_)) => Ok(Type::Utf8),
             // Integer-valued scalar functions: a date part (`extract(minute …)`),
-            // a byte length, and integer arithmetic (`a * 2`, `ClientIP - 1`).
+            // a byte length, and integer arithmetic (`a * 2`, `ip - 1`).
             Expression::Function(Function::DatePart(_) | Function::Length(_)) => Ok(Type::Int64),
             Expression::Function(Function::Arithmetic(_)) => Ok(Type::Int64),
             // Everything else (comparisons, `contains`, `Divide`'s Float64

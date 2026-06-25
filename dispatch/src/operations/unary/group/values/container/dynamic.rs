@@ -155,8 +155,8 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
     fn value(reader: &[BoundSlot<'_>; N], idx: usize, wc: &mut WorkerArena) -> Self {
         // A plain loop, not `std::array::from_fn`: the per-slot match is large, so
         // as a `from_fn` closure it exceeds the inline threshold and is emitted
-        // out-of-line through the `Wrapped`/try-trait machinery — measured at ~40%
-        // of a q09 merge regression. The loop keeps the op `seed`s inlined.
+        // out-of-line through the `Wrapped`/try-trait machinery. The loop keeps the
+        // op `seed`s inlined.
         // Numeric arms take a throwaway `&mut ()` (their `Arena` is `()`); only a
         // string arm touches the real `WorkerArena`.
         let mut na = ();

@@ -252,10 +252,8 @@ pub fn read_perf_data(path: &Path) -> anyhow::Result<Profile> {
                                         }
                                     }
                                     EventClass::Other => {
-                                        // PMC events still feed token_stalls
-                                        // / prefetch counters via a richer
-                                        // path in a follow-up; for now we
-                                        // just don't double-count them here.
+                                        // PMC events are deliberately not
+                                        // double-counted in this branch.
                                     }
                                 }
                             }

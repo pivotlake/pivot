@@ -1,6 +1,6 @@
 //! The catalog's durable metadata, as JSON in the database's [`ObjectStore`].
 //!
-//! Two documents, both folded out of what used to be a separate "table log":
+//! Two documents:
 //!
 //! - the **database manifest** ([`CatalogManifest`], at [`MANIFEST_KEY`]) — the
 //!   index of which tables exist and where each one's Parquet data lives. Written

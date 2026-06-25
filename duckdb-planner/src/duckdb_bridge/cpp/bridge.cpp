@@ -373,7 +373,7 @@ static duckdb::DynamicFilter *extract_dynamic_filter(duckdb::TableFilter &filter
 // (`col <> ''`) and a TopN-installed dynamic filter in one table_filters entry.
 // Anything else (CONJUNCTION_OR, IS_NULL, IN, …) flows through `ToExpression`
 // and may then be rejected by `build_expression` if Rust doesn't support that
-// shape yet — the same conservative behaviour as before this pass existed.
+// shape yet — the same conservative behaviour as for any unrecognised filter.
 static void emit_table_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_idx,
                               const duckdb::LogicalGet &get, DynamicFilterDedup &df_dedup,
                               json &dynamic_filters, json &conditions) {
@@ -447,8 +447,7 @@ static GetTableFilters split_table_filters(duckdb::LogicalGet &get, DynamicFilte
 // positional indices ColumnBindingResolver assigns to every ref above the
 // scan, follow projection_ids, NOT column_ids, so we serialize in that
 // order. This is the scan-level twin of the LogicalFilter `projection_map`
-// handling in build_plan_node_json (the latter is what actually fixed Q42,
-// where the filter stayed a separate node)
+// handling in build_plan_node_json.
 json build_get_output_columns(duckdb::LogicalGet *get) {
 	json columns = json::array();
 	auto &column_ids = get->GetColumnIds();
@@ -982,8 +981,8 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	// filter against that projected output — so e.g. with projection_map=[4] the
 	// lone surviving column becomes index 0. pivot's filter passes every input
 	// column through unchanged, so without replaying the projection those indices
-	// point at the wrong columns (this is what made grouped `date_trunc(EventTime)`
-	// read CounterID and collapse every row into one bucket). Replay it by wrapping
+	// point at the wrong columns (e.g. a grouped `date_trunc(timestamp_col)`
+	// would read the wrong column and collapse every row into one bucket). Replay it by wrapping
 	// the filter in a Projection that selects exactly `projection_map`, positionally,
 	// from the filter's (pass-through) output.
 	if (op->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {

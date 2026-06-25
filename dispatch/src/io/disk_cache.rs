@@ -259,7 +259,7 @@ impl DiskCache {
         // evicted. Under churn (ingest writing new files, compaction deleting them)
         // the objects backing deleted remote files are never re-read, so leaving
         // them untracked leaked them across every restart - unbounded, until the
-        // disk filled (76 GB under a 48 GB budget on the OTLP sink). Registering
+        // disk filled. Registering
         // every existing file up front, then evicting to budget, keeps a restart's
         // cache warm yet bounded.
         #[cfg(target_os = "linux")]

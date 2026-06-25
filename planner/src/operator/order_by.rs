@@ -108,7 +108,7 @@ impl OrderBy {
                 Ok(DispatchOrderBy::new(col, descending, false))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        //Tmp -- until we have a order by without limit
+        // No standalone ORDER BY (without LIMIT) yet, so emulate it with a sentinel limit.
         Ok(input.order_by_limit(orders, 1_000_000_000))
     }
 }

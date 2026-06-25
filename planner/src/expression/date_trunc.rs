@@ -11,7 +11,7 @@ use std::fmt::{self, Display};
 use std::sync::Arc;
 
 /// SQL `date_trunc(unit, source)` — truncate a timestamp down to `unit`
-/// (e.g. `date_trunc('minute', EventTime)`). DuckDB passes the unit as a string
+/// (e.g. `date_trunc('minute', ts)`). DuckDB passes the unit as a string
 /// constant in the first argument and the timestamp expression second.
 #[derive(Debug, Clone)]
 pub struct DateTrunc {
@@ -48,7 +48,7 @@ impl Display for DateTrunc {
 
 impl DateTrunc {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        // EventTime is stored as Int64 epoch *seconds*, so truncating to a unit
+        // A timestamp is stored as Int64 epoch *seconds*, so truncating to a unit
         // is flooring to that many seconds. `M = (t / secs) * secs`.
         let secs: i64 = match self.unit.as_str() {
             "second" => 1,

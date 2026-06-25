@@ -34,9 +34,9 @@ static BindInfo PivotScanGetBindInfo(const optional_ptr<FunctionData> bind_data)
 // expressions handed to us reference columns by their position in *that
 // pruned output*, not by their position in the underlying table. The Rust
 // catalog, on the other hand, indexes parquet row-group statistics by
-// storage position — so without this remap a filter on `UserID` (storage
+// storage position — so without this remap a filter on a non-leading column (storage
 // index 9, projected index 0) would look up stats for whatever storage
-// column happens to live at parquet index 0 (e.g. `WatchID`), which is
+// column happens to live at parquet index 0, which is
 // nonsense and over-prunes (or under-prunes) row groups.
 //
 // We mutate a *clone* of the expression rather than the filter in-place: if
