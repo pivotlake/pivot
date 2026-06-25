@@ -47,6 +47,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Clone)]
 pub struct ParquetTable {
     pub(crate) row_groups: Vec<Arc<RowGroupMetadata>>,
+    /// The table's Arrow schema, captured at construction so it survives even
+    /// when every row group is pruned away (e.g. predicate-stats pruning removes
+    /// all of them). Deriving it from `row_groups[0]` instead would yield an
+    /// empty schema for a fully-pruned table, panicking any scan that projects a
+    /// column.
+    schema: SchemaRef,
 }
 
 impl Debug for ParquetTable {
@@ -56,9 +62,15 @@ impl Debug for ParquetTable {
 }
 
 impl ParquetTable {
-    /// Wraps pre-built row group metadata into a table.
+    /// Wraps pre-built row group metadata into a table. The schema is taken from
+    /// the first row group (or empty when there are none) and then retained, so
+    /// later pruning of all row groups does not lose it.
     pub fn new(row_groups: Vec<Arc<RowGroupMetadata>>) -> Self {
-        Self { row_groups }
+        let schema = row_groups
+            .first()
+            .map(|rg| rg.schema.clone())
+            .unwrap_or_else(|| EMPTY_SCHEMA.clone());
+        Self { row_groups, schema }
     }
 
     /// Read-only view of this table's row groups.
@@ -136,13 +148,10 @@ impl ParquetTable {
         Ok(Self::new(row_groups))
     }
 
-    /// Returns the Arrow schema (taken from the first row group).
+    /// Returns the table's Arrow schema. Preserved across pruning, so a table
+    /// whose row groups were all eliminated still reports its real schema.
     pub fn schema(&self) -> &SchemaRef {
-        if self.row_groups.is_empty() {
-            &EMPTY_SCHEMA
-        } else {
-            &self.row_groups[0].schema
-        }
+        &self.schema
     }
 }
 
@@ -477,6 +486,31 @@ mod tests {
             encoding,
             count,
         }
+    }
+
+    /// Pruning away every row group keeps the table's schema, so a scan that
+    /// projects a column still builds. Regression: a fully-pruned table reported
+    /// an empty schema, panicking the decoder build on the projected column.
+    #[test]
+    fn schema_survives_pruning_every_row_group() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        let (_dir, mut table) = write_parquet(&batch, EnabledStatistics::Chunk);
+        let schema = table.schema().clone();
+
+        table.row_groups_mut().clear();
+
+        assert_eq!(table.schema(), &schema);
+        assert_eq!(table.schema().fields().len(), 2);
     }
 
     /// All data pages dictionary-encoded → prunable.
