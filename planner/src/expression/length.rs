@@ -93,12 +93,12 @@ mod tests {
 
         let mut rows = run(&mut testing_planner, "SELECT length(s) FROM strs");
 
-        rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+        rows.sort_by_key(|r| only_column(r).as_i64().unwrap());
         // Byte counts, not characters: "héllo" is 6 bytes (é is 2),
         // "日本語abc" is 12 (three 3-byte CJK chars + "abc").
         assert_eq!(
             rows.iter()
-                .map(|r| r["col0"].as_i64().unwrap())
+                .map(|r| only_column(r).as_i64().unwrap())
                 .collect::<Vec<_>>(),
             vec![0, 5, 6, 12]
         );
@@ -110,10 +110,10 @@ mod tests {
 
         let mut rows = run(&mut testing_planner, "SELECT strlen(s) FROM strs");
 
-        rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+        rows.sort_by_key(|r| only_column(r).as_i64().unwrap());
         assert_eq!(
             rows.iter()
-                .map(|r| r["col0"].as_i64().unwrap())
+                .map(|r| only_column(r).as_i64().unwrap())
                 .collect::<Vec<_>>(),
             vec![0, 5, 6, 12]
         );

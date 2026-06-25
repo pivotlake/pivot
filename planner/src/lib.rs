@@ -165,8 +165,8 @@ impl Planner {
     /// through the catalog), then each [`duckdb_planner::PlanNode`] is
     /// translated into a [`PlanNode`].
     pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
-        let duckdb_plan = self.planner_context.plan(query)?;
-        let mut root = PlanNode::try_from(duckdb_plan)?;
+        let planned = self.planner_context.plan(query)?;
+        let mut root = PlanNode::try_from(planned.root)?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
         // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
@@ -174,6 +174,7 @@ impl Planner {
         Ok(Plan {
             catalog: self.catalog.clone(),
             root,
+            output_names: planned.output_names,
         })
     }
 }

@@ -241,6 +241,15 @@ pub fn testing_planner() -> TestingPlanner {
     }
 }
 
+/// The value of a row's single column, by position rather than name. For tests
+/// that check a computed select item's value, not its (DuckDB-derived) name.
+#[allow(dead_code)]
+pub fn only_column(row: &Value) -> &Value {
+    let cols = row.as_object().expect("row is a JSON object");
+    assert_eq!(cols.len(), 1, "only_column expects exactly one column");
+    cols.values().next().unwrap()
+}
+
 // Used only by compile tests, but this module is shared across test binaries.
 #[allow(dead_code)]
 pub fn batches_to_json(batches: &[RecordBatch]) -> Vec<Value> {

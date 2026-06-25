@@ -508,9 +508,9 @@ fn grouped_multikey_order_by_count_desc_limit(mut testing_planner: TestingPlanne
         .iter()
         .map(|r| {
             (
-                r["k0"].as_i64().unwrap(),
-                r["k1"].as_str().unwrap().to_string(),
-                r["v0"].as_i64().unwrap(),
+                r["UserID"].as_i64().unwrap(),
+                r["SearchPhrase"].as_str().unwrap().to_string(),
+                r["c"].as_i64().unwrap(),
             )
         })
         .collect();
@@ -591,8 +591,8 @@ fn grouped_avg_length_filtered_having_ordered(mut testing_planner: TestingPlanne
         2,
         "g=3 should be dropped by HAVING; got {rows:?}"
     );
-    let groups: Vec<i64> = rows.iter().map(|r| r["col0"].as_i64().unwrap()).collect();
-    let avgs: Vec<f64> = rows.iter().map(|r| r["col2"].as_f64().unwrap()).collect();
+    let groups: Vec<i64> = rows.iter().map(|r| r["g"].as_i64().unwrap()).collect();
+    let avgs: Vec<f64> = rows.iter().map(|r| r["l"].as_f64().unwrap()).collect();
     assert_eq!(groups, vec![1, 2]);
     assert_eq!(avgs, vec![3.5, 3.0]);
 }
@@ -609,12 +609,12 @@ fn group_by_int_column(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["a"].as_i64().unwrap());
 
     // Each value of a (1..=5) appears exactly once.
     assert_eq!(rows.len(), 5);
     for row in &rows {
-        assert_eq!(row["v0"], 1);
+        assert_eq!(row["count_star()"], 1);
     }
 }
 
@@ -630,14 +630,14 @@ fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
+    rows.sort_by_key(|r| r["name"].as_str().unwrap().to_string());
 
     // alice appears twice, bob/charlie/dave each once.
     assert_eq!(rows.len(), 4);
-    let alice = rows.iter().find(|r| r["key"] == "alice").unwrap();
-    assert_eq!(alice["v0"], 2);
-    let bob = rows.iter().find(|r| r["key"] == "bob").unwrap();
-    assert_eq!(bob["v0"], 1);
+    let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
+    assert_eq!(alice["count_star()"], 2);
+    let bob = rows.iter().find(|r| r["name"] == "bob").unwrap();
+    assert_eq!(bob["count_star()"], 1);
 }
 
 // GROUP BY (Int64, Utf8) takes the dedicated int+string key extractor (the int
@@ -669,8 +669,8 @@ fn group_by_int64_string_key(mut testing_planner: TestingPlanner) {
     );
     rows.sort_by_key(|r| {
         (
-            r["k0"].as_i64().unwrap(),
-            r["k1"].as_str().unwrap().to_string(),
+            r["id"].as_i64().unwrap(),
+            r["name"].as_str().unwrap().to_string(),
         )
     });
 
@@ -678,33 +678,33 @@ fn group_by_int64_string_key(mut testing_planner: TestingPlanner) {
     assert_eq!(rows.len(), 4);
     assert_eq!(
         (
-            rows[0]["k0"].as_i64(),
-            rows[0]["k1"].as_str(),
-            rows[0]["v0"].as_i64()
+            rows[0]["id"].as_i64(),
+            rows[0]["name"].as_str(),
+            rows[0]["count_star()"].as_i64()
         ),
         (Some(1), Some("a"), Some(2))
     );
     assert_eq!(
         (
-            rows[1]["k0"].as_i64(),
-            rows[1]["k1"].as_str(),
-            rows[1]["v0"].as_i64()
+            rows[1]["id"].as_i64(),
+            rows[1]["name"].as_str(),
+            rows[1]["count_star()"].as_i64()
         ),
         (Some(2), Some("b"), Some(1))
     );
     assert_eq!(
         (
-            rows[2]["k0"].as_i64(),
-            rows[2]["k1"].as_str(),
-            rows[2]["v0"].as_i64()
+            rows[2]["id"].as_i64(),
+            rows[2]["name"].as_str(),
+            rows[2]["count_star()"].as_i64()
         ),
         (Some(2), Some("c"), Some(1))
     );
     assert_eq!(
         (
-            rows[3]["k0"].as_i64(),
-            rows[3]["k1"].as_str(),
-            rows[3]["v0"].as_i64()
+            rows[3]["id"].as_i64(),
+            rows[3]["name"].as_str(),
+            rows[3]["count_star()"].as_i64()
         ),
         (Some(3), Some("c"), Some(1))
     );
@@ -742,30 +742,30 @@ fn group_by_int64_and_date_columns(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| (r["k0"].as_i64().unwrap(), r["k1"].as_i64().unwrap()));
+    rows.sort_by_key(|r| (r["id"].as_i64().unwrap(), r["d"].as_i64().unwrap()));
 
     assert_eq!(rows.len(), 3);
     assert_eq!(
         (
-            rows[0]["k0"].as_i64(),
-            rows[0]["k1"].as_i64(),
-            rows[0]["v0"].as_i64()
+            rows[0]["id"].as_i64(),
+            rows[0]["d"].as_i64(),
+            rows[0]["count_star()"].as_i64()
         ),
         (Some(100), Some(10), Some(2))
     );
     assert_eq!(
         (
-            rows[1]["k0"].as_i64(),
-            rows[1]["k1"].as_i64(),
-            rows[1]["v0"].as_i64()
+            rows[1]["id"].as_i64(),
+            rows[1]["d"].as_i64(),
+            rows[1]["count_star()"].as_i64()
         ),
         (Some(100), Some(20), Some(1))
     );
     assert_eq!(
         (
-            rows[2]["k0"].as_i64(),
-            rows[2]["k1"].as_i64(),
-            rows[2]["v0"].as_i64()
+            rows[2]["id"].as_i64(),
+            rows[2]["d"].as_i64(),
+            rows[2]["count_star()"].as_i64()
         ),
         (Some(200), Some(10), Some(2))
     );
@@ -792,14 +792,14 @@ fn group_by_count_distinct(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["g"].as_i64().unwrap());
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0]["key"], 1);
-    assert_eq!(rows[0]["v0"], 2);
-    assert_eq!(rows[1]["key"], 2);
-    assert_eq!(rows[1]["v0"], 1);
-    assert_eq!(rows[2]["key"], 3);
-    assert_eq!(rows[2]["v0"], 1);
+    assert_eq!(rows[0]["g"], 1);
+    assert_eq!(rows[0]["count(DISTINCT x)"], 2);
+    assert_eq!(rows[1]["g"], 2);
+    assert_eq!(rows[1]["count(DISTINCT x)"], 1);
+    assert_eq!(rows[2]["g"], 3);
+    assert_eq!(rows[2]["count(DISTINCT x)"], 1);
 }
 
 #[rstest]
@@ -825,16 +825,22 @@ fn group_by_count_distinct_string_key(mut testing_planner: TestingPlanner) {
 
     // A single string group key counts through the dedicated `StringKeyExtractor`
     // (the same extractor a plain `GROUP BY name` uses), whose key column is
-    // emitted as `key`.
+    // emitted as `name`.
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_str().unwrap().to_string());
+    rows.sort_by_key(|r| r["name"].as_str().unwrap().to_string());
     assert_eq!(rows.len(), 2);
     assert_eq!(
-        (rows[0]["key"].as_str(), rows[0]["v0"].as_i64()),
+        (
+            rows[0]["name"].as_str(),
+            rows[0]["count(DISTINCT x)"].as_i64()
+        ),
         (Some("a"), Some(2))
     );
     assert_eq!(
-        (rows[1]["key"].as_str(), rows[1]["v0"].as_i64()),
+        (
+            rows[1]["name"].as_str(),
+            rows[1]["count(DISTINCT x)"].as_i64()
+        ),
         (Some("b"), Some(1))
     );
 }
@@ -864,24 +870,24 @@ fn group_by_count_distinct_multi_column_key(mut testing_planner: TestingPlanner)
     let mut rows = batches_to_json(&results);
     rows.sort_by_key(|r| {
         (
-            r["k0"].as_i64().unwrap(),
-            r["k1"].as_str().unwrap().to_string(),
+            r["g"].as_i64().unwrap(),
+            r["name"].as_str().unwrap().to_string(),
         )
     });
     assert_eq!(rows.len(), 2);
     assert_eq!(
         (
-            rows[0]["k0"].as_i64(),
-            rows[0]["k1"].as_str(),
-            rows[0]["v0"].as_i64()
+            rows[0]["g"].as_i64(),
+            rows[0]["name"].as_str(),
+            rows[0]["count(DISTINCT uid)"].as_i64()
         ),
         (Some(1), Some("x"), Some(2))
     );
     assert_eq!(
         (
-            rows[1]["k0"].as_i64(),
-            rows[1]["k1"].as_str(),
-            rows[1]["v0"].as_i64()
+            rows[1]["g"].as_i64(),
+            rows[1]["name"].as_str(),
+            rows[1]["count(DISTINCT uid)"].as_i64()
         ),
         (Some(2), Some("y"), Some(1))
     );
@@ -911,8 +917,11 @@ fn group_by_count_distinct_computed_key(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["v0"].as_i64().unwrap());
-    let counts: Vec<i64> = rows.iter().map(|r| r["v0"].as_i64().unwrap()).collect();
+    rows.sort_by_key(|r| r["count(DISTINCT x)"].as_i64().unwrap());
+    let counts: Vec<i64> = rows
+        .iter()
+        .map(|r| r["count(DISTINCT x)"].as_i64().unwrap())
+        .collect();
     assert_eq!(rows.len(), 2);
     assert_eq!(counts, vec![1, 2]);
 }
@@ -981,23 +990,23 @@ fn group_by_mixed_distinct(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["g"].as_i64().unwrap());
     assert_eq!(rows.len(), 2);
-    // Value columns are v0/v1/v2 in DuckDB's expression order; assert the
-    // multiset so the test is robust to that order (all three values differ).
+    // Assert the multiset of the three aggregate values so the test is robust to
+    // their column order (all three values differ).
     let vals = |r: &serde_json::Value| -> Vec<i64> {
-        ["v0", "v1", "v2"]
+        ["sum(v)", "count_star()", "count(DISTINCT x)"]
             .iter()
             .map(|c| r[*c].as_i64().unwrap())
             .collect()
     };
-    assert_eq!(rows[0]["key"], 1);
+    assert_eq!(rows[0]["g"], 1);
     let v1 = vals(&rows[0]);
     assert!(
         v1.contains(&10) && v1.contains(&2) && v1.contains(&1),
         "g=1 {v1:?}"
     );
-    assert_eq!(rows[1]["key"], 2);
+    assert_eq!(rows[1]["g"], 2);
     let v2 = vals(&rows[1]);
     assert!(v2.contains(&7) && v2.contains(&1), "g=2 {v2:?}");
 }
@@ -1028,20 +1037,20 @@ fn group_by_two_counts_mixed_distinct(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["g"].as_i64().unwrap());
     assert_eq!(
         (
-            rows[0]["v0"].as_i64(),
-            rows[0]["v1"].as_i64(),
-            rows[0]["v2"].as_i64()
+            rows[0]["count_star()"].as_i64(),
+            rows[0]["count(w)"].as_i64(),
+            rows[0]["count(DISTINCT x)"].as_i64()
         ),
         (Some(2), Some(2), Some(1))
     );
     assert_eq!(
         (
-            rows[1]["v0"].as_i64(),
-            rows[1]["v1"].as_i64(),
-            rows[1]["v2"].as_i64()
+            rows[1]["count_star()"].as_i64(),
+            rows[1]["count(w)"].as_i64(),
+            rows[1]["count(DISTINCT x)"].as_i64()
         ),
         (Some(2), Some(2), Some(2))
     );
@@ -1073,9 +1082,9 @@ fn group_by_count_two_int16_sums_coalesce(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["g"].as_i64().unwrap());
     let row = |r: &serde_json::Value| {
-        ["v0", "v1", "v2", "v3"]
+        ["count_star()", "sum(a)", "sum(b)", "count(c)"]
             .iter()
             .map(|c| r[*c].as_i64().unwrap())
             .collect::<Vec<_>>()
@@ -1113,11 +1122,11 @@ fn group_order_by_sum_with_coalesced_count_limit(mut testing_planner: TestingPla
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 2);
     assert_eq!(
-        (rows[0]["key"].as_i64(), rows[0]["v2"].as_i64()),
+        (rows[0]["g"].as_i64(), rows[0]["s"].as_i64()),
         (Some(1), Some(30))
     );
     assert_eq!(
-        (rows[1]["key"].as_i64(), rows[1]["v2"].as_i64()),
+        (rows[1]["g"].as_i64(), rows[1]["s"].as_i64()),
         (Some(3), Some(7))
     );
 }
@@ -1175,7 +1184,7 @@ fn filter_then_count(mut testing_planner: TestingPlanner) {
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["count"], 0);
+    assert_eq!(rows[0]["count_star()"], 0);
 }
 
 #[rstest]
@@ -1241,8 +1250,8 @@ fn global_min_max(mut testing_planner: TestingPlanner) {
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["min"], 1);
-    assert_eq!(rows[0]["max"], 50);
+    assert_eq!(rows[0]["min(a)"], 1);
+    assert_eq!(rows[0]["max(b)"], 50);
 }
 
 #[rstest]
@@ -1268,8 +1277,8 @@ fn global_string_min_max(mut testing_planner: TestingPlanner) {
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["min"], "apple");
-    assert_eq!(rows[0]["max"], "date");
+    assert_eq!(rows[0]["min(s)"], "apple");
+    assert_eq!(rows[0]["max(s)"], "date");
 }
 
 #[rstest]
@@ -1294,16 +1303,17 @@ fn grouped_min_max(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     // A single integer key uses the dedicated `IntKeyExtractor`, whose key column
-    // is named `key` (multi-key groups use the row encoder's `k0`, `k1`, …).
+    // carries the source column name `g` (multi-key groups use the row encoder's
+    // `k0`, `k1`, …).
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["g"].as_i64().unwrap());
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["key"], 1);
-    assert_eq!(rows[0]["v0"], 10); // min
-    assert_eq!(rows[0]["v1"], 40); // max
-    assert_eq!(rows[1]["key"], 2);
-    assert_eq!(rows[1]["v0"], 5); // min
-    assert_eq!(rows[1]["v1"], 20); // max
+    assert_eq!(rows[0]["g"], 1);
+    assert_eq!(rows[0]["min(v)"], 10); // min
+    assert_eq!(rows[0]["max(v)"], 40); // max
+    assert_eq!(rows[1]["g"], 2);
+    assert_eq!(rows[1]["min(v)"], 5); // min
+    assert_eq!(rows[1]["max(v)"], 20); // max
 }
 
 #[rstest]
@@ -1333,17 +1343,17 @@ fn grouped_string_min_and_max(mut testing_planner: TestingPlanner) {
             .collect()
             .unwrap();
         let mut rows = batches_to_json(&results);
-        rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+        rows.sort_by_key(|r| r["g"].as_i64().unwrap());
         rows
     };
 
     let mins = run(&mut testing_planner, "SELECT g, MIN(s) FROM gs GROUP BY g");
-    assert_eq!(mins[0]["v0"], "apple");
-    assert_eq!(mins[1]["v0"], "cherry");
+    assert_eq!(mins[0]["min(s)"], "apple");
+    assert_eq!(mins[1]["min(s)"], "cherry");
 
     let maxes = run(&mut testing_planner, "SELECT g, MAX(s) FROM gs GROUP BY g");
-    assert_eq!(maxes[0]["v0"], "banana");
-    assert_eq!(maxes[1]["v0"], "date");
+    assert_eq!(maxes[0]["max(s)"], "banana");
+    assert_eq!(maxes[1]["max(s)"], "date");
 }
 
 #[rstest]
@@ -1375,7 +1385,7 @@ fn grouped_string_max_order_by_limit(mut testing_planner: TestingPlanner) {
 
     let rows = batches_to_json(&results);
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0]["v0"], "zebra");
+    assert_eq!(rows[0]["max(s)"], "zebra");
 }
 
 /// A string extreme mixed with the opposite direction (or with integer
@@ -1408,11 +1418,11 @@ fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
         .collect()
         .unwrap();
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
-    assert_eq!(rows[0]["v0"], "apple"); // g=1 min
-    assert_eq!(rows[0]["v1"], "banana"); // g=1 max
-    assert_eq!(rows[1]["v0"], "cherry"); // g=2 min
-    assert_eq!(rows[1]["v1"], "date"); // g=2 max
+    rows.sort_by_key(|r| r["g"].as_i64().unwrap());
+    assert_eq!(rows[0]["min(s)"], "apple"); // g=1 min
+    assert_eq!(rows[0]["max(s)"], "banana"); // g=1 max
+    assert_eq!(rows[1]["min(s)"], "cherry"); // g=2 min
+    assert_eq!(rows[1]["max(s)"], "date"); // g=2 max
 
     // MIN(s) (string) + MAX(v) (integer): a string extreme beside a numeric one.
     let mixed = testing_planner
@@ -1424,11 +1434,11 @@ fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
         .collect()
         .unwrap();
     let mut mixed_rows = batches_to_json(&mixed);
-    mixed_rows.sort_by_key(|r| r["key"].as_i64().unwrap());
-    assert_eq!(mixed_rows[0]["v0"], "apple"); // g=1 min(s)
-    assert_eq!(mixed_rows[0]["v1"], 30); // g=1 max(v)
-    assert_eq!(mixed_rows[1]["v0"], "cherry"); // g=2 min(s)
-    assert_eq!(mixed_rows[1]["v1"], 20); // g=2 max(v)
+    mixed_rows.sort_by_key(|r| r["g"].as_i64().unwrap());
+    assert_eq!(mixed_rows[0]["min(s)"], "apple"); // g=1 min(s)
+    assert_eq!(mixed_rows[0]["max(v)"], 30); // g=1 max(v)
+    assert_eq!(mixed_rows[1]["min(s)"], "cherry"); // g=2 min(s)
+    assert_eq!(mixed_rows[1]["max(v)"], 20); // g=2 max(v)
 }
 
 #[rstest]
@@ -1480,7 +1490,7 @@ fn group_order_by_count_desc_with_offset(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let rows = batches_to_json(&results);
-    let keys: Vec<i64> = rows.iter().map(|r| r["key"].as_i64().unwrap()).collect();
+    let keys: Vec<i64> = rows.iter().map(|r| r["g"].as_i64().unwrap()).collect();
     assert_eq!(keys, vec![3, 4]);
 }
 
@@ -1503,7 +1513,7 @@ fn group_order_by_key_asc_with_offset(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let rows = batches_to_json(&results);
-    let keys: Vec<i64> = rows.iter().map(|r| r["key"].as_i64().unwrap()).collect();
+    let keys: Vec<i64> = rows.iter().map(|r| r["g"].as_i64().unwrap()).collect();
     assert_eq!(keys, vec![2, 3]);
 }
 
@@ -1683,17 +1693,17 @@ fn group_by_string_min_mixed_distinct_filtered_ordered(mut testing_planner: Test
     // Surviving rows: (x,a,Goog news,u1), (x,b,Goog maps,u2), (z,f,Goog w,u6).
     // y rows drop (one URL has ".google.", one title misses "Goog"); "" drops.
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["key"], "x");
-    assert_eq!(rows[0]["v0"], "a");
-    assert_eq!(rows[0]["v1"], "Goog maps");
-    assert_eq!(rows[0]["v2"], 2);
-    assert_eq!(rows[0]["v3"], 2);
-    assert_eq!(rows[1]["key"], "z");
+    assert_eq!(rows[0]["phrase"], "x");
+    assert_eq!(rows[0]["min(url)"], "a");
+    assert_eq!(rows[0]["min(title)"], "Goog maps");
+    assert_eq!(rows[0]["c"], 2);
+    assert_eq!(rows[0][r#"count(DISTINCT "user")"#], 2);
+    assert_eq!(rows[1]["phrase"], "z");
     assert_eq!(
         (
-            rows[1]["v0"].as_str(),
-            rows[1]["v2"].as_i64(),
-            rows[1]["v3"].as_i64()
+            rows[1]["min(url)"].as_str(),
+            rows[1]["c"].as_i64(),
+            rows[1][r#"count(DISTINCT "user")"#].as_i64()
         ),
         (Some("f"), Some(1), Some(1))
     );
@@ -1724,22 +1734,22 @@ fn group_by_numeric_min_max_mixed_distinct(mut testing_planner: TestingPlanner) 
             .collect()
             .unwrap(),
     );
-    rows.sort_by_key(|r| r["key"].as_i64().unwrap());
+    rows.sort_by_key(|r| r["g"].as_i64().unwrap());
 
     assert_eq!(rows.len(), 2);
     assert_eq!(
         (
-            rows[0]["v0"].as_i64(),
-            rows[0]["v1"].as_i64(),
-            rows[0]["v2"].as_i64()
+            rows[0]["min(v)"].as_i64(),
+            rows[0]["max(v)"].as_i64(),
+            rows[0][r#"count(DISTINCT "user")"#].as_i64()
         ),
         (Some(10), Some(30), Some(2))
     );
     assert_eq!(
         (
-            rows[1]["v0"].as_i64(),
-            rows[1]["v1"].as_i64(),
-            rows[1]["v2"].as_i64()
+            rows[1]["min(v)"].as_i64(),
+            rows[1]["max(v)"].as_i64(),
+            rows[1][r#"count(DISTINCT "user")"#].as_i64()
         ),
         (Some(5), Some(7), Some(1))
     );
@@ -1820,7 +1830,9 @@ fn generate_series_streams_across_chunk_boundaries(mut testing_planner: TestingP
 
     assert_eq!(
         rows,
-        vec![serde_json::json!({"count": 20000, "min": 1, "max": 20000})]
+        vec![
+            serde_json::json!({"count_star()": 20000, "min(generate_series)": 1, "max(generate_series)": 20000})
+        ]
     );
 }
 
@@ -1837,7 +1849,7 @@ fn count_star_over_generate_series(mut testing_planner: TestingPlanner) {
 
     let rows = batches_to_json(&results);
 
-    assert_eq!(rows, vec![serde_json::json!({"count": 5})]);
+    assert_eq!(rows, vec![serde_json::json!({"count_star()": 5})]);
 }
 
 #[rstest]
@@ -1883,7 +1895,7 @@ fn count_star_over_empty_series(mut testing_planner: TestingPlanner) {
 
     let rows = batches_to_json(&results);
 
-    assert_eq!(rows, vec![serde_json::json!({"count": 0})]);
+    assert_eq!(rows, vec![serde_json::json!({"count_star()": 0})]);
 }
 
 #[rstest]
@@ -1899,7 +1911,10 @@ fn generate_series_composes_with_aggregate(mut testing_planner: TestingPlanner) 
 
     let rows = batches_to_json(&results);
 
-    assert_eq!(rows, vec![serde_json::json!({"count": 4, "sum": 10})]);
+    assert_eq!(
+        rows,
+        vec![serde_json::json!({"count_star()": 4, "sum(generate_series)": 10})]
+    );
 }
 
 #[rstest]

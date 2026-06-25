@@ -122,13 +122,14 @@ mod tests {
 
     #[rstest]
     fn group_by_count(mut testing_planner: TestingPlanner) {
-        // Grouped output is positional: the key is `key`, the aggregate `v0`.
+        // Output columns keep DuckDB's resolved names (the group key `name` and
+        // the aggregate `count_star()`), not internal positional placeholders.
         let rows = run(
             &mut testing_planner,
             "SELECT name, COUNT(*) FROM example_table GROUP BY name",
         );
 
-        let alice = rows.iter().find(|r| r["key"] == "alice").unwrap();
-        assert_eq!(alice["v0"], 2); // alice appears twice
+        let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
+        assert_eq!(alice["count_star()"], 2); // alice appears twice
     }
 }

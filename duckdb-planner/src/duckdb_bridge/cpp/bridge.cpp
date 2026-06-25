@@ -27,6 +27,8 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/planner/planner.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -1012,12 +1014,54 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	return new_node;
 }
 
+// Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
+// binder-resolved result column names (in select order) via `result_names`.
+// The stock `ExtractPlan` computes those names on its local `Planner` and then
+// discards them when it returns only the plan; we reproduce its body here (the
+// binder/optimizer/resolver steps are all public API) so the names can be
+// captured without patching the bundled DuckDB.
+static duckdb::unique_ptr<duckdb::LogicalOperator>
+extract_plan_with_names(duckdb::Connection &con, const std::string &query,
+                        duckdb::vector<std::string> &result_names) {
+	auto statements = con.ExtractStatements(query);
+	if (statements.size() != 1) {
+		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
+	}
+	auto &context = *con.context;
+	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+	context.RunFunctionInTransaction([&]() {
+		duckdb::Planner planner(context);
+		planner.CreatePlan(std::move(statements[0]));
+		// The binder resolves the client-facing result column names before
+		// optimization rewrites the plan; capture them while still intact.
+		result_names = planner.names;
+		plan = std::move(planner.plan);
+		if (context.config.enable_optimizer) {
+			duckdb::Optimizer optimizer(*planner.binder, context);
+			plan = optimizer.Optimize(std::move(plan));
+		}
+		plan->ResolveOperatorTypes();
+		duckdb::ColumnBindingResolver resolver;
+		resolver.Verify(*plan);
+		resolver.VisitOperator(*plan);
+	});
+	return plan;
+}
+
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
 	json result;
 	rust::Vec<rust::Box<OptionalTableWrapper>> tables;
 
 	try {
-		auto plan = ctx.con.ExtractPlan(std::string(query.data(), query.size()));
+		std::string query_str(query.data(), query.size());
+		// The result column names DuckDB would hand a client, in select order
+		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
+		// Captured in the same planning pass as the plan itself: the binder
+		// resolves them before optimization pushes expressions around and the
+		// optimized plan no longer carries them intact. The Rust side stamps
+		// them onto the final output schema.
+		duckdb::vector<std::string> name_list;
+		auto plan = extract_plan_with_names(ctx.con, query_str, name_list);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. Without this we serialized binding.column_index directly, which
@@ -1029,7 +1073,12 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
 		resolver.VisitOperator(*plan);
 		DynamicFilterDedup df_dedup;
 		auto root = build_plan_node_json(plan.get(), tables, df_dedup);
-		result = {{"type", "success"}, {"data", root}};
+
+		json output_names = json::array();
+		for (const auto &name : name_list) {
+			output_names.push_back(name);
+		}
+		result = {{"type", "success"}, {"data", {{"plan", root}, {"output_names", output_names}}}};
 	} catch (duckdb::Exception &e) {
 		result = build_duckdb_error(e);
 	} catch (const UnsupportedPlanError &e) {

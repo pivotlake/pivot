@@ -228,6 +228,11 @@ impl PlanNode {
 pub struct Plan {
     pub catalog: Arc<dyn Catalog>,
     pub root: PlanNode,
+    /// The result column names DuckDB resolved for the client, in output order
+    /// (e.g. `["hour", "count_star()"]`). Stamped onto the compiled output's
+    /// schema. Empty when unavailable, in which case the operators' own field
+    /// names stand.
+    pub output_names: Vec<String>,
 }
 
 impl Plan {

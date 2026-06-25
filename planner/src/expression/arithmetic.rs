@@ -139,18 +139,17 @@ mod tests {
 
     #[rstest]
     fn nested_add_and_mul_in_projection(mut testing_planner: TestingPlanner) {
-        // A computed projection names its single output `col0`. (a + b) * 2 over
-        // the (a, b) pairs (1,10)…(5,50).
+        // (a + b) * 2 over the (a, b) pairs (1,10)…(5,50).
         let mut rows = run(
             &mut testing_planner,
             "SELECT (a + b) * 2 FROM example_table",
         );
 
-        rows.sort_by_key(|r| r["col0"].as_i64().unwrap());
+        rows.sort_by_key(|r| only_column(r).as_i64().unwrap());
 
         assert_eq!(
             rows.iter()
-                .map(|r| r["col0"].as_i64().unwrap())
+                .map(|r| only_column(r).as_i64().unwrap())
                 .collect::<Vec<_>>(),
             vec![22, 44, 66, 88, 110]
         );
