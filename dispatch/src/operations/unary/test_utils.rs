@@ -4,7 +4,9 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
 use crate::worker::install_test_worker_waker;
-use arrow_array::{Decimal128Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::{
+    Decimal128Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+};
 
 /// A [`Sender`] that collects all sent items for later inspection.
 pub struct CollectSender<T = RecordBatch> {
@@ -79,6 +81,23 @@ impl CollectSender<RecordBatch> {
                 b.column(col)
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    /// All values from a `Float64` column `col` as `f64`, in order (e.g. a
+    /// grouped float `SUM`/`MIN`/`MAX` output).
+    pub fn f64_column(&self, col: usize) -> Vec<f64> {
+        self.items
+            .iter()
+            .flat_map(|b| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
                     .unwrap()
                     .values()
                     .iter()

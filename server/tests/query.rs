@@ -13,7 +13,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use common::{Conn, conn, connect_client, server_port};
 use parquet::arrow::ArrowWriter;
@@ -197,19 +197,15 @@ async fn filtered_min_max_does_not_short_circuit(#[future] conn: Conn) {
     );
 }
 
-/// Regression: the metadata short-circuit only fires for integer/temporal
-/// columns whose stats cast losslessly to Int64. Before the type allowlist, a
-/// global MIN/MAX over a DOUBLE column cast the float stats to Int64 and
-/// silently returned the truncated values ([3, 9] for {3.7, 9.2}); now a
-/// non-integer column declines the short-circuit, so the truncated row is never
-/// produced (today the unsupported float aggregate errors instead of
-/// corrupting, either outcome is acceptable, the wrong row is not).
+/// A global MIN/MAX over a DOUBLE column returns the real float extremes, not
+/// the Int64-truncated [3, 9] the metadata short-circuit once produced; that
+/// path declines non-integer columns, so the scan-based float aggregate runs.
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
-async fn global_min_max_does_not_short_circuit_double_column(#[future] conn: Conn) {
+async fn global_min_max_over_double_column(#[future] conn: Conn) {
     let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
-    let f: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![3.7f64, 9.2, 5.0]));
+    let f: ArrayRef = Arc::new(Float64Array::from(vec![3.7f64, 9.2, 5.0]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![f]).unwrap());
     conn.simple_query(&format!(
         "CREATE TABLE doubles (f DOUBLE) WITH (path = '{}')",
@@ -218,28 +214,99 @@ async fn global_min_max_does_not_short_circuit_double_column(#[future] conn: Con
     .await
     .unwrap();
 
-    let result = conn
-        .simple_query("SELECT MIN(f), MAX(f) FROM doubles")
-        .await;
+    let rows = select_floats(&conn, "SELECT MIN(f), MAX(f) FROM doubles").await;
 
-    if let Ok(msgs) = result {
-        let rows: Vec<Vec<Option<String>>> = msgs
-            .into_iter()
-            .filter_map(|m| match m {
-                SimpleQueryMessage::Row(r) => Some(
-                    (0..r.len())
-                        .map(|i| r.get(i).map(|s| s.to_string()))
-                        .collect(),
-                ),
-                _ => None,
-            })
-            .collect();
-        assert_ne!(
-            rows,
-            vec![vec![Some("3".into()), Some("9".into())]],
-            "DOUBLE MIN/MAX must not be silently truncated to Int64"
-        );
-    }
+    assert_eq!(rows, vec![vec![Some(3.7), Some(9.2)]]);
+}
+
+/// (g BIGINT, v DOUBLE) batch for the float-aggregate tests. Group 1 holds
+/// {1.5, 2.5}; group 2 holds {10.0, 20.0, 30.0}.
+fn float_group_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", DataType::Float64, false),
+    ]));
+    let g: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1, 2, 2, 2]));
+    let v: ArrayRef = Arc::new(Float64Array::from(vec![1.5f64, 2.5, 10.0, 20.0, 30.0]));
+    RecordBatch::try_new(schema, vec![g, v]).unwrap()
+}
+
+async fn create_floats_table(client: &Client, table: &str, dir: &Path) {
+    let path = dir.to_str().unwrap();
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (g BIGINT, v DOUBLE) WITH (path = '{path}')"
+        ))
+        .await
+        .unwrap();
+}
+
+/// Run `sql` and decode each cell as an `Option<f64>` (text format, `NULL` →
+/// `None`). Float results are compared numerically to avoid wire-format
+/// formatting brittleness.
+async fn select_floats(client: &Client, sql: &str) -> Vec<Vec<Option<f64>>> {
+    select_rows(client, sql)
+        .await
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|cell| cell.map(|s| s.parse::<f64>().expect("float scalar")))
+                .collect()
+        })
+        .collect()
+}
+
+/// Global SUM/AVG/MIN/MAX over a DOUBLE column, folded in `f64`.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn global_float_aggregates(#[future] conn: Conn) {
+    let dir = write_parquet(&float_group_batch());
+    create_floats_table(&conn, "floats_global", dir.path()).await;
+
+    let rows = select_floats(
+        &conn,
+        "SELECT SUM(v), AVG(v), MIN(v), MAX(v) FROM floats_global",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Some(64.0), Some(12.8), Some(1.5), Some(30.0)]]);
+}
+
+/// Grouped SUM/AVG/MIN/MAX over a DOUBLE column.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn grouped_float_aggregates(#[future] conn: Conn) {
+    let dir = write_parquet(&float_group_batch());
+    create_floats_table(&conn, "floats_grouped", dir.path()).await;
+
+    let rows = select_floats(
+        &conn,
+        "SELECT g, SUM(v), AVG(v), MIN(v), MAX(v) FROM floats_grouped GROUP BY g ORDER BY g",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(1.0), Some(4.0), Some(2.0), Some(1.5), Some(2.5)],
+            vec![Some(2.0), Some(60.0), Some(20.0), Some(10.0), Some(30.0)],
+        ],
+    );
+}
+
+/// A float SUM over zero matching rows is SQL `NULL`, not a fabricated `0.0`.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn global_float_sum_of_no_rows_is_null(#[future] conn: Conn) {
+    let dir = write_parquet(&float_group_batch());
+    create_floats_table(&conn, "floats_empty", dir.path()).await;
+
+    let rows = select_floats(&conn, "SELECT SUM(v) FROM floats_empty WHERE g = 99").await;
+
+    assert_eq!(rows, vec![vec![None]]);
 }
 
 /// An unfiltered global COUNT(*) is answered from the sum of parquet row-group

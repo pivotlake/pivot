@@ -136,19 +136,27 @@ impl PlanNode {
                 }
                 Step::SetAgg(slot) => {
                     if let Operator::Aggregate(a) = &mut node.operator {
-                        // Don't push top-k onto a string MIN/MAX. A string
-                        // extreme's `sort_key` is its raw `ArenaKey`/StringView
-                        // header bits, not lexicographic order, so a per-partition
-                        // top-k would keep the wrong rows. Leave it to the full
-                        // `TopN` sort above (only the pushdown is skipped).
+                        // Don't push top-k onto an aggregate whose `sort_key` isn't
+                        // order-preserving: a string MIN/MAX (its cell is the raw
+                        // `ArenaKey`/StringView header bits, not lexicographic order)
+                        // or any float aggregate (its cell holds the running `f64`'s
+                        // bits, which don't order as integers). A per-partition top-k
+                        // would keep the wrong rows, so leave it to the full `TopN`
+                        // sort above (only the pushdown is skipped).
                         use crate::expression::AggregateFunc;
-                        let string_extreme = matches!(
+                        use crate::types::Type;
+                        let unordered_sort_key = matches!(
                             a.expressions.get(slot),
                             Some(Expression::AggregateFunc(
                                 AggregateFunc::Min(x) | AggregateFunc::Max(x)
-                            )) if x.column.return_type == crate::types::Type::Utf8
+                            )) if x.column.return_type == Type::Utf8
+                        ) || matches!(
+                            a.expressions.get(slot),
+                            Some(Expression::AggregateFunc(
+                                AggregateFunc::Sum(x) | AggregateFunc::Min(x) | AggregateFunc::Max(x)
+                            )) if x.column.return_type == Type::Float64
                         );
-                        if !string_extreme {
+                        if !unordered_sort_key {
                             a.output_limit = Some(GroupLimit::TopK { slot, limit });
                         }
                     }

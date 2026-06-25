@@ -31,7 +31,10 @@ pub mod read;
 pub use cell::{Cell, Numeric};
 pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, SumSlot};
 pub use distinct::Distinct;
-pub use fold::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
+pub use fold::{
+    Count, FloatMax, FloatMin, FloatSum, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum,
+};
+pub(crate) use fold::{keep_max, keep_min};
 pub use read::{IntRead, NoRead, Read, StrRead};
 
 /// Which per-group aggregate a value slot computes during consume — a pure
@@ -54,6 +57,14 @@ pub enum AggregationKind {
     Min,
     /// `MAX(col)` over an integer column.
     Max,
+    /// `SUM(col)` over a `Float64` column: folds in `f64`
+    /// ([`FloatSum`](super::FloatSum)), keeping the running value's bits in the
+    /// numeric cell ([`FloatCell`]).
+    FloatSum,
+    /// `MIN(col)` over a `Float64` column ([`FloatMin`](super::FloatMin)).
+    FloatMin,
+    /// `MAX(col)` over a `Float64` column ([`FloatMax`](super::FloatMax)).
+    FloatMax,
     /// `MIN(col)` over a string (`Utf8`) column — its cell is an `ArenaKey` and
     /// its fold ([`StrMin`]) compares the raw bytes through the value arena, not
     /// the numeric path.

@@ -12,7 +12,7 @@
 //! for [`Count`](super::fold::Count), which reads no column.
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::ArrowPrimitiveType;
+use arrow_array::types::{ArrowPrimitiveType, Float64Type};
 use arrow_array::{PrimitiveArray, RecordBatch, StringViewArray};
 use std::marker::PhantomData;
 
@@ -53,6 +53,25 @@ where
     #[inline(always)]
     fn read<'b>(input: &Self::Input<'b>, idx: usize) -> Self::Val<'b> {
         unsafe { input.value_unchecked(idx) }.into()
+    }
+}
+
+/// Reads a `Float64` column, yielding the `f64` the float folds
+/// (`FloatSum`/`FloatMin`/`FloatMax`) consume. The float counterpart to
+/// [`IntRead`]; there is one float width (`f64`), so no type parameter.
+pub struct FloatRead;
+
+impl Read for FloatRead {
+    type Input<'b> = &'b PrimitiveArray<Float64Type>;
+    type Val<'b> = f64;
+
+    #[inline(always)]
+    fn bind(batch: &RecordBatch, column: usize) -> &PrimitiveArray<Float64Type> {
+        batch.column(column).as_primitive::<Float64Type>()
+    }
+    #[inline(always)]
+    fn read<'b>(input: &Self::Input<'b>, idx: usize) -> Self::Val<'b> {
+        unsafe { input.value_unchecked(idx) }
     }
 }
 

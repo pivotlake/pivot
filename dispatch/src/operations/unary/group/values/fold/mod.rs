@@ -20,11 +20,14 @@
 
 mod count;
 mod extreme;
+mod float;
 mod string;
 mod sum;
 
 pub use count::Count;
 pub use extreme::{Max, Min};
+pub use float::{FloatMax, FloatMin, FloatSum};
+pub(crate) use float::{keep_max, keep_min};
 pub use string::{StrMax, StrMin};
 pub use sum::{Sum, WideSum};
 

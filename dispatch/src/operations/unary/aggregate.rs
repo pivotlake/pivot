@@ -25,14 +25,14 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
-    AggregationKind, AggregationSlot, Count, FoldAcc, Max, Min, Numeric, Sum,
+    AggregationKind, AggregationSlot, Count, FoldAcc, Max, Min, Numeric, Sum, keep_max, keep_min,
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::types::{Float64Type, Int16Type, Int32Type, Int64Type};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -45,16 +45,19 @@ use std::sync::mpsc;
 #[derive(Clone)]
 enum Partial<A> {
     Num(Option<A>),
+    Float(Option<f64>),
     Str(Option<String>),
 }
 
 impl<A: Numeric> Partial<A> {
     /// The empty accumulator for a slot of `kind`.
     fn empty(kind: AggregationKind) -> Self {
-        if kind.is_string_extreme() {
-            Partial::Str(None)
-        } else {
-            Partial::Num(None)
+        match kind {
+            AggregationKind::StrMin | AggregationKind::StrMax => Partial::Str(None),
+            AggregationKind::FloatSum | AggregationKind::FloatMin | AggregationKind::FloatMax => {
+                Partial::Float(None)
+            }
+            _ => Partial::Num(None),
         }
     }
 
@@ -66,6 +69,9 @@ impl<A: Numeric> Partial<A> {
         match (self, other) {
             (Partial::Num(acc), Partial::Num(c)) => {
                 *acc = fold_first(*acc, c, |a, b| merge_num(kind, a, b));
+            }
+            (Partial::Float(acc), Partial::Float(c)) => {
+                *acc = fold_first(*acc, c, |a, b| merge_float(kind, a, b));
             }
             (Partial::Str(acc), Partial::Str(c)) => {
                 let is_max = matches!(kind, AggregationKind::StrMax);
@@ -88,6 +94,12 @@ impl<A: Numeric> Partial<A> {
     fn into_column(self, kind: AggregationKind) -> (Field, ArrayRef) {
         match self {
             Partial::Num(total) => num_column::<A>(kind, total),
+            // `MIN`/`MAX`/`SUM` over a `Float64` column. `None` (zero rows) is a SQL
+            // NULL, so the column is nullable.
+            Partial::Float(total) => (
+                Field::new(column_name(kind), DataType::Float64, true),
+                Arc::new(Float64Array::from(vec![total])),
+            ),
             Partial::Str(total) => {
                 let arr: ArrayRef = Arc::new(StringViewArray::from_iter(std::iter::once(
                     total.as_deref(),
@@ -122,9 +134,68 @@ fn merge_num<A: Numeric>(kind: AggregationKind, a: A, b: A) -> A {
         AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
         AggregationKind::Min => Min::<A>::merge(a, b, &()),
         AggregationKind::Max => Max::<A>::merge(a, b, &()),
+        AggregationKind::FloatSum | AggregationKind::FloatMin | AggregationKind::FloatMax => {
+            unreachable!("float aggregate accumulates as Partial::Float, not numeric")
+        }
         AggregationKind::StrMin | AggregationKind::StrMax => {
             unreachable!("string extreme accumulates as Partial::Str, not numeric")
         }
+    }
+}
+
+/// Combine two `f64` partials by the slot's float op. `SUM` adds; `MIN`/`MAX`
+/// reuse the grouped path's [`keep_min`]/[`keep_max`] (which rank `NaN` greatest,
+/// matching DuckDB), so global and grouped fold the same float ordering.
+#[inline(always)]
+fn merge_float(kind: AggregationKind, a: f64, b: f64) -> f64 {
+    match kind {
+        AggregationKind::FloatSum => a + b,
+        AggregationKind::FloatMin => keep_min(a, b),
+        AggregationKind::FloatMax => keep_max(a, b),
+        _ => unreachable!("merge_float only handles the float SUM/MIN/MAX kinds"),
+    }
+}
+
+/// Reduce one batch's `Float64` column to a partial of `kind`
+/// (`SUM`/`MIN`/`MAX`), or `None` if it contributes nothing (empty or all-NULL).
+/// NULLs are skipped (SQL aggregates ignore them).
+fn reduce_float_column(kind: AggregationKind, arr: &dyn Array) -> Option<f64> {
+    let a = arr.as_primitive::<Float64Type>();
+    if a.is_empty() {
+        return None;
+    }
+    macro_rules! reduce_with {
+        ($merge:expr) => {{
+            if a.null_count() == 0 {
+                let mut acc = unsafe { a.value_unchecked(0) };
+                for i in 1..a.len() {
+                    acc = $merge(acc, unsafe { a.value_unchecked(i) });
+                }
+                Some(acc)
+            } else {
+                let mut acc: Option<f64> = None;
+                for i in 0..a.len() {
+                    if a.is_null(i) {
+                        continue;
+                    }
+                    let v = unsafe { a.value_unchecked(i) };
+                    acc = Some(match acc {
+                        Some(p) => $merge(p, v),
+                        None => v,
+                    });
+                }
+                acc
+            }
+        }};
+    }
+    // Hoist `kind` out of the row loop (as `reduce_int_column` does): each arm
+    // instantiates a monomorphic reduction the autovectoriser can lift, instead
+    // of a per-row `merge_float(kind, ..)` branch.
+    match kind {
+        AggregationKind::FloatSum => reduce_with!(|x: f64, y: f64| x + y),
+        AggregationKind::FloatMin => reduce_with!(keep_min),
+        AggregationKind::FloatMax => reduce_with!(keep_max),
+        _ => unreachable!("reduce_float_column only handles the float SUM/MIN/MAX kinds"),
     }
 }
 
@@ -231,9 +302,9 @@ fn reduce_str_column(is_max: bool, arr: &dyn Array) -> Option<String> {
 fn column_name(kind: AggregationKind) -> &'static str {
     match kind {
         AggregationKind::CountStar | AggregationKind::Count => "count",
-        AggregationKind::Sum => "sum",
-        AggregationKind::Min | AggregationKind::StrMin => "min",
-        AggregationKind::Max | AggregationKind::StrMax => "max",
+        AggregationKind::Sum | AggregationKind::FloatSum => "sum",
+        AggregationKind::Min | AggregationKind::FloatMin | AggregationKind::StrMin => "min",
+        AggregationKind::Max | AggregationKind::FloatMax | AggregationKind::StrMax => "max",
     }
 }
 
@@ -257,6 +328,9 @@ fn num_column<A: Numeric>(kind: AggregationKind, total: Option<A>) -> (Field, Ar
                 Field::new(column_name(kind), DataType::Int64, false),
                 Arc::new(Int64Array::from(vec![count])),
             )
+        }
+        AggregationKind::FloatSum | AggregationKind::FloatMin | AggregationKind::FloatMax => {
+            unreachable!("float aggregate renders through Partial::Float")
         }
         AggregationKind::StrMin | AggregationKind::StrMax => {
             unreachable!("string extreme renders through Partial::Str")
@@ -345,6 +419,9 @@ impl<A: Numeric> Aggregate<A> {
             }
             AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
                 Partial::Num(reduce_int_column::<A>(slot.kind, batch.column(slot.column)))
+            }
+            AggregationKind::FloatSum | AggregationKind::FloatMin | AggregationKind::FloatMax => {
+                Partial::Float(reduce_float_column(slot.kind, batch.column(slot.column)))
             }
             AggregationKind::StrMin | AggregationKind::StrMax => {
                 let is_max = matches!(slot.kind, AggregationKind::StrMax);
@@ -440,6 +517,15 @@ mod tests {
         .unwrap()
     }
 
+    fn make_float_batch(values: &[f64]) -> RecordBatch {
+        let array = Float64Array::from(values.to_vec());
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)])),
+            vec![Arc::new(array)],
+        )
+        .unwrap()
+    }
+
     fn make_str_batch(values: &[&str]) -> RecordBatch {
         let array = StringViewArray::from(values.to_vec());
         RecordBatch::try_new(
@@ -477,6 +563,9 @@ mod tests {
     }
     fn col_str(batch: &RecordBatch, i: usize) -> String {
         batch.column(i).as_string_view().value(0).to_string()
+    }
+    fn col_f64(batch: &RecordBatch, i: usize) -> f64 {
+        batch.column(i).as_primitive::<Float64Type>().value(0)
     }
 
     fn slot(kind: AggregationKind, column: usize) -> AggregationSlot {
@@ -627,6 +716,85 @@ mod tests {
 
         assert_eq!(col_i64(&out.items[0], 0), 2); // min ignores NULLs
         assert_eq!(col_i64(&out.items[0], 1), 9); // max ignores NULLs
+    }
+
+    #[test]
+    fn float_sum_min_max_over_batches() {
+        // Float SUM/MIN/MAX fold in f64 across rows and batches.
+        let ops = build::<i64>(
+            1,
+            vec![
+                slot(AggregationKind::FloatSum, 0),
+                slot(AggregationKind::FloatMin, 0),
+                slot(AggregationKind::FloatMax, 0),
+            ],
+        );
+
+        let out = run_consumers(
+            ops,
+            vec![vec![
+                make_float_batch(&[1.5, 2.5, 9.0]),
+                make_float_batch(&[7.25, 0.5]),
+            ]],
+        );
+
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(col_f64(&out.items[0], 0), 20.75); // sum
+        assert_eq!(col_f64(&out.items[0], 1), 0.5); // min
+        assert_eq!(col_f64(&out.items[0], 2), 9.0); // max
+    }
+
+    #[test]
+    fn float_extremes_merge_across_workers() {
+        // Each worker's partial float extreme combines (not adds) at the
+        // collector, including negatives the MAX identity must not swallow.
+        let ops = build::<i64>(
+            3,
+            vec![
+                slot(AggregationKind::FloatMin, 0),
+                slot(AggregationKind::FloatMax, 0),
+            ],
+        );
+
+        let out = run_consumers(
+            ops,
+            vec![
+                vec![make_float_batch(&[10.0, 4.5])],
+                vec![make_float_batch(&[-3.5, 20.25])],
+                vec![make_float_batch(&[7.0])],
+            ],
+        );
+
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(col_f64(&out.items[0], 0), -3.5); // min
+        assert_eq!(col_f64(&out.items[0], 1), 20.25); // max
+    }
+
+    #[test]
+    fn float_min_max_rank_negative_nan_greatest() {
+        // A negative-signbit NaN must rank as the greatest value (DuckDB), so it
+        // lands in MAX and never displaces the finite MIN. `f64::total_cmp` would
+        // wrongly rank it least, inverting both.
+        let neg_nan = f64::from_bits(0xFFF8_0000_0000_0000);
+        let ops = build::<i64>(
+            1,
+            vec![slot(AggregationKind::FloatMin, 0), slot(AggregationKind::FloatMax, 0)],
+        );
+
+        let out = run_consumers(ops, vec![vec![make_float_batch(&[1.0, 2.0, neg_nan])]]);
+
+        assert_eq!(col_f64(&out.items[0], 0), 1.0); // min ignores the NaN
+        assert!(col_f64(&out.items[0], 1).is_nan()); // max keeps the NaN
+    }
+
+    #[test]
+    fn float_sum_of_empty_is_null() {
+        let ops = build::<i64>(1, vec![slot(AggregationKind::FloatSum, 0)]);
+
+        let out = run_consumers(ops, vec![vec![]]);
+
+        assert_eq!(out.items.len(), 1);
+        assert!(out.items[0].column(0).is_null(0)); // SUM of zero rows is NULL
     }
 
     #[test]

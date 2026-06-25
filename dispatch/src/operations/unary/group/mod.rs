@@ -106,6 +106,7 @@ pub use values::{
     Dynamic, Fold, FoldAcc, IntRead, Max, MaxSlot, Min, MinSlot, Mono, NoRead, Numeric, OpTuple,
     Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, WideSum, WorkerContext,
 };
+pub(crate) use values::{keep_max, keep_min};
 
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
@@ -877,6 +878,96 @@ mod tests {
         );
 
         assert_eq!(group_counts(&sender), vec![(1, 40), (2, 20), (3, 10)]);
+    }
+
+    /// Grouped SUM/MIN/MAX over a `Float64` value column, folded in `f64` through
+    /// the `Dynamic` container's float slots (the path the planner takes for a
+    /// float aggregate). The narrow (`i64`) cell holds each running `f64`'s bits.
+    #[test]
+    fn float_aggregates_per_group() {
+        // key 1 -> {1.5, 2.5}; key 2 -> {10.0, 20.0, 30.0}.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Float64, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1, 2, 1, 2, 2])),
+            Arc::new(arrow_array::Float64Array::from(vec![
+                1.5, 10.0, 2.5, 20.0, 30.0,
+            ])),
+        ];
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::FloatSum, 1),
+            AggregationSlot::new(AggregationKind::FloatMin, 1),
+            AggregationSlot::new(AggregationKind::FloatMax, 1),
+        ];
+        type FloatValue = Dynamic<3, i64>;
+
+        let sender = run_group_full::<IntExtractor, FloatValue>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        let mut rows: Vec<(i32, f64, f64, f64)> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.f64_column(1))
+            .zip(sender.f64_column(2))
+            .zip(sender.f64_column(3))
+            .map(|(((k, sum), min), max)| (k, sum, min, max))
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        assert_eq!(
+            rows,
+            vec![(1, 4.0, 1.5, 2.5), (2, 60.0, 10.0, 30.0)]
+        );
+    }
+
+    /// Grouped float SUM/MIN/MAX through the *wide* (`i128`) cell, the width a
+    /// float slot rides when co-located with a string extreme or a 64-bit SUM.
+    /// Exercises the i128 `FloatCell` pack/unpack and the element-by-element
+    /// `finish_float`, which the narrow (`i64`) test above never touches.
+    #[test]
+    fn float_aggregates_per_group_wide_cell() {
+        // key 1 -> {1.5, 2.5}; key 2 -> {-3.5, 10.0}.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("val", DataType::Float64, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1, 2, 1, 2])),
+            Arc::new(arrow_array::Float64Array::from(vec![1.5, -3.5, 2.5, 10.0])),
+        ];
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+        let slots = vec![
+            AggregationSlot::new(AggregationKind::FloatSum, 1),
+            AggregationSlot::new(AggregationKind::FloatMin, 1),
+            AggregationSlot::new(AggregationKind::FloatMax, 1),
+        ];
+        type FloatWide = Dynamic<3, i128>;
+
+        let sender = run_group_full::<IntExtractor, FloatWide>(
+            vec![vec![batch]],
+            vec![0],
+            slots,
+            None,
+            RadixConfig::DEFAULT,
+        );
+
+        let mut rows: Vec<(i32, f64, f64, f64)> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.f64_column(1))
+            .zip(sender.f64_column(2))
+            .zip(sender.f64_column(3))
+            .map(|(((k, sum), min), max)| (k, sum, min, max))
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        assert_eq!(rows, vec![(1, 4.0, 1.5, 2.5), (2, 6.5, -3.5, 10.0)]);
     }
 
     #[test]

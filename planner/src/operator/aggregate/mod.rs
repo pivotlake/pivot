@@ -143,12 +143,18 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                     AggregationSlot::new(AggregationKind::Count, a.column.column_idx)
                 }
                 AggregateFunc::Sum(a) => {
-                    AggregationSlot::new(AggregationKind::Sum, a.column.column_idx)
+                    let kind = if a.column.return_type == Type::Float64 {
+                        AggregationKind::FloatSum
+                    } else {
+                        AggregationKind::Sum
+                    };
+                    AggregationSlot::new(kind, a.column.column_idx)
                 }
                 AggregateFunc::Min(a) => extreme_kind(
                     &a.column.return_type,
                     AggregationKind::StrMin,
                     AggregationKind::Min,
+                    AggregationKind::FloatMin,
                 )
                 .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
                 .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
@@ -156,6 +162,7 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                     &a.column.return_type,
                     AggregationKind::StrMax,
                     AggregationKind::Max,
+                    AggregationKind::FloatMax,
                 )
                 .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
                 .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
@@ -168,16 +175,19 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
 /// The MIN/MAX kind for a column of type `ty`: the byte-wise `string` extreme for
 /// a `Utf8` column (folded through the value container's arena path), the
 /// `numeric` extreme for the integer widths the executor can read
-/// (`Int16`/`Int32`/`Int64`). `None` for any other type, so the caller reports a
-/// clean `UnsupportedAggregateExpression` rather than a worker panic in the reader.
+/// (`Int16`/`Int32`/`Int64`), or the `float` extreme for a `Float64` column.
+/// `None` for any other type, so the caller reports a clean
+/// `UnsupportedAggregateExpression` rather than a worker panic in the reader.
 fn extreme_kind(
     ty: &Type,
     string: AggregationKind,
     numeric: AggregationKind,
+    float: AggregationKind,
 ) -> Option<AggregationKind> {
     match ty {
         Type::Utf8 => Some(string),
         Type::Int16 | Type::Int32 | Type::Int64 => Some(numeric),
+        Type::Float64 => Some(float),
         _ => None,
     }
 }

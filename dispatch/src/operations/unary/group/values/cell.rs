@@ -13,7 +13,7 @@ use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::keys::ArenaKey;
 use arrow_array::types::{ArrowPrimitiveType, Decimal128Type, Int64Type};
-use arrow_array::{ArrayRef, Decimal128Array, Int64Array, StringViewArray};
+use arrow_array::{ArrayRef, Decimal128Array, Float64Array, Int64Array, StringViewArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
@@ -141,5 +141,73 @@ impl StringCell for i128 {
         let arr: ArrayRef =
             Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
         (Field::new(name, DataType::Utf8View, false), arr)
+    }
+}
+
+/// Storing an `f64` aggregate value in a numeric value cell: the float
+/// counterpart to [`StringCell`].
+///
+/// A `SUM`/`MIN`/`MAX` over a `Float64` column folds in `f64`, but the value
+/// containers ([`Dynamic`](super::container::Dynamic)) store every slot in one
+/// uniform numeric cell (`i64` narrow / `i128` wide). So a float slot keeps the
+/// raw *bit pattern* of its running `f64` in that integer cell, reinterpreted
+/// back to `f64` inside the [`FloatSum`](super::fold::FloatSum)/[`FloatMin`](super::fold::FloatMin)/[`FloatMax`](super::fold::FloatMax)
+/// fold, the same "pack a foreign value into the numeric cell" trick
+/// [`StringCell`] uses for an `ArenaKey`. The cell is never read through the
+/// integer ([`Numeric`]) path, so the bit-punning never crosses families.
+///
+/// Both widths can hold an `f64` (its 64 bits fit either), so unlike a string
+/// extreme a float never forces the planner to widen; it rides whatever width
+/// the rest of the signature picks.
+pub trait FloatCell: Cell {
+    /// Pack an `f64`'s bits into the cell.
+    fn from_f64(value: f64) -> Self;
+    /// Read the cell's bits back as the `f64` a float slot stored in it.
+    fn into_f64(self) -> f64;
+    /// Render a finished column of float cells as a `Float64` array.
+    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef);
+}
+
+impl FloatCell for i64 {
+    #[inline(always)]
+    fn from_f64(value: f64) -> Self {
+        value.to_bits() as i64
+    }
+    #[inline(always)]
+    fn into_f64(self) -> f64 {
+        f64::from_bits(self as u64)
+    }
+    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+        let len = col.len();
+        // Each cell holds an `f64`'s bits in its 8 bytes, so the slab's bytes are
+        // already the `Float64` array's bytes, so reinterpret zero-copy.
+        let values = ScalarBuffer::<f64>::new(col.into_buffer(), 0, len);
+        (
+            Field::new(name, DataType::Float64, false),
+            Arc::new(Float64Array::new(values, None)),
+        )
+    }
+}
+
+impl FloatCell for i128 {
+    #[inline(always)]
+    fn from_f64(value: f64) -> Self {
+        // Zero-extend the 64 `f64` bits into the wide cell; `into_f64` truncates
+        // back to the low 64.
+        value.to_bits() as i128
+    }
+    #[inline(always)]
+    fn into_f64(self) -> f64 {
+        f64::from_bits(self as u64)
+    }
+    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+        let len = col.len();
+        // Wide cells are 16 bytes each (a float only occupies the low 64), so the
+        // slab can't be reinterpreted directly; unpack each cell to its `f64`. This
+        // is the rare path (a float beside a wide sum or a string extreme) over the
+        // low-cardinality group output.
+        let cells = ScalarBuffer::<i128>::new(col.into_buffer(), 0, len);
+        let arr = Float64Array::from_iter_values(cells.iter().map(|&c| Self::into_f64(c)));
+        (Field::new(name, DataType::Float64, false), Arc::new(arr))
     }
 }

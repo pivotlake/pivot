@@ -464,8 +464,13 @@ pub(super) fn dispatch_group_by(
 
     // Whether every slot folds additively (COUNT/SUM, no MIN/MAX or string
     // extreme): the `ONLY_ADDITIVE` `Dynamic` drops the per-slot kind dispatch to
-    // a branch-free `+`, recovering the additive fast path (~7% on low-cardinality
-    // grouped aggregates).
+    // a branch-free integer `+`, recovering the additive fast path (~7% on
+    // low-cardinality grouped aggregates).
+    //
+    // `FloatSum` must NOT be listed here: its cell holds an `f64` *bit pattern*,
+    // so the additive path's integer `+` would corrupt it (it must fold via
+    // `FloatSum`'s `f64` add). Adding it would silently produce garbage sums; see
+    // `Dynamic::merge`'s `ONLY_ADDITIVE` branch.
     let all_additive = slots.iter().all(|s| {
         matches!(
             s.kind,

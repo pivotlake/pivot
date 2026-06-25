@@ -15,17 +15,18 @@
 //! (`i128`) instantiation; the `i64` [`StringCell`] arms are the fail-out (the
 //! planner always widens a string signature to `i128`).
 
-use super::super::cell::{Numeric, StringCell};
+use super::super::cell::{FloatCell, Numeric, StringCell};
 use super::super::fold::{Fold, FoldAcc};
-use super::super::read::{IntRead, Read, StrRead};
+use super::super::read::{FloatRead, IntRead, Read, StrRead};
 use super::super::{
-    AggregationKind, AggregationSlot, AggregationValue, Count, Max, Min, StrMax, StrMin, Sum,
+    AggregationKind, AggregationSlot, AggregationValue, Count, FloatMax, FloatMin, FloatSum, Max,
+    Min, StrMax, StrMin, Sum,
 };
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Decimal128Type, Int16Type, Int32Type, Int64Type};
+use arrow_array::types::{Decimal128Type, Float64Type, Int16Type, Int32Type, Int64Type};
 use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
@@ -79,6 +80,9 @@ pub enum BoundSlot<'b> {
     Sum(NumReader<'b>),
     Min(NumReader<'b>),
     Max(NumReader<'b>),
+    FloatSum(&'b PrimitiveArray<Float64Type>),
+    FloatMin(&'b PrimitiveArray<Float64Type>),
+    FloatMax(&'b PrimitiveArray<Float64Type>),
     StrMin(&'b StringViewArray),
     StrMax(&'b StringViewArray),
 }
@@ -91,6 +95,9 @@ impl<'b> BoundSlot<'b> {
             Sum => BoundSlot::Sum(NumReader::bind(batch, slot.column)),
             Min => BoundSlot::Min(NumReader::bind(batch, slot.column)),
             Max => BoundSlot::Max(NumReader::bind(batch, slot.column)),
+            FloatSum => BoundSlot::FloatSum(FloatRead::bind(batch, slot.column)),
+            FloatMin => BoundSlot::FloatMin(FloatRead::bind(batch, slot.column)),
+            FloatMax => BoundSlot::FloatMax(FloatRead::bind(batch, slot.column)),
             StrMin => BoundSlot::StrMin(StrRead::bind(batch, slot.column)),
             StrMax => BoundSlot::StrMax(StrRead::bind(batch, slot.column)),
         }
@@ -106,23 +113,23 @@ impl<'b> BoundSlot<'b> {
 /// `StringCell`/`i128` machinery to a branch-free additive loop — recovering the
 /// hand-written `Mono` codegen from this same generic container. The two-level
 /// `COUNT(DISTINCT)` path (all additive) sets it; everything else leaves it `false`.
-pub struct Dynamic<const N: usize, A: Numeric + StringCell = i64, const ONLY_ADDITIVE: bool = false>
+pub struct Dynamic<const N: usize, A: Numeric + StringCell + FloatCell = i64, const ONLY_ADDITIVE: bool = false>
 {
     cells: [A; N],
 }
 
-impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Copy
+impl<const N: usize, A: Numeric + StringCell + FloatCell, const ONLY_ADDITIVE: bool> Copy
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
 }
-impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Clone
+impl<const N: usize, A: Numeric + StringCell + FloatCell, const ONLY_ADDITIVE: bool> Clone
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
+impl<const N: usize, A: Numeric + StringCell + FloatCell, const ONLY_ADDITIVE: bool> Default
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
     fn default() -> Self {
@@ -132,7 +139,7 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
     }
 }
 
-impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> AggregationValue
+impl<const N: usize, A: Numeric + StringCell + FloatCell, const ONLY_ADDITIVE: bool> AggregationValue
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
     type Reader<'b> = [BoundSlot<'b>; N];
@@ -182,6 +189,27 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                         unreachable!()
                     } else {
                         Max::<A>::seed(r.read(idx), &mut na)
+                    }
+                }
+                BoundSlot::FloatSum(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        FloatSum::<A>::seed(FloatRead::read(a, idx), &mut na)
+                    }
+                }
+                BoundSlot::FloatMin(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        FloatMin::<A>::seed(FloatRead::read(a, idx), &mut na)
+                    }
+                }
+                BoundSlot::FloatMax(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        FloatMax::<A>::seed(FloatRead::read(a, idx), &mut na)
                     }
                 }
                 BoundSlot::StrMin(a) => {
@@ -238,6 +266,27 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                         Max::<A>::update(c, r.read(idx), &mut na, &())
                     }
                 }
+                BoundSlot::FloatSum(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        FloatSum::<A>::update(c, FloatRead::read(a, idx), &mut na, &())
+                    }
+                }
+                BoundSlot::FloatMin(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        FloatMin::<A>::update(c, FloatRead::read(a, idx), &mut na, &())
+                    }
+                }
+                BoundSlot::FloatMax(a) => {
+                    if ONLY_ADDITIVE {
+                        unreachable!()
+                    } else {
+                        FloatMax::<A>::update(c, FloatRead::read(a, idx), &mut na, &())
+                    }
+                }
                 BoundSlot::StrMin(a) => {
                     if ONLY_ADDITIVE {
                         unreachable!()
@@ -271,7 +320,10 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
             cells[s] = if ONLY_ADDITIVE {
                 // All-additive: `Count` and `Sum` both merge by `+`, so skip the
                 // per-slot `slots[s].kind` load and Count/Sum branch entirely — a
-                // pure add, identical to Mono's branch-free merge.
+                // pure add, identical to Mono's branch-free merge. This is an
+                // *integer* add of the cells; `FloatSum` (whose cell is an `f64` bit
+                // pattern) must never reach here, which the planner guarantees by
+                // excluding it from `all_additive` (see grouped.rs).
                 a + b
             } else {
                 match slots[s].kind {
@@ -281,6 +333,9 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                     AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
                     AggregationKind::Min => Min::<A>::merge(a, b, &()),
                     AggregationKind::Max => Max::<A>::merge(a, b, &()),
+                    AggregationKind::FloatSum => FloatSum::<A>::merge(a, b, &()),
+                    AggregationKind::FloatMin => FloatMin::<A>::merge(a, b, &()),
+                    AggregationKind::FloatMax => FloatMax::<A>::merge(a, b, &()),
                     AggregationKind::StrMin => StrMin::<A>::merge(a, b, shared),
                     AggregationKind::StrMax => StrMax::<A>::merge(a, b, shared),
                 }
@@ -291,8 +346,10 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
 
     #[inline(always)]
     fn sort_key(&self, slot: usize) -> i128 {
-        // Numeric cells widen to their `ORDER BY` key. A string extreme never feeds
-        // a top-k (the planner doesn't push one), so its raw bits here are inert.
+        // Numeric cells widen to their `ORDER BY` key. A string extreme or a float
+        // slot never feeds a top-k (the planner suppresses the pushdown for both;
+        // see `plan.rs` `unordered_sort_key`), so their raw bits here, which do not
+        // order as the real value, are inert.
         self.cells[slot].into()
     }
 
@@ -325,6 +382,9 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
                 AggregationKind::Sum => Sum::<A>::finish(&name, col, &()),
                 AggregationKind::Min => Min::<A>::finish(&name, col, &()),
                 AggregationKind::Max => Max::<A>::finish(&name, col, &()),
+                AggregationKind::FloatSum => FloatSum::<A>::finish(&name, col, &()),
+                AggregationKind::FloatMin => FloatMin::<A>::finish(&name, col, &()),
+                AggregationKind::FloatMax => FloatMax::<A>::finish(&name, col, &()),
                 AggregationKind::StrMin => StrMin::<A>::finish(&name, col, arena),
                 AggregationKind::StrMax => StrMax::<A>::finish(&name, col, arena),
             };
