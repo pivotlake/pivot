@@ -25,7 +25,7 @@ fn count() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .count()
+        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
         .collect()
         .unwrap();
 
@@ -54,7 +54,7 @@ fn filter_string_contains() {
                 )
             }
         })
-        .count()
+        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
         .collect()
         .unwrap();
 
@@ -80,7 +80,7 @@ fn filter_no_matches_returns_zero() {
                 )
             }
         })
-        .count()
+        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
         .collect()
         .unwrap();
 
@@ -106,7 +106,7 @@ fn filter_integer_column() {
                 }))
             }
         })
-        .count()
+        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
         .collect()
         .unwrap();
 

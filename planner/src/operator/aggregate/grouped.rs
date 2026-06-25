@@ -18,9 +18,8 @@
 //!   [`Aggregate::materialize_group_keys`]), so from the dispatch's view every
 //!   key is a column.
 //! * **value** — recognised signatures lower to a branch-free [`Compiled`]
-//!   tuple; every other shape folds each slot by kind in `Dynamic<N>` (numeric,
-//!   string, or mixed; branch-free `+` when all-additive), in `i128` when a slot
-//!   needs the width (see [`Aggregate`]'s rule) else the narrow `i64`.
+//!   tuple; every other shape folds each slot by kind in `Dynamic<N>`, in `i128`
+//!   when a slot needs the width (see [`Aggregate`]'s rule) else the narrow `i64`.
 
 use super::{Aggregate, aggregation_slots, row_key_schema, sum_reads_wide_column};
 use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
@@ -464,9 +463,9 @@ pub(super) fn dispatch_group_by(
     let key_cols: Vec<usize> = keys.iter().map(|(col, _)| *col).collect();
 
     // Whether every slot folds additively (COUNT/SUM, no MIN/MAX or string
-    // extreme): the `ONLY_ADDITIVE` `Dynamic` then merges branch-free (`a + b`) and
-    // prunes its non-additive arms, skipping the per-slot kind dispatch (~1.5-2% on
-    // a low-card grouped aggregate).
+    // extreme): the `ONLY_ADDITIVE` `Dynamic` drops the per-slot kind dispatch to
+    // a branch-free `+`, recovering the additive fast path (~7% on low-cardinality
+    // grouped aggregates).
     let all_additive = slots.iter().all(|s| {
         matches!(
             s.kind,
@@ -502,7 +501,7 @@ pub(super) fn dispatch_group_by(
         };
     }
     // The generic value fallback: pick the accumulator width and the additive
-    // flag, then dispatch by arity. A string extreme is `wide` + non-additive.
+    // flag, then dispatch by arity.
     macro_rules! dynamic {
         ($K:ty, $cfg:expr) => {
             match (wide, all_additive) {

@@ -139,11 +139,11 @@ pub fn strings_and_ints(names: &[&str], values: &[i64]) -> RecordBatch {
     .unwrap()
 }
 
-pub fn extract_count(batches: &[RecordBatch]) -> u64 {
+pub fn extract_count(batches: &[RecordBatch]) -> i64 {
     batches[0]
         .column(0)
         .as_any()
-        .downcast_ref::<UInt64Array>()
+        .downcast_ref::<Int64Array>()
         .unwrap()
         .value(0)
 }

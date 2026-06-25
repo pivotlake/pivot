@@ -13,9 +13,9 @@
 //!
 //! The main execution is done through sending a [`DataFlowBuilder`] to each worker. For a
 //! given query, every worker receives the full dataflow (source through output), with each
-//! stage able to synchronize across workers. For example, in a `Table -> Filter -> Count`
+//! stage able to synchronize across workers. For example, in a `Table -> Filter -> Aggregate`
 //! query, each worker filters its own chunk of data and maintains a local count, then the
-//! count operators coordinate to produce the final result.
+//! aggregate operators coordinate to produce the final result.
 //!
 //! To work with the dispatch library, build and execute dataflows through the `api` module.
 //!
@@ -42,7 +42,7 @@
 //!             contains.run(col)
 //!         }
 //!     })
-//!     .count()
+//!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
 //!     .collect();
 //! ```
 //!
@@ -100,11 +100,11 @@ pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, DynamicFilterSlot, Fold, GroupLimit, HashOnlyIntKeyExtractor, IntKeyExtractor,
-    IntPairKeyExtractor, IntRead, IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot, NoRead, Nullary,
-    NullaryFactory, NullaryOperatorFactory, Numeric, OpTuple, Operator, OrderBy, Read,
-    Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
-    StringKeyExtractor, Sum, SumSlot, WideSum,
+    Dynamic, DynamicFilterSlot, Fold, FoldAcc, GroupLimit, HashOnlyIntKeyExtractor,
+    IntKeyExtractor, IntPairKeyExtractor, IntRead, IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot,
+    Mono, NoRead, Nullary, NullaryFactory, NullaryOperatorFactory, Numeric, OpTuple, Operator,
+    OrderBy, Read, Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin,
+    StrRead, StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,

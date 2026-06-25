@@ -29,9 +29,9 @@ pub mod fold;
 pub mod read;
 
 pub use cell::{Cell, Numeric};
-pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, SumSlot};
+pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, Mono, OpTuple, SumSlot};
 pub use distinct::Distinct;
-pub use fold::{Count, Fold, Max, Min, StrMax, StrMin, Sum, WideSum};
+pub use fold::{Count, Fold, FoldAcc, Max, Min, StrMax, StrMin, Sum, WideSum};
 pub use read::{IntRead, NoRead, Read, StrRead};
 
 /// Which per-group aggregate a value slot computes during consume — a pure
