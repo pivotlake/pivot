@@ -6,17 +6,15 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::duckdb_bridge::duckdb_types::{LogicalOperatorType, OrderType};
+use crate::duckdb_bridge::duckdb_types::OrderType;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Expression, type_name};
-use custom_deserializer::CustomDeserializer;
-use serde_repr::Deserialize_repr;
 
-/// Raw, pre-resolution form of a table scan as it comes off the JSON plan.
+/// Raw, pre-resolution form of a table scan as it comes off the plan.
 ///
 /// `PlanNode::resolve_inputs` turns each `RawInput` into an [`Input`] by looking
 /// up the table by `table_id` and binding each [`DynamicFilter`] to its slot.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct RawInput {
     pub table_id: usize,
     pub columns: Vec<Expression>,
@@ -49,7 +47,7 @@ impl fmt::Debug for Input {
 /// and the projected output columns (positional `BOUND_REF`s, like
 /// [`RawInput`]). The rows are regenerated on the Rust side from the name and
 /// args; there is no `table_id` because nothing is read off disk.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct TableFunctionScan {
     pub function_name: String,
     pub args: Vec<crate::types::ScalarValue>,
@@ -57,7 +55,7 @@ pub struct TableFunctionScan {
 }
 
 /// Computes a list of output expressions from its child's columns.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Projection {
     pub projections: Vec<Expression>,
 }
@@ -66,7 +64,7 @@ pub struct Projection {
 ///
 /// `Default` is what DuckDB emits when no explicit `ASC`/`DESC` is given
 /// (equivalent to `Asc` in practice).
-#[derive(Deserialize_repr, Debug)]
+#[derive(Debug)]
 #[repr(u8)]
 pub enum OrderByDirection {
     Default = OrderType::ORDER_DEFAULT as u8,
@@ -75,33 +73,33 @@ pub enum OrderByDirection {
 }
 
 /// A single sort key within an ORDER BY or TopN operator.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct OrderByNode {
     pub direction: OrderByDirection,
     pub expression: Expression,
 }
 
 /// Sorts its input by one or more keys.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct OrderBy {
     pub order_bys: Vec<OrderByNode>,
 }
 
 /// GROUP BY + aggregate functions.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Aggregate {
     pub groups: Vec<Expression>,
     pub expressions: Vec<Expression>,
 }
 
 /// Filters rows by one or more boolean conditions (implicitly ANDed).
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Filter {
     pub conditions: Vec<Expression>,
 }
 
 /// Combined ORDER BY + LIMIT (returns the top N rows).
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,
@@ -116,21 +114,21 @@ pub struct TopN {
 /// [`TopN`] by the optimizer). `limit` is `None` for an offset-only query (no
 /// upper bound); a non-constant (percentage/expression) limit is rejected by the
 /// bridge before it reaches here.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Limit {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
 
 /// A single column definition inside a CREATE TABLE statement.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct CreateTableColumn {
     pub name: String,
     pub col_type: crate::duckdb_bridge::duckdb_types::LogicalTypeId,
 }
 
 /// CREATE TABLE with an explicit column list.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct CreateTable {
     pub name: String,
     pub columns: Vec<CreateTableColumn>,
@@ -158,7 +156,7 @@ pub struct CreateTable {
 /// DuckDB's join are the one table), so `resolve_inputs` hands this node a clone
 /// of that scan's resolved table — same instance, same filter-pushdown state,
 /// which the materializer needs to index row groups by the scan's global ids.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct RawMaterialize {
     pub table_id: usize,
     pub columns: Vec<usize>,
@@ -183,14 +181,14 @@ impl fmt::Debug for Materialize {
 /// `SELECT drop_cache()` or `SELECT 1`). Carries no payload; compiles to a
 /// source that emits one empty row, over which the parent projection evaluates
 /// its expressions exactly once.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct DummyScan {}
 
 /// `EXPLAIN <query>`. DuckDB wraps the optimized plan in a `LOGICAL_EXPLAIN`
 /// whose single child is the plan being explained; the bridge emits that child
 /// as this node's input. Carries no payload: the consumer renders the child
 /// plan as text instead of running it.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Explain {}
 
 /// `SET <name> = <value>` (and, relabelled by the bridge, `RESET <name>`, which
@@ -202,7 +200,7 @@ pub struct Explain {}
 /// names it honours. `value` is the bound constant in string form as DuckDB
 /// serialized it (so a boolean reads back as `"true"`/`"false"`); `None` for a
 /// `RESET`.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct SetVariable {
     pub name: String,
     pub value: Option<String>,
@@ -210,48 +208,33 @@ pub struct SetVariable {
 
 /// A logical operator in the query plan. Discriminated by DuckDB's
 /// [`LogicalOperatorType`].
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub enum Operator {
-    #[type_tag(LogicalOperatorType::LOGICAL_GET)]
     #[doc(hidden)]
     RawInput(RawInput),
-    #[skip_deserialize]
     // LogicalGet is deserialized as RawInput, then converted to Input in a
     // post-processing step to attach the DuckDBTable trait object.
     Input(Input),
     // A table-function get carries no base table, so the bridge re-tags it as
     // LOGICAL_CHUNK_GET to distinguish it from a base-table `RawInput`.
-    #[type_tag(LogicalOperatorType::LOGICAL_CHUNK_GET)]
     TableFunctionScan(TableFunctionScan),
-    #[type_tag(LogicalOperatorType::LOGICAL_PROJECTION)]
     Projection(Projection),
-    #[type_tag(LogicalOperatorType::LOGICAL_ORDER_BY)]
     OrderBy(OrderBy),
-    #[type_tag(LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY)]
     Aggregate(Aggregate),
-    #[type_tag(LogicalOperatorType::LOGICAL_FILTER)]
     Filter(Filter),
-    #[type_tag(LogicalOperatorType::LOGICAL_TOP_N)]
     TopN(TopN),
-    #[type_tag(LogicalOperatorType::LOGICAL_LIMIT)]
     Limit(Limit),
-    #[type_tag(LogicalOperatorType::LOGICAL_CREATE_TABLE)]
     CreateTable(CreateTable),
-    #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
     DummyScan(DummyScan),
-    #[type_tag(LogicalOperatorType::LOGICAL_EXPLAIN)]
     Explain(Explain),
     // The bridge tags both SET and RESET as LOGICAL_SET (RESET carries no value).
-    #[type_tag(LogicalOperatorType::LOGICAL_SET)]
     Set(SetVariable),
     // The bridge collapses DuckDB's late-materialization SEMI join into this
     // node and emits it tagged with LOGICAL_COMPARISON_JOIN (a raw join never
     // otherwise reaches Rust). Resolved to `Materialize` (table attached) the
     // same way `RawInput` becomes `Input`.
-    #[type_tag(LogicalOperatorType::LOGICAL_COMPARISON_JOIN)]
     #[doc(hidden)]
     RawMaterialize(RawMaterialize),
-    #[skip_deserialize]
     Materialize(Materialize),
 }
 

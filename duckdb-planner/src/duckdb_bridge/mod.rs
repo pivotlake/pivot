@@ -6,6 +6,7 @@
 //!   (`LogicalOperatorType`, `ExpressionType`, etc.).
 
 pub mod duckdb_types;
+pub mod plan_fb;
 
 use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, catalog_get_scalar_function, catalog_get_table,
@@ -30,10 +31,11 @@ pub mod ffi {
         pub table: Box<OptionalTableWrapper>,
     }
 
-    /// Result of `extract_plan`: the JSON plan string plus the `OptionalTableWrapper`
-    /// boxes collected from each LogicalGet node during serialization.
+    /// Result of `extract_plan`: the FlatBuffers-encoded `PlanResult` buffer plus
+    /// the `OptionalTableWrapper` boxes collected from each LogicalGet node during
+    /// serialization.
     struct ExtractPlanResult {
-        pub json: String,
+        pub plan: Vec<u8>,
         pub tables: Vec<Box<OptionalTableWrapper>>,
     }
 
@@ -69,7 +71,7 @@ pub mod ffi {
             ctx: &CatalogContext,
             name: &str,
         ) -> CatalogGetScalarFunctionResult;
-        fn pushdown_filter(table: &mut OptionalTableWrapper, filters_json: &str) -> Result<bool>;
+        fn pushdown_filter(table: &mut OptionalTableWrapper, filter_fb: &[u8]) -> Result<bool>;
     }
 
     unsafe extern "C++" {

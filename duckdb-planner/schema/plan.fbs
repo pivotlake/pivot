@@ -1,0 +1,285 @@
+// Single source of truth for the logical plan IR that crosses the C++/Rust
+// bridge. `flatc` (invoked from build.rs) generates the C++ writer
+// (`plan_generated.h`) and the Rust reader (`plan_generated.rs`) from this file.
+//
+// The C++ bridge walks DuckDB's LogicalOperator tree into the FlatBuffers
+// object-API structs (the mutable `*T` types flatc generates), then serializes
+// those into one of these messages. The Rust side reads the buffer back into the
+// owned `PlanNode` / `Operator` / `Expression` types.
+//
+// DuckDB's numeric type discriminants (LogicalTypeId, ExpressionType, OrderType)
+// stay as raw `ubyte` fields, exactly as the Rust side holds them; the union
+// *tags* replace the old JSON `"type"` discriminant for operators and
+// expressions.
+
+namespace pivot.plan;
+
+// ---------------------------------------------------------------------------
+// Leaf values
+// ---------------------------------------------------------------------------
+
+// A constant value: the DuckDB logical type id plus the value as DuckDB
+// stringified it (e.g. logical_type = INTEGER, raw_value = "42").
+table ScalarValue {
+  logical_type: ubyte;
+  raw_value: string;
+}
+
+// A reference to a shared dynamic-filter slot, correlated across producer and
+// consumers by `slot_id`.
+table DynamicFilter {
+  slot_id: ulong;
+  column_idx: ulong;
+  compare_type: ubyte; // ExpressionType discriminant
+}
+
+// ---------------------------------------------------------------------------
+// Expressions
+// ---------------------------------------------------------------------------
+
+// A bound column reference by positional index into the child's output.
+// `name` is null when the reference has no alias.
+table Ref {
+  column_idx: ulong;
+  return_type: ubyte;
+  name: string;
+}
+
+table Compare {
+  left: Expression (required);
+  right: Expression (required);
+  compare_type: ubyte;
+  return_type: ubyte;
+}
+
+table Between {
+  input: Expression (required);
+  lower: Expression (required);
+  upper: Expression (required);
+  lower_inclusive: bool;
+  upper_inclusive: bool;
+}
+
+table AggregateFunc {
+  aggregate_function: string;
+  params: [Expression];
+  distinct: bool;
+  return_type: ubyte;
+}
+
+table Function {
+  function: string;
+  params: [Expression];
+  return_type: ubyte;
+}
+
+table InList {
+  input: Expression (required);
+  values: [Expression];
+}
+
+table Conjunction {
+  conjunction_type: ubyte;
+  children: [Expression];
+}
+
+table CaseCheck {
+  when_expr: Expression (required);
+  then_expr: Expression (required);
+}
+
+table Case {
+  checks: [CaseCheck];
+  else_expr: Expression (required);
+}
+
+table Not {
+  input: Expression (required);
+}
+
+// The expression discriminant. `ScalarValue` here corresponds to a
+// VALUE_CONSTANT (the Rust `Expression::Constant`).
+union ExpressionKind {
+  Ref,
+  Compare,
+  Between,
+  ScalarValue,
+  AggregateFunc,
+  Function,
+  InList,
+  Conjunction,
+  Case,
+  Not,
+}
+
+// FlatBuffers requires a table around a union field; this wrapper is the node
+// that gets referenced wherever an expression appears.
+table Expression {
+  kind: ExpressionKind;
+}
+
+// A constant comparison against a single column (e.g. `col <> 42`), used by the
+// filter-pushdown callback.
+table ConstantComparison {
+  column_ref: Expression (required);
+  compare_type: ubyte;
+  constant: ScalarValue (required);
+}
+
+// A filter offered to a table during planning's pushdown callback.
+union TableFilterKind {
+  Expression,
+  ConstantComparison,
+}
+
+table TableFilter {
+  kind: TableFilterKind;
+}
+
+// ---------------------------------------------------------------------------
+// Operators
+// ---------------------------------------------------------------------------
+
+// A scan over a base table (DuckDB LOGICAL_GET). `table_id` indexes the table
+// objects returned alongside the plan.
+table Input {
+  table_id: ulong;
+  columns: [Expression];
+  dynamic_filters: [DynamicFilter];
+  emit_row_group_metadata: bool;
+}
+
+// A scan over a table-valued function rather than a base table (re-tagged
+// LOGICAL_CHUNK_GET): no `table_id`, the rows are regenerated from the name/args.
+table TableFunctionScan {
+  function_name: string;
+  args: [ScalarValue];
+  columns: [Expression];
+}
+
+table Projection {
+  projections: [Expression];
+}
+
+table OrderByNode {
+  direction: ubyte; // OrderType
+  expression: Expression (required);
+}
+
+table OrderBy {
+  order_bys: [OrderByNode];
+}
+
+table Aggregate {
+  groups: [Expression];
+  expressions: [Expression];
+}
+
+table Filter {
+  conditions: [Expression];
+}
+
+table TopN {
+  order_bys: [OrderByNode];
+  limit: ulong;
+  offset: ulong;
+  // Null unless DuckDB's Top-N optimizer installed a dynamic-filter producer.
+  produces_dynamic_filter: DynamicFilter;
+}
+
+// A bare LIMIT/OFFSET. A null `limit` means unbounded (offset-only query).
+table Limit {
+  limit: ulong = null;
+  offset: ulong = null;
+}
+
+table KeyValue {
+  key: string;
+  value: string;
+}
+
+table CreateTableColumn {
+  name: string;
+  col_type: ubyte;
+}
+
+table CreateTable {
+  name: string;
+  columns: [CreateTableColumn];
+  options: [KeyValue];
+  if_not_exists: bool;
+  or_replace: bool;
+  temporary: bool;
+  has_query: bool;
+  constraint_count: ulong;
+}
+
+table DummyScan {}
+
+table Explain {}
+
+// SET <name> = <value> (and RESET, which arrives with has_value = false).
+// has_value distinguishes `SET x = ''` (an empty-string value) from RESET, which
+// an empty/null `value` alone could not.
+table SetVariable {
+  name: string;
+  has_value: bool;
+  value: string;
+}
+
+// Late-materialization fetch collapsed from DuckDB's row-id SEMI join. `columns`
+// are table-schema column indices (not expressions). `table_id` is shared with
+// the narrow scan beneath it.
+table Materialize {
+  table_id: ulong;
+  columns: [ulong];
+}
+
+union OperatorKind {
+  Input,
+  TableFunctionScan,
+  Projection,
+  OrderBy,
+  Aggregate,
+  Filter,
+  TopN,
+  Limit,
+  CreateTable,
+  DummyScan,
+  Explain,
+  SetVariable,
+  Materialize,
+}
+
+table PlanNode {
+  name: string;
+  inputs: [PlanNode];
+  op: OperatorKind;
+}
+
+// ---------------------------------------------------------------------------
+// Top-level result
+// ---------------------------------------------------------------------------
+
+table SuccessPayload {
+  plan: PlanNode (required);
+  output_names: [string];
+}
+
+// kind is one of "duckdb_planning", "unsupported_plan", "bridge_error".
+table BridgeError {
+  kind: string;
+  exception_message: string;
+  position: string;
+}
+
+union PlanResultKind {
+  SuccessPayload,
+  BridgeError,
+}
+
+table PlanResult {
+  result: PlanResultKind;
+}
+
+root_type PlanResult;

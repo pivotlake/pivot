@@ -169,11 +169,16 @@ pub(crate) fn catalog_get_scalar_function(
     }
 }
 
-pub(crate) fn pushdown_filter(table: &mut OptionalTableWrapper, filter_json: &str) -> Result<bool> {
+pub(crate) fn pushdown_filter(table: &mut OptionalTableWrapper, filter_fb: &[u8]) -> Result<bool> {
     let table = table
         .table
         .as_mut()
         .ok_or_else(|| -> Error { "pushdown_filter called on unbound table".into() })?;
-    let filter = serde_json::from_str::<TableFilter>(filter_json)?;
+    // SAFETY: trusted in-process buffer from our own C++ bridge, so read without
+    // the verifier (redundant here, and its depth cap would reject deeply nested
+    // pushed-down predicates).
+    let fb_filter =
+        unsafe { flatbuffers::root_unchecked::<crate::duckdb_bridge::plan_fb::TableFilter>(filter_fb) };
+    let filter = crate::from_fb::decode_table_filter(fb_filter)?;
     table.pushdown_filter(filter)
 }

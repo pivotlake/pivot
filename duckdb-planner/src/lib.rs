@@ -54,14 +54,15 @@ pub mod catalog_provider;
 pub mod duckdb_bridge;
 pub mod dynamic_filter;
 pub mod expression;
+mod from_fb;
 pub mod operator;
 pub mod plan;
 mod types;
 
 use std::sync::Arc;
 
-use custom_deserializer::CustomDeserializer;
 use duckdb_bridge::ffi;
+use duckdb_bridge::plan_fb as fb;
 use thiserror::Error;
 
 pub use catalog_provider::{DuckDBBind, DuckDBTable};
@@ -80,12 +81,12 @@ pub enum Error {
     UnsupportedPlan(String),
     #[error("Bridge error: {0}")]
     Bridge(String),
-    #[error("Deserialization error: {0}")]
-    SerdeDeserialize(#[from] serde_json::Error),
+    #[error("Plan decode error: {0}")]
+    Decode(String),
 }
 
 /// Error returned by DuckDB when it cannot produce a plan for a query.
-#[derive(CustomDeserializer, Debug, Error)]
+#[derive(Debug, Error)]
 pub struct PlanningError {
     pub exception_message: String,
     pub position: Option<String>,
@@ -97,27 +98,18 @@ impl std::fmt::Display for PlanningError {
     }
 }
 
-#[derive(CustomDeserializer)]
-struct BridgeErrorPayload {
-    kind: String,
-    exception_message: String,
-    position: Option<String>,
-}
-
-impl BridgeErrorPayload {
-    fn into_error(self) -> Error {
-        match self.kind.as_str() {
-            "duckdb_planning" => Error::DuckDBPlanning(PlanningError {
-                exception_message: self.exception_message,
-                position: self.position,
-            }),
-            "unsupported_plan" => Error::UnsupportedPlan(self.exception_message),
-            "bridge_error" => Error::Bridge(self.exception_message),
-            other => Error::Bridge(format!(
-                "Unknown bridge error kind `{other}`: {}",
-                self.exception_message
-            )),
-        }
+/// Translate the bridge's structured error message into an [`Error`].
+fn bridge_error(err: fb::BridgeError) -> Error {
+    let message = err.exception_message().unwrap_or_default().to_string();
+    let position = err.position().map(str::to_string);
+    match err.kind().unwrap_or_default() {
+        "duckdb_planning" => Error::DuckDBPlanning(PlanningError {
+            exception_message: message,
+            position,
+        }),
+        "unsupported_plan" => Error::UnsupportedPlan(message),
+        "bridge_error" => Error::Bridge(message),
+        other => Error::Bridge(format!("Unknown bridge error kind `{other}`: {message}")),
     }
 }
 
@@ -138,22 +130,6 @@ impl std::fmt::Display for PlannedQuery {
     }
 }
 
-/// Deserialized `data` payload of a successful plan: the operator tree under
-/// `plan`, alongside the client-facing `output_names`.
-#[derive(CustomDeserializer)]
-struct SuccessPayload {
-    plan: PlanNode,
-    output_names: Vec<String>,
-}
-
-/// Internal wrapper for the JSON response from the C++ bridge, which is
-/// either a successfully planned query or a structured bridge error.
-#[derive(CustomDeserializer)]
-enum PlanResult {
-    Success(SuccessPayload),
-    Error(BridgeErrorPayload),
-}
-
 /// Owns an in-process DuckDB instance and exposes SQL planning.
 pub struct PlannerContext {
     cxx_context: cxx::UniquePtr<ffi::DuckPlannerContext>,
@@ -168,25 +144,43 @@ impl PlannerContext {
         }
     }
 
-    /// Plan a SQL query: sends the query to DuckDB, deserializes the JSON
-    /// logical plan into a [`PlanNode`] tree, and attaches the `DuckDBTable`
-    /// trait objects to each `Input` node.
+    /// Plan a SQL query: sends the query to DuckDB, reads the FlatBuffers logical
+    /// plan into a [`PlanNode`] tree, and attaches the `DuckDBTable` trait objects
+    /// to each `Input` node.
     pub fn plan(&mut self, query: &str) -> Result<PlannedQuery, Error> {
         let result = ffi::extract_plan(self.cxx_context.pin_mut(), query);
-        let plan: PlanResult = serde_json::from_str(&result.json)?;
-        match plan {
-            PlanResult::Success(payload) => {
+        // SAFETY: the buffer was produced by our own in-process C++ bridge, so
+        // skip the FlatBuffers verifier: verification is redundant for trusted
+        // data and its default depth cap (64) would reject deeply nested
+        // expression trees the writer imposes no limit on.
+        let plan = unsafe { flatbuffers::root_unchecked::<fb::PlanResult>(&result.plan) };
+        match plan.result_type() {
+            fb::PlanResultKind::SuccessPayload => {
+                let payload = plan
+                    .result_as_success_payload()
+                    .ok_or_else(|| Error::Decode("missing success payload".to_string()))?;
                 let tables: Vec<Box<dyn catalog_provider::DuckDBTable>> = result
                     .tables
                     .into_iter()
                     .map(|ot| ot.table.expect("planner returned an unbound table"))
                     .collect();
+                let root = from_fb::decode_plan_node(payload.plan())?;
+                let output_names = payload
+                    .output_names()
+                    .map(|names| names.iter().map(str::to_string).collect())
+                    .unwrap_or_default();
                 Ok(PlannedQuery {
-                    root: payload.plan.resolve_inputs(tables),
-                    output_names: payload.output_names,
+                    root: root.resolve_inputs(tables),
+                    output_names,
                 })
             }
-            PlanResult::Error(err) => Err(err.into_error()),
+            fb::PlanResultKind::BridgeError => {
+                let err = plan
+                    .result_as_bridge_error()
+                    .ok_or_else(|| Error::Decode("missing bridge error".to_string()))?;
+                Err(bridge_error(err))
+            }
+            other => Err(Error::Decode(format!("unknown plan result kind {}", other.0))),
         }
     }
 }

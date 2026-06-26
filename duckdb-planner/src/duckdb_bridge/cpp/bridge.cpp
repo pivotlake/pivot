@@ -34,14 +34,15 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/common/error_data.hpp"
 
-#include <nlohmann/json.hpp>
+#include <flatbuffers/flatbuffers.h>
 #include <optional>
 #include <string>
 #include <unordered_map>
 
-using json = nlohmann::json;
 using std::string;
+using namespace pivot::plan;
 
 struct UnsupportedPlanError : public std::runtime_error {
 	using std::runtime_error::runtime_error;
@@ -53,48 +54,60 @@ struct UnsupportedPlanError : public std::runtime_error {
 // identity lets the Rust side rebuild the shared-slot graph by index lookup.
 using DynamicFilterDedup = std::unordered_map<duckdb::DynamicFilterData *, size_t>;
 
-json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
-                          DynamicFilterDedup &df_dedup);
-json build_expression(duckdb::Expression *expr);
-json build_late_materialization(duckdb::LogicalComparisonJoin &join,
-                                rust::Vec<rust::Box<OptionalTableWrapper>> &tables, DynamicFilterDedup &df_dedup);
+std::unique_ptr<PlanNodeT> build_plan_node(duckdb::LogicalOperator *op,
+                                           rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                                           DynamicFilterDedup &df_dedup);
+std::unique_ptr<PlanNodeT> build_late_materialization(duckdb::LogicalComparisonJoin &join,
+                                                      rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                                                      DynamicFilterDedup &df_dedup);
 
-json build_bridge_error(const string &kind, const string &message, std::optional<string> position = std::nullopt) {
-	json error = {
-	    {"kind", kind},
-	    {"exception_message", message},
-	    {"position", nullptr},
-	};
-	if (position.has_value()) {
-		error["position"] = *position;
-	}
-	return {{"type", "error"}, {"data", std::move(error)}};
+// Wrap a concrete expression payload (RefT, CompareT, …) in the ExpressionT
+// table whose union tag the Rust reader matches on.
+template <typename T>
+static std::unique_ptr<ExpressionT> wrap_expr(T value) {
+	auto expr = std::make_unique<ExpressionT>();
+	expr->kind.Set(std::move(value));
+	return expr;
 }
 
-json build_duckdb_error(const duckdb::Exception &e) {
-	auto parsed = json::parse(e.what(), nullptr, false);
-	string message = e.what();
-	std::optional<string> position;
-
-	if (parsed.is_object()) {
-		if (auto message_it = parsed.find("exception_message");
-		    message_it != parsed.end() && message_it->is_string()) {
-			message = message_it->get<string>();
-		}
-		if (auto position_it = parsed.find("position"); position_it != parsed.end()) {
-			if (position_it->is_string()) {
-				position = position_it->get<string>();
-			} else if (position_it->is_number_integer()) {
-				position = std::to_string(position_it->get<int64_t>());
-			} else if (position_it->is_number_unsigned()) {
-				position = std::to_string(position_it->get<uint64_t>());
-			} else if (!position_it->is_null()) {
-				position = position_it->dump();
-			}
-		}
+// Serialize the finished plan tree (or error) into a FlatBuffers buffer for the
+// Rust side. This is the single point where the mutable object-API tree becomes
+// an immutable wire buffer.
+static rust::Vec<uint8_t> serialize_plan_result(const PlanResultT &result) {
+	flatbuffers::FlatBufferBuilder fbb;
+	fbb.Finish(PlanResult::Pack(fbb, &result));
+	rust::Vec<uint8_t> out;
+	out.reserve(fbb.GetSize());
+	const uint8_t *data = fbb.GetBufferPointer();
+	for (flatbuffers::uoffset_t i = 0; i < fbb.GetSize(); i++) {
+		out.push_back(data[i]);
 	}
+	return out;
+}
 
-	return build_bridge_error("duckdb_planning", message, position);
+static PlanResultT make_bridge_error(const string &kind, const string &message,
+                                     std::optional<string> position = std::nullopt) {
+	BridgeErrorT error;
+	error.kind = kind;
+	error.exception_message = message;
+	if (position.has_value()) {
+		// Empty stays null on the Rust side; only set when we actually have one.
+		error.position = *position;
+	}
+	PlanResultT result;
+	result.result.Set(std::move(error));
+	return result;
+}
+
+static PlanResultT build_duckdb_error(const duckdb::Exception &e) {
+	duckdb::ErrorData error_data(e);
+	string message = error_data.RawMessage();
+	std::optional<string> position;
+	const auto &extra = error_data.ExtraInfo();
+	if (auto it = extra.find("position"); it != extra.end()) {
+		position = it->second;
+	}
+	return make_bridge_error("duckdb_planning", message, position);
 }
 
 // Create new context for an in-memory DB
@@ -124,224 +137,177 @@ std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalo
 }
 
 // The column's source name (the binding's alias, which the binder/optimizer
-// carry through column resolution), or null when it has none. Lets the Rust
-// side render a plan with real names instead of positional `#idx` references.
-static json ref_name(const duckdb::Expression &expr) {
-	const auto &alias = expr.GetAlias();
-	return alias.empty() ? json(nullptr) : json(alias);
+// carry through column resolution), or empty when it has none. An empty string
+// is serialized as null, letting the Rust side render a plan with real names
+// instead of positional `#idx` references.
+static string ref_name(const duckdb::Expression &expr) {
+	return expr.GetAlias();
 }
 
-json build_ref_expression(duckdb::BoundReferenceExpression *ref) {
-	return {
-	    {"column_idx", ref->index},
-	    {"return_type", ref->return_type.id()},
-	    {"name", ref_name(*ref)},
-	};
+std::unique_ptr<ExpressionT> build_ref_expression(duckdb::BoundReferenceExpression *ref) {
+	RefT data;
+	data.column_idx = ref->index;
+	data.return_type = static_cast<uint8_t>(ref->return_type.id());
+	data.name = ref_name(*ref);
+	return wrap_expr(std::move(data));
 }
 
-json build_column_ref_expression(duckdb::BoundColumnRefExpression *col_ref) {
-	return {
-	    {"column_idx", col_ref->binding.column_index.GetIndex()},
-	    {"return_type", col_ref->return_type.id()},
-	    {"name", ref_name(*col_ref)},
-	};
+std::unique_ptr<ExpressionT> build_column_ref_expression(duckdb::BoundColumnRefExpression *col_ref) {
+	RefT data;
+	data.column_idx = col_ref->binding.column_index.GetIndex();
+	data.return_type = static_cast<uint8_t>(col_ref->return_type.id());
+	data.name = ref_name(*col_ref);
+	return wrap_expr(std::move(data));
 }
 
-json build_comparison_expression(duckdb::BoundComparisonExpression *compare) {
-	return {
-		{"left", build_expression(compare->left.get())},
-		{"right", build_expression(compare->right.get())},
-		{"compare_type", static_cast<uint8_t>(compare->type)},
-		{"return_type", compare->return_type.id()}
-	};
+std::unique_ptr<ExpressionT> build_comparison_expression(duckdb::BoundComparisonExpression *compare) {
+	CompareT data;
+	data.left = build_expression(compare->left.get());
+	data.right = build_expression(compare->right.get());
+	data.compare_type = static_cast<uint8_t>(compare->type);
+	data.return_type = static_cast<uint8_t>(compare->return_type.id());
+	return wrap_expr(std::move(data));
 }
 
-json build_between_expression(duckdb::BoundBetweenExpression *between) {
-	return {
-		{"input", build_expression(between->input.get())},
-		{"lower", build_expression(between->lower.get())},
-		{"upper", build_expression(between->upper.get())},
-		{"lower_inclusive", between->lower_inclusive},
-		{"upper_inclusive", between->upper_inclusive}
-	};
+std::unique_ptr<ExpressionT> build_between_expression(duckdb::BoundBetweenExpression *between) {
+	BetweenT data;
+	data.input = build_expression(between->input.get());
+	data.lower = build_expression(between->lower.get());
+	data.upper = build_expression(between->upper.get());
+	data.lower_inclusive = between->lower_inclusive;
+	data.upper_inclusive = between->upper_inclusive;
+	return wrap_expr(std::move(data));
 }
 
-json build_value_constant_expression(duckdb::BoundConstantExpression *constant) {
-	return {
-		{"logical_type", constant->value.type().id()},
-		{"raw_value", constant->value.ToString()}
-	};
+// Encode a DuckDB constant as a ScalarValueT: its logical-type id plus the value
+// stringified exactly as DuckDB renders it. Shared by constant expressions and
+// table-function arguments.
+static ScalarValueT build_scalar_value(const duckdb::Value &value) {
+	ScalarValueT data;
+	data.logical_type = static_cast<uint8_t>(value.type().id());
+	data.raw_value = value.ToString();
+	return data;
 }
 
-json build_aggregate_expression(duckdb::BoundAggregateExpression *aggregate) {
-    json params = json::array();
-
-    for (auto &param : aggregate->children) {
-        params.push_back(build_expression(param.get()));
-    }
-
-    return {
-        {"aggregate_function", aggregate->function.name},
-        {"params", params},
-        {"distinct", aggregate->IsDistinct()},
-        {"return_type", aggregate->return_type.id()}
-    };
+std::unique_ptr<ExpressionT> build_value_constant_expression(duckdb::BoundConstantExpression *constant) {
+	return wrap_expr(build_scalar_value(constant->value));
 }
 
-json build_function_expression(duckdb::BoundFunctionExpression *function) {
-    json params = json::array();
-    for (auto &param : function->children) {
-        params.push_back(build_expression(param.get()));
-    }
+std::unique_ptr<ExpressionT> build_aggregate_expression(duckdb::BoundAggregateExpression *aggregate) {
+	AggregateFuncT data;
+	data.aggregate_function = aggregate->function.name;
+	for (auto &param : aggregate->children) {
+		data.params.push_back(build_expression(param.get()));
+	}
+	data.distinct = aggregate->IsDistinct();
+	data.return_type = static_cast<uint8_t>(aggregate->return_type.id());
+	return wrap_expr(std::move(data));
+}
 
-    return {
-        {"function", function->function.name},
-        {"params", params},
-        {"return_type", function->return_type.id()}
-    };
+std::unique_ptr<ExpressionT> build_function_expression(duckdb::BoundFunctionExpression *function) {
+	FunctionT data;
+	data.function = function->function.name;
+	for (auto &param : function->children) {
+		data.params.push_back(build_expression(param.get()));
+	}
+	data.return_type = static_cast<uint8_t>(function->return_type.id());
+	return wrap_expr(std::move(data));
 }
 
 // `a AND b AND ...` / `a OR b OR ...`. The optimizer rewrites a small
 // `x IN (a, b)` into `x = a OR x = b`, so this is the usual shape a pushed-down
 // IN membership test reaches us in. `conjunction_type` preserves AND vs OR.
-json build_conjunction_expression(duckdb::BoundConjunctionExpression *conj) {
-	json children = json::array();
+std::unique_ptr<ExpressionT> build_conjunction_expression(duckdb::BoundConjunctionExpression *conj) {
+	ConjunctionT data;
+	data.conjunction_type = static_cast<uint8_t>(conj->type);
 	for (auto &child : conj->children) {
-		children.push_back(build_expression(child.get()));
+		data.children.push_back(build_expression(child.get()));
 	}
-	return {
-		{"conjunction_type", static_cast<uint8_t>(conj->type)},
-		{"children", std::move(children)},
-	};
+	return wrap_expr(std::move(data));
 }
 
 // `x IN (a, b, ...)` is a BoundOperatorExpression whose first child is the
 // tested expression and whose remaining children are the list values.
-json build_in_expression(duckdb::BoundOperatorExpression *op) {
-	json values = json::array();
+std::unique_ptr<ExpressionT> build_in_expression(duckdb::BoundOperatorExpression *op) {
+	InListT data;
+	data.input = build_expression(op->children[0].get());
 	for (size_t i = 1; i < op->children.size(); i++) {
-		values.push_back(build_expression(op->children[i].get()));
+		data.values.push_back(build_expression(op->children[i].get()));
 	}
-	return {
-		{"input", build_expression(op->children[0].get())},
-		{"values", std::move(values)},
-	};
+	return wrap_expr(std::move(data));
 }
 
 // `CASE WHEN c0 THEN r0 WHEN c1 THEN r1 ... ELSE e END`. Each `(when, then)`
 // pair becomes a check; a CASE without an explicit ELSE has a NULL else_expr.
-json build_case_expression(duckdb::BoundCaseExpression *case_expr) {
-	json checks = json::array();
+std::unique_ptr<ExpressionT> build_case_expression(duckdb::BoundCaseExpression *case_expr) {
+	CaseT data;
 	for (auto &check : case_expr->case_checks) {
-		checks.push_back({
-			{"when", build_expression(check.when_expr.get())},
-			{"then", build_expression(check.then_expr.get())},
-		});
+		auto entry = std::make_unique<CaseCheckT>();
+		entry->when_expr = build_expression(check.when_expr.get());
+		entry->then_expr = build_expression(check.then_expr.get());
+		data.checks.push_back(std::move(entry));
 	}
-	return {
-		{"checks", std::move(checks)},
-		{"else_expr", build_expression(case_expr->else_expr.get())},
-	};
+	data.else_expr = build_expression(case_expr->else_expr.get());
+	return wrap_expr(std::move(data));
 }
 
 // `NOT expr` — a BoundOperatorExpression with a single child.
-json build_not_expression(duckdb::BoundOperatorExpression *op) {
-	return {
-		{"input", build_expression(op->children[0].get())},
-	};
+std::unique_ptr<ExpressionT> build_not_expression(duckdb::BoundOperatorExpression *op) {
+	NotT data;
+	data.input = build_expression(op->children[0].get());
+	return wrap_expr(std::move(data));
 }
 
-json build_expression(duckdb::Expression *expr) {
-	json new_expression;
-	new_expression["type"] = expr->type;
-
+std::unique_ptr<ExpressionT> build_expression(duckdb::Expression *expr) {
 	switch (expr->type) {
-	case duckdb::ExpressionType::BOUND_REF: {
-		new_expression["data"] = build_ref_expression(&expr->Cast<duckdb::BoundReferenceExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::BOUND_COLUMN_REF: {
-		new_expression["type"] = duckdb::ExpressionType::BOUND_REF;
-		new_expression["data"] = build_column_ref_expression(&expr->Cast<duckdb::BoundColumnRefExpression>());
-		break;
-	}
+	case duckdb::ExpressionType::BOUND_REF:
+		return build_ref_expression(&expr->Cast<duckdb::BoundReferenceExpression>());
+	case duckdb::ExpressionType::BOUND_COLUMN_REF:
+		// A column ref carries the same shape as a positional ref; both deserialize
+		// into a Rust `Expression::Ref`.
+		return build_column_ref_expression(&expr->Cast<duckdb::BoundColumnRefExpression>());
 	case duckdb::ExpressionType::COMPARE_EQUAL:
 	case duckdb::ExpressionType::COMPARE_NOTEQUAL:
 	case duckdb::ExpressionType::COMPARE_LESSTHAN:
 	case duckdb::ExpressionType::COMPARE_GREATERTHAN:
 	case duckdb::ExpressionType::COMPARE_LESSTHANOREQUALTO:
-	case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
-		new_expression["data"] = build_comparison_expression(&expr->Cast<duckdb::BoundComparisonExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::COMPARE_BETWEEN: {
-		new_expression["data"] = build_between_expression(&expr->Cast<duckdb::BoundBetweenExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::VALUE_CONSTANT: {
-		new_expression["data"] = build_value_constant_expression(&expr->Cast<duckdb::BoundConstantExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::BOUND_AGGREGATE: {
-		new_expression["data"] = build_aggregate_expression(&expr->Cast<duckdb::BoundAggregateExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::BOUND_FUNCTION: {
-		new_expression["data"] = build_function_expression(&expr->Cast<duckdb::BoundFunctionExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::COMPARE_IN: {
-		new_expression["data"] = build_in_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
-		break;
-	}
+	case duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return build_comparison_expression(&expr->Cast<duckdb::BoundComparisonExpression>());
+	case duckdb::ExpressionType::COMPARE_BETWEEN:
+		return build_between_expression(&expr->Cast<duckdb::BoundBetweenExpression>());
+	case duckdb::ExpressionType::VALUE_CONSTANT:
+		return build_value_constant_expression(&expr->Cast<duckdb::BoundConstantExpression>());
+	case duckdb::ExpressionType::BOUND_AGGREGATE:
+		return build_aggregate_expression(&expr->Cast<duckdb::BoundAggregateExpression>());
+	case duckdb::ExpressionType::BOUND_FUNCTION:
+		return build_function_expression(&expr->Cast<duckdb::BoundFunctionExpression>());
+	case duckdb::ExpressionType::COMPARE_IN:
+		return build_in_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
 	case duckdb::ExpressionType::CONJUNCTION_AND:
-	case duckdb::ExpressionType::CONJUNCTION_OR: {
-		new_expression["data"] = build_conjunction_expression(&expr->Cast<duckdb::BoundConjunctionExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::CASE_EXPR: {
-		new_expression["data"] = build_case_expression(&expr->Cast<duckdb::BoundCaseExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::OPERATOR_NOT: {
-		new_expression["data"] = build_not_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
-		break;
-	}
-	case duckdb::ExpressionType::OPERATOR_CAST: {
+	case duckdb::ExpressionType::CONJUNCTION_OR:
+		return build_conjunction_expression(&expr->Cast<duckdb::BoundConjunctionExpression>());
+	case duckdb::ExpressionType::CASE_EXPR:
+		return build_case_expression(&expr->Cast<duckdb::BoundCaseExpression>());
+	case duckdb::ExpressionType::OPERATOR_NOT:
+		return build_not_expression(&expr->Cast<duckdb::BoundOperatorExpression>());
+	case duckdb::ExpressionType::OPERATOR_CAST:
 		// Unwrap casts: pivot's executor aggregates the underlying column
 		// directly (e.g. AVG casts its integer input to DOUBLE in DuckDB,
 		// but pivot sums the raw integer values). Serialize the cast's child
 		// in place of the cast itself.
 		return build_expression(expr->Cast<duckdb::BoundCastExpression>().child.get());
-	}
 	default:
 		throw UnsupportedPlanError("Unsupported expression: " + expr->ToString() + " of type " +
 		                           std::to_string(static_cast<int>(expr->type)));
 	}
-
-	return new_expression;
 }
 
-json build_projection(duckdb::LogicalProjection *projection) {
-	json projections = json::array();
+ProjectionT build_projection(duckdb::LogicalProjection *projection) {
+	ProjectionT data;
 	for (auto &expr : projection->expressions) {
-		projections.push_back(build_expression(expr.get()));
+		data.projections.push_back(build_expression(expr.get()));
 	}
-
-	return {
-		{"projections", projections}
-	};
-}
-
-json build_constant_comparison_filter(duckdb::ConstantFilter &filter, json column_ref) {
-    return {
-        {"column_ref", std::move(column_ref)},
-        {"compare_type", static_cast<uint8_t>(filter.comparison_type)},
-        {"constant", {
-            {"logical_type", filter.constant.type().id()},
-            {"raw_value", filter.constant.ToString()},
-        }},
-    };
+	return data;
 }
 
 // Find a DynamicFilter inside a TableFilter, peeling off a single
@@ -364,6 +330,29 @@ static duckdb::DynamicFilter *extract_dynamic_filter(duckdb::TableFilter &filter
 	return nullptr;
 }
 
+// Result of walking a Get's table_filters: consumer-side dynamic-filter entries
+// to attach to the Input, plus synthetic LogicalFilter conditions to sit above
+// it.
+struct GetTableFilters {
+	std::vector<std::unique_ptr<DynamicFilterT>> dynamic_filters;
+	std::vector<std::unique_ptr<ExpressionT>> conditions;
+};
+
+// Build a reference to a shared dynamic-filter cell: assign (or reuse) a stable
+// slot id for `filter_data` via `df_dedup`, recording the comparison and the
+// given column index. Used by both the consumer side (a Get's table_filters) and
+// the producer side (a Top-N), which must agree on the slot id per cell.
+static std::unique_ptr<DynamicFilterT> make_dynamic_filter(duckdb::DynamicFilterData *filter_data,
+                                                           uint64_t column_idx,
+                                                           DynamicFilterDedup &df_dedup) {
+	auto [it, _] = df_dedup.try_emplace(filter_data, df_dedup.size());
+	auto entry = std::make_unique<DynamicFilterT>();
+	entry->slot_id = it->second;
+	entry->column_idx = column_idx;
+	entry->compare_type = static_cast<uint8_t>(filter_data->filter->comparison_type);
+	return entry;
+}
+
 // Recursively split a single column's TableFilter into:
 //   * dynamic-filter consumer entries appended to `dynamic_filters`
 //     (for `OPTIONAL(DYNAMIC)` / bare `DYNAMIC`), and
@@ -378,24 +367,18 @@ static duckdb::DynamicFilter *extract_dynamic_filter(duckdb::TableFilter &filter
 // shape yet — the same conservative behaviour as for any unrecognised filter.
 static void emit_table_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_idx,
                               const duckdb::LogicalGet &get, DynamicFilterDedup &df_dedup,
-                              json &dynamic_filters, json &conditions) {
+                              GetTableFilters &out) {
 	if (filter.filter_type == duckdb::TableFilterType::CONJUNCTION_AND) {
 		auto &conj = filter.Cast<duckdb::ConjunctionAndFilter>();
 		for (auto &child : conj.child_filters) {
-			emit_table_filter(*child, proj_idx, get, df_dedup, dynamic_filters, conditions);
+			emit_table_filter(*child, proj_idx, get, df_dedup, out);
 		}
 		return;
 	}
 
 	if (auto *df = extract_dynamic_filter(filter)) {
-		auto *filter_data = df->filter_data.get();
-		auto [it, _] = df_dedup.try_emplace(filter_data, df_dedup.size());
 		auto storage_idx = get.GetColumnIds()[proj_idx].GetPrimaryIndex();
-		dynamic_filters.push_back({
-		    {"slot_id", it->second},
-		    {"column_idx", storage_idx},
-		    {"compare_type", static_cast<uint8_t>(filter_data->filter->comparison_type)},
-		});
+		out.dynamic_filters.push_back(make_dynamic_filter(df->filter_data.get(), storage_idx, df_dedup));
 		return;
 	}
 
@@ -417,22 +400,13 @@ static void emit_table_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_id
 		col_ref->SetAlias(get.names[storage_idx]);
 	}
 	auto expr = filter.ToExpression(*col_ref);
-	conditions.push_back(build_expression(expr.get()));
+	out.conditions.push_back(build_expression(expr.get()));
 }
 
-// Result of walking a Get's table_filters: consumer-side dynamic-filter entries
-// to attach to the Input, plus synthetic LogicalFilter conditions to sit above
-// it.
-struct GetTableFilters {
-	json dynamic_filters;
-	json conditions;
-};
-
 static GetTableFilters split_table_filters(duckdb::LogicalGet &get, DynamicFilterDedup &df_dedup) {
-	GetTableFilters out{json::array(), json::array()};
+	GetTableFilters out;
 	for (auto &entry : get.table_filters) {
-		emit_table_filter(entry.Filter(), entry.GetIndex().GetIndex(), get, df_dedup,
-		                  out.dynamic_filters, out.conditions);
+		emit_table_filter(entry.Filter(), entry.GetIndex().GetIndex(), get, df_dedup, out);
 	}
 	return out;
 }
@@ -449,18 +423,15 @@ static GetTableFilters split_table_filters(duckdb::LogicalGet &get, DynamicFilte
 // positional indices ColumnBindingResolver assigns to every ref above the
 // scan, follow projection_ids, NOT column_ids, so we serialize in that
 // order. This is the scan-level twin of the LogicalFilter `projection_map`
-// handling in build_plan_node_json.
-json build_get_output_columns(duckdb::LogicalGet *get) {
-	json columns = json::array();
+// handling in build_plan_node.
+std::vector<std::unique_ptr<ExpressionT>> build_get_output_columns(duckdb::LogicalGet *get) {
+	std::vector<std::unique_ptr<ExpressionT>> columns;
 	auto &column_ids = get->GetColumnIds();
 	auto emit = [&](size_t column_position, size_t type_position) {
-		json data;
-		data["column_idx"] = column_ids[column_position].GetPrimaryIndex();
-		data["return_type"] = get->types[type_position].id();
-		json column;
-		column["type"] = static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF);
-		column["data"] = data;
-		columns.push_back(column);
+		RefT data;
+		data.column_idx = column_ids[column_position].GetPrimaryIndex();
+		data.return_type = static_cast<uint8_t>(get->types[type_position].id());
+		columns.push_back(wrap_expr(std::move(data)));
 	};
 	if (!get->projection_ids.empty()) {
 		for (auto projection_id : get->projection_ids) {
@@ -474,9 +445,10 @@ json build_get_output_columns(duckdb::LogicalGet *get) {
 	return columns;
 }
 
-json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
-               json dynamic_filters) {
-	json columns = build_get_output_columns(get);
+InputT build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                 std::vector<std::unique_ptr<DynamicFilterT>> dynamic_filters) {
+	InputT data;
+	data.columns = build_get_output_columns(get);
 
 	if (!get->GetTable()) {
 		throw UnsupportedPlanError("LogicalGet without a pivot table entry is not supported");
@@ -484,15 +456,11 @@ json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper
 
 	auto &pivot_entry = get->GetTable()->Cast<PivotTableCatalogEntry>();
 	tables.push_back(std::move(pivot_entry.table));
-	size_t table_id = tables.size() - 1;
-
-	return {
-	    {"table_id", table_id},
-	    {"columns", columns},
-	    {"dynamic_filters", std::move(dynamic_filters)},
-	    // Flipped to true by build_late_materialization on a late-mat narrow scan.
-	    {"emit_row_group_metadata", false},
-	};
+	data.table_id = tables.size() - 1;
+	data.dynamic_filters = std::move(dynamic_filters);
+	// Flipped to true by build_late_materialization on a late-mat narrow scan.
+	data.emit_row_group_metadata = false;
+	return data;
 }
 
 // A LogicalGet over a table-valued function (e.g. `generate_series(1, 10)`, or
@@ -502,7 +470,7 @@ json build_get(duckdb::LogicalGet *get, rust::Vec<rust::Box<OptionalTableWrapper
 // the projected output columns. The Rust side regenerates the rows from the name
 // and args, then projects them to `columns`; there is no `table_id` because
 // nothing is read off disk.
-json build_table_function_get(duckdb::LogicalGet *get) {
+TableFunctionScanT build_table_function_get(duckdb::LogicalGet *get) {
 	// Only positional `parameters` are serialized. None of pivot's table
 	// functions take named parameters; reject them rather than silently drop a
 	// bound argument (which would compile the function with that argument missing).
@@ -511,96 +479,68 @@ json build_table_function_get(duckdb::LogicalGet *get) {
 		                           " with named parameters is not supported");
 	}
 
-	json args = json::array();
+	TableFunctionScanT data;
+	data.function_name = get->function.name;
 	for (auto &param : get->parameters) {
-		args.push_back({
-		    {"logical_type", param.type().id()},
-		    {"raw_value", param.ToString()},
-		});
+		data.args.push_back(std::make_unique<ScalarValueT>(build_scalar_value(param)));
 	}
-
-	return {
-	    {"function_name", get->function.name},
-	    {"args", std::move(args)},
-	    {"columns", build_get_output_columns(get)},
-	};
+	data.columns = build_get_output_columns(get);
+	return data;
 }
 
-json build_order_by(duckdb::LogicalOrder *order_by) {
-	json orders = json::array();
+OrderByT build_order_by(duckdb::LogicalOrder *order_by) {
+	OrderByT data;
 	for (auto &order : order_by->orders) {
-		orders.push_back({
-			{"direction", static_cast<uint8_t>(order.type)},
-			{"expression", build_expression(order.expression.get())}
-		});
+		auto node = std::make_unique<OrderByNodeT>();
+		node->direction = static_cast<uint8_t>(order.type);
+		node->expression = build_expression(order.expression.get());
+		data.order_bys.push_back(std::move(node));
 	}
-
-	return {
-		{"order_bys", orders}
-	};
+	return data;
 }
 
-json build_aggregate(duckdb::LogicalAggregate *aggregate) {
-    json groups = json::array();
-    for (auto &group :aggregate->groups) {
-        groups.push_back(build_expression(group.get()));
-    }
-
-    json expressions = json::array();
-    for (auto &expression :aggregate->expressions ) {
-        expressions.push_back(build_expression(expression.get()));
-    }
-
-	return {
-	    {"groups", groups},
-	    {"expressions", expressions}
-	};
+AggregateT build_aggregate(duckdb::LogicalAggregate *aggregate) {
+	AggregateT data;
+	for (auto &group : aggregate->groups) {
+		data.groups.push_back(build_expression(group.get()));
+	}
+	for (auto &expression : aggregate->expressions) {
+		data.expressions.push_back(build_expression(expression.get()));
+	}
+	return data;
 }
 
-json build_filter(duckdb::LogicalFilter *filter) {
-	json filter_expressions = json::array();
+FilterT build_filter(duckdb::LogicalFilter *filter) {
+	FilterT data;
 	for (auto &expr : filter->expressions) {
-		filter_expressions.push_back(build_expression(expr.get()));
+		data.conditions.push_back(build_expression(expr.get()));
 	}
-
-	return {
-		{"conditions", filter_expressions}
-	};
+	return data;
 }
 
-json build_top_n(duckdb::LogicalTopN *top_n, DynamicFilterDedup &df_dedup) {
-	json orders = json::array();
-    for (auto &order : top_n->orders) {
-        orders.push_back({
-            {"direction", static_cast<uint8_t>(order.type)},
-            {"expression", build_expression(order.expression.get())}
-        });
-    }
+TopNT build_top_n(duckdb::LogicalTopN *top_n, DynamicFilterDedup &df_dedup) {
+	TopNT data;
+	for (auto &order : top_n->orders) {
+		auto node = std::make_unique<OrderByNodeT>();
+		node->direction = static_cast<uint8_t>(order.type);
+		node->expression = build_expression(order.expression.get());
+		data.order_bys.push_back(std::move(node));
+	}
+	data.limit = top_n->limit;
+	data.offset = top_n->offset;
 
-    // The TopN optimizer only installs a dynamic filter when `orders[0]` is a
-    // BoundColumnRefExpression (topn_optimizer.cpp), but by the time the plan is
-    // extracted ColumnBindingResolver has rewritten that into a
-    // BoundReferenceExpression whose `index` is the column's position in the
-    // TopN's child output — the value we publish. The comparison lives on the
-    // pre-allocated placeholder ConstantFilter and is stable across runs.
-    json produces_dynamic_filter = nullptr;
-    if (top_n->dynamic_filter) {
-        auto *filter_data = top_n->dynamic_filter.get();
-        auto &ref = top_n->orders[0].expression->Cast<duckdb::BoundReferenceExpression>();
-        auto [it, _] = df_dedup.try_emplace(filter_data, df_dedup.size());
-        produces_dynamic_filter = {
-            {"slot_id", it->second},
-            {"column_idx", ref.index},
-            {"compare_type", static_cast<uint8_t>(filter_data->filter->comparison_type)},
-        };
-    }
-
-    return {
-        {"limit", top_n->limit},
-        {"offset", top_n->offset},
-        {"order_bys", orders},
-        {"produces_dynamic_filter", produces_dynamic_filter}
-	    };
+	// The TopN optimizer only installs a dynamic filter when `orders[0]` is a
+	// BoundColumnRefExpression (topn_optimizer.cpp), but by the time the plan is
+	// extracted ColumnBindingResolver has rewritten that into a
+	// BoundReferenceExpression whose `index` is the column's position in the
+	// TopN's child output, the value we publish. The comparison lives on the
+	// pre-allocated placeholder ConstantFilter and is stable across runs.
+	if (top_n->dynamic_filter) {
+		auto &ref = top_n->orders[0].expression->Cast<duckdb::BoundReferenceExpression>();
+		data.produces_dynamic_filter =
+		    make_dynamic_filter(top_n->dynamic_filter.get(), ref.index, df_dedup);
+	}
+	return data;
 }
 
 // A bare LIMIT/OFFSET (no ORDER BY; an ORDER BY + LIMIT is fused into LogicalTopN
@@ -608,59 +548,59 @@ json build_top_n(duckdb::LogicalTopN *top_n, DynamicFilterDedup &df_dedup) {
 // limit can't be a fixed row count, so reject it rather than emit a wrong plan.
 // An absent LIMIT (offset-only query) serializes as a null limit, which the Rust
 // side reads as "unbounded".
-json build_limit(duckdb::LogicalLimit *limit) {
-    auto bound_to_json = [](const duckdb::BoundLimitNode &node, const char *what) -> json {
-        switch (node.Type()) {
-        case duckdb::LimitNodeType::CONSTANT_VALUE:
-            return json(node.GetConstantValue());
-        case duckdb::LimitNodeType::UNSET:
-            return json(nullptr);
-        default:
-            throw UnsupportedPlanError(std::string("Unsupported non-constant LIMIT ") + what);
-        }
-    };
-    return {
-        {"limit", bound_to_json(limit->limit_val, "value")},
-        {"offset", bound_to_json(limit->offset_val, "offset")},
-    };
+LimitT build_limit(duckdb::LogicalLimit *limit) {
+	auto bound = [](const duckdb::BoundLimitNode &node,
+	                const char *what) -> flatbuffers::Optional<uint64_t> {
+		switch (node.Type()) {
+		case duckdb::LimitNodeType::CONSTANT_VALUE:
+			return flatbuffers::Optional<uint64_t>(node.GetConstantValue());
+		case duckdb::LimitNodeType::UNSET:
+			return flatbuffers::nullopt;
+		default:
+			throw UnsupportedPlanError(std::string("Unsupported non-constant LIMIT ") + what);
+		}
+	};
+	LimitT data;
+	data.limit = bound(limit->limit_val, "value");
+	data.offset = bound(limit->offset_val, "offset");
+	return data;
 }
 
 string create_table_option_to_string(duckdb::ParsedExpression &expr) {
-    if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
-        auto &value = expr.Cast<duckdb::ConstantExpression>().value;
-        if (value.IsNull()) {
-            return "true";
-        }
-        return value.ToString();
-    }
-    return expr.ToString();
+	if (expr.GetExpressionClass() == duckdb::ExpressionClass::CONSTANT) {
+		auto &value = expr.Cast<duckdb::ConstantExpression>().value;
+		if (value.IsNull()) {
+			return "true";
+		}
+		return value.ToString();
+	}
+	return expr.ToString();
 }
 
-json build_create_table(duckdb::LogicalCreateTable *create_table) {
-    json columns = json::array();
-    json options = json::object();
-    auto &info = create_table->info->Base();
+CreateTableT build_create_table(duckdb::LogicalCreateTable *create_table) {
+	CreateTableT data;
+	auto &info = create_table->info->Base();
 
-    for (auto &column : info.columns.Logical()) {
-        columns.push_back({
-            {"name", column.GetName()},
-            {"col_type", static_cast<uint8_t>(column.Type().id())},
-        });
-    }
-    for (auto &entry : info.options) {
-        options[entry.first] = create_table_option_to_string(*entry.second);
-    }
+	for (auto &column : info.columns.Logical()) {
+		auto col = std::make_unique<CreateTableColumnT>();
+		col->name = column.GetName();
+		col->col_type = static_cast<uint8_t>(column.Type().id());
+		data.columns.push_back(std::move(col));
+	}
+	for (auto &entry : info.options) {
+		auto kv = std::make_unique<KeyValueT>();
+		kv->key = entry.first;
+		kv->value = create_table_option_to_string(*entry.second);
+		data.options.push_back(std::move(kv));
+	}
 
-    return {
-        {"name", info.table},
-        {"columns", columns},
-        {"options", options},
-        {"if_not_exists", info.on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT},
-        {"or_replace", info.on_conflict == duckdb::OnCreateConflict::REPLACE_ON_CONFLICT},
-        {"temporary", info.temporary},
-        {"has_query", create_table->info->query != nullptr},
-        {"constraint_count", create_table->info->constraints.size()},
-    };
+	data.name = info.table;
+	data.if_not_exists = info.on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
+	data.or_replace = info.on_conflict == duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+	data.temporary = info.temporary;
+	data.has_query = create_table->info->query != nullptr;
+	data.constraint_count = create_table->info->constraints.size();
+	return data;
 }
 
 // `SET <name> = <value>`. DuckDB's binder builds a LogicalSet for *any* name —
@@ -669,25 +609,28 @@ json build_create_table(duckdb::LogicalCreateTable *create_table) {
 // means. The value is a bound constant; pivot only ever wants its string form
 // (a boolean reads back as "true"/"false"), so serialize just that, not the
 // `{logical_type, raw_value}` pair every other scalar carries.
-json build_set(duckdb::LogicalSet *set) {
-	return {
-		{"name", set->name},
-		{"value", set->value.ToString()},
-	};
+SetVariableT build_set(duckdb::LogicalSet *set) {
+	SetVariableT data;
+	data.name = set->name;
+	// `has_value` distinguishes a real SET (even `SET x = ''`, an empty string)
+	// from a RESET, which an empty/null value alone could not.
+	data.has_value = true;
+	data.value = set->value.ToString();
+	return data;
 }
 
 // `RESET <name>` — restore the setting's default. pivot has no per-setting
-// default machinery, so we model it as a SET with no value (`null`); the consumer
-// reads "no value" as "off / default". Emitted under the LOGICAL_SET tag (see the
-// switch) so the Rust side needs only one variant.
-json build_reset(duckdb::LogicalReset *reset) {
-	return {
-		{"name", reset->name},
-		{"value", nullptr},
-	};
+// default machinery, so we model it as a SetVariable with no value (`has_value`
+// false); the consumer reads "no value" as "off / default". Emitted under the
+// same SetVariable variant so the Rust side needs only one operator.
+SetVariableT build_reset(duckdb::LogicalReset *reset) {
+	SetVariableT data;
+	data.name = reset->name;
+	// has_value defaults to false -> decoded as `value: None`.
+	return data;
 }
 
-// Remove DuckDB's row-id column from an already-built late-mat RHS subtree JSON.
+// Remove DuckDB's row-id column from an already-built late-mat RHS subtree.
 //
 // Late materialization threads a row-id column from the narrow scan up to the
 // (now-removed) join. pivot can't scan a virtual row-id and doesn't need it —
@@ -697,14 +640,13 @@ json build_reset(duckdb::LogicalReset *reset) {
 // find it at the scan and drop the lone reference to it in each projection on the
 // way back up. Returns the output position that held the row-id in `node`, or
 // `nullopt` if this subtree has none.
-static std::optional<size_t> strip_trailing_rowid(json &node) {
-	auto type = node["operator"]["type"].get<uint8_t>();
-	auto &data = node["operator"]["data"];
-
-	if (type == static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_GET)) {
-		auto &cols = data["columns"];
+static std::optional<size_t> strip_trailing_rowid(PlanNodeT &node) {
+	if (node.op.type == OperatorKind_Input) {
+		auto *input = node.op.AsInput();
+		auto &cols = input->columns;
 		for (size_t i = 0; i < cols.size(); i++) {
-			if (cols[i]["data"]["column_idx"].get<uint64_t>() == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+			auto *ref = cols[i]->kind.AsRef();
+			if (ref && ref->column_idx == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
 				cols.erase(cols.begin() + i);
 				return i;
 			}
@@ -712,20 +654,20 @@ static std::optional<size_t> strip_trailing_rowid(json &node) {
 		return std::nullopt;
 	}
 
-	if (!node.contains("inputs") || node["inputs"].empty()) {
+	if (node.inputs.empty()) {
 		return std::nullopt;
 	}
-	auto child_rowid = strip_trailing_rowid(node["inputs"][0]);
+	auto child_rowid = strip_trailing_rowid(*node.inputs[0]);
 
 	// A projection that carried the row-id up references it positionally in its
 	// child's output; drop that one entry. Other operators (Filter, Top-N, and
 	// the synthetic PUSHDOWN_FILTER wrapper) pass columns through unchanged.
-	if (type == static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_PROJECTION) && child_rowid) {
-		auto &exprs = data["projections"];
+	if (node.op.type == OperatorKind_Projection && child_rowid) {
+		auto *projection = node.op.AsProjection();
+		auto &exprs = projection->projections;
 		for (size_t i = 0; i < exprs.size(); i++) {
-			auto &e = exprs[i];
-			if (e["type"].get<uint8_t>() == static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF) &&
-			    e["data"]["column_idx"].get<uint64_t>() == *child_rowid) {
+			auto *ref = exprs[i]->kind.AsRef();
+			if (ref && ref->column_idx == *child_rowid) {
 				exprs.erase(exprs.begin() + i);
 				return i;
 			}
@@ -737,17 +679,16 @@ static std::optional<size_t> strip_trailing_rowid(json &node) {
 // Walk a late-mat RHS subtree to its scan, flag it to emit row-group metadata
 // (so the materializer can fetch survivors), and return its table_id — which the
 // Materialize node reuses, so resolution clones the one resolved table for both.
-static int64_t prepare_narrow_scan(json &node) {
-	if (node["operator"]["type"].get<uint8_t>() ==
-	    static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_GET)) {
-		auto &data = node["operator"]["data"];
-		data["emit_row_group_metadata"] = true;
-		return data["table_id"].get<int64_t>();
+static int64_t prepare_narrow_scan(PlanNodeT &node) {
+	if (node.op.type == OperatorKind_Input) {
+		auto *input = node.op.AsInput();
+		input->emit_row_group_metadata = true;
+		return static_cast<int64_t>(input->table_id);
 	}
-	if (!node.contains("inputs") || node["inputs"].empty()) {
+	if (node.inputs.empty()) {
 		return -1;
 	}
-	return prepare_narrow_scan(node["inputs"][0]);
+	return prepare_narrow_scan(*node.inputs[0]);
 }
 
 // Collapse DuckDB's late-materialization SEMI join into a pivot Materialize node.
@@ -762,12 +703,12 @@ static int64_t prepare_narrow_scan(json &node) {
 // the surviving rows. `columns` is the LHS Get's output column set (storage
 // indices, row-id excluded), in output order so the Projection kept above the
 // (former) join still lines up positionally.
-json build_late_materialization(duckdb::LogicalComparisonJoin &join,
-                                rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
-                                DynamicFilterDedup &df_dedup) {
+std::unique_ptr<PlanNodeT> build_late_materialization(duckdb::LogicalComparisonJoin &join,
+                                                      rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                                                      DynamicFilterDedup &df_dedup) {
 	auto &lhs_get = join.children[0]->Cast<duckdb::LogicalGet>();
 	auto &col_ids = lhs_get.GetColumnIds();
-	json mat_columns = json::array();
+	std::vector<uint64_t> mat_columns;
 	auto emit_col = [&](size_t pos) {
 		auto storage = col_ids[pos].GetPrimaryIndex();
 		if (storage == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
@@ -787,20 +728,26 @@ json build_late_materialization(duckdb::LogicalComparisonJoin &join,
 
 	// The narrow pipeline is the RHS; translate it normally, then drop the row-id
 	// column DuckDB threaded through it for the join we're discarding.
-	json child = build_plan_node_json(join.children[1].get(), tables, df_dedup);
-	strip_trailing_rowid(child);
+	auto child = build_plan_node(join.children[1].get(), tables, df_dedup);
+	strip_trailing_rowid(*child);
 	// Tag the narrow scan to emit row-group metadata, and reuse its table_id for
 	// the Materialize so both resolve to (a clone of) the same table.
-	int64_t table_id = prepare_narrow_scan(child);
+	int64_t table_id = prepare_narrow_scan(*child);
+	if (table_id < 0) {
+		// No base-table scan under the narrow pipeline (should not happen given
+		// is_late_materialization_join). Fail cleanly rather than ship a
+		// usize::MAX table_id that panics on an out-of-bounds index in Rust.
+		throw UnsupportedPlanError("late-materialization narrow pipeline has no base-table scan");
+	}
 
-	json op = json::object();
-	op["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN);
-	op["data"] = json{{"table_id", table_id}, {"columns", std::move(mat_columns)}};
+	MaterializeT data;
+	data.table_id = static_cast<uint64_t>(table_id);
+	data.columns = std::move(mat_columns);
 
-	json node = json::object();
-	node["name"] = "Materialize";
-	node["inputs"] = json::array({std::move(child)});
-	node["operator"] = std::move(op);
+	auto node = std::make_unique<PlanNodeT>();
+	node->name = "Materialize";
+	node->inputs.push_back(std::move(child));
+	node->op.Set(std::move(data));
 	return node;
 }
 
@@ -832,23 +779,23 @@ static bool is_late_materialization_join(duckdb::LogicalComparisonJoin &join) {
 // above the join in that case — see late_materialization.cpp — which pivot can't
 // run (its materializer drops the row id) and doesn't need (materialized rows
 // come back in scan/row-id order anyway), so the caller drops it.
-static bool is_materialize_over_empty_scan(const json &node) {
-	if (!node.contains("name") || node["name"] != "Materialize") {
+static bool is_materialize_over_empty_scan(const PlanNodeT &node) {
+	if (node.name != "Materialize") {
 		return false;
 	}
-	const json *cur = &node;
-	while (cur->contains("inputs") && !(*cur)["inputs"].empty()) {
-		cur = &(*cur)["inputs"][0];
-		if (cur->at("operator").at("type").get<uint8_t>() ==
-		    static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_GET)) {
-			return cur->at("operator").at("data").at("columns").empty();
+	const PlanNodeT *cur = &node;
+	while (!cur->inputs.empty()) {
+		cur = cur->inputs[0].get();
+		if (cur->op.type == OperatorKind_Input) {
+			return cur->op.AsInput()->columns.empty();
 		}
 	}
 	return false;
 }
 
-json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
-                          DynamicFilterDedup &df_dedup) {
+std::unique_ptr<PlanNodeT> build_plan_node(duckdb::LogicalOperator *op,
+                                           rust::Vec<rust::Box<OptionalTableWrapper>> &tables,
+                                           DynamicFilterDedup &df_dedup) {
 	// DuckDB's late_materialization optimizer rewrites a wide Top-N/Limit scan
 	// into a row-id SEMI join. Collapse that into pivot's own Materialize node
 	// rather than executing a join — but only the late-mat shape, not a user
@@ -860,59 +807,45 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 		}
 	}
 
-	json new_node = json::object();
-	json new_operator = json::object();
-
-	new_node["name"] = op->GetName();
-
-	json inputs = json::array();
+	auto node = std::make_unique<PlanNodeT>();
+	node->name = op->GetName();
 	for (auto &child : op->children) {
-		inputs.push_back(build_plan_node_json(child.get(), tables, df_dedup));
+		node->inputs.push_back(build_plan_node(child.get(), tables, df_dedup));
 	}
-	new_node["inputs"] = inputs;
-
-	new_operator["type"] = static_cast<uint8_t>(op->type);
 
 	// Static `col op const` filters DuckDB pushed into a LogicalGet's
 	// table_filters, rewritten back into expressions; reattached below as a
 	// synthetic LogicalFilter so the Rust side keeps seeing `Filter -> Input`
 	// exactly as it would with filter_pushdown disabled.
-	json get_pushed_conditions = json::array();
+	std::vector<std::unique_ptr<ExpressionT>> get_pushed_conditions;
 
-	// Add operator-specific properties
 	switch (op->type) {
-	case duckdb::LogicalOperatorType::LOGICAL_PROJECTION: {
-		new_operator["data"] = build_projection(&op->Cast<duckdb::LogicalProjection>());
+	case duckdb::LogicalOperatorType::LOGICAL_PROJECTION:
+		node->op.Set(build_projection(&op->Cast<duckdb::LogicalProjection>()));
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN: {
+	case duckdb::LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 		// The single-row source under a FROM-less SELECT (e.g.
 		// `SELECT drop_cache()`). No payload — pivot emits one empty row.
-		new_operator["data"] = json::object();
+		node->op.Set(DummyScanT());
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_EXPLAIN: {
+	case duckdb::LogicalOperatorType::LOGICAL_EXPLAIN:
 		// `EXPLAIN <query>` wraps the optimized plan as its single child (already
 		// built into `inputs` above). No payload: pivot renders that child plan
 		// as text rather than running it.
-		new_operator["data"] = json::object();
+		node->op.Set(ExplainT());
 		break;
-	}
 	case duckdb::LogicalOperatorType::LOGICAL_GET: {
 		auto &get = op->Cast<duckdb::LogicalGet>();
 		// A table-valued function (generate_series, pivot's metadata functions)
-		// has no base-table catalog entry. Re-tag it so Rust deserializes a
-		// TableFunctionScan instead of a base-table Input, and serialize the
-		// function name + args rather than a `table_id`.
+		// has no base-table catalog entry. Emit a TableFunctionScan instead of a
+		// base-table Input, with the function name + args rather than a `table_id`.
 		if (!get.GetTable()) {
-			new_operator["type"] =
-			    static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_CHUNK_GET);
-			new_operator["data"] = build_table_function_get(&get);
+			node->op.Set(build_table_function_get(&get));
 			break;
 		}
 		auto split = split_table_filters(get, df_dedup);
 		get_pushed_conditions = std::move(split.conditions);
-		new_operator["data"] = build_get(&get, tables, std::move(split.dynamic_filters));
+		node->op.Set(build_get(&get, tables, std::move(split.dynamic_filters)));
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_ORDER_BY: {
@@ -920,59 +853,48 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 		// plain LIMIT (see is_materialize_over_empty_scan): pivot can't run it and
 		// doesn't need it. Returns the Materialize child directly; the ORDER BY is
 		// a pass-through, so the parent's column positions are unchanged.
-		if (!inputs.empty() && is_materialize_over_empty_scan(inputs[0])) {
-			return inputs[0];
+		if (!node->inputs.empty() && is_materialize_over_empty_scan(*node->inputs[0])) {
+			return std::move(node->inputs[0]);
 		}
-		new_operator["data"] = build_order_by(&op->Cast<duckdb::LogicalOrder>());
+		node->op.Set(build_order_by(&op->Cast<duckdb::LogicalOrder>()));
 		break;
 	}
-	case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
-		new_operator["data"] = build_aggregate(&op->Cast<duckdb::LogicalAggregate>());
+	case duckdb::LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		node->op.Set(build_aggregate(&op->Cast<duckdb::LogicalAggregate>()));
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_FILTER: {
-		new_operator["data"] = build_filter(&op->Cast<duckdb::LogicalFilter>());
+	case duckdb::LogicalOperatorType::LOGICAL_FILTER:
+		node->op.Set(build_filter(&op->Cast<duckdb::LogicalFilter>()));
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_TOP_N: {
-		new_operator["data"] = build_top_n(&op->Cast<duckdb::LogicalTopN>(), df_dedup);
+	case duckdb::LogicalOperatorType::LOGICAL_TOP_N:
+		node->op.Set(build_top_n(&op->Cast<duckdb::LogicalTopN>(), df_dedup));
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_LIMIT: {
-		new_operator["data"] = build_limit(&op->Cast<duckdb::LogicalLimit>());
+	case duckdb::LogicalOperatorType::LOGICAL_LIMIT:
+		node->op.Set(build_limit(&op->Cast<duckdb::LogicalLimit>()));
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE: {
-		new_operator["data"] = build_create_table(&op->Cast<duckdb::LogicalCreateTable>());
+	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE:
+		node->op.Set(build_create_table(&op->Cast<duckdb::LogicalCreateTable>()));
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_SET: {
-		new_operator["data"] = build_set(&op->Cast<duckdb::LogicalSet>());
+	case duckdb::LogicalOperatorType::LOGICAL_SET:
+		node->op.Set(build_set(&op->Cast<duckdb::LogicalSet>()));
 		break;
-	}
-	case duckdb::LogicalOperatorType::LOGICAL_RESET: {
-		// Relabel RESET to SET (with a null value) so Rust needs one variant.
-		new_operator["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_SET);
-		new_operator["data"] = build_reset(&op->Cast<duckdb::LogicalReset>());
+	case duckdb::LogicalOperatorType::LOGICAL_RESET:
+		// Modelled as a SetVariable with no value (see build_reset).
+		node->op.Set(build_reset(&op->Cast<duckdb::LogicalReset>()));
 		break;
-	}
 	default:
 		throw UnsupportedPlanError("Unsupported operator type: " + op->GetName());
 	}
-
-	new_node["operator"] = new_operator;
 
 	// Reattach the Get's static pushed-down filters as a LogicalFilter above it.
 	// The conditions reference the Get's output columns positionally, which is
 	// what a Filter parent expects.
 	if (op->type == duckdb::LogicalOperatorType::LOGICAL_GET && !get_pushed_conditions.empty()) {
-		json filter_op = json::object();
-		filter_op["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_FILTER);
-		filter_op["data"] = json{{"conditions", get_pushed_conditions}};
-		json wrapper = json::object();
-		wrapper["name"] = "PUSHDOWN_FILTER";
-		wrapper["inputs"] = json::array({new_node});
-		wrapper["operator"] = filter_op;
+		FilterT filter;
+		filter.conditions = std::move(get_pushed_conditions);
+		auto wrapper = std::make_unique<PlanNodeT>();
+		wrapper->name = "PUSHDOWN_FILTER";
+		wrapper->inputs.push_back(std::move(node));
+		wrapper->op.Set(std::move(filter));
 		return wrapper;
 	}
 
@@ -990,28 +912,22 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	if (op->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
 		auto &filter = op->Cast<duckdb::LogicalFilter>();
 		if (!filter.projection_map.empty()) {
-			json projections = json::array();
+			ProjectionT projection;
 			for (size_t i = 0; i < filter.projection_map.size(); i++) {
-				json data;
-				data["column_idx"] = static_cast<uint64_t>(filter.projection_map[i]);
-				data["return_type"] = filter.types[i].id();
-				json col;
-				col["type"] = static_cast<uint8_t>(duckdb::ExpressionType::BOUND_REF);
-				col["data"] = data;
-				projections.push_back(col);
+				RefT data;
+				data.column_idx = static_cast<uint64_t>(filter.projection_map[i]);
+				data.return_type = static_cast<uint8_t>(filter.types[i].id());
+				projection.projections.push_back(wrap_expr(std::move(data)));
 			}
-			json proj_op = json::object();
-			proj_op["type"] = static_cast<uint8_t>(duckdb::LogicalOperatorType::LOGICAL_PROJECTION);
-			proj_op["data"] = json{{"projections", projections}};
-			json wrapper = json::object();
-			wrapper["name"] = "FILTER_PROJECTION";
-			wrapper["inputs"] = json::array({new_node});
-			wrapper["operator"] = proj_op;
+			auto wrapper = std::make_unique<PlanNodeT>();
+			wrapper->name = "FILTER_PROJECTION";
+			wrapper->inputs.push_back(std::move(node));
+			wrapper->op.Set(std::move(projection));
 			return wrapper;
 		}
 	}
 
-	return new_node;
+	return node;
 }
 
 // Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
@@ -1049,7 +965,7 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 }
 
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
-	json result;
+	PlanResultT result;
 	rust::Vec<rust::Box<OptionalTableWrapper>> tables;
 
 	try {
@@ -1072,25 +988,26 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
 		duckdb::ColumnBindingResolver resolver;
 		resolver.VisitOperator(*plan);
 		DynamicFilterDedup df_dedup;
-		auto root = build_plan_node_json(plan.get(), tables, df_dedup);
+		auto root = build_plan_node(plan.get(), tables, df_dedup);
 
-		json output_names = json::array();
+		SuccessPayloadT success;
+		success.plan = std::move(root);
 		for (const auto &name : name_list) {
-			output_names.push_back(name);
+			success.output_names.push_back(name);
 		}
-		result = {{"type", "success"}, {"data", {{"plan", root}, {"output_names", output_names}}}};
+		result.result.Set(std::move(success));
 	} catch (duckdb::Exception &e) {
 		result = build_duckdb_error(e);
 	} catch (const UnsupportedPlanError &e) {
-		result = build_bridge_error("unsupported_plan", e.what());
+		result = make_bridge_error("unsupported_plan", e.what());
 	} catch (const std::exception &e) {
-		result = build_bridge_error("bridge_error", e.what());
+		result = make_bridge_error("bridge_error", e.what());
 	} catch (...) {
-		result = build_bridge_error("bridge_error", "unknown C++ exception");
+		result = make_bridge_error("bridge_error", "unknown C++ exception");
 	}
 
 	// Free table entries created during this plan call
 	PivotStorageInfo::Get(*ctx.db.instance).ClearTableEntries();
 
-	return ExtractPlanResult{rust::String(result.dump()), std::move(tables)};
+	return ExtractPlanResult{serialize_plan_result(result), std::move(tables)};
 }

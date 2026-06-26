@@ -1,7 +1,8 @@
 # C++ Bridge
 
 We use DuckDB as a SQL planner only — no execution. This bridge embeds a
-DuckDB instance, feeds it SQL, and extracts the logical plan as JSON. The
+DuckDB instance, feeds it SQL, and extracts the logical plan as a FlatBuffers
+buffer (schema in `schema/plan.fbs`). The
 trick is wiring a Rust catalog into DuckDB so that table lookups during
 planning call back into Rust, and the resulting
 `Arc<dyn GetDuckDBTypedColumns>` objects survive the round-trip through C++
@@ -61,7 +62,7 @@ PivotSchemaCatalogEntry::LookupEntry()
     |
     v  (stored in PivotStorageInfo::table_entries for the duration of planning)
     |
-build_get() during JSON serialization
+build_get() during FlatBuffers serialization
   moves Box out of PivotTableCatalogEntry into tables vector
     |
     v  (returned in ExtractPlanResult::tables)
@@ -79,7 +80,7 @@ has already been moved out into the result.
 ## File map
 
 ```
-bridge.h / bridge.cpp             DuckPlannerContext, extract_plan, JSON serialization
+bridge.h / bridge.cpp             DuckPlannerContext, extract_plan, FlatBuffers serialization
 catalog/
   catalog.h / .cpp                PivotCatalog (single-schema catalog)
   schema_entry.h / .cpp           PivotSchemaCatalogEntry (calls Rust on table lookup)

@@ -7,7 +7,6 @@
 //! published into is allocated later, at compile time, and keyed back to these
 //! references by `slot_id`.
 
-use custom_deserializer::CustomDeserializer;
 
 use crate::duckdb_bridge::duckdb_types::ExpressionType;
 
@@ -18,7 +17,7 @@ use crate::duckdb_bridge::duckdb_types::ExpressionType;
 ///   value is published.
 ///
 /// `slot_id` correlates a producer with the consumer scans that read its slot.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct DynamicFilter {
     pub slot_id: usize,
     pub column_idx: usize,
