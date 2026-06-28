@@ -25,7 +25,7 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
-    AggregationKind, AggregationSlot, Count, FoldAcc, Max, Min, Numeric, Sum,
+    AggregationKind, AggregationSlot, Count, Fold, Max, Min, Numeric, Sum,
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
@@ -118,10 +118,10 @@ fn fold_first<T>(acc: Option<T>, c: Option<T>, combine: impl FnOnce(T, T) -> T) 
 #[inline(always)]
 fn merge_num<A: Numeric>(kind: AggregationKind, a: A, b: A) -> A {
     match kind {
-        AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b, &()),
-        AggregationKind::Sum => Sum::<A>::merge(a, b, &()),
-        AggregationKind::Min => Min::<A>::merge(a, b, &()),
-        AggregationKind::Max => Max::<A>::merge(a, b, &()),
+        AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b),
+        AggregationKind::Sum => Sum::<A>::merge(a, b),
+        AggregationKind::Min => Min::<A>::merge(a, b),
+        AggregationKind::Max => Max::<A>::merge(a, b),
         AggregationKind::StrMin | AggregationKind::StrMax => {
             unreachable!("string extreme accumulates as Partial::Str, not numeric")
         }
@@ -170,9 +170,9 @@ fn reduce_int_column<A: Numeric>(kind: AggregationKind, arr: &dyn Array) -> Opti
                 }};
             }
             match kind {
-                AggregationKind::Sum => reduce_with!(|a, b| Sum::<A>::merge(a, b, &())),
-                AggregationKind::Min => reduce_with!(|a, b| Min::<A>::merge(a, b, &())),
-                AggregationKind::Max => reduce_with!(|a, b| Max::<A>::merge(a, b, &())),
+                AggregationKind::Sum => reduce_with!(|a, b| Sum::<A>::merge(a, b)),
+                AggregationKind::Min => reduce_with!(|a, b| Min::<A>::merge(a, b)),
+                AggregationKind::Max => reduce_with!(|a, b| Max::<A>::merge(a, b)),
                 _ => unreachable!("reduce_int_column only handles SUM/MIN/MAX"),
             }
         }};

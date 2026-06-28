@@ -9,7 +9,7 @@ use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 
 use common::*;
-use dispatch::{AggregationKind, AggregationSlot, values_input};
+use dispatch::values_input;
 
 /// A panicking filter on every batch should surface as an error from
 /// `.collect()`, not a silent empty result.
@@ -23,7 +23,7 @@ fn panic_in_filter_returns_error() {
     let result = values_input(&dispatch, vec![batch])
         .record_batches()
         .filter(|| move |_batch: &RecordBatch| panic!("intentional panic in filter"))
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .count()
         .collect();
 
     // Assert: collect() returned an error mentioning the panic.
