@@ -24,8 +24,8 @@ use crate::duckdb_bridge::duckdb_types::{
 use crate::duckdb_bridge::ffi;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{
-    AggregateFunc, Between, Case, CaseCheck, Compare, Conjunction, Expression, Function, InList,
-    Not, Ref,
+    AggregateFunc, Between, Case, CaseCheck, Cast, Compare, Conjunction, Expression, Function,
+    InList, Not, Ref,
 };
 use crate::operator::{
     Aggregate, CreateTable, CreateTableColumn, DummyScan, Explain, Filter, Limit, Operator,
@@ -493,9 +493,11 @@ pub(crate) fn build_expression(expr: &ffi::Expression) -> Result<Expression, Bui
         })),
         E::BOUND_AGGREGATE => Ok(Expression::AggregateFunc(AggregateFunc {
             aggregate_function: ffi::expr_aggregate_name(expr),
-            params: build_expr_seq(ffi::expr_aggregate_child_count(expr), |i| {
-                ffi::expr_aggregate_child(expr, i)
-            })?,
+            // An aggregate folds its input column directly, so strip any cast
+            // DuckDB wrapped the argument in (AVG/SUM keep their narrow input).
+            params: (0..ffi::expr_aggregate_child_count(expr))
+                .map(|i| build_aggregate_param(ffi::expr_aggregate_child(expr, i)))
+                .collect::<Result<Vec<_>, BuildError>>()?,
             distinct: ffi::expr_aggregate_distinct(expr),
             return_type: return_type(),
         })),
@@ -539,12 +541,27 @@ pub(crate) fn build_expression(expr: &ffi::Expression) -> Result<Expression, Bui
         E::OPERATOR_NOT => Ok(Expression::Not(Not {
             input: Box::new(build_expression(ffi::expr_operator_child(expr, 0))?),
         })),
-        // Unwrap casts: pivot aggregates the underlying column directly, so build
-        // the cast's child in place of the cast itself.
-        E::OPERATOR_CAST => build_expression(ffi::expr_cast_child(expr)),
+        // Honor the cast: build a `Cast` over the child. The cast's own return
+        // type is its target (a `BoundCastExpression`'s `return_type`).
+        E::OPERATOR_CAST => Ok(Expression::Cast(Cast {
+            child: Box::new(build_expression(ffi::expr_cast_child(expr))?),
+            target_type: LogicalTypeId::from_u8(ffi::expr_return_type(expr)),
+        })),
         _ => Err(BuildError(format!(
             "Unsupported expression of type {}",
             ffi::expr_type(expr)
         ))),
     }
+}
+
+/// Build an aggregate's argument, stripping any leading cast(s) DuckDB inserted:
+/// the reducers fold the raw input column (an `AVG`/`SUM` keeps its narrow
+/// accumulator), so the cast would only force a widening copy.
+fn build_aggregate_param(expr: &ffi::Expression) -> Result<Expression, BuildError> {
+    let mut expr = expr;
+    while ExpressionType::from_u8(ffi::expr_type(expr)) as u8 == ExpressionType::OPERATOR_CAST as u8
+    {
+        expr = ffi::expr_cast_child(expr);
+    }
+    build_expression(expr)
 }

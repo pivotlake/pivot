@@ -41,7 +41,12 @@ impl Aggregate {
                 dt => return Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
             };
         // Per-partition distinct counts are i64; their total can't exceed the
-        // row count, so the narrow accumulator suffices.
-        Ok(counts.aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::Sum, 0)]))
+        // row count, so the narrow accumulator suffices. The result is the
+        // `COUNT(DISTINCT)` type DuckDB declares (`BIGINT`).
+        Ok(counts.aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::Sum,
+            0,
+            crate::types::physical_arrow_type(&distinct.return_type),
+        )]))
     }
 }

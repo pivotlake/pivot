@@ -2,15 +2,20 @@
 
 use super::Error;
 use super::Expression;
-use super::shared::{CmpKernel, compare_coerced};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::{Type, type_from_logical};
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, Datum, RecordBatch};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
+use arrow_schema::ArrowError;
 use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
 use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
+
+/// Signature shared by arrow's scalar comparison kernels, used here and by
+/// [`Between`](super::Between).
+pub(crate) type CmpKernel =
+    fn(&dyn Datum, &dyn Datum) -> std::result::Result<BooleanArray, ArrowError>;
 
 #[derive(Debug, Clone, Copy)]
 pub enum CompareType {
@@ -99,11 +104,9 @@ impl Compare {
             Box::new(move |batch: &RecordBatch| {
                 let left = left_expr(batch);
                 let right = right_expr(batch);
-                ExprResult::Array(Arc::new(compare_coerced(
-                    left.as_datum(),
-                    right.as_datum(),
-                    kernel,
-                )) as ArrayRef)
+                let mask = kernel(left.as_datum(), right.as_datum())
+                    .expect("comparison operands share a type");
+                ExprResult::Array(Arc::new(mask) as ArrayRef)
             }) as ExprEvalFn
         }))
     }

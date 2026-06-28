@@ -66,7 +66,11 @@ fn dropped_batch_memory_is_reused() {
                 .unwrap()
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 
@@ -128,7 +132,11 @@ fn decompressed_string_buffer_is_reused() {
                 .unwrap()
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 

@@ -69,7 +69,7 @@ pub struct Server {
     compact_bytes: u64,
     /// The compacter's count trigger for sub-target (low-traffic) partitions.
     compact_min_files: usize,
-    /// Address for the optional bundled web dashboard ([`crate::http`]).
+    /// Address for the optional bundled web dashboard (the `http` module).
     /// `None` (the default) leaves it off; set it with
     /// [`with_http_bind`](Self::with_http_bind).
     http_bind: Option<SocketAddr>,
@@ -113,7 +113,7 @@ impl Server {
         }
     }
 
-    /// Also serve the bundled web dashboard (see [`crate::http`]) on `addr`
+    /// Also serve the bundled web dashboard (served by the `http` module) on `addr`
     /// while the server runs. Off by default.
     pub fn with_http_bind(mut self, addr: SocketAddr) -> Self {
         self.http_bind = Some(addr);

@@ -1,6 +1,5 @@
 //! [`InList`] — an `input IN (v0, v1, …)` membership test.
 
-use super::shared::compare_coerced;
 use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::boolean::or;
@@ -43,9 +42,7 @@ impl InList {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         // `x IN (a, b, …)` is the disjunction `x = a OR x = b OR …`. We compile
         // the tested expression and every list value once, then per batch
-        // OR-reduce the equality masks. `compare_coerced` aligns differing
-        // physical types (e.g. an Int16 column against Int32 literals) the same
-        // way `Compare` does, so an IN over any integer/string column works.
+        // OR-reduce the equality masks.
         let input_builder = self.input.compile()?;
         let value_builders = self
             .values
@@ -61,7 +58,7 @@ impl InList {
                     .iter_mut()
                     .map(|v| {
                         let value = v(batch);
-                        compare_coerced(input.as_datum(), value.as_datum(), eq)
+                        eq(input.as_datum(), value.as_datum()).expect("IN operands share a type")
                     })
                     .reduce(|left, right| or(&left, &right).unwrap())
                     // An empty list (`IN ()`) matches nothing; DuckDB folds this

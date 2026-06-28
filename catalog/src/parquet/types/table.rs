@@ -11,10 +11,11 @@ use crate::parquet::types::thrift::general::{Encoding, PageType};
 use crate::parquet::types::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::store::DataFile;
 use arrow_array::{
-    ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, Scalar, StringViewArray, UInt8Array, UInt16Array, UInt32Array,
+    ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, Scalar, StringViewArray, TimestampSecondArray, UInt8Array, UInt16Array,
+    UInt32Array,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
 use std::fmt::{Debug, Formatter};
 use std::path::Path;
@@ -35,6 +36,10 @@ pub enum Error {
     Materialize(String),
     #[error("invalid parquet footer: {0}")]
     InvalidFooter(String),
+    /// A Parquet/arrow type with no mapping in either direction (an arrow type
+    /// the writer can't emit, or a Parquet leaf the reader can't decode).
+    #[error("unsupported type: {0}")]
+    UnsupportedType(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -320,6 +325,14 @@ fn decode_scalar(bytes: &[u8], data_type: &DataType) -> Option<Scalar<ArrayRef>>
         DataType::Utf8View => std::str::from_utf8(bytes)
             .ok()
             .map(|s| erase_type(StringViewArray::new_scalar(s))),
+        // Temporal stats share their physical int's encoding (Date32 the i32
+        // days, Timestamp(Second) the i64 count).
+        DataType::Date32 => read_le::<4>(bytes)
+            .map(i32::from_le_bytes)
+            .map(|v| erase_type(Date32Array::new_scalar(v))),
+        DataType::Timestamp(TimeUnit::Second, None) => read_le::<8>(bytes)
+            .map(i64::from_le_bytes)
+            .map(|v| erase_type(TimestampSecondArray::new_scalar(v))),
         _ => None,
     }
 }
@@ -352,7 +365,7 @@ fn schema_elements_to_arrow(
         let nullable = elem.repetition_type == Some(1);
         let def_level: i16 = if nullable { 1 } else { 0 };
 
-        let data_type = convert_physical_to_arrow(
+        let data_type = super::arrow_map::parquet_to_arrow(
             elem.physical_type,
             elem.converted_type,
             elem.logical_type.as_ref(),
@@ -363,76 +376,6 @@ fn schema_elements_to_arrow(
     }
 
     Ok((Schema::new(fields), def_levels))
-}
-
-/// Maps a Parquet physical type (+ optional logical/converted type annotations)
-/// to an Arrow [`DataType`].
-fn convert_physical_to_arrow(
-    physical_type: Option<i32>,
-    converted_type: Option<i32>,
-    logical_type: Option<&crate::parquet::types::thrift::footer::LogicalType>,
-) -> Result<DataType> {
-    use crate::parquet::types::thrift::footer::LogicalType;
-
-    let pt = physical_type.ok_or_else(|| {
-        Error::IO(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "leaf schema element missing physical type",
-        ))
-    })?;
-
-    match pt {
-        // BOOLEAN = 0
-        0 => Ok(DataType::Boolean),
-        // INT32 = 1
-        1 => match logical_type {
-            Some(LogicalType::Integer {
-                bit_width: 8,
-                is_signed: true,
-            }) => Ok(DataType::Int8),
-            Some(LogicalType::Integer {
-                bit_width: 8,
-                is_signed: false,
-            }) => Ok(DataType::UInt8),
-            Some(LogicalType::Integer {
-                bit_width: 16,
-                is_signed: true,
-            }) => Ok(DataType::Int16),
-            Some(LogicalType::Integer {
-                bit_width: 16,
-                is_signed: false,
-            }) => Ok(DataType::UInt16),
-            Some(LogicalType::Integer {
-                bit_width: 32,
-                is_signed: true,
-            }) => Ok(DataType::Int32),
-            Some(LogicalType::Integer {
-                bit_width: 32,
-                is_signed: false,
-            }) => Ok(DataType::UInt32),
-            _ => match converted_type {
-                Some(15) => Ok(DataType::Int8),   // INT_8
-                Some(11) => Ok(DataType::UInt8),  // UINT_8
-                Some(16) => Ok(DataType::Int16),  // INT_16
-                Some(12) => Ok(DataType::UInt16), // UINT_16
-                Some(17) => Ok(DataType::Int32),  // INT_32
-                Some(13) => Ok(DataType::UInt32), // UINT_32
-                _ => Ok(DataType::Int32),
-            },
-        },
-        // INT64 = 2
-        2 => Ok(DataType::Int64),
-        // FLOAT = 4
-        4 => Ok(DataType::Float32),
-        // DOUBLE = 5
-        5 => Ok(DataType::Float64),
-        // BYTE_ARRAY = 6
-        6 => Ok(DataType::Utf8View),
-        _ => Err(Error::IO(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported physical type {}", pt),
-        ))),
-    }
 }
 
 #[cfg(test)]

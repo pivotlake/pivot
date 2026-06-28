@@ -25,13 +25,15 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
-    AggregationKind, AggregationSlot, Count, Fold, Max, Min, Numeric, Sum,
+    AggregationKind, AggregationSlot, Count, Fold, Max, Min, Numeric, Sum, cast_value_column,
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Int16Type, Int32Type, Int64Type};
+use arrow_array::types::{
+    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
+};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
@@ -179,9 +181,13 @@ fn reduce_int_column<A: Numeric>(kind: AggregationKind, arr: &dyn Array) -> Opti
     }
 
     match arr.data_type() {
+        DataType::Int8 => reduce_primitive!(Int8Type),
         DataType::Int16 => reduce_primitive!(Int16Type),
         DataType::Int32 => reduce_primitive!(Int32Type),
         DataType::Int64 => reduce_primitive!(Int64Type),
+        DataType::UInt8 => reduce_primitive!(UInt8Type),
+        DataType::UInt16 => reduce_primitive!(UInt16Type),
+        DataType::UInt32 => reduce_primitive!(UInt32Type),
         other => panic!("aggregate: unsupported column type {other:?}"),
     }
 }
@@ -414,7 +420,10 @@ impl<A: Numeric> Outputter<RecordBatch> for AggregateOutputter<A> {
                         std::mem::take(&mut self.totals)
                             .into_iter()
                             .zip(self.slots.iter())
-                            .map(|(total, slot)| total.into_column(slot.kind))
+                            .map(|(total, slot)| {
+                                let (field, column) = total.into_column(slot.kind);
+                                cast_value_column(field, column, &slot.output_type)
+                            })
                             .unzip();
                     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
                     output.send(batch)?;
@@ -480,18 +489,30 @@ mod tests {
     }
 
     fn slot(kind: AggregationKind, column: usize) -> AggregationSlot {
-        AggregationSlot::new(kind, column)
+        AggregationSlot::new(kind, column, test_output_type(kind))
+    }
+
+    /// The output type a test slot of `kind` declares: `Decimal128` for a sum,
+    /// `Utf8View` for a string extreme, `Int64` otherwise (the accumulator's
+    /// natural width for a count or numeric extreme over the int columns tests
+    /// use).
+    fn test_output_type(kind: AggregationKind) -> arrow_schema::DataType {
+        match kind {
+            AggregationKind::Sum => arrow_schema::DataType::Decimal128(38, 0),
+            AggregationKind::StrMin | AggregationKind::StrMax => arrow_schema::DataType::Utf8View,
+            _ => arrow_schema::DataType::Int64,
+        }
     }
 
     #[test]
     fn single_worker_sum() {
-        // Int32 column → i64 accumulator → Int64 output.
+        // Int32 column → i64 accumulator → Decimal128 output (a SUM is a HUGEINT).
         let ops = build::<i64>(1, vec![slot(AggregationKind::Sum, 0)]);
 
         let out = run_consumers(ops, vec![vec![make_batch(&[1, 2, 3]), make_batch(&[4, 5])]]);
 
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i64(&out.items[0], 0), 15);
+        assert_eq!(col_i128(&out.items[0], 0), 15);
     }
 
     #[test]
@@ -507,8 +528,8 @@ mod tests {
         let out = run_consumers(ops, vec![vec![make_batch(&[2, 4, 6, 8])]]);
 
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i64(&out.items[0], 0), 20); // sum
-        assert_eq!(col_i64(&out.items[0], 1), 4); // count
+        assert_eq!(col_i128(&out.items[0], 0), 20); // sum (Decimal128)
+        assert_eq!(col_i64(&out.items[0], 1), 4); // count (Int64)
     }
 
     #[test]
@@ -525,7 +546,7 @@ mod tests {
         );
 
         assert_eq!(out.items.len(), 1);
-        assert_eq!(col_i64(&out.items[0], 0), 36);
+        assert_eq!(col_i128(&out.items[0], 0), 36);
     }
 
     #[test]
@@ -704,6 +725,6 @@ mod tests {
         let out = run_consumers(ops, vec![vec![batch]]);
 
         assert_eq!(col_str(&out.items[0], 0), "apple");
-        assert_eq!(col_i64(&out.items[0], 1), 6);
+        assert_eq!(col_i128(&out.items[0], 1), 6); // SUM is Decimal128
     }
 }

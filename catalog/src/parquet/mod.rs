@@ -36,6 +36,7 @@ pub use row_group_stats::{
 };
 
 pub(crate) mod types;
+pub use types::arrow_map::arrow_to_parquet_physical;
 pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
 pub use types::page::{CompressedPage, DecompressedPage};
 pub use types::requests::{RowGroupBuffer, RowGroupRequest};

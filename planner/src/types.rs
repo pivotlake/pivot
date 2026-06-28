@@ -16,7 +16,9 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{
     ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow_schema::{DataType, TimeUnit};
 use duckdb_planner::ScalarValue;
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
 use std::fmt;
@@ -35,6 +37,10 @@ pub enum Type {
     Int16,
     Int32,
     Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
     /// DuckDB `HUGEINT` — the result type of `SUM` over integers. Pivot's
     /// executor emits `SUM` as a `Decimal128(38, 0)` column matching this
     /// width, so large sums (e.g. `SUM(user_id)`) stay exact.
@@ -64,6 +70,10 @@ impl fmt::Display for Type {
             Type::Int16 => "Int16",
             Type::Int32 => "Int32",
             Type::Int64 => "Int64",
+            Type::UInt8 => "UInt8",
+            Type::UInt16 => "UInt16",
+            Type::UInt32 => "UInt32",
+            Type::UInt64 => "UInt64",
             Type::Int128 => "Int128",
             Type::Float64 => "Float64",
             Type::Decimal => "Decimal",
@@ -89,16 +99,28 @@ pub enum Error {
     },
 }
 
-/// Generates a pair of conversion functions between Pivot's [`Type`] and
-/// DuckDB's [`LogicalTypeId`] from a single list of pairs, so the mapping
-/// is defined once and both directions stay in sync.
+/// Generates the conversion functions between Pivot's [`Type`], DuckDB's
+/// [`LogicalTypeId`], and the executor's physical arrow [`DataType`] from a
+/// single table of triples, so every type is described in one place and the
+/// directions can't drift.
+///
+/// Each row is `(pivot Type, DuckDB LogicalTypeId, physical arrow DataType)`:
 ///
 /// - `type_from_logical`: DuckDB `LogicalTypeId` -> Pivot `Type` (fallible,
 ///   returns `Err` for unmapped DuckDB types).
 /// - `logical_from_type`: Pivot `Type` -> DuckDB `LogicalTypeId` (infallible,
 ///   every Pivot type has a DuckDB counterpart).
+/// - `physical_arrow_type`: Pivot `Type` -> the arrow `DataType` a column of that
+///   type carries (infallible).
+///
+/// The arrow column is where the "logical vs physical" facts live, once:
+/// `Date` is `Date32`, `Timestamp` is `Timestamp(Second)`, and the wide aggregate
+/// types (`Int128`/`Decimal`) land on `Decimal128(38, 0)`/`Float64`. This is the
+/// single arrow type a value carries everywhere; only the group-by drops a
+/// temporal column to its backing int (`temporal_to_int`) to hash/encode it,
+/// restoring the type on its output.
 macro_rules! type_conversions {
-    ( $( ($pivot:path, $duckdb:path) ),+ $(,)? ) => {
+    ( $( ($pivot:path, $duckdb:path, $arrow:expr) ),+ $(,)? ) => {
         pub fn type_from_logical(duckdb_type: LogicalTypeId) -> Result<Type, Error> {
             match duckdb_type {
                 $( $duckdb => Ok($pivot), )+
@@ -111,21 +133,37 @@ macro_rules! type_conversions {
                 $( $pivot => $duckdb, )+
             }
         }
+
+        /// The arrow [`DataType`] a column of this `Type` carries.
+        ///
+        /// Note this is many-to-one (`Decimal` and `Float64` both map to
+        /// `Float64`), so it has no clean inverse: recovering the logical type
+        /// from an arrow column is exactly the ambiguity the rest of the planner
+        /// carries the [`Type`] around to avoid.
+        pub fn physical_arrow_type(pivot_type: &Type) -> DataType {
+            match pivot_type {
+                $( $pivot => $arrow, )+
+            }
+        }
     };
 }
 
 type_conversions! {
-    (Type::Boolean,   LogicalTypeId::BOOLEAN),
-    (Type::Int8,      LogicalTypeId::TINYINT),
-    (Type::Int16,     LogicalTypeId::SMALLINT),
-    (Type::Int32,     LogicalTypeId::INTEGER),
-    (Type::Int64,     LogicalTypeId::BIGINT),
-    (Type::Int128,    LogicalTypeId::HUGEINT),
-    (Type::Float64,   LogicalTypeId::DOUBLE),
-    (Type::Decimal,   LogicalTypeId::DECIMAL),
-    (Type::Utf8,      LogicalTypeId::VARCHAR),
-    (Type::Date,      LogicalTypeId::DATE),
-    (Type::Timestamp, LogicalTypeId::TIMESTAMP),
+    (Type::Boolean,   LogicalTypeId::BOOLEAN,   DataType::Boolean),
+    (Type::Int8,      LogicalTypeId::TINYINT,   DataType::Int8),
+    (Type::Int16,     LogicalTypeId::SMALLINT,  DataType::Int16),
+    (Type::Int32,     LogicalTypeId::INTEGER,   DataType::Int32),
+    (Type::Int64,     LogicalTypeId::BIGINT,    DataType::Int64),
+    (Type::UInt8,     LogicalTypeId::UTINYINT,  DataType::UInt8),
+    (Type::UInt16,    LogicalTypeId::USMALLINT, DataType::UInt16),
+    (Type::UInt32,    LogicalTypeId::UINTEGER,  DataType::UInt32),
+    (Type::UInt64,    LogicalTypeId::UBIGINT,   DataType::UInt64),
+    (Type::Int128,    LogicalTypeId::HUGEINT,   DataType::Decimal128(38, 0)),
+    (Type::Float64,   LogicalTypeId::DOUBLE,    DataType::Float64),
+    (Type::Decimal,   LogicalTypeId::DECIMAL,   DataType::Float64),
+    (Type::Utf8,      LogicalTypeId::VARCHAR,   DataType::Utf8View),
+    (Type::Date,      LogicalTypeId::DATE,      DataType::Date32),
+    (Type::Timestamp, LogicalTypeId::TIMESTAMP, DataType::Timestamp(TimeUnit::Second, None)),
 }
 
 /// Parse a DuckDB [`ScalarValue`] (logical type + raw string) into an arrow
@@ -134,6 +172,7 @@ pub fn build_scalar_value(
     ScalarValue {
         logical_type,
         raw_value,
+        ..
     }: ScalarValue,
 ) -> Result<Scalar<ArrayRef>, Error> {
     let pivot_type = type_from_logical(logical_type.clone())?;
@@ -156,6 +195,22 @@ pub fn build_scalar_value(
         ),
         Type::Int64 => Arc::new(
             Int64Array::new_scalar(parse_scalar::<i64>(&raw_value, logical_type.clone())?)
+                .into_inner(),
+        ),
+        Type::UInt8 => Arc::new(
+            UInt8Array::new_scalar(parse_scalar::<u8>(&raw_value, logical_type.clone())?)
+                .into_inner(),
+        ),
+        Type::UInt16 => Arc::new(
+            UInt16Array::new_scalar(parse_scalar::<u16>(&raw_value, logical_type.clone())?)
+                .into_inner(),
+        ),
+        Type::UInt32 => Arc::new(
+            UInt32Array::new_scalar(parse_scalar::<u32>(&raw_value, logical_type.clone())?)
+                .into_inner(),
+        ),
+        Type::UInt64 => Arc::new(
+            UInt64Array::new_scalar(parse_scalar::<u64>(&raw_value, logical_type.clone())?)
                 .into_inner(),
         ),
         Type::Utf8 => Arc::new(StringViewArray::new_scalar(raw_value).into_inner()),

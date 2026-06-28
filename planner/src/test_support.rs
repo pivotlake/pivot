@@ -16,15 +16,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringViewArray};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Date32Type, Int32Type, Int64Type, TimestampSecondType};
+use arrow_array::{
+    ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, Scalar, StringViewArray,
+    TimestampSecondArray,
+};
 use arrow_json::ArrayWriter;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use rstest::fixture;
 use serde_json::Value;
 
 use crate::Planner;
 use crate::catalog::{Catalog, Column, DynamicScanPredicate, Table};
-use crate::types::Type;
+use crate::types::{Type, physical_arrow_type};
 use dispatch::{
     DataFlowDispatcher, Dispatch, Nullary, NullaryFactory, NullaryResult, Projection,
     RecordBatchOperatorSpec, Sender, WorkStatus,
@@ -72,12 +77,24 @@ struct TestTable {
 
 impl TestTable {
     fn new(columns: &[(&str, Type, ArrayRef)]) -> Self {
+        // Surface each column as the real arrow type its pivot `Type` decodes
+        // into, mirroring the reader: a temporal column becomes Date32/Timestamp,
+        // others keep the array they were given.
+        let arrays: Vec<ArrayRef> = columns
+            .iter()
+            .map(|(_, col_type, array)| match col_type {
+                Type::Date | Type::Timestamp => {
+                    arrow::compute::cast(array, &physical_arrow_type(col_type)).unwrap()
+                }
+                _ => array.clone(),
+            })
+            .collect();
         let fields: Vec<Field> = columns
             .iter()
-            .map(|(name, _, array)| Field::new(*name, array.data_type().clone(), false))
+            .zip(&arrays)
+            .map(|((name, _, _), array)| Field::new(*name, array.data_type().clone(), false))
             .collect();
         let schema = Arc::new(Schema::new(fields));
-        let arrays: Vec<ArrayRef> = columns.iter().map(|(_, _, array)| array.clone()).collect();
         let batch = RecordBatch::try_new(schema, arrays).unwrap();
         let cols = columns
             .iter()
@@ -127,6 +144,56 @@ impl Table for TestTable {
         _ctx: &dyn crate::catalog::QueryContext,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("the in-memory test table is never late-materialized")
+    }
+
+    /// Exact min/max over the stored column as a scalar of its physical int type,
+    /// so the no-scan global MIN/MAX peephole ([`Aggregate::try_compile_from_stats`])
+    /// can be exercised. Only the int columns the peephole supports are answered.
+    fn column_min_max(
+        &self,
+        column: usize,
+        _ctx: &dyn crate::catalog::QueryContext,
+    ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+        let arr = self.batch.column(column);
+        match arr.data_type() {
+            DataType::Int32 => {
+                let values = arr.as_primitive::<Int32Type>().values();
+                let lo = *values.iter().min()?;
+                let hi = *values.iter().max()?;
+                Some((
+                    Scalar::new(Arc::new(Int32Array::from(vec![lo])) as ArrayRef),
+                    Scalar::new(Arc::new(Int32Array::from(vec![hi])) as ArrayRef),
+                ))
+            }
+            DataType::Int64 => {
+                let values = arr.as_primitive::<Int64Type>().values();
+                let lo = *values.iter().min()?;
+                let hi = *values.iter().max()?;
+                Some((
+                    Scalar::new(Arc::new(Int64Array::from(vec![lo])) as ArrayRef),
+                    Scalar::new(Arc::new(Int64Array::from(vec![hi])) as ArrayRef),
+                ))
+            }
+            DataType::Date32 => {
+                let values = arr.as_primitive::<Date32Type>().values();
+                let lo = *values.iter().min()?;
+                let hi = *values.iter().max()?;
+                Some((
+                    Scalar::new(Arc::new(Date32Array::from(vec![lo])) as ArrayRef),
+                    Scalar::new(Arc::new(Date32Array::from(vec![hi])) as ArrayRef),
+                ))
+            }
+            DataType::Timestamp(_, _) => {
+                let values = arr.as_primitive::<TimestampSecondType>().values();
+                let lo = *values.iter().min()?;
+                let hi = *values.iter().max()?;
+                Some((
+                    Scalar::new(Arc::new(TimestampSecondArray::from(vec![lo])) as ArrayRef),
+                    Scalar::new(Arc::new(TimestampSecondArray::from(vec![hi])) as ArrayRef),
+                ))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -238,15 +305,21 @@ pub fn testing_planner() -> TestingPlanner {
 /// JSON. The one call the inline blackbox tests build their setup/execute/assert
 /// around.
 pub fn run(planner: &mut TestingPlanner, sql: &str) -> Vec<Value> {
-    let results = planner
+    batches_to_json(&run_batches(planner, sql))
+}
+
+/// Plan, compile, and run `sql`, returning the raw result batches. Lets a test
+/// inspect the output arrow schema (e.g. that a DATE column surfaces as
+/// `Date32`) rather than only the JSON-rendered values.
+pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> {
+    planner
         .planner
         .plan(sql)
         .unwrap()
         .compile(planner.dispatch.dispatcher())
         .unwrap()
         .collect()
-        .unwrap();
-    batches_to_json(&results)
+        .unwrap()
 }
 
 /// The value of a row's single column, by position rather than name. For tests
