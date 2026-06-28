@@ -690,8 +690,7 @@ fn arithmetic_does_not_truncate_floats(mut testing_planner: TestingPlanner) {
         ],
     );
 
-    // `f` is a DOUBLE column, `n` an INTEGER column (a float *constant* isn't
-    // supported, so both operands must be columns). DuckDB casts `n` to DOUBLE,
+    // `f` is a DOUBLE column, `n` an INTEGER column. DuckDB casts `n` to DOUBLE,
     // but the bridge unwraps that column cast, so the operands reach the kernel
     // with mismatched types (Float64 array vs Int32 array) and hit the coercion
     // branch. Coercing both to Int64 there would truncate `f` (1.5 -> 1) before
@@ -718,6 +717,104 @@ fn arithmetic_does_not_truncate_floats(mut testing_planner: TestingPlanner) {
     // coercion would truncate to {11.0, 22.0, 33.0}.
     let sums: Vec<f64> = rows.iter().map(|r| r["col0"].as_f64().unwrap()).collect();
     assert_eq!(sums, vec![11.5, 22.5, 33.5]);
+}
+
+#[rstest]
+fn float_scalar_arithmetic(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "floats",
+        &[(
+            "f",
+            Type::Float64,
+            Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5])) as ArrayRef,
+        )],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT f + 1, f + 0.25 FROM floats")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by(|x, y| {
+        x["col0"]
+            .as_f64()
+            .unwrap()
+            .partial_cmp(&y["col0"].as_f64().unwrap())
+            .unwrap()
+    });
+
+    let plus_one: Vec<f64> = rows.iter().map(|r| r["col0"].as_f64().unwrap()).collect();
+    let plus_quarter: Vec<f64> = rows.iter().map(|r| r["col1"].as_f64().unwrap()).collect();
+    assert_eq!(plus_one, vec![2.5, 3.5, 4.5]);
+    assert_eq!(plus_quarter, vec![1.75, 2.75, 3.75]);
+}
+
+#[rstest]
+fn float_column_comparison_does_not_truncate(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "floats",
+        &[(
+            "f",
+            Type::Float64,
+            Arc::new(Float64Array::from(vec![1.5, 2.5, 3.5])) as ArrayRef,
+        )],
+    );
+
+    // `f` is a DOUBLE column compared against an INTEGER literal. DuckDB casts
+    // `f` to match, but the bridge unwraps that cast, so the kernel sees a
+    // Float64 array vs an Int32 scalar and hits the coercion branch. Coercing
+    // both to Int64 there would truncate `f` (1.5 -> 1) before comparing; the
+    // comparison must use the real fractional values.
+    let results = testing_planner
+        .planner
+        .plan("SELECT f FROM floats WHERE f > 2")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by(|x, y| {
+        x["f"]
+            .as_f64()
+            .unwrap()
+            .partial_cmp(&y["f"].as_f64().unwrap())
+            .unwrap()
+    });
+
+    // f ∈ {1.5, 2.5, 3.5} filtered by `> 2` keeps {2.5, 3.5}; an Int64 coercion
+    // would truncate to {1, 2, 3} and wrongly keep only 3.5 (and drop 2.5).
+    let kept: Vec<f64> = rows.iter().map(|r| r["f"].as_f64().unwrap()).collect();
+    assert_eq!(kept, vec![2.5, 3.5]);
+}
+
+#[rstest]
+fn float_arithmetic_group_key_rejected(mut testing_planner: TestingPlanner) {
+    // Grouping keys are materialised as Int64; a float-valued arithmetic key
+    // would be truncated, silently merging distinct keys (1.2 and 1.8 -> 1).
+    // Such a key must be rejected at plan time rather than aggregated wrongly.
+    testing_planner.add_table(
+        "floats",
+        &[(
+            "f",
+            Type::Float64,
+            Arc::new(Float64Array::from(vec![1.5, 2.5, 1.5])) as ArrayRef,
+        )],
+    );
+
+    let result = testing_planner
+        .planner
+        .plan("SELECT f + 0.25 AS k, COUNT(*) FROM floats GROUP BY k")
+        .unwrap()
+        .compile(testing_planner.dispatcher());
+
+    assert!(result.is_err());
 }
 
 #[rstest]

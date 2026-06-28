@@ -15,7 +15,8 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
+    ArrayRef, BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar,
+    StringViewArray,
 };
 use duckdb_planner::ScalarValue;
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
@@ -158,6 +159,10 @@ pub fn build_scalar_value(
             Int64Array::new_scalar(parse_scalar::<i64>(&raw_value, logical_type.clone())?)
                 .into_inner(),
         ),
+        Type::Float64 => Arc::new(
+            Float64Array::new_scalar(parse_scalar::<f64>(&raw_value, logical_type.clone())?)
+                .into_inner(),
+        ),
         Type::Utf8 => Arc::new(StringViewArray::new_scalar(raw_value).into_inner()),
         // DuckDB serialises a DATE constant as "YYYY-MM-DD"; let arrow parse it
         // to a Date32 (days since epoch). Comparisons coerce both sides to a
@@ -178,10 +183,10 @@ pub fn build_scalar_value(
                 .value(0);
             Arc::new(arrow_array::Date32Array::new_scalar(days).into_inner())
         }
-        // SUM/AVG result types and TIMESTAMP never appear as query *constants*
+        // SUM result types and TIMESTAMP never appear as query *constants*
         // (TIMESTAMP shows up only as a column / date_trunc result), so we don't
         // need to materialise them as scalar literals.
-        Type::Int128 | Type::Float64 | Type::Decimal | Type::Timestamp => {
+        Type::Int128 | Type::Decimal | Type::Timestamp => {
             return Err(Error::UnsupportedScalarType(pivot_type));
         }
     };

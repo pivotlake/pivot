@@ -137,6 +137,7 @@ impl Expression {
                 arrow_schema::DataType::Int16 => Ok(Type::Int16),
                 arrow_schema::DataType::Int32 => Ok(Type::Int32),
                 arrow_schema::DataType::Int64 => Ok(Type::Int64),
+                arrow_schema::DataType::Float64 => Ok(Type::Float64),
                 _ => Err(compile::Error::IndeterminateResultType(self.clone())),
             },
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
@@ -145,10 +146,21 @@ impl Expression {
             // `date_trunc` yields a timestamp; `regexp_replace` a string.
             Expression::Function(Function::DateTrunc(_)) => Ok(Type::Timestamp),
             Expression::Function(Function::RegexpReplace(_)) => Ok(Type::Utf8),
-            // Integer-valued scalar functions: a date part (`extract(minute …)`),
-            // a byte length, and integer arithmetic (`a * 2`, `ip - 1`).
+            // Integer-valued scalar functions: a date part (`extract(minute …)`)
+            // and a byte length.
             Expression::Function(Function::DatePart(_) | Function::Length(_)) => Ok(Type::Int64),
-            Expression::Function(Function::Arithmetic(_)) => Ok(Type::Int64),
+            // Arithmetic over integers yields Int64 (`a * 2`, `ip - 1`), but the
+            // kernel promotes to Float64 when either operand is a float (see
+            // `arith_coerced`). Report that so a float-valued key isn't silently
+            // truncated to Int64 when used for grouping.
+            Expression::Function(Function::Arithmetic(a)) => {
+                let is_float = |e: &Expression| matches!(e.result_type(), Ok(Type::Float64));
+                if is_float(&a.left) || is_float(&a.right) {
+                    Ok(Type::Float64)
+                } else {
+                    Ok(Type::Int64)
+                }
+            }
             // Everything else (comparisons, `contains`, `Divide`'s Float64
             // quotient, …) has no type we use for grouping.
             _ => Err(compile::Error::IndeterminateResultType(self.clone())),

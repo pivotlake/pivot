@@ -10,11 +10,15 @@ use arrow_schema::{ArrowError, DataType};
 pub(crate) type CmpKernel =
     fn(&dyn Datum, &dyn Datum) -> std::result::Result<BooleanArray, ArrowError>;
 
-/// Run a comparison kernel, coercing both operands to Int64 when their data
-/// types differ. The declared logical type (e.g. DATE) and the physical parquet
-/// array (e.g. UInt16 day counts) can diverge, and arrow's kernels require
-/// matching types; Int64 is a safe common type for every integer/date/timestamp
-/// column we compare.
+/// Run a comparison kernel, coercing both operands to a common type when their
+/// data types differ. The declared logical type (e.g. DATE) and the physical
+/// parquet array (e.g. UInt16 day counts) can diverge, and arrow's kernels
+/// require matching types.
+///
+/// The common type must *preserve values*: unconditionally casting to Int64
+/// would truncate a fractional operand (`a >= 1.5` would compare against `1`),
+/// so we promote to Float64 whenever either side is non-integer and only fall
+/// back to Int64 for genuinely integer operands.
 pub(crate) fn compare_coerced(
     left: &dyn Datum,
     right: &dyn Datum,
@@ -25,8 +29,13 @@ pub(crate) fn compare_coerced(
     if la.data_type() == ra.data_type() {
         kernel(left, right).unwrap()
     } else {
-        let lc = arrow::compute::cast(la, &DataType::Int64).unwrap();
-        let rc = arrow::compute::cast(ra, &DataType::Int64).unwrap();
+        let common = if la.data_type().is_integer() && ra.data_type().is_integer() {
+            DataType::Int64
+        } else {
+            DataType::Float64
+        };
+        let lc = arrow::compute::cast(la, &common).unwrap();
+        let rc = arrow::compute::cast(ra, &common).unwrap();
         let ld: Box<dyn Datum> = if l_scalar {
             Box::new(Scalar::new(lc))
         } else {
