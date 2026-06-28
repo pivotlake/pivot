@@ -5,25 +5,21 @@ use crate::catalog::QueryContext;
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
 use crate::types::Type;
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use std::sync::Arc;
 
 impl Aggregate {
-    /// A bare `COUNT(*)` keeps the dedicated row-counter; anything else
-    /// (SUM/COUNT/MIN/MAX, possibly several) compiles to the multi-aggregate
-    /// operator, one output column per expression. `AVG` never appears here:
-    /// DuckDB lowers it to a `sum`+`count` pair with a downstream divide, so
-    /// only count/sum/min/max slots reach this point.
+    /// Every global aggregate (`COUNT(*)`/SUM/COUNT/MIN/MAX, possibly several,
+    /// including a bare `COUNT(*)`) compiles to the multi-aggregate operator,
+    /// one output column per expression. `AVG` never appears here: DuckDB lowers
+    /// it to a `sum`+`count` pair with a downstream divide, so only
+    /// count/sum/min/max slots reach this point.
     pub(super) fn compile_global(
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        if self.is_lone_count_star() {
-            return Ok(input.count());
-        }
-
         let slots = aggregation_slots(&self.expressions)?;
         // Pick the accumulator width by column type (see `sum_reads_wide_column`).
         Ok(if sum_reads_wide_column(&self.expressions) {
@@ -67,15 +63,15 @@ impl Aggregate {
         }
 
         // A lone unfiltered COUNT(*) is the sum of every row group's row count.
-        // Emit the same UInt64 "count" column the dedicated count operator does.
+        // Emit the same Int64 "count" column the scan-based aggregate path does.
         if self.is_lone_count_star() {
             let Some(count) = scan.table.row_count(ctx) else {
                 return Ok(None);
             };
-            let array = UInt64Array::from(vec![count as u64]);
+            let array = Int64Array::from(vec![count]);
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "count",
-                DataType::UInt64,
+                DataType::Int64,
                 false,
             )]));
             let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])

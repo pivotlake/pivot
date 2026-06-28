@@ -21,7 +21,7 @@
 //!             contains.run(col)
 //!         }
 //!     })
-//!     .count()
+//!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
 //!     .collect();
 //! ```
 //!
@@ -57,7 +57,7 @@ use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::{
-    AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CountFactory, Distinct,
+    AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
     DynamicFilterSlot, FilterFactory, GroupFactory, GroupLimit, KeyExtractor, LimitFactory,
     MapFactory, NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory,
     UnaryFactory, UnaryOperator, UnaryOperatorFactory,
@@ -199,7 +199,7 @@ impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
 ///             contains.run(col)
 ///         }
 ///     })
-///     .count()
+///     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
 ///     .collect();
 /// ```
 ///
@@ -384,7 +384,7 @@ impl RecordBatchOperatorSpec {
     ///
     /// Lifts out of `RecordBatchOperatorSpec` into the generic
     /// [`OperatorSpec<T, _>`]. To chain back into RB-only methods like
-    /// `.count()` / `.order_by_limit()`, call
+    /// `.aggregate()` / `.order_by_limit()`, call
     /// [`record_batches`](OperatorSpec::record_batches) on the result when
     /// `T = RecordBatch`.
     ///
@@ -434,7 +434,7 @@ impl RecordBatchOperatorSpec {
 
     /// Sugar for [`map`](Self::map) when the output is `RecordBatch`: applies
     /// the transform and stays in `RecordBatchOperatorSpec` so you can keep
-    /// chaining RB-only methods like `.count()` / `.order_by_limit()`.
+    /// chaining RB-only methods like `.aggregate()` / `.order_by_limit()`.
     ///
     /// Equivalent to `self.map(builder).record_batches()`.
     pub fn project<F, FB>(self, builder: FB) -> Self
@@ -443,30 +443,6 @@ impl RecordBatchOperatorSpec {
         FB: Fn() -> F,
     {
         self.map(builder).record_batches()
-    }
-
-    /// Count the total number of rows across all batches.
-    ///
-    /// Each worker maintains a local count, then the workers coordinate to produce
-    /// a single output batch with the total.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// # use std::sync::Arc;
-    /// # use dispatch::*;
-    /// # use dispatch::table_input;
-    /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
-    /// # let dispatch = Dispatch::spin_up(1, 32, None);
-    /// # let dispatcher = dispatch.dispatcher();
-    /// let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
-    ///     .count()
-    ///     .collect();
-    /// // results contains a single RecordBatch with one row: the count
-    /// ```
-    pub fn count(self) -> Self {
-        let worker_count = self.worker_count();
-        self.unary(CountFactory::create_for_workers(worker_count))
     }
 
     /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT` slots over

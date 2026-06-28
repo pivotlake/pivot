@@ -37,7 +37,6 @@
 //!
 //! - [`FilterFactory`] — Keeps rows matching a boolean mask.
 //! - [`MapFactory`] — Transforms each batch (column selection, computation).
-//! - [`CountFactory`] — Counts rows, coordinating across workers for the total.
 //! - [`OrderByLimitFactory`] — Top-N sort across workers.
 //! - [`GroupFactory`] — Hash-based group-by with aggregation.
 
@@ -70,9 +69,6 @@ use crate::worker::worker_waker;
 
 mod pipeline_breaker;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
-
-mod count;
-pub use count::CountFactory;
 
 mod aggregate;
 pub use aggregate::AggregateFactory;
