@@ -20,7 +20,7 @@
 //!             contains.run(col)
 //!         }
 //!     })
-//!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+//!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64)])
 //!     .collect();
 //! ```
 //!

@@ -2,11 +2,13 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DatePartKind, DateTrunc, Divide, Error, Length, RegexpReplace,
+    Arithmetic, Contains, DatePart, DatePartKind, DateTrunc, Divide, Error, IntervalArithmetic,
+    Length, RegexpReplace, TemporalConvert,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::Type;
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Int64Array, RecordBatch, TimestampSecondArray};
+use duckdb_planner::LogicalTypeId;
 use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
@@ -34,6 +36,17 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Int64,
             volatile: true,
         }),
+        // `now()`: current wall-clock time. VOLATILE so DuckDB can't fold the
+        // call into its own `TIMESTAMP WITH TIME ZONE` constant; pivot evaluates
+        // it instead, returning a `TIMESTAMP` (epoch seconds) like the rest of
+        // its time path. (The bare `CURRENT_TIMESTAMP` keyword is a separate
+        // DuckDB value-function that yields a TZ type pivot doesn't model, so
+        // only the `now()` call form is intercepted here.)
+        "now" => Some(ScalarFunctionSignature {
+            arguments: vec![],
+            return_type: Type::Timestamp,
+            volatile: true,
+        }),
         _ => None,
     }
 }
@@ -48,12 +61,21 @@ pub enum Function {
     Divide(Divide),
     DateTrunc(DateTrunc),
     DatePart(DatePart),
+    /// `date`/`timestamp` ± `INTERVAL` (e.g. `now() - interval '5 days'`).
+    IntervalArithmetic(IntervalArithmetic),
+    /// `make_date(days)` / `make_timestamp(seconds)` — read an integer column as a
+    /// real `DATE` / `TIMESTAMP`.
+    TemporalConvert(TemporalConvert),
     /// `drop_cache()` — evict pivot's file cache, returning the regions dropped.
     /// A side-effecting admin function; evaluated once over the [`DummyScan`]
     /// row of a `FROM`-less `SELECT`. See its compile impl.
     ///
     /// [`DummyScan`]: crate::operator::DummyScan
     DropCache,
+    /// `now()` yields the wall-clock time captured once when the query
+    /// compiles, so every row of the statement sees the same instant. Result is
+    /// a `TIMESTAMP` (epoch seconds).
+    Now,
 }
 
 impl TryFrom<duckdb_expression::Function> for Function {
@@ -61,11 +83,26 @@ impl TryFrom<duckdb_expression::Function> for Function {
     fn try_from(f: duckdb_expression::Function) -> Result<Self, Self::Error> {
         match f.function.as_str() {
             "contains" => Ok(Function::Contains(f.try_into()?)),
-            "+" | "-" | "*" => Ok(Function::Arithmetic(f.try_into()?)),
+            // `date`/`timestamp` ± `INTERVAL` carries an INTERVAL constant
+            // operand; plain numeric `+`/`-` does not and stays `Arithmetic`.
+            "+" | "-" => match f.params.iter().position(|p| {
+                matches!(p, duckdb_expression::Expression::Constant(c)
+                    if c.logical_type.clone() as u8 == LogicalTypeId::INTERVAL as u8)
+            }) {
+                Some(idx) => Ok(Function::IntervalArithmetic(IntervalArithmetic::try_build(
+                    f, idx,
+                )?)),
+                None => Ok(Function::Arithmetic(f.try_into()?)),
+            },
+            "*" => Ok(Function::Arithmetic(f.try_into()?)),
             "length" | "strlen" | "len" => Ok(Function::Length(f.try_into()?)),
             "regexp_replace" => Ok(Function::RegexpReplace(f.try_into()?)),
             "/" => Ok(Function::Divide(f.try_into()?)),
             "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),
+            "make_date" => Ok(Function::TemporalConvert(TemporalConvert::make_date(f)?)),
+            "make_timestamp" => Ok(Function::TemporalConvert(TemporalConvert::make_timestamp(
+                f,
+            )?)),
             "drop_cache" => {
                 if !f.params.is_empty() {
                     return Err(Error::InvalidParameterCount {
@@ -75,6 +112,16 @@ impl TryFrom<duckdb_expression::Function> for Function {
                     });
                 }
                 Ok(Function::DropCache)
+            }
+            "now" => {
+                if !f.params.is_empty() {
+                    return Err(Error::InvalidParameterCount {
+                        function: f.function,
+                        expected: 0,
+                        actual: f.params.len(),
+                    });
+                }
+                Ok(Function::Now)
             }
             // `extract(<part> FROM ts)` lowers to a function named after the
             // part (`minute`, `year`, `dayofweek`, …).
@@ -96,7 +143,10 @@ impl Display for Function {
             Function::Divide(d) => write!(f, "{d}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
             Function::DatePart(d) => write!(f, "{d}"),
+            Function::IntervalArithmetic(i) => write!(f, "{i}"),
+            Function::TemporalConvert(c) => write!(f, "{c}"),
             Function::DropCache => write!(f, "drop_cache()"),
+            Function::Now => write!(f, "now()"),
         }
     }
 }
@@ -111,6 +161,8 @@ impl Function {
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
             Function::DatePart(d) => d.compile(),
+            Function::IntervalArithmetic(i) => i.compile(),
+            Function::TemporalConvert(c) => c.compile(),
             // `drop_cache()` evicts pivot's in-memory file cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single
@@ -123,6 +175,23 @@ impl Function {
                 let evicted = (extents + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
+            // Capture the instant once, here at compile time, so every worker and
+            // every row of the statement observes the same `now()`. Emitted as a
+            // real `Timestamp` (epoch seconds, pivot's timestamp representation).
+            // Negative (pre-epoch) clocks are clamped to 0, which can't happen on a
+            // sane host.
+            Function::Now => {
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .unwrap_or(0);
+                Ok(stateless_expr(move |batch: &RecordBatch| {
+                    ExprResult::Array(Arc::new(TimestampSecondArray::from(vec![
+                        now_secs;
+                        batch.num_rows()
+                    ])))
+                }))
+            }
         }
     }
 }
@@ -130,6 +199,9 @@ impl Function {
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::TimestampSecondType;
+    use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
 
     #[rstest]
@@ -140,5 +212,31 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(only_column(&rows[0]).as_i64().unwrap() >= 0);
+    }
+
+    #[rstest]
+    fn now_returns_current_time_as_a_timestamp(mut testing_planner: TestingPlanner) {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let batches = run_batches(&mut testing_planner, "SELECT now()");
+
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let col = batches[0].column(0);
+        // `now()` surfaces as a real TIMESTAMP carrying the captured epoch second.
+        assert_eq!(
+            col.data_type(),
+            &DataType::Timestamp(TimeUnit::Second, None)
+        );
+        let now = col.as_primitive::<TimestampSecondType>().value(0);
+        assert!(
+            (before..=after).contains(&now),
+            "{now} not in [{before}, {after}]"
+        );
     }
 }

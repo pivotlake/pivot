@@ -420,7 +420,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         |s| {
             s.group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
                 vec![0],
-                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
                 None,
                 (),
             )
@@ -446,7 +450,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             s.filter(|| move |b: &RecordBatch| i16_nonzero_mask(b, 0))
                 .group_by_aggregate::<IntKeyExtractor<Int16Type>, Compiled<(CountSlot,)>>(
                     vec![0],
-                    vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                    vec![AggregationSlot::new(
+                        AggregationKind::CountStar,
+                        0,
+                        DataType::Int64,
+                    )],
                     None,
                     (),
                 )
@@ -475,7 +483,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         |s| {
             s.group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
                 vec![0],
-                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
                 None,
                 (),
             )
@@ -507,7 +519,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         |s| {
             s.group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
                 vec![0],
-                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
                 None,
                 (),
             )
@@ -535,7 +551,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
                 .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
                     vec![0],
-                    vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                    vec![AggregationSlot::new(
+                        AggregationKind::CountStar,
+                        0,
+                        DataType::Int64,
+                    )],
                     None,
                     (),
                 )
@@ -578,7 +598,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             })
             .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
                 vec![1],
-                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
                 None,
                 (),
             )
@@ -594,10 +618,10 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         // [COUNT(*), SUM(v0), SUM(v1), COUNT(v1)] — matches the compiled
         // `(CountSlot, SumSlot<i16>, SumSlot<i16>, CountSlot)` value extractor.
         let slots = vec![
-            AggregationSlot::new(AggregationKind::CountStar, 0),
-            AggregationSlot::new(AggregationKind::Sum, 2),
-            AggregationSlot::new(AggregationKind::Sum, 3),
-            AggregationSlot::new(AggregationKind::Count, 3),
+            AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64),
+            AggregationSlot::new(AggregationKind::Sum, 2, DataType::Decimal128(38, 0)),
+            AggregationSlot::new(AggregationKind::Sum, 3, DataType::Decimal128(38, 0)),
+            AggregationSlot::new(AggregationKind::Count, 3, DataType::Int64),
         ];
         type Value = Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>, CountSlot)>;
         bench(
@@ -646,10 +670,10 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
     //     kind dispatch.
     {
         let slots = vec![
-            AggregationSlot::new(AggregationKind::CountStar, 0),
-            AggregationSlot::new(AggregationKind::Sum, 2),
-            AggregationSlot::new(AggregationKind::Sum, 3),
-            AggregationSlot::new(AggregationKind::Count, 3),
+            AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64),
+            AggregationSlot::new(AggregationKind::Sum, 2, DataType::Decimal128(38, 0)),
+            AggregationSlot::new(AggregationKind::Sum, 3, DataType::Decimal128(38, 0)),
+            AggregationSlot::new(AggregationKind::Count, 3, DataType::Int64),
         ];
         bench(
             c,
@@ -736,7 +760,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             )
             .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,)>>(
                 vec![0],
-                vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
                 None,
                 (),
             )
@@ -755,7 +783,13 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
     //       and merge.
     //     * `_pair` uses the dedicated `IntStrKeyExtractor`: the native int beside
     //       the string's arena handle, no row encode.
-    let count_star = || vec![AggregationSlot::new(AggregationKind::CountStar, 0)];
+    let count_star = || {
+        vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )]
+    };
     bench(
         c,
         d,
@@ -857,7 +891,11 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
                     contains.run(col)
                 }
             })
-            .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+            .aggregate::<i64>(vec![AggregationSlot::new(
+                AggregationKind::CountStar,
+                0,
+                DataType::Int64,
+            )])
         },
     );
 
@@ -878,7 +916,11 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
-                .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+                .aggregate::<i64>(vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )])
         },
     );
 
@@ -902,7 +944,11 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(move || move |b: &RecordBatch| i64_eq_mask(b, 0, target))
-                    .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+                    .aggregate::<i64>(vec![AggregationSlot::new(
+                        AggregationKind::CountStar,
+                        0,
+                        DataType::Int64,
+                    )])
             },
         );
     }
@@ -1045,10 +1091,10 @@ fn bench_aggregate(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             let slots = vec![
-                AggregationSlot::new(AggregationKind::Sum, 0),
-                AggregationSlot::new(AggregationKind::CountStar, 0),
-                AggregationSlot::new(AggregationKind::Sum, 1),
-                AggregationSlot::new(AggregationKind::Count, 1),
+                AggregationSlot::new(AggregationKind::Sum, 0, DataType::Decimal128(38, 0)),
+                AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64),
+                AggregationSlot::new(AggregationKind::Sum, 1, DataType::Decimal128(38, 0)),
+                AggregationSlot::new(AggregationKind::Count, 1, DataType::Int64),
             ];
             s.aggregate::<i64>(slots)
         },

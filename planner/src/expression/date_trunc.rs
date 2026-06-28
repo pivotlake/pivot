@@ -4,7 +4,7 @@ use super::{Error, Expression, Function, constant_string};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, TimestampSecondArray};
 use arrow_schema::DataType;
 use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
@@ -72,7 +72,9 @@ impl DateTrunc {
                 let (arr, _) = src.as_datum().get();
                 let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
                 let vals = i64arr.as_primitive::<Int64Type>();
-                let truncated: Int64Array = vals
+                // Floor to `secs` and emit a real TIMESTAMP (epoch seconds), the
+                // type date_trunc returns, rather than a bare int.
+                let truncated: TimestampSecondArray = vals
                     .iter()
                     .map(|v| v.map(|x| x.div_euclid(secs) * secs))
                     .collect();
@@ -86,7 +88,10 @@ impl DateTrunc {
 mod tests {
     use crate::test_support::*;
     use crate::types::Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::TimestampSecondType;
     use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
     use std::sync::Arc;
 
@@ -101,18 +106,19 @@ mod tests {
             )],
         );
 
-        let mut rows = run(
+        let batches = run_batches(
             &mut testing_planner,
             "SELECT date_trunc('minute', EventTime) FROM events",
         );
 
-        rows.sort_by_key(|r| only_column(r).as_i64().unwrap());
-
+        // date_trunc yields a real TIMESTAMP (epoch seconds floored to the minute).
+        let col = batches[0].column(0);
         assert_eq!(
-            rows.iter()
-                .map(|r| only_column(r).as_i64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 60, 120, 3660]
+            col.data_type(),
+            &DataType::Timestamp(TimeUnit::Second, None)
         );
+        let mut secs: Vec<i64> = col.as_primitive::<TimestampSecondType>().values().to_vec();
+        secs.sort();
+        assert_eq!(secs, vec![0, 60, 120, 3660]);
     }
 }

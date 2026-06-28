@@ -24,7 +24,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::values::AggregationValue;
+use crate::operations::unary::group::values::{AggregationValue, cast_value_column};
 
 use super::{GroupLimit, Result};
 
@@ -176,6 +176,9 @@ pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue> {
     output_buffers: Arc<[Buffer]>,
     key_config: K::Config,
     shared_context: V::SharedContext,
+    /// Declared output type per value column, in slot order; each finished value
+    /// column is cast to its type (see [`emit`](Self::emit)).
+    value_output_types: Arc<[DataType]>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
@@ -186,6 +189,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         output_buffers: Arc<[Buffer]>,
         key_config: K::Config,
         shared_context: V::SharedContext,
+        value_output_types: Arc<[DataType]>,
     ) -> Self {
         // A pushed LIMIT caps the rows this worker ever emits, so its builders never
         // need a full chunk; an unlimited group-by streams full chunks.
@@ -202,6 +206,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
             output_buffers,
             key_config,
             shared_context,
+            value_output_types,
         }
     }
 
@@ -318,8 +323,17 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         let (mut fields, mut columns) =
             keys.finish(&self.key_arena, &self.output_buffers, allocator);
         let (value_fields, value_columns) = V::finish_columns(values, &self.shared_context);
-        fields.extend(value_fields);
-        columns.extend(value_columns);
+        // The accumulator renders each value at its storage width; cast it to the
+        // slot's declared output type (zero-cost when they already match).
+        for ((field, column), output_type) in value_fields
+            .into_iter()
+            .zip(value_columns)
+            .zip(self.value_output_types.iter())
+        {
+            let (field, column) = cast_value_column(field, column, output_type);
+            fields.push(field);
+            columns.push(column);
+        }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
         sender.send(batch)?;
         Ok(())

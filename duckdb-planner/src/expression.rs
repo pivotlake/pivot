@@ -108,6 +108,16 @@ pub struct Not {
     pub input: Box<Expression>,
 }
 
+/// A type cast (`BoundCastExpression`): `CAST(child AS target_type)`. DuckDB
+/// inserts these to coerce operands to a common type; pivot honors them with an
+/// Arrow cast (an aggregate's input strips its top cast instead, since the
+/// reducers fold the raw column).
+#[derive(Debug)]
+pub struct Cast {
+    pub child: Box<Expression>,
+    pub target_type: LogicalTypeId,
+}
+
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
 #[derive(Debug)]
 pub enum Expression {
@@ -121,6 +131,7 @@ pub enum Expression {
     Conjunction(Conjunction),
     Case(Case),
     Not(Not),
+    Cast(Cast),
 }
 
 /// A constant comparison against a single column (e.g. `col <> 42`).
@@ -263,6 +274,7 @@ impl fmt::Display for Expression {
                 write!(f, " ELSE {} END", case.else_expr)
             }
             Expression::Not(n) => write!(f, "NOT({})", n.input),
+            Expression::Cast(c) => write!(f, "CAST({} AS {})", c.child, type_name(&c.target_type)),
         }
     }
 }

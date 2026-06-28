@@ -36,6 +36,37 @@
 //! - [`columns`] — the decode side: [`RowKeyColumns`] rebuilds typed output
 //!   columns from the persisted blobs.
 
+/// The fixed-width integer types a row key can hold, listed **once**. Both the
+/// encode side ([`reader`]) and the decode side ([`columns`]) build a parallel
+/// enum + per-type match arms over exactly this set, so spelling it out in each
+/// place is how they would silently drift (one supporting a width the other
+/// panics on).
+///
+/// This is a *callback* macro: `int_key_types!(some_macro)` expands to
+/// `some_macro! { (I8, Int8, Int8Type, i8), … }`, handing the list to a macro in
+/// the consuming module that stamps out that module's enum and match arms. Each
+/// row is `(enum variant, arrow DataType, arrow primitive type, native int)`.
+/// The `Utf8View` string case is deliberately *not* here: it is genuinely
+/// special on both sides (length-prefixing, zero-copy arena views), so each
+/// module spells that one arm out explicitly.
+///
+/// Defined before the `mod` declarations below so both child modules see it by
+/// bare name (macro_rules textual scope); it is not used anywhere else.
+macro_rules! int_key_types {
+    ($callback:ident) => {
+        $callback! {
+            (I8,  Int8,   Int8Type,   i8),
+            (I16, Int16,  Int16Type,  i16),
+            (I32, Int32,  Int32Type,  i32),
+            (I64, Int64,  Int64Type,  i64),
+            (U8,  UInt8,  UInt8Type,  u8),
+            (U16, UInt16, UInt16Type, u16),
+            (U32, UInt32, UInt32Type, u32),
+            (U64, UInt64, UInt64Type, u64),
+        }
+    };
+}
+
 mod columns;
 mod live_key;
 mod reader;

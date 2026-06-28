@@ -4,12 +4,15 @@
 //! operator (see [`crate::compile`]).
 
 use super::{Error, Expression, Ref};
+use crate::types::Type;
 use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 
 #[derive(Debug, Clone)]
 pub struct CountStar {
     pub params: Vec<Expression>,
+    /// DuckDB's declared result type for the call (`BIGINT`).
+    pub return_type: Type,
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for CountStar {
@@ -18,21 +21,26 @@ impl TryFrom<duckdb_expression::AggregateFunc> for CountStar {
         if a.aggregate_function != "count_star" {
             return Err(Error::UnsupportedAggregateFunction(a.aggregate_function));
         }
+        let return_type = crate::types::type_from_logical(a.return_type)?;
         Ok(CountStar {
             params: a
                 .params
                 .into_iter()
                 .map(Expression::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
+            return_type,
         })
     }
 }
 
 /// A single-column numeric aggregate (`SUM(col)` / `AVG(col)`). Carries the
-/// bound column reference being aggregated.
+/// bound column reference being aggregated and DuckDB's declared result type for
+/// the call (e.g. `HUGEINT` for an integer `SUM`, `BIGINT` for `COUNT`, the input
+/// type for `MIN`/`MAX`).
 #[derive(Debug, Clone)]
 pub struct NumericAggregate {
     pub column: Ref,
+    pub return_type: Type,
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for NumericAggregate {
@@ -45,6 +53,7 @@ impl TryFrom<duckdb_expression::AggregateFunc> for NumericAggregate {
                 actual: a.params.len(),
             });
         }
+        let return_type = crate::types::type_from_logical(a.return_type)?;
         let column = match Expression::try_from(a.params.into_iter().next().unwrap())? {
             Expression::Ref(r) => r,
             other => {
@@ -53,7 +62,10 @@ impl TryFrom<duckdb_expression::AggregateFunc> for NumericAggregate {
                 )));
             }
         };
-        Ok(NumericAggregate { column })
+        Ok(NumericAggregate {
+            column,
+            return_type,
+        })
     }
 }
 
@@ -73,6 +85,21 @@ pub enum AggregateFunc {
     /// Lowered in compilation to a two-level GROUP BY (dedup on the group keys
     /// plus `col`, then count rows per group); see [`crate::compile`].
     CountDistinct(NumericAggregate),
+}
+
+impl AggregateFunc {
+    /// DuckDB's declared result type for the call.
+    pub fn return_type(&self) -> &Type {
+        match self {
+            AggregateFunc::CountStar(c) => &c.return_type,
+            AggregateFunc::Sum(a)
+            | AggregateFunc::Avg(a)
+            | AggregateFunc::Min(a)
+            | AggregateFunc::Max(a)
+            | AggregateFunc::Count(a)
+            | AggregateFunc::CountDistinct(a) => &a.return_type,
+        }
+    }
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {

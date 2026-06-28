@@ -157,7 +157,14 @@ pub(super) fn build_group_by_operator(
 
     let slots: Vec<AggregationSlot> = aggregation_slots(&unique_exprs)?
         .into_iter()
-        .map(|s| AggregationSlot::new(s.kind, s.column + key_shift))
+        .map(|s| {
+            // Shift the column index past the leading key columns; keep the kind and
+            // declared output type the slot was built with.
+            AggregationSlot {
+                column: s.column + key_shift,
+                ..s
+            }
+        })
         .collect();
     let sig = signatures(&unique_exprs);
 
@@ -570,4 +577,104 @@ pub(super) fn derive_outer_keys(groups: &[(usize, Type)]) -> Vec<(usize, Type)> 
         .enumerate()
         .map(|(col, (_, ty))| (col, ty.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use crate::types::Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Date32Type;
+    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_schema::DataType;
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    #[rstest]
+    fn group_by_date_emits_dates(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "d",
+                Type::Date,
+                Arc::new(Int32Array::from(vec![0, 7, 0])) as ArrayRef,
+            )],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT d, count(*) FROM events GROUP BY d",
+        );
+
+        // The group-by computes on the int key but the emitted key column must be
+        // restored to a real Date32 so it renders as a date.
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Date32);
+    }
+
+    #[rstest]
+    fn grouped_min_of_date_returns_a_date(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "d",
+                    Type::Date,
+                    Arc::new(Int32Array::from(vec![10, 3, 7])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, MIN(d) FROM events GROUP BY g",
+        );
+
+        // Key g stays Int32; the MIN(d) value column is restored to Date32.
+        assert_eq!(batches[0].schema().field(1).data_type(), &DataType::Date32);
+    }
+
+    #[rstest]
+    fn global_max_of_date_from_scan_is_a_date(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "d",
+                Type::Date,
+                Arc::new(Int32Array::from(vec![10, 3, 7])) as ArrayRef,
+            )],
+        );
+
+        // The COUNT alongside MAX keeps this off the stats peephole, so it runs
+        // the scan-based global aggregate.
+        let batches = run_batches(&mut testing_planner, "SELECT MAX(d), COUNT(d) FROM events");
+
+        let col = batches[0].column(0);
+        assert_eq!(col.data_type(), &DataType::Date32);
+        assert_eq!(col.as_primitive::<Date32Type>().value(0), 10);
+    }
+
+    #[rstest]
+    fn global_max_of_date_from_stats_is_a_date(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "d",
+                Type::Date,
+                Arc::new(Int32Array::from(vec![10, 3, 7])) as ArrayRef,
+            )],
+        );
+
+        // A lone unfiltered MAX over a bare scan is answered from column_min_max
+        // (no scan); it must still surface the temporal type, not a bare int.
+        let batches = run_batches(&mut testing_planner, "SELECT MAX(d) FROM events");
+
+        let col = batches[0].column(0);
+        assert_eq!(col.data_type(), &DataType::Date32);
+        assert_eq!(col.as_primitive::<Date32Type>().value(0), 10);
+    }
 }

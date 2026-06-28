@@ -6,6 +6,7 @@ mod common;
 
 use arrow_array::{Array, BooleanArray, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
+use arrow_schema::DataType;
 
 use common::*;
 use dispatch::{
@@ -66,7 +67,11 @@ fn filter_then_count() {
                 )
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 
@@ -107,7 +112,11 @@ fn filter_then_group_by_then_order_by() {
         })
         .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
             vec![0],
-            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            vec![AggregationSlot::new(
+                AggregationKind::CountStar,
+                0,
+                DataType::Int64,
+            )],
             None,
             (),
         )

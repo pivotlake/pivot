@@ -10,74 +10,63 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_schema::DataType;
 
-/// Encodes one key column into the row blob: a downcast primitive array per
-/// integer type, or a string array, bound once per batch. [`encode`] appends a
-/// cell's canonical bytes.
+/// Generates [`ColumnEncoder`] (the encode-side per-column binder) and its
+/// methods from the shared `int_key_types!` list, so its integer arms stay in
+/// lockstep with the decode side. The `Str` arm is spelled out because it is
+/// genuinely different (a `u32` length prefix, not a fixed-width value).
 ///
 /// Per-type (rather than a single width-parameterised path) so each integer
 /// encodes a *const*-width little-endian copy via `to_le_bytes`, which the
 /// compiler lowers to a fixed-size `memcpy` from an unchecked load. On the
 /// per-row hot path that's measurably tighter than a runtime-width slice copy.
-///
-/// [`encode`]: ColumnEncoder::encode
-enum ColumnEncoder<'b> {
-    I8(&'b PrimitiveArray<Int8Type>),
-    I16(&'b PrimitiveArray<Int16Type>),
-    I32(&'b PrimitiveArray<Int32Type>),
-    I64(&'b PrimitiveArray<Int64Type>),
-    U8(&'b PrimitiveArray<UInt8Type>),
-    U16(&'b PrimitiveArray<UInt16Type>),
-    U32(&'b PrimitiveArray<UInt32Type>),
-    U64(&'b PrimitiveArray<UInt64Type>),
-    Str(&'b StringViewArray),
-}
-
-impl<'b> ColumnEncoder<'b> {
-    fn new(array: &'b ArrayRef) -> Self {
-        match array.data_type() {
-            DataType::Int8 => ColumnEncoder::I8(array.as_primitive()),
-            DataType::Int16 => ColumnEncoder::I16(array.as_primitive()),
-            DataType::Int32 => ColumnEncoder::I32(array.as_primitive()),
-            DataType::Int64 => ColumnEncoder::I64(array.as_primitive()),
-            DataType::UInt8 => ColumnEncoder::U8(array.as_primitive()),
-            DataType::UInt16 => ColumnEncoder::U16(array.as_primitive()),
-            DataType::UInt32 => ColumnEncoder::U32(array.as_primitive()),
-            DataType::UInt64 => ColumnEncoder::U64(array.as_primitive()),
-            DataType::Utf8View => ColumnEncoder::Str(array.as_string_view()),
-            dt => panic!("row key column type not supported: {dt}"),
+macro_rules! define_column_encoder {
+    ( $( ($variant:ident, $dt:ident, $arrow:ty, $native:ty) ),+ $(,)? ) => {
+        /// Encodes one key column into the row blob: a downcast primitive array per
+        /// integer type, or a string array, bound once per batch. [`encode`] appends a
+        /// cell's canonical bytes.
+        ///
+        /// [`encode`]: ColumnEncoder::encode
+        enum ColumnEncoder<'b> {
+            $( $variant(&'b PrimitiveArray<$arrow>), )+
+            Str(&'b StringViewArray),
         }
-    }
 
-    /// Append row `idx`'s encoded bytes to `out`. Safety: `idx` is always within
-    /// the batch row count, so the unchecked reads are sound.
-    #[inline(always)]
-    fn encode(&self, idx: usize, out: &mut Vec<u8>) {
-        // Every integer arm is the same: append the value's little-endian bytes
-        // (a const-width copy — see the type doc).
-        macro_rules! le {
-            ($a:expr) => {
-                out.extend_from_slice(&$a.value_unchecked(idx).to_le_bytes())
-            };
-        }
-        unsafe {
-            match self {
-                ColumnEncoder::I8(a) => le!(a),
-                ColumnEncoder::I16(a) => le!(a),
-                ColumnEncoder::I32(a) => le!(a),
-                ColumnEncoder::I64(a) => le!(a),
-                ColumnEncoder::U8(a) => le!(a),
-                ColumnEncoder::U16(a) => le!(a),
-                ColumnEncoder::U32(a) => le!(a),
-                ColumnEncoder::U64(a) => le!(a),
-                ColumnEncoder::Str(a) => {
-                    let s = a.value_unchecked(idx).as_bytes();
-                    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                    out.extend_from_slice(s);
+        impl<'b> ColumnEncoder<'b> {
+            fn new(array: &'b ArrayRef) -> Self {
+                match array.data_type() {
+                    $( DataType::$dt => ColumnEncoder::$variant(array.as_primitive()), )+
+                    DataType::Utf8View => ColumnEncoder::Str(array.as_string_view()),
+                    dt => panic!("row key column type not supported: {dt}"),
+                }
+            }
+
+            /// Append row `idx`'s encoded bytes to `out`. Safety: `idx` is always within
+            /// the batch row count, so the unchecked reads are sound.
+            #[inline(always)]
+            fn encode(&self, idx: usize, out: &mut Vec<u8>) {
+                // Every integer arm is the same: append the value's little-endian bytes
+                // (a const-width copy, see the type doc).
+                macro_rules! le {
+                    ($a:expr) => {
+                        out.extend_from_slice(&$a.value_unchecked(idx).to_le_bytes())
+                    };
+                }
+                unsafe {
+                    match self {
+                        $( ColumnEncoder::$variant(a) => le!(a), )+
+                        ColumnEncoder::Str(a) => {
+                            let s = a.value_unchecked(idx).as_bytes();
+                            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                            out.extend_from_slice(s);
+                        }
+                    }
                 }
             }
         }
-    }
+    };
 }
+
+int_key_types!(define_column_encoder);
 
 /// Per-worker reusable encode buffers. Cleared and refilled by
 /// [`RowReader::encode_and_hash`] each batch; the capacity persists across
