@@ -456,7 +456,7 @@ impl CatalogTable {
     }
 
     /// The table's columns (schema), as the planner's [`Column`]s.
-    pub(super) fn columns(&self) -> Vec<Column> {
+    pub fn columns(&self) -> Vec<Column> {
         self.manifest.columns.clone()
     }
 }

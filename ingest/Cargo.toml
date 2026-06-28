@@ -11,6 +11,11 @@ thriftparquet = { path = "../thriftparquet" }
 # rows are queryable immediately, and the compacter reads files back / swaps
 # them through it.
 catalog = { path = "../catalog" }
+# The Kafka source derives the Arrow schema it decodes records into from the
+# destination table's declared columns (`CatalogTable::columns` -> planner
+# `Type`). Already a transitive dependency via `catalog`, so this adds no build
+# cost; naming it directly lets the schema mapping live in the `kafka` module.
+planner = { path = "../planner" }
 
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
@@ -47,6 +52,33 @@ serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 tracing = "0.1"
+
+# Kafka ingest source (see `kafka`). rdkafka wraps librdkafka (built from source
+# via cmake) and gives the async `StreamConsumer`, consumer groups, and SASL/SSL.
+rdkafka = { version = "0.37", default-features = false, features = [
+    "tokio",
+    "cmake-build",
+    "libz",
+    "ssl-vendored",
+    "gssapi-vendored",
+] }
+# Decoding Confluent-framed Avro / Protobuf payloads into `serde_json::Value`
+# (the single Arrow-construction path, via arrow-json). `apache-avro` decodes an
+# Avro datum against a registry-fetched writer schema; `prost-reflect` +
+# `protox` compile a registry `.proto` schema and decode a dynamic message.
+apache-avro = "0.17"
+# Dynamic Protobuf decode: compile the registry `.proto` (protox) into a
+# descriptor pool and decode each message reflectively (prost-reflect, serde
+# feature renders it to JSON). prost-reflect re-exports the matching prost /
+# prost-types, so the protobuf island stays self-consistent regardless of the
+# prost 0.14 used for OTLP above.
+prost-reflect = { version = "0.14", features = ["serde"] }
+# `protox-parse` compiles a single self-contained `.proto` (no imports) into a
+# `FileDescriptorProto`; it shares prost-reflect's `prost-types`, so the
+# descriptor set round-trips into a `DescriptorPool` by bytes.
+protox-parse = "0.7"
+# Confluent Schema Registry client: blocking HTTPS, like catalog's object stores.
+ureq = { version = "2", features = ["json", "tls"] }
 
 [dev-dependencies]
 tempfile = "3"

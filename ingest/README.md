@@ -129,8 +129,96 @@ Metrics are flattened one row per data point: gauge/sum data points carry their
 numeric `Value`; histogram data points carry their `sum`/`count`. Exponential
 histograms and summaries are skipped for now.
 
+## Kafka
+
+A second source consumes Kafka topics into a catalog table, modelled on
+ClickHouse's classic **Kafka table engine**: an in-process consumer reads a
+topic, accumulates a block, writes it to the destination table, and commits the
+Kafka offset, reusing the same encode/partition/commit/compact pipeline as the
+OTLP source. The only source-specific concern is the **offset durability
+coupling** (`kafka/consumer.rs`).
+
+```
+StreamConsumer -> decode to JSON value -> buffer block -> encode_and_append
+   (rdkafka)        (json|avro|protobuf)   (rows / time)   (shared write path)
+                                                                | success
+                                                                v
+                                                       commit Kafka offsets
+```
+
+### Delivery semantics (at-least-once)
+
+librdkafka auto-commit is **off**. A partition's offset is committed only after
+its block is durably appended to the catalog. A flush distinguishes its failure:
+a **transient** write error (catalog/store I/O) seeks the block start and
+re-consumes, while a **permanent** one (the destination table was dropped, or a
+failed seek) stops the consumer rather than spin on a block that can never land
+(a restart then resumes from the last committed offset). No rows are dropped, but
+**duplicates are possible** after a transient failure (there is no idempotent
+dedup yet, see future work).
+
+### Configuration
+
+Each `--kafka` flag starts one consumer (repeatable). The value is a
+comma-separated `key=value` spec; for SASL/SSL and other raw librdkafka settings
+use a `--kafka-config` TOML file with a `[properties]` table.
+
+```bash
+pivotdb-server \
+  --kafka 'brokers=localhost:9092,topics=events,group_id=pivot,table=events'
+```
+
+Spec keys: `brokers`, `topics` (`;`-separated), `group_id`, `table`, `format`
+(`json`|`avro`|`protobuf`), `registry` (schema-registry URL, required for
+avro/protobuf), `flush_rows` (default 1,000,000), `flush_secs` (default 5),
+`num_consumers`, `auto_offset_reset` (`earliest`|`latest`), `skip_broken`, `dlq`
+(dead-letter table). See `kafka/config.rs` for the TOML form.
+
+### Schema (the table is the schema)
+
+The destination table's declared columns **are** the decode schema (the
+JSONEachRow model): JSON/Avro/Protobuf values match columns by name, a missing
+field is null, and unknown fields are ignored. Column types are restricted to
+what pivot's writer round-trips: `INTEGER`, `BIGINT`, `DOUBLE`, `VARCHAR`. A
+value that decodes but whose type doesn't fit its column (e.g. a JSON `true` for
+a `BIGINT`) is treated as a poison message (below), not a silent null.
+
+```sql
+CREATE TABLE events (
+    user_id      BIGINT,
+    action       VARCHAR,
+    amount       DOUBLE,
+    _partition   INTEGER,   -- optional Kafka virtual columns, populated when declared
+    _offset      BIGINT,
+    _timestamp   BIGINT,    -- message time in seconds (ClickHouse _timestamp)
+    _timestamp_ms BIGINT,   -- message time in milliseconds
+    _topic       VARCHAR,
+    _key         VARCHAR
+) WITH (path = './kafka/events');
+```
+
+Avro and Protobuf values are Confluent-framed (magic byte + schema id); the
+writer schema is fetched from the schema registry and cached by id, then decoded
+to a JSON object so all three formats share one Arrow-construction path. Protobuf
+fields keep their `snake_case` names (so they match snake_case columns).
+
+### Errors / dead-letter
+
+A poison message (undecodable, or decoded but not fitting the schema) is routed
+to the `dead_letter_table` if configured (`_topic`, `_partition`, `_offset`,
+`_key`, `_raw`, `_error`). Otherwise it counts against `skip_broken_messages`,
+and once that budget is exceeded the consumer **stops** (loudly) rather than
+silently dropping records past it; the default `skip_broken_messages = 0` stops
+on the first poison message.
+
 ## Notes / future work
 
+- Kafka is **at-least-once**; an idempotent dedup token keyed off
+  `(topic, partition, offset)` (à la ClickHouse `insert_deduplication_token`)
+  would make it effectively-once. Avro union rendering and Protobuf schemas with
+  imports are current decode limitations. The consumer could run as a separate
+  process (like the compacter, and like ClickPipes) to scale ingestion apart from
+  queries.
 - `run_on_worker` currently always runs on worker 0, so flushes serialise there.
   Fine for typical ingest volumes; could round-robin if it becomes a bottleneck.
 - Object-store output is write-only (pivot reads only local dirs). Reading

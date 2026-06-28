@@ -39,9 +39,11 @@
 //! where the data lives (the table is the single source of truth).
 
 mod compact;
+mod kafka;
 mod otel;
 mod parquet_writing;
 mod sink;
+mod write;
 
 use std::sync::Arc;
 
@@ -55,8 +57,15 @@ use tracing::{error, info, warn};
 pub use compact::{
     Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
 };
+pub use kafka::{
+    AutoOffsetReset, DEFAULT_FLUSH_ROWS as DEFAULT_KAFKA_FLUSH_ROWS,
+    DEFAULT_FLUSH_SECS as DEFAULT_KAFKA_FLUSH_SECS,
+    DEFAULT_NUM_CONSUMERS as DEFAULT_KAFKA_NUM_CONSUMERS, Format as KafkaFormat, KafkaConfig,
+};
+pub use kafka::ConfigError as KafkaConfigError;
 pub use otel::{ConfigError, DEFAULT_OTLP_ADDR, OtelConfig, Signal};
 
+use crate::kafka::KafkaSource;
 use crate::otel::OtelServer;
 use crate::sink::Flushable;
 
@@ -66,6 +75,8 @@ use crate::sink::Flushable;
 pub enum IngestConfig {
     /// An OTLP-over-gRPC receiver.
     Otel(OtelConfig),
+    /// A Kafka consumer that sinks a topic into a catalog table.
+    Kafka(KafkaConfig),
 }
 
 /// Lifecycle handle for all running ingest sources.
@@ -156,6 +167,15 @@ impl Ingestor {
                             error!(%addr, error = %e, "otel gRPC server stopped with error");
                         }
                     }));
+                }
+                IngestConfig::Kafka(cfg) => {
+                    // Each consumer task self-flushes its final block when the
+                    // shutdown watch flips, so joining the tasks drains them — no
+                    // separate `Flushable` registration (unlike the OTLP sinks).
+                    let source = KafkaSource::build(&cfg, &dispatcher, &catalog)?;
+                    for consumer in source.consumers {
+                        tasks.push(tokio::spawn(consumer.run(shutdown_tx.subscribe())));
+                    }
                 }
             }
         }

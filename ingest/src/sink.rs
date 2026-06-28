@@ -23,12 +23,12 @@
 use std::sync::Arc;
 
 use catalog::ParquetCatalog;
-use catalog::store::ObjectPath;
-use dispatch::{DataFlowDispatcher, DataFlowError};
+use dispatch::DataFlowDispatcher;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::warn;
 
-use crate::parquet_writing::{self, EncodedFile, ToRecordBatch};
+use crate::parquet_writing::ToRecordBatch;
+use crate::write::encode_and_append;
 
 /// Rows per Parquet row group. A flush's items are cut into row groups of about
 /// this many rows as they stream through the write pipeline.
@@ -36,9 +36,6 @@ pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Row groups per Parquet file. Once this many accumulate, a file is emitted and
 /// written; the flush's remainder lands in a final, smaller file.
 pub(crate) const ROW_GROUPS_PER_FILE: usize = 8;
-/// Finished files buffered between the encode pipeline and the writer: small, so
-/// it bounds in-flight files and backpressures the pipeline onto the writer.
-const IN_FLIGHT_FILES: usize = 4;
 
 /// Object-safe view of a sink for the lifecycle paths (flush timer, shutdown
 /// drain), which don't care about the concrete item type. `tonic::async_trait`
@@ -142,101 +139,16 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         }
     }
 
-    /// Run `items` through the write pipeline and write each Parquet file it
-    /// produces.
+    /// Run `items` through the shared write path
+    /// ([`encode_and_append`](crate::write::encode_and_append)) and write each
+    /// Parquet file it produces into the sink's catalog table.
     ///
-    /// The pipeline (see [`parquet_writing`]) flattens items into Arrow batches,
-    /// then partitions, encodes, and assembles them into Parquet files across the
-    /// dispatch worker pool, streaming finished files out as they complete.
-    /// Iterating that stream blocks, so it runs on a blocking thread; each
-    /// finished file is handed to the async runtime, which writes/uploads it (I/O)
-    /// while the pipeline keeps working.
-    /// A failed pipeline run or write is logged and dropped rather than blocking
-    /// — the drop-under-pressure stance OTLP exporters expect.
+    /// A failed flush is logged and dropped rather than blocking — the
+    /// drop-under-pressure stance OTLP exporters expect. (The Kafka source uses
+    /// the same write path but acts on the error, gating its offset commit.)
     async fn write(&self, items: Vec<T>) {
-        // The table carries the partition/sort spec; read it per flush (the table
-        // may have been dropped out from under us).
-        let (partition_by, sort_by) = match self.catalog.table_handle(&self.name) {
-            Some(table) => (table.partition_by().to_vec(), table.sort_by().to_vec()),
-            None => {
-                warn!(sink = %self.name, "table no longer exists; dropping flush");
-                return;
-            }
-        };
-
-        let dispatcher = self.dispatcher.clone();
-        // Each finished file streams out as an `EncodedFile` (bytes + the metadata
-        // to record).
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<EncodedFile>(IN_FLIGHT_FILES);
-
-        // One pipeline, parameterised by the table's spec: it splits by partition,
-        // files per partition, and tags each `EncodedFile` with its tuple +
-        // sort_bounds (both `None` when the spec is empty).
-        let pipeline = tokio::task::spawn_blocking(move || -> Result<(), DataFlowError> {
-            for file in parquet_writing::encode_items(
-                &dispatcher,
-                items,
-                partition_by.into(),
-                sort_by.into(),
-                ROW_GROUP_ROWS,
-                ROW_GROUPS_PER_FILE,
-            ) {
-                if tx.blocking_send(file?).is_err() {
-                    return Ok(());
-                }
-            }
-            Ok(())
-        });
-
-        // Write each file as it streams out, under an opaque uuid name so
-        // concurrent ingestors never collide.
-        while let Some(encoded) = rx.recv().await {
-            let file_name = format!("pivot-{}.parquet", uuid::Uuid::new_v4());
-            self.write_file(file_name, encoded).await;
-        }
-
-        match pipeline.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!(sink = %self.name, error = %e, "parquet write pipeline failed"),
-            Err(e) => error!(sink = %self.name, error = %e, "write pipeline task panicked"),
-        }
-    }
-
-    /// Append one finished file (`file_name`, relative to the table's location)
-    /// to the sink's catalog table: write the bytes into the table's location
-    /// and commit the file, making its rows queryable at once. Runs on a
-    /// blocking thread — the store write and the footer-reading commit dataflow
-    /// both block. Failures are logged, never propagated (the drop-under-pressure
-    /// stance OTLP exporters expect); a `None` means the table was dropped while
-    /// ingest is running.
-    async fn write_file(&self, file_name: String, encoded: EncodedFile) {
-        let catalog = self.catalog.clone();
-        let table = self.name.clone();
-        let path = ObjectPath::new(file_name.clone());
-        let appended = tokio::task::spawn_blocking(move || {
-            catalog.table_handle(&table).map(|mut handle| {
-                handle.append_data_file(
-                    path,
-                    &encoded.bytes,
-                    encoded.partition,
-                    encoded.sort_bounds,
-                )
-            })
-        })
-        .await;
-        match appended {
-            Ok(Some(Ok(()))) => {
-                info!(sink = %self.name, file = file_name, "appended parquet to table")
-            }
-            Ok(Some(Err(e))) => {
-                warn!(sink = %self.name, file = file_name, error = %e, "appending parquet to table failed")
-            }
-            Ok(None) => {
-                warn!(sink = %self.name, file = file_name, "table no longer exists; dropping flushed file")
-            }
-            Err(e) => {
-                error!(sink = %self.name, file = file_name, error = %e, "parquet append task panicked")
-            }
+        if let Err(e) = encode_and_append(&self.catalog, &self.name, &self.dispatcher, items).await {
+            warn!(sink = %self.name, error = %e, "flush failed; dropping");
         }
     }
 }

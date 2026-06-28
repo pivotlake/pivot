@@ -12,7 +12,7 @@ use std::time::Duration;
 use catalog::ParquetCatalog;
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch};
-use ingest::{IngestConfig, OtelConfig, Signal};
+use ingest::{IngestConfig, KafkaConfig, OtelConfig, Signal};
 use server::{Error, Server};
 use tracing::{error, info};
 
@@ -72,6 +72,28 @@ struct Args {
     #[arg(long = "otel-config", value_name = "PATH")]
     otel_config: Vec<OtelFileSpec>,
 
+    /// Start a Kafka ingest consumer. Repeatable — pass `--kafka` once per
+    /// source.
+    ///
+    /// The value is a comma-separated `key=value` spec. Keys: `brokers`,
+    /// `topics` (`;`-separated), `group_id`, `table` (destination catalog table,
+    /// must exist), `format` (`json`|`avro`|`protobuf`), `registry` (schema
+    /// registry URL, required for avro/protobuf), `flush_rows`, `flush_secs`,
+    /// `num_consumers`, `auto_offset_reset` (`earliest`|`latest`),
+    /// `skip_broken`, `dlq` (dead-letter table). Example:
+    ///
+    ///   --kafka 'brokers=localhost:9092,topics=events,group_id=pivot,table=events'
+    ///
+    /// For SASL/SSL and other librdkafka properties, use `--kafka-config`.
+    #[arg(long = "kafka", value_name = "SPEC")]
+    kafka: Vec<KafkaSpec>,
+
+    /// Start a Kafka ingest consumer from a TOML file (supports a `[properties]`
+    /// table of raw librdkafka settings for SASL/SSL). Repeatable. See
+    /// `ingest::kafka::config` for the file format.
+    #[arg(long = "kafka-config", value_name = "PATH")]
+    kafka_config: Vec<KafkaFileSpec>,
+
     /// Run the bundled compacter: any table's Parquet files smaller than this
     /// are merged into one (CPU on the dispatch pool) once they amount to it.
     /// `0` disables it — e.g. when a dedicated compacter process owns the job.
@@ -90,9 +112,42 @@ impl Args {
     /// Translate the ingest flags into the configs the server starts. Returns
     /// an empty vec when no ingest is requested.
     fn ingests(&self) -> Vec<IngestConfig> {
-        let inline = self.otel.iter().map(|spec| spec.0.clone());
-        let from_file = self.otel_config.iter().map(|spec| spec.0.clone());
-        inline.chain(from_file).map(IngestConfig::Otel).collect()
+        let otel_inline = self.otel.iter().map(|spec| spec.0.clone());
+        let otel_file = self.otel_config.iter().map(|spec| spec.0.clone());
+        let otel = otel_inline.chain(otel_file).map(IngestConfig::Otel);
+
+        let kafka_inline = self.kafka.iter().map(|spec| spec.0.clone());
+        let kafka_file = self.kafka_config.iter().map(|spec| spec.0.clone());
+        let kafka = kafka_inline.chain(kafka_file).map(IngestConfig::Kafka);
+
+        otel.chain(kafka).collect()
+    }
+}
+
+/// One `--kafka` consumer, parsed from a `key=value,...` spec string.
+#[derive(Clone, Debug)]
+struct KafkaSpec(KafkaConfig);
+
+impl std::str::FromStr for KafkaSpec {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        KafkaConfig::from_spec(s).map(KafkaSpec).map_err(|e| e.to_string())
+    }
+}
+
+/// One `--kafka-config` consumer, parsed from a TOML file path.
+#[derive(Clone, Debug)]
+struct KafkaFileSpec(KafkaConfig);
+
+impl std::str::FromStr for KafkaFileSpec {
+    type Err = String;
+
+    fn from_str(path: &str) -> Result<Self, Self::Err> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("reading `{path}`: {e}"))?;
+        KafkaConfig::from_toml(&text)
+            .map(KafkaFileSpec)
+            .map_err(|e| format!("`{path}`: {e}"))
     }
 }
 
