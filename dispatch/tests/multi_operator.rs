@@ -66,7 +66,7 @@ fn filter_then_count() {
                 )
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .count()
         .collect()
         .unwrap();
 

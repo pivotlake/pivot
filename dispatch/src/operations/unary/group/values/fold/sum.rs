@@ -4,7 +4,7 @@
 //! width lives in the read, so there is one `Sum` per accumulator width, not per
 //! column type.
 
-use super::{Fold, FoldAcc};
+use super::Fold;
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::values::cell::Numeric;
 use arrow_array::ArrayRef;
@@ -17,27 +17,23 @@ pub struct Sum<A = i64>(PhantomData<A>);
 /// `SUM` accumulating in `i128` — the planner picks this for a 64-bit column.
 pub type WideSum = Sum<i128>;
 
-impl<A: Numeric> FoldAcc for Sum<A> {
+impl<A: Numeric> Fold for Sum<A> {
+    type Val = i64;
     type Acc = A;
-    type SharedContext = ();
-    type WorkerContext = ();
 
     #[inline(always)]
-    fn merge(a: A, b: A, _ctx: &()) -> A {
-        a + b
-    }
-    fn finish(name: &str, col: SlabColumn<A>, _ctx: &()) -> (Field, ArrayRef) {
-        A::finish(name, col)
-    }
-}
-
-impl<A: Numeric> Fold<i64> for Sum<A> {
-    #[inline(always)]
-    fn seed(v: i64, _wc: &mut ()) -> A {
+    fn seed(v: i64) -> A {
         A::from(v)
     }
     #[inline(always)]
-    fn update(acc: A, v: i64, _wc: &mut (), _ctx: &()) -> A {
+    fn update(acc: A, v: i64) -> A {
         acc + A::from(v)
+    }
+    #[inline(always)]
+    fn merge(a: A, b: A) -> A {
+        a + b
+    }
+    fn finish(name: &str, col: SlabColumn<A>) -> (Field, ArrayRef) {
+        A::finish(name, col)
     }
 }

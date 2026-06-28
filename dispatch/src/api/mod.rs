@@ -20,7 +20,7 @@
 //!             contains.run(col)
 //!         }
 //!     })
-//!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+//!     .count()
 //!     .collect();
 //! ```
 //!
@@ -32,7 +32,7 @@
 //! A query is a blueprint: one factory per worker thread. Nothing runs until
 //! [`RecordBatchOperatorSpec::collect`] is called. The lifecycle is:
 //!
-//! 1. **Build factories** — Each chained method (`.filter(...)`, `.aggregate(...)`, etc.) wraps
+//! 1. **Build factories** — Each chained method (`.filter(...)`, `.count()`, etc.) wraps
 //!    the previous factories in a new layer of [`RecordBatchUnaryOperatorFactory`], producing
 //!    already one factory per worker.
 //!    The factories are stored as `Box<dyn RecordBatchOperatorFactory>`

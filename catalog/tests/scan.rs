@@ -11,7 +11,7 @@ use tempfile::TempDir;
 
 use catalog::parquet::{ParquetTable, table_input};
 use common::*;
-use dispatch::{AggregationKind, AggregationSlot, Projection};
+use dispatch::Projection;
 
 #[test]
 fn scan_all_columns() {
@@ -109,7 +109,7 @@ fn scan_multiple_parquet_files() {
     let table = parquet_table_from_dir(&dispatch, dir.path());
 
     let results = table_input(&dispatch, &table, Projection::all(2), false)
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .count()
         .collect()
         .unwrap();
 
@@ -143,7 +143,7 @@ fn scan_empty_table() {
     let (_dir, table) = parquet_table(&dispatch, &[strings_and_ints(&[], &[])], true);
 
     let results = table_input(&dispatch, &table, Projection::all(0), false)
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .count()
         .collect()
         .unwrap();
 

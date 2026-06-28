@@ -7,7 +7,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 use catalog::parquet::table_input;
 use common::*;
-use dispatch::{AggregationKind, AggregationSlot, Projection, RECORD_BATCH_SIZE};
+use dispatch::{Projection, RECORD_BATCH_SIZE};
 
 #[test]
 fn subsequent_batches_reuse_write_buffer() {
@@ -66,7 +66,7 @@ fn dropped_batch_memory_is_reused() {
                 .unwrap()
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .count()
         .collect()
         .unwrap();
 
@@ -128,11 +128,11 @@ fn decompressed_string_buffer_is_reused() {
                 .unwrap()
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .count()
         .collect()
         .unwrap();
 
-    assert_eq!(extract_count(&res), n as i64);
+    assert_eq!(extract_count(&res), n as u64);
 
     let ptrs = ptrs.lock().unwrap();
     assert!(ptrs.windows(2).all(|w| w[0] == w[1]));

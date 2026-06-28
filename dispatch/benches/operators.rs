@@ -642,8 +642,8 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
     //     non-empty free-text filter — the lower-cardinality sibling of (g),
     //     using the runtime-signature `Dynamic` value. Its slots are all additive
     //     (COUNT/SUM), so it takes the `ONLY_ADDITIVE` form the planner routes an
-    //     all-additive fallback signature to — a branch-free additive fold, not
-    //     the per-slot kind dispatch.
+    //     all-additive signature to: a branch-free additive fold, not the per-slot
+    //     kind dispatch.
     {
         let slots = vec![
             AggregationSlot::new(AggregationKind::CountStar, 0),
@@ -857,7 +857,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
                     contains.run(col)
                 }
             })
-            .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+            .count()
         },
     );
 
@@ -878,7 +878,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
-                .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+                .count()
         },
     );
 
@@ -902,7 +902,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(move || move |b: &RecordBatch| i64_eq_mask(b, 0, target))
-                    .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+                    .count()
             },
         );
     }
