@@ -1,39 +1,21 @@
-//! Typed expressions deserialized from DuckDB's JSON plan.
+//! Typed expressions built from DuckDB's logical plan.
 //!
 //! Each node in the logical plan can carry [`Expression`]s that
 //! represent column references, constants, comparisons, function calls,
 //! aggregates, etc...
 //!
-//! This file implements and represents those.
+//! This file implements and represents those. The trees are built directly from
+//! the C++ bridge by [`crate::plan_build`]; there is no intermediate serialized
+//! form.
 
-use crate::duckdb_bridge::duckdb_types::{ExpressionType, LogicalTypeId, TableFilterType};
+use crate::duckdb_bridge::duckdb_types::{ExpressionType, LogicalTypeId};
 use crate::types::ScalarValue;
-use custom_deserializer::CustomDeserializer;
 use std::fmt;
 use std::fmt::{Debug, Display};
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("Failed to find type key in serve json: {0}")]
-    DeserializationMissingType(serde_json::Value),
-    #[error("Failed to find value key in serve json: {0}")]
-    DeserializationMissingValue(serde_json::Value),
-    #[error("Failed to deserialize scalar value: {0}")]
-    ScalarDeserializationInvalidValue(serde_json::Value),
-    #[error("Unsupported scalar type of duckdb type: {0}")]
-    UnsupportedScalar(u8),
-    #[error("Json serde deserialization error: {0}")]
-    SerdeDeserialize(#[from] serde_json::Error),
-    #[error("Unsupported type id: {0}")]
-    UnsupportedTypeId(u8),
-    #[error("Failed to parse integer value: {0}")]
-    IntegerParse(#[from] std::num::ParseIntError),
-}
 
 /// A bound column reference — points at a column by its positional index
 /// in the child operator's output.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Ref {
     /// Zero-based index into the child operator's output columns.
     pub column_idx: usize,
@@ -45,7 +27,7 @@ pub struct Ref {
 }
 
 /// A binary comparison expression (e.g. `<>`, `=`).
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Compare {
     pub left: Box<Expression>,
     pub right: Box<Expression>,
@@ -54,7 +36,7 @@ pub struct Compare {
 }
 
 /// A `BETWEEN` expression (`input BETWEEN lower AND upper`).
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Between {
     pub input: Box<Expression>,
     pub lower: Box<Expression>,
@@ -64,7 +46,7 @@ pub struct Between {
 }
 
 /// An aggregate function call (e.g. `SUM`, `COUNT`).
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct AggregateFunc {
     pub aggregate_function: String,
     pub params: Vec<Expression>,
@@ -75,7 +57,7 @@ pub struct AggregateFunc {
 }
 
 /// A scalar function call (e.g. `year`, `substring`).
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Function {
     pub function: String,
     pub params: Vec<Expression>,
@@ -83,9 +65,9 @@ pub struct Function {
 }
 
 /// An `input IN (v0, v1, …)` membership test. DuckDB keeps a small constant
-/// list as a `BoundOperatorExpression`; the bridge serializes its first child
-/// as `input` and the remaining children as `values`.
-#[derive(CustomDeserializer, Debug)]
+/// list as a `BoundOperatorExpression`; the bridge records its first child as
+/// `input` and the remaining children as `values`.
+#[derive(Debug)]
 pub struct InList {
     pub input: Box<Expression>,
     pub values: Vec<Expression>,
@@ -96,14 +78,14 @@ pub struct InList {
 /// `CONJUNCTION_AND` (50) or `CONJUNCTION_OR` (51); the optimizer rewrites a
 /// small `x IN (a, b)` into the `OR` form, so this is how most pushed-down `IN`
 /// membership tests arrive.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Conjunction {
     pub conjunction_type: ExpressionType,
     pub children: Vec<Expression>,
 }
 
 /// One `WHEN when THEN then` arm of a [`Case`].
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct CaseCheck {
     pub when: Box<Expression>,
     pub then: Box<Expression>,
@@ -112,7 +94,7 @@ pub struct CaseCheck {
 /// A `CASE WHEN … THEN … [WHEN …] ELSE … END` expression
 /// (`BoundCaseExpression`). DuckDB always materializes an `else_expr` —
 /// a `CASE` without an explicit `ELSE` carries a `NULL` constant there.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Case {
     pub checks: Vec<CaseCheck>,
     pub else_expr: Box<Expression>,
@@ -121,44 +103,28 @@ pub struct Case {
 /// Logical negation (`NOT expr`). DuckDB lowers it as a
 /// `BoundOperatorExpression` of type [`ExpressionType::OPERATOR_NOT`] with a
 /// single child.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct Not {
     pub input: Box<Expression>,
 }
 
 /// An expression in the logical plan. Discriminated by DuckDB's [`ExpressionType`].
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub enum Expression {
-    #[type_tag(ExpressionType::BOUND_REF)]
     Ref(Ref),
-    #[type_tag(ExpressionType::COMPARE_EQUAL)]
-    #[type_tag(ExpressionType::COMPARE_NOTEQUAL)]
-    #[type_tag(ExpressionType::COMPARE_LESSTHAN)]
-    #[type_tag(ExpressionType::COMPARE_GREATERTHAN)]
-    #[type_tag(ExpressionType::COMPARE_LESSTHANOREQUALTO)]
-    #[type_tag(ExpressionType::COMPARE_GREATERTHANOREQUALTO)]
     Compare(Compare),
-    #[type_tag(ExpressionType::COMPARE_BETWEEN)]
     Between(Between),
-    #[type_tag(ExpressionType::VALUE_CONSTANT)]
     Constant(ScalarValue),
-    #[type_tag(ExpressionType::BOUND_AGGREGATE)]
     AggregateFunc(AggregateFunc),
-    #[type_tag(ExpressionType::BOUND_FUNCTION)]
     Function(Function),
-    #[type_tag(ExpressionType::COMPARE_IN)]
     InList(InList),
-    #[type_tag(ExpressionType::CONJUNCTION_AND)]
-    #[type_tag(ExpressionType::CONJUNCTION_OR)]
     Conjunction(Conjunction),
-    #[type_tag(ExpressionType::CASE_EXPR)]
     Case(Case),
-    #[type_tag(ExpressionType::OPERATOR_NOT)]
     Not(Not),
 }
 
 /// A constant comparison against a single column (e.g. `col <> 42`).
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct ConstantComparison {
     pub column_ref: Box<Expression>,
     pub compare_type: ExpressionType,
@@ -166,11 +132,9 @@ pub struct ConstantComparison {
 }
 
 /// A filter that was pushed down into a table scan.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub enum TableFilter {
-    #[type_tag(TableFilterType::EXPRESSION_FILTER)]
     Expression(Box<Expression>),
-    #[type_tag(TableFilterType::CONSTANT_COMPARISON)]
     ConstantComparison(ConstantComparison),
 }
 
@@ -187,6 +151,14 @@ impl fmt::Display for TableFilter {
                 type_name(&c.constant.logical_type),
             ),
         }
+    }
+}
+
+impl ExpressionType {
+    /// Reconstruct an [`ExpressionType`] from the `u8` discriminant the bridge
+    /// reports. DuckDB defines `ExpressionType` as `enum class : uint8_t`.
+    pub(crate) fn from_u8(value: u8) -> Self {
+        unsafe { std::mem::transmute::<u8, ExpressionType>(value) }
     }
 }
 
@@ -292,13 +264,6 @@ impl fmt::Display for Expression {
             }
             Expression::Not(n) => write!(f, "NOT({})", n.input),
         }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ExpressionType {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = <u8 as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(unsafe { std::mem::transmute::<u8, ExpressionType>(value) })
     }
 }
 

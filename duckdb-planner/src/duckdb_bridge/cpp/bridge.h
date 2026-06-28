@@ -3,13 +3,17 @@
 #include "duckdb.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include <nlohmann/json.hpp>
 #include <memory>
-
-using json = nlohmann::json;
+#include <vector>
 
 struct CatalogContext;
+struct OptionalTableWrapper;
 struct ExtractPlanResult;
+
+// The Rust plan builder reads DuckDB's own objects directly, so expose them to
+// CXX as opaque types by their real names.
+using LogicalOperator = duckdb::LogicalOperator;
+using Expression = duckdb::Expression;
 
 struct DuckPlannerContext {
 	rust::Box<CatalogContext> catalog;  // owns the CatalogContext; must outlive db
@@ -20,6 +24,159 @@ struct DuckPlannerContext {
 	explicit DuckPlannerContext(rust::Box<CatalogContext> catalog);
 };
 
+// Owns DuckDB's resolved plan tree so it stays alive while Rust walks it. The
+// pivot `DuckDBTable` handles are moved out of the catalog entries during that
+// walk, so the per-plan catalog entries are only cleared when this handle is
+// dropped (after the walk), not at the end of `extract_plan`.
+struct PlanHandle {
+	duckdb::unique_ptr<duckdb::LogicalOperator> root;
+	DuckPlannerContext *ctx;
+	~PlanHandle();
+};
+
+// Owns the expressions synthesized for a LogicalGet's pushed-down filters (the
+// `ToExpression` results), so they outlive the per-condition Rust read.
+struct ExpressionList {
+	std::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
+};
+
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query);
-json build_expression(duckdb::Expression *expr);
+
+const LogicalOperator &plan_root(const PlanHandle &plan);
+size_t rowid_column_id();
+
+// ---- LogicalOperator: shared structure ----
+uint8_t lo_type(const LogicalOperator &op);
+rust::String lo_name(const LogicalOperator &op);
+size_t lo_child_count(const LogicalOperator &op);
+const LogicalOperator &lo_child(const LogicalOperator &op, size_t index);
+
+// ---- Projection ----
+size_t lo_projection_expr_count(const LogicalOperator &op);
+const Expression &lo_projection_expr(const LogicalOperator &op, size_t index);
+
+// ---- Filter ----
+size_t lo_filter_expr_count(const LogicalOperator &op);
+const Expression &lo_filter_expr(const LogicalOperator &op, size_t index);
+size_t lo_filter_projection_map_count(const LogicalOperator &op);
+size_t lo_filter_projection_map_index(const LogicalOperator &op, size_t index);
+uint8_t lo_filter_type_id(const LogicalOperator &op, size_t index);
+
+// ---- OrderBy ----
+size_t lo_orderby_count(const LogicalOperator &op);
+uint8_t lo_orderby_direction(const LogicalOperator &op, size_t index);
+const Expression &lo_orderby_expr(const LogicalOperator &op, size_t index);
+
+// ---- Aggregate ----
+size_t lo_aggregate_group_count(const LogicalOperator &op);
+const Expression &lo_aggregate_group(const LogicalOperator &op, size_t index);
+size_t lo_aggregate_expr_count(const LogicalOperator &op);
+const Expression &lo_aggregate_expr(const LogicalOperator &op, size_t index);
+
+// ---- TopN ----
+size_t lo_topn_order_count(const LogicalOperator &op);
+uint8_t lo_topn_order_direction(const LogicalOperator &op, size_t index);
+const Expression &lo_topn_order_expr(const LogicalOperator &op, size_t index);
+size_t lo_topn_limit(const LogicalOperator &op);
+size_t lo_topn_offset(const LogicalOperator &op);
+bool lo_topn_has_dynamic_filter(const LogicalOperator &op);
+size_t lo_topn_dynamic_filter_data_id(const LogicalOperator &op);
+size_t lo_topn_dynamic_filter_column(const LogicalOperator &op);
+uint8_t lo_topn_dynamic_filter_comparison(const LogicalOperator &op);
+
+// ---- Limit ----
+uint8_t lo_limit_value_kind(const LogicalOperator &op);
+size_t lo_limit_value(const LogicalOperator &op);
+uint8_t lo_limit_offset_kind(const LogicalOperator &op);
+size_t lo_limit_offset(const LogicalOperator &op);
+
+// ---- Get: base table ----
+bool lo_get_has_table(const LogicalOperator &op);
+rust::Box<OptionalTableWrapper> lo_get_take_table(const LogicalOperator &op);
+size_t lo_get_output_count(const LogicalOperator &op);
+size_t lo_get_output_column(const LogicalOperator &op, size_t index);
+uint8_t lo_get_output_type(const LogicalOperator &op, size_t index);
+std::unique_ptr<ExpressionList> lo_get_pushed_conditions(const LogicalOperator &op);
+size_t lo_get_dynamic_filter_count(const LogicalOperator &op);
+size_t lo_get_dynamic_filter_data_id(const LogicalOperator &op, size_t index);
+size_t lo_get_dynamic_filter_column(const LogicalOperator &op, size_t index);
+uint8_t lo_get_dynamic_filter_comparison(const LogicalOperator &op, size_t index);
+
+// ---- Get: table function ----
+rust::String lo_get_function_name(const LogicalOperator &op);
+bool lo_get_has_named_params(const LogicalOperator &op);
+size_t lo_get_param_count(const LogicalOperator &op);
+uint8_t lo_get_param_type(const LogicalOperator &op, size_t index);
+rust::String lo_get_param_value(const LogicalOperator &op, size_t index);
+
+// ---- CreateTable ----
+rust::String lo_create_table_name(const LogicalOperator &op);
+size_t lo_create_column_count(const LogicalOperator &op);
+rust::String lo_create_column_name(const LogicalOperator &op, size_t index);
+uint8_t lo_create_column_type(const LogicalOperator &op, size_t index);
+size_t lo_create_option_count(const LogicalOperator &op);
+rust::String lo_create_option_key(const LogicalOperator &op, size_t index);
+rust::String lo_create_option_value(const LogicalOperator &op, size_t index);
+bool lo_create_if_not_exists(const LogicalOperator &op);
+bool lo_create_or_replace(const LogicalOperator &op);
+bool lo_create_temporary(const LogicalOperator &op);
+bool lo_create_has_query(const LogicalOperator &op);
+size_t lo_create_constraint_count(const LogicalOperator &op);
+
+// ---- Set / Reset ----
+rust::String lo_set_name(const LogicalOperator &op);
+rust::String lo_set_value(const LogicalOperator &op);
+rust::String lo_reset_name(const LogicalOperator &op);
+
+// ---- ComparisonJoin: late materialization ----
+bool lo_is_late_materialization_join(const LogicalOperator &op);
+size_t lo_late_materialization_column_count(const LogicalOperator &op);
+size_t lo_late_materialization_column(const LogicalOperator &op, size_t index);
+
+// ---- ExpressionList ----
+size_t expr_list_count(const ExpressionList &list);
+const Expression &expr_list_get(const ExpressionList &list, size_t index);
+
+// ---- Expression: shared ----
+uint8_t expr_type(const Expression &expr);
+uint8_t expr_return_type(const Expression &expr);
+bool expr_has_alias(const Expression &expr);
+rust::String expr_alias(const Expression &expr);
+
+uint8_t expr_constant_type(const Expression &expr);
+rust::String expr_constant_value(const Expression &expr);
+
+size_t expr_ref_index(const Expression &expr);
+size_t expr_columnref_index(const Expression &expr);
+
+const Expression &expr_comparison_left(const Expression &expr);
+const Expression &expr_comparison_right(const Expression &expr);
+
+const Expression &expr_between_input(const Expression &expr);
+const Expression &expr_between_lower(const Expression &expr);
+const Expression &expr_between_upper(const Expression &expr);
+bool expr_between_lower_inclusive(const Expression &expr);
+bool expr_between_upper_inclusive(const Expression &expr);
+
+rust::String expr_aggregate_name(const Expression &expr);
+bool expr_aggregate_distinct(const Expression &expr);
+size_t expr_aggregate_child_count(const Expression &expr);
+const Expression &expr_aggregate_child(const Expression &expr, size_t index);
+
+rust::String expr_function_name(const Expression &expr);
+size_t expr_function_child_count(const Expression &expr);
+const Expression &expr_function_child(const Expression &expr, size_t index);
+
+size_t expr_operator_child_count(const Expression &expr);
+const Expression &expr_operator_child(const Expression &expr, size_t index);
+
+size_t expr_conjunction_child_count(const Expression &expr);
+const Expression &expr_conjunction_child(const Expression &expr, size_t index);
+
+size_t expr_case_check_count(const Expression &expr);
+const Expression &expr_case_when(const Expression &expr, size_t index);
+const Expression &expr_case_then(const Expression &expr, size_t index);
+const Expression &expr_case_else(const Expression &expr);
+
+const Expression &expr_cast_child(const Expression &expr);

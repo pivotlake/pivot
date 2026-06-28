@@ -11,11 +11,9 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
-#include <nlohmann/json.hpp>
 #include <cstdio>
 
 using namespace duckdb;
-using json = nlohmann::json;
 
 static BindInfo PivotScanGetBindInfo(const optional_ptr<FunctionData> bind_data) {
 	auto &data = bind_data->Cast<PivotScanBindData>();
@@ -78,11 +76,9 @@ static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &g
 	for (auto it = filters.begin(); it != filters.end();) {
 		auto remapped = (*it)->Copy();
 		RewriteRefsToStorage(*remapped, column_ids);
-		json serialized_filter = {
-		    {"type", static_cast<uint8_t>(duckdb::TableFilterType::EXPRESSION_FILTER)},
-		    {"data", build_expression(remapped.get())},
-		};
-		if (pushdown_filter(data.table, serialized_filter.dump())) {
+		// Hand the (storage-remapped) DuckDB expression straight to Rust, which
+		// reads it through the same `expr_*` accessors the plan walk uses.
+		if (pushdown_filter(data.table, *remapped)) {
 			it = filters.erase(it);
 		} else {
 			++it;
@@ -121,7 +117,7 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	// Enabling filter_pushdown lets DuckDB's optimizer passes install filters
 	// into get.table_filters — both `col op const` leftovers and the
 	// DynamicFilters produced by the Top-N pushdown pass. The Rust catalog
-	// doesn't consume TableFilters directly; `build_plan_node_json` in
+	// doesn't consume TableFilters directly; `build_plan_node` in
 	// bridge.cpp splits each Get's table_filters back into a synthetic
 	// LogicalFilter (for the static predicates, keeping the Rust-facing shape
 	// identical to filter_pushdown=false) plus dynamic-filter slot references

@@ -62,8 +62,8 @@ fn compare_notequal_structure(mut planner: PlannerContext) {
     ");
 }
 
-/// Equality compares deserialize as `Compare` (same variant as `<>`) thanks
-/// to the multi-tag `#[type_tag]` on `Expression::Compare`.
+/// Equality compares build as `Compare` (the same variant as `<>`): the bridge
+/// maps all six comparison operators onto `Expression::Compare`.
 #[rstest]
 fn compare_equal_structure(mut planner: PlannerContext) {
     let plan = planner
