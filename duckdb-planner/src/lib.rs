@@ -1,9 +1,9 @@
 //! duckdb-planner: a Rust wrapper around DuckDB's C++ query planner.
 //!
-//! This crate sends SQL strings to an embedded DuckDB instance, deserializes it into a Rust [`PlanNode`] tree.
+//! This crate sends SQL strings to an embedded DuckDB instance and builds a Rust [`PlanNode`] tree from the resulting plan.
 //!
 //! The main entry point is [`PlannerContext`], which owns the DuckDB state and
-//! exposes [`plan`](PlannerContext::plan) (returns a [`PlanNode`]).
+//! exposes [`plan`](PlannerContext::plan) (returns a [`PlannedQuery`]).
 //!
 //! # Example
 //!
@@ -56,11 +56,11 @@ pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;
 pub mod plan;
+mod plan_build;
 mod types;
 
 use std::sync::Arc;
 
-use custom_deserializer::CustomDeserializer;
 use duckdb_bridge::ffi;
 use thiserror::Error;
 
@@ -80,12 +80,19 @@ pub enum Error {
     UnsupportedPlan(String),
     #[error("Bridge error: {0}")]
     Bridge(String),
-    #[error("Deserialization error: {0}")]
-    SerdeDeserialize(#[from] serde_json::Error),
+}
+
+impl From<plan_build::BuildError> for Error {
+    fn from(err: plan_build::BuildError) -> Self {
+        // The builder only fails on plan shapes pivot doesn't support yet (an
+        // unmapped operator/expression, a non-constant LIMIT, ...), which the
+        // old C++ path surfaced as an `unsupported_plan` error.
+        Error::UnsupportedPlan(err.0)
+    }
 }
 
 /// Error returned by DuckDB when it cannot produce a plan for a query.
-#[derive(CustomDeserializer, Debug, Error)]
+#[derive(Debug, Error)]
 pub struct PlanningError {
     pub exception_message: String,
     pub position: Option<String>,
@@ -94,30 +101,6 @@ pub struct PlanningError {
 impl std::fmt::Display for PlanningError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.exception_message)
-    }
-}
-
-#[derive(CustomDeserializer)]
-struct BridgeErrorPayload {
-    kind: String,
-    exception_message: String,
-    position: Option<String>,
-}
-
-impl BridgeErrorPayload {
-    fn into_error(self) -> Error {
-        match self.kind.as_str() {
-            "duckdb_planning" => Error::DuckDBPlanning(PlanningError {
-                exception_message: self.exception_message,
-                position: self.position,
-            }),
-            "unsupported_plan" => Error::UnsupportedPlan(self.exception_message),
-            "bridge_error" => Error::Bridge(self.exception_message),
-            other => Error::Bridge(format!(
-                "Unknown bridge error kind `{other}`: {}",
-                self.exception_message
-            )),
-        }
     }
 }
 
@@ -138,20 +121,23 @@ impl std::fmt::Display for PlannedQuery {
     }
 }
 
-/// Deserialized `data` payload of a successful plan: the operator tree under
-/// `plan`, alongside the client-facing `output_names`.
-#[derive(CustomDeserializer)]
-struct SuccessPayload {
-    plan: PlanNode,
-    output_names: Vec<String>,
-}
-
-/// Internal wrapper for the JSON response from the C++ bridge, which is
-/// either a successfully planned query or a structured bridge error.
-#[derive(CustomDeserializer)]
-enum PlanResult {
-    Success(SuccessPayload),
-    Error(BridgeErrorPayload),
+/// Translate the error fields the bridge reports into a typed [`Error`].
+fn bridge_error(result: &ffi::ExtractPlanResult) -> Error {
+    let position = result
+        .has_error_position
+        .then(|| result.error_position.clone());
+    match result.error_kind.as_str() {
+        "duckdb_planning" => Error::DuckDBPlanning(PlanningError {
+            exception_message: result.error_message.clone(),
+            position,
+        }),
+        "unsupported_plan" => Error::UnsupportedPlan(result.error_message.clone()),
+        "bridge_error" => Error::Bridge(result.error_message.clone()),
+        other => Error::Bridge(format!(
+            "Unknown bridge error kind `{other}`: {}",
+            result.error_message
+        )),
+    }
 }
 
 /// Owns an in-process DuckDB instance and exposes SQL planning.
@@ -168,25 +154,29 @@ impl PlannerContext {
         }
     }
 
-    /// Plan a SQL query: sends the query to DuckDB, deserializes the JSON
-    /// logical plan into a [`PlanNode`] tree, and attaches the `DuckDBTable`
-    /// trait objects to each `Input` node.
+    /// Plan a SQL query: sends the query to DuckDB, builds a [`PlanNode`] tree
+    /// directly from the C++ plan the bridge exposes, and attaches the
+    /// `DuckDBTable` trait objects to each `Input` node. Returns the resolved
+    /// tree alongside the client-facing result column names.
     pub fn plan(&mut self, query: &str) -> Result<PlannedQuery, Error> {
         let result = ffi::extract_plan(self.cxx_context.pin_mut(), query);
-        let plan: PlanResult = serde_json::from_str(&result.json)?;
-        match plan {
-            PlanResult::Success(payload) => {
-                let tables: Vec<Box<dyn catalog_provider::DuckDBTable>> = result
-                    .tables
-                    .into_iter()
-                    .map(|ot| ot.table.expect("planner returned an unbound table"))
-                    .collect();
-                Ok(PlannedQuery {
-                    root: payload.plan.resolve_inputs(tables),
-                    output_names: payload.output_names,
-                })
-            }
-            PlanResult::Error(err) => Err(err.into_error()),
+        if !result.error_kind.is_empty() {
+            return Err(bridge_error(&result));
         }
+
+        let root = ffi::plan_root(result.plan.as_ref().expect("plan present on success"));
+        // Walking the live plan takes the bound table handles out of the catalog
+        // entries (in scan order); `resolve_inputs` then binds them by index.
+        let mut tables = Vec::new();
+        let plan = plan_build::build_plan(root, &mut tables)?;
+
+        let tables: Vec<Box<dyn catalog_provider::DuckDBTable>> = tables
+            .into_iter()
+            .map(|ot| ot.table.expect("planner returned an unbound table"))
+            .collect();
+        Ok(PlannedQuery {
+            root: plan.resolve_inputs(tables),
+            output_names: result.output_names,
+        })
     }
 }

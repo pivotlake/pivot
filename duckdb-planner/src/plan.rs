@@ -1,10 +1,9 @@
-//! The [`PlanNode`] tree that represents a deserialized DuckDB logical plan.
+//! The [`PlanNode`] tree that represents a DuckDB logical plan.
 
 use std::fmt;
 
 use crate::catalog_provider::DuckDBTable;
 use crate::operator::Operator;
-use custom_deserializer::CustomDeserializer;
 
 /// A single node in the logical plan tree.
 ///
@@ -25,7 +24,7 @@ use custom_deserializer::CustomDeserializer;
 ///
 /// Each node above feeds its rows to exactly one parent — `Input` cannot
 /// simultaneously feed both `Filter` and some other operator.
-#[derive(CustomDeserializer, Debug)]
+#[derive(Debug)]
 pub struct PlanNode {
     pub name: String,
     pub inputs: Vec<PlanNode>,

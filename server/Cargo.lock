@@ -1422,14 +1422,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "custom_deserializer"
-version = "0.1.0"
-dependencies = [
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "cxx"
 version = "1.0.194"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1638,13 +1630,9 @@ dependencies = [
  "autocxx",
  "autocxx-build",
  "cmake",
- "custom_deserializer",
  "cxx",
  "cxx-build",
  "dispatch",
- "serde",
- "serde_json",
- "serde_repr",
  "thiserror 2.0.18",
 ]
 
