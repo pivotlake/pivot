@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::duckdb_bridge::ffi;
 use crate::duckdb_bridge::ffi::CatalogGetScalarFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableResult;
@@ -35,7 +36,7 @@ pub trait DuckDBTable: Any {
     fn clone_box(&self) -> Box<dyn DuckDBTable>;
 
     /// Called from DuckDB's `pushdown_complex_filter` hook with the current
-    /// scan-local filter expressions deserialized into a [`TableFilter`].
+    /// scan-local filter expressions built into a [`TableFilter`].
     ///
     /// Returns `Ok(true)` when the filter was fully consumed by the table
     /// (DuckDB drops it from the scan), `Ok(false)` to keep it. Errors are
@@ -169,11 +170,14 @@ pub(crate) fn catalog_get_scalar_function(
     }
 }
 
-pub(crate) fn pushdown_filter(table: &mut OptionalTableWrapper, filter_json: &str) -> Result<bool> {
+pub(crate) fn pushdown_filter(
+    table: &mut OptionalTableWrapper,
+    expr: &ffi::Expression,
+) -> Result<bool> {
     let table = table
         .table
         .as_mut()
         .ok_or_else(|| -> Error { "pushdown_filter called on unbound table".into() })?;
-    let filter = serde_json::from_str::<TableFilter>(filter_json)?;
-    table.pushdown_filter(filter)
+    let expression = crate::plan_build::build_expression(expr)?;
+    table.pushdown_filter(TableFilter::Expression(Box::new(expression)))
 }
