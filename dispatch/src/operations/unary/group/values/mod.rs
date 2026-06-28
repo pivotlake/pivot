@@ -19,7 +19,7 @@
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::Field;
+use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
 pub mod cell;
@@ -73,17 +73,51 @@ impl AggregationKind {
     }
 }
 
-/// One aggregate output slot: which aggregate, over which input column.
-#[derive(Clone, Copy, Debug)]
+/// One aggregate output slot: which aggregate, over which input column, and the
+/// Arrow type its output column is declared as.
+///
+/// The accumulator's *storage* width (`i64` / `i128`) is an execution detail
+/// independent of this declared type: a `COUNT` may sit in an `i128` cell (forced
+/// by a `SUM` sharing a [`Dynamic`] cell array) yet is always a `BIGINT`, and a
+/// narrow `SUM` accumulates in `i64` yet is always a `HUGEINT`. The slot carries
+/// the type the result column must have, so the output phase renders the
+/// accumulator at its storage width then casts each column to its `output_type`
+/// (a no-op when they already match).
+#[derive(Clone, Debug)]
 pub struct AggregationSlot {
     pub kind: AggregationKind,
     pub column: usize,
+    pub output_type: DataType,
 }
 
 impl AggregationSlot {
-    pub fn new(kind: AggregationKind, column: usize) -> Self {
-        Self { kind, column }
+    /// A slot for `kind` over input `column`, whose result column is declared as
+    /// `output_type` (the planner passes DuckDB's result type for the call).
+    pub fn new(kind: AggregationKind, column: usize, output_type: DataType) -> Self {
+        Self {
+            kind,
+            column,
+            output_type,
+        }
     }
+}
+
+/// Cast a rendered value column to its slot's declared `output_type`, rebuilding
+/// the field to match. A no-op (a cheap `Arc` clone) when the rendered type
+/// already equals the declared one, so a slot whose accumulator width is its
+/// output type pays nothing; a `COUNT` rendered from an `i128` cell narrows to
+/// `Int64` here, a narrow `SUM` widens to `Decimal128`.
+pub(crate) fn cast_value_column(
+    field: Field,
+    column: ArrayRef,
+    output_type: &DataType,
+) -> (Field, ArrayRef) {
+    if field.data_type() == output_type {
+        return (field, column);
+    }
+    let casted = arrow::compute::cast(&column, output_type).expect("aggregate output column cast");
+    let field = Field::new(field.name(), output_type.clone(), field.is_nullable());
+    (field, casted)
 }
 
 /// The shared, read-side context the merge + output phase resolves through — the

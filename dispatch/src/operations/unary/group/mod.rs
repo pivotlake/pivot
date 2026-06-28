@@ -101,6 +101,7 @@ pub use keys::{
     ArenaKey, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
     KeyExtractor, RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
+pub(crate) use values::cast_value_column;
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, Fold, IntRead, Max, MaxSlot, Min, MinSlot, NoRead, Numeric, OpTuple, Read,
@@ -119,7 +120,7 @@ use ahash::RandomState;
 use arena::SharedArena;
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType};
 use crossbeam_deque::{Injector, Steal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -208,6 +209,8 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         radix: RadixConfig,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
+        let value_output_types: Arc<[DataType]> =
+            value_slots.iter().map(|s| s.output_type.clone()).collect();
         // A string extreme persists its winner lazily during the in-place fold, so
         // it must not take the radix scatter path (which materialises — and thus
         // persists — every row's string before any comparison). Disable the switch
@@ -233,6 +236,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
                 partition_jobs_injected,
                 key_config,
                 shared_context,
+                value_output_types,
                 output_limit,
                 count_only,
                 output_allocator: None,
@@ -287,6 +291,11 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     /// folds existing entries via [`AggregationValue::merge`] and the output
     /// resolves string extremes (it carries the value arena).
     shared_context: V::SharedContext,
+    /// The declared output type of each value column, in slot order. The output
+    /// phase renders each accumulator at its storage width then casts it to this
+    /// type (a `COUNT` in an `i128` cell down to `Int64`, a narrow `SUM` up to
+    /// `Decimal128`); a no-op when the width already matches.
+    value_output_types: Arc<[DataType]>,
     output_limit: Option<GroupLimit>,
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
@@ -332,6 +341,9 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     key_config: K::Config,
     /// The value's shared context, for the partition merge's entry fold + output.
     shared_context: V::SharedContext,
+    /// Declared output type per value column, in slot order; the output phase casts
+    /// each finished value column to its type.
+    value_output_types: Arc<[DataType]>,
     output_limit: Option<GroupLimit>,
     count_only: bool,
 }
@@ -375,6 +387,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
                 self.output_buffers.clone(),
                 self.key_config.clone(),
                 self.shared_context.clone(),
+                self.value_output_types.clone(),
             )
         });
         acc.extend_from_table(result_map, allocator, sender)
@@ -483,6 +496,7 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
                 num_partitions,
                 key_config: self.key_config.clone(),
                 shared_context: self.shared_context.clone(),
+                value_output_types: self.value_output_types.clone(),
                 output_limit: self.output_limit,
                 count_only: self.count_only,
             });
@@ -594,7 +608,11 @@ mod tests {
     }
 
     fn count_slots() -> Vec<AggregationSlot> {
-        vec![AggregationSlot::new(AggregationKind::CountStar, 0)]
+        vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )]
     }
 
     /// Common case: `Int32` keys, `COUNT(*)`, key column 0, no LIMIT, default radix.
@@ -866,7 +884,11 @@ mod tests {
     fn sum_aggregates_value_per_group() {
         // key 1 -> 10+30, key 2 -> 20, key 3 -> 5+5.
         let batch = keyed_i32_batch(&[1, 2, 1, 3, 3], &[10, 20, 30, 5, 5]);
-        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 1)];
+        let slots = vec![AggregationSlot::new(
+            AggregationKind::Sum,
+            1,
+            DataType::Decimal128(38, 0),
+        )];
 
         let sender = run_group_full::<IntExtractor, SumValue>(
             vec![vec![batch]],
@@ -876,7 +898,14 @@ mod tests {
             RadixConfig::DEFAULT,
         );
 
-        assert_eq!(group_counts(&sender), vec![(1, 40), (2, 20), (3, 10)]);
+        // A SUM renders as a Decimal128 column.
+        let mut pairs: Vec<(i32, i128)> = sender
+            .i32_column(0)
+            .into_iter()
+            .zip(sender.decimal128_column(1))
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![(1, 40), (2, 20), (3, 10)]);
     }
 
     #[test]
@@ -1014,6 +1043,20 @@ mod tests {
         rows
     }
 
+    /// Read the `(id, name, sum)` output rows of a row-key group-by whose value is
+    /// a `SUM` (a `Decimal128` column), sorted.
+    fn row_key_sum_rows(sender: &CollectSender) -> Vec<(i64, String, i128)> {
+        let mut rows: Vec<(i64, String, i128)> = sender
+            .i64_column(0)
+            .into_iter()
+            .zip(sender.string_column(1))
+            .zip(sender.decimal128_column(2))
+            .map(|((id, name), v)| (id, name, v))
+            .collect();
+        rows.sort();
+        rows
+    }
+
     /// `GROUP BY (Int64, Utf8View)` — each distinct tuple is one group, counted.
     #[test]
     fn row_key_mixed_int_string_counts() {
@@ -1134,7 +1177,11 @@ mod tests {
         let long = "a-string-well-over-twelve-bytes";
         let batch = mixed_key_batch(&[1, 2, 1, 2], &["x", long, "x", "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
+        let slots = vec![AggregationSlot::new(
+            AggregationKind::Sum,
+            2,
+            DataType::Decimal128(38, 0),
+        )];
         let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![batch]],
             vec![0, 1],
@@ -1142,7 +1189,7 @@ mod tests {
             slots,
         );
         assert_eq!(
-            row_key_rows(&sender),
+            row_key_sum_rows(&sender),
             vec![
                 (1, "x".to_string(), 40),
                 (2, long.to_string(), 5),
@@ -1184,19 +1231,23 @@ mod tests {
         // GROUP BY (name, id), summing the value column.
         let batch = mixed_key_batch(&[1, 2, 1, 2], &[long, "y", long, "y"], &[10, 5, 30, 7]);
         let schema = RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]);
-        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
+        let slots = vec![AggregationSlot::new(
+            AggregationKind::Sum,
+            2,
+            DataType::Decimal128(38, 0),
+        )];
         let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![batch]],
             vec![1, 0], // name (col 1) then id (col 0)
             schema,
             slots,
         );
-        // Output columns: k0 = name (str), k1 = id (i64), agg = sum.
-        let mut rows: Vec<(String, i64, i64)> = sender
+        // Output columns: k0 = name (str), k1 = id (i64), agg = sum (Decimal128).
+        let mut rows: Vec<(String, i64, i128)> = sender
             .string_column(0)
             .into_iter()
             .zip(sender.i64_column(1))
-            .zip(sender.i64_column(2))
+            .zip(sender.decimal128_column(2))
             .map(|((name, id), v)| (name, id, v))
             .collect();
         rows.sort();
@@ -1214,7 +1265,11 @@ mod tests {
         let b1 = mixed_key_batch(&[1, 1], &["a", long], &[10, 5]);
         let b2 = mixed_key_batch(&[1, 1], &["a", long], &[3, 7]);
         let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
-        let slots = vec![AggregationSlot::new(AggregationKind::Sum, 2)];
+        let slots = vec![AggregationSlot::new(
+            AggregationKind::Sum,
+            2,
+            DataType::Decimal128(38, 0),
+        )];
 
         let sender = run_row_key_group::<Compiled<(SumSlot<Int32Type>,)>>(
             vec![vec![b1, b2]],
@@ -1224,7 +1279,7 @@ mod tests {
         );
 
         assert_eq!(
-            row_key_rows(&sender),
+            row_key_sum_rows(&sender),
             vec![(1, "a".to_string(), 13), (1, long.to_string(), 12)],
         );
     }
@@ -1234,8 +1289,9 @@ mod tests {
     /// The same `MIN(name)` (string) + `MAX(v)` (int) mix, but folded by the
     /// runtime [`Dynamic`] instead of a `Compiled` tuple — the path the planner
     /// now takes for a heterogeneous string signature. The wide (`i128`) cell
-    /// holds the string slot's `ArenaKey` and the int slot's value, so the int
-    /// extreme renders as `Decimal128` (every numeric slot in a wide value does).
+    /// holds the string slot's `ArenaKey` and the int slot's value; the int
+    /// extreme stores wide but its slot declares `Int64`, so the output phase
+    /// casts it back to `Int64`.
     #[test]
     fn dynamic_string_min_int_max() {
         let batch = mixed_key_batch(
@@ -1244,8 +1300,8 @@ mod tests {
             &[10, 7, 30, 5, 20],
         );
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1), // MIN(name) — string
-            AggregationSlot::new(AggregationKind::Max, 2),    // MAX(v)    — int
+            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View), // MIN(name) — string
+            AggregationSlot::new(AggregationKind::Max, 2, DataType::Int64),       // MAX(v)    — int
         ];
         type Mix = Dynamic<2, i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
@@ -1255,11 +1311,11 @@ mod tests {
             None,
             RadixConfig::DEFAULT,
         );
-        let mut rows: Vec<(i64, String, i128)> = sender
+        let mut rows: Vec<(i64, String, i64)> = sender
             .i64_column(0)
             .into_iter()
             .zip(sender.string_column(1))
-            .zip(sender.decimal128_column(2))
+            .zip(sender.i64_column(2))
             .map(|((id, name), v)| (id, name, v))
             .collect();
         rows.sort();
@@ -1280,8 +1336,8 @@ mod tests {
             &[10, 7, 30, 5, 20],
         );
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1), // MIN(name)
-            AggregationSlot::new(AggregationKind::StrMax, 1), // MAX(name)
+            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View), // MIN(name)
+            AggregationSlot::new(AggregationKind::StrMax, 1, DataType::Utf8View), // MAX(name)
         ];
         type Mix = Dynamic<2, i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
@@ -1321,8 +1377,8 @@ mod tests {
         let w0 = mixed_key_batch(&[1, 1], &["mango", long_z], &[1, 2]);
         let w1 = mixed_key_batch(&[1, 1], &[long_a, "mint"], &[3, 4]);
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1),
-            AggregationSlot::new(AggregationKind::StrMax, 1),
+            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View),
+            AggregationSlot::new(AggregationKind::StrMax, 1, DataType::Utf8View),
         ];
         type Mix = Dynamic<2, i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
@@ -1361,8 +1417,8 @@ mod tests {
         let batch = mixed_key_batch(&ids, &names, &vals);
 
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1),
-            AggregationSlot::new(AggregationKind::StrMax, 1),
+            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View),
+            AggregationSlot::new(AggregationKind::StrMax, 1, DataType::Utf8View),
         ];
         type Mix = Dynamic<2, i128>;
         // A threshold the in-place table crosses well before N groups — a numeric

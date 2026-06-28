@@ -113,19 +113,18 @@ impl Aggregate {
                 return Ok(None);
             };
             let scalar = if is_min { min } else { max };
-            // Emit Int64, the same output type as the scan-based global MIN/MAX
-            // (stats carry the column's physical storage type). A cast failure
-            // is just another "can't answer from stats": fall back to the scan
-            // rather than failing the whole query.
+            // Match the scan-based global MIN/MAX output type: a temporal column
+            // surfaces as its real Date32/Timestamp, every other column as Int64.
+            // Stats carry the column's physical storage int, which casts
+            // losslessly to the target. A cast failure is just another "can't
+            // answer from stats": fall back to the scan rather than failing.
+            let target =
+                super::temporal_output_type(&agg.column.return_type).unwrap_or(DataType::Int64);
             let arr = scalar.into_inner();
-            let Ok(casted) = arrow::compute::cast(&arr, &DataType::Int64) else {
+            let Ok(casted) = arrow::compute::cast(&arr, &target) else {
                 return Ok(None);
             };
-            fields.push(Field::new(
-                if is_min { "min" } else { "max" },
-                DataType::Int64,
-                true,
-            ));
+            fields.push(Field::new(if is_min { "min" } else { "max" }, target, true));
             columns.push(casted);
         }
 

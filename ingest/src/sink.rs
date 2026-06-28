@@ -43,7 +43,7 @@ pub(crate) struct SinkStats {
     last_flush_unix_ms: AtomicU64,
 }
 
-/// A point-in-time read of a sink's [`SinkStats`], tagged with its table.
+/// A point-in-time read of a sink's `SinkStats`, tagged with its table.
 #[derive(Debug, Clone)]
 pub struct SinkStatsSnapshot {
     pub table: String,

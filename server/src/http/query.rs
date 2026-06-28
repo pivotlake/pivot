@@ -31,9 +31,12 @@ pub(super) async fn query(
     Json(req): Json<QueryRequest>,
 ) -> Json<QueryResponse> {
     let started = Instant::now();
-    let result =
-        crate::query_handler::execute_sql(state.catalog_dyn.clone(), state.dispatcher.clone(), req.sql)
-            .await;
+    let result = crate::query_handler::execute_sql(
+        state.catalog_dyn.clone(),
+        state.dispatcher.clone(),
+        req.sql,
+    )
+    .await;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
     Json(match result {
         Ok(batches) => {

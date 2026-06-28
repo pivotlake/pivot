@@ -1,14 +1,25 @@
-use super::general::{Encoding, PageType};
+use super::general::{Encoding, PageType, TimeUnit};
 use super::parquet_thrift::*;
 use crate::{general_err, thrift_struct};
 use std::io::Write;
 
-// LogicalType is a thrift union where most variants are empty structs.
-// We only care about String (id=1) and Integer (id=10).
+// LogicalType is a thrift union where most variants are empty structs. We model
+// the ones whose arrow type pivot decodes natively: String, Integer, Date, and
+// Timestamp; everything else is `Other`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalType {
     String,
-    Integer { bit_width: i8, is_signed: bool },
+    Integer {
+        bit_width: i8,
+        is_signed: bool,
+    },
+    /// `DATE`: an `INT32` of days since the epoch.
+    Date,
+    /// `TIMESTAMP`: an `INT64` of `unit` since the epoch.
+    Timestamp {
+        unit: TimeUnit,
+        is_adjusted_to_utc: bool,
+    },
     Other,
 }
 
@@ -44,6 +55,33 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for LogicalType {
                 LogicalType::Integer {
                     bit_width,
                     is_signed,
+                }
+            }
+            // DATE: empty struct
+            6 => {
+                prot.skip_empty_struct()?;
+                LogicalType::Date
+            }
+            // TIMESTAMP: struct { 1: bool isAdjustedToUTC, 2: TimeUnit unit }
+            8 => {
+                let mut is_adjusted_to_utc = false;
+                let mut unit = TimeUnit::MILLIS;
+                let mut last_field_id = 0i16;
+                loop {
+                    let fi = prot.read_field_begin(last_field_id)?;
+                    if fi.field_type == FieldType::Stop {
+                        break;
+                    }
+                    match fi.id {
+                        1 => is_adjusted_to_utc = fi.bool_val.unwrap_or(false),
+                        2 => unit = TimeUnit::read_thrift(prot)?,
+                        _ => prot.skip(fi.field_type)?,
+                    }
+                    last_field_id = fi.id;
+                }
+                LogicalType::Timestamp {
+                    unit,
+                    is_adjusted_to_utc,
                 }
             }
             // Any other variant — skip it

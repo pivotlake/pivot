@@ -1,8 +1,9 @@
 -- Pivot-flavoured ClickBench schema. Maps the original ClickBench schema onto
--- the SQL types pivot's planner currently understands (BIGINT, INTEGER,
--- SMALLINT, VARCHAR). Columns that ClickBench declares as TIMESTAMP/DATE land
--- as integers since the source parquet files store them as packed seconds /
--- days. CHAR(...) columns are widened to VARCHAR.
+-- the SQL types pivot's planner understands (BIGINT, INTEGER, SMALLINT,
+-- VARCHAR). EventTime/EventDate are stored in the source parquet as packed
+-- epoch seconds / days, so they're declared as their integer storage type here;
+-- the queries read them as real dates on demand via `make_timestamp(EventTime)` and
+-- `make_date(EventDate)`. CHAR(...) columns are widened to VARCHAR.
 --
 -- The runner substitutes `{source}` with the value of `--source`.
 CREATE TABLE hits (
@@ -10,8 +11,8 @@ CREATE TABLE hits (
     JavaEnable SMALLINT,
     Title VARCHAR,
     GoodEvent SMALLINT,
-    EventTime TIMESTAMP,
-    EventDate DATE,
+    EventTime BIGINT,
+    EventDate USMALLINT,
     CounterID INTEGER,
     ClientIP INTEGER,
     RegionID INTEGER,

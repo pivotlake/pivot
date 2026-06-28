@@ -7,39 +7,43 @@
 //! [`ExprFn`]. This module holds the cross-cutting
 //! pieces: the [`Expression`] / [`Function`] enums that tie the kinds together,
 //! the conversion [`enum@Error`], the pushed-down [`TableFilter`], and the small
-//! `Display`/constant helpers shared across kinds. The comparison-coercion
-//! helper used by more than one `compile` impl lives in the `shared` module.
+//! `Display`/constant helpers shared across kinds.
 
 mod aggregate;
 mod arithmetic;
 mod between;
 mod case;
+mod cast;
 mod compare;
 mod conjunction;
 mod contains;
+mod convert;
 mod date_part;
 mod date_trunc;
 mod divide;
 mod function;
 mod in_list;
+mod interval;
 mod length;
 mod not;
 mod reference;
 mod regexp;
-mod shared;
 
 pub use aggregate::{AggregateFunc, CountStar, NumericAggregate};
 pub use arithmetic::{Arithmetic, ArithmeticOp};
 pub use between::Between;
 pub use case::{Case, CaseCheck};
+pub use cast::Cast;
 pub use compare::{Compare, CompareType};
 pub use conjunction::{Conjunction, ConjunctionOp};
 pub use contains::Contains;
+pub use convert::TemporalConvert;
 pub use date_part::{DatePart, DatePartKind};
 pub use date_trunc::DateTrunc;
 pub use divide::Divide;
 pub use function::{Function, ScalarFunctionSignature, builtin_scalar_function};
 pub use in_list::InList;
+pub use interval::IntervalArithmetic;
 pub use length::Length;
 pub use not::Not;
 pub use reference::Ref;
@@ -71,6 +75,8 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
+    #[error("Unsupported interval arithmetic: {0}")]
+    UnsupportedInterval(String),
 }
 
 /// Extract a constant string argument (e.g. a regex pattern or a `date_trunc`
@@ -119,6 +125,7 @@ pub enum Expression {
     Conjunction(Conjunction),
     Case(Case),
     Not(Not),
+    Cast(Cast),
 }
 
 impl Expression {
@@ -142,8 +149,14 @@ impl Expression {
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
-            // `date_trunc` yields a timestamp; `regexp_replace` a string.
-            Expression::Function(Function::DateTrunc(_)) => Ok(Type::Timestamp),
+            // A cast yields its target type.
+            Expression::Cast(c) => Ok(c.target.clone()),
+            // `date_trunc` and `now()` yield a timestamp; `regexp_replace` a string.
+            Expression::Function(Function::DateTrunc(_) | Function::Now) => Ok(Type::Timestamp),
+            // `date`/`timestamp` ± interval keeps the temporal operand's type.
+            Expression::Function(Function::IntervalArithmetic(i)) => Ok(i.result.clone()),
+            // `make_date`/`make_timestamp` produce the temporal type they convert to.
+            Expression::Function(Function::TemporalConvert(c)) => Ok(c.result.clone()),
             Expression::Function(Function::RegexpReplace(_)) => Ok(Type::Utf8),
             // Integer-valued scalar functions: a date part (`extract(minute …)`),
             // a byte length, and integer arithmetic (`a * 2`, `ip - 1`).
@@ -171,6 +184,7 @@ impl Expression {
             Expression::Conjunction(c) => c.compile(),
             Expression::Case(c) => c.compile(),
             Expression::Not(n) => n.compile(),
+            Expression::Cast(c) => c.compile(),
             _ => Err(compile::Error::UnsupportedExpression(self.clone())),
         }
     }
@@ -189,6 +203,7 @@ impl Display for Expression {
             Expression::Conjunction(c) => write!(f, "{c}"),
             Expression::Case(c) => write!(f, "{c}"),
             Expression::Not(n) => write!(f, "{n}"),
+            Expression::Cast(c) => write!(f, "{c}"),
         }
     }
 }
@@ -211,6 +226,7 @@ impl TryFrom<duckdb_expression::Expression> for Expression {
             duckdb_expression::Expression::Conjunction(c) => Expression::Conjunction(c.try_into()?),
             duckdb_expression::Expression::Case(c) => Expression::Case(c.try_into()?),
             duckdb_expression::Expression::Not(n) => Expression::Not(n.try_into()?),
+            duckdb_expression::Expression::Cast(c) => Expression::Cast(c.try_into()?),
         })
     }
 }

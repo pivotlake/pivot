@@ -18,16 +18,20 @@ mod global;
 mod global_distinct;
 mod grouped;
 mod grouped_distinct;
+mod reinterpret;
 
+use self::reinterpret::{reinterpret_columns, temporal_to_int};
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
 use crate::types::Type;
+use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 use dispatch::{
     AggregationKind, AggregationSlot, GroupLimit, RecordBatchOperatorSpec, RowKeySchema,
 };
 use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
+use std::sync::Arc;
 
 /// GROUP BY + aggregate functions.
 #[derive(Debug)]
@@ -92,6 +96,15 @@ impl Aggregate {
             return self.compile_global_distinct(input, a);
         }
 
+        // Aggregates compute on the int a temporal column stores (a DATE is Int32
+        // days, a TIMESTAMP is Int64 seconds), so reinterpret any temporal value
+        // column to that int before the readers see it, and restore the temporal
+        // type on the output (group keys, and MIN/MAX of a date) afterwards. The
+        // int-ify is gated to a MIN/MAX of a date/timestamp, so ordinary
+        // aggregates and a plain `GROUP BY date` (whose key the row reader already
+        // casts) pay nothing.
+        let input = self.int_ify_temporal_values(input);
+
         // One `COUNT(DISTINCT)` over a GROUP BY, alone or mixed with non-distinct
         // aggregates, lowers to a two-level GROUP BY.
         let n_distinct = self
@@ -104,17 +117,57 @@ impl Aggregate {
                 )
             })
             .count();
-        if !self.groups.is_empty() && n_distinct == 1 {
-            return self.compile_grouped_distinct(input);
-        }
+        let grouped = if !self.groups.is_empty() && n_distinct == 1 {
+            self.compile_grouped_distinct(input)?
+        } else if self.groups.is_empty() {
+            self.compile_global(input)?
+        } else {
+            // Every GROUP BY (plain column keys, two-int-key, the row fallback, or
+            // a single computed key) lowers through the general grouped path.
+            self.compile_grouped(input)?
+        };
+        Ok(self.restore_temporal_output(grouped))
+    }
 
-        if self.groups.is_empty() {
-            return self.compile_global(input);
+    /// Reinterpret every temporal column of the aggregate input to the int it
+    /// stores (`Date32 -> Int32`, `Timestamp -> Int64`), zero-copy, so the value
+    /// readers (which only know int columns) can read a `MIN`/`MAX` of a date.
+    /// A no-op unless the aggregate actually takes a `MIN`/`MAX` of a date/
+    /// timestamp, so the common paths are untouched.
+    fn int_ify_temporal_values(&self, input: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+        let has_temporal_value = self
+            .expressions
+            .iter()
+            .any(|e| aggregate_value_temporal(e).is_some());
+        if !has_temporal_value {
+            return input;
         }
+        input.project(|| {
+            |batch: RecordBatch| reinterpret_columns(batch, |_, dt| temporal_to_int(dt))
+        })
+    }
 
-        // Every GROUP BY (plain column keys, two-int-key, the row fallback, or a
-        // single computed key) lowers through the general grouped path.
-        self.compile_grouped(input)
+    /// Restore the temporal arrow type on the grouped/global output's columns:
+    /// the group-key columns lead (one per `self.groups`, typed by its
+    /// `result_type`), followed by one value column per `self.expressions` (typed
+    /// only for a `MIN`/`MAX` of a date). Zero-copy where the widths match.
+    fn restore_temporal_output(&self, op: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+        let mut targets: Vec<Option<DataType>> = self
+            .groups
+            .iter()
+            .map(|g| g.result_type().ok().and_then(|t| temporal_output_type(&t)))
+            .collect();
+        targets.extend(self.expressions.iter().map(aggregate_value_temporal));
+        if !targets.iter().any(Option::is_some) {
+            return op;
+        }
+        let targets = Arc::new(targets);
+        op.project(move || {
+            let targets = targets.clone();
+            move |batch: RecordBatch| {
+                reinterpret_columns(batch, |i, _| targets.get(i).and_then(Option::clone))
+            }
+        })
     }
 
     fn is_lone_count_star(&self) -> bool {
@@ -130,6 +183,13 @@ impl Aggregate {
 /// `MIN`/`MAX` over a `Utf8` column folds the byte extreme (`StrMin`/`StrMax`);
 /// over an integer column the numeric one. `COUNT(*)` ignores its column, so the
 /// index is a placeholder.
+///
+/// Each slot's output type is DuckDB's declared result type for the call (its
+/// physical arrow type: `BIGINT`→`Int64` for a count, `HUGEINT`→`Decimal128` for
+/// a sum, the input type for a `MIN`/`MAX`). The accumulator may store it at a
+/// different width; the output phase casts to this. A `MIN`/`MAX` of a date keeps
+/// its physical int here and is restored to the temporal type by
+/// [`Aggregate::restore_temporal_output`], the one place dates are coerced.
 fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error> {
     exprs
         .iter()
@@ -137,30 +197,35 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
             let Expression::AggregateFunc(func) = e else {
                 return Err(Error::UnsupportedAggregateExpression(e.clone()));
             };
-            Ok(match func {
-                AggregateFunc::CountStar(_) => AggregationSlot::new(AggregationKind::CountStar, 0),
-                AggregateFunc::Count(a) => {
-                    AggregationSlot::new(AggregationKind::Count, a.column.column_idx)
-                }
-                AggregateFunc::Sum(a) => {
-                    AggregationSlot::new(AggregationKind::Sum, a.column.column_idx)
-                }
-                AggregateFunc::Min(a) => extreme_kind(
-                    &a.column.return_type,
-                    AggregationKind::StrMin,
-                    AggregationKind::Min,
-                )
-                .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
-                .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
-                AggregateFunc::Max(a) => extreme_kind(
-                    &a.column.return_type,
-                    AggregationKind::StrMax,
-                    AggregationKind::Max,
-                )
-                .map(|kind| AggregationSlot::new(kind, a.column.column_idx))
-                .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
+            let (kind, column) = match func {
+                AggregateFunc::CountStar(_) => (AggregationKind::CountStar, 0),
+                AggregateFunc::Count(a) => (AggregationKind::Count, a.column.column_idx),
+                AggregateFunc::Sum(a) => (AggregationKind::Sum, a.column.column_idx),
+                AggregateFunc::Min(a) => (
+                    extreme_kind(
+                        &a.column.return_type,
+                        AggregationKind::StrMin,
+                        AggregationKind::Min,
+                    )
+                    .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
+                    a.column.column_idx,
+                ),
+                AggregateFunc::Max(a) => (
+                    extreme_kind(
+                        &a.column.return_type,
+                        AggregationKind::StrMax,
+                        AggregationKind::Max,
+                    )
+                    .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
+                    a.column.column_idx,
+                ),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
-            })
+            };
+            Ok(AggregationSlot::new(
+                kind,
+                column,
+                crate::types::physical_arrow_type(func.return_type()),
+            ))
         })
         .collect()
 }
@@ -168,8 +233,10 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
 /// The MIN/MAX kind for a column of type `ty`: the byte-wise `string` extreme for
 /// a `Utf8` column (folded through the value container's arena path), the
 /// `numeric` extreme for the integer widths the executor can read
-/// (`Int16`/`Int32`/`Int64`). `None` for any other type, so the caller reports a
-/// clean `UnsupportedAggregateExpression` rather than a worker panic in the reader.
+/// (`Int16`/`Int32`/`Int64`) and for `Date`/`Timestamp` (which the reader sees as
+/// the int they store, after [`Aggregate::int_ify_temporal_values`]). `None` for
+/// any other type, so the caller reports a clean `UnsupportedAggregateExpression`
+/// rather than a worker panic in the reader.
 fn extreme_kind(
     ty: &Type,
     string: AggregationKind,
@@ -177,7 +244,39 @@ fn extreme_kind(
 ) -> Option<AggregationKind> {
     match ty {
         Type::Utf8 => Some(string),
-        Type::Int16 | Type::Int32 | Type::Int64 => Some(numeric),
+        // UInt8/16/32 fold losslessly through the reader's i64 accumulator;
+        // UInt64 is excluded (it would wrap above i64::MAX) so it reports a clean
+        // unsupported error rather than a silently wrong extreme.
+        Type::Int8
+        | Type::Int16
+        | Type::Int32
+        | Type::Int64
+        | Type::UInt8
+        | Type::UInt16
+        | Type::UInt32
+        | Type::Date
+        | Type::Timestamp => Some(numeric),
+        _ => None,
+    }
+}
+
+/// The arrow output type of a temporal `Type`, or `None` for a non-temporal one.
+/// A temporal type is one whose canonical arrow type has a backing int form
+/// ([`temporal_to_int`]); that int is what the group-by computes on, and this
+/// canonical type is restored on its output. The one place dates are coerced.
+pub(super) fn temporal_output_type(t: &Type) -> Option<DataType> {
+    let arrow = crate::types::physical_arrow_type(t);
+    temporal_to_int(&arrow).is_some().then_some(arrow)
+}
+
+/// The temporal arrow type a `MIN`/`MAX` aggregate emits, or `None` for any other
+/// expression (or a `MIN`/`MAX` over a non-temporal column). Used to gate the
+/// int-ify of value columns and to restore the temporal type on the output.
+fn aggregate_value_temporal(e: &Expression) -> Option<DataType> {
+    match e {
+        Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a)) => {
+            temporal_output_type(&a.column.return_type)
+        }
         _ => None,
     }
 }
@@ -200,22 +299,19 @@ pub(super) fn row_key_schema<'a>(
 
 /// The arrow type the row encoder uses for one group-key column, or `None` for a
 /// type it can't encode.
+///
+/// Only the integer widths and `Utf8View` are byte-packable into a row key,
+/// exactly the rule [`RowKeySchema::new`](dispatch::RowKeySchema) enforces. A
+/// `DATE`/`TIMESTAMP` key drops to its backing int ([`temporal_to_int`]) and
+/// rides along for free; the row reader casts each key column to this type, so
+/// grouping on the integer day/second count is lossless (the temporal type is
+/// restored on the output). `Boolean`/`Float64`/`Decimal`/`Int128` can't pack,
+/// so they return `None` for a clean "unsupported" rather than a panic in
+/// `RowKeySchema::new`.
 fn row_key_arrow_type(t: &Type) -> Option<DataType> {
-    Some(match t {
-        Type::Int8 => DataType::Int8,
-        Type::Int16 => DataType::Int16,
-        Type::Int32 => DataType::Int32,
-        Type::Int64 => DataType::Int64,
-        Type::Utf8 => DataType::Utf8View,
-        // DATE is days-since-epoch (arrives as Date32 or the parquet-physical
-        // integer); TIMESTAMP is Int64 epoch seconds. The row reader casts each
-        // key column to the schema type, so encoding them as their integer
-        // day/second count is lossless and groups identically. This is what lets
-        // a wide key tuple like `(Int64, Date)` group instead of erroring.
-        Type::Date => DataType::Int32,
-        Type::Timestamp => DataType::Int64,
-        _ => return None,
-    })
+    let dt = crate::types::physical_arrow_type(t);
+    let dt = temporal_to_int(&dt).unwrap_or(dt);
+    (dt.is_integer() || dt == DataType::Utf8View).then_some(dt)
 }
 
 /// The accumulator-width rule shared by the global and grouped paths: `i128`

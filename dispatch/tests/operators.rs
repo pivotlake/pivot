@@ -25,7 +25,11 @@ fn count() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 
@@ -54,7 +58,11 @@ fn filter_string_contains() {
                 )
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 
@@ -80,7 +88,11 @@ fn filter_no_matches_returns_zero() {
                 )
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 
@@ -106,7 +118,11 @@ fn filter_integer_column() {
                 }))
             }
         })
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 
@@ -188,7 +204,11 @@ fn group_by_count_string_keys() {
         .record_batches()
         .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
             vec![0],
-            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            vec![AggregationSlot::new(
+                AggregationKind::CountStar,
+                0,
+                DataType::Int64,
+            )],
             None,
             (),
         )
@@ -213,7 +233,11 @@ fn group_by_count_int_keys() {
         .record_batches()
         .group_by_aggregate::<IntKeyExtractor<Int64Type>, Compiled<(CountSlot,)>>(
             vec![0],
-            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            vec![AggregationSlot::new(
+                AggregationKind::CountStar,
+                0,
+                DataType::Int64,
+            )],
             None,
             (),
         )
@@ -298,7 +322,11 @@ fn group_by_count_row_key_with_string_field() {
         .record_batches()
         .group_by_aggregate::<RowKeyExtractor, Compiled<(CountSlot,)>>(
             vec![0, 1],
-            vec![AggregationSlot::new(AggregationKind::CountStar, 0)],
+            vec![AggregationSlot::new(
+                AggregationKind::CountStar,
+                0,
+                DataType::Int64,
+            )],
             None,
             RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]),
         )

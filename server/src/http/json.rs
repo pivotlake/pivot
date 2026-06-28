@@ -15,7 +15,9 @@ pub(super) struct ColumnOut {
 /// Render result batches (heap-backed via CopyOut, see [`crate::query_handler`])
 /// as JSON columns + text cells - the universally-safe representation, like the
 /// wire protocol's text format. `null` for SQL NULL.
-pub(super) fn batches_to_json(batches: &[RecordBatch]) -> (Vec<ColumnOut>, Vec<Vec<Option<String>>>) {
+pub(super) fn batches_to_json(
+    batches: &[RecordBatch],
+) -> (Vec<ColumnOut>, Vec<Vec<Option<String>>>) {
     let Some(first) = batches.first() else {
         return (Vec::new(), Vec::new());
     };

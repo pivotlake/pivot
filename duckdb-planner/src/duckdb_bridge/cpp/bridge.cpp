@@ -27,6 +27,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -713,7 +714,17 @@ uint8_t expr_constant_type(const Expression &expr) {
 }
 
 rust::String expr_constant_value(const Expression &expr) {
-	return rust::String::lossy(as_expr<duckdb::BoundConstantExpression>(expr).value.ToString());
+	auto &value = as_expr<duckdb::BoundConstantExpression>(expr).value;
+	// An INTERVAL's string form ("1 month 2 days …") is ambiguous to parse, so
+	// emit its three independent components ("<months> <days> <micros>") for the
+	// Rust side to read directly.
+	if (value.type().id() == duckdb::LogicalTypeId::INTERVAL) {
+		auto interval = value.GetValue<duckdb::interval_t>();
+		return rust::String::lossy(std::to_string(interval.months) + " " +
+		                           std::to_string(interval.days) + " " +
+		                           std::to_string(interval.micros));
+	}
+	return rust::String::lossy(value.ToString());
 }
 
 size_t expr_ref_index(const Expression &expr) {

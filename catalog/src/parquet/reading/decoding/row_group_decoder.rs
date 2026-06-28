@@ -17,10 +17,11 @@ use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, UInt16Type,
+    ArrowPrimitiveType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    TimestampSecondType, UInt16Type,
 };
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
-use arrow_schema::{ArrowError, DataType, SchemaRef};
+use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
 use std::sync::Arc;
@@ -71,6 +72,8 @@ fn column_decoder_for_type(
         DataType::Int16 => Ok(primitive!(Int16Type)),
         DataType::Int32 => Ok(primitive!(Int32Type)),
         DataType::Int64 => Ok(primitive!(Int64Type)),
+        DataType::Date32 => Ok(primitive!(Date32Type)),
+        DataType::Timestamp(TimeUnit::Second, None) => Ok(primitive!(TimestampSecondType)),
         DataType::Float32 => Ok(primitive!(Float32Type)),
         DataType::Float64 => Ok(primitive!(Float64Type)),
         DataType::Utf8View

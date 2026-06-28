@@ -126,3 +126,31 @@ fn build_dynamic_scan_predicates(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use crate::types::Type;
+    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_schema::DataType;
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    #[rstest]
+    fn date_column_scans_as_a_real_date(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "d",
+                Type::Date,
+                Arc::new(Int32Array::from(vec![0, 7])) as ArrayRef,
+            )],
+        );
+
+        let batches = run_batches(&mut testing_planner, "SELECT d FROM events");
+
+        // The DATE column is stored as Int32 days but must surface as a real
+        // Date32 (reinterpreted zero-copy at the scan), so it renders as a date.
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Date32);
+    }
+}
