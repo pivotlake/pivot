@@ -30,7 +30,7 @@ use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::{
     ColumnChunk, ColumnMetaData, FileMetaData, RowGroup, SchemaElement, Statistics,
 };
-use thriftparquet::general::{Encoding, Type};
+use thriftparquet::general::Encoding;
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use super::error::{WriteError, WriteResult};
@@ -43,10 +43,11 @@ const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 const REPETITION_REQUIRED: i32 = 0;
 /// Parquet `CompressionCodec::SNAPPY`.
 const SNAPPY_CODEC: i32 = 1;
-/// Parquet `ConvertedType::UTF8` — marks a BYTE_ARRAY column as a string.
-const CONVERTED_TYPE_UTF8: i32 = 0;
 /// Parquet format version written into the footer.
 const PARQUET_VERSION: i32 = 1;
+/// Parquet `ConvertedType::UTF8` — marks a BYTE_ARRAY column as a string so
+/// readers surface it as text rather than opaque bytes.
+const CONVERTED_UTF8: i32 = 0;
 
 pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
 
@@ -335,7 +336,7 @@ fn write_column_chunk(
     Ok(ColumnChunk {
         file_offset: chunk_start,
         meta_data: Some(ColumnMetaData {
-            physical_type: physical_type(field.data_type())?,
+            physical_type: catalog::parquet::arrow_to_parquet_physical(field.data_type())?,
             encodings,
             path_in_schema: vec![field.name().clone()],
             codec: SNAPPY_CODEC,
@@ -364,11 +365,16 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
     });
     for field in schema.fields() {
         elements.push(SchemaElement {
-            physical_type: Some(physical_type(field.data_type())?),
+            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(
+                field.data_type(),
+            )?),
             repetition_type: Some(REPETITION_REQUIRED),
             name: field.name().clone(),
             num_children: None,
-            converted_type: converted_type(field.data_type()),
+            converted_type: match field.data_type() {
+                DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_UTF8),
+                _ => None,
+            },
             logical_type: None,
         });
     }
@@ -383,28 +389,6 @@ fn write_footer(out: &mut Vec<u8>, file_meta: &FileMetaData) -> WriteResult<()> 
     out.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     out.extend_from_slice(PARQUET_MAGIC);
     Ok(())
-}
-
-/// Map an Arrow type to its Parquet physical type id (matching the reader's
-/// `convert_physical_to_arrow`). Errors on types the encoder does not handle.
-fn physical_type(data_type: &DataType) -> WriteResult<i32> {
-    Ok(match data_type {
-        DataType::Int32 => Type::INT32 as i32,
-        DataType::Int64 => Type::INT64 as i32,
-        DataType::Float32 => Type::FLOAT as i32,
-        DataType::Float64 => Type::DOUBLE as i32,
-        DataType::Utf8 | DataType::Utf8View => Type::BYTE_ARRAY as i32,
-        other => return Err(WriteError::UnsupportedType(other.clone())),
-    })
-}
-
-/// The Parquet converted type for a column, if any. Marks string columns as
-/// UTF8 so readers surface them as text rather than opaque bytes.
-fn converted_type(data_type: &DataType) -> Option<i32> {
-    match data_type {
-        DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_TYPE_UTF8),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

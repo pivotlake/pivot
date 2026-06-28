@@ -1,6 +1,6 @@
 //! [`Between`] — a `BETWEEN` range test.
 
-use super::shared::{CmpKernel, compare_coerced};
+use super::compare::CmpKernel;
 use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::boolean::and;
@@ -62,8 +62,10 @@ impl Between {
                 let input = input_expr(batch);
                 let lower = lower_expr(batch);
                 let upper = upper_expr(batch);
-                let ge = compare_coerced(input.as_datum(), lower.as_datum(), lower_kernel);
-                let le = compare_coerced(input.as_datum(), upper.as_datum(), upper_kernel);
+                let ge = lower_kernel(input.as_datum(), lower.as_datum())
+                    .expect("BETWEEN operands share a type");
+                let le = upper_kernel(input.as_datum(), upper.as_datum())
+                    .expect("BETWEEN operands share a type");
                 ExprResult::Array(Arc::new(and(&ge, &le).unwrap()) as ArrayRef)
             }) as ExprEvalFn
         }))

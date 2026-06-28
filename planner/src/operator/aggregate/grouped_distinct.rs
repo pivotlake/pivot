@@ -212,7 +212,13 @@ fn refold_partial_type(func: &AggregateFunc) -> Type {
 /// re-extremise them with the same direction. `func` is one of those five kinds
 /// (the caller's match guarantees it).
 fn refold_expr(func: &AggregateFunc, partial: Ref) -> Expression {
-    let agg = NumericAggregate { column: partial };
+    // The re-fold's result column keeps the original aggregate's declared type
+    // (a re-summed COUNT is still a BIGINT, a re-summed SUM still a HUGEINT, a
+    // re-extremised MIN/MAX still the input type).
+    let agg = NumericAggregate {
+        column: partial,
+        return_type: func.return_type().clone(),
+    };
     Expression::AggregateFunc(match func {
         AggregateFunc::Min(_) => AggregateFunc::Min(agg),
         AggregateFunc::Max(_) => AggregateFunc::Max(agg),
@@ -220,7 +226,10 @@ fn refold_expr(func: &AggregateFunc, partial: Ref) -> Expression {
     })
 }
 
-/// A synthetic `COUNT(*)` expression.
+/// A synthetic `COUNT(*)` expression (a `BIGINT` row count).
 fn count_star_expr() -> Expression {
-    Expression::AggregateFunc(AggregateFunc::CountStar(CountStar { params: Vec::new() }))
+    Expression::AggregateFunc(AggregateFunc::CountStar(CountStar {
+        params: Vec::new(),
+        return_type: Type::Int64,
+    }))
 }

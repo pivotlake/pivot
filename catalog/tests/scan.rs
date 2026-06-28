@@ -109,7 +109,11 @@ fn scan_multiple_parquet_files() {
     let table = parquet_table_from_dir(&dispatch, dir.path());
 
     let results = table_input(&dispatch, &table, Projection::all(2), false)
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 
@@ -143,7 +147,11 @@ fn scan_empty_table() {
     let (_dir, table) = parquet_table(&dispatch, &[strings_and_ints(&[], &[])], true);
 
     let results = table_input(&dispatch, &table, Projection::all(0), false)
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect()
         .unwrap();
 

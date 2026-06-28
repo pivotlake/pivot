@@ -376,7 +376,11 @@ mod tests {
         agg.consume_batch(
             &batch,
             &[0],
-            &[AggregationSlot::new(AggregationKind::CountStar, 0)],
+            &[AggregationSlot::new(
+                AggregationKind::CountStar,
+                0,
+                DataType::Int64,
+            )],
             &(),
             &COUNT_CFG,
         );
@@ -570,7 +574,11 @@ mod tests {
             agg.consume_batch(
                 &batch,
                 &[0],
-                &[AggregationSlot::new(AggregationKind::CountStar, 0)],
+                &[AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
                 &(),
                 &COUNT_CFG,
             );

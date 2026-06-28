@@ -1,3 +1,4 @@
+pub mod arrow_map;
 pub mod filter_mask;
 pub mod metadata;
 pub mod page;

@@ -742,32 +742,39 @@ fn group_by_int64_and_date_columns(mut testing_planner: TestingPlanner) {
         .unwrap();
 
     let mut rows = batches_to_json(&results);
-    rows.sort_by_key(|r| (r["id"].as_i64().unwrap(), r["d"].as_i64().unwrap()));
+    // The Date key surfaces as a real date (day 10 -> 1970-01-11, day 20 ->
+    // 1970-01-21), even though it travels through the row encoder as an integer.
+    rows.sort_by_key(|r| {
+        (
+            r["id"].as_i64().unwrap(),
+            r["d"].as_str().unwrap().to_string(),
+        )
+    });
 
     assert_eq!(rows.len(), 3);
     assert_eq!(
         (
             rows[0]["id"].as_i64(),
-            rows[0]["d"].as_i64(),
-            rows[0]["count_star()"].as_i64()
+            rows[0]["d"].as_str(),
+            rows[0]["count_star()"].as_i64(),
         ),
-        (Some(100), Some(10), Some(2))
+        (Some(100), Some("1970-01-11"), Some(2))
     );
     assert_eq!(
         (
             rows[1]["id"].as_i64(),
-            rows[1]["d"].as_i64(),
-            rows[1]["count_star()"].as_i64()
+            rows[1]["d"].as_str(),
+            rows[1]["count_star()"].as_i64(),
         ),
-        (Some(100), Some(20), Some(1))
+        (Some(100), Some("1970-01-21"), Some(1))
     );
     assert_eq!(
         (
             rows[2]["id"].as_i64(),
-            rows[2]["d"].as_i64(),
-            rows[2]["count_star()"].as_i64()
+            rows[2]["d"].as_str(),
+            rows[2]["count_star()"].as_i64(),
         ),
-        (Some(200), Some(10), Some(2))
+        (Some(200), Some("1970-01-11"), Some(2))
     );
 }
 

@@ -7,6 +7,7 @@ mod common;
 
 use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_buffer::BooleanBuffer;
+use arrow_schema::DataType;
 
 use common::*;
 use dispatch::{AggregationKind, AggregationSlot, values_input};
@@ -23,7 +24,11 @@ fn panic_in_filter_returns_error() {
     let result = values_input(&dispatch, vec![batch])
         .record_batches()
         .filter(|| move |_batch: &RecordBatch| panic!("intentional panic in filter"))
-        .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0)])
+        .aggregate::<i64>(vec![AggregationSlot::new(
+            AggregationKind::CountStar,
+            0,
+            DataType::Int64,
+        )])
         .collect();
 
     // Assert: collect() returned an error mentioning the panic.

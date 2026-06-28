@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 
@@ -60,131 +60,105 @@ impl From<RecordBatch> for PGRowBatch {
     }
 }
 
-/// Encode a single cell. We always feed the encoder a typed Rust value (or
-/// `Option::None` for SQL NULL) so pgwire's `ToSqlText` impl handles the
-/// formatting — no manual `to_string()` round-trips.
-fn encode_cell(encoder: &mut DataRowEncoder, arr: &dyn Array, row: usize) {
-    if arr.is_null(row) {
-        // Type doesn't matter for null encoding — the encoder writes -1 length.
-        let _ = encoder.encode_field::<Option<&str>>(&None);
-        return;
-    }
-    let _ = match arr.data_type() {
-        DataType::Boolean => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap()
-                .value(row),
-        ),
-        DataType::Int8 => {
-            encoder.encode_field(&arr.as_any().downcast_ref::<Int8Array>().unwrap().value(row))
+/// Generates [`pg_type_for_arrow`] (schema: arrow type -> Postgres OID) and
+/// [`encode_cell`] (data: one cell -> pgwire field) from one table, so the OID a
+/// column advertises and the value its rows carry are declared together and
+/// can't drift.
+///
+/// Two sections, because Postgres has no unsigned types:
+///
+/// - `direct`: value encoded straight from `array.value(row)`, OID one-to-one.
+///   Row shape `(arrow DataType, arrow array type, Postgres Type)`.
+/// - `widened`: an unsigned int that widens to the next signed type on the wire.
+///   Row adds the signed cast target: `(DataType, array type, Postgres Type, signed)`.
+///
+/// The arms that fit neither shape stay spelled out: `UInt64` (no signed type
+/// fits, so it ships as TEXT via `to_string`), `Decimal128` (NUMERIC via
+/// `value_as_string`), and the advertise-only `Binary`/`LargeUtf8` that fall
+/// through to the best-effort text fallback in `encode_cell`.
+macro_rules! arrow_pg_types {
+    (
+        direct: [ $( ($dt:ident, $array:ty, $pg:ident) ),+ $(,)? ],
+        widened: [ $( ($udt:ident, $uarray:ty, $upg:ident, $signed:ty) ),+ $(,)? ] $(,)?
+    ) => {
+        /// Map an Arrow [`DataType`] to its closest Postgres [`Type`]. Values we
+        /// can't represent precisely fall back to [`Type::TEXT`].
+        fn pg_type_for_arrow(dt: &DataType) -> Type {
+            match dt {
+                $( DataType::$dt => Type::$pg, )+
+                $( DataType::$udt => Type::$upg, )+
+                // UInt64 can't fit any signed type, so it ships as TEXT.
+                DataType::UInt64 => Type::TEXT,
+                DataType::Decimal128(_, _) => Type::NUMERIC,
+                // Temporal types reinterpreted from the executor's int columns at
+                // the output boundary (see `encode_cell`).
+                DataType::Date32 => Type::DATE,
+                DataType::Timestamp(_, _) => Type::TIMESTAMP,
+                // Advertised but encoded via the text fallback below.
+                DataType::LargeUtf8 => Type::TEXT,
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Type::BYTEA,
+                _ => Type::TEXT,
+            }
         }
-        DataType::Int16 => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<Int16Array>()
-                .unwrap()
-                .value(row),
-        ),
-        DataType::Int32 => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap()
-                .value(row),
-        ),
-        DataType::Int64 => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(row),
-        ),
-        // Postgres has no unsigned types; widen to the next signed type so
-        // values fit. UInt64 is reported as TEXT (see [`pg_type_for_arrow`]).
-        DataType::UInt8 => encoder.encode_field(
-            &(arr
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .unwrap()
-                .value(row) as i16),
-        ),
-        DataType::UInt16 => encoder.encode_field(
-            &(arr
-                .as_any()
-                .downcast_ref::<UInt16Array>()
-                .unwrap()
-                .value(row) as i32),
-        ),
-        DataType::UInt32 => encoder.encode_field(
-            &(arr
-                .as_any()
-                .downcast_ref::<UInt32Array>()
-                .unwrap()
-                .value(row) as i64),
-        ),
-        DataType::UInt64 => {
-            let v = arr
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap()
-                .value(row);
-            encoder.encode_field(&v.to_string())
+
+        /// Encode a single cell. We always feed the encoder a typed Rust value
+        /// (or `Option::None` for SQL NULL) so pgwire's `ToSqlText` impl handles
+        /// the formatting, with no manual `to_string()` round-trips.
+        fn encode_cell(encoder: &mut DataRowEncoder, arr: &dyn Array, row: usize) {
+            if arr.is_null(row) {
+                // Type is irrelevant for null encoding: the encoder writes -1 length.
+                let _ = encoder.encode_field::<Option<&str>>(&None);
+                return;
+            }
+            let _ = match arr.data_type() {
+                $( DataType::$dt => encoder
+                    .encode_field(&arr.as_any().downcast_ref::<$array>().unwrap().value(row)), )+
+                // Unsigned ints widen to the next signed type so the value fits.
+                $( DataType::$udt => encoder
+                    .encode_field(&(arr.as_any().downcast_ref::<$uarray>().unwrap().value(row) as $signed)), )+
+                DataType::UInt64 => encoder
+                    .encode_field(&arr.as_any().downcast_ref::<UInt64Array>().unwrap().value(row).to_string()),
+                // Decimal128 (e.g. the SUM aggregate output). `value_as_string`
+                // renders the integer/decimal with its scale applied; scale 0
+                // yields a plain integer like "12345".
+                DataType::Decimal128(_, _) => encoder.encode_field(
+                    &arr.as_any().downcast_ref::<Decimal128Array>().unwrap().value_as_string(row),
+                ),
+                // Temporal columns render in text format as their ISO string,
+                // which is also Postgres's text wire form for DATE/TIMESTAMP.
+                // The executor only ever produces second-granularity timestamps.
+                DataType::Date32 => encoder.encode_field(
+                    &arr.as_any().downcast_ref::<Date32Array>().unwrap()
+                        .value_as_date(row).map(|d| d.to_string()),
+                ),
+                DataType::Timestamp(_, _) => encoder.encode_field(
+                    &arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap()
+                        .value_as_datetime(row).map(|t| t.to_string()),
+                ),
+                // Best-effort fallback: stringify and ship as text.
+                _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
+            };
         }
-        DataType::Float32 => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap()
-                .value(row),
-        ),
-        DataType::Float64 => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<Float64Array>()
-                .unwrap()
-                .value(row),
-        ),
-        DataType::Utf8 => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(row),
-        ),
-        DataType::Utf8View => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<StringViewArray>()
-                .unwrap()
-                .value(row),
-        ),
-        // Decimal128 (e.g. the SUM aggregate output). `value_as_string`
-        // renders the integer/decimal with its scale applied — scale 0 yields
-        // a plain integer like "12345".
-        DataType::Decimal128(_, _) => encoder.encode_field(
-            &arr.as_any()
-                .downcast_ref::<Decimal128Array>()
-                .unwrap()
-                .value_as_string(row),
-        ),
-        // Best-effort fallback: stringify and ship as text.
-        _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
     };
 }
 
-/// Map an Arrow [`DataType`] to its closest Postgres [`Type`]. Values we can't
-/// represent precisely fall back to [`Type::TEXT`].
-fn pg_type_for_arrow(dt: &DataType) -> Type {
-    match dt {
-        DataType::Boolean => Type::BOOL,
-        DataType::Int8 | DataType::Int16 => Type::INT2,
-        DataType::Int32 => Type::INT4,
-        DataType::Int64 => Type::INT8,
-        DataType::UInt8 => Type::INT2,
-        DataType::UInt16 => Type::INT4,
-        DataType::UInt32 => Type::INT8,
-        DataType::UInt64 => Type::TEXT,
-        DataType::Float32 => Type::FLOAT4,
-        DataType::Float64 => Type::FLOAT8,
-        DataType::Decimal128(_, _) => Type::NUMERIC,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Type::TEXT,
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Type::BYTEA,
-        _ => Type::TEXT,
-    }
+arrow_pg_types! {
+    direct: [
+        (Boolean,  BooleanArray,    BOOL),
+        (Int8,     Int8Array,       INT2),
+        (Int16,    Int16Array,      INT2),
+        (Int32,    Int32Array,      INT4),
+        (Int64,    Int64Array,      INT8),
+        (Float32,  Float32Array,    FLOAT4),
+        (Float64,  Float64Array,    FLOAT8),
+        (Utf8,     StringArray,     TEXT),
+        (Utf8View, StringViewArray, TEXT),
+    ],
+    widened: [
+        (UInt8,  UInt8Array,  INT2, i16),
+        (UInt16, UInt16Array, INT4, i32),
+        (UInt32, UInt32Array, INT8, i64),
+    ],
 }
 
 #[cfg(test)]
@@ -368,6 +342,38 @@ mod tests {
     fn decimal128_maps_to_numeric() {
         let fields = build_field_info(&schema(vec![("s", DataType::Decimal128(38, 0))]));
         assert_eq!(fields[0].datatype(), &Type::NUMERIC);
+    }
+
+    #[test]
+    fn date32_maps_to_date_and_renders_iso() {
+        let col: ArrayRef = Arc::new(Date32Array::from(vec![0, 7]));
+        let b = batch(vec![("d", DataType::Date32)], vec![col]);
+
+        let fields = build_field_info(&b.schema());
+        let decoded = rows(&b);
+
+        assert_eq!(fields[0].datatype(), &Type::DATE);
+        assert_eq!(decoded[0], vec![Some("1970-01-01".to_string())]);
+        assert_eq!(decoded[1], vec![Some("1970-01-08".to_string())]);
+    }
+
+    #[test]
+    fn timestamp_second_maps_to_timestamp_and_renders_iso() {
+        let col: ArrayRef = Arc::new(TimestampSecondArray::from(vec![0, 90]));
+        let b = batch(
+            vec![(
+                "t",
+                DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+            )],
+            vec![col],
+        );
+
+        let fields = build_field_info(&b.schema());
+        let decoded = rows(&b);
+
+        assert_eq!(fields[0].datatype(), &Type::TIMESTAMP);
+        assert_eq!(decoded[0], vec![Some("1970-01-01 00:00:00".to_string())]);
+        assert_eq!(decoded[1], vec![Some("1970-01-01 00:01:30".to_string())]);
     }
 
     #[test]
