@@ -229,6 +229,10 @@ impl GcsAuth {
 }
 
 impl ObjectStore for GcsStore {
+    fn describe(&self) -> String {
+        format!("gs://{}/{}", self.bucket, self.prefix)
+    }
+
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         let header = self.auth.header()?;
         let url = format!(

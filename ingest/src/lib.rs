@@ -53,9 +53,11 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 pub use compact::{
-    Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
+    CompactSnapshot, CompactStatsSnapshot, Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL,
+    DEFAULT_MIN_FILES_TO_MERGE,
 };
 pub use otel::{ConfigError, DEFAULT_OTLP_ADDR, OtelConfig, Signal};
+pub use sink::SinkStatsSnapshot;
 
 use crate::otel::OtelServer;
 use crate::sink::Flushable;
@@ -76,6 +78,45 @@ pub struct Ingestor {
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     sinks: Vec<Arc<dyn Flushable>>,
+    stats: IngestStatsHandle,
+}
+
+/// A cheap, cloneable handle for reading live ingest + compaction counters
+/// (held by the server's introspection API). Cloning shares the same
+/// underlying sinks/compacter, so reads always see current values.
+#[derive(Clone)]
+pub struct IngestStatsHandle {
+    sources: Vec<IngestSourceDesc>,
+    sinks: Vec<Arc<dyn Flushable>>,
+    compacter: Option<Arc<Compacter>>,
+}
+
+/// A configured ingest receiver: where it listens and which table each enabled
+/// signal feeds.
+#[derive(Clone)]
+pub struct IngestSourceDesc {
+    pub kind: &'static str,
+    pub addr: String,
+    pub flush_rows: usize,
+    pub flush_secs: u64,
+    pub signals: Vec<(Signal, String)>,
+}
+
+impl IngestStatsHandle {
+    /// The configured receivers (static for the process's lifetime).
+    pub fn sources(&self) -> &[IngestSourceDesc] {
+        &self.sources
+    }
+
+    /// Current per-sink (per-table) flush counters.
+    pub fn sink_stats(&self) -> Vec<SinkStatsSnapshot> {
+        self.sinks.iter().map(|sink| sink.stats()).collect()
+    }
+
+    /// Current per-table compaction counters, or `None` if no compacter runs.
+    pub fn compaction(&self) -> Option<CompactSnapshot> {
+        self.compacter.as_ref().map(|c| c.snapshot())
+    }
 }
 
 impl Ingestor {
@@ -98,6 +139,8 @@ impl Ingestor {
         let (shutdown_tx, _) = watch::channel(false);
         let mut tasks = Vec::new();
         let mut sinks = Vec::new();
+        let mut sources = Vec::new();
+        let mut compacter_handle = None;
 
         // The bundled compacter: one catalog-wide maintenance loop, joined on
         // shutdown like the flush timers (an in-flight merge encodes on the
@@ -111,6 +154,7 @@ impl Ingestor {
                 DEFAULT_COMPACT_POLL,
                 catalog.clone(),
             ));
+            compacter_handle = Some(compacter.clone());
             tasks.push(tokio::spawn(compacter.run(shutdown_tx.subscribe())));
         }
 
@@ -124,6 +168,14 @@ impl Ingestor {
                         );
                         continue;
                     }
+                    sources.push(IngestSourceDesc {
+                        kind: "otlp",
+                        addr: cfg.addr.to_string(),
+                        flush_rows: cfg.flush_rows,
+                        flush_secs: cfg.flush_interval.as_secs(),
+                        signals: cfg.signal_tables(),
+                    });
+
                     let server = OtelServer::build(&cfg, &dispatcher, &catalog)?;
                     info!(
                         addr = %server.addr,
@@ -160,11 +212,23 @@ impl Ingestor {
             }
         }
 
+        let stats = IngestStatsHandle {
+            sources,
+            sinks: sinks.clone(),
+            compacter: compacter_handle,
+        };
+
         Ok(Self {
             shutdown_tx,
             tasks,
             sinks,
+            stats,
         })
+    }
+
+    /// A cloneable handle for reading live ingest + compaction counters.
+    pub fn stats(&self) -> IngestStatsHandle {
+        self.stats.clone()
     }
 
     /// Stop the receivers and flush every sink one last time, then return.

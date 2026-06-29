@@ -1,0 +1,1140 @@
+/* pivotdb dashboard — clean, light, lots of whitespace. Inter for everything;
+   JetBrains Mono only where it earns it (SQL, result cells, file paths). */
+
+:root {
+  --bg: #ffffff;
+  --canvas: #fafbfc;
+  --panel: #ffffff;
+  --border: #e9ebf1;
+  --border-strong: #d9dce6;
+
+  --text: #1b1d2a;
+  --muted: #6b7180;
+  --faint: #9aa0ad;
+
+  --brand: #1c1e57; /* logo indigo */
+  --indigo: #4f46e5;
+  --indigo-soft: #eef0fe;
+  --teal: #0fb5a6; /* live data movement */
+  --teal-soft: #e3f7f4;
+  --good: #10b981;
+  --danger: #e5484d;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 6px 16px rgba(16, 24, 40, 0.06);
+
+  --ui: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--ui);
+  background: var(--bg);
+  color: var(--text);
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+  font-size: 14px;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+/* numbers that should align in columns / tick in place */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+::selection {
+  background: rgba(79, 70, 229, 0.16);
+}
+
+/* ---------- App shell ---------- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 32px;
+  padding: 0 24px;
+  height: 60px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+}
+
+.brand img {
+  height: 38px;
+  width: auto;
+  display: block;
+}
+
+.tabs {
+  display: flex;
+  gap: 2px;
+  height: 100%;
+  align-items: stretch;
+}
+
+.tab {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 500;
+  padding: 0 4px;
+  margin: 0 12px;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  color: var(--text);
+  border-bottom-color: var(--indigo);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.conn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conn .store {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--faint);
+  flex-shrink: 0;
+}
+
+.dot.live {
+  background: var(--good);
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.16);
+}
+
+.dot.down {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px rgba(229, 72, 77, 0.16);
+}
+
+.main {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.section-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* ---------- Overview: canvas + floating docks ---------- */
+
+.overview {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.flow-pane {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background: var(--canvas);
+}
+
+.pane-head {
+  position: absolute;
+  top: 18px;
+  left: 22px;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.pane-head h2 {
+  margin: 0 0 2px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.pane-head p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* hint shown on the canvas when no ingest receiver is configured */
+.flow-hint {
+  position: absolute;
+  top: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 4;
+  max-width: 560px;
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: var(--shadow-sm);
+  padding: 9px 18px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.flow-hint code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--indigo);
+  background: var(--indigo-soft);
+  padding: 1px 6px;
+  border-radius: 5px;
+}
+
+/* floating metrics dock, top-right over the canvas */
+.dock {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 5;
+  width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px 0;
+}
+
+.card-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--good);
+}
+
+.status.off {
+  color: var(--faint);
+}
+
+.card-body {
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* a metric row: label, big value, bar */
+.metric .metric-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 7px;
+}
+
+.metric .label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.metric .value {
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.metric .value small {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.bar {
+  height: 6px;
+  border-radius: 6px;
+  background: #eef0f4;
+  overflow: hidden;
+}
+
+.bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 6px;
+  background: var(--indigo);
+  transition: width 0.5s ease;
+}
+
+.bar.teal > span {
+  background: var(--teal);
+}
+
+/* per-core bars: a row of thin verticals that tick in realtime */
+.cores {
+  display: flex;
+  gap: 3px;
+  align-items: flex-end;
+  height: 34px;
+  margin-top: 8px;
+}
+
+.core {
+  flex: 1;
+  background: #eef0f4;
+  border-radius: 2px;
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+
+.core > span {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--indigo);
+  transition: height 0.4s ease;
+}
+
+.disk-line {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.disk-line .meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.disk-line .meta .name {
+  color: var(--text);
+}
+
+/* small inline stat grid (activity / compaction) */
+.stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 14px;
+}
+
+.stat .k {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.stat .v {
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat .v.live {
+  color: var(--teal);
+}
+
+/* ---------- React Flow nodes (light, clean) ---------- */
+
+.node {
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow-sm);
+  width: 188px;
+  font-family: var(--ui);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.node:hover {
+  box-shadow: var(--shadow);
+}
+
+.node.selected {
+  border-color: var(--indigo);
+  box-shadow: 0 0 0 3px var(--indigo-soft);
+}
+
+.node .nhead {
+  padding: 11px 13px 9px;
+}
+
+.node .kind {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.node .kind .pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.node .kind .pip.live {
+  background: var(--teal);
+  box-shadow: 0 0 0 3px var(--teal-soft);
+}
+
+.node .kind .tel-icon {
+  color: var(--faint);
+  flex-shrink: 0;
+  margin: -2px 0;
+}
+
+.node .kind .tel-icon.live {
+  color: var(--teal);
+}
+
+.node .title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.node .nbody {
+  padding: 0 13px 12px;
+}
+
+.node .big {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums;
+}
+
+.node .big.idle {
+  color: var(--faint);
+  font-weight: 600;
+}
+
+.node .sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.node .sub b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* table node rendered as an actual table */
+.table-node {
+  width: 238px;
+}
+
+.table-node .nhead {
+  padding: 11px 14px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.title-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 3px;
+}
+
+.title-row .title {
+  margin: 0;
+}
+
+.rowcount {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.schema {
+  padding: 4px 0;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.schema .col {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 14px;
+}
+
+.schema .col + .col {
+  border-top: 1px solid #f1f2f6;
+}
+
+.schema .cname {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.schema .ctype {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--indigo);
+}
+
+.schema .more {
+  justify-content: flex-start;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.table-node .nfoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 14px;
+  border-top: 1px solid var(--border);
+  background: #fafbfc;
+  border-radius: 0 0 10px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.nfoot .comp {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.nfoot .comp.idle {
+  color: var(--faint);
+}
+
+.nfoot .glyph {
+  color: var(--teal);
+  font-size: 13px;
+}
+
+.nfoot .when {
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.react-flow__handle {
+  width: 6px;
+  height: 6px;
+  background: var(--border-strong);
+  border: none;
+}
+
+.react-flow__attribution {
+  display: none;
+}
+
+/* edge count labels: white pill with a hairline border, like the reference */
+.react-flow__edge-text {
+  font-family: var(--ui);
+  font-size: 11px;
+  font-weight: 500;
+  fill: var(--muted);
+}
+
+.react-flow__edge-textbg {
+  fill: #ffffff;
+  stroke: var(--border);
+  stroke-width: 1px;
+}
+
+/* custom edge: a pill in the middle of the connector with the live rate */
+.edge-label {
+  position: absolute;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 4px 10px;
+  box-shadow: var(--shadow-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.edge-label .sig {
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.edge-label .rate {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.edge-label .rate.live {
+  color: var(--teal);
+}
+
+/* flowing dashed stroke for a live edge (no moving node = no origin flash) */
+@keyframes flow-dash {
+  to {
+    stroke-dashoffset: -10;
+  }
+}
+
+.react-flow__controls {
+  box-shadow: var(--shadow);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.react-flow__controls-button {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.react-flow__controls-button:hover {
+  background: #f6f7f9;
+}
+
+/* ---------- bottom detail drawer ---------- */
+
+.drawer {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  height: 42vh;
+  overflow: hidden;
+}
+
+.detail {
+  padding: 18px 22px 22px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.detail .head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.detail .kv {
+  flex-shrink: 0;
+}
+
+.panel-col .section-label {
+  flex-shrink: 0;
+}
+
+.detail .head h3 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.detail .loc {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.kv {
+  display: flex;
+  gap: 28px;
+  flex-wrap: wrap;
+  margin: 14px 0 18px;
+}
+
+.kv .item .k {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--faint);
+  margin-bottom: 3px;
+}
+
+.kv .item .v {
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.kv .item .v.live {
+  color: var(--teal);
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1.3fr;
+  gap: 28px;
+  flex: 1;
+  min-height: 0;
+}
+
+.panel-col {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* each storage panel virtualizes + infinite-loads on its own (react-virtuoso) */
+.scroll-panel {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+/* fixed layout keeps columns from jumping as windows of rows render in/out */
+table.grid.vgrid {
+  width: 100%;
+  table-layout: fixed;
+}
+
+.scroll-loading {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  background: linear-gradient(rgba(255, 255, 255, 0), var(--panel) 55%);
+  pointer-events: none;
+}
+
+.scroll-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--faint);
+  font-size: 13px;
+}
+
+tr.vrow {
+  cursor: pointer;
+}
+
+tr.vrow.sel td {
+  background: var(--indigo-soft) !important;
+}
+
+.filter-chip {
+  appearance: none;
+  margin-left: 8px;
+  border: 1px solid var(--indigo);
+  background: var(--indigo-soft);
+  color: var(--indigo);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.filter-chip:hover {
+  background: #e3e6fd;
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--indigo);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- tables ---------- */
+
+table.grid {
+  width: auto;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+/* size columns to content, not stretched across the pane (a 1-column result
+   shouldn't spread a lone value to the far edge). Long cells ellipsize. */
+table.grid td,
+table.grid th {
+  max-width: 460px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* numeric cells keep a sensible min width so they don't cramp against headers */
+table.grid td.num,
+table.grid th {
+  min-width: 56px;
+}
+
+table.grid th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+
+table.grid td {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+table.grid td.mono,
+table.grid th.mono {
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+table.grid td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+table.grid tr:hover td {
+  background: #fafbfc;
+}
+
+.type-tag {
+  color: var(--indigo);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 100%;
+  min-height: 160px;
+  color: var(--muted);
+  text-align: center;
+  padding: 40px;
+}
+
+.empty .sub {
+  color: var(--faint);
+  font-size: 13px;
+}
+
+.hint {
+  color: var(--faint);
+  font-size: 13px;
+}
+
+/* ---------- Console ---------- */
+
+.console {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+
+.editor-wrap {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  padding: 18px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.editor {
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  background: var(--canvas);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 1.6;
+  padding: 13px 15px;
+  outline: none;
+  tab-size: 2;
+}
+
+.editor:focus {
+  border-color: var(--indigo);
+  box-shadow: 0 0 0 3px var(--indigo-soft);
+}
+
+.editor::placeholder {
+  color: var(--faint);
+}
+
+/* CodeMirror editor, themed to match */
+.editor-wrap .cm-editor {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--canvas);
+  font-family: var(--mono);
+  font-size: 13.5px;
+  overflow: hidden;
+}
+
+.editor-wrap .cm-editor.cm-focused {
+  outline: none;
+  border-color: var(--indigo);
+  box-shadow: 0 0 0 3px var(--indigo-soft);
+}
+
+.editor-wrap .cm-editor .cm-scroller {
+  font-family: var(--mono);
+  line-height: 1.6;
+}
+
+.editor-wrap .cm-content {
+  padding: 11px 4px;
+}
+
+.editor-wrap .cm-gutters {
+  background: transparent;
+  border: none;
+}
+
+.editor-wrap .cm-cursor {
+  border-left-color: var(--indigo);
+}
+
+.run.stop {
+  background: var(--danger);
+}
+
+.run.stop:hover {
+  background: #cf3a3f;
+}
+
+.editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.run {
+  appearance: none;
+  border: none;
+  background: var(--indigo);
+  color: #fff;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 9px 18px;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  transition: background 0.15s, transform 0.05s;
+}
+
+.run:hover {
+  background: #4338ca;
+}
+
+.run:active {
+  transform: translateY(1px);
+}
+
+.run:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.run kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.2);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.run-meta {
+  font-size: 13px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.results {
+  min-height: 0;
+  overflow: auto;
+}
+
+.query-error {
+  margin: 18px 22px;
+  padding: 13px 15px;
+  border-radius: var(--radius);
+  border: 1px solid #f3c0c2;
+  background: #fdf3f3;
+  color: #b42318;
+  font-family: var(--mono);
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+
+.suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.suggestion {
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  background: var(--panel);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.suggestion:hover {
+  border-color: var(--indigo);
+  color: var(--indigo);
+}
+
+/* ---------- scrollbars ---------- */
+
+::-webkit-scrollbar {
+  width: 11px;
+  height: 11px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d7dae3;
+  border-radius: 6px;
+  border: 3px solid var(--bg);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #c2c6d2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

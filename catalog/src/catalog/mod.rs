@@ -242,6 +242,13 @@ impl ParquetCatalog {
         self.tables.read().unwrap().values().cloned().collect()
     }
 
+    /// A human-readable description of where this database is rooted (local
+    /// directory or object-store bucket/prefix) - for introspection. Table
+    /// locations are relative to this root.
+    pub fn store_description(&self) -> String {
+        self.store.describe()
+    }
+
     /// Table `name`'s current committed files — refreshing to the latest version
     /// first, so a commit by ingest/compaction (in this process or another) is
     /// reflected. `None` if no such table exists.
@@ -490,6 +497,21 @@ impl ParquetQueryContext {
         self.tables.write().unwrap().insert(name.to_string(), table);
         self.pinned.lock().unwrap().insert(key, parquet.clone());
         Ok(parquet)
+    }
+
+    /// Per-file row groups (path + its row groups, manifest order) for the
+    /// `metadata()` table function. Call after [`parquet`](Self::parquet) has
+    /// warmed the table so its footers are loaded.
+    pub(super) fn file_row_groups(
+        &self,
+        name: &str,
+    ) -> Vec<(String, Vec<Arc<crate::parquet::RowGroupMetadata>>)> {
+        self.tables
+            .read()
+            .unwrap()
+            .get(name)
+            .map(|table| table.file_row_groups())
+            .unwrap_or_default()
     }
 }
 
