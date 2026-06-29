@@ -24,7 +24,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::values::{AggregationValue, cast_value_column};
+use crate::operations::unary::group::values::{AggregationValue, ValueColumns, cast_value_column};
 
 use super::{GroupLimit, Result};
 
@@ -198,7 +198,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         });
         Self {
             keys: K::Columns::with_capacity(allocator, builder_cap, &key_config),
-            values: V::new_columns(allocator, builder_cap),
+            values: V::Columns::with_capacity(allocator, builder_cap),
             builder_cap,
             len: 0,
             mode: OutputMode::new(output_limit),
@@ -213,7 +213,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
     #[inline]
     fn push(&mut self, key: &K::Persisted, value: V) {
         self.keys.push(key);
-        value.push_to(&mut self.values);
+        self.values.push(&value);
         self.len += 1;
     }
 
@@ -303,7 +303,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         );
         let values = std::mem::replace(
             &mut self.values,
-            V::new_columns(allocator, self.builder_cap),
+            V::Columns::with_capacity(allocator, self.builder_cap),
         );
         self.len = 0;
         self.emit(keys, values, allocator, sender)
@@ -322,7 +322,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
     ) -> Result<()> {
         let (mut fields, mut columns) =
             keys.finish(&self.key_arena, &self.output_buffers, allocator);
-        let (value_fields, value_columns) = V::finish_columns(values, &self.shared_context);
+        let (value_fields, value_columns) = values.finish(&self.shared_context);
         // The accumulator renders each value at its storage width; cast it to the
         // slot's declared output type (zero-cost when they already match).
         for ((field, column), output_type) in value_fields

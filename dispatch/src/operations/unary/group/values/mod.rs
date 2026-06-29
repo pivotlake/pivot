@@ -165,6 +165,32 @@ impl WorkerContext for WorkerArena {
     }
 }
 
+/// Builds the trailing value column(s) of a GROUP BY result, one group at a time:
+/// the value-side counterpart to [`KeyColumns`](super::keys::KeyColumns).
+///
+/// The output combinator pushes each surviving group's [`AggregationValue`], then
+/// [`finish`](Self::finish) materialises the Arrow columns and their fields.
+/// `finish` takes the value's [`SharedContext`] so a string extreme can emit
+/// zero-copy `StringView`s into the value arena and a runtime [`Dynamic`] value
+/// can read each slot's render kind; an all-numeric value ignores it.
+pub trait ValueColumns {
+    /// The per-group value these columns accumulate.
+    type Value;
+    /// The owning value's read-side context (see [`AggregationValue::SharedContext`]).
+    type Context;
+
+    /// Allocate the value-column builders over engine memory, sized for `rows`
+    /// (one output chunk; must fit a single 2 MB slab).
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self;
+    /// Append one finished group's value.
+    fn push(&mut self, value: &Self::Value);
+    /// Materialise the value columns and their fields. `context` backs the
+    /// zero-copy `StringView` output of a string extreme (numeric columns ignore
+    /// it) and carries the per-slot descriptor a runtime value ([`Dynamic`]) needs
+    /// to pick each slot's output type.
+    fn finish(self, context: &Self::Context) -> (Vec<Field>, Vec<ArrayRef>);
+}
+
 /// The per-group value stored in a GROUP BY hash table — read from input rows,
 /// folded with other rows and partials, and emitted as the result's value columns.
 ///
@@ -178,13 +204,14 @@ impl WorkerContext for WorkerArena {
 pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
-    /// The shared, read-side context [`merge`](Self::merge)/[`finish_columns`](Self::finish_columns)
+    /// The shared, read-side context [`merge`](Self::merge)/[`ValueColumns::finish`]
     /// resolve through (slot kinds for [`Dynamic`] + the value
     /// arena for a string extreme; `()` otherwise). It builds the per-worker
     /// [`WorkerContext`](Self::WorkerContext); see [`SharedContext`].
     type SharedContext: SharedContext<Worker = Self::WorkerContext>;
-    /// The result value columns under construction.
-    type Columns;
+    /// The trailing value columns these groups emit (the value-side counterpart
+    /// to [`KeyExtractor::Columns`](super::keys::KeyExtractor::Columns)).
+    type Columns: ValueColumns<Value = Self, Context = Self::SharedContext>;
     /// The scalar an `ORDER BY <slot> DESC LIMIT k` sorts on — widened to `i128`
     /// so a wide sum compares at full precision.
     type SortKey: Ord + Copy;
@@ -221,18 +248,4 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
 
     /// This group's value for slot `slot`, as an `ORDER BY` sort key.
     fn sort_key(&self, slot: usize) -> Self::SortKey;
-
-    /// Allocate the result value columns over engine memory, sized for `rows`
-    /// (one output chunk; must fit a single 2 MB slab).
-    fn new_columns(allocator: &mut SlabAllocator, rows: usize) -> Self::Columns;
-    /// Append this group to the columns.
-    fn push_to(&self, cols: &mut Self::Columns);
-    /// Materialise the columns and their fields. `ctx` backs the zero-copy
-    /// `StringView` output of a string extreme (numeric columns ignore it) and
-    /// carries the per-slot descriptor a runtime value ([`Dynamic`])
-    /// needs to pick each slot's output type.
-    fn finish_columns(
-        cols: Self::Columns,
-        ctx: &Self::SharedContext,
-    ) -> (Vec<Field>, Vec<ArrayRef>);
 }
