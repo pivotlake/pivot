@@ -84,6 +84,12 @@ struct Args {
     /// sub-target merges.
     #[arg(long, default_value_t = ingest::DEFAULT_MIN_FILES_TO_MERGE)]
     compact_min_files: usize,
+
+    /// Also serve the bundled web dashboard (data-flow graph, live ingest +
+    /// compaction stats, system metrics, SQL console) on this address. Omit to
+    /// disable.
+    #[arg(long, value_name = "ADDR")]
+    http_bind: Option<SocketAddr>,
 }
 
 impl Args {
@@ -265,7 +271,7 @@ fn main() -> Result<(), Error> {
     };
 
     rt.block_on(async move {
-        let server = Server::new(
+        let mut server = Server::new(
             args.bind,
             dispatch,
             catalog,
@@ -273,6 +279,9 @@ fn main() -> Result<(), Error> {
             args.compact_bytes,
             args.compact_min_files,
         );
+        if let Some(addr) = args.http_bind {
+            server = server.with_http_bind(addr);
+        }
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;
         });

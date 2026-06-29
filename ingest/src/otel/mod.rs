@@ -120,6 +120,20 @@ impl OtelConfig {
     pub fn any_signal_enabled(&self) -> bool {
         self.logs.is_some() || self.traces.is_some() || self.metrics.is_some()
     }
+
+    /// The enabled signals paired with the catalog table each appends to - for
+    /// introspection (a dashboard drawing receiver → table edges). Disabled
+    /// signals are omitted.
+    pub fn signal_tables(&self) -> Vec<(Signal, String)> {
+        [
+            (Signal::Logs, &self.logs),
+            (Signal::Traces, &self.traces),
+            (Signal::Metrics, &self.metrics),
+        ]
+        .into_iter()
+        .filter_map(|(signal, setup)| setup.as_ref().map(|s| (signal, s.table.clone())))
+        .collect()
+    }
 }
 
 struct LogsSinkService {

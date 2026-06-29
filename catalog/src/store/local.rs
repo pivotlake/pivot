@@ -29,6 +29,10 @@ impl LocalStore {
 }
 
 impl ObjectStore for LocalStore {
+    fn describe(&self) -> String {
+        format!("file://{}", self.root.display())
+    }
+
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         match std::fs::read(self.path_for(key)) {
             Ok(bytes) => Ok(Some(bytes)),

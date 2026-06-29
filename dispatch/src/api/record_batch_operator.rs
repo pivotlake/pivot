@@ -644,4 +644,14 @@ impl RecordBatchOperatorSpec {
             .execute_with_stats()
             .collect_with_stats()
     }
+
+    /// Append the `CopyOut` cap (like [`collect`](Self::collect)) and launch the
+    /// dataflow, returning the running [`DataFlowHandle`] instead of collecting
+    /// here. Lets the caller drive collection itself and cancel mid-run via
+    /// [`DataFlowHandle::cancel_token`] - the batches it yields are heap-backed,
+    /// safe to hold on any thread.
+    pub fn execute_copying(self) -> DataFlowHandle<RecordBatch> {
+        let count = self.worker_count();
+        self.unary((0..count).map(|_| CopyOutFactory)).execute()
+    }
 }
