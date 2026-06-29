@@ -58,21 +58,23 @@ impl PlanNode {
     /// decodes, and fully sorts every group only to keep `k` — the dominant cost
     /// on such queries.
     ///
-    /// Driven by the *primary* (first) order key, which must be a DESC ref to an
-    /// aggregate column traced through column-ref-only projections. Secondary
-    /// order keys (tiebreakers) are left to the surviving `TopN`, which re-sorts
-    /// the per-partition candidates under the full order. Exact when the primary
-    /// key has no ties at the limit boundary; with such ties it is tie-approximate
-    /// — the same class of approximation a single-key DESC LIMIT pushdown already
-    /// makes, additionally dropping secondary-key disambiguation among the tied
-    /// boundary group.
+    /// Only fires for a *single* order key (a DESC ref to an aggregate column,
+    /// traced through column-ref-only projections). A multi-key sort falls back to
+    /// the full `TopN`: a per-partition prune by the primary key alone can't honour
+    /// the secondary tiebreakers, so among groups tied on the primary key at the
+    /// limit boundary it would keep arbitrary ones and drop the rows the secondary
+    /// keys actually select, returning the wrong rows. A single key has no such hazard:
+    /// ties under one DESC key are order-ambiguous in SQL, so keeping any of the
+    /// tied boundary groups is a valid answer.
     pub(crate) fn annotate_group_topn(&mut self) {
         for child in &mut self.inputs {
             child.annotate_group_topn();
         }
 
         let (mut col, limit) = match &self.operator {
-            Operator::TopN(t) if !t.order_bys.is_empty() => {
+            // Single order key only (see the doc comment); multi-key sorts fall
+            // back to the full TopN above.
+            Operator::TopN(t) if t.order_bys.len() == 1 => {
                 let ob = &t.order_bys[0];
                 match (&ob.direction, &ob.expression) {
                     // Keep `limit + offset` rows per partition: the downstream
