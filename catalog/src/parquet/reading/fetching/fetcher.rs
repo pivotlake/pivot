@@ -8,8 +8,8 @@
 //! landed block off the waiting row group, and emit it once complete.
 //!
 //! Disk and HTTP have very different latencies, so the tracker bounds the
-//! outstanding reads of each kind independently: at most [`MAX_DISK_IN_FLIGHT`]
-//! disk-backed and [`MAX_HTTP_IN_FLIGHT`] remote-backed blocks. The cap is soft
+//! outstanding reads of each kind independently: at most `MAX_DISK_IN_FLIGHT`
+//! disk-backed and `MAX_HTTP_IN_FLIGHT` remote-backed blocks. The cap is soft
 //! (a row group may push over it) and gates only whether the *next* row group is
 //! admitted; a homogeneous scan only fills its medium's pool, so the other never
 //! gates.
@@ -24,10 +24,6 @@ use dispatch::io::{FsRequest, HttpRequest};
 /// group. One keeps disk reads serial — io_uring gives a single read ample
 /// depth.
 const MAX_DISK_IN_FLIGHT: usize = 1;
-/// Remote-backed read blocks (≈ concurrent HTTP round trips) outstanding per
-/// worker before admitting another row group. Larger, to hide HTTP latency;
-/// also bounds pinned cache slots per worker.
-const MAX_HTTP_IN_FLIGHT: usize = 32;
 
 #[derive(Default)]
 pub struct RowGroupFetcher {
@@ -94,7 +90,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
 
     fn ready_for_more_work(&mut self) -> bool {
         self.tracker.disk_in_flight() < MAX_DISK_IN_FLIGHT
-            && self.tracker.http_in_flight() < MAX_HTTP_IN_FLIGHT
+            && self.tracker.http_in_flight() < crate::parquet::http_readahead()
     }
 
     fn process_fs_response<S: Sender<RowGroupBuffer>>(

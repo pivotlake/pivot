@@ -17,6 +17,16 @@ pub(crate) fn op_err(e: impl std::error::Error + Send + Sync + 'static) -> dispa
     dispatch::UnaryError::Operator(Box::new(e))
 }
 
+/// Remote read-ahead depth: how many HTTP block reads a fetcher keeps in flight
+/// per worker before admitting the next row group. The effective scan concurrency
+/// against object storage is this times the worker count, so for a table of many
+/// small files (round-trip bound) raising it can hide more latency. Tunable via
+/// `PIVOT_HTTP_READAHEAD`; resolved once.
+pub(crate) fn http_readahead() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| dispatch::env::get_env_var_with_default("PIVOT_HTTP_READAHEAD", 64))
+}
+
 mod request_tracker;
 
 mod reading;
