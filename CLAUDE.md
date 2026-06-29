@@ -10,3 +10,9 @@ Use descriptive variable names and function names; avoid ad-hoc abbreviations li
 Established short names are fine: `i`/`j` for loop indices, `ctx`, `idx`, `len`.
 
 Function names should usually begin with a verb (e.g. `parse_header`, not `header`).
+
+When adding comments, don't reference old code (the user reading the new code has no idea what you're talking about) or
+things that are extremely mission-specific (for example, if changing GROUP-BY to optimize a query in a benchmark, do NOT mention the benchmark in comments- your code is generic!)
+
+Don't return None or have fallbacks when it's not absolutely necessary. We don't want to have silent 
+failures or have unexpected flows.
