@@ -68,20 +68,31 @@ impl<T> DataFlowHandle<T> {
     /// already shipped its tally, so the stats channel is fully drained here.
     pub fn collect_with_stats(mut self) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
         let mut items = Vec::new();
+        let mut error = None;
+        // Drain to channel close (every worker has dropped its sender, finished
+        // or cancelled) so all stats have been reported before we fold them. Keep
+        // the first error rather than returning on it, so a failed query's IO is
+        // still tallied.
         for item in &mut self {
-            items.push(item?);
-        }
-        // The output channel closes when every worker drops its sender (on
-        // panic or completion). A worker that errored may have queued the
-        // error before dropping, so check err_rx after the channel closes.
-        if let Ok(e) = self.err_rx.try_recv() {
-            return Err(e);
+            match item {
+                Ok(value) => items.push(value),
+                Err(e) if error.is_none() => error = Some(e),
+                Err(_) => {}
+            }
         }
         let mut stats = DataFlowStats::default();
         while let Ok(worker_stats) = self.stats_rx.try_recv() {
             stats.merge(&worker_stats);
         }
-        Ok((items, stats))
+        match error {
+            // The success path reports via the server's stats NOTICE; a failed
+            // query has no such path, so log what IO it did before failing.
+            Some(e) => {
+                stats.log_failed_query();
+                Err(e)
+            }
+            None => Ok((items, stats)),
+        }
     }
 }
 

@@ -72,17 +72,34 @@ struct Args {
     #[arg(long = "otel-config", value_name = "PATH")]
     otel_config: Vec<OtelFileSpec>,
 
-    /// Run the bundled compacter: any table's Parquet files smaller than this
-    /// are merged into one (CPU on the dispatch pool) once they amount to it.
-    /// `0` disables it — e.g. when a dedicated compacter process owns the job.
-    #[arg(long, default_value_t = ingest::DEFAULT_COMPACT_BYTES)]
+    /// Run the bundled compacter (OFF by default). The compacter merges and
+    /// then deletes a table's small Parquet files, so it mutates the catalog;
+    /// leave it off for a read-only server or an external reader, and only the
+    /// process that owns the data (e.g. an ingest sink) should enable it. The
+    /// `--compact-*` tuning flags require this.
+    #[arg(long)]
+    compact: bool,
+
+    /// Byte threshold the compacter merges a table's small Parquet files up to
+    /// (CPU on the dispatch pool), once they amount to it. Requires `--compact`.
+    #[arg(
+        long,
+        default_value_t = ingest::DEFAULT_COMPACT_BYTES,
+        requires = "compact",
+        value_name = "BYTES"
+    )]
     compact_bytes: u64,
 
     /// Compacter count trigger for low-traffic partitions: merge a sub-target
     /// partition's small files once this many accumulate (even below
-    /// `compact_bytes`). Lower = fewer tiny files per partition, more frequent
-    /// sub-target merges.
-    #[arg(long, default_value_t = ingest::DEFAULT_MIN_FILES_TO_MERGE)]
+    /// `--compact-bytes`). Lower means fewer tiny files per partition and more
+    /// frequent sub-target merges. Requires `--compact`.
+    #[arg(
+        long,
+        default_value_t = ingest::DEFAULT_MIN_FILES_TO_MERGE,
+        requires = "compact",
+        value_name = "N"
+    )]
     compact_min_files: usize,
 
     /// Also serve the bundled web dashboard (data-flow graph, live ingest +
@@ -271,12 +288,13 @@ fn main() -> Result<(), Error> {
     };
 
     rt.block_on(async move {
+        let compact_bytes = if args.compact { args.compact_bytes } else { 0 };
         let mut server = Server::new(
             args.bind,
             dispatch,
             catalog,
             ingests,
-            args.compact_bytes,
+            compact_bytes,
             args.compact_min_files,
         );
         if let Some(addr) = args.http_bind {

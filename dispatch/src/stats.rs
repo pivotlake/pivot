@@ -63,6 +63,27 @@ impl DataFlowStats {
         self.disk_time += other.disk_time;
         self.cpu += other.cpu;
     }
+
+    /// Log the IO tally at WARN when any read happened, for a path that has no
+    /// other reporting: a failed query never reaches the server's stats NOTICE,
+    /// so this keeps a slow or failed scan diagnosable. A no-op when the query did
+    /// no IO (or did not opt into stats, leaving every counter zero).
+    pub fn log_failed_query(&self) {
+        if self.http_requests + self.disk_requests + self.disk_cache_requests == 0 {
+            return;
+        }
+        tracing::warn!(
+            http_requests = self.http_requests,
+            http_mib = self.http_bytes >> 20,
+            http_ms = self.http_time.as_millis() as u64,
+            disk_cache_requests = self.disk_cache_requests,
+            disk_cache_mib = self.disk_cache_bytes >> 20,
+            disk_requests = self.disk_requests,
+            disk_mib = self.disk_bytes >> 20,
+            cpu_ms = self.cpu.as_millis() as u64,
+            "query failed; IO completed before the failure"
+        );
+    }
 }
 
 /// Accumulates one worker's [`DataFlowStats`] for a dataflow, or nothing when the

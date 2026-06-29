@@ -40,6 +40,15 @@ type ReadResult = std::result::Result<Completion, FailedRead>;
 
 /// HTTP range reads with an optional disk cache in front of the network.
 pub(crate) struct CachedHttpEngine {
+    /// Declared before `http_reads`/`cache_writes` on purpose: on non-Linux the
+    /// engine's `Drop` blocks until every in-flight fetch reports back, and Rust
+    /// drops fields in declaration order, so `http` must drain while those maps
+    /// still hold the slot pins for reads a pool thread may still be writing into.
+    /// The pin is a reader refcount on a ring slot, not an allocation: dropping it
+    /// frees no memory (the ring mmap is process-lifetime), it only makes the slot
+    /// eligible for cache eviction/reuse. So reordering `http` below the maps would
+    /// release those pins first and let the cache recycle a slot out from under an
+    /// in-flight write, corrupting whichever read the slot is handed to next.
     http: HttpEngine,
     /// The shared disk cache, or `None` to read straight from the network.
     disk_cache: Option<Arc<DiskCache>>,
@@ -313,6 +322,23 @@ impl CachedHttpEngine {
     /// `true` while any HTTP read is in flight.
     pub fn has_network_pending(&self) -> bool {
         self.http.has_active() || !self.http_reads.is_empty()
+    }
+
+    /// `true` if an HTTP completion is already in hand (non-Linux only, where the
+    /// engine delivers over its own channel rather than the shared ring).
+    #[cfg(not(target_os = "linux"))]
+    pub fn has_ready_completion(&self) -> bool {
+        self.http.has_ready_completion()
+    }
+
+    /// The HTTP completion channel, so the requester can park on it alongside the
+    /// disk channel (non-Linux: the two pools deliver on independent channels with
+    /// no shared ring).
+    #[cfg(not(target_os = "linux"))]
+    pub fn completion_receiver(
+        &self,
+    ) -> &crossbeam_channel::Receiver<crate::io::http::HttpCompletion> {
+        self.http.completion_receiver()
     }
 
     /// `true` while any cache-file read or write-back is in flight on the backend.
