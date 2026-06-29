@@ -37,8 +37,8 @@
 //! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use catalog::parquet::table_input;
@@ -97,6 +97,50 @@ pub struct Compacter {
     /// Monotonic sequence for merged-file names (same collision guard as the
     /// sink's).
     seq: AtomicU64,
+    /// Cumulative work counters, for the introspection API.
+    stats: CompactStats,
+}
+
+/// The compacter's cumulative work counters, tracked per table behind a mutex
+/// (merges are infrequent, so the lock is uncontended).
+#[derive(Default)]
+struct CompactStats {
+    inner: Mutex<CompactState>,
+}
+
+#[derive(Default)]
+struct CompactState {
+    per_table: HashMap<String, CompactStatsSnapshot>,
+    /// When the last full sweep ran (regardless of whether it merged anything).
+    last_sweep_unix_ms: u64,
+}
+
+/// One table's compaction counters.
+#[derive(Debug, Clone, Default)]
+pub struct CompactStatsSnapshot {
+    /// Merge batches successfully committed.
+    pub compactions: u64,
+    /// Small input files merged away.
+    pub files_merged_in: u64,
+    /// Target-sized files written.
+    pub files_written: u64,
+    pub bytes_written: u64,
+    /// Unix-epoch milliseconds of this table's last merge, or 0 if none.
+    pub last_run_unix_ms: u64,
+}
+
+/// A point-in-time read of the compacter's work, per table plus the last sweep.
+#[derive(Debug, Clone, Default)]
+pub struct CompactSnapshot {
+    pub per_table: HashMap<String, CompactStatsSnapshot>,
+    pub last_sweep_unix_ms: u64,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Compacter {
@@ -112,7 +156,29 @@ impl Compacter {
             poll_interval,
             catalog,
             seq: AtomicU64::new(0),
+            stats: CompactStats::default(),
         }
+    }
+
+    /// A snapshot of the compacter's per-table work counters.
+    pub fn snapshot(&self) -> CompactSnapshot {
+        let state = self.stats.inner.lock().unwrap();
+        CompactSnapshot {
+            per_table: state.per_table.clone(),
+            last_sweep_unix_ms: state.last_sweep_unix_ms,
+        }
+    }
+
+    /// Record a committed merge against `table`.
+    fn record_merge(&self, table: &str, files_merged_in: u64, written: &[FileRef]) {
+        let bytes: u64 = written.iter().map(|f| f.size).sum();
+        let mut state = self.stats.inner.lock().unwrap();
+        let entry = state.per_table.entry(table.to_string()).or_default();
+        entry.compactions += 1;
+        entry.files_merged_in += files_merged_in;
+        entry.files_written += written.len() as u64;
+        entry.bytes_written += bytes;
+        entry.last_run_unix_ms = now_unix_ms();
     }
 
     /// The compaction loop: every `poll_interval`, sweep the catalog's tables
@@ -138,6 +204,7 @@ impl Compacter {
     /// and a future standalone compacter binary — can drive one round without
     /// the loop.)
     pub async fn compact_all(&self) {
+        self.stats.inner.lock().unwrap().last_sweep_unix_ms = now_unix_ms();
         for table in self.catalog.tables() {
             self.compact_table(table).await;
         }
@@ -155,6 +222,7 @@ impl Compacter {
             return;
         }
         while let Some(inputs) = self.next_batch(&table) {
+            let input_count = inputs.len() as u64;
             let job = CompactJob {
                 dispatcher: self.catalog.dispatcher().clone(),
                 table: table.clone(),
@@ -162,6 +230,11 @@ impl Compacter {
             };
             match tokio::task::spawn_blocking(move || job.compact(inputs)).await {
                 Ok(Ok(merged)) => {
+                    // `merged` is empty when another writer won the swap (no real
+                    // work happened); only count an actual merge.
+                    if !merged.is_empty() {
+                        self.record_merge(table.name(), input_count, &merged);
+                    }
                     info!(
                         table = table.name(),
                         files = merged.len(),

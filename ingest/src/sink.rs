@@ -21,6 +21,8 @@
 //! *writes into* a table, it never creates one.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use catalog::ParquetCatalog;
 use catalog::store::ObjectPath;
@@ -29,6 +31,36 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::parquet_writing::{self, EncodedFile, ToRecordBatch};
+
+/// Cumulative, lock-free counters for one sink's flush activity - read by the
+/// introspection API to show live ingest throughput per table.
+#[derive(Default)]
+pub(crate) struct SinkStats {
+    rows: AtomicU64,
+    bytes: AtomicU64,
+    files: AtomicU64,
+    flushes: AtomicU64,
+    last_flush_unix_ms: AtomicU64,
+}
+
+/// A point-in-time read of a sink's [`SinkStats`], tagged with its table.
+#[derive(Debug, Clone)]
+pub struct SinkStatsSnapshot {
+    pub table: String,
+    pub rows: u64,
+    pub bytes: u64,
+    pub files: u64,
+    pub flushes: u64,
+    /// Unix-epoch milliseconds of the last committed file, or 0 if none yet.
+    pub last_flush_unix_ms: u64,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Rows per Parquet row group. A flush's items are cut into row groups of about
 /// this many rows as they stream through the write pipeline.
@@ -46,6 +78,9 @@ const IN_FLIGHT_FILES: usize = 4;
 #[tonic::async_trait]
 pub(crate) trait Flushable: Send + Sync {
     async fn flush(&self);
+
+    /// A snapshot of the sink's cumulative flush counters, for introspection.
+    fn stats(&self) -> SinkStatsSnapshot;
 }
 
 /// Buffers items for one stream and flushes them to Parquet files. Cheap to
@@ -64,6 +99,7 @@ pub struct ParquetSink<T> {
     /// it never creates the table (existence is checked when the sink is built).
     catalog: Arc<ParquetCatalog>,
     buffer: Mutex<Buffer<T>>,
+    stats: SinkStats,
 }
 
 struct Buffer<T> {
@@ -97,6 +133,19 @@ impl<T> ParquetSink<T> {
             dispatcher,
             catalog,
             buffer: Mutex::new(Buffer::default()),
+            stats: SinkStats::default(),
+        }
+    }
+
+    /// A snapshot of this sink's cumulative flush counters.
+    pub(crate) fn stats_snapshot(&self) -> SinkStatsSnapshot {
+        SinkStatsSnapshot {
+            table: self.name.clone(),
+            rows: self.stats.rows.load(Ordering::Relaxed),
+            bytes: self.stats.bytes.load(Ordering::Relaxed),
+            files: self.stats.files.load(Ordering::Relaxed),
+            flushes: self.stats.flushes.load(Ordering::Relaxed),
+            last_flush_unix_ms: self.stats.last_flush_unix_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -105,6 +154,10 @@ impl<T> ParquetSink<T> {
 impl<T: ToRecordBatch> Flushable for ParquetSink<T> {
     async fn flush(&self) {
         self.flush_now().await;
+    }
+
+    fn stats(&self) -> SinkStatsSnapshot {
+        self.stats_snapshot()
     }
 }
 
@@ -116,6 +169,9 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         if rows == 0 {
             return;
         }
+        // Count rows as they arrive (not at flush), so the ingest rate the
+        // dashboard derives is continuous rather than a step at each flush.
+        self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
         let drained = {
             let mut buf = self.buffer.lock().await;
             buf.rows += rows;
@@ -154,6 +210,10 @@ impl<T: ToRecordBatch> ParquetSink<T> {
     /// A failed pipeline run or write is logged and dropped rather than blocking
     /// — the drop-under-pressure stance OTLP exporters expect.
     async fn write(&self, items: Vec<T>) {
+        // Rows are counted on arrival (see `append`); here we only tally the
+        // flush itself. Bytes/files are tallied per file as each one commits.
+        self.stats.flushes.fetch_add(1, Ordering::Relaxed);
+
         // The table carries the partition/sort spec; read it per flush (the table
         // may have been dropped out from under us).
         let (partition_by, sort_by) = match self.catalog.table_handle(&self.name) {
@@ -210,6 +270,7 @@ impl<T: ToRecordBatch> ParquetSink<T> {
     /// stance OTLP exporters expect); a `None` means the table was dropped while
     /// ingest is running.
     async fn write_file(&self, file_name: String, encoded: EncodedFile) {
+        let byte_len = encoded.bytes.len() as u64;
         let catalog = self.catalog.clone();
         let table = self.name.clone();
         let path = ObjectPath::new(file_name.clone());
@@ -226,6 +287,11 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         .await;
         match appended {
             Ok(Some(Ok(()))) => {
+                self.stats.bytes.fetch_add(byte_len, Ordering::Relaxed);
+                self.stats.files.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .last_flush_unix_ms
+                    .store(now_unix_ms(), Ordering::Relaxed);
                 info!(sink = %self.name, file = file_name, "appended parquet to table")
             }
             Ok(Some(Err(e))) => {

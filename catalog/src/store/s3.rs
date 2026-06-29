@@ -146,6 +146,10 @@ impl S3Store {
 }
 
 impl ObjectStore for S3Store {
+    fn describe(&self) -> String {
+        format!("{} (prefix `{}`)", self.base, self.prefix)
+    }
+
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);

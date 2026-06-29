@@ -69,6 +69,10 @@ pub struct Server {
     compact_bytes: u64,
     /// The compacter's count trigger for sub-target (low-traffic) partitions.
     compact_min_files: usize,
+    /// Address for the optional bundled web dashboard ([`crate::http`]).
+    /// `None` (the default) leaves it off; set it with
+    /// [`with_http_bind`](Self::with_http_bind).
+    http_bind: Option<SocketAddr>,
 }
 
 impl Server {
@@ -105,7 +109,15 @@ impl Server {
             ingests,
             compact_bytes,
             compact_min_files,
+            http_bind: None,
         }
+    }
+
+    /// Also serve the bundled web dashboard (see [`crate::http`]) on `addr`
+    /// while the server runs. Off by default.
+    pub fn with_http_bind(mut self, addr: SocketAddr) -> Self {
+        self.http_bind = Some(addr);
+        self
     }
 
     /// Run the accept loop until `shutdown` resolves or a worker exits.
@@ -124,17 +136,37 @@ impl Server {
 
         // Start the configured ingest sources (OTLP receivers, etc.). They
         // encode Parquet on the dispatch workers, so they must be drained
-        // before the workers stop. `Option` so the two terminal arms below can
-        // each take ownership without the borrow checker tripping over the loop.
-        // The catalog lets each sink register (and compact) the files it
-        // writes, so ingested rows are queryable as they land.
-        let mut ingestor = Some(Ingestor::start(
+        // before the workers stop. The catalog lets each sink register (and
+        // compact) the files it writes, so ingested rows are queryable as they
+        // land.
+        let ingestor = Ingestor::start(
             std::mem::take(&mut self.ingests),
             self.dispatcher.clone(),
             self.catalog.clone(),
             self.compact_bytes,
             self.compact_min_files,
-        )?);
+        )?;
+
+        // Optionally serve the bundled web dashboard. It reads the engine's live
+        // state directly - the catalog, the ingestor's stats handle, and the
+        // dispatcher (for the in-process query console). Read-only except
+        // `/api/query`, so on shutdown we just abort the task.
+        let http_task = self.http_bind.map(|bind| {
+            let state = crate::http::IntrospectState::new(
+                self.catalog.clone(),
+                self.dispatcher.clone(),
+                ingestor.stats(),
+            );
+            tokio::spawn(async move {
+                if let Err(e) = crate::http::serve(bind, state, std::future::pending()).await {
+                    error!(?e, "web dashboard server error");
+                }
+            })
+        });
+
+        // `Option` so the two terminal arms below can each take ownership
+        // without the borrow checker tripping over the loop.
+        let mut ingestor = Some(ingestor);
 
         loop {
             tokio::select! {
@@ -143,6 +175,9 @@ impl Server {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signalled, draining ingest then workers");
+                    if let Some(task) = &http_task {
+                        task.abort();
+                    }
                     // Drain ingest first — the final flush encodes on the
                     // workers, which must still be alive.
                     if let Some(ingestor) = ingestor.take() {
@@ -157,6 +192,9 @@ impl Server {
                 Some(joined) = self.worker_watchers.join_next() => {
                     // A worker died: flushing would hang on a dead worker, so
                     // stop the receivers without a final flush.
+                    if let Some(task) = &http_task {
+                        task.abort();
+                    }
                     if let Some(ingestor) = ingestor.take() {
                         ingestor.abort();
                     }
