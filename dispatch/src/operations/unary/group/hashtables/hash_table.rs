@@ -556,7 +556,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::unary::group::values::AggregationSlot;
+    use crate::operations::unary::group::values::{AggregationSlot, ValueColumns};
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::Field;
 
@@ -568,7 +568,7 @@ mod tests {
     impl AggregationValue for Count {
         type Reader<'b> = ();
         type SharedContext = ();
-        type Columns = ();
+        type Columns = CountColumns;
         type SortKey = i64;
         type WorkerContext = ();
         fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
@@ -581,9 +581,20 @@ mod tests {
         fn sort_key(&self, _slot: usize) -> i64 {
             self.0 as i64
         }
-        fn new_columns(_allocator: &mut SlabAllocator, _rows: usize) {}
-        fn push_to(&self, _cols: &mut ()) {}
-        fn finish_columns(_cols: (), _ctx: &()) -> (Vec<Field>, Vec<ArrayRef>) {
+    }
+
+    /// Empty output columns for the test [`Count`] value (the probe tests never
+    /// materialise output).
+    struct CountColumns;
+
+    impl ValueColumns for CountColumns {
+        type Value = Count;
+        type Context = ();
+        fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+            CountColumns
+        }
+        fn push(&mut self, _value: &Count) {}
+        fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
             (Vec::new(), Vec::new())
         }
     }
