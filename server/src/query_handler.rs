@@ -97,6 +97,56 @@ fn with_planner<R>(
     })
 }
 
+/// Run `sql` to completion in-process and return its result batches - the path
+/// the HTTP dashboard uses instead of the Postgres wire. Plans on the blocking
+/// pool (the thread-local DuckDB planner), then compiles and runs on the
+/// dispatch workers. A `SET`/`RESET` is a session no-op here and yields nothing.
+///
+/// Uses [`RecordBatchOperatorSpec::collect`], which appends a `CopyOut` stage:
+/// each batch's ring-backed buffers are deep-copied to plain heap allocations on
+/// the worker, so the returned batches are safe to hold and drop on this
+/// (non-worker) thread. Calling `execute().collect()` instead would return
+/// ring-backed batches whose `Drop` reaches `memory_ctx()` off-worker and aborts.
+pub(crate) async fn execute_sql(
+    catalog: Arc<dyn planner::catalog::Catalog>,
+    dispatcher: dispatch::DataFlowDispatcher,
+    sql: String,
+) -> Result<Vec<arrow_array::RecordBatch>, String> {
+    let plan = {
+        let catalog = catalog.clone();
+        tokio::task::spawn_blocking(move || with_planner(&catalog, |p| p.plan(&sql)))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+    };
+    // A SET/RESET compiles to no dataflow; nothing to return.
+    if plan.as_set_variable().is_some() {
+        return Ok(Vec::new());
+    }
+    let plan = Arc::new(plan);
+    // Compile and launch the dataflow (with the CopyOut cap) on the blocking
+    // pool; `execute_copying` returns the running handle without collecting.
+    let handle = tokio::task::spawn_blocking(
+        move || -> Result<DataFlowHandle<arrow_array::RecordBatch>, String> {
+            let spec = plan.compile(&dispatcher).map_err(|e| e.to_string())?;
+            Ok(spec.execute_copying())
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // If this future is dropped before collection finishes - e.g. the HTTP
+    // client aborted the request via the dashboard's Stop button - cancel the
+    // running dataflow so its workers stop instead of finishing a doomed query.
+    let guard = CancelOnDrop::new(handle.cancel_token());
+    let batches = tokio::task::spawn_blocking(move || handle.collect())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    guard.defuse();
+    Ok(batches)
+}
+
 #[derive(Debug, Error)]
 enum Error {
     #[error(transparent)]
