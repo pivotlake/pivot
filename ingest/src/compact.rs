@@ -50,7 +50,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::parquet_writing;
-use crate::sink::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
+use crate::parquet_writing::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
 
 /// Why one compaction merge failed: either the scan→encode dataflow, or a
 /// catalog write/swap/delete. Both already carry typed causes.

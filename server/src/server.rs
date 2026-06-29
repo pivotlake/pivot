@@ -20,8 +20,8 @@
 
 use crate::query_handler::PivotHandlers;
 use catalog::ParquetCatalog;
-use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
-use ingest::{IngestConfig, Ingestor};
+use dispatch::{Dispatch, Shutdown};
+use ingest::Ingestor;
 use pgwire::tokio::process_socket;
 use std::io;
 use std::net::SocketAddr;
@@ -56,15 +56,10 @@ pub struct Server {
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
     handlers: Arc<PivotHandlers>,
-    /// Cloned dispatcher handed to the ingest sources so their Parquet encodes
-    /// run on the same worker pool as queries.
-    dispatcher: DataFlowDispatcher,
-    /// The concrete catalog, kept so the ingest sources can register (and
-    /// compact) the Parquet files they write. The query handlers hold it as a
-    /// `dyn Catalog`.
+    /// The concrete catalog, kept so the bundled compacter can read back and
+    /// swap the Parquet files a table accumulates. The query handlers hold it as
+    /// a `dyn Catalog`.
     catalog: Arc<ParquetCatalog>,
-    /// Ingest sources to start when [`serve`](Self::serve) runs.
-    ingests: Vec<IngestConfig>,
     /// Target size for the bundled compacter (`0` = don't run one).
     compact_bytes: u64,
     /// The compacter's count trigger for sub-target (low-traffic) partitions.
@@ -82,13 +77,11 @@ impl Server {
         bind: SocketAddr,
         dispatch: Dispatch,
         catalog: Arc<ParquetCatalog>,
-        ingests: Vec<IngestConfig>,
         compact_bytes: u64,
         compact_min_files: usize,
     ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
-        // handler needs it to compile every plan, and the ingest sources need
-        // it to encode Parquet on the worker pool.
+        // handler needs it to compile every plan.
         let dispatcher = dispatch.dispatcher().clone();
         let (handles, shutdown) = dispatch.into_parts();
         let mut watchers = JoinSet::new();
@@ -99,10 +92,8 @@ impl Server {
             bind,
             shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher.clone())),
-            dispatcher,
+            handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher)),
             catalog,
-            ingests,
             compact_bytes,
             compact_min_files,
         }
@@ -122,19 +113,15 @@ impl Server {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, "listening for psql connections");
 
-        // Start the configured ingest sources (OTLP receivers, etc.). They
-        // encode Parquet on the dispatch workers, so they must be drained
-        // before the workers stop. `Option` so the two terminal arms below can
-        // each take ownership without the borrow checker tripping over the loop.
-        // The catalog lets each sink register (and compact) the files it
-        // writes, so ingested rows are queryable as they land.
+        // Start the bundled compacter. It encodes its merges on the dispatch
+        // workers, so it must be drained before the workers stop. `Option` so the
+        // two terminal arms below can each take ownership without the borrow
+        // checker tripping over the loop.
         let mut ingestor = Some(Ingestor::start(
-            std::mem::take(&mut self.ingests),
-            self.dispatcher.clone(),
             self.catalog.clone(),
             self.compact_bytes,
             self.compact_min_files,
-        )?);
+        ));
 
         loop {
             tokio::select! {
@@ -230,14 +217,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let dispatch = Dispatch::spin_up(1, 32, None);
         let catalog = catalog(&dispatch);
-        let server = Server::new(
-            bind(),
-            dispatch,
-            catalog,
-            vec![],
-            0,
-            ingest::DEFAULT_MIN_FILES_TO_MERGE,
-        );
+        let server = Server::new(bind(), dispatch, catalog, 0, ingest::DEFAULT_MIN_FILES_TO_MERGE);
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;
