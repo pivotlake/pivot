@@ -310,7 +310,7 @@ mod blocking_engine {
     /// range read onto the pool and collects completions over `rx`; the requester
     /// drains them via [`take_completed`](Self::take_completed) /
     /// [`take_failed`](Self::take_failed) and parks on `rx` (alongside the disk
-    /// channel) in [`park_until_completion`](Self::park_until_completion).
+    /// channel) through [`completion_receiver`](Self::completion_receiver).
     pub(crate) struct HttpEngine {
         client_config: Arc<rustls::ClientConfig>,
         /// This worker's job sender into the shared pool.

@@ -525,6 +525,42 @@ fn grouped_multikey_order_by_count_desc_limit(mut testing_planner: TestingPlanne
     );
 }
 
+// Every group's `COUNT(*)` is identical here (50 keys, each appearing twice), so
+// `ORDER BY c DESC, g LIMIT 3` is decided purely by the secondary key: the three
+// smallest `g`. Pushing a per-group top-k by the count alone would keep arbitrary
+// tied groups and drop the ones the secondary key selects, so a multi-key sort
+// must not push the limit into the group-by. This guards that.
+#[rstest]
+fn grouped_multikey_order_by_breaks_count_ties_on_secondary_key(
+    mut testing_planner: TestingPlanner,
+) {
+    let counts: Vec<i64> = (1..=50i64).flat_map(|g| [g, g]).collect();
+    testing_planner.add_table(
+        "g_ties",
+        &[(
+            "g",
+            Type::Int64,
+            Arc::new(Int64Array::from(counts)) as ArrayRef,
+        )],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan("SELECT g, COUNT(*) AS c FROM g_ties GROUP BY g ORDER BY c DESC, g LIMIT 3")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    let got: Vec<(i64, i64)> = rows
+        .iter()
+        .map(|r| (r["g"].as_i64().unwrap(), r["c"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(got, vec![(1, 2), (2, 2), (3, 2)]);
+}
+
 // `SELECT *` over a filtered Top-N is exactly the late-materialization shape:
 // DuckDB scans only `a`/`name` for the predicate+sort, then materializes the
 // full row for the survivors. Exercises multi-column materialize + reordering
