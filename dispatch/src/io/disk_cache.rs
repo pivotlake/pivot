@@ -1,6 +1,6 @@
 //! A persistent, disk-backed second tier for remote (HTTP) object reads.
 //!
-//! The in-memory [`FileMemoryCache`](crate::memory::file_memory_cache::FileMemoryCache) caches 2 MB
+//! The in-memory [`CompressedCache`](crate::memory::compressed_cache::CompressedCache) caches 2 MB
 //! regions of every file - local or remote - in RAM. For remote objects that's
 //! the *only* thing standing between a query and a network round-trip to S3/GCS.
 //! This disk cache adds a tier *below* RAM and *above* HTTP: fetched byte ranges
@@ -12,7 +12,7 @@
 //! ## Where it plugs in
 //!
 //! Entirely inside [`IORequester`](crate::io::IORequester): when a remote
-//! [`MissingBlock`](crate::memory::file_memory_cache::MissingBlock) needs filling, the
+//! [`MissingBlock`](crate::memory::compressed_cache::MissingBlock) needs filling, the
 //! requester asks the disk cache which sub-ranges are already on disk
 //! ([`Object::split_into_segments`]). Present sub-ranges are read from the cache file
 //! (a plain filesystem read into the same pinned slot); absent ones are fetched
@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::warn;
 
-/// Disk-cache block granularity - matches the file cache's `SUB_BLOCK_SIZE` and
+/// Disk-cache block granularity - matches the compressed cache's `SUB_BLOCK_SIZE` and
 /// the direct-I/O alignment. Every cached range is a whole number of these.
 const BLOCK_SIZE: usize = 4096;
 
@@ -89,7 +89,7 @@ pub struct Segment {
 /// A fixed atomic bitmap over a file's 4 KB blocks: bit `b` set means block `b`
 /// (bytes `[b*BLOCK_SIZE, (b+1)*BLOCK_SIZE)`) is resident on disk. Sized to the
 /// object up front from its known length, so it never grows and its bits flip
-/// lock-free - like the file cache's `ValidBitmap`.
+/// lock-free - like the compressed cache's `ValidBitmap`.
 struct BlockBitmap {
     words: Box<[AtomicU64]>,
 }

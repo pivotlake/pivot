@@ -46,6 +46,7 @@ pub struct Indexer {}
 /// row range is attached.
 fn create_compressed_pages(
     col_idx: usize,
+    column_chunk_offset: usize,
     query_row_group_metadata: QueryRowGroupMetadata,
     buffers: &[Bytes],
 ) -> Result<Vec<CompressedPage>, ParquetError> {
@@ -56,6 +57,9 @@ fn create_compressed_pages(
     let mut data_page_idx = 0;
     let mut row_offset = 0;
     loop {
+        // Bytes consumed so far = this page's offset within the chunk, which the
+        // chunk's file offset turns into the page's absolute file offset.
+        let page_start = reader.consumed();
         let header = {
             let mut prot = ThriftReadInputProtocol::new(&mut reader);
             PageHeader::read_thrift_without_stats(&mut prot)?
@@ -67,6 +71,7 @@ fn create_compressed_pages(
             worker_id: WORKER_IDX.get(),
             row_group: query_row_group_metadata.clone(),
             column_idx: col_idx,
+            file_offset: column_chunk_offset + page_start,
             page_idx: data_page_idx,
             data,
             filter_mask: if header.r#type == PageType::DATA_PAGE
@@ -107,7 +112,14 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             .columns
             .iter()
             .enumerate()
-            .map(|(col_idx, b)| create_compressed_pages(col_idx, buffer.metadata.clone(), b))
+            .map(|(col_idx, b)| {
+                create_compressed_pages(
+                    col_idx,
+                    buffer.column_offsets[col_idx],
+                    buffer.metadata.clone(),
+                    b,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::parquet::op_err)?;
 
@@ -226,6 +238,7 @@ mod tests {
     ) -> RowGroupBuffer {
         RowGroupBuffer {
             metadata: dummy_metadata(filtered_indices),
+            column_offsets: (0..columns.len()).collect(),
             columns,
         }
     }

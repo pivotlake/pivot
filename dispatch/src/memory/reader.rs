@@ -72,6 +72,15 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
         self.position
     }
 
+    /// Total bytes consumed from the start of the stream.
+    pub fn consumed(&self) -> usize {
+        let prior: usize = self.buffers[..self.position.buffer_index]
+            .iter()
+            .map(Bytes::len)
+            .sum();
+        prior + self.position.offset
+    }
+
     /// Read exactly `N` bytes into a fixed-size array, crossing buffer
     /// boundaries if needed.
     #[inline(always)]

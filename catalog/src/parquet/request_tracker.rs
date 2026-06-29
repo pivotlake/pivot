@@ -309,7 +309,7 @@ impl<T: PendingRequest> RequestTracker<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch::memory::file_memory_cache::MissingBlock;
+    use dispatch::memory::compressed_cache::MissingBlock;
     use dispatch::memory::{init_test_free_pool, memory_ctx};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -345,9 +345,7 @@ mod tests {
         let path = dir.path().join("data");
         std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
         let location = FileLocation::Local(Arc::new(std::fs::File::open(&path).unwrap()));
-        memory_ctx()
-            .file_memory_cache()
-            .open_entry(location.clone());
+        memory_ctx().compressed_cache().open_entry(location.clone());
         (location, dir)
     }
 
@@ -377,7 +375,7 @@ mod tests {
     /// than one when that happens.
     fn fs_reads(location: &FileLocation, offset: usize, len: usize) -> Vec<FsRequest> {
         memory_ctx()
-            .file_memory_cache()
+            .compressed_cache()
             .get(location, offset, len)
             .iter()
             .flat_map(|lookup| lookup.missing())
@@ -440,9 +438,7 @@ mod tests {
         // second read must NOT be folded onto the first - doing so would credit it
         // when the first's slot fills and leave its own slot full of garbage.
         let first = fs_read(&location, 0, 4096);
-        memory_ctx()
-            .file_memory_cache()
-            .open_entry(location.clone());
+        memory_ctx().compressed_cache().open_entry(location.clone());
         let second = fs_read(&location, 0, 4096);
         assert_ne!(
             ReadRequest::of_fs(&first).dest,
