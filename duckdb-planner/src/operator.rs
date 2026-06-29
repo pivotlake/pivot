@@ -142,6 +142,30 @@ pub struct CreateTable {
     pub constraint_count: usize,
 }
 
+/// `INSERT INTO <table> ...`. The single child plan produces the rows to insert
+/// (a `VALUES` list becomes an [`ExpressionGet`]; a sub-`SELECT` an ordinary
+/// plan), already cast to the table's column types by DuckDB.
+///
+/// `columns` are the table's columns in storage order. `column_index_map` maps
+/// each table column to the position in the child's output that supplies it:
+/// empty means the child already matches the table's column order, otherwise
+/// entry `i` is the child column for table column `i`, or `-1` for a column the
+/// statement omitted (the planner rejects those, as the engine has no defaults).
+#[derive(CustomDeserializer, Debug)]
+pub struct Insert {
+    pub table: String,
+    pub columns: Vec<CreateTableColumn>,
+    pub column_index_map: Vec<i64>,
+}
+
+/// A scan over a list of constant rows: DuckDB's `LOGICAL_EXPRESSION_GET`, the
+/// source under an `INSERT ... VALUES` (and a bare `VALUES` query). Each inner
+/// vec is one row's column expressions, in column order.
+#[derive(CustomDeserializer, Debug)]
+pub struct ExpressionGet {
+    pub rows: Vec<Vec<Expression>>,
+}
+
 /// Late-materialization fetch, synthesized by the bridge from DuckDB's
 /// `late_materialization` optimizer output.
 ///
@@ -237,6 +261,10 @@ pub enum Operator {
     Limit(Limit),
     #[type_tag(LogicalOperatorType::LOGICAL_CREATE_TABLE)]
     CreateTable(CreateTable),
+    #[type_tag(LogicalOperatorType::LOGICAL_INSERT)]
+    Insert(Insert),
+    #[type_tag(LogicalOperatorType::LOGICAL_EXPRESSION_GET)]
+    ExpressionGet(ExpressionGet),
     #[type_tag(LogicalOperatorType::LOGICAL_DUMMY_SCAN)]
     DummyScan(DummyScan),
     #[type_tag(LogicalOperatorType::LOGICAL_EXPLAIN)]
@@ -270,6 +298,8 @@ impl Operator {
             | Operator::TopN(_)
             | Operator::Limit(_)
             | Operator::CreateTable(_)
+            | Operator::Insert(_)
+            | Operator::ExpressionGet(_)
             | Operator::DummyScan(_)
             | Operator::Explain(_)
             | Operator::Set(_)
@@ -386,6 +416,15 @@ impl fmt::Display for Operator {
                     options_str.join(", "),
                 )
             }
+            Operator::Insert(i) => {
+                let cols: Vec<String> = i
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}:{}", c.name, type_name(&c.col_type)))
+                    .collect();
+                write!(f, "Insert({}, [{}])", i.table, cols.join(", "))
+            }
+            Operator::ExpressionGet(e) => write!(f, "ExpressionGet({} rows)", e.rows.len()),
             Operator::DummyScan(_) => write!(f, "DummyScan"),
             Operator::Explain(_) => write!(f, "Explain"),
             Operator::Set(s) => match &s.value {

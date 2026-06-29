@@ -8,7 +8,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use serde_json::Value;
 
-use crate::parquet_writing::error::WriteResult;
+use crate::parquet::writing::error::WriteResult;
 
 /// The values of `columns` at `row` of `batch`, as a JSON object keyed by column
 /// name.

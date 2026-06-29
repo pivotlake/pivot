@@ -27,6 +27,13 @@ const DICTIONARY_PAGE_SIZE_LIMIT: usize = 1024 * 1024;
 /// PLAIN — the dictionary grew too large, or the value type doesn't
 /// dictionary-cast.
 pub(super) fn try_encode(values: &ArrayRef) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
+    // A dictionary's index keys drop the null bitmap, so a NULL would be written
+    // as index 0 (the first distinct value). These columns are REQUIRED, so fall
+    // back to PLAIN, which rejects nulls with a clean `NullsInRequiredColumn`
+    // error rather than silently corrupting the data.
+    if values.null_count() > 0 {
+        return Ok(None);
+    }
     let dict_type = DataType::Dictionary(
         Box::new(DataType::Int32),
         Box::new(values.data_type().clone()),

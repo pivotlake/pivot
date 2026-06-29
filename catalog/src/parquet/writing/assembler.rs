@@ -410,8 +410,8 @@ fn converted_type(data_type: &DataType) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet_writing::encoder::encode_column_chunk;
-    use crate::parquet_writing::types::{EncodedColumnChunk, PartitionTag};
+    use crate::parquet::writing::encoder::encode_column_chunk;
+    use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::Schema;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;

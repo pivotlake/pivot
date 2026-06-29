@@ -901,11 +901,14 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "arrow 58.0.0",
+ "arrow-arith 58.0.0",
  "arrow-array 58.0.0",
  "arrow-buffer 58.0.0",
+ "arrow-cast 58.0.0",
  "arrow-json 58.0.0",
  "arrow-ord 58.0.0",
  "arrow-schema 58.0.0",
+ "arrow-select 58.0.0",
  "aws-credential-types",
  "aws-sigv4",
  "base64",
@@ -931,6 +934,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3753,6 +3757,17 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "uuid"
+version = "1.23.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
+dependencies = [
+ "getrandom 0.4.2",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"

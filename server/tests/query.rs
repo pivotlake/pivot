@@ -280,6 +280,120 @@ async fn filtered_count_star_is_correct(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn insert_values_then_select(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE ins_values (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO ins_values VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, name FROM ins_values ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), Some("bob".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_select_from_other_table(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "ins_src", dir.path()).await;
+    conn.simple_query("CREATE TABLE ins_dst (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO ins_dst SELECT id, name FROM ins_src")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, name FROM ins_dst ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), Some("bob".into())],
+            vec![Some("3".into()), Some("carol".into())],
+        ],
+    );
+}
+
+/// A column list reorders the values: `(name, id)` lands in the right columns.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_with_column_list_reorders(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE ins_reorder (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO ins_reorder (name, id) VALUES ('zoe', 7)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, name FROM ins_reorder").await;
+    assert_eq!(rows, vec![vec![Some("7".into()), Some("zoe".into())]]);
+}
+
+/// The INSERT only returns once its file is committed, so a *separate* connection
+/// SELECTing immediately after sees the rows.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_visible_on_second_connection(#[future] conn: Conn) {
+    let reader = connect_client(server_port()).await;
+    conn.simple_query("CREATE TABLE ins_shared (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO ins_shared VALUES (1, 'alice'), (2, 'bob')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&reader, "SELECT id, name FROM ins_shared ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), Some("bob".into())],
+        ],
+    );
+}
+
+/// Rows spanning two partitions are routed into per-partition files (respecting
+/// `partition_by`) and all read back.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_into_partitioned_table(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE ins_part (id BIGINT, p VARCHAR) WITH (partition_by = 'p')")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO ins_part VALUES (1, 'x'), (2, 'y'), (3, 'x')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, p FROM ins_part ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("x".into())],
+            vec![Some("2".into()), Some("y".into())],
+            vec![Some("3".into()), Some("x".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn query_against_unknown_table_errors(#[future] conn: Conn) {
     let err = conn
         .simple_query("SELECT id FROM does_not_exist")

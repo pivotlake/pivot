@@ -34,7 +34,7 @@ use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 use arrow_schema::{Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
-use catalog::SortBounds;
+use crate::SortBounds;
 use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult};
 use serde_json::Value;
 

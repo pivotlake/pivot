@@ -29,13 +29,10 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::parquet_writing::{self, EncodedFile, ToRecordBatch};
+// The file-sizing constants live with the write pipeline (now in `catalog`), so
+// every writer cuts files the same shape.
+pub(crate) use crate::parquet_writing::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
 
-/// Rows per Parquet row group. A flush's items are cut into row groups of about
-/// this many rows as they stream through the write pipeline.
-pub(crate) const ROW_GROUP_ROWS: usize = 128 * 1024;
-/// Row groups per Parquet file. Once this many accumulate, a file is emitted and
-/// written; the flush's remainder lands in a final, smaller file.
-pub(crate) const ROW_GROUPS_PER_FILE: usize = 8;
 /// Finished files buffered between the encode pipeline and the writer: small, so
 /// it bounds in-flight files and backpressures the pipeline onto the writer.
 const IN_FLIGHT_FILES: usize = 4;

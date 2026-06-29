@@ -40,8 +40,11 @@
 
 mod compact;
 mod otel;
-mod parquet_writing;
 mod sink;
+
+// The Parquet write pipeline moved to `catalog` (beside the read pipeline) so the
+// catalog can reuse it for INSERT; ingest drives it for flush and compaction.
+use catalog::parquet::writing as parquet_writing;
 
 use std::sync::Arc;
 

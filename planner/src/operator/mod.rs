@@ -17,8 +17,10 @@ mod aggregate;
 mod create_table;
 mod dummy_scan;
 mod explain;
+mod expression_get;
 mod filter;
 mod input;
+mod insert;
 mod limit;
 mod materialize;
 mod order_by;
@@ -31,8 +33,10 @@ pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
+pub use expression_get::ExpressionGet;
 pub use filter::Filter;
 pub use input::Input;
+pub use insert::Insert;
 pub use limit::Limit;
 pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
@@ -83,6 +87,10 @@ pub enum Operator {
     TopN(TopN),
     Limit(Limit),
     CreateTable(CreateTable),
+    /// `INSERT INTO <table> ...`: compiles to the dataflow that writes its rows.
+    Insert(Insert),
+    /// A scan over a list of constant rows (the source under `INSERT ... VALUES`).
+    ExpressionGet(ExpressionGet),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -108,6 +116,8 @@ impl TryFrom<duckdb_operator::Operator> for Operator {
             duckdb_operator::Operator::TopN(t) => Operator::TopN(t.try_into()?),
             duckdb_operator::Operator::Limit(l) => Operator::Limit(l.try_into()?),
             duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
+            duckdb_operator::Operator::Insert(i) => Operator::Insert(i.try_into()?),
+            duckdb_operator::Operator::ExpressionGet(e) => Operator::ExpressionGet(e.try_into()?),
             duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
             duckdb_operator::Operator::Explain(e) => Operator::Explain(e.try_into()?),
             duckdb_operator::Operator::Set(s) => Operator::SetVariable(s.try_into()?),
@@ -134,6 +144,8 @@ impl fmt::Display for Operator {
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::Limit(l) => write!(f, "{l}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
+            Operator::Insert(i) => write!(f, "{i}"),
+            Operator::ExpressionGet(e) => write!(f, "{e}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),

@@ -87,6 +87,16 @@ pub enum Error {
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("inserting rows: {0}")]
+    Insert(#[source] crate::catalog::Error),
+    #[error(
+        "INSERT omits column `{0}`, which has no value (the engine has no column defaults)"
+    )]
+    InsertMissingColumn(String),
+    #[error("INSERT into a column of type {0:?} is not supported")]
+    InsertUnsupportedColumnType(Type),
+    #[error("building VALUES rows: {0}")]
+    ValuesBatch(#[source] arrow_schema::ArrowError),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
     #[error("Unsupported table function: {0}")]
@@ -208,6 +218,14 @@ impl PlanNode {
             return explain.compile(dispatcher, plan_text);
         }
 
+        // ExpressionGet is a constant-row source; its rows are self-contained, so
+        // it needs no inputs compiled (DuckDB gives it a dummy-scan child we never
+        // run). Handle it before the input loop so that child isn't built and
+        // dropped. This must happen before the input-compile loop below.
+        if let crate::Operator::ExpressionGet(expr_get) = &self.operator {
+            return expr_get.compile(dispatcher);
+        }
+
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
             inputs.push(input.compile(dispatcher, catalog, ctx, slots)?);
@@ -228,6 +246,11 @@ impl PlanNode {
                     return Err(Error::UnexpectedCreateTableInputs);
                 }
                 o.compile(dispatcher, catalog)
+            }
+            crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher, catalog),
+            // ExpressionGet is handled above, before its inputs are compiled.
+            crate::Operator::ExpressionGet(_) => {
+                unreachable!("ExpressionGet is compiled before its inputs")
             }
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.

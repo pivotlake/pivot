@@ -41,11 +41,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::manifest::{
-    self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
+    self, CatalogManifest, CatalogManifestTableEntry, ManifestEntry, PartitionEqFilter,
+    TableManifest,
 };
 use crate::parquet::{ParquetTable, ParquetTableError};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
-use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
+use arrow_array::RecordBatch;
+use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec, values_input};
 use metadata_function::MetadataTableFunction;
 use planner::TableFunction;
 use planner::catalog::{
@@ -76,6 +78,8 @@ pub enum Error {
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
     TableExists(String),
+    #[error("table `{0}` does not exist")]
+    TableNotFound(String),
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
@@ -329,6 +333,61 @@ impl ParquetCatalog {
         ))
     }
 
+    /// Write `rows` into `table` and return an empty spec (the statement yields no
+    /// rows). Encodes the rows into Parquet, respecting the table's
+    /// partitioning/sort, and commits the resulting files into the manifest in one
+    /// atomic version, so the insert is durable and all-or-nothing by the time this
+    /// returns. `rows` are already in the table's column order (the
+    /// [`Insert`](planner::operator::Insert) operator projects them there). The
+    /// dispatcher rides along on `rows`.
+    fn insert_rows(
+        &self,
+        table: String,
+        rows: RecordBatchOperatorSpec,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Result<RecordBatchOperatorSpec> {
+        let mut handle = self
+            .table_handle(&table)
+            .ok_or_else(|| Error::TableNotFound(table.clone()))?;
+        let partition_by: Arc<[String]> = Arc::from(handle.partition_by());
+        let sort_by: Arc<[String]> = Arc::from(handle.sort_by());
+
+        // Encode on the worker pool, streaming each finished file to the store as
+        // it arrives. Writing the bytes is a plain object-store put (no nested
+        // dataflow), so draining and writing here on the coordinator can't
+        // deadlock the pool even with a single worker, and only one file's bytes
+        // are held at a time. We keep just each file's lightweight manifest entry.
+        // This runs at plan compile time, which is the coordinator.
+        let mut entries = Vec::new();
+        for file in crate::parquet::writing::encode_record_batches(
+            rows,
+            partition_by,
+            sort_by,
+            crate::parquet::writing::ROW_GROUP_ROWS,
+            crate::parquet::writing::ROW_GROUPS_PER_FILE,
+        ) {
+            let file = file?;
+            let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
+            let file_ref = handle.write_data_file(path, &file.bytes)?;
+            entries.push(ManifestEntry {
+                file: file_ref,
+                partition: file.partition,
+                sort_bounds: file.sort_bounds,
+            });
+        }
+
+        // Commit every file in one manifest version (the encode pool is now idle,
+        // so the commit's footer fetch can't deadlock). This makes a multi-file
+        // insert (e.g. one file per partition) atomic: a reader never sees a
+        // partial subset. Empty inserts skip the commit rather than bump a version.
+        if !entries.is_empty() {
+            handle.replace_data_files(&[], &entries)?;
+        }
+
+        // The write is durable; the statement itself yields no rows.
+        Ok(values_input(dispatcher, Vec::<RecordBatch>::new()).record_batches())
+    }
+
     /// The location stored for a new table: an explicit `path` (kept as given),
     /// or the table name under the database root.
     ///
@@ -408,6 +467,15 @@ impl Catalog for ParquetCatalog {
         dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         Ok(self.create(request, dispatcher)?)
+    }
+
+    fn insert(
+        &self,
+        table: String,
+        rows: RecordBatchOperatorSpec,
+        dispatcher: &DataFlowDispatcher,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        Ok(self.insert_rows(table, rows, dispatcher)?)
     }
 
     fn table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {

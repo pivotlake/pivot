@@ -264,6 +264,27 @@ pub trait Catalog: Debug + Send + Sync {
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec>;
 
+    /// Compile an `INSERT` into the dataflow that writes `rows` into the named
+    /// table and returns no rows.
+    ///
+    /// `rows` is the spec the [`Insert`](crate::operator::Insert) operator
+    /// produces: the values to insert, already projected into the table's column
+    /// order. The backend encodes those rows into Parquet (respecting the table's
+    /// partitioning/sort) and commits the files, so the statement only completes
+    /// once the data is durable; the returned spec yields no rows. Default:
+    /// unsupported (for in-memory test catalogs that never write).
+    fn insert(
+        &self,
+        table: String,
+        rows: RecordBatchOperatorSpec,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Result<RecordBatchOperatorSpec> {
+        let _ = (table, rows, dispatcher);
+        Err(Error::Other(
+            "INSERT is not supported by this catalog".into(),
+        ))
+    }
+
     /// A backend-specific table-valued function by `name`, or `None`. This is how
     /// a catalog contributes functions only it can answer (e.g. `metadata`, which
     /// needs the backend's row-group metadata) without the generic planner

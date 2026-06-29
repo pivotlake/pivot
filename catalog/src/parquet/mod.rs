@@ -30,6 +30,12 @@ mod metadata;
 pub use metadata::create_load_and_commit_spec;
 pub(crate) use metadata::load_table_files;
 
+pub mod writing;
+pub use writing::{
+    EncodedFile, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, ToRecordBatch, encode_items,
+    encode_record_batches,
+};
+
 mod row_group_stats;
 pub use row_group_stats::{
     RowGroupFilter, ScanOrder, row_group_eliminated, row_group_filter_from, scan_order_from,

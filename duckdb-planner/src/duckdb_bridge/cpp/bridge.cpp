@@ -10,6 +10,8 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
@@ -663,6 +665,60 @@ json build_create_table(duckdb::LogicalCreateTable *create_table) {
     };
 }
 
+// `INSERT INTO <table> ...`. The child plan (serialized as this node's input)
+// produces the rows; here we record the target table, its columns in storage
+// order, and the column_index_map that tells the Rust side how the child's
+// output columns line up with the table's. RETURNING is rejected: pivot never
+// runs the physical insert, so it can't produce the returned chunk.
+json build_insert(duckdb::LogicalInsert *insert) {
+    if (insert->return_chunk) {
+        throw UnsupportedPlanError("INSERT ... RETURNING is not supported");
+    }
+
+    // The table's columns in storage order, with their declared types. The Rust
+    // side names and casts the inserted rows to these (DuckDB's coercing casts are
+    // unwrapped by build_expression, so the planner re-applies them).
+    json columns = json::array();
+    for (auto &column : insert->table.GetColumns().Physical()) {
+        columns.push_back({
+            {"name", column.Name()},
+            {"col_type", static_cast<uint8_t>(column.Type().id())},
+        });
+    }
+
+    // Indexed by physical column; empty when the insert covers every column by
+    // position. INVALID_INDEX marks a column the statement omitted (defaulted),
+    // serialized as -1.
+    json column_index_map = json::array();
+    for (auto mapped : insert->column_index_map) {
+        if (mapped == duckdb::DConstants::INVALID_INDEX) {
+            column_index_map.push_back(-1);
+        } else {
+            column_index_map.push_back(static_cast<int64_t>(mapped));
+        }
+    }
+
+    return {
+        {"table", insert->table.name},
+        {"columns", columns},
+        {"column_index_map", column_index_map},
+    };
+}
+
+// DuckDB's LOGICAL_EXPRESSION_GET: a scan over a list of constant rows, the
+// source under an `INSERT ... VALUES`. Each row is its column expressions.
+json build_expression_get(duckdb::LogicalExpressionGet *expr_get) {
+    json rows = json::array();
+    for (auto &row : expr_get->expressions) {
+        json cells = json::array();
+        for (auto &cell : row) {
+            cells.push_back(build_expression(cell.get()));
+        }
+        rows.push_back(std::move(cells));
+    }
+    return {{"rows", std::move(rows)}};
+}
+
 // `SET <name> = <value>`. DuckDB's binder builds a LogicalSet for *any* name —
 // it doesn't validate the setting exists until execution, which pivot never runs
 // — so the name comes through verbatim and pivot decides what (if anything) it
@@ -944,6 +1000,14 @@ json build_plan_node_json(duckdb::LogicalOperator *op, rust::Vec<rust::Box<Optio
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_CREATE_TABLE: {
 		new_operator["data"] = build_create_table(&op->Cast<duckdb::LogicalCreateTable>());
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_INSERT: {
+		new_operator["data"] = build_insert(&op->Cast<duckdb::LogicalInsert>());
+		break;
+	}
+	case duckdb::LogicalOperatorType::LOGICAL_EXPRESSION_GET: {
+		new_operator["data"] = build_expression_get(&op->Cast<duckdb::LogicalExpressionGet>());
 		break;
 	}
 	case duckdb::LogicalOperatorType::LOGICAL_SET: {
