@@ -67,6 +67,10 @@ impl ColumnRequest {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     column_requests: Vec<ColumnRequest>,
+    /// File byte offset of each projected column's chunk, in projection order.
+    /// Carried through to the indexer so each page gets a projection-independent
+    /// physical identity for the decompressed-page cache.
+    column_offsets: Vec<usize>,
     /// Local filesystem reads not yet handed to the fetcher (drained when the
     /// row group is admitted).
     pending_fs: Vec<FsRequest>,
@@ -97,9 +101,18 @@ impl RowGroupRequest {
                 )
             })
             .collect();
+        let column_offsets = projection
+            .indices()
+            .iter()
+            .map(|&col_idx| {
+                let meta = &columns[col_idx];
+                meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize
+            })
+            .collect();
 
         Self {
             column_requests,
+            column_offsets,
             remaining: pending_fs.len() + pending_http.len(),
             pending_fs,
             pending_http,
@@ -121,6 +134,7 @@ impl RowGroupRequest {
     pub fn into_row_group_buffer(self) -> RowGroupBuffer {
         RowGroupBuffer {
             metadata: self.metadata,
+            column_offsets: self.column_offsets,
             columns: self
                 .column_requests
                 .into_iter()
@@ -144,4 +158,7 @@ pub struct RowGroupBuffer {
     pub metadata: QueryRowGroupMetadata,
     /// 2d array, inner vec is chunks within column
     pub columns: Vec<Vec<Bytes>>,
+    /// File byte offset of each column's chunk, aligned with `columns` (projection
+    /// order). The indexer stamps it onto each page as a stable cache identity.
+    pub column_offsets: Vec<usize>,
 }

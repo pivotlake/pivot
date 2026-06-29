@@ -119,8 +119,9 @@ impl Function {
             // exactly once; the returned array matches the (one-row) batch.
             Function::DropCache => Ok(stateless_expr(|batch: &RecordBatch| {
                 let extents = dispatch::memory_ctx().file_memory_cache().clear();
+                let decompressed = dispatch::memory_ctx().decompressed_cache().clear();
                 let objects = dispatch::io::clear_disk_cache();
-                let evicted = (extents + objects) as i64;
+                let evicted = (extents + decompressed + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
         }

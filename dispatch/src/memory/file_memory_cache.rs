@@ -52,7 +52,8 @@ use ahash::HashMap;
 use bytes::Bytes;
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::memory::clock::Owner;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Sub-block granularity for validity tracking and disk reads (the direct-I/O
@@ -299,10 +300,9 @@ impl ValidBitmap {
     }
 }
 
-/// Per-slot CLOCK metadata, validity, and tenancy. One per ring slot.
+/// Per-slot validity and tenancy. One per ring slot. The CLOCK state (recency
+/// counter, owner, sweep hand) lives in the shared [`Clock`].
 struct Entry {
-    /// CLOCK second-chance bit: set on access, cleared by the eviction sweep.
-    ref_bit: AtomicBool,
     /// Bumped on every recycle and snapshotted into each [`Extent`] placed here, so
     /// a reader that pins the slot can detect it was reused out from under its
     /// placement (the snapshot no longer matches).
@@ -313,11 +313,6 @@ struct Entry {
     /// eviction can drop them from their files' maps. Written only by the worker filling the
     /// slot (under its fill pin); read only by the evictor (under `try_write`).
     tenants: UnsafeCell<Vec<Tenant>>,
-    /// Whether the cache owns this slot (`true`, a published fill/cache buffer) or
-    /// the free pool does (`false`). The evictor must not hand out a pooled slot, and
-    /// a freshly-rotated cache slot can still have an empty `tenants`, so this can't
-    /// be derived from `tenants.is_empty()`.
-    bound: AtomicBool,
 }
 
 /// One resolved run on the [`get`](FileMemoryCache::get) path, starting at the block the
@@ -356,8 +351,6 @@ pub struct FileMemoryCache {
     /// Per-slot metadata, indexed by ring slot. `UnsafeCell` because `tenants` is
     /// mutated through a shared `&self` under the pin/exclusivity discipline.
     entries: Box<[UnsafeCell<Entry>]>,
-    /// The CLOCK sweep hand: the next ring slot index [`evict`](Self::evict) considers.
-    hand: AtomicUsize,
 }
 
 unsafe impl Send for FileMemoryCache {}
@@ -370,16 +363,13 @@ impl FileMemoryCache {
             entries: (0..capacity)
                 .map(|_| {
                     UnsafeCell::new(Entry {
-                        ref_bit: Default::default(),
                         generation: Default::default(),
                         valid: Default::default(),
                         tenants: UnsafeCell::new(Vec::new()),
-                        bound: Default::default(),
                     })
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            hand: Default::default(),
         }
     }
 
@@ -488,7 +478,7 @@ impl FileMemoryCache {
             return None;
         }
         let entry = self.entry(slot_idx);
-        entry.ref_bit.store(true, Ordering::Relaxed);
+        memory_ctx().clock().touch(slot_idx);
 
         let run_end = extent.last_block_in_file().min(last_block_in_file);
         // Slot sub-block holding file block `b`.
@@ -580,11 +570,9 @@ impl FileMemoryCache {
                             .load(Ordering::Acquire),
                     },
                 );
-                // Mark the slot referenced so a freshly packed run survives one CLOCK
-                // sweep before becoming eligible for eviction.
-                self.entry(fill_cursor.slot_idx)
-                    .ref_bit
-                    .store(true, Ordering::Relaxed);
+                // Mark the slot referenced so a freshly packed run survives the
+                // CLOCK sweep before becoming eligible for eviction.
+                memory_ctx().clock().touch(fill_cursor.slot_idx);
             }
             break claimed;
         };
@@ -653,7 +641,7 @@ impl FileMemoryCache {
         // Exclusively held (WRITING): reset metadata before any reader can pin it.
         entry.valid.clear();
         self.tenants_mut(slot_idx).clear();
-        entry.bound.store(true, Ordering::Relaxed);
+        memory_ctx().clock().bind(slot_idx, Owner::Compressed);
         let buffer = ReadBuffer::from(write_buffer); // used=1, Release; non-zeroed
 
         fill_cursor.buffer = Some(Arc::new(buffer));
@@ -687,33 +675,31 @@ impl FileMemoryCache {
             == extent.generation
     }
 
-    /// Reset a slot's validity and unbind it, bumping its generation so any
-    /// surviving placement resolves to a miss. Sound only while the slot is held
-    /// exclusively (`try_write` succeeded); the caller must have already taken or
-    /// cleared its tenant list. The `Release` bump is the edge paired with the
-    /// `Acquire` loads in [`is_live`](Self::is_live).
+    /// Reset a slot's validity and release it from the clock, bumping its
+    /// generation so any surviving placement resolves to a miss. Sound only while
+    /// the slot is held exclusively (`try_write` succeeded); the caller must have
+    /// already taken or cleared its tenant list. The `Release` bump is the edge
+    /// paired with the `Acquire` loads in [`is_live`](Self::is_live).
     fn recycle_slot(&self, idx: usize) {
         let entry = self.entry(idx);
         entry.valid.clear();
-        entry.bound.store(false, Ordering::Relaxed);
         entry.generation.fetch_add(1, Ordering::Release);
+        memory_ctx().clock().release(idx);
     }
 
-    /// Evict a slot using the (second-chance) CLOCK algorithm and return it as a
-    /// writable buffer. Drops every run packed in the slot from its file's extent
-    /// map (only those still pointing at this slot) and bumps the slot's generation
-    /// so a reader pinning a surviving placement resolves to a miss.
+    /// Evict a ring slot via the shared CLOCK and return it writable. The sweep
+    /// picks victims across both caches (compressed and decompressed), preferring
+    /// decompressed pages because they age out faster.
     pub fn evict(&self) -> WriteBuffer {
         // Livelock guard. When a query's working set exceeds the ring, every
         // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
-        // progress, and the loop has no cancellation point). After two full ring
-        // sweeps find nothing (a healthy CLOCK finds a
-        // victim within ~2 sweeps, so this is clearly abnormal), warn and sleep to
-        // give peer workers / ingest a chance to release slots; if one more sweep
-        // after the sleep still finds nothing, the cache is genuinely exhausted, so
-        // panic to abort the offending query rather than peg all cores forever.
+        // progress, and the loop has no cancellation point). A healthy CLOCK finds
+        // a victim within a few sweeps (counters reach zero in at most their tier
+        // max), so far more than that is abnormal: warn and sleep to let peer
+        // workers / ingest release slots; if it still finds nothing, the cache is
+        // genuinely exhausted, so panic to abort the offending query.
         let ring_len = memory_ctx().ring().len() as u64;
-        let warn_at = 2 * ring_len;
+        let warn_at = 4 * ring_len;
         let mut iterations: u64 = 0;
         let mut panic_at: Option<u64> = None;
         loop {
@@ -733,61 +719,70 @@ impl FileMemoryCache {
                 );
             }
 
-            let slot_idx = self.hand.fetch_add(1, Ordering::Relaxed) % memory_ctx().ring().len();
-            let entry = self.entry(slot_idx);
-            // Give recently-used slots a second chance.
-            if entry.ref_bit.swap(false, Ordering::Relaxed) {
-                continue;
-            }
-            let Some(write_buffer) = memory_ctx().ring().try_write(slot_idx) else {
-                continue;
+            let (slot_idx, victim) = memory_ctx().clock().advance();
+            let reclaimed = match victim {
+                Some(Owner::Compressed) => self.reclaim_compressed(slot_idx),
+                Some(Owner::Decompressed) => {
+                    memory_ctx().decompressed_cache().reclaim_slot(slot_idx)
+                }
+                Some(Owner::Free) | None => None,
             };
-            // Exclusive now (WRITING; every reader pin dropped - including the
-            // filler's, so the tenant list is complete and visible: the last
-            // reader's Release drop synchronizes with this try_write's Acquire).
-            if !entry.bound.load(Ordering::Relaxed) {
-                // A free buffer parked in a pool, not a cache slot. Handing it out
-                // would alias the pool's copy; release it without pooling it again
-                // (its pool listing stays valid) and keep scanning.
-                std::mem::forget(write_buffer);
-                memory_ctx()
-                    .ring()
-                    .set_slot_used(slot_idx, 0, Ordering::Release);
-                continue;
+            if let Some(write_buffer) = reclaimed {
+                return write_buffer;
             }
+        }
+    }
 
-            let tenants = std::mem::take(self.tenants_mut(slot_idx));
-            let mut emptied_files: Vec<FileLocation> = Vec::new();
-            {
-                let file_maps = self.file_maps.read().unwrap();
-                for tenant in tenants {
-                    let Some(extents_lock) = file_maps.get(&tenant.location) else {
-                        continue;
-                    };
-                    let mut extents = extents_lock.write().unwrap();
-                    // Remove only if the extent still names this slot: a run re-homed
-                    // to another slot by a racing miss must survive. We hold WRITING,
-                    // so the slot can't be concurrently refilled - any extent that
-                    // names it is one of ours and is being evicted, so the generation
-                    // necessarily matches and isn't worth re-checking.
-                    if extents
-                        .get(&tenant.first_block_in_file)
-                        .is_some_and(|extent| extent.slot_idx as usize == slot_idx)
-                    {
-                        extents.remove(&tenant.first_block_in_file);
-                    }
-                    if extents.is_empty() {
-                        emptied_files.push(tenant.location);
-                    }
+    /// Reclaim compressed slot `slot_idx` if it can be taken exclusively: drop its
+    /// tenants from their files' extent maps, recycle it, and return it writable.
+    /// `None` when a reader still pins it or it raced to another owner.
+    fn reclaim_compressed(&self, slot_idx: usize) -> Option<WriteBuffer> {
+        let write_buffer = memory_ctx().ring().try_write(slot_idx)?;
+        // Exclusive now (WRITING; every reader pin dropped - including the
+        // filler's, so the tenant list is complete and visible: the last reader's
+        // Release drop synchronizes with this try_write's Acquire). Re-check the
+        // owner: the slot may have raced to the free pool or another cache between
+        // the sweep and the `try_write`; releasing it without re-pooling keeps its
+        // existing listing valid.
+        if memory_ctx().clock().owner(slot_idx) != Owner::Compressed {
+            std::mem::forget(write_buffer);
+            memory_ctx()
+                .ring()
+                .set_slot_used(slot_idx, 0, Ordering::Release);
+            return None;
+        }
+
+        let tenants = std::mem::take(self.tenants_mut(slot_idx));
+        let mut emptied_files: Vec<FileLocation> = Vec::new();
+        {
+            let file_maps = self.file_maps.read().unwrap();
+            for tenant in tenants {
+                let Some(extents_lock) = file_maps.get(&tenant.location) else {
+                    continue;
+                };
+                let mut extents = extents_lock.write().unwrap();
+                // Remove only if the extent still names this slot: a run re-homed
+                // to another slot by a racing miss must survive. We hold WRITING,
+                // so the slot can't be concurrently refilled - any extent that
+                // names it is one of ours and is being evicted, so the generation
+                // necessarily matches and isn't worth re-checking.
+                if extents
+                    .get(&tenant.first_block_in_file)
+                    .is_some_and(|extent| extent.slot_idx as usize == slot_idx)
+                {
+                    extents.remove(&tenant.first_block_in_file);
+                }
+                if extents.is_empty() {
+                    emptied_files.push(tenant.location);
                 }
             }
-            self.prune_empty_file_locations(emptied_files);
-
-            // Recycle under WRITING (before returning), so no reader ever observes
-            // the slot still carrying the old generation.
-            self.recycle_slot(slot_idx);
-            return write_buffer;
         }
+        self.prune_empty_file_locations(emptied_files);
+
+        // Recycle under WRITING (before returning), so no reader ever observes
+        // the slot still carrying the old generation.
+        self.recycle_slot(slot_idx);
+        Some(write_buffer)
     }
 
     /// Remove `file_maps` entries for the given locations whose extent map is now
@@ -810,12 +805,47 @@ impl FileMemoryCache {
         }
     }
 
+    /// Mark every resident slot holding bytes in `[offset, offset + len)` of
+    /// `location` as recently used in the shared clock, without reading or
+    /// allocating. The decompressed cache calls this on a hit to keep a block's
+    /// source bytes hot, so evicting the (faster-aging) decompressed copy falls
+    /// back to an in-memory re-decompress rather than a disk read.
+    pub fn touch_range(&self, location: &FileLocation, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let first_block = offset / SUB_BLOCK_SIZE;
+        let last_block = (offset + len - 1) / SUB_BLOCK_SIZE;
+
+        let file_maps = self.file_maps.read().unwrap();
+        let Some(extents_lock) = file_maps.get(location) else {
+            return;
+        };
+        let extents = extents_lock.read().unwrap();
+        // Walk from the extent that may cover `first_block` forward through the
+        // range, touching each live one's slot (extents never overlap).
+        let start = extents
+            .range(..=first_block)
+            .next_back()
+            .map(|(&k, _)| k)
+            .unwrap_or(first_block);
+        for (_, &extent) in extents.range(start..=last_block) {
+            if extent.last_block_in_file() >= first_block && self.is_live(extent) {
+                memory_ctx().clock().touch(extent.slot_idx as usize);
+            }
+        }
+    }
+
     /// Register a [`FileLocation`] (a local fd or a remote object) so its runs can
     /// be cached. Clears any runs from a previous registration of an equal location
     /// (e.g. a reused fd number) by dropping its extent map - the next lookup then
     /// misses. The orphaned tenants in their slots self-clean on eviction (their
     /// extent is gone, so the per-slot guard skips them).
     pub fn open_entry(&self, location: FileLocation) {
+        // Drop any decompressed pages cached under this (possibly reused) location
+        // for the same reason the compressed map is reset below: a reopened fd may
+        // now name a different file, so its old pages must not serve a later read.
+        memory_ctx().decompressed_cache().invalidate(&location);
         // The `file_maps` write lock serializes with `allocate_run`'s read, so a
         // racing miss either sees the fresh empty map or has its run dropped here.
         self.file_maps

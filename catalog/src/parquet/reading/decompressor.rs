@@ -17,7 +17,7 @@ use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::memory::{BUFFER_SIZE, memory_ctx};
+use dispatch::memory::{BUFFER_SIZE, BlockKey, memory_ctx};
 use snap::raw::Decoder;
 use thiserror::Error;
 
@@ -51,6 +51,61 @@ impl Default for Decompressor {
 
 impl Decompressor {
     fn decompress(&mut self, page: CompressedPage) -> Result<DecompressedPage> {
+        let is_dict = match page.header.r#type {
+            PageType::DATA_PAGE => false,
+            PageType::DICTIONARY_PAGE => true,
+            other => return Err(Error::UnsupportedPageType(other)),
+        };
+
+        // The decompressed bytes depend only on the compressed input, not on the
+        // per-query filter mask, so a cache hit reuses them across queries; the
+        // mask is attached to the `DataPage` below either way.
+        let key = BlockKey {
+            location: page.row_group.get_metadata().location.clone(),
+            offset: page.file_offset,
+        };
+        let data = match memory_ctx().decompressed_cache().get(&key) {
+            Some(cached) => cached,
+            None => {
+                let (data, slots) = self.decompress_bytes(&page)?;
+                // A zero-length page occupies no ring slot, so there is nothing to
+                // cache (and nothing for the clock to evict); re-decompressing an
+                // empty page is free anyway.
+                if !slots.is_empty() {
+                    memory_ctx()
+                        .decompressed_cache()
+                        .insert(key, data.clone(), slots, page.source_len);
+                }
+                data
+            }
+        };
+
+        let payload = if is_dict {
+            DecompressedPageType::Dict {
+                header: page.header.dictionary_page_header.unwrap(),
+                data,
+            }
+        } else {
+            DecompressedPageType::Data(DataPage {
+                header: page.header.data_page_header.unwrap(),
+                data,
+                filter_mask: page.filter_mask,
+            })
+        };
+
+        Ok(DecompressedPage {
+            worker_id: page.worker_id,
+            query_row_group_metadata: page.row_group,
+            column_idx: page.column_idx,
+            data: payload,
+            idx: page.page_idx,
+        })
+    }
+
+    /// Snappy-decompress the page body into freshly allocated ring buffers,
+    /// returning one ring-backed [`Bytes`] per 2 MB slot, plus the slots they
+    /// occupy (so the cache can register them with the shared clock).
+    fn decompress_bytes(&mut self, page: &CompressedPage) -> Result<(Vec<Bytes>, Vec<usize>)> {
         let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
 
         let uncompressed_size = page.header.uncompressed_page_size as usize;
@@ -63,6 +118,7 @@ impl Decompressor {
 
         self.decoder.decompress_scattered(&input, output_bufs)?;
 
+        let slots: Vec<usize> = write_buffers.iter().map(|b| b.slot_idx).collect();
         let mut data = Vec::with_capacity(num_buffers);
         let mut remaining = uncompressed_size;
         for write_buffer in write_buffers {
@@ -70,25 +126,7 @@ impl Decompressor {
             data.push(Bytes::from_owner(write_buffer).slice(..chunk_len));
             remaining -= chunk_len;
         }
-
-        Ok(DecompressedPage {
-            worker_id: page.worker_id,
-            query_row_group_metadata: page.row_group,
-            column_idx: page.column_idx,
-            data: match page.header.r#type {
-                PageType::DATA_PAGE => DecompressedPageType::Data(DataPage {
-                    header: page.header.data_page_header.unwrap(),
-                    data,
-                    filter_mask: page.filter_mask,
-                }),
-                PageType::DICTIONARY_PAGE => DecompressedPageType::Dict {
-                    header: page.header.dictionary_page_header.unwrap(),
-                    data,
-                },
-                _ => return Err(Error::UnsupportedPageType(page.header.r#type)),
-            },
-            idx: page.page_idx,
-        })
+        Ok((data, slots))
     }
 }
 
@@ -161,6 +199,8 @@ mod tests {
             worker_id: 0,
             row_group: dummy_metadata(None),
             column_idx: 0,
+            file_offset: 0,
+            source_len: 0,
             page_idx: 0,
             header: PageHeader {
                 r#type: PageType::DATA_PAGE,
@@ -189,6 +229,8 @@ mod tests {
             worker_id: 0,
             row_group: dummy_metadata(None),
             column_idx: 0,
+            file_offset: 0,
+            source_len: 0,
             page_idx: 0,
             header: PageHeader {
                 r#type: PageType::DICTIONARY_PAGE,
@@ -309,6 +351,113 @@ mod tests {
         assert_eq!(data_page.filter_mask.as_ref().unwrap().rows(), 1);
     }
 
+    /// Decompressing the same page identity twice reuses the cached bytes
+    /// (same ring address) instead of decompressing again.
+    #[test]
+    fn test_same_page_is_cached_and_reused() {
+        init_test_free_pool(8);
+        let payload = vec![0x5Au8; 200];
+        let metadata = dummy_metadata(None);
+        let make_page = || {
+            let mut page = compressed_data_page(&payload, 10, None);
+            page.row_group = metadata.clone();
+            page
+        };
+
+        let first = run_unary(Decompressor::default(), vec![make_page()]);
+        let second = run_unary(Decompressor::default(), vec![make_page()]);
+
+        let data = |out: &DecompressedPage| {
+            let DecompressedPageType::Data(d) = &out.data else {
+                panic!("expected Data");
+            };
+            d.data.clone()
+        };
+        let decompressed: Vec<u8> = data(&second[0]).iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+        assert_eq!(
+            data(&first[0])[0].as_ptr(),
+            data(&second[0])[0].as_ptr(),
+            "second read should reuse the cached ring buffer",
+        );
+    }
+
+    /// A cache hit attaches the *current* query's filter mask, not the one from
+    /// the read that populated the cache.
+    #[test]
+    fn test_cache_hit_attaches_the_query_filter_mask() {
+        init_test_free_pool(8);
+        let payload = vec![0u8; 64];
+        let metadata = dummy_metadata(None);
+        let mut first_page = compressed_data_page(&payload, 10, None);
+        first_page.row_group = metadata.clone();
+        run_unary(Decompressor::default(), vec![first_page]);
+
+        let mut second_page = compressed_data_page(&payload, 10, Some(FilterMask::new(0, 10, &[3])));
+        second_page.row_group = metadata.clone();
+        let out = run_unary(Decompressor::default(), vec![second_page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        assert_eq!(data_page.filter_mask.as_ref().unwrap().rows(), 1);
+    }
+
+    /// Regression: the cache keys on the physical column-chunk offset, not the
+    /// projection-relative `column_idx`. Two different physical columns that share
+    /// a `column_idx` (across queries with different projections) must NOT collide.
+    /// That bug returned column A's bytes for column B (an out-of-bounds at decode).
+    #[test]
+    fn test_distinct_columns_sharing_column_idx_do_not_collide() {
+        init_test_free_pool(8);
+        let metadata = dummy_metadata(None);
+        let mut col_a = compressed_data_page(&[0xAAu8; 64], 10, None);
+        col_a.row_group = metadata.clone();
+        col_a.file_offset = 100;
+        col_a.column_idx = 0;
+        let mut col_b = compressed_data_page(&[0xBBu8; 64], 10, None);
+        col_b.row_group = metadata.clone();
+        col_b.file_offset = 200; // different physical column...
+        col_b.column_idx = 0; // ...but same projection-relative index
+
+        run_unary(Decompressor::default(), vec![col_a]);
+        let out = run_unary(Decompressor::default(), vec![col_b]);
+
+        let DecompressedPageType::Data(d) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let bytes: Vec<u8> = d.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(bytes, vec![0xBBu8; 64], "must not return column A's cached bytes");
+    }
+
+    /// The same physical column reached at a different projection position (same
+    /// `file_offset`, different `column_idx`) still hits the cache.
+    #[test]
+    fn test_same_offset_different_column_idx_hits() {
+        init_test_free_pool(8);
+        let metadata = dummy_metadata(None);
+        let payload = vec![0xC7u8; 80];
+        let mut first = compressed_data_page(&payload, 10, None);
+        first.row_group = metadata.clone();
+        first.file_offset = 500;
+        first.column_idx = 0;
+        let mut second = compressed_data_page(&payload, 10, None);
+        second.row_group = metadata.clone();
+        second.file_offset = 500;
+        second.column_idx = 3;
+
+        let a = run_unary(Decompressor::default(), vec![first]);
+        let b = run_unary(Decompressor::default(), vec![second]);
+
+        let ptr = |o: &DecompressedPage| {
+            let DecompressedPageType::Data(d) = &o.data else {
+                panic!("expected Data");
+            };
+            d.data[0].as_ptr()
+        };
+        assert_eq!(ptr(&a[0]), ptr(&b[0]), "same physical column should reuse cached bytes");
+    }
+
     /// Unsupported page type → error.
     #[test]
     fn test_unsupported_page_type() {
@@ -318,6 +467,8 @@ mod tests {
             worker_id: 0,
             row_group: dummy_metadata(None),
             column_idx: 0,
+            file_offset: 0,
+            source_len: 0,
             page_idx: 0,
             header: PageHeader {
                 r#type: PageType::INDEX_PAGE,

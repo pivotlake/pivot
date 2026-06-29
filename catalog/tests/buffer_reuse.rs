@@ -84,6 +84,12 @@ fn dropped_batch_memory_is_reused() {
 
 #[test]
 fn decompressed_string_buffer_is_reused() {
+    // This pins the underlying cross-page decompression-buffer recycling. The
+    // decompressed-page cache retains each page's buffer, which would mask that
+    // reuse, so disable it here (its own behaviour is covered by the decompressor
+    // unit tests). Set before the dispatcher is built; the cache reads this at
+    // construction.
+    unsafe { std::env::set_var("PIVOT_DECOMPRESSED_CACHE", "false") };
     let dispatcher = dispatch(1);
     // ~50K unique strings > 12 bytes → just over 1MB raw, forcing exactly 2 Parquet pages.
     // Each page gets its own decompressed WriteBuffer. After page 1's batches are

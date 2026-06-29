@@ -484,13 +484,16 @@ impl Worker {
     /// atomically with the wait and stored back into `last_seen_wake_count` for the
     /// next park.
     fn clear_dirty_buffer_or_park(&mut self) {
-        // Only clean dirty buffers between queries — while a dataflow is
-        // running we don't want to spend filler-time on buffer cleanup that
-        // could otherwise be CPU available for stealing work from sibling workers.
+        // Zero a dirty buffer when we have nothing better to do, to keep a
+        // reserve of zeroed buffers ready for allocators that need them (group-by
+        // hash tables, which rely on the `hash == 0` empty-slot sentinel and
+        // otherwise pay a 2 MB memset inline on the allocation hot path).
         //
-        // Ideally, we would do cleanup also when you have dataflows above a certain
-        // threshold of dirty buffers - but we don't have that implemented yet.
-        if self.data_flows.is_empty()
+        // Between queries (no dataflows) we always top up. While a dataflow is
+        // running we only top up when the zeroed reserve is below its target, so
+        // we don't spend steal-time zeroing buffers we already have enough of -
+        // and we only zero this worker's own dirty buffers (no stealing).
+        if (self.data_flows.is_empty() || memory_ctx().needs_zeroed_buffers())
             && let Some(b) = memory_ctx().pop_dirty_buffer()
         {
             b.zero_out();

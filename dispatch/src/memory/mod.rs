@@ -23,6 +23,12 @@ pub use ring::{BUFFER_SIZE, Ring};
 pub mod file_memory_cache;
 pub use file_memory_cache::CacheLookup;
 
+pub mod decompressed_cache;
+pub use decompressed_cache::{BlockKey, DecompressedCache};
+
+pub mod clock;
+pub use clock::{Clock, Owner};
+
 mod free_pool;
 
 mod write_buffer;

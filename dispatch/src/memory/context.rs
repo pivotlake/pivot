@@ -1,13 +1,25 @@
 use crate::env::get_env_var_with_default;
+use crate::memory::clock::Clock;
+use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::file_memory_cache::{FileMemoryCache, FillCursor};
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
 use crate::worker::{NUM_WORKERS, WORKER_IDX};
 use std::cell::{Cell, RefCell, UnsafeCell};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 static PANIC_ON_EVICT: LazyLock<bool> =
     LazyLock::new(|| get_env_var_with_default("PANIC_ON_EVICT", true));
+
+/// Target number of pre-zeroed buffers to keep on hand. Idle workers top the
+/// zeroed pool up to this so allocators that need zeroed memory (group-by hash
+/// tables) rarely have to zero inline. Must stay below the cache's reserve
+/// (`buffers - max_slots`) so there's room to hold them. Default: an eighth of
+/// the ring. Env `PIVOT_ZEROED_BUFFER_TARGET` overrides.
+fn zeroed_buffer_target(buffers: usize) -> usize {
+    get_env_var_with_default("PIVOT_ZEROED_BUFFER_TARGET", buffers / 8)
+}
 
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
@@ -38,8 +50,12 @@ pub fn has_memory_context() -> bool {
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
     file_memory_cache: Arc<FileMemoryCache>,
+    decompressed_cache: Arc<DecompressedCache>,
+    clock: Arc<Clock>,
     dirty_pool_factory: PoolFactory,
     zeroed_pool_factory: PoolFactory,
+    zeroed_count: Arc<AtomicUsize>,
+    zeroed_target: usize,
 }
 
 impl MemoryContextFactory {
@@ -51,6 +67,10 @@ impl MemoryContextFactory {
 
         let ring = Arc::new(Ring::new(buffers).unwrap());
         let file_memory_cache = Arc::new(FileMemoryCache::new(buffers));
+        let decompressed_cache = Arc::new(DecompressedCache::new());
+        let clock = Arc::new(Clock::new(buffers));
+        let zeroed_count = Arc::new(AtomicUsize::new(0));
+        let zeroed_target = zeroed_buffer_target(buffers);
         let mut zeroed_pool_factories = PoolFactory::create_many(count);
         let mut dirty_pool_factories = PoolFactory::create_many(count);
 
@@ -58,8 +78,12 @@ impl MemoryContextFactory {
             .map(|_| Self {
                 ring: ring.clone(),
                 file_memory_cache: file_memory_cache.clone(),
+                decompressed_cache: decompressed_cache.clone(),
+                clock: clock.clone(),
                 dirty_pool_factory: dirty_pool_factories.pop().unwrap(),
                 zeroed_pool_factory: zeroed_pool_factories.pop().unwrap(),
+                zeroed_count: zeroed_count.clone(),
+                zeroed_target,
             })
             .collect()
     }
@@ -68,8 +92,12 @@ impl MemoryContextFactory {
         MemoryContext {
             ring: self.ring,
             file_memory_cache: self.file_memory_cache,
+            decompressed_cache: self.decompressed_cache,
+            clock: self.clock,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
+            zeroed_count: self.zeroed_count,
+            zeroed_target: self.zeroed_target,
             fill_cursor: UnsafeCell::new(FillCursor::empty()),
         }
     }
@@ -78,8 +106,18 @@ impl MemoryContextFactory {
 pub struct MemoryContext {
     ring: Arc<Ring>,
     file_memory_cache: Arc<FileMemoryCache>,
+    decompressed_cache: Arc<DecompressedCache>,
+    /// The CLOCK eviction policy over all ring slots, shared by both caches.
+    clock: Arc<Clock>,
     dirty_pool: FreePool,
     zeroed_pool: FreePool,
+    /// Approximate count of buffers currently in the zeroed pool (shared across
+    /// workers). Bumped on push-as-zeroed, dropped on pop-from-zeroed. Drives the
+    /// idle zeroing target; a small race-induced drift is harmless (it only nudges
+    /// how eagerly idle workers zero).
+    zeroed_count: Arc<AtomicUsize>,
+    /// Target zeroed-pool size idle workers maintain (see [`zeroed_buffer_target`]).
+    zeroed_target: usize,
     /// This worker's bump cursor for packing missed reads into a shared fill buffer
     /// (see [`FileMemoryCache`]). Per-thread, so interior-mutable without a lock - the
     /// `&'static MemoryContext` is really thread-local, so there is never a second
@@ -106,6 +144,14 @@ impl MemoryContext {
         self.file_memory_cache.as_ref()
     }
 
+    pub fn decompressed_cache(&self) -> &DecompressedCache {
+        self.decompressed_cache.as_ref()
+    }
+
+    pub fn clock(&self) -> &Clock {
+        self.clock.as_ref()
+    }
+
     pub fn ring(&self) -> &Ring {
         self.ring.as_ref()
     }
@@ -125,6 +171,7 @@ impl MemoryContext {
     /// placed into the home worker's injector so the owner retrieves it on its next pop.
     pub fn push_free_idx(&self, idx: usize, zeroed: bool) {
         if zeroed {
+            self.zeroed_count.fetch_add(1, Ordering::Relaxed);
             self.zeroed_pool.push(idx)
         } else {
             self.dirty_pool.push(idx)
@@ -134,14 +181,27 @@ impl MemoryContext {
     /// Pop a free buffer index for the current worker thread.
     ///
     /// When `prefer_zeroed` is true, tries the zeroed pool first then dirty.
-    /// When false, tries dirty first then zeroed.
+    /// When false, tries dirty first then zeroed. Popping from the zeroed pool
+    /// decrements [`zeroed_count`](Self::needs_zeroed_buffers).
     pub fn pop_free_idx(&self, prefer_zeroed: bool) -> Option<usize> {
-        let (first, second) = if prefer_zeroed {
-            (&self.zeroed_pool, &self.dirty_pool)
+        if prefer_zeroed {
+            self.pop_zeroed().or_else(|| self.dirty_pool.pop(true))
         } else {
-            (&self.dirty_pool, &self.zeroed_pool)
-        };
-        first.pop(true).or_else(|| second.pop(true))
+            self.dirty_pool.pop(true).or_else(|| self.pop_zeroed())
+        }
+    }
+
+    /// Pop from the zeroed pool, keeping the shared zeroed count in step.
+    fn pop_zeroed(&self) -> Option<usize> {
+        let idx = self.zeroed_pool.pop(true)?;
+        self.zeroed_count.fetch_sub(1, Ordering::Relaxed);
+        Some(idx)
+    }
+
+    /// Whether the zeroed pool is below its target, so an otherwise-idle worker
+    /// should zero a dirty buffer to top it up.
+    pub fn needs_zeroed_buffers(&self) -> bool {
+        self.zeroed_count.load(Ordering::Relaxed) < self.zeroed_target
     }
 
     /// Pop a dirty buffer from this worker's local deque only (no stealing).
@@ -193,10 +253,14 @@ impl MemoryContext {
                 }
             }
 
-            if *PANIC_ON_EVICT {
+            // Pool empty: evict via the shared clock, which surrenders
+            // decompressed pages preferentially (they age out faster). Panic only
+            // when there is nothing cheap to reclaim - an empty decompressed cache
+            // means we would be evicting the compressed file cache, the
+            // memory-pressure signal `PANIC_ON_EVICT` guards.
+            if *PANIC_ON_EVICT && self.decompressed_cache.is_empty() {
                 panic!("Evicting");
             }
-            // Nothing free! Let's evict from page cache
             return self.file_memory_cache.evict();
         }
     }
