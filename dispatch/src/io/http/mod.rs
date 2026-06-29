@@ -27,6 +27,8 @@ pub use tls::default_client_config;
 
 #[cfg(target_os = "linux")]
 pub(crate) use backend::HTTP_TAG;
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) use backend::HttpCompletion;
 pub(crate) use backend::HttpEngine;
 
 #[derive(Debug, Error)]

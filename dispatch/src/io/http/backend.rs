@@ -10,9 +10,10 @@
 //! connection's state machine (connect → handshake → request → response). Idle
 //! keep-alive connections are pooled per host and reused.
 //!
-//! On non-Linux (macOS dev builds) there is no ring: the engine performs the whole
-//! exchange synchronously at `start` time via `std::net` + `rustls::StreamOwned`,
-//! mirroring the file path's `pread` fallback.
+//! On non-Linux (macOS) there is no ring: the engine hands each range read to a
+//! shared pool of blocking `std::net` + `rustls::StreamOwned` threads (mirroring
+//! the file path's `pread` pool) and collects their completions over a channel,
+//! so a fetch never blocks the dataflow worker and many run concurrently.
 
 use super::RemoteRead;
 use super::proto;
@@ -21,7 +22,7 @@ use super::proto;
 pub(crate) use uring_engine::HttpEngine;
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) use blocking_engine::HttpEngine;
+pub(crate) use blocking_engine::{HttpCompletion, HttpEngine};
 
 /// High bit of an SQE `user_data` marking a completion as belonging to the HTTP
 /// engine rather than a file read. File-read ids are small monotonic counters,
@@ -35,7 +36,7 @@ fn host_key(remote: &crate::io::RemoteFile) -> String {
 }
 
 // ============================================================================
-// Other Unix: synchronous std::net + rustls fallback
+// Other Unix (macOS): blocking std::net + rustls thread pool
 // ============================================================================
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -44,13 +45,36 @@ mod blocking_engine {
     use crate::Identifier;
     use crate::io::http::http1;
     use crate::io::http::{Error, Result};
+    use crossbeam_channel::{Receiver, Sender, unbounded};
     use rustls::{ClientConnection, StreamOwned};
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
 
-    /// A pooled connection — TLS-wrapped or plain TCP.
+    /// Bound how long a single connect / read / write may block, so a hung server
+    /// can't pin a pool thread (and stall the engine's `Drop`) forever. Generous
+    /// for a range read against object storage; well above any healthy latency.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A finished fetch handed back from a pool thread: `Ok` once the body landed
+    /// in the slot, `Err` for a terminal transport failure (the engine surfaces it
+    /// to the owning dataflow). The id is the read's engine-side request id.
+    pub(crate) type HttpCompletion = (Identifier, Result<()>);
+
+    /// One range read for a pool thread to perform: fetch `read` into its pinned
+    /// slot and report `(id, outcome)` on `sink`. `client_config` builds any fresh
+    /// connection the fetch needs.
+    struct HttpJob {
+        id: Identifier,
+        read: RemoteRead,
+        client_config: Arc<rustls::ClientConfig>,
+        sink: Sender<HttpCompletion>,
+    }
+
+    /// A pooled connection: TLS-wrapped or plain TCP.
     enum Conn {
         Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
         Plain(TcpStream),
@@ -80,144 +104,310 @@ mod blocking_engine {
         }
     }
 
+    /// The keep-alive connection pool, keyed by host. Shared across all pool
+    /// threads (behind a mutex held only to pop or push a connection, never during
+    /// the network exchange) so reuse is global, exactly as the single engine did:
+    /// a sequential pair of reads to one host rides one connection.
+    type ConnPool = Mutex<HashMap<String, Vec<Conn>>>;
+
+    /// The process-wide pool of blocking-HTTP threads, created once and shared by
+    /// every worker's engine.
+    struct HttpPool {
+        jobs: Sender<HttpJob>,
+    }
+
+    fn http_pool() -> &'static HttpPool {
+        static POOL: OnceLock<HttpPool> = OnceLock::new();
+        POOL.get_or_init(|| {
+            let (jobs_tx, jobs_rx) = unbounded::<HttpJob>();
+            let conns: Arc<ConnPool> = Arc::new(Mutex::new(HashMap::new()));
+            for _ in 0..http_pool_thread_count() {
+                let jobs_rx = jobs_rx.clone();
+                let conns = conns.clone();
+                std::thread::Builder::new()
+                    .name("pivot-http".to_string())
+                    .spawn(move || run_http_thread(&jobs_rx, &conns))
+                    .expect("failed to spawn http pool thread");
+            }
+            HttpPool { jobs: jobs_tx }
+        })
+    }
+
+    /// Pool size: 512 threads by default (override with `PIVOT_HTTP_THREADS`).
+    /// HTTP fetches are latency-bound (a thread parks on the network, not the
+    /// CPU), so a deep pool overlaps many in-flight range reads against object
+    /// storage to hide per-request round trips. 512 pairs with the default
+    /// per-worker read-ahead to keep the pool fed without exceeding a laptop's
+    /// cross-region connection budget; raise it on a host close to the store.
+    fn http_pool_thread_count() -> usize {
+        crate::env::get_env_var_with_default("PIVOT_HTTP_THREADS", 512)
+    }
+
+    fn run_http_thread(jobs: &Receiver<HttpJob>, conns: &ConnPool) {
+        // The channel closes only when the (static) pool's sender is dropped,
+        // i.e. never; this loop runs for the life of the process.
+        while let Ok(job) = jobs.recv() {
+            // Every job MUST yield one completion (a worker parks until its read
+            // reports back) and this thread must survive to serve the next job, so
+            // a panic in the fetch fails just this read rather than stranding the
+            // worker or shrinking the pool.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_fetch(conns, &job.client_config, &job.read)
+            }))
+            .unwrap_or_else(|_| {
+                Err(Error::Io(std::io::Error::other(
+                    "http pool thread panicked",
+                )))
+            });
+            // The issuing engine may have been dropped mid-flight (its receiver
+            // gone); a failed send is then expected and ignored.
+            let _ = job.sink.send((job.id, outcome));
+        }
+    }
+
+    /// Fetch `read` into its slot, reusing a pooled keep-alive connection when one
+    /// is idle for the host and reconnecting once if it turns out to be stale.
+    fn run_fetch(
+        conns: &ConnPool,
+        client_config: &Arc<rustls::ClientConfig>,
+        read: &RemoteRead,
+    ) -> Result<()> {
+        let key = host_key(&read.remote);
+        // Recover a poisoned lock rather than propagating the panic: the guarded
+        // region is only a pop/push, so a poisoned map is still usable, and the
+        // pool is process-wide, so a panic-unwrap would brick every worker's HTTP
+        // reads for the life of the process rather than failing one read.
+        let pooled = conns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&key)
+            .and_then(|v| v.pop());
+        let conn = match pooled {
+            // A pooled connection may have been closed by the server's keep-alive
+            // timeout; on any error, reconnect once and retry.
+            Some(c) => match do_request(c, read) {
+                Ok(c) => c,
+                Err(_) => do_request(connect(client_config, read)?, read)?,
+            },
+            None => do_request(connect(client_config, read)?, read)?,
+        };
+        conns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key)
+            .or_default()
+            .push(conn);
+        Ok(())
+    }
+
+    fn connect(client_config: &Arc<rustls::ClientConfig>, read: &RemoteRead) -> Result<Conn> {
+        let tcp = TcpStream::connect_timeout(&read.remote.addr(), CONNECT_TIMEOUT)?;
+        tcp.set_nodelay(true).ok();
+        // These bound every read/write so a hung server can't pin a pool thread
+        // (and stall Drop) forever, so a failure to set them must fail the
+        // connection rather than be ignored.
+        tcp.set_read_timeout(Some(IO_TIMEOUT))?;
+        tcp.set_write_timeout(Some(IO_TIMEOUT))?;
+        if read.remote.is_https() {
+            let server_name =
+                rustls::pki_types::ServerName::try_from(read.remote.host().to_string())?;
+            let client = ClientConnection::new(client_config.clone(), server_name)?;
+            Ok(Conn::Tls(Box::new(StreamOwned::new(client, tcp))))
+        } else {
+            Ok(Conn::Plain(tcp))
+        }
+    }
+
+    /// Issue the range GET on `conn` and read its body into `read.dest`, returning
+    /// the connection for re-pooling on success.
+    fn do_request(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
+        let auth = read.remote.auth_header();
+        let request = proto::build_range_get(
+            read.remote.host_header(),
+            read.remote.request_target(),
+            read.offset,
+            read.len,
+            auth.as_deref(),
+        );
+        conn.write_all(&request)?;
+        conn.flush()?;
+
+        // Accumulate until the response head parses.
+        let mut chunk = vec![0u8; 16 * 1024];
+        let mut acc: Vec<u8> = Vec::new();
+        let head = loop {
+            let n = conn.read(&mut chunk)?;
+            if n == 0 {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before response head",
+                )));
+            }
+            acc.extend_from_slice(&chunk[..n]);
+            match proto::parse_response_head(&acc, read.len) {
+                Ok(proto::HeadParse::Complete(h)) => break h,
+                Ok(proto::HeadParse::Incomplete) => continue,
+                Err(e) => {
+                    // A rejected request (e.g. a GCS 404/403) carries an error
+                    // body explaining why; pull a little more so it lands in the
+                    // message, since a bare status is hard to diagnose.
+                    if let Ok(extra) = conn.read(&mut chunk) {
+                        acc.extend_from_slice(&chunk[..extra]);
+                    }
+                    let response = String::from_utf8_lossy(&acc);
+                    let response = &response[..response.len().min(800)];
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "{e}; {} {} -> {response}",
+                        read.remote.host_header(),
+                        read.remote.request_target(),
+                    ))));
+                }
+            }
+        };
+
+        let body_len = head.content_length as usize;
+        // SAFETY: dest points into the pinned cache slot for exactly this block's
+        // currently-invalid sub-blocks; body_len <= read.len <= the block length
+        // (validated in parse_response_head).
+        let dest = unsafe { std::slice::from_raw_parts_mut(read.dest, body_len) };
+
+        // Drive the body through the sans-IO decoder. The range policy guarantees
+        // an identity (`Content-Length`) body, so the Direct path applies: read
+        // straight into the cache slot and report the count, no intermediate
+        // buffer. `decode` first absorbs any body bytes that arrived alongside the
+        // head, and would transparently handle a chunked body too were the range
+        // policy ever relaxed.
+        let mut body = http1::BodyDecoder::new(head.content_length);
+        let mut written = 0usize;
+        let leftover = &acc[head.head_len..];
+        body.decode(leftover, |bytes| {
+            dest[written..written + bytes.len()].copy_from_slice(bytes);
+            written += bytes.len();
+        });
+
+        while !body.is_complete() {
+            match body.read_plan() {
+                http1::ReadPlan::Done => break,
+                http1::ReadPlan::Direct { max } => {
+                    let cap = (max as usize).min(dest.len() - written);
+                    let n = conn.read(&mut dest[written..written + cap])?;
+                    if n == 0 {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "connection closed before response body completed",
+                        )));
+                    }
+                    written += n;
+                    body.consumed(n as u64)?;
+                }
+            }
+        }
+
+        Ok(conn)
+    }
+
+    /// A thin per-worker handle onto the shared blocking-HTTP pool. Stages each
+    /// range read onto the pool and collects completions over `rx`; the requester
+    /// drains them via [`take_completed`](Self::take_completed) /
+    /// [`take_failed`](Self::take_failed) and parks on `rx` (alongside the disk
+    /// channel) in [`park_until_completion`](Self::park_until_completion).
     pub(crate) struct HttpEngine {
         client_config: Arc<rustls::ClientConfig>,
-        pool: HashMap<String, Vec<Conn>>,
+        /// This worker's job sender into the shared pool.
+        pool: Sender<HttpJob>,
+        /// Cloned onto each dispatched [`HttpJob`] so the pool thread reports back.
+        sink: Sender<HttpCompletion>,
+        /// Receives completions from the pool threads (MPSC: many threads, one
+        /// engine).
+        rx: Receiver<HttpCompletion>,
+        /// Fetches dispatched but not yet drained from `rx`.
+        active: usize,
+        /// Drained successes, awaiting [`take_completed`](Self::take_completed).
         completed: Vec<Identifier>,
+        /// Drained failures with their error, awaiting [`take_failed`](Self::take_failed).
+        failed: Vec<(Identifier, Error)>,
     }
 
     impl HttpEngine {
         pub fn new(client_config: Arc<rustls::ClientConfig>) -> Result<Self> {
+            let (sink, rx) = unbounded();
             Ok(Self {
                 client_config,
-                pool: HashMap::new(),
+                pool: http_pool().jobs.clone(),
+                sink,
+                rx,
+                active: 0,
                 completed: Vec::new(),
+                failed: Vec::new(),
             })
         }
 
-        /// Perform the whole range read synchronously and queue its id as completed.
+        /// Dispatch a range read onto the pool (non-blocking); it completes later
+        /// on `rx`.
         pub fn start(&mut self, id: Identifier, read: RemoteRead) -> Result<()> {
-            let key = host_key(&read.remote);
-            let pooled = self.pool.get_mut(&key).and_then(|v| v.pop());
-            let conn = match pooled {
-                // A pooled connection may have been closed by the server's
-                // keep-alive timeout; on any error, reconnect once and retry.
-                Some(c) => match Self::do_request(c, &read) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        let fresh = self.connect(&read)?;
-                        Self::do_request(fresh, &read)?
-                    }
-                },
-                None => {
-                    let fresh = self.connect(&read)?;
-                    Self::do_request(fresh, &read)?
-                }
-            };
-            self.pool.entry(key).or_default().push(conn);
-            self.completed.push(id);
+            self.pool
+                .send(HttpJob {
+                    id,
+                    read,
+                    client_config: self.client_config.clone(),
+                    sink: self.sink.clone(),
+                })
+                .expect("http pool thread gone");
+            self.active += 1;
             Ok(())
         }
 
+        /// Move every completion the pool has delivered into the success/failure
+        /// buckets (non-blocking).
+        fn drain_rx(&mut self) {
+            while let Ok((id, outcome)) = self.rx.try_recv() {
+                self.active -= 1;
+                match outcome {
+                    Ok(()) => self.completed.push(id),
+                    Err(error) => self.failed.push((id, error)),
+                }
+            }
+        }
+
         pub fn take_completed(&mut self) -> Vec<Identifier> {
+            self.drain_rx();
             std::mem::take(&mut self.completed)
         }
 
-        /// API parity with the uring engine: the blocking engine reports failures
-        /// synchronously through `start`'s `Result` (the requester fails the
-        /// dataflow there), so it never has deferred failures to hand back.
         pub fn take_failed(&mut self) -> Vec<(Identifier, Error)> {
-            Vec::new()
+            self.drain_rx();
+            std::mem::take(&mut self.failed)
         }
 
         pub fn has_active(&self) -> bool {
-            !self.completed.is_empty()
+            self.active > 0
         }
 
-        fn connect(&self, read: &RemoteRead) -> Result<Conn> {
-            let tcp = TcpStream::connect(read.remote.addr())?;
-            tcp.set_nodelay(true).ok();
-            if read.remote.is_https() {
-                let server_name =
-                    rustls::pki_types::ServerName::try_from(read.remote.host().to_string())?;
-                let client = ClientConnection::new(self.client_config.clone(), server_name)?;
-                Ok(Conn::Tls(Box::new(StreamOwned::new(client, tcp))))
-            } else {
-                Ok(Conn::Plain(tcp))
-            }
+        /// `true` if a completion is already in hand, so the worker need not park.
+        pub fn has_ready_completion(&self) -> bool {
+            !self.rx.is_empty() || !self.completed.is_empty() || !self.failed.is_empty()
         }
 
-        /// Issue the range GET on `conn` and read its body into `read.dest`,
-        /// returning the connection for re-pooling on success.
-        fn do_request(mut conn: Conn, read: &RemoteRead) -> Result<Conn> {
-            let auth = read.remote.auth_header();
-            let request = proto::build_range_get(
-                read.remote.host_header(),
-                read.remote.request_target(),
-                read.offset,
-                read.len,
-                auth.as_deref(),
-            );
-            conn.write_all(&request)?;
-            conn.flush()?;
+        /// The completion channel, so the requester can park on it alongside the
+        /// disk channel (the two pools deliver independently, with no shared ring
+        /// here to provide a single wake point).
+        pub fn completion_receiver(&self) -> &Receiver<HttpCompletion> {
+            &self.rx
+        }
+    }
 
-            // Accumulate until the response head parses.
-            let mut chunk = vec![0u8; 16 * 1024];
-            let mut acc: Vec<u8> = Vec::new();
-            let head = loop {
-                let n = conn.read(&mut chunk)?;
-                if n == 0 {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "connection closed before response head",
-                    )));
-                }
-                acc.extend_from_slice(&chunk[..n]);
-                match proto::parse_response_head(&acc, read.len)? {
-                    proto::HeadParse::Complete(h) => break h,
-                    proto::HeadParse::Incomplete => continue,
-                }
-            };
-
-            let body_len = head.content_length as usize;
-            // SAFETY: dest points into the pinned cache slot for exactly this
-            // block's currently-invalid sub-blocks; body_len <= read.len <= the
-            // block length (validated in parse_response_head).
-            let dest = unsafe { std::slice::from_raw_parts_mut(read.dest, body_len) };
-
-            // Drive the body through the sans-IO decoder. The range policy
-            // guarantees an identity (`Content-Length`) body, so the Direct path
-            // applies: read straight into the cache slot and report the count —
-            // no intermediate buffer. `decode` first absorbs any body bytes that
-            // arrived alongside the head, and would transparently handle a chunked
-            // body too were the range policy ever relaxed.
-            let mut body = http1::BodyDecoder::new(head.content_length);
-            let mut written = 0usize;
-            let leftover = &acc[head.head_len..];
-            body.decode(leftover, |bytes| {
-                dest[written..written + bytes.len()].copy_from_slice(bytes);
-                written += bytes.len();
-            });
-
-            while !body.is_complete() {
-                match body.read_plan() {
-                    http1::ReadPlan::Done => break,
-                    http1::ReadPlan::Direct { max } => {
-                        let cap = (max as usize).min(dest.len() - written);
-                        let n = conn.read(&mut dest[written..written + cap])?;
-                        if n == 0 {
-                            return Err(Error::Io(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "connection closed before response body completed",
-                            )));
-                        }
-                        written += n;
-                        body.consumed(n as u64)?;
-                    }
+    impl Drop for HttpEngine {
+        /// Block until every dispatched fetch reports back, so no pool thread
+        /// writes into a cache slot after the issuing read's pin is dropped. The
+        /// socket timeouts bound how long this can take.
+        fn drop(&mut self) {
+            self.drain_rx();
+            while self.active > 0 {
+                match self.rx.recv() {
+                    Ok(_) => self.active -= 1,
+                    Err(_) => break,
                 }
             }
-
-            Ok(conn)
         }
     }
 }
