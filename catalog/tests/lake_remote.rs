@@ -223,7 +223,7 @@ fn materializes_a_remote_footer_over_the_ring() {
 
     // Materialize the footer through `ParquetTable::from_remote_files` — the
     // on-ring path: the catalog-recorded size locates the footer, so its tail
-    // window is fetched through the file cache exactly like a column chunk. No
+    // window is fetched through the compressed cache exactly like a column chunk. No
     // HEAD, no suffix probe.
     let table = Arc::new(
         ParquetTable::from_remote_files(&dispatch, &[(url, size)]).expect("materialize footers"),

@@ -205,7 +205,7 @@ impl DataFlowDispatcher {
     /// Ship a `FnOnce() -> T` to worker 0 and return its result.
     ///
     /// Useful for one-shot setup work that needs a `MemoryContext` to run
-    /// (e.g. `ParquetTable::from_directory`, which touches the file cache)
+    /// (e.g. `ParquetTable::from_directory`, which touches the compressed cache)
     /// from a thread that doesn't have one. Builds a single-element
     /// `OperatorSpec` whose nullary fires once, sends one item, and finishes.
     pub fn run_on_worker<T, F>(&self, f: F) -> crate::data_flow::Result<T>

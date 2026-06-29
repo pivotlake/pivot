@@ -32,7 +32,7 @@
 //!
 //! Env: `PIVOT_BENCH_ROWS` (default 4M), `PIVOT_BENCH_WORKERS` (default all
 //! cores), `PIVOT_BENCH_BUFFERS` (ring/file-cache slots of 2 MiB, default 1024).
-//! Iteration 1 is a cold read; the rest decode from the warm file cache (so the
+//! Iteration 1 is a cold read; the rest decode from the warm compressed cache (so the
 //! steady-state samples are decompress+decode, not disk IO). Under `perf`, raise
 //! the locked-memory limit (`ulimit -l unlimited`) for io_uring setup.
 

@@ -120,18 +120,18 @@ async fn select_one_i64(client: &Client, sql: &str) -> i64 {
         .expect("integer scalar")
 }
 
-/// `SELECT drop_cache()` evicts pivot's file cache: after a scan populates it,
+/// `SELECT drop_cache()` evicts pivot's compressed cache: after a scan populates it,
 /// the first drop reports ≥1 region freed and an immediate second drop reports
 /// 0 (nothing left to evict). Serialised against the shared server by the
 /// `conn` fixture, so no other query touches the cache in between.
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
-async fn drop_cache_evicts_file_memory_cache(#[future] conn: Conn) {
+async fn drop_cache_evicts_compressed_cache(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_drop_cache", dir.path()).await;
 
-    // Scan the table so its parquet region lands in the file cache.
+    // Scan the table so its parquet region lands in the compressed cache.
     let rows = select_rows(&conn, "SELECT id, name FROM people_drop_cache").await;
     assert_eq!(rows.len(), 3);
 
@@ -155,7 +155,7 @@ async fn global_min_max_answers_from_metadata(#[future] conn: Conn) {
 }
 
 /// The unfiltered global MIN/MAX short-circuits to parquet row-group stats and
-/// never reads a data page, so it leaves the file cache empty. Proven by
+/// never reads a data page, so it leaves the compressed cache empty. Proven by
 /// clearing the cache (of any footer-load residue), running the aggregate, and
 /// finding nothing to evict afterwards.
 #[rstest]
