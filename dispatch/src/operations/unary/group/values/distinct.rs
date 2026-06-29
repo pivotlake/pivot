@@ -6,7 +6,7 @@
 //! Used for the dedup stage of `COUNT(DISTINCT x)` (and, later, `SELECT DISTINCT`):
 //! only the *set* of distinct keys matters, so it emits no value columns.
 
-use super::{AggregationSlot, AggregationValue};
+use super::{AggregationSlot, AggregationValue, ValueColumns};
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
@@ -16,10 +16,14 @@ use arrow_schema::Field;
 #[derive(Clone, Copy, Default)]
 pub struct Distinct;
 
+/// The (empty) output columns of a [`Distinct`] value: a keys-only group emits no
+/// value columns, so this builds nothing.
+pub struct DistinctColumns;
+
 impl AggregationValue for Distinct {
     type Reader<'b> = ();
     type SharedContext = ();
-    type Columns = ();
+    type Columns = DistinctColumns;
     type SortKey = i64;
     type WorkerContext = ();
 
@@ -42,13 +46,20 @@ impl AggregationValue for Distinct {
         // A keys-only group never feeds an ORDER BY <agg> top-k.
         0
     }
+}
 
-    fn new_columns(_allocator: &mut SlabAllocator, _rows: usize) {}
+impl ValueColumns for DistinctColumns {
+    type Value = Distinct;
+    type Context = ();
+
+    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+        DistinctColumns
+    }
 
     #[inline(always)]
-    fn push_to(&self, _cols: &mut ()) {}
+    fn push(&mut self, _value: &Distinct) {}
 
-    fn finish_columns(_cols: (), _ctx: &()) -> (Vec<Field>, Vec<ArrayRef>) {
+    fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())
     }
 }
