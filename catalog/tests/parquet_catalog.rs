@@ -433,7 +433,7 @@ fn metadata_function_honors_column_projection() {
     assert_eq!(single[0].num_columns(), 1);
     assert_eq!(i64_column(&single, "num_rows"), vec![1, 1, 1]);
     // Assert width and order, not just by-name lookups, so a projection that
-    // emitted all five columns or the wrong order would fail here.
+    // emitted all six columns or the wrong order would fail here.
     assert_eq!(column_names(&reordered), vec!["num_columns", "file_index"]);
     assert_eq!(i64_column(&reordered, "num_columns"), vec![2, 2, 2]);
     assert_eq!(i64_column(&reordered, "file_index"), vec![0, 0, 0]);
@@ -454,7 +454,7 @@ fn metadata_function_on_empty_table() {
     let results = run_sql(&catalog, "SELECT * FROM metadata('t')");
 
     assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
-    assert_eq!(results[0].num_columns(), 5);
+    assert_eq!(results[0].num_columns(), 6);
 }
 
 /// Each file gets its own `file_index`, so the metadata composes with normal SQL

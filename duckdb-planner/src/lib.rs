@@ -121,7 +121,7 @@ impl std::fmt::Display for PlannedQuery {
     }
 }
 
-/// Translate the error fields the bridge reports into a typed [`Error`].
+/// Translate the error fields the bridge reports into a typed [`enum@Error`].
 fn bridge_error(result: &ffi::ExtractPlanResult) -> Error {
     let position = result
         .has_error_position

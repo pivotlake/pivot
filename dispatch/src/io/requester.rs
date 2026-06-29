@@ -608,7 +608,7 @@ mod tests {
         let FileLocation::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
-        let lookups = memory_ctx().file_memory_cache().get(loc, offset, len);
+        let lookups = memory_ctx().compressed_cache().get(loc, offset, len);
         let mut submitted = 0;
         for lookup in &lookups {
             for block in lookup.missing() {
