@@ -8,8 +8,8 @@
 //! landed block off the waiting row group, and emit it once complete.
 //!
 //! Disk and HTTP have very different latencies, so the tracker bounds the
-//! outstanding reads of each kind independently: at most [`MAX_DISK_IN_FLIGHT`]
-//! disk-backed and [`MAX_HTTP_IN_FLIGHT`] remote-backed blocks. The cap is soft
+//! outstanding reads of each kind independently: at most `MAX_DISK_IN_FLIGHT`
+//! disk-backed and `MAX_HTTP_IN_FLIGHT` remote-backed blocks. The cap is soft
 //! (a row group may push over it) and gates only whether the *next* row group is
 //! admitted; a homogeneous scan only fills its medium's pool, so the other never
 //! gates.

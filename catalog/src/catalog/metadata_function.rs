@@ -92,7 +92,9 @@ impl TableFunction for MetadataTableFunction {
             i64_column(rows.iter().map(|r| r.num_columns).collect()),
             i64_column(rows.iter().map(|r| r.compressed_bytes).collect()),
             Arc::new(StringViewArray::from(
-                rows.iter().map(|r| r.file_name.as_str()).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|r| r.file_name.as_str())
+                    .collect::<Vec<_>>(),
             )),
         ];
         let schema = Arc::new(Schema::new(

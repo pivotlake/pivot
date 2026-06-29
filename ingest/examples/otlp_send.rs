@@ -65,7 +65,10 @@ fn log_request(service: &str, batch: usize, n: usize) -> ExportLogsServiceReques
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let addr = args.first().cloned().unwrap_or_else(|| "127.0.0.1:4317".to_string());
+    let addr = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:4317".to_string());
     let batches: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
     let per: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
     let interval_ms: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(500);

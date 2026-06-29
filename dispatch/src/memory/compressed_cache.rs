@@ -301,7 +301,7 @@ impl ValidBitmap {
 }
 
 /// Per-slot validity and tenancy. One per ring slot. The CLOCK state (recency
-/// counter, owner, sweep hand) lives in the shared [`Clock`].
+/// counter, owner, sweep hand) lives in the shared [`Clock`](crate::memory::Clock).
 struct Entry {
     /// Bumped on every recycle and snapshotted into each [`Extent`] placed here, so
     /// a reader that pins the slot can detect it was reused out from under its
@@ -666,7 +666,7 @@ impl CompressedCache {
 
     /// Whether slot `extent.slot_idx`'s live generation still matches the one this
     /// extent snapshotted - i.e. the placement hasn't been recycled. `Acquire` pairs
-    /// with the `Release` bump in [`recycle_slot`](Self::recycle_slot)/[`evict`](Self::evict),
+    /// with the `Release` bump in [`recycle_slot`](Self::recycle_slot)/[`evict`](crate::memory::context::MemoryContext::evict),
     /// so a match guarantees the slot still holds this placement's bytes.
     fn is_live(&self, extent: Extent) -> bool {
         self.entry(extent.slot_idx as usize)

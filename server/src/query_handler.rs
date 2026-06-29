@@ -102,7 +102,7 @@ fn with_planner<R>(
 /// pool (the thread-local DuckDB planner), then compiles and runs on the
 /// dispatch workers. A `SET`/`RESET` is a session no-op here and yields nothing.
 ///
-/// Uses [`RecordBatchOperatorSpec::collect`], which appends a `CopyOut` stage:
+/// Uses [`RecordBatchOperatorSpec::collect`](dispatch::RecordBatchOperatorSpec::collect), which appends a `CopyOut` stage:
 /// each batch's ring-backed buffers are deep-copied to plain heap allocations on
 /// the worker, so the returned batches are safe to hold and drop on this
 /// (non-worker) thread. Calling `execute().collect()` instead would return

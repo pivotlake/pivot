@@ -36,7 +36,7 @@ fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
 }
 
 /// Reads files' footers and emits one [`TableFile`] per file, keeping many reads
-/// in flight (bounded by [`MAX_DISK_IN_FLIGHT`]/[`MAX_HTTP_IN_FLIGHT`] via the
+/// in flight (bounded by `MAX_DISK_IN_FLIGHT`/`MAX_HTTP_IN_FLIGHT` via the
 /// shared [`RequestTracker`]).
 #[derive(Default)]
 pub(super) struct TableFileMetadataFetcher {
