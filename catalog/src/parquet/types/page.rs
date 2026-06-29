@@ -31,8 +31,13 @@ pub struct CompressedPage {
     pub worker_id: usize,
     /// Row-group-level query metadata (includes filtered indices).
     pub row_group: QueryRowGroupMetadata,
-    /// Column index within the row group.
+    /// Column index within the *projected* set (the position in
+    /// [`RowGroupBuffer::columns`](crate::parquet::types::requests::RowGroupBuffer),
+    /// used to route the decompressed page back to its column decoder).
     pub column_idx: usize,
+    /// Absolute byte offset of this page in the file. Unique per page, so it is
+    /// the decompressed cache's key.
+    pub file_offset: usize,
     /// Sequential page index within the column chunk.
     pub page_idx: usize,
     /// Thrift page header (type, sizes, encoding info).

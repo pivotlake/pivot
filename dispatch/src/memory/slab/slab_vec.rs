@@ -45,7 +45,7 @@ impl<T: Copy> SlabVec<T> {
     /// switch allocates `RADIX_PARTITIONS` (thousands of) per-partition buffers, and
     /// at moderate cardinality most hold only a few rows. Chunks bump-pack into the
     /// shared 2MB pool buffers, so a full first chunk apiece would tie up ~8x more of
-    /// the pool — buffers the file cache could otherwise use — for partitions that
+    /// the pool — buffers the compressed cache could otherwise use — for partitions that
     /// barely fill them. Buffers that do grow large take full `CHUNK_CAP` chunks from
     /// the second one on, so the per-chunk overhead for big partitions stays
     /// negligible.

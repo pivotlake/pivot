@@ -66,7 +66,7 @@ pub enum Function {
     /// `make_date(days)` / `make_timestamp(seconds)` — read an integer column as a
     /// real `DATE` / `TIMESTAMP`.
     TemporalConvert(TemporalConvert),
-    /// `drop_cache()` — evict pivot's file cache, returning the regions dropped.
+    /// `drop_cache()` — evict pivot's compressed cache, returning the regions dropped.
     /// A side-effecting admin function; evaluated once over the [`DummyScan`]
     /// row of a `FROM`-less `SELECT`. See its compile impl.
     ///
@@ -163,16 +163,17 @@ impl Function {
             Function::DatePart(d) => d.compile(),
             Function::IntervalArithmetic(i) => i.compile(),
             Function::TemporalConvert(c) => c.compile(),
-            // `drop_cache()` evicts pivot's in-memory file cache *and* the on-disk
+            // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single
             // `DummyScan` row on a worker thread (where `memory_ctx` and the
             // worker's disk-cache handle are valid), so the eviction happens
             // exactly once; the returned array matches the (one-row) batch.
             Function::DropCache => Ok(stateless_expr(|batch: &RecordBatch| {
-                let extents = dispatch::memory_ctx().file_memory_cache().clear();
+                let extents = dispatch::memory_ctx().compressed_cache().clear();
+                let decompressed = dispatch::memory_ctx().decompressed_cache().clear();
                 let objects = dispatch::io::clear_disk_cache();
-                let evicted = (extents + objects) as i64;
+                let evicted = (extents + decompressed + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
             // Capture the instant once, here at compile time, so every worker and

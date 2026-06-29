@@ -1,5 +1,5 @@
 //! Fetch stage: reads each file's Parquet footer — through the io_uring ring and
-//! the file cache, exactly like a column-chunk read — and emits one [`TableFile`]
+//! the compressed cache, exactly like a column-chunk read — and emits one [`TableFile`]
 //! per file (its [`FileRef`] paired with its row groups). The footer-reading
 //! analog of the column-chunk scan fetcher: it keeps many footer reads in flight,
 //! bounded per medium, and shares the same slot/routing/in-flight bookkeeping
@@ -163,7 +163,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 /// One file's in-flight footer read.
 ///
 /// It reads a region of the file (first the tail probe window, then — only if
-/// the footer overflows it — the exact footer) into the file cache, tracking the
+/// the footer overflows it — the exact footer) into the compressed cache, tracking the
 /// blocks still outstanding for the current region. Once a region's blocks have
 /// all landed, [`parse_region`](Self::parse_region) turns it into the file's row
 /// groups (or issues the exact re-read).
@@ -200,9 +200,7 @@ impl FooterRead {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
     fn start(file: FileRef, location: FileLocation, size: usize) -> Self {
-        memory_ctx()
-            .file_memory_cache()
-            .open_entry(location.clone());
+        memory_ctx().compressed_cache().open_entry(location.clone());
         let mut request = Self {
             file,
             location,
@@ -242,7 +240,7 @@ impl FooterRead {
             "read_region over un-drained pending reads"
         );
         self.lookups = memory_ctx()
-            .file_memory_cache()
+            .compressed_cache()
             .get(&self.location, offset, len);
         self.remaining = 0;
         for lookup in &self.lookups {

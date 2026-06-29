@@ -1,5 +1,7 @@
 use crate::env::get_env_var_with_default;
-use crate::memory::file_memory_cache::{FileMemoryCache, FillCursor};
+use crate::memory::clock::{Clock, Owner};
+use crate::memory::compressed_cache::{CompressedCache, FillCursor};
+use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
 use crate::worker::{NUM_WORKERS, WORKER_IDX};
@@ -37,7 +39,9 @@ pub fn has_memory_context() -> bool {
 
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
-    file_memory_cache: Arc<FileMemoryCache>,
+    compressed_cache: Arc<CompressedCache>,
+    decompressed_cache: Arc<DecompressedCache>,
+    clock: Arc<Clock>,
     dirty_pool_factory: PoolFactory,
     zeroed_pool_factory: PoolFactory,
 }
@@ -50,14 +54,18 @@ impl MemoryContextFactory {
         );
 
         let ring = Arc::new(Ring::new(buffers).unwrap());
-        let file_memory_cache = Arc::new(FileMemoryCache::new(buffers));
+        let compressed_cache = Arc::new(CompressedCache::new(buffers));
+        let decompressed_cache = Arc::new(DecompressedCache::new());
+        let clock = Arc::new(Clock::new(buffers));
         let mut zeroed_pool_factories = PoolFactory::create_many(count);
         let mut dirty_pool_factories = PoolFactory::create_many(count);
 
         (0..count)
             .map(|_| Self {
                 ring: ring.clone(),
-                file_memory_cache: file_memory_cache.clone(),
+                compressed_cache: compressed_cache.clone(),
+                decompressed_cache: decompressed_cache.clone(),
+                clock: clock.clone(),
                 dirty_pool_factory: dirty_pool_factories.pop().unwrap(),
                 zeroed_pool_factory: zeroed_pool_factories.pop().unwrap(),
             })
@@ -67,7 +75,9 @@ impl MemoryContextFactory {
     pub fn create_memory_ctx(self) -> MemoryContext {
         MemoryContext {
             ring: self.ring,
-            file_memory_cache: self.file_memory_cache,
+            compressed_cache: self.compressed_cache,
+            decompressed_cache: self.decompressed_cache,
+            clock: self.clock,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
             fill_cursor: UnsafeCell::new(FillCursor::empty()),
@@ -77,13 +87,16 @@ impl MemoryContextFactory {
 
 pub struct MemoryContext {
     ring: Arc<Ring>,
-    file_memory_cache: Arc<FileMemoryCache>,
+    compressed_cache: Arc<CompressedCache>,
+    decompressed_cache: Arc<DecompressedCache>,
+    /// The CLOCK eviction policy over all ring slots, shared by both caches.
+    clock: Arc<Clock>,
     dirty_pool: FreePool,
     zeroed_pool: FreePool,
     /// This worker's bump cursor for packing missed reads into a shared fill buffer
-    /// (see [`FileMemoryCache`]). Per-thread, so interior-mutable without a lock - the
+    /// (see [`CompressedCache`]). Per-thread, so interior-mutable without a lock - the
     /// `&'static MemoryContext` is really thread-local, so there is never a second
-    /// accessor. Mirrors the `UnsafeCell` discipline the file cache uses for its
+    /// accessor. Mirrors the `UnsafeCell` discipline the compressed cache uses for its
     /// per-slot metadata.
     fill_cursor: UnsafeCell<FillCursor>,
 }
@@ -102,15 +115,23 @@ impl MemoryContext {
         }
     }
 
-    pub fn file_memory_cache(&self) -> &FileMemoryCache {
-        self.file_memory_cache.as_ref()
+    pub fn compressed_cache(&self) -> &CompressedCache {
+        self.compressed_cache.as_ref()
+    }
+
+    pub fn decompressed_cache(&self) -> &DecompressedCache {
+        self.decompressed_cache.as_ref()
+    }
+
+    pub fn clock(&self) -> &Clock {
+        self.clock.as_ref()
     }
 
     pub fn ring(&self) -> &Ring {
         self.ring.as_ref()
     }
 
-    /// This worker's fill cursor (the bump allocator the file cache packs missed
+    /// This worker's fill cursor (the bump allocator the compressed cache packs missed
     /// reads into). Sound because the context is per-thread, so the returned `&mut`
     /// never aliases another accessor on the same thread.
     #[allow(clippy::mut_from_ref)] // interior mutability; per-thread, single accessor
@@ -193,11 +214,58 @@ impl MemoryContext {
                 }
             }
 
-            if *PANIC_ON_EVICT {
+            // Pool empty: evict via the shared clock, which surrenders
+            // decompressed pages preferentially (they age out faster). Panic only
+            // when there is nothing cheap to reclaim - an empty decompressed cache
+            // means we would be evicting the compressed cache, the
+            // memory-pressure signal `PANIC_ON_EVICT` guards.
+            if *PANIC_ON_EVICT && self.decompressed_cache.is_empty() {
                 panic!("Evicting");
             }
-            // Nothing free! Let's evict from page cache
-            return self.file_memory_cache.evict();
+            return self.evict();
+        }
+    }
+
+    /// Evict a ring slot via the shared CLOCK and return it writable. The sweep
+    /// picks victims across both caches, routing each to its owner's reclaim:
+    /// compressed runs to [`CompressedCache::reclaim`], decompressed
+    /// pages to [`DecompressedCache::reclaim`]. Decompressed pages age out
+    /// faster (lower clock tier), so they are surrendered first.
+    pub(crate) fn evict(&self) -> WriteBuffer {
+        // Livelock guard. When a query's working set exceeds the ring, every
+        // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
+        // progress, and the loop has no cancellation point). A healthy CLOCK finds
+        // a victim within a few sweeps (counters reach zero in at most their tier
+        // max), so far more than that is abnormal: warn and sleep to let peer
+        // workers / ingest release slots; if it still finds nothing, the cache is
+        // genuinely exhausted, so panic to abort the offending query.
+        let ring_len = self.ring.len() as u64;
+        let warn_at = 4 * ring_len;
+        let mut iterations: u64 = 0;
+        let mut panic_at: Option<u64> = None;
+        loop {
+            iterations += 1;
+            if panic_at.is_none() && iterations == warn_at {
+                tracing::warn!(iterations, "evict: no memory left to evict, sleeping");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                panic_at = Some(iterations + ring_len);
+            } else if panic_at.is_some_and(|limit| iterations >= limit) {
+                panic!(
+                    "evict: still no evictable memory after sleeping ({iterations} \
+                     iterations) — aborting query (cache exhausted by an oversized \
+                     working set)"
+                );
+            }
+
+            let (slot_idx, victim) = self.clock.advance();
+            let reclaimed = match victim {
+                Some(Owner::Compressed) => self.compressed_cache.reclaim(slot_idx),
+                Some(Owner::Decompressed) => self.decompressed_cache.reclaim(slot_idx),
+                Some(Owner::Free) | None => None,
+            };
+            if let Some(write_buffer) = reclaimed {
+                return write_buffer;
+            }
         }
     }
 }
@@ -225,7 +293,7 @@ mod tests {
     //! Tests for [`MemoryContext`] - the zeroed/dirty pair, fallback rules,
     //! and the buffer accessors. Single-pool routing lives in
     //! [`crate::memory::free_pool`]'s tests; here we only exercise behaviour
-    //! that comes from owning *both* pools (plus the ring and file cache).
+    //! that comes from owning *both* pools (plus the ring and compressed cache).
     //!
     //! Each test installs a fresh [`MemoryContext`] on its own thread via
     //! [`init_test_free_pool`], so there's no shared state and no lock.

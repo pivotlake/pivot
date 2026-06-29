@@ -49,11 +49,11 @@ impl Deref for ReadBuffer {
 /// Decrements the slot's reader count. When the last `ReadBuffer` for a slot is dropped,
 /// the count reaches 0 and the slot becomes reclaimable.
 ///
-/// The decrement is `Release` (not `Relaxed`): the file cache packs many tenants into a
+/// The decrement is `Release` (not `Relaxed`): the compressed cache packs many tenants into a
 /// shared slot, and the filler writes that slot's tenant list while holding a read pin. The
 /// evictor reads the list only after `try_write` succeeds (`used == 0`, AcqRel). Releasing
 /// here is what lets that Acquire observe the filler's tenant writes - the publication edge
-/// for shared state written by a reader and read by the next writer. See `FileMemoryCache::evict`.
+/// for shared state written by a reader and read by the next writer. See `MemoryContext::evict`.
 impl Drop for ReadBuffer {
     fn drop(&mut self) {
         memory_ctx().ring().slots[self.slot_idx]

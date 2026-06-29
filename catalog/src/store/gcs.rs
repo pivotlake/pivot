@@ -342,7 +342,7 @@ impl ObjectStore for GcsStore {
         // The same media URL the JSON API serves for `get`, but range-read
         // straight off the ring. Unlike a presigned URL it's stable (no embedded
         // signature to expire) — auth rides in a per-request `Authorization`
-        // header instead, so a file cached across queries never goes stale.
+        // header instead, so a compressed cached across queries never goes stale.
         let url = format!(
             "{}/storage/v1/b/{}/o/{}?alt=media",
             self.endpoint,
