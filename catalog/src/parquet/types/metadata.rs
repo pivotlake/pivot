@@ -64,7 +64,7 @@ pub struct ColumnChunkMeta {
 #[derive(Clone)]
 pub struct RowGroupMetadata {
     /// The open file holding this row group's bytes (local file or remote
-    /// object) — what the fetcher reads from and the file cache keys on.
+    /// object) — what the fetcher reads from and the compressed cache keys on.
     pub location: FileLocation,
     /// Arrow schema describing the columns in this row group.
     pub schema: SchemaRef,

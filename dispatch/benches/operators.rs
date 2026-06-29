@@ -40,7 +40,7 @@
 //!   run thus needs ≳2k buffers just for scatter, plus the in-place tables and
 //!   output. With no Parquet page cache to evict, an undersized ring panics
 //!   (`Evicting`) — bump `PIVOT_BENCH_BUFFERS` if so.
-//! * **Ceiling** — engine startup allocates a ring *and* a file cache, each
+//! * **Ceiling** — engine startup allocates a ring *and* a compressed cache, each
 //!   sized to `buffers`, so the resident floor is ≈ `2 × buffers × 2 MiB`
 //!   (≈16 GiB at 4096) before any data. Keep that under box RAM. (The file
 //!   cache is unused here — no Parquet — but is still reserved.)

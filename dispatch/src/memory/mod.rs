@@ -12,7 +12,7 @@
 //! allocate on initialization half the system memory for [`WriteBuffer`]s, as this will be our main
 //! usage of memory. Every worker upon initialization faults in all [`WriteBuffer`]s and pushes equal
 //! amounts to local pools for use afterward. These [`WriteBuffer`]s will be used for any disk access
-//! (and subsequently saved in the [`FileMemoryCache`](file_memory_cache::FileMemoryCache)) as well as large allocations.
+//! (and subsequently saved in the [`CompressedCache`](compressed_cache::CompressedCache)) as well as large allocations.
 //!
 //! [`WriteBuffer`]s can also be used for many miscellaneous things, such as Vectors and HashTables. It
 //! is generally preferred to use [`WriteBuffer`]s as the memory is easily accounted for. See [`SlabAllocator`].
@@ -20,8 +20,14 @@
 mod ring;
 pub use ring::{BUFFER_SIZE, Ring};
 
-pub mod file_memory_cache;
-pub use file_memory_cache::CacheLookup;
+pub mod compressed_cache;
+pub use compressed_cache::CacheLookup;
+
+pub mod decompressed_cache;
+pub use decompressed_cache::{BlockKey, DecompressedCache};
+
+pub mod clock;
+pub use clock::{Clock, Owner};
 
 mod free_pool;
 

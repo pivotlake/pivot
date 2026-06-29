@@ -6,7 +6,7 @@
 //!
 //! - [`injector`] — the source: hands out the input files.
 //! - [`fetcher`] — reads each file's footer (over the io_uring ring, through the
-//!   file cache) on whatever worker steals it, emitting one [`TableFile`].
+//!   compressed cache) on whatever worker steals it, emitting one [`TableFile`].
 //! - [`writer`] — the terminal fan-in sink: gathers the [`TableFile`]s on one
 //!   worker and hands them to the `commit` closure.
 //!
