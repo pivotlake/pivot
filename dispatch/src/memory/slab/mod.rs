@@ -27,16 +27,16 @@ mod allocator;
 pub use allocator::SlabAllocator;
 
 mod slab_buffer;
-
 pub use slab_buffer::SlabBuffer;
 
 mod multi_slab_buffer;
-
 pub use multi_slab_buffer::MultiSlabBuffer;
 
 mod slab_vec;
-
 pub use slab_vec::SlabVec;
+
+mod slab_top_k;
+pub(crate) use slab_top_k::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
 
 /// A contiguous byte region within a `WriteBuffer`.
 ///

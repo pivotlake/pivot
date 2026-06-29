@@ -11,15 +11,15 @@
 //! [`OUTPUT_CHUNK_ROWS`]-row `RecordBatch`es (a slab is at most 2MB), so the
 //! emitted batch count tracks the row count, not the partition count.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema};
 
-use crate::memory::{BUFFER_SIZE, SlabAllocator};
+use crate::memory::{
+    BUFFER_SIZE, HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabAllocator, SlabTopK, slots_per_slab,
+};
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{Table, TableStorage};
@@ -35,45 +35,8 @@ use super::{GroupLimit, Result};
 /// value would also re-wrap the whole arena once per batch for string keys.)
 const OUTPUT_CHUNK_ROWS: usize = BUFFER_SIZE / 16;
 
-/// Upper bound on the heap capacity pre-allocated for a pushed
-/// `ORDER BY <slot> DESC LIMIT k`. A generous user `LIMIT` (or `LIMIT k OFFSET m`
-/// with a large `m`) must not pre-allocate a giant heap before a single row
-/// arrives; the heap still grows to `limit` if that many rows actually survive.
-const TOPK_PREALLOC_CAP: usize = 4096;
-
-/// A heap entry for top-k selection, ordered solely by the aggregate `sort`
-/// scalar. Ties compare equal, which is fine: an `ORDER BY <slot> DESC LIMIT k`
-/// is indifferent to the order within a tied group.
-struct TopK<P, Val, S: Ord> {
-    sort: S,
-    key: P,
-    value: Val,
-}
-
-impl<P, Val, S: Ord> PartialEq for TopK<P, Val, S> {
-    fn eq(&self, other: &Self) -> bool {
-        self.sort == other.sort
-    }
-}
-impl<P, Val, S: Ord> Eq for TopK<P, Val, S> {}
-impl<P, Val, S: Ord> PartialOrd for TopK<P, Val, S> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<P, Val, S: Ord> Ord for TopK<P, Val, S> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.sort.cmp(&other.sort)
-    }
-}
-
-/// One heap entry: a group keyed for top-`limit` selection, ordered so the min-heap
-/// evicts the smallest sort key.
-type HeapEntry<K, V> =
-    Reverse<TopK<<K as KeyExtractor>::Persisted, V, <V as AggregationValue>::SortKey>>;
-
-/// A worker-wide top-`limit` min-heap for a pushed `ORDER BY <slot> DESC LIMIT`,
-/// kept across *every* partition a worker runs.
+/// A worker-wide top-`limit` heap for a pushed `ORDER BY <slot> DESC LIMIT`, kept
+/// across *every* partition a worker runs.
 ///
 /// The per-partition pushdown can only prune a partition larger than `limit`; the
 /// radix path's many small buckets (smaller than `limit`) would each emit all
@@ -82,39 +45,61 @@ type HeapEntry<K, V> =
 /// groups were partitioned. Sound for the same reason the per-partition pushdown
 /// is: the downstream operator re-applies the global LIMIT over every worker's
 /// output.
-struct TopKHeap<K: KeyExtractor, V: AggregationValue> {
-    slot: usize,
-    limit: usize,
-    heap: BinaryHeap<HeapEntry<K, V>>,
+///
+/// Backed by a slab-resident [`SlabTopK`] rather than a `BinaryHeap`, so the
+/// worker's top-k lives on the engine's accounted buffers; its buffer grows
+/// lazily toward `limit`, so a generous user `LIMIT` reserves no slab until that
+/// many rows actually survive.
+///
+/// The backing is chosen once, here, by `limit`: a `limit` that fits one slab
+/// (the near-universal case) takes the contiguous [`SingleTopK`], a larger one the
+/// [`MultiTopK`]. Picking it up front rather than per row keeps the per-group
+/// `offer` monomorphised, with no runtime dispatch over the storage kind (the
+/// caller matches the enum once per partition table, not once per group).
+enum TopKHeap<K: KeyExtractor, V: AggregationValue> {
+    Single {
+        slot: usize,
+        heap: SingleTopK<V::SortKey, (K::Persisted, V)>,
+    },
+    Multi {
+        slot: usize,
+        heap: MultiTopK<V::SortKey, (K::Persisted, V)>,
+    },
 }
 
 impl<K: KeyExtractor, V: AggregationValue> TopKHeap<K, V> {
-    /// A heap that keeps the top `limit`. The capacity is capped so a huge user
-    /// LIMIT doesn't pre-allocate before any row arrives; it grows if that many
-    /// rows actually survive.
-    fn new(slot: usize, limit: usize) -> Self {
-        Self {
-            slot,
-            limit,
-            heap: BinaryHeap::with_capacity(limit.min(TOPK_PREALLOC_CAP) + 1),
+    /// A heap that keeps the top `limit` groups by `sort_key(slot)`.
+    fn new(allocator: &mut SlabAllocator, slot: usize, limit: usize) -> Self {
+        if limit <= slots_per_slab::<V::SortKey, (K::Persisted, V)>() {
+            Self::Single {
+                slot,
+                heap: SlabTopK::single(allocator, limit),
+            }
+        } else {
+            Self::Multi {
+                slot,
+                heap: SlabTopK::multi(allocator, limit),
+            }
         }
     }
+}
 
-    /// Offer one row to the heap, keeping the `limit` largest by `sort_key(slot)`.
-    #[inline]
-    fn offer(&mut self, key: K::Persisted, value: V) {
-        // `LIMIT 0` keeps nothing; without this the `peek().unwrap()` below would
-        // hit the perpetually-empty heap (`len < 0` is never true) and panic.
-        if self.limit == 0 {
-            return;
-        }
-        let sort = value.sort_key(self.slot);
-        if self.heap.len() < self.limit {
-            self.heap.push(Reverse(TopK { sort, key, value }));
-        } else if sort > self.heap.peek().unwrap().0.sort {
-            self.heap.pop();
-            self.heap.push(Reverse(TopK { sort, key, value }));
-        }
+/// Offer every group in `table` into `heap`, keyed by the sort key of aggregate
+/// `slot`. The heap retains the top rows by that key.
+fn offer_all<K, V, A, S>(
+    heap: &mut SlabTopK<V::SortKey, (K::Persisted, V), A>,
+    slot: usize,
+    table: &Table<K, V, S>,
+    allocator: &mut SlabAllocator,
+) where
+    K: KeyExtractor,
+    V: AggregationValue,
+    A: HeapBuffer<Ranked<V::SortKey, (K::Persisted, V)>>,
+    S: TableStorage<K, V>,
+{
+    for entry in table.iter(0) {
+        let sort = entry.value().sort_key(slot);
+        heap.offer(allocator, sort, (*entry.key(), *entry.value()));
     }
 }
 
@@ -133,9 +118,11 @@ enum OutputMode<K: KeyExtractor, V: AggregationValue> {
 }
 
 impl<K: KeyExtractor, V: AggregationValue> OutputMode<K, V> {
-    fn new(output_limit: Option<GroupLimit>) -> Self {
+    fn new(allocator: &mut SlabAllocator, output_limit: Option<GroupLimit>) -> Self {
         match output_limit {
-            Some(GroupLimit::TopK { slot, limit }) => Self::TopK(TopKHeap::new(slot, limit)),
+            Some(GroupLimit::TopK { slot, limit }) => {
+                Self::TopK(TopKHeap::new(allocator, slot, limit))
+            }
             Some(GroupLimit::First { limit }) => Self::First { remaining: limit },
             None => Self::Unlimited,
         }
@@ -201,7 +188,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
             values: V::Columns::with_capacity(allocator, builder_cap),
             builder_cap,
             len: 0,
-            mode: OutputMode::new(output_limit),
+            mode: OutputMode::new(allocator, output_limit),
             key_arena,
             output_buffers,
             key_config,
@@ -231,36 +218,38 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         S: TableStorage<K, V>,
         Snd: Sender<RecordBatch>,
     {
-        // `ORDER BY … DESC LIMIT`: keep only the worker-wide top-`limit` (emitted
-        // at flush). No mid-stream flush: the heap is bounded by `limit`.
-        if let OutputMode::TopK(heap) = &mut self.mode {
-            for entry in table.iter(0) {
-                heap.offer(*entry.key(), *entry.value());
+        match &mut self.mode {
+            // `ORDER BY … DESC LIMIT`: keep only the worker-wide top-`limit`
+            // (emitted at flush). No mid-stream flush: the heap is bounded by
+            // `limit`. The backing kind is matched here, once, so each row's
+            // `offer` runs monomorphised.
+            OutputMode::TopK(TopKHeap::Single { slot, heap }) => {
+                offer_all(heap, *slot, &table, allocator)
             }
-            return Ok(());
-        }
-        // Plain `LIMIT`: take rows until this worker's budget is spent. The budget
-        // is copied out (it's `Copy`) so `push` can borrow `self`, then written back.
-        let first_budget = match &self.mode {
-            OutputMode::First { remaining } => Some(*remaining),
-            _ => None,
-        };
-        if let Some(mut remaining) = first_budget {
-            for entry in table.iter(0) {
-                if remaining == 0 {
-                    break;
+            OutputMode::TopK(TopKHeap::Multi { slot, heap }) => {
+                offer_all(heap, *slot, &table, allocator)
+            }
+            // Plain `LIMIT`: take rows until this worker's budget is spent, then
+            // write the budget back so the next partition resumes from it.
+            OutputMode::First { remaining } => {
+                let mut remaining = *remaining;
+                for entry in table.iter(0) {
+                    if remaining == 0 {
+                        break;
+                    }
+                    remaining -= 1;
+                    self.push(entry.key(), *entry.value());
+                    self.flush_if_full(allocator, sender)?;
                 }
-                remaining -= 1;
-                self.push(entry.key(), *entry.value());
-                self.flush_if_full(allocator, sender)?;
+                self.mode = OutputMode::First { remaining };
             }
-            self.mode = OutputMode::First { remaining };
-            return Ok(());
-        }
-        // No pushdown: every group streams into the builders.
-        for entry in table.iter(0) {
-            self.push(entry.key(), *entry.value());
-            self.flush_if_full(allocator, sender)?;
+            // No pushdown: every group streams into the builders.
+            OutputMode::Unlimited => {
+                for entry in table.iter(0) {
+                    self.push(entry.key(), *entry.value());
+                    self.flush_if_full(allocator, sender)?;
+                }
+            }
         }
         Ok(())
     }
@@ -287,9 +276,19 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         sender: &mut Snd,
     ) -> Result<()> {
         if let Some(topk) = self.take_topk() {
-            for Reverse(entry) in topk.heap {
-                self.push(&entry.key, entry.value);
-                self.flush_if_full(allocator, sender)?;
+            match topk {
+                TopKHeap::Single { mut heap, .. } => {
+                    for (key, value) in heap.values() {
+                        self.push(&key, value);
+                        self.flush_if_full(allocator, sender)?;
+                    }
+                }
+                TopKHeap::Multi { mut heap, .. } => {
+                    for (key, value) in heap.values() {
+                        self.push(&key, value);
+                        self.flush_if_full(allocator, sender)?;
+                    }
+                }
             }
         }
         if self.len == 0 {
