@@ -352,13 +352,16 @@ impl Worker {
     /// scan to one read at a time per worker — catastrophic over a table of many
     /// small files, where the whole query becomes round-trip bound.
     fn saturate_http(&mut self) -> Result<()> {
-        const HTTP_INFLIGHT_TARGET: usize = 100;
+        // Per-worker remote read-ahead ceiling, tunable via `PIVOT_HTTP_INFLIGHT`.
+        static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let http_inflight_target =
+            *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_HTTP_INFLIGHT", 100));
         'flows: for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
                 continue;
             }
-            if self.io.http_in_flight() >= HTTP_INFLIGHT_TARGET {
+            if self.io.http_in_flight() >= http_inflight_target {
                 break;
             }
 
@@ -379,7 +382,7 @@ impl Worker {
                     }
                 }
 
-                if self.io.http_in_flight() >= HTTP_INFLIGHT_TARGET {
+                if self.io.http_in_flight() >= http_inflight_target {
                     break;
                 }
             }
@@ -524,7 +527,17 @@ impl Worker {
     }
 
     fn clear_cancelled_dataflows(&mut self) {
-        self.data_flows.retain(|_, d| !d.cancelled())
+        self.data_flows.retain(|_, d| {
+            if d.cancelled() {
+                // Ship this worker's partial tally before dropping the flow, so a
+                // failed or cancelled query's IO stats still reach the handle (a
+                // finished flow reports in `try_finishing_dataflows`).
+                d.stats().report();
+                false
+            } else {
+                true
+            }
+        })
     }
 
     /// Let any operator that's done with its upstream (e.g. a satisfied `LIMIT`)

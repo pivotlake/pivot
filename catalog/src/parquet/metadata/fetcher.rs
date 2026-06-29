@@ -23,9 +23,6 @@ const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
 /// another file. Larger than a column-chunk read's depth: footers are small and
 /// scattered, so keeping many in flight hides per-file read latency.
 const MAX_DISK_IN_FLIGHT: usize = 32;
-/// Remote-backed footer-read blocks outstanding per worker before admitting
-/// another file. Larger, to hide the HTTP round trip each read costs.
-const MAX_HTTP_IN_FLIGHT: usize = 32;
 
 /// Parse the 4-byte footer length from a file's `tail` (whose final 8 bytes are
 /// `[footer_len][PAR1]`). The reader fetches the tail through the cache, so it
@@ -128,7 +125,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 
     fn ready_for_more_work(&mut self) -> bool {
         self.tracker.disk_in_flight() < MAX_DISK_IN_FLIGHT
-            && self.tracker.http_in_flight() < MAX_HTTP_IN_FLIGHT
+            && self.tracker.http_in_flight() < crate::parquet::http_readahead()
     }
 
     fn process_fs_response<S: Sender<TableFile>>(

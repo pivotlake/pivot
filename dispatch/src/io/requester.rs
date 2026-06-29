@@ -198,9 +198,30 @@ impl IORequester {
         Ok(out)
     }
 
-    /// Blocks until at least one pending read (disk or HTTP) makes progress.
+    /// Blocks until at least one pending read (disk or HTTP) makes progress. On
+    /// Linux both ride one ring, so a single `submit_and_wait` wakes on either.
+    #[cfg(target_os = "linux")]
     pub fn wait(&mut self) -> Result<()> {
         self.backend.submit_and_wait(1)?;
+        Ok(())
+    }
+
+    /// Non-Linux disk and HTTP completions arrive on independent channels, so park
+    /// until either is ready (without consuming it; `completions` drains both),
+    /// matching the Linux single-ring wake on either kind.
+    #[cfg(not(target_os = "linux"))]
+    pub fn wait(&mut self) -> Result<()> {
+        // Flush any staged disk ops so they are in flight before we park.
+        self.backend.submit()?;
+        if self.backend.has_ready_completion() || self.http.has_ready_completion() {
+            return Ok(());
+        }
+        // Park until either channel has a completion, without consuming it
+        // (completions() drains both).
+        let mut select = crossbeam_channel::Select::new();
+        select.recv(self.backend.completion_receiver());
+        select.recv(self.http.completion_receiver());
+        select.ready();
         Ok(())
     }
 }
@@ -554,6 +575,80 @@ mod tests {
         // re-issue the (idempotent) range read rather than surfacing an error.
         fetch(&mut requester, &loc, 4096, 4096);
         assert_cached(&loc, 4096, 4096);
+    }
+
+    /// Spawn a server that accepts connections and drops them without responding,
+    /// so a range read fails terminally (the exchange hits EOF). Accepts a few in
+    /// case the engine reconnects.
+    fn spawn_closing_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            for _ in 0..4 {
+                match listener.accept() {
+                    Ok((stream, _)) => drop(stream),
+                    Err(_) => break,
+                }
+            }
+        });
+
+        port
+    }
+
+    /// Submit a remote read and drive it to completion, returning every per-read
+    /// result so a test can assert success or failure (the failure-aware sibling
+    /// of `fetch_split`).
+    fn fetch_results(
+        requester: &mut IORequester,
+        loc: &FileLocation,
+        offset: usize,
+        len: usize,
+    ) -> Vec<std::result::Result<Completion, FailedRead>> {
+        let FileLocation::Remote(remote) = loc else {
+            panic!("test fetches over http")
+        };
+        let lookups = memory_ctx().file_memory_cache().get(loc, offset, len);
+        let mut submitted = 0;
+        for lookup in &lookups {
+            for block in lookup.missing() {
+                let req = HttpRequest {
+                    remote: remote.clone(),
+                    block: block.clone(),
+                };
+                requester
+                    .request_http(DataFlowRequest::new(0, 0, req))
+                    .unwrap();
+                submitted += 1;
+            }
+        }
+        assert!(submitted > 0, "expected blocks to read");
+
+        let mut results = Vec::new();
+        while results.len() < submitted {
+            if requester.has_pending() {
+                requester.wait().unwrap();
+            }
+            results.extend(requester.completions().unwrap());
+        }
+        results
+    }
+
+    /// A terminal transport failure surfaces as a `FailedRead`, never a committed
+    /// block or a hang. Exercises the async failure path: a pool thread reports an
+    /// error, `take_failed` buckets it, and the drain maps it to the dataflow.
+    #[test]
+    fn a_failed_http_read_surfaces_a_failed_read() {
+        init_test_free_pool(16);
+        let loc = remote_loc(spawn_closing_server());
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let results = fetch_results(&mut requester, &loc, 0, 4096);
+
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "every http read should fail"
+        );
     }
 
     /// Drive every pending read *and* write-back to completion - `fetch` only

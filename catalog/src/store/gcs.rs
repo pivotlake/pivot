@@ -4,17 +4,21 @@
 //! `Authorization: Bearer` header rather than a presigned URL (presigned URLs
 //! expire after an hour, stranding files cached across queries).
 //!
-//! The token is minted (and cached until shortly before expiry) from, in order:
-//! `GOOGLE_APPLICATION_CREDENTIALS` pointing at a **service-account** key (a
-//! self-signed RS256 JWT exchanged for an access token) or an **authorized_user**
-//! file (refresh-token grant), else the **GCE metadata server** (workload
-//! identity on Google compute). Minting is a blocking `ureq` call kept off the
+//! The token is minted (and cached until shortly before expiry) following the
+//! standard Application Default Credentials chain, in order: the file at
+//! `GOOGLE_APPLICATION_CREDENTIALS`, else the well-known file that
+//! `gcloud auth application-default login` writes (so a developer with gcloud
+//! needs no extra config), else the **GCE metadata server** (workload identity
+//! on Google compute). A credentials file is either a **service-account** key
+//! (a self-signed RS256 JWT exchanged for an access token) or an
+//! **authorized_user** file (refresh-token grant). Minting is a blocking `ureq` call kept off the
 //! ring: it happens on the control thread (every query primes the token via
 //! [`source`](GcsStore::source)), so a worker only ever *reads* a current token.
 //! RS256 signing uses `ring`; everything is synchronous, no async runtime.
 
 use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use base64::Engine;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -141,24 +145,38 @@ impl GcsAuth {
             .map(|t| t.header.clone())
     }
 
-    /// Mint a fresh access token, returning `(token, lifetime_seconds)`.
+    /// Mint a fresh access token, returning `(token, lifetime_seconds)`, walking
+    /// the Application Default Credentials chain: an explicit
+    /// `GOOGLE_APPLICATION_CREDENTIALS` file, else the gcloud-written well-known
+    /// file, else the metadata server.
     fn mint_token(&self) -> Result<(String, u64)> {
         if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
-            let bytes = std::fs::read(&path).map_err(|source| StoreError::Io {
-                key: path.clone(),
-                source,
-            })?;
-            let creds: serde_json::Value = serde_json::from_slice(&bytes)
-                .map_err(|e| StoreError::Config(format!("parsing {path}: {e}")))?;
-            return match creds.get("type").and_then(|t| t.as_str()) {
-                Some("service_account") => self.service_account_token(&creds),
-                Some("authorized_user") => self.authorized_user_token(&creds),
-                other => Err(StoreError::Config(format!(
-                    "unsupported credential type {other:?} in {path}"
-                ))),
-            };
+            return self.token_from_credentials_file(&path);
+        }
+        if let Some(path) = well_known_credentials_path()
+            && path.is_file()
+        {
+            return self.token_from_credentials_file(&path.to_string_lossy());
         }
         self.metadata_token()
+    }
+
+    /// Mint a token from a credentials file (a service-account key or an
+    /// authorized-user file), dispatching on its `type`.
+    fn token_from_credentials_file(&self, path: &str) -> Result<(String, u64)> {
+        let bytes = std::fs::read(path).map_err(|source| StoreError::Io {
+            key: path.to_string(),
+            source,
+        })?;
+        let creds: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| StoreError::Config(format!("parsing {path}: {e}")))?;
+        match creds.get("type").and_then(|t| t.as_str()) {
+            Some("service_account") => self.service_account_token(&creds),
+            Some("authorized_user") => self.authorized_user_token(&creds),
+            other => Err(StoreError::Config(format!(
+                "unsupported credential type {other:?} in {path}"
+            ))),
+        }
     }
 
     /// Service-account flow: build and RS256-sign a JWT asserting our identity,
@@ -221,7 +239,8 @@ impl GcsAuth {
             .call()
             .map_err(|e| {
                 StoreError::Config(format!(
-                    "no GOOGLE_APPLICATION_CREDENTIALS and metadata server unavailable: {e}"
+                    "no GOOGLE_APPLICATION_CREDENTIALS, no gcloud application-default \
+                     credentials, and metadata server unavailable: {e}"
                 ))
             })?;
         parse_token_response(resp)
@@ -431,6 +450,31 @@ struct TokenResponse {
     access_token: String,
     #[serde(default = "default_expiry")]
     expires_in: u64,
+}
+
+/// The path `gcloud auth application-default login` writes its credentials to:
+/// `$CLOUDSDK_CONFIG/application_default_credentials.json` when that env var is
+/// set, else the per-user gcloud config dir (`%APPDATA%\gcloud` on Windows,
+/// `~/.config/gcloud` elsewhere, including macOS). `None` if the home/config dir
+/// can't be resolved.
+fn well_known_credentials_path() -> Option<PathBuf> {
+    const FILE: &str = "application_default_credentials.json";
+    if let Some(dir) = std::env::var_os("CLOUDSDK_CONFIG") {
+        return Some(PathBuf::from(dir).join(FILE));
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("gcloud").join(FILE))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join(".config")
+                .join("gcloud")
+                .join(FILE)
+        })
+    }
 }
 
 fn default_expiry() -> u64 {

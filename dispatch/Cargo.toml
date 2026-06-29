@@ -57,6 +57,12 @@ io-uring = "0.7"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.2", features = ["fs", "uio"] }
 
+# Non-Linux Unix (macOS) drives its blocking pread/pwrite pool over per-worker
+# MPSC channels: pool threads `send` completions, the owning worker `try_recv`
+# drains them and `recv`-parks in `submit_and_wait`. Off Linux's io_uring path.
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+crossbeam-channel = "0.5"
+
 [dev-dependencies]
 tempfile = "3"
 # Generate a self-signed cert so tests can stand up a loopback HTTPS server the
