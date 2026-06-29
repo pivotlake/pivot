@@ -5,7 +5,7 @@
 //! aggregates, etc...
 //!
 //! This file implements and represents those. The trees are built directly from
-//! the C++ bridge by [`crate::plan_build`]; there is no intermediate serialized
+//! the C++ bridge by `plan_build`; there is no intermediate serialized
 //! form.
 
 use crate::duckdb_bridge::duckdb_types::{ExpressionType, LogicalTypeId};

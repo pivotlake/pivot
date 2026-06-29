@@ -77,7 +77,11 @@ fn build_plan_node(
 
     let mut inputs = Vec::with_capacity(ffi::lo_child_count(op));
     for i in 0..ffi::lo_child_count(op) {
-        inputs.push(build_plan_node(ffi::lo_child(op, i), tables, dynamic_filter_slots)?);
+        inputs.push(build_plan_node(
+            ffi::lo_child(op, i),
+            tables,
+            dynamic_filter_slots,
+        )?);
     }
 
     // Drop the row-id ORDER BY DuckDB synthesizes above a late-materialized plain
@@ -140,13 +144,20 @@ fn build_plan_node(
             limit: ffi::lo_topn_limit(op),
             offset: ffi::lo_topn_offset(op),
             produces_dynamic_filter: ffi::lo_topn_has_dynamic_filter(op).then(|| DynamicFilter {
-                slot_id: get_or_assign_slot(dynamic_filter_slots, ffi::lo_topn_dynamic_filter_data_id(op)),
+                slot_id: get_or_assign_slot(
+                    dynamic_filter_slots,
+                    ffi::lo_topn_dynamic_filter_data_id(op),
+                ),
                 column_idx: ffi::lo_topn_dynamic_filter_column(op),
                 compare_type: ExpressionType::from_u8(ffi::lo_topn_dynamic_filter_comparison(op)),
             }),
         }),
         L::LOGICAL_LIMIT => Operator::Limit(Limit {
-            limit: build_limit_bound(ffi::lo_limit_value_kind(op), || ffi::lo_limit_value(op), "value")?,
+            limit: build_limit_bound(
+                ffi::lo_limit_value_kind(op),
+                || ffi::lo_limit_value(op),
+                "value",
+            )?,
             offset: build_limit_bound(
                 ffi::lo_limit_offset_kind(op),
                 || ffi::lo_limit_offset(op),
@@ -280,10 +291,16 @@ fn build_get_output_columns(op: &ffi::LogicalOperator) -> Result<Vec<Expression>
         .collect())
 }
 
-fn build_get_dynamic_filters(op: &ffi::LogicalOperator, dynamic_filter_slots: &mut DynamicFilterSlots) -> Vec<DynamicFilter> {
+fn build_get_dynamic_filters(
+    op: &ffi::LogicalOperator,
+    dynamic_filter_slots: &mut DynamicFilterSlots,
+) -> Vec<DynamicFilter> {
     (0..ffi::lo_get_dynamic_filter_count(op))
         .map(|i| DynamicFilter {
-            slot_id: get_or_assign_slot(dynamic_filter_slots, ffi::lo_get_dynamic_filter_data_id(op, i)),
+            slot_id: get_or_assign_slot(
+                dynamic_filter_slots,
+                ffi::lo_get_dynamic_filter_data_id(op, i),
+            ),
             column_idx: ffi::lo_get_dynamic_filter_column(op, i),
             compare_type: ExpressionType::from_u8(ffi::lo_get_dynamic_filter_comparison(op, i)),
         })
@@ -307,7 +324,12 @@ fn build_create_table(op: &ffi::LogicalOperator) -> Operator {
             })
             .collect(),
         options: (0..ffi::lo_create_option_count(op))
-            .map(|i| (ffi::lo_create_option_key(op, i), ffi::lo_create_option_value(op, i)))
+            .map(|i| {
+                (
+                    ffi::lo_create_option_key(op, i),
+                    ffi::lo_create_option_value(op, i),
+                )
+            })
             .collect(),
         if_not_exists: ffi::lo_create_if_not_exists(op),
         or_replace: ffi::lo_create_or_replace(op),
@@ -398,15 +420,14 @@ fn strip_trailing_rowid(node: &mut PlanNode) -> Option<usize> {
 
     // A projection that carried the row-id up references it positionally in its
     // child's output; drop that one entry. Other operators pass columns through.
-    if let (Operator::Projection(proj), Some(rowid_pos)) = (&mut node.operator, child_rowid) {
-        if let Some(pos) = proj
+    if let (Operator::Projection(proj), Some(rowid_pos)) = (&mut node.operator, child_rowid)
+        && let Some(pos) = proj
             .projections
             .iter()
             .position(|e| matches!(e, Expression::Ref(r) if r.column_idx == rowid_pos))
-        {
-            proj.projections.remove(pos);
-            return Some(pos);
-        }
+    {
+        proj.projections.remove(pos);
+        return Some(pos);
     }
     child_rowid
 }
@@ -488,9 +509,10 @@ pub(crate) fn build_expression(expr: &ffi::Expression) -> Result<Expression, Bui
         E::COMPARE_IN => Ok(Expression::InList(InList {
             // child 0 is the tested expression; children 1.. are the list values.
             input: Box::new(build_expression(ffi::expr_operator_child(expr, 0))?),
-            values: build_expr_seq(ffi::expr_operator_child_count(expr).saturating_sub(1), |i| {
-                ffi::expr_operator_child(expr, i + 1)
-            })?,
+            values: build_expr_seq(
+                ffi::expr_operator_child_count(expr).saturating_sub(1),
+                |i| ffi::expr_operator_child(expr, i + 1),
+            )?,
         })),
         conjunction_type @ (E::CONJUNCTION_AND | E::CONJUNCTION_OR) => {
             Ok(Expression::Conjunction(Conjunction {

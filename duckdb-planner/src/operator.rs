@@ -1,8 +1,8 @@
 //! Logical operators that make up the nodes of a query plan.
 //!
 //! Each variant of [`Operator`] corresponds to a DuckDB
-//! [`LogicalOperatorType`](crate::duckdb_bridge::duckdb_types::LogicalOperatorType)
-//! and carries the operator-specific payload (column lists, expressions, etc.).
+//! [`LogicalOperatorType`] and carries the operator-specific payload
+//! (column lists, expressions, etc.).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -239,7 +239,7 @@ pub struct SetVariable {
 }
 
 /// A logical operator in the query plan. Discriminated by DuckDB's
-/// [`LogicalOperatorType`](crate::duckdb_bridge::duckdb_types::LogicalOperatorType).
+/// [`LogicalOperatorType`].
 #[derive(Debug)]
 pub enum Operator {
     // `LOGICAL_GET` over a base table is built as `RawInput`, then converted to
