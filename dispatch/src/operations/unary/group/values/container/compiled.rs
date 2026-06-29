@@ -30,7 +30,7 @@
 use super::super::cell::Cell;
 use super::super::fold::{Count, Fold, Max, Min, Sum};
 use super::super::read::{IntRead, NoRead, Read};
-use super::super::{AggregationSlot, AggregationValue};
+use super::super::{AggregationSlot, AggregationValue, ValueColumns};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
@@ -71,12 +71,24 @@ pub type MaxSlot<T, A = i64> = Pair<IntRead<T>, Max<A>>;
 pub trait OpTuple: Send + Sync + 'static {
     /// The per-slot accumulator cells.
     type Accs: Cell;
+    /// The per-slot output-column builders: one [`SlabColumn`] per slot, in the
+    /// same tuple shape as [`Accs`](Self::Accs). Held by [`CompiledColumns`], which
+    /// a struct declared once over a generic `Ops` can only name through this
+    /// associated type (the same reason [`Accs`](Self::Accs) exists).
+    type Cols;
 }
 
 /// A fixed aggregate signature: the slots named by the op tuple `Ops`, each its
 /// own cell. The running cells are the only state — their tuple type is `Ops::Accs`.
 pub struct Compiled<Ops: OpTuple> {
     accs: Ops::Accs,
+}
+
+/// The output-column builders for a [`Compiled`] signature: one [`SlabColumn`] per
+/// slot, in the tuple shape [`OpTuple::Cols`]. The value-side counterpart to a key
+/// extractor's [`KeyColumns`](crate::operations::unary::group::keys::KeyColumns).
+pub struct CompiledColumns<Ops: OpTuple> {
+    cols: Ops::Cols,
 }
 
 impl<Ops: OpTuple> Copy for Compiled<Ops> {}
@@ -110,6 +122,7 @@ macro_rules! impl_compiled {
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>,)+
         {
             type Accs = ($($F::Acc,)+);
+            type Cols = ($(SlabColumn<$F::Acc>,)+);
         }
 
         // `Compiled` is numeric-only — its ops are contextless numeric `Fold`s — so
@@ -122,7 +135,7 @@ macro_rules! impl_compiled {
         {
             type Reader<'b> = ($($R::Input<'b>,)+);
             type SharedContext = ();
-            type Columns = ($(SlabColumn<$F::Acc>,)+);
+            type Columns = CompiledColumns<($(Pair<$R, $F>,)+)>;
             type SortKey = i128;
             type WorkerContext = ();
 
@@ -163,24 +176,29 @@ macro_rules! impl_compiled {
                     _ => unreachable!("sort_key slot {slot} out of range"),
                 }
             }
+        }
 
-            fn new_columns(allocator: &mut SlabAllocator, rows: usize) -> Self::Columns {
-                ($(SlabColumn::<$F::Acc>::with_capacity(allocator, rows),)+)
+        impl<$($R, $F),+> ValueColumns for CompiledColumns<($(Pair<$R, $F>,)+)>
+        where
+            $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
+        {
+            type Value = Compiled<($(Pair<$R, $F>,)+)>;
+            type Context = ();
+
+            fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+                Self { cols: ($(SlabColumn::<$F::Acc>::with_capacity(allocator, rows),)+) }
             }
 
             #[inline(always)]
-            fn push_to(&self, cols: &mut Self::Columns) {
-                $(cols.$idx.push(self.accs.$idx);)+
+            fn push(&mut self, value: &Self::Value) {
+                $(self.cols.$idx.push(value.accs.$idx);)+
             }
 
-            fn finish_columns(
-                cols: Self::Columns,
-                _ctx: &(),
-            ) -> (Vec<Field>, Vec<ArrayRef>) {
+            fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
                 let mut fields = Vec::new();
                 let mut arrays = Vec::new();
                 $(
-                    let (f, a) = $F::finish(&format!("v{}", $idx), cols.$idx);
+                    let (f, a) = $F::finish(&format!("v{}", $idx), self.cols.$idx);
                     fields.push(f);
                     arrays.push(a);
                 )+

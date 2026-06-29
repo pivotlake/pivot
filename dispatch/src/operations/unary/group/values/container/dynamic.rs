@@ -22,6 +22,7 @@ use super::super::fold::Fold;
 use super::super::read::{IntRead, Read, StrRead};
 use super::super::{
     AggregationKind, AggregationSlot, AggregationValue, Count, Max, Min, StrMax, StrMin, Sum,
+    ValueColumns,
 };
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
@@ -133,6 +134,15 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Default
     }
 }
 
+/// The output-column builders for a [`Dynamic`] signature: `N` [`SlabColumn`]s of
+/// width `A`. The value-side counterpart to a key extractor's
+/// [`KeyColumns`](crate::operations::unary::group::keys::KeyColumns). The
+/// `ONLY_ADDITIVE` flag is carried only to bind these columns one-to-one to their
+/// [`Dynamic`] value; the output path renders by slot kind regardless.
+pub struct DynamicColumns<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> {
+    cols: [SlabColumn<A>; N],
+}
+
 impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> AggregationValue
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
@@ -141,7 +151,7 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
     /// (which a string extreme resolves its keys through). It spawns a per-worker
     /// [`WorkerArena`] via [`SharedContext::worker`](super::super::SharedContext::worker).
     type SharedContext = (Arc<[AggregationSlot]>, Arc<SharedArena>);
-    type Columns = [SlabColumn<A>; N];
+    type Columns = DynamicColumns<N, A, ONLY_ADDITIVE>;
     type SortKey = i128;
     /// A runtime signature may carry a string extreme, so it always takes a real
     /// per-worker [`WorkerArena`] (its numeric arms thread a throwaway `&mut ()`).
@@ -289,29 +299,35 @@ impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> Aggrega
         // a top-k (the planner doesn't push one), so its raw bits here are inert.
         self.cells[slot].into()
     }
+}
 
-    fn new_columns(allocator: &mut SlabAllocator, rows: usize) -> [SlabColumn<A>; N] {
-        std::array::from_fn(|_| SlabColumn::with_capacity(allocator, rows))
+impl<const N: usize, A: Numeric + StringCell, const ONLY_ADDITIVE: bool> ValueColumns
+    for DynamicColumns<N, A, ONLY_ADDITIVE>
+{
+    type Value = Dynamic<N, A, ONLY_ADDITIVE>;
+    type Context = (Arc<[AggregationSlot]>, Arc<SharedArena>);
+
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+        Self {
+            cols: std::array::from_fn(|_| SlabColumn::with_capacity(allocator, rows)),
+        }
     }
 
     #[inline(always)]
-    fn push_to(&self, cols: &mut [SlabColumn<A>; N]) {
-        for (col, cell) in cols.iter_mut().zip(self.cells.iter()) {
+    fn push(&mut self, value: &Self::Value) {
+        for (col, cell) in self.cols.iter_mut().zip(value.cells.iter()) {
             col.push(*cell);
         }
     }
 
-    fn finish_columns(
-        cols: [SlabColumn<A>; N],
-        ctx: &Self::SharedContext,
-    ) -> (Vec<Field>, Vec<ArrayRef>) {
-        let (slots, arena) = ctx;
+    fn finish(self, context: &Self::Context) -> (Vec<Field>, Vec<ArrayRef>) {
+        let (slots, arena) = context;
         let mut fields = Vec::with_capacity(N);
         let mut arrays = Vec::with_capacity(N);
         // One call per output column (`N` total, not per row), so the per-slot kind
         // dispatch is irrelevant. Each op renders its own column (numeric → its
         // width's Arrow type, string → `Utf8View` resolved through the arena).
-        for (s, col) in cols.into_iter().enumerate() {
+        for (s, col) in self.cols.into_iter().enumerate() {
             let name = format!("v{s}");
             let (f, a) = match slots[s].kind {
                 AggregationKind::CountStar | AggregationKind::Count => {
