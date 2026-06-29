@@ -14,8 +14,8 @@
 //!    rather than competing with the OS for the same physical pages.
 //!
 //! Provides direct I/O reads with platform-specific backends (io_uring on Linux,
-//! pread on other Unix), reading straight into the compressed cache's 4 KB-aligned slot
-//! regions.
+//! a blocking pread/pwrite thread pool on other Unix), reading straight into the
+//! file cache's 4 KB-aligned slot regions.
 //!
 //! # Architecture
 //!

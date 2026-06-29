@@ -6,9 +6,13 @@
 //! - **Linux** — `uring_backend::IOBackend` wraps `io_uring` for truly
 //!   asynchronous, kernel-managed reads. Submissions are batched in the SQ and
 //!   completions are drained from the CQ.
-//! - **Other Unix** — `pread_backend::IOBackend` executes reads synchronously
-//!   via `pread(2)` at `submit` time, so "completions" are always immediately
-//!   available.
+//! - **Other Unix (macOS)**: `pread_pool_backend::IOBackend` hands each read to
+//!   a shared pool of blocking `pread(2)`/`pwrite(2)` threads, so submission
+//!   never blocks the worker and reads run concurrently (filling device queue
+//!   depth and overlapping with compute). Each pool thread delivers its result
+//!   back over the issuing worker's MPSC channel; `completions` `try_recv`-drains
+//!   it and `submit_and_wait` `recv`-parks on it. There is no userspace lock on
+//!   the hot path.
 
 use crate::Identifier;
 
@@ -215,45 +219,185 @@ mod uring_backend {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-mod pread_backend {
+mod pread_pool_backend {
     use super::*;
+    use crossbeam_channel::{Receiver, Sender, unbounded};
     use std::collections::VecDeque;
     use std::os::fd::BorrowedFd;
     use std::os::unix::io::RawFd;
+    use std::sync::OnceLock;
 
-    struct PendingRead {
+    /// One read or write for a pool thread to perform: a `pread`/`pwrite` into or
+    /// out of a pinned cache slot, plus the channel its result is delivered on.
+    struct Job {
         fd: RawFd,
         offset: u64,
+        /// Destination of a read or source of a write; points into a pinned
+        /// cache slot kept alive by an `Arc` on the issuing block until commit.
+        buffer_ptr: *mut u8,
         length: usize,
         request_id: Identifier,
-        buffer_ptr: *mut u8,
         /// `true` for a `pwrite` (disk-cache fill), `false` for a `pread`.
         is_write: bool,
+        /// The issuing backend's completion channel; the pool thread sends the
+        /// `(result, request_id)` here once the op finishes.
+        sink: Sender<(i32, Identifier)>,
     }
 
-    unsafe impl Send for PendingRead {}
+    // SAFETY: `buffer_ptr` addresses a pinned cache slot whose `Arc` the issuing
+    // block holds for the whole flight of the op; only the one pool thread that
+    // takes this job touches that region, and only until it sends the completion.
+    unsafe impl Send for Job {}
 
-    /// Synchronous pread-based fallback for non-Linux Unix.
+    /// The process-wide pool of blocking-I/O threads. Created once, lazily, and
+    /// shared by every worker's backend so the threads load-balance: any pool
+    /// thread can serve any worker's read, which is what keeps the device queue
+    /// full under a burst from a single worker.
+    struct IoPool {
+        jobs: Sender<Job>,
+    }
+
+    fn io_pool() -> &'static IoPool {
+        static POOL: OnceLock<IoPool> = OnceLock::new();
+        POOL.get_or_init(|| {
+            let (jobs_tx, jobs_rx) = unbounded::<Job>();
+            for _ in 0..io_pool_thread_count() {
+                let jobs_rx = jobs_rx.clone();
+                std::thread::Builder::new()
+                    .name("pivot-io".to_string())
+                    .spawn(move || run_pool_thread(&jobs_rx))
+                    .expect("failed to spawn io pool thread");
+            }
+            IoPool { jobs: jobs_tx }
+        })
+    }
+
+    /// Pool size: four blocking threads per core (override with `PIVOT_IO_THREADS`).
+    /// The threads spend their time parked in `pread`, not on the CPU, so
+    /// oversubscribing keeps the device's queue deep (many reads in flight) without
+    /// starving the dataflow workers.
+    fn io_pool_thread_count() -> usize {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        crate::env::get_env_var_with_default("PIVOT_IO_THREADS", cores * 4)
+    }
+
+    fn run_pool_thread(jobs: &Receiver<Job>) {
+        // The channel closes only when the (static) pool's sender is dropped,
+        // i.e. never; this loop runs for the life of the process.
+        while let Ok(job) = jobs.recv() {
+            // Every job MUST yield exactly one completion: a worker parked in
+            // `submit_and_wait` blocks until its read reports back, and this
+            // thread must survive to serve the next job. `perform` is a raw
+            // syscall and shouldn't panic, but if it ever did (e.g. a bad
+            // pointer), an unguarded unwind would kill this thread, strand that
+            // worker forever, and shrink the pool. Catch it and fail just that
+            // read instead.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| perform(&job)))
+                .unwrap_or(-libc::EIO);
+            // The issuing backend may have been dropped while this op was in
+            // flight (its receiver gone); its completion then has nowhere to go,
+            // so a failed send is expected and ignored.
+            let _ = job.sink.send((result, job.request_id));
+        }
+    }
+
+    /// Runs the job's `pread`/`pwrite`, looping until the whole slot has moved,
+    /// and returns the bytes transferred or `-errno`, mirroring the signed CQE
+    /// result the io_uring backend reports so the requester interprets failures
+    /// by sign rather than by type.
     ///
-    /// Reads are queued in [`submit_read`](Self::submit_read) and executed
-    /// synchronously when [`submit`](Self::submit) is called. Completions are
-    /// therefore always available immediately after submission.
+    /// A blocking `pread`/`pwrite` may move fewer bytes than asked (a partial
+    /// transfer) or be interrupted by a signal before moving any (`EINTR`).
+    /// io_uring surfaces neither for a regular-file op, so this retries rather
+    /// than hand back a half-filled slot or cancel the query: it loops on a
+    /// partial transfer, retries on `EINTR`, and stops on `0` (end of file).
+    fn perform(job: &Job) -> i32 {
+        let mut moved = 0usize;
+        while moved < job.length {
+            // SAFETY: `fd` belongs to a file the issuing request keeps open, and
+            // `buffer_ptr`/`length` describe its pinned slot, live for this op
+            // (see the `Send` note on `Job`). `moved < length`, so the offset
+            // pointer and remaining length stay inside that slot.
+            let outcome = unsafe {
+                let fd = BorrowedFd::borrow_raw(job.fd);
+                let ptr = job.buffer_ptr.add(moved);
+                let remaining = job.length - moved;
+                let at = (job.offset + moved as u64) as i64;
+                if job.is_write {
+                    let buf = std::slice::from_raw_parts(ptr as *const u8, remaining);
+                    nix::sys::uio::pwrite(fd, buf, at)
+                } else {
+                    let buf = std::slice::from_raw_parts_mut(ptr, remaining);
+                    nix::sys::uio::pread(fd, buf, at)
+                }
+            };
+            match outcome {
+                // End of file (read) or a write that made no progress: stop and
+                // report what landed, leaving the shortfall for the caller's
+                // `result == len` check to treat as a failure.
+                Ok(0) => break,
+                Ok(bytes) => moved += bytes,
+                Err(nix::errno::Errno::EINTR) => continue,
+                // Negate to match io_uring's `-errno`, guarding the zero hole: an
+                // errno nix cannot classify is `UnknownErrno` (value 0), and a
+                // bare `-0` would be misread as a 0-byte success.
+                Err(errno) => {
+                    let code = errno as i32;
+                    return if code > 0 { -code } else { -libc::EIO };
+                }
+            }
+        }
+        moved as i32
+    }
+
+    /// Non-Linux backend: a thin handle onto the shared blocking-I/O pool.
+    ///
+    /// Reads and writes are staged in [`submit_read`](Self::submit_read) /
+    /// [`submit_write`](Self::submit_write) and dispatched to the pool in
+    /// [`submit`](Self::submit) (mirroring io_uring's SQ-push-then-flush). The
+    /// pool runs them concurrently and delivers each result back over `rx`;
+    /// [`completions`](Self::completions) `try_recv`-drains it, and
+    /// [`submit_and_wait`](Self::submit_and_wait) `recv`-parks on it.
     pub struct IOBackend {
-        pending: VecDeque<PendingRead>,
-        /// Completed ops as `(bytes_transferred, request_id)`, mirroring the
-        /// io_uring backend's `(result, id)` so callers can check the byte count.
-        completed: VecDeque<(i32, Identifier)>,
+        /// This worker's job sender into the shared pool.
+        pool: Sender<Job>,
+        /// Cloned onto each dispatched [`Job`] so the pool thread can deliver the
+        /// completion back here.
+        sink: Sender<(i32, Identifier)>,
+        /// Receives completions from the pool threads. MPSC: many pool threads
+        /// send, this one backend receives.
+        rx: Receiver<(i32, Identifier)>,
+        /// Completions pulled off `rx` but not yet handed to the caller; lets
+        /// `submit_and_wait` block for `want` of them while leaving them for
+        /// `completions` to drain.
+        ready: VecDeque<(i32, Identifier)>,
+        /// Ops dispatched to the pool that have not yet reported back. Bounds how
+        /// long `submit_and_wait` will park (never past what's outstanding) and
+        /// gates the drain in `Drop`.
+        in_flight: usize,
+        /// Staged ops not yet handed to the pool; flushed by [`submit`](Self::submit).
+        staged: Vec<Job>,
     }
 
     impl IOBackend {
+        /// `_ring_size` is accepted for parity with the io_uring backend's
+        /// constructor but ignored here: the pool's concurrency is set by
+        /// `io_pool_thread_count()` and its backlog is an unbounded channel.
         pub fn new(_ring_size: u32) -> io::Result<Self> {
+            let (sink, rx) = unbounded();
             Ok(Self {
-                pending: VecDeque::new(),
-                completed: VecDeque::new(),
+                pool: io_pool().jobs.clone(),
+                sink,
+                rx,
+                ready: VecDeque::new(),
+                in_flight: 0,
+                staged: Vec::new(),
             })
         }
 
-        /// Queues a read into `dest`; the actual `pread` happens at
+        /// Stages a read into `dest`; dispatched to the pool at
         /// [`submit`](Self::submit) time.
         pub fn submit_read(
             &mut self,
@@ -263,19 +407,20 @@ mod pread_backend {
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
-            self.pending.push_back(PendingRead {
+            self.staged.push(Job {
                 fd,
                 offset,
+                buffer_ptr: dest,
                 length,
                 request_id,
-                buffer_ptr: dest,
                 is_write: false,
+                sink: self.sink.clone(),
             });
             Ok(())
         }
 
-        /// Queues a write from `src`; the actual `pwrite` happens at
-        /// [`submit`](Self::submit) time. Mirrors [`submit_read`](Self::submit_read).
+        /// Stages a write from `src`; dispatched at [`submit`](Self::submit) time.
+        /// Mirrors [`submit_read`](Self::submit_read).
         pub fn submit_write(
             &mut self,
             fd: RawFd,
@@ -284,50 +429,292 @@ mod pread_backend {
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
-            self.pending.push_back(PendingRead {
+            self.staged.push(Job {
                 fd,
                 offset,
+                buffer_ptr: src as *mut u8,
                 length,
                 request_id,
-                buffer_ptr: src as *mut u8,
                 is_write: true,
+                sink: self.sink.clone(),
             });
             Ok(())
         }
 
-        /// Executes all pending reads synchronously via `pread(2)`.
+        /// Hands every staged op to the pool (non-blocking) and returns how many
+        /// were dispatched. The pool starts them immediately and concurrently.
         pub fn submit(&mut self) -> io::Result<usize> {
-            self.execute_pending()
+            let dispatched = self.staged.len();
+            for job in self.staged.drain(..) {
+                // The pool's receivers are the static pool threads, alive for the
+                // life of the process, so the send never fails.
+                self.pool.send(job).expect("io pool thread gone");
+                self.in_flight += 1;
+            }
+            Ok(dispatched)
         }
 
-        pub fn submit_and_wait(&mut self, _want: usize) -> io::Result<usize> {
-            self.execute_pending()
+        /// Flushes staged ops, then blocks until at least `want` completions are
+        /// ready to drain (or nothing is left in flight). Returns the count of
+        /// ops dispatched this call (callers must not read bytes from it).
+        ///
+        /// The requester parks on the disk and HTTP channels together (via
+        /// [`completion_receiver`](Self::completion_receiver)), so this self-contained
+        /// blocking wait is used only by the backend's own tests; kept for parity
+        /// with the io_uring backend's `submit_and_wait`.
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub fn submit_and_wait(&mut self, want: usize) -> io::Result<usize> {
+            let dispatched = self.submit()?;
+            self.block_until_ready(want);
+            Ok(dispatched)
         }
 
-        fn execute_pending(&mut self) -> io::Result<usize> {
-            let count = self.pending.len();
+        /// Moves every completion the pool has delivered so far off the channel
+        /// into `ready` (non-blocking).
+        fn drain_ready(&mut self) {
+            while let Ok(completion) = self.rx.try_recv() {
+                self.ready.push_back(completion);
+                self.in_flight -= 1;
+            }
+        }
 
-            while let Some(req) = self.pending.pop_front() {
-                // SAFETY: The fd is valid because it's from an open file managed by the reader
-                let bytes = unsafe {
-                    let borrowed_fd = BorrowedFd::borrow_raw(req.fd);
-                    if req.is_write {
-                        let buf = std::slice::from_raw_parts(req.buffer_ptr, req.length);
-                        nix::sys::uio::pwrite(borrowed_fd, buf, req.offset as i64)?
-                    } else {
-                        let buf = std::slice::from_raw_parts_mut(req.buffer_ptr, req.length);
-                        nix::sys::uio::pread(borrowed_fd, buf, req.offset as i64)?
-                    }
-                };
+        /// Buffers completions into `ready`, blocking, until at least `want` are
+        /// held or nothing is left in flight. `self.sink` keeps a sender alive, so
+        /// `recv` only ever blocks; it never errors on a closed channel.
+        fn block_until_ready(&mut self, want: usize) {
+            self.drain_ready();
+            while self.ready.len() < want && self.in_flight > 0 {
+                let completion = self.rx.recv().expect("backend holds a sender");
+                self.ready.push_back(completion);
+                self.in_flight -= 1;
+            }
+        }
 
-                self.completed.push_back((bytes as i32, req.request_id));
+        /// Drains finished ops as `(bytes_transferred, request_id)`, mirroring the
+        /// io_uring backend's `(result, id)` (negative is `-errno`).
+        pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
+            self.drain_ready();
+            Ok(self.ready.drain(..).collect())
+        }
+
+        /// The completion channel, so the requester can park on it alongside the
+        /// HTTP channel (the two pools deliver independently, with no shared ring
+        /// here to provide a single wake point).
+        pub fn completion_receiver(&self) -> &Receiver<(i32, Identifier)> {
+            &self.rx
+        }
+
+        /// `true` if a disk completion is already in hand, so the worker need not
+        /// park.
+        pub fn has_ready_completion(&self) -> bool {
+            !self.ready.is_empty() || !self.rx.is_empty()
+        }
+    }
+
+    impl Drop for IOBackend {
+        /// Block until every dispatched op has reported back before tearing down,
+        /// so no pool thread writes into a cache slot after the issuing request
+        /// (and its `Arc` pin) has been dropped. The backend is declared before
+        /// the requester's pending-request map, so it drops first, meaning the
+        /// slots are still pinned here. Ops target local files and always finish.
+        fn drop(&mut self) {
+            // `want = usize::MAX` is unreachable, so this blocks until in_flight
+            // hits 0, draining every dispatched op into `ready` (then discarded).
+            self.block_until_ready(usize::MAX);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        /// File byte at absolute offset `off`, so a read's bytes are predictable.
+        fn pattern(off: usize) -> u8 {
+            (off % 251) as u8
+        }
+
+        /// A temp file of `len` bytes filled with [`pattern`], kept alive by the
+        /// returned handle so its fd stays valid for the read.
+        fn patterned_file(len: usize) -> tempfile::NamedTempFile {
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            let data: Vec<u8> = (0..len).map(pattern).collect();
+            tmp.write_all(&data).unwrap();
+            tmp.flush().unwrap();
+            tmp
+        }
+
+        /// More reads than pool threads, issued at once, must all run and each
+        /// land in its own buffer with its own id, the core concurrency contract
+        /// the old serial backend couldn't make.
+        #[test]
+        fn many_concurrent_reads_each_land_in_their_own_buffer() {
+            const N: usize = 64;
+            const BLK: usize = 4096;
+            let file = patterned_file(N * BLK);
+            let fd = file.as_file().as_raw_fd();
+            let mut backend = IOBackend::new(64).unwrap();
+            let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; BLK]).collect();
+
+            for (id, buf) in bufs.iter_mut().enumerate() {
+                backend
+                    .submit_read(
+                        fd,
+                        (id * BLK) as u64,
+                        buf.as_mut_ptr(),
+                        BLK,
+                        id as Identifier,
+                    )
+                    .unwrap();
+            }
+            backend.submit().unwrap();
+
+            let mut seen = [false; N];
+            let mut remaining = N;
+            while remaining > 0 {
+                backend.submit_and_wait(1).unwrap();
+                for (result, id) in backend.completions().unwrap() {
+                    assert_eq!(result, BLK as i32);
+                    assert!(!seen[id], "id {id} completed twice");
+                    seen[id] = true;
+                    remaining -= 1;
+                }
             }
 
-            Ok(count)
+            for (i, buf) in bufs.iter().enumerate() {
+                for (j, &byte) in buf.iter().enumerate() {
+                    assert_eq!(byte, pattern(i * BLK + j), "block {i} byte {j}");
+                }
+            }
         }
 
-        pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
-            Ok(self.completed.drain(..).collect())
+        /// An op that fails syscall-side comes back as a negative result carrying
+        /// its id (mirroring io_uring's `-errno`), never a panic or a hang, so
+        /// the requester can fail just the owning dataflow.
+        #[test]
+        fn a_failed_op_reports_a_negative_result_with_its_id() {
+            let file = patterned_file(64);
+            // A read-only descriptor: a `pwrite` to it fails with EBADF, a real
+            // syscall error from a valid fd (no invalid-descriptor edge cases).
+            let read_only = std::fs::File::open(file.path()).unwrap();
+            let fd = read_only.as_raw_fd();
+            let mut backend = IOBackend::new(8).unwrap();
+            let src = [0u8; 64];
+
+            backend
+                .submit_write(fd, 0, src.as_ptr(), src.len(), 7)
+                .unwrap();
+            backend.submit_and_wait(1).unwrap();
+
+            let completions = backend.completions().unwrap();
+            assert_eq!(completions.len(), 1);
+            let (result, id) = completions[0];
+            assert!(result < 0, "expected -errno, got {result}");
+            assert_eq!(id, 7);
+        }
+
+        /// A `submit_write` then `submit_read` of the same range round-trips the
+        /// bytes: the disk-cache fill path the requester drives on a remote miss.
+        #[test]
+        fn a_write_then_read_round_trips() {
+            const LEN: usize = 4096;
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let fd = file.as_file().as_raw_fd();
+            let mut backend = IOBackend::new(8).unwrap();
+            let src: Vec<u8> = (0..LEN).map(pattern).collect();
+
+            backend.submit_write(fd, 0, src.as_ptr(), LEN, 1).unwrap();
+            backend.submit_and_wait(1).unwrap();
+            assert_eq!(backend.completions().unwrap(), vec![(LEN as i32, 1)]);
+
+            let mut readback = vec![0u8; LEN];
+            backend
+                .submit_read(fd, 0, readback.as_mut_ptr(), LEN, 2)
+                .unwrap();
+            backend.submit_and_wait(1).unwrap();
+            assert_eq!(backend.completions().unwrap(), vec![(LEN as i32, 2)]);
+
+            assert_eq!(readback, src);
+        }
+
+        /// A read that runs past end of file fills what is there and stops at the
+        /// terminal zero-byte `pread`, reporting the short count rather than
+        /// spinning on EOF or erroring.
+        #[test]
+        fn a_read_past_eof_returns_the_available_bytes() {
+            const FILE_LEN: usize = 100;
+            const REQ_LEN: usize = 4096;
+            let file = patterned_file(FILE_LEN);
+            let fd = file.as_file().as_raw_fd();
+            let mut backend = IOBackend::new(8).unwrap();
+            let mut buf = vec![0u8; REQ_LEN];
+
+            backend
+                .submit_read(fd, 0, buf.as_mut_ptr(), REQ_LEN, 3)
+                .unwrap();
+            backend.submit_and_wait(1).unwrap();
+
+            assert_eq!(backend.completions().unwrap(), vec![(FILE_LEN as i32, 3)]);
+        }
+
+        /// `submit_and_wait(want)` parks until at least `want` completions are
+        /// ready, so a single follow-up drain yields all of them.
+        #[test]
+        fn submit_and_wait_blocks_for_the_requested_count() {
+            const N: usize = 8;
+            const BLK: usize = 4096;
+            let file = patterned_file(N * BLK);
+            let fd = file.as_file().as_raw_fd();
+            let mut backend = IOBackend::new(64).unwrap();
+            let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; BLK]).collect();
+
+            for (id, buf) in bufs.iter_mut().enumerate() {
+                backend
+                    .submit_read(
+                        fd,
+                        (id * BLK) as u64,
+                        buf.as_mut_ptr(),
+                        BLK,
+                        id as Identifier,
+                    )
+                    .unwrap();
+            }
+            backend.submit_and_wait(N).unwrap();
+
+            assert_eq!(backend.completions().unwrap().len(), N);
+        }
+
+        /// Dropping a backend with reads still dispatched must block until the
+        /// pool finishes them, so no thread writes into `bufs` after they (would)
+        /// be freed. The test reaching its end at all means `Drop` didn't hang and
+        /// the in-flight drain branch ran.
+        #[test]
+        fn dropping_with_reads_in_flight_drains_before_returning() {
+            const N: usize = 32;
+            const BLK: usize = 4096;
+            let file = patterned_file(N * BLK);
+            let fd = file.as_file().as_raw_fd();
+            let mut bufs: Vec<Vec<u8>> = (0..N).map(|_| vec![0u8; BLK]).collect();
+
+            {
+                let mut backend = IOBackend::new(64).unwrap();
+                for (id, buf) in bufs.iter_mut().enumerate() {
+                    backend
+                        .submit_read(
+                            fd,
+                            (id * BLK) as u64,
+                            buf.as_mut_ptr(),
+                            BLK,
+                            id as Identifier,
+                        )
+                        .unwrap();
+                }
+                backend.submit().unwrap();
+                // Drop without draining: the `Drop` impl must wait out the pool.
+            }
+
+            drop(bufs);
         }
     }
 }
@@ -336,4 +723,4 @@ mod pread_backend {
 pub(crate) use uring_backend::IOBackend;
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) use pread_backend::IOBackend;
+pub(crate) use pread_pool_backend::IOBackend;

@@ -11,7 +11,8 @@ Box: `ssh ubuntu@parquetsink` (x86_64). Live dir: `~/pivotdb-deploy/` — `run.s
 export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/parquet_sink/gcs-key.json   # SA parquet-sink-writer@epsio-io (has delete)
 export RUST_LOG=info PANIC_ON_EVICT=false                                       # PANIC_ON_EVICT=false is required
 ./pivotdb-server --path gs://epsio-io-otel-parquet/pivotdb-otel --bind 0.0.0.0:5432 \
---otel-config /home/ubuntu/pivotdb-deploy/otel.toml --compact-bytes 52428800
+--otel-config /home/ubuntu/pivotdb-deploy/otel.toml --compact --compact-bytes 52428800
+NOTE: the compacter is opt-in. `--compact` must be present or the server refuses `--compact-bytes`/`--compact-min-files` and exits. Older run.sh lacking `--compact` will fail to start after the swap; add it.
 otel.toml: OTLP/gRPC on 0.0.0.0:4317, logs→table otel_logs, DeploymentId column from resource:deployment_id, partition_by=DeploymentId sort_by=ObservedTimestamp. The otel_logs table must already exist in the catalog (ingest refuses otherwise).
 
 Get the binary
@@ -41,3 +42,4 @@ Pitfalls (all hit for real)
 - Changing cargo profile (e.g. CARGO_PROFILE_RELEASE_DEBUG=…) busts the cache → full Rust recompile. Keep the profile constant.
 - Deployed (CI) binaries have no debug info → perf/addr2line mislead and stacks don't unwind. For real debugging build with CARGO_PROFILE_RELEASE_DEBUG=line-tables-only.
 - Don't run unbounded full-table queries against the live sink (memory). Use DuckDB on the parquet for ad-hoc checks.
+- Compaction is opt-in via `--compact` (the sink owns the data, so it should compact). A newer binary started WITHOUT `--compact` but WITH `--compact-bytes` exits immediately with "the following required arguments were not provided: --compact". When deploying a build at/after the opt-in change, make sure run.sh passes `--compact`. A read-only/external reader must omit it (no `--compact` = never merges or deletes catalog files).
