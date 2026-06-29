@@ -113,7 +113,7 @@ impl Server {
         }
     }
 
-    /// Also serve the bundled web dashboard (see [`crate::http`]) on `addr`
+    /// Also serve the bundled web dashboard (served by the `http` module) on `addr`
     /// while the server runs. Off by default.
     pub fn with_http_bind(mut self, addr: SocketAddr) -> Self {
         self.http_bind = Some(addr);
