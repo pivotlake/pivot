@@ -38,6 +38,9 @@ pub use slab_vec::SlabVec;
 mod slab_top_k;
 pub(crate) use slab_top_k::{HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabTopK, slots_per_slab};
 
+mod contiguous_multi_buffer;
+pub use contiguous_multi_buffer::ContiguousMultiBuffer;
+
 /// A contiguous byte region within a `WriteBuffer`.
 ///
 /// Keeps the parent buffer alive via `Arc<WriteBuffer>`. Multiple slabs can share the same
