@@ -29,11 +29,19 @@ use crate::io::FileLocation;
 use crate::memory::clock::Owner;
 use crate::memory::context::memory_ctx;
 use crate::memory::read_buffer::ReadBuffer;
+use crate::memory::ring::BUFFER_SIZE;
 use crate::memory::write_buffer::WriteBuffer;
 use ahash::HashMap;
 use bytes::Bytes;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Valid byte length of slot `i` of a block whose decompressed bytes total
+/// `total_len`: every slot is full (`BUFFER_SIZE`) except the last, which holds the
+/// remainder. Lets a block store one length instead of a per-slot `Vec`.
+fn slot_len(total_len: usize, i: usize) -> usize {
+    (total_len - i * BUFFER_SIZE).min(BUFFER_SIZE)
+}
 
 /// Identity of a cached decompressed block: the file, the byte offset of its
 /// source bytes, and their length. Unique per block. The length is part of the
@@ -47,12 +55,13 @@ pub struct BlockKey {
 }
 
 /// A cached decompressed block: the ring slots holding its bytes (one per 2 MB),
-/// each slot's valid byte length, and the source `len` from its [`BlockKey`] (so a
-/// `get` can reject a same-offset key of a different size).
+/// the decompressed total length (per-slot lengths come from [`slot_len`]), and the
+/// source `len` from its [`BlockKey`] (so a `get` can reject a same-offset key of a
+/// different size).
 struct DecompBlock {
     slots: Vec<usize>,
-    lens: Vec<usize>,
-    key_len: usize,
+    total_len: usize,
+    len: usize,
 }
 
 /// A cache of decompressed blocks, shared across workers behind an `Arc` like the
@@ -99,41 +108,42 @@ impl DecompressedCache {
         let files = self.files.read().unwrap();
         let table = files.get(&key.location)?.read().unwrap();
         let block = table.get(&key.offset)?;
-        if block.key_len != key.len {
+        if block.len != key.len {
             return None;
         }
         let mut views = Vec::with_capacity(block.slots.len());
-        for (&slot, &len) in block.slots.iter().zip(&block.lens) {
+        for (i, &slot) in block.slots.iter().enumerate() {
             // `?` on a failed `try_read` drops `views`, releasing the pins already
             // taken, and the whole lookup misses.
             let read = memory_ctx().ring().try_read(slot)?;
             memory_ctx().clock().touch(slot);
-            views.push(Bytes::from_owner(read).slice(..len));
+            views.push(Bytes::from_owner(read).slice(..slot_len(block.total_len, i)));
         }
         Some(views)
     }
 
     /// Cache the page just decompressed into `write_buffers` (one per 2 MB slot,
-    /// `lens[i]` valid bytes each) and return the bytes to hand the decoder. If it
-    /// caches, each buffer is converted to a read pin so its slot becomes resident
-    /// at `used == 0` once the decoder drops the returned `Bytes`; otherwise (cache
-    /// off, empty page, or the block already cached) the `WriteBuffer`-backed bytes
-    /// are returned and their slots return to the pool on drop.
+    /// `total_len` decompressed bytes across them) and return the bytes to hand the
+    /// decoder. If it caches, each buffer is converted to a read pin so its slot
+    /// becomes resident at `used == 0` once the decoder drops the returned `Bytes`;
+    /// otherwise (cache off, empty page, or the block already cached) the
+    /// `WriteBuffer`-backed bytes are returned and their slots return to the pool on
+    /// drop.
     pub fn insert(
         &self,
         key: BlockKey,
         write_buffers: Vec<WriteBuffer>,
-        lens: Vec<usize>,
+        total_len: usize,
     ) -> Vec<Bytes> {
         if !self.enabled || write_buffers.is_empty() {
-            return transient(write_buffers, &lens);
+            return transient(write_buffers, total_len);
         }
         let slots: Vec<usize> = write_buffers.iter().map(|b| b.slot_idx).collect();
 
         // Claim `offset` under the file's write lock (so two workers decompressing
         // the same page don't both cache it); on a dup, leave this copy transient.
-        if !self.claim(&key, &slots, &lens) {
-            return transient(write_buffers, &lens);
+        if !self.claim(&key, &slots, total_len) {
+            return transient(write_buffers, total_len);
         }
 
         // Record the reverse index and clock ownership while the slots are still
@@ -142,10 +152,8 @@ impl DecompressedCache {
             let mut reverse = self.reverse.write().unwrap();
             for &slot in &slots {
                 reverse.insert(slot, key.clone());
+                memory_ctx().clock().bind(slot, Owner::Decompressed);
             }
-        }
-        for &slot in &slots {
-            memory_ctx().clock().bind(slot, Owner::Decompressed);
         }
         self.count.fetch_add(slots.len(), Ordering::Relaxed);
 
@@ -153,14 +161,16 @@ impl DecompressedCache {
         // the returned views the slot drops to `used == 0` - resident, not pooled.
         write_buffers
             .into_iter()
-            .zip(&lens)
-            .map(|(buffer, &len)| Bytes::from_owner(ReadBuffer::from(buffer)).slice(..len))
+            .enumerate()
+            .map(|(i, buffer)| {
+                Bytes::from_owner(ReadBuffer::from(buffer)).slice(..slot_len(total_len, i))
+            })
             .collect()
     }
 
     /// Insert the block's forward entry under the file's write lock, creating the
     /// file's table if needed. Returns `false` if `offset` is already cached.
-    fn claim(&self, key: &BlockKey, slots: &[usize], lens: &[usize]) -> bool {
+    fn claim(&self, key: &BlockKey, slots: &[usize], total_len: usize) -> bool {
         loop {
             {
                 let files = self.files.read().unwrap();
@@ -173,8 +183,8 @@ impl DecompressedCache {
                         key.offset,
                         DecompBlock {
                             slots: slots.to_vec(),
-                            lens: lens.to_vec(),
-                            key_len: key.len,
+                            total_len,
+                            len: key.len,
                         },
                     );
                     return true;
@@ -224,7 +234,7 @@ impl DecompressedCache {
                 Some(buffer) => buffers.push(buffer),
                 None => {
                     for buffer in buffers {
-                        release_without_pool(buffer);
+                        buffer.release_in_place();
                     }
                     return None;
                 }
@@ -261,7 +271,7 @@ impl DecompressedCache {
         }
         let buffer = memory_ctx().ring().try_write(slot)?;
         if memory_ctx().clock().owner(slot) != Owner::Decompressed {
-            release_without_pool(buffer);
+            buffer.release_in_place();
             return None;
         }
         self.reverse.write().unwrap().remove(&slot);
@@ -320,23 +330,12 @@ impl DecompressedCache {
 }
 
 /// Build `WriteBuffer`-backed (uncached, pooled-on-drop) views from the buffers.
-fn transient(write_buffers: Vec<WriteBuffer>, lens: &[usize]) -> Vec<Bytes> {
+fn transient(write_buffers: Vec<WriteBuffer>, total_len: usize) -> Vec<Bytes> {
     write_buffers
         .into_iter()
-        .zip(lens)
-        .map(|(buffer, &len)| Bytes::from_owner(buffer).slice(..len))
+        .enumerate()
+        .map(|(i, buffer)| Bytes::from_owner(buffer).slice(..slot_len(total_len, i)))
         .collect()
-}
-
-/// Drop a `WriteBuffer` without returning its slot to the pool: forget it and reset
-/// `used` to 0, leaving the slot resident (still owned, not free). Used when a
-/// multi-slot reclaim bails after acquiring only some of a block's slots.
-fn release_without_pool(buffer: WriteBuffer) {
-    let slot = buffer.slot_idx;
-    std::mem::forget(buffer);
-    memory_ctx()
-        .ring()
-        .set_slot_used(slot, 0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -400,7 +399,7 @@ mod tests {
         let cache = for_test(true);
         let buffer = ring_write();
         let ptr = buffer.as_slice().as_ptr();
-        cache.insert(test_key(0), vec![buffer], vec![1]);
+        cache.insert(test_key(0), vec![buffer], 1);
 
         let hit = cache.get(&test_key(0)).unwrap();
 
@@ -417,7 +416,7 @@ mod tests {
                 ..test_key(0)
             },
             vec![ring_write()],
-            vec![1],
+            1,
         );
 
         let other = BlockKey {
@@ -432,13 +431,13 @@ mod tests {
     fn insert_is_a_noop_when_the_offset_is_already_cached() {
         init_test_free_pool(2);
         let cache = for_test(true);
-        cache.insert(test_key(0), vec![ring_write()], vec![1]);
+        cache.insert(test_key(0), vec![ring_write()], 1);
         let dup = ring_write();
         let dup_slot = dup.slot_idx;
 
         // The dup is returned transient (WriteBuffer-backed): dropping it pools the
         // slot, which the next allocation hands back.
-        drop(cache.insert(test_key(0), vec![dup], vec![1]));
+        drop(cache.insert(test_key(0), vec![dup], 1));
 
         assert_eq!(memory_ctx().get_write_buffer(false).slot_idx, dup_slot);
     }
@@ -449,7 +448,7 @@ mod tests {
         let cache = for_test(true);
         let buffer = ring_write();
         let slot = buffer.slot_idx;
-        drop(cache.insert(test_key(0), vec![buffer], vec![1])); // drop the view → resident
+        drop(cache.insert(test_key(0), vec![buffer], 1)); // drop the view → resident
 
         let reclaimed = cache.reclaim(slot);
 
@@ -475,8 +474,8 @@ mod tests {
         let cache = for_test(true);
         let a = new_file();
         let b = new_file();
-        cache.insert(key_for(&a), vec![ring_write()], vec![1]);
-        cache.insert(key_for(&b), vec![ring_write()], vec![1]);
+        cache.insert(key_for(&a), vec![ring_write()], 1);
+        cache.insert(key_for(&b), vec![ring_write()], 1);
 
         cache.invalidate(&a);
 
@@ -488,8 +487,8 @@ mod tests {
     fn clear_drops_everything() {
         init_test_free_pool(4);
         let cache = for_test(true);
-        drop(cache.insert(test_key(0), vec![ring_write()], vec![1]));
-        drop(cache.insert(test_key(1), vec![ring_write()], vec![1]));
+        drop(cache.insert(test_key(0), vec![ring_write()], 1));
+        drop(cache.insert(test_key(1), vec![ring_write()], 1));
 
         let dropped = cache.clear();
 
@@ -503,7 +502,7 @@ mod tests {
         let cache = for_test(false);
 
         // insert returns the bytes transient; nothing is cached.
-        drop(cache.insert(test_key(0), vec![ring_write()], vec![1]));
+        drop(cache.insert(test_key(0), vec![ring_write()], 1));
 
         assert!(cache.get(&test_key(0)).is_none());
         assert!(cache.is_empty());

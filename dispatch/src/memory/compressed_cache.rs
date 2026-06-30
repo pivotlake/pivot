@@ -699,10 +699,7 @@ impl CompressedCache {
         // the sweep and the `try_write`; releasing it without re-pooling keeps its
         // existing listing valid.
         if memory_ctx().clock().owner(slot_idx) != Owner::Compressed {
-            std::mem::forget(write_buffer);
-            memory_ctx()
-                .ring()
-                .set_slot_used(slot_idx, 0, Ordering::Release);
+            write_buffer.release_in_place();
             return None;
         }
 

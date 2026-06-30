@@ -71,10 +71,10 @@ impl Decompressor {
                 // `insert` caches the page (binding its slots so a later read skips
                 // snappy) and returns the bytes to decode; a zero-length page yields
                 // no buffers and is left uncached.
-                let (write_buffers, lens) = self.decompress_to_buffers(&page)?;
+                let (write_buffers, total_len) = self.decompress_to_buffers(&page)?;
                 memory_ctx()
                     .decompressed_cache()
-                    .insert(key, write_buffers, lens)
+                    .insert(key, write_buffers, total_len)
             }
         };
 
@@ -101,13 +101,14 @@ impl Decompressor {
     }
 
     /// Snappy-decompress the page body into freshly allocated ring buffers (one per
-    /// 2 MB slot), returning the write buffers plus each one's valid byte length.
-    /// The cache turns these into resident, read-pinned slots; an unached page's
-    /// buffers return to the pool when the decoder drops them.
+    /// 2 MB slot), returning the write buffers plus the decompressed total length
+    /// (the cache derives each slot's valid bytes from it). The cache turns these
+    /// into resident, read-pinned slots; an uncached page's buffers return to the
+    /// pool when the decoder drops them.
     fn decompress_to_buffers(
         &mut self,
         page: &CompressedPage,
-    ) -> Result<(Vec<WriteBuffer>, Vec<usize>)> {
+    ) -> Result<(Vec<WriteBuffer>, usize)> {
         let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
 
         let uncompressed_size = page.header.uncompressed_page_size as usize;
@@ -120,14 +121,7 @@ impl Decompressor {
 
         self.decoder.decompress_scattered(&input, output_bufs)?;
 
-        let mut lens = Vec::with_capacity(num_buffers);
-        let mut remaining = uncompressed_size;
-        for _ in 0..num_buffers {
-            let chunk_len = remaining.min(BUFFER_SIZE);
-            lens.push(chunk_len);
-            remaining -= chunk_len;
-        }
-        Ok((write_buffers, lens))
+        Ok((write_buffers, uncompressed_size))
     }
 }
 
