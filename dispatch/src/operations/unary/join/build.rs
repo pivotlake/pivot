@@ -1,43 +1,42 @@
-use std::cell::UnsafeCell;
-use std::hint::black_box;
-use std::mem;
-use std::ops::{Index, IndexMut};
-use std::sync::{mpsc, Arc, LazyLock, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crossbeam_deque::{Injector, Steal};
-use arrow_array::{Array, Int64Array, RecordBatch};
-use ahash::RandomState;
-use tracing::debug;
-use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer, Slab, SlabAllocator, SlabBuffer, SlabVec, BUFFER_SIZE};
+use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer, SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
-use crate::operations::{unary, Consumer, Outputter};
-use crate::operations::unary::join::directory::{prefetch_ptr, Directory, JoinDirectory};
-use crate::operations::unary::join::Value;
+use crate::operations::unary::join::directory::{Directory, JoinDirectory};
+use crate::operations::unary::join::{JoinCell, Value};
+use crate::operations::{Consumer, Outputter, unary};
+use ahash::RandomState;
+use arrow_array::{Array, Int64Array, RecordBatch};
+use crossbeam_deque::{Injector, Steal};
+use std::ops::{Index, IndexMut};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use tracing::debug;
 
 pub(crate) const NUM_PARTITIONS: usize = 64;
 const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
+pub(crate) type PartitionBuffers = Vec<SlabVec<(u64, Value)>>;
 
 pub struct JoinBuildConsumer {
     key_column: usize,
     hash_state: RandomState,
-    values: Vec<SlabVec<(u64, Value)>>,
+    values: PartitionBuffers,
     slab_allocator: SlabAllocator,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    sender: mpsc::Sender<Vec<SlabVec<(u64, Value)>>>,
+    sender: mpsc::Sender<PartitionBuffers>,
     outputter: JoinBuilder,
 }
 
 unsafe impl Send for JoinBuildConsumer {}
 
 impl JoinBuildConsumer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         key_column: usize,
         hash_state: RandomState,
-        sender: mpsc::Sender<Vec<SlabVec<(u64, Value)>>>,
-        receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
+        sender: mpsc::Sender<PartitionBuffers>,
+        receiver: Option<mpsc::Receiver<PartitionBuffers>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
-        directory: Arc<UnsafeCell<JoinDirectory>>,
-        arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
+        directory: Arc<JoinCell<JoinDirectory>>,
+        arena: Arc<JoinCell<MultiSlabBuffer<Value>>>,
         injector: Arc<Injector<JoinPartitionJob>>,
         jobs_injected: Arc<AtomicBool>,
         gate: Arc<AtomicBool>,
@@ -67,11 +66,7 @@ impl JoinBuildConsumer {
 impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
     type Outputter = JoinBuilder;
 
-    fn consume<S: Sender<()>>(
-        &mut self,
-        batch: RecordBatch,
-        _sender: &mut S,
-    ) -> unary::Result<()> {
+    fn consume<S: Sender<()>>(&mut self, batch: RecordBatch, _sender: &mut S) -> unary::Result<()> {
         debug!("Consuming build");
         let col = batch
             .column(self.key_column)
@@ -101,9 +96,9 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 }
 
 pub struct JoinBuilder {
-    directory: Arc<UnsafeCell<JoinDirectory>>,
-    arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
-    receiver: Option<mpsc::Receiver<Vec<SlabVec<(u64, Value)>>>>,
+    directory: Arc<JoinCell<JoinDirectory>>,
+    arena: Arc<JoinCell<MultiSlabBuffer<Value>>>,
+    receiver: Option<mpsc::Receiver<PartitionBuffers>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
@@ -114,9 +109,9 @@ pub struct JoinBuilder {
 unsafe impl Send for JoinBuilder {}
 
 pub struct JoinPartitionJob {
-    tuples: Vec<SlabVec<(u64, Value)>>,
-    directory: Arc<UnsafeCell<JoinDirectory>>,
-    arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
+    tuples: PartitionBuffers,
+    directory: Arc<JoinCell<JoinDirectory>>,
+    arena: Arc<JoinCell<MultiSlabBuffer<Value>>>,
     arena_offset: usize,
 
     slot_start: usize,
@@ -199,7 +194,7 @@ impl JoinPartitionJob {
 impl Outputter<()> for JoinBuilder {
     fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let mut all_worker_tuples: Vec<Vec<SlabVec<(u64, Value)>>> = rx.into_iter().collect();
+            let mut all_worker_tuples: Vec<PartitionBuffers> = rx.into_iter().collect();
 
             let sizes: Vec<usize> = self
                 .partition_sizes
@@ -209,11 +204,13 @@ impl Outputter<()> for JoinBuilder {
             let total: usize = sizes.iter().sum();
 
             // Pre-allocate directory and arena.
-            let dir_capacity = ((total as f64 * 1.125) as usize).next_power_of_two().max(NUM_PARTITIONS);
+            let dir_capacity = ((total as f64 * 1.125) as usize)
+                .next_power_of_two()
+                .max(NUM_PARTITIONS);
             let directory = unsafe { &mut *self.directory.get() };
             *directory = match ContiguousMultiBuffer::<u64>::new(dir_capacity + 1) {
                 Ok(buf) => JoinDirectory::Contiguous(Directory::new(buf, dir_capacity)),
-                Err(()) => {
+                Err(_) => {
                     let mut alloc = SlabAllocator::new(false);
                     JoinDirectory::NonContiguous(Directory::new(
                         alloc.create_multi_slab_buffer(dir_capacity + 1, true),
@@ -235,7 +232,6 @@ impl Outputter<()> for JoinBuilder {
             //     dir_capacity,
             // ));
 
-
             let arena = unsafe { &mut *self.arena.get() };
             let mut arena_alloc = SlabAllocator::new(false);
             *arena = arena_alloc.create_multi_slab_buffer::<Value>(total.max(1), false);
@@ -248,7 +244,7 @@ impl Outputter<()> for JoinBuilder {
 
             let slots_per_partition = dir_capacity / NUM_PARTITIONS;
             for i in 0..NUM_PARTITIONS {
-                let tuples: Vec<SlabVec<(u64, Value)>> = all_worker_tuples
+                let tuples: PartitionBuffers = all_worker_tuples
                     .iter_mut()
                     .map(|worker| std::mem::take(&mut worker[i]))
                     .collect();

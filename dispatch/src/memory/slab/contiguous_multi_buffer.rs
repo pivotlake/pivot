@@ -17,9 +17,12 @@ pub struct ContiguousMultiBuffer<T> {
     /// Pointer to the start of the contiguous region (first slot's buffer pointer).
     ptr: *mut u8,
     /// The consecutive write buffers held for the lifetime of this buffer.
-    buffers: Vec<WriteBuffer>,
+    _buffers: Vec<WriteBuffer>,
     _phantom: PhantomData<T>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContiguousAllocationError;
 
 unsafe impl<T> Send for ContiguousMultiBuffer<T> {}
 unsafe impl<T> Sync for ContiguousMultiBuffer<T> {}
@@ -33,7 +36,7 @@ impl<T> ContiguousMultiBuffer<T> {
     /// continues past the failed slot.
     ///
     /// Returns `Err(())` if no contiguous run of the required size exists in the ring.
-    pub fn new(num_elements: usize) -> Result<Self, ()> {
+    pub fn new(num_elements: usize) -> Result<Self, ContiguousAllocationError> {
         let total_bytes = num_elements * size_of::<T>();
         let slot_count = total_bytes.div_ceil(BUFFER_SIZE);
 
@@ -67,13 +70,13 @@ impl<T> ContiguousMultiBuffer<T> {
                 }
                 return Ok(Self {
                     ptr,
-                    buffers,
+                    _buffers: buffers,
                     _phantom: PhantomData,
                 });
             }
         }
 
-        Err(())
+        Err(ContiguousAllocationError)
     }
 
     /// Returns the raw pointer to the start of the contiguous region.
