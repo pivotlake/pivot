@@ -80,6 +80,15 @@ impl<T> DataFlowHandle<T> {
                 Err(_) => {}
             }
         }
+        // A worker that panicked (or otherwise failed without queueing an `Err`
+        // item) reports on the separate error channel before dropping its
+        // sender, so check it once the output channel has closed. Without this a
+        // panicking operator surfaces as a silent empty result.
+        if error.is_none()
+            && let Ok(e) = self.err_rx.try_recv()
+        {
+            error = Some(e);
+        }
         let mut stats = DataFlowStats::default();
         while let Ok(worker_stats) = self.stats_rx.try_recv() {
             stats.merge(&worker_stats);
