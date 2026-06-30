@@ -1,6 +1,5 @@
 use crate::stats::DataFlowStats;
 use crate::worker::WorkerWaker;
-use crate::{Dispatched, InFlightGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -18,12 +17,9 @@ pub struct DataFlowHandle<T> {
     stats_rx: mpsc::Receiver<DataFlowStats>,
     /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
-    /// Waker for the node group this dataflow was dispatched to, so that cancel callers
-    /// (which may not be on a worker thread) can wake that node's parked workers.
-    waker: Arc<WorkerWaker>,
-    /// Releases the node group's in-flight count when this handle is dropped, so the
-    /// least-loaded selection sees the load disappear once the query is done.
-    _in_flight: InFlightGuard,
+    /// Every node group's waker (a dataflow spans all nodes), so cancel callers — which
+    /// may not be on a worker thread — can wake all parked workers.
+    wakers: Vec<Arc<WorkerWaker>>,
 }
 
 impl<T> DataFlowHandle<T> {
@@ -32,15 +28,14 @@ impl<T> DataFlowHandle<T> {
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
         stats_rx: mpsc::Receiver<DataFlowStats>,
         cancelled: Arc<AtomicBool>,
-        dispatched: Dispatched,
+        wakers: Vec<Arc<WorkerWaker>>,
     ) -> Self {
         Self {
             rx,
             err_rx,
             stats_rx,
             cancelled,
-            waker: dispatched.waker,
-            _in_flight: dispatched.guard,
+            wakers,
         }
     }
 
@@ -48,7 +43,9 @@ impl<T> DataFlowHandle<T> {
     /// iteration of their event loop.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        self.waker.notify();
+        for waker in &self.wakers {
+            waker.notify();
+        }
     }
 
     /// A cheap, `Clone + Send + Sync` handle that can fire cancellation from
@@ -56,7 +53,7 @@ impl<T> DataFlowHandle<T> {
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             cancelled: self.cancelled.clone(),
-            waker: self.waker.clone(),
+            wakers: self.wakers.clone(),
         }
     }
 
@@ -130,13 +127,15 @@ impl<T> Iterator for DataFlowHandle<T> {
 #[derive(Clone)]
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
-    waker: Arc<WorkerWaker>,
+    wakers: Vec<Arc<WorkerWaker>>,
 }
 
 impl CancelToken {
     /// Signal cancellation. Idempotent.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        self.waker.notify();
+        for waker in &self.wakers {
+            waker.notify();
+        }
     }
 }

@@ -12,11 +12,15 @@
 //! stealers, so a buffer pushed by one worker is reachable by every other
 //! worker in the same group.
 //!
-//! On push, the index is routed to its *home worker* (`idx % NUM_WORKERS`).
+//! On push, the index is routed to its *home worker* (`idx % workers_per_node`).
 //! Pushing from the home worker hits the local deque; pushing from any other
 //! worker hits the home worker's injector.
+//!
+//! Indexing here is **node-local** (`NODE_LOCAL_IDX`, `0..workers_per_node`): a
+//! pool belongs to one NUMA node's memory domain and only that node's workers
+//! share its injectors/stealers, so the process-global `WORKER_IDX` is not used.
 
-use crate::worker::WORKER_IDX;
+use crate::worker::NODE_LOCAL_IDX;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -96,7 +100,7 @@ impl FreePool {
         }
 
         loop {
-            match self.injectors[WORKER_IDX.get()].steal() {
+            match self.injectors[NODE_LOCAL_IDX.get()].steal() {
                 Steal::Success(idx) => return Some(idx),
                 Steal::Retry => continue,
                 Steal::Empty => break,
@@ -122,7 +126,7 @@ impl FreePool {
     /// injector, where the home worker can pick it up on its next `pop`.
     pub(crate) fn push(&self, idx: usize) {
         let home_worker = idx % self.injectors.len();
-        if WORKER_IDX.get() == home_worker {
+        if NODE_LOCAL_IDX.get() == home_worker {
             self.worker.push(idx)
         } else {
             self.injectors[home_worker].push(idx);
@@ -141,7 +145,7 @@ mod tests {
     //! that pairing is a `MemoryContext` concept, not a `FreePool` one.
 
     use super::*;
-    use crate::worker::NUM_WORKERS;
+    use crate::worker::{NUM_WORKERS, WORKER_IDX, WORKERS_PER_NODE};
 
     /// Build `count` `FreePool`s wired to a shared injector array and stealer
     /// list, without the registration barrier (so a test thread can hold every
@@ -161,10 +165,13 @@ mod tests {
             .collect()
     }
 
-    /// Configure this thread to act as worker `idx` of `count`.
+    /// Configure this thread to act as worker `idx` of `count` (single node, so
+    /// node-local index == global index here).
     fn act_as_worker(idx: usize, count: usize) {
         WORKER_IDX.set(idx);
         NUM_WORKERS.set(count);
+        NODE_LOCAL_IDX.set(idx);
+        WORKERS_PER_NODE.set(count);
     }
 
     #[test]

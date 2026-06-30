@@ -4,7 +4,7 @@ use crate::memory::compressed_cache::{CompressedCache, FillCursor};
 use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
-use crate::worker::{NUM_WORKERS, WORKER_IDX};
+use crate::worker::{NODE_LOCAL_IDX, WORKERS_PER_NODE};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::{Arc, LazyLock};
 
@@ -103,10 +103,12 @@ pub struct MemoryContext {
 
 impl MemoryContext {
     pub fn prefault_buffers(&self) {
-        // Pre-fault buffers (strided by NUM_WORKERS) so each worker faults different pages.
-        // We forget the WriteBuffer to avoid the Drop impl pushing to the dirty pool,
-        // then manually release the slot and push to the zeroed pool.
-        for i in (WORKER_IDX.get()..self.ring.len()).step_by(NUM_WORKERS.get()) {
+        // Pre-fault this node's ring, strided by the node-local worker index so each
+        // of the node's workers faults different pages of its own domain's ring (and,
+        // pinned to its node first, faults them node-local). We forget the WriteBuffer
+        // to avoid the Drop impl pushing to the dirty pool, then manually release the
+        // slot and push to the zeroed pool.
+        for i in (NODE_LOCAL_IDX.get()..self.ring.len()).step_by(WORKERS_PER_NODE.get()) {
             let mut write = memory_ctx().ring().try_write(i).unwrap();
             for j in (0..BUFFER_SIZE).step_by(4096) {
                 write.as_mut()[j] = 1u8;
@@ -286,8 +288,10 @@ impl MemoryContext {
 /// don't share state and don't need a serializing lock.
 #[cfg(any(test, feature = "test-util"))]
 pub fn init_test_free_pool(dirty_count: usize) {
-    WORKER_IDX.set(0);
-    NUM_WORKERS.set(1);
+    crate::worker::WORKER_IDX.set(0);
+    crate::worker::NUM_WORKERS.set(1);
+    NODE_LOCAL_IDX.set(0);
+    WORKERS_PER_NODE.set(1);
     crate::worker::install_test_worker_waker();
     let factory = MemoryContextFactory::create_many(1, 128).pop().unwrap();
     init_memory_context(factory.create_memory_ctx());

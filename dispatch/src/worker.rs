@@ -51,8 +51,19 @@ use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
 thread_local! {
+    /// Process-global worker index `0..total_workers` and the total count. Used for
+    /// operator coordination only (per-worker channel/sender arrays, sibling
+    /// counters, page `worker_id` routing) — a dataflow spans all workers across
+    /// all NUMA nodes, so these range over every worker.
     pub static WORKER_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
     pub static NUM_WORKERS: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// This worker's NUMA node and its index `0..workers_per_node` within that
+    /// node's group, plus the per-node worker count. Used for memory only (the
+    /// node-local free pools and ring prefault stride), since each worker's memory
+    /// domain (`memory_ctx()`) is its own node's ring/caches.
+    pub static NODE_ID: Cell<usize> = const { Cell::new(usize::MAX) };
+    pub static NODE_LOCAL_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+    pub static WORKERS_PER_NODE: Cell<usize> = const { Cell::new(usize::MAX) };
     /// Worker-thread-only handle to the shared [`WorkerWaker`].
     ///
     /// Set once by [`Worker::create`] before the event loop starts, so that
@@ -244,6 +255,17 @@ pub struct Worker {
     last_seen_wake_count: u64,
 }
 
+/// A worker's place in the pool: a process-global index/count for operator
+/// coordination, plus its NUMA node and node-local index/count for memory.
+#[derive(Clone, Copy)]
+pub struct WorkerIdentity {
+    pub global_idx: usize,
+    pub total_workers: usize,
+    pub node_id: usize,
+    pub node_local_idx: usize,
+    pub workers_per_node: usize,
+}
+
 impl Worker {
     /// Spawn a worker thread pinned to `core`. Blocks on `ready_barrier` before
     /// entering the event loop, so all workers start roughly together.
@@ -254,8 +276,7 @@ impl Worker {
     /// returned [`JoinHandle`].
     #[allow(clippy::too_many_arguments)]
     pub fn create(
-        idx: usize,
-        num_workers: usize,
+        identity: WorkerIdentity,
         core: CoreId,
         should_exit: Arc<AtomicBool>,
         memory_context_factory: MemoryContextFactory,
@@ -264,14 +285,18 @@ impl Worker {
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
     ) -> JoinHandle<()> {
+        let idx = identity.global_idx;
         thread::spawn(move || {
             // Worker startup (io_uring + memory-context setup) can fail. Every worker
             // must reach `ready_barrier` or `Dispatch::spin_up` deadlocks on it forever,
             // so run startup under `catch_unwind`: on failure we still trip the barrier
             // below (letting spin_up return its handles) and then re-raise the panic.
             let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                WORKER_IDX.set(idx);
-                NUM_WORKERS.set(num_workers);
+                WORKER_IDX.set(identity.global_idx);
+                NUM_WORKERS.set(identity.total_workers);
+                NODE_ID.set(identity.node_id);
+                NODE_LOCAL_IDX.set(identity.node_local_idx);
+                WORKERS_PER_NODE.set(identity.workers_per_node);
                 // Pin to this worker's core BEFORE touching any memory, so everything
                 // this worker first-faults — its node-local ring (via `prefault_buffers`),
                 // free pools, and io_uring buffers — lands on this core's NUMA node. Pages
