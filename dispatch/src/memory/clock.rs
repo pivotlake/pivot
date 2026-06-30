@@ -4,17 +4,27 @@
 //! by ring slot.
 //!
 //! Each slot has an `owner` and a small "recently used" counter. A hit refreshes
-//! the counter to the owner's tier max - **2 for compressed, 1 for
+//! the counter to the owner's tier max - **4 for compressed, 1 for
 //! decompressed** - and the sweep decrements it, evicting at zero. So
-//! decompressed slots age out twice as fast (given up first under pressure), yet
-//! a just-used decompressed page still outlives a cold compressed slot.
+//! decompressed slots are given up first under pressure: a query whose
+//! decompressed working set exceeds the ring keeps its (still-useful) compressed
+//! pages resident and falls back to re-decompress, instead of evicting them and
+//! thrashing on disk re-reads.
 //!
 //! Everything is lock-free; a little racing between the two atomics is fine
 //! because eviction only needs to be approximate.
 
+use crate::env::get_env_var_with_default;
+use std::sync::LazyLock;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
+
+/// Sweeps a freshly-used compressed slot survives. Higher = the compressed cache
+/// is stickier, so decompressed pages are given up first under pressure (env
+/// `PIVOT_COMPRESSED_LIVES`, default 4). Read once; off the hot path.
+static COMPRESSED_LIVES: LazyLock<u8> =
+    LazyLock::new(|| get_env_var_with_default("PIVOT_COMPRESSED_LIVES", 4));
 
 /// Which cache (if any) owns a ring slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -29,7 +39,7 @@ impl Owner {
     fn lives(self) -> u8 {
         match self {
             Owner::Free => 0,
-            Owner::Compressed => 2,
+            Owner::Compressed => *COMPRESSED_LIVES,
             Owner::Decompressed => 1,
         }
     }
