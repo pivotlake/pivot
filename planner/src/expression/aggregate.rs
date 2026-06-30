@@ -33,14 +33,33 @@ impl TryFrom<duckdb_expression::AggregateFunc> for CountStar {
     }
 }
 
-/// A single-column numeric aggregate (`SUM(col)` / `AVG(col)`). Carries the
-/// bound column reference being aggregated and DuckDB's declared result type for
-/// the call (e.g. `HUGEINT` for an integer `SUM`, `BIGINT` for `COUNT`, the input
-/// type for `MIN`/`MAX`).
+/// A single-argument numeric aggregate (`SUM(col)` / `SUM(a * b)`). Carries the
+/// argument expression being aggregated and DuckDB's declared result type for the
+/// call (e.g. `HUGEINT` for an integer `SUM`, `BIGINT` for `COUNT`, the input type
+/// for `MIN`/`MAX`). The argument may be any expression (e.g. `a * b`); a
+/// projection that materialises every computed argument into a column is inserted
+/// before the aggregate
+/// ([`Aggregate::materialize_inputs`](crate::operator::Aggregate)), so by
+/// compilation [`column`](Self::column) is always a plain column reference.
 #[derive(Debug, Clone)]
 pub struct NumericAggregate {
-    pub column: Ref,
+    /// Boxed to break the `Expression` → `AggregateFunc` → `NumericAggregate`
+    /// type cycle.
+    pub argument: Box<Expression>,
     pub return_type: Type,
+}
+
+impl NumericAggregate {
+    /// The input column this aggregate reads. Valid only after the Aggregate
+    /// operator has materialised every computed argument into a column, which it
+    /// always does before lowering, so every slot-building site reads a plain
+    /// reference here.
+    pub fn column(&self) -> &Ref {
+        match self.argument.as_ref() {
+            Expression::Ref(r) => r,
+            other => unreachable!("aggregate argument not materialised to a column: {other}"),
+        }
+    }
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for NumericAggregate {
@@ -54,16 +73,9 @@ impl TryFrom<duckdb_expression::AggregateFunc> for NumericAggregate {
             });
         }
         let return_type = crate::types::type_from_logical(a.return_type)?;
-        let column = match Expression::try_from(a.params.into_iter().next().unwrap())? {
-            Expression::Ref(r) => r,
-            other => {
-                return Err(Error::UnsupportedAggregateFunction(format!(
-                    "non-column argument: {other}"
-                )));
-            }
-        };
+        let argument = Expression::try_from(a.params.into_iter().next().unwrap())?;
         Ok(NumericAggregate {
-            column,
+            argument: Box::new(argument),
             return_type,
         })
     }
@@ -100,6 +112,37 @@ impl AggregateFunc {
             | AggregateFunc::CountDistinct(a) => &a.return_type,
         }
     }
+
+    /// The expression(s) this aggregate is computed over (`SUM(x)`'s `x`). Empty
+    /// for `COUNT(*)`, which reads no column. An iterator so it stays correct once
+    /// a function takes more than one argument.
+    pub fn arguments(&self) -> impl Iterator<Item = &Expression> {
+        match self {
+            AggregateFunc::CountStar(_) => None,
+            AggregateFunc::Sum(a)
+            | AggregateFunc::Avg(a)
+            | AggregateFunc::Min(a)
+            | AggregateFunc::Max(a)
+            | AggregateFunc::Count(a)
+            | AggregateFunc::CountDistinct(a) => Some(a.argument.as_ref()),
+        }
+        .into_iter()
+    }
+
+    /// Mutable view of [`arguments`](Self::arguments), for rewriting each argument
+    /// in place (e.g. pointing it at a materialised column).
+    pub fn arguments_mut(&mut self) -> impl Iterator<Item = &mut Expression> {
+        match self {
+            AggregateFunc::CountStar(_) => None,
+            AggregateFunc::Sum(a)
+            | AggregateFunc::Avg(a)
+            | AggregateFunc::Min(a)
+            | AggregateFunc::Max(a)
+            | AggregateFunc::Count(a)
+            | AggregateFunc::CountDistinct(a) => Some(a.argument.as_mut()),
+        }
+        .into_iter()
+    }
 }
 
 impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
@@ -130,14 +173,12 @@ impl Display for AggregateFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AggregateFunc::CountStar(_) => f.write_str("count_star()"),
-            AggregateFunc::Sum(a) => write!(f, "sum({})", a.column.name_or_index()),
-            AggregateFunc::Avg(a) => write!(f, "avg({})", a.column.name_or_index()),
-            AggregateFunc::Min(a) => write!(f, "min({})", a.column.name_or_index()),
-            AggregateFunc::Max(a) => write!(f, "max({})", a.column.name_or_index()),
-            AggregateFunc::Count(a) => write!(f, "count({})", a.column.name_or_index()),
-            AggregateFunc::CountDistinct(a) => {
-                write!(f, "count(distinct {})", a.column.name_or_index())
-            }
+            AggregateFunc::Sum(a) => write!(f, "sum({})", a.argument),
+            AggregateFunc::Avg(a) => write!(f, "avg({})", a.argument),
+            AggregateFunc::Min(a) => write!(f, "min({})", a.argument),
+            AggregateFunc::Max(a) => write!(f, "max({})", a.argument),
+            AggregateFunc::Count(a) => write!(f, "count({})", a.argument),
+            AggregateFunc::CountDistinct(a) => write!(f, "count(distinct {})", a.argument),
         }
     }
 }

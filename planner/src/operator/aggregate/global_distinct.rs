@@ -26,9 +26,9 @@ impl Aggregate {
         input: RecordBatchOperatorSpec,
         distinct: &NumericAggregate,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let distinct_cols = vec![distinct.column.column_idx];
+        let distinct_cols = vec![distinct.column().column_idx];
         let counts =
-            match &distinct.column.return_type {
+            match &distinct.column().return_type {
                 Type::Int8 => input
                     .group_by_distinct_count::<HashOnlyIntKeyExtractor<Int8Type>>(distinct_cols),
                 Type::Int16 => input

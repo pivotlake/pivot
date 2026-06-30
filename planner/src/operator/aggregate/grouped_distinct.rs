@@ -61,10 +61,10 @@ impl Aggregate {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Step 1: any computed group key (e.g. `date_trunc(...)`) becomes a leading
-        // column, so from here every group key is a plain column. `key_shift` is how
-        // far the distinct argument and aggregate value columns slid right.
-        let (input, groups, key_shift) = self.materialize_group_keys(input)?;
+        // Step 1: every group key is a plain column after `materialize_inputs`
+        // (called once at the top of compilation), as is every aggregate
+        // argument including the distinct one, so resolve the keys directly.
+        let groups = self.resolved_keys();
 
         // Step 2: split each SELECT aggregate into an inner partial expression and an
         // outer re-fold expression (and pick out the single distinct argument `x`).
@@ -73,7 +73,7 @@ impl Aggregate {
             distinct_type,
             inner_exprs,
             outer_exprs,
-        } = self.plan_two_level(&groups, key_shift)?;
+        } = self.plan_two_level(&groups)?;
 
         // Step 3: build the INNER level over keys `(g…, x)`. The key encoding emits
         // the key columns in this order, so the inner output is
@@ -85,7 +85,7 @@ impl Aggregate {
         let inner = if inner_exprs.is_empty() {
             build_dedup_operator(input, &inner_keys)?
         } else {
-            build_group_by_operator(input, &inner_keys, &inner_exprs, key_shift, None)?
+            build_group_by_operator(input, &inner_keys, &inner_exprs, None)?
         };
 
         // Step 4: build the OUTER level grouping by the inner's leading group columns
@@ -96,7 +96,6 @@ impl Aggregate {
             inner,
             &derive_outer_keys(&groups),
             &outer_exprs,
-            0,
             self.output_limit,
         )
     }
@@ -118,13 +117,9 @@ impl Aggregate {
     /// ```
     ///
     /// The outer list stays in SELECT order so the output columns match DuckDB's
-    /// aggregate layout. `key_shift` offsets each inner value column past any
-    /// materialised group key.
-    fn plan_two_level(
-        &self,
-        groups: &[(usize, Type)],
-        key_shift: usize,
-    ) -> Result<TwoLevel, Error> {
+    /// aggregate layout. Every aggregate argument is already a plain column (the
+    /// distinct one included), materialised before lowering.
+    fn plan_two_level(&self, groups: &[(usize, Type)]) -> Result<TwoLevel, Error> {
         // The inner emits `[group…, x, partial0, partial1, …]`: `n_groups + 1` key
         // columns then the partials, so partial `k` is at column `n_groups + 1 + k`.
         let partial_base = groups.len() + 1;
@@ -141,19 +136,16 @@ impl Aggregate {
                     if distinct.is_some() {
                         return Err(Error::UnsupportedAggregateExpression(e.clone()));
                     }
-                    distinct = Some((
-                        a.column.column_idx + key_shift,
-                        a.column.return_type.clone(),
-                    ));
+                    distinct = Some((a.column().column_idx, a.column().return_type.clone()));
                     // distinct count = number of inner `(group…, x)` rows for the
                     // group; the outer's `COUNT(*)` ignores its column.
                     outer_exprs.push(count_star_expr());
                 }
                 // The non-distinct aggregates: the inner computes the original
-                // aggregate over each `(group…, x)` subgroup (its column shifted by
-                // `build_group_by_operator`), the outer re-folds that partial. `build_group_by_operator`
-                // coalesces duplicate inner partials and re-expands its output, so
-                // each expression still has its own partial column `partial_base + k`.
+                // aggregate over each `(group…, x)` subgroup, the outer re-folds
+                // that partial. `build_group_by_operator` coalesces duplicate inner
+                // partials and re-expands its output, so each expression still has
+                // its own partial column `partial_base + k`.
                 AggregateFunc::CountStar(_)
                 | AggregateFunc::Count(_)
                 | AggregateFunc::Sum(_)
@@ -201,7 +193,7 @@ struct TwoLevel {
 fn refold_partial_type(func: &AggregateFunc) -> Type {
     match func {
         AggregateFunc::Sum(a) | AggregateFunc::Min(a) | AggregateFunc::Max(a) => {
-            a.column.return_type.clone()
+            a.column().return_type.clone()
         }
         _ => Type::Int64,
     }
@@ -216,7 +208,7 @@ fn refold_expr(func: &AggregateFunc, partial: Ref) -> Expression {
     // (a re-summed COUNT is still a BIGINT, a re-summed SUM still a HUGEINT, a
     // re-extremised MIN/MAX still the input type).
     let agg = NumericAggregate {
-        column: partial,
+        argument: Box::new(Expression::Ref(partial)),
         return_type: func.return_type().clone(),
     };
     Expression::AggregateFunc(match func {

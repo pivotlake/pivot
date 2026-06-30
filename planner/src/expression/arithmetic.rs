@@ -2,6 +2,7 @@
 
 use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
+use crate::types::{self, Type};
 use arrow::compute::kernels::numeric::{add_wrapping, mul_wrapping, sub_wrapping};
 use arrow_array::{ArrayRef, Datum, RecordBatch};
 use arrow_schema::ArrowError;
@@ -38,6 +39,7 @@ pub struct Arithmetic {
     pub op: ArithmeticOp,
     pub left: Box<Expression>,
     pub right: Box<Expression>,
+    pub return_type: Type,
 }
 
 impl TryFrom<duckdb_expression::Function> for Arithmetic {
@@ -59,9 +61,15 @@ impl TryFrom<duckdb_expression::Function> for Arithmetic {
                 actual,
             });
         }
+        let return_type = types::type_from_logical(f.return_type)?;
         let right = Box::new(Expression::try_from(f.params.remove(1))?);
         let left = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(Arithmetic { op, left, right })
+        Ok(Arithmetic {
+            op,
+            left,
+            right,
+            return_type,
+        })
     }
 }
 
