@@ -43,6 +43,18 @@ fn slot_len(total_len: usize, i: usize) -> usize {
     (total_len - i * BUFFER_SIZE).min(BUFFER_SIZE)
 }
 
+/// Whether `stored` (a block's slots, in insert order) names the same set as
+/// `acquired` (the slots an evictor `try_write`-locked, sorted) - i.e. the forward
+/// entry at an offset is still the block being reclaimed and not a re-inserted one.
+/// Since the evictor holds every `acquired` slot `WRITING`, no re-insert could have
+/// reused them, so equal sets prove identity.
+fn slots_match(stored: &[usize], acquired_sorted: &[usize]) -> bool {
+    stored.len() == acquired_sorted.len()
+        && stored
+            .iter()
+            .all(|s| acquired_sorted.binary_search(s).is_ok())
+}
+
 /// Identity of a cached decompressed block: the file, the byte offset of its
 /// source bytes, and their length. Unique per block. The length is part of the
 /// key so a lookup only hits when both offset and size match, never serving bytes
@@ -242,9 +254,7 @@ impl DecompressedCache {
         }
 
         // Hold all the block's slots exclusively: drop the block and recycle them.
-        if let Some(table) = self.files.read().unwrap().get(&key.location) {
-            table.write().unwrap().remove(&key.offset);
-        }
+        self.remove_block_if_current(&key.location, key.offset, &block_slots);
         {
             let mut reverse = self.reverse.write().unwrap();
             for &s in &block_slots {
@@ -259,6 +269,43 @@ impl DecompressedCache {
         // Hand `slot` back; the rest return to the pool when their buffers drop.
         let pos = buffers.iter().position(|b| b.slot_idx == slot)?;
         Some(buffers.swap_remove(pos))
+    }
+
+    /// Remove the block at `offset` only if it still names `acquired` (the slots an
+    /// evictor `try_write`-locked, sorted). An invalidate/clear + re-insert in the
+    /// acquisition window can replace it with a different, live block at the same
+    /// offset, which must survive; the evictor holds every `acquired` slot `WRITING`,
+    /// so a re-insert can't have reused them and matching slots prove it is the same
+    /// block. Prunes the file's table if it goes empty.
+    fn remove_block_if_current(&self, location: &FileLocation, offset: usize, acquired: &[usize]) {
+        let mut emptied_file = false;
+        if let Some(table) = self.files.read().unwrap().get(location) {
+            let mut table = table.write().unwrap();
+            if table
+                .get(&offset)
+                .is_some_and(|block| slots_match(&block.slots, acquired))
+            {
+                table.remove(&offset);
+            }
+            emptied_file = table.is_empty();
+        }
+        if emptied_file {
+            self.prune_empty_file(location);
+        }
+    }
+
+    /// Remove `location`'s table if it is now empty, so its never-reused
+    /// `FileLocation` (an `Arc<File>`/`Arc<RemoteFile>` pinning the file/connection
+    /// it holds) isn't kept alive for every file ever opened. Re-checks emptiness
+    /// under the outer write lock so a concurrent `claim` that just re-created the
+    /// table isn't dropped.
+    fn prune_empty_file(&self, location: &FileLocation) {
+        let mut files = self.files.write().unwrap();
+        if let Some(table) = files.get(location)
+            && table.read().unwrap().is_empty()
+        {
+            files.remove(location);
+        }
     }
 
     /// Reclaim a slot the reverse map doesn't know about - an orphan left
@@ -458,6 +505,27 @@ mod tests {
             "the freed slot is handed back"
         );
         assert!(cache.is_empty(), "its block was evicted");
+    }
+
+    #[test]
+    fn evicting_a_files_last_block_releases_its_file_handle() {
+        init_test_free_pool(1);
+        let cache = for_test(true);
+        let location = new_file();
+        let FileLocation::Local(file) = &location else {
+            unreachable!()
+        };
+        let buffer = ring_write();
+        let slot = buffer.slot_idx;
+        drop(cache.insert(key_for(&location), vec![buffer], 1));
+
+        cache.reclaim(slot);
+
+        assert_eq!(
+            Arc::strong_count(file),
+            1,
+            "evicting a file's last block drops the cache's clone of its fd, not just the block"
+        );
     }
 
     #[test]
