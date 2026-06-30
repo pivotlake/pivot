@@ -79,10 +79,10 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let (err_tx, err_rx) = std::sync::mpsc::channel();
         let (stats_tx, stats_rx) = std::sync::mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let waker = self.dispatcher.waker().clone();
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
-        self.dispatcher
+        let dispatched = self
+            .dispatcher
             .push_data_flow(self.factories.into_iter().map(|f| {
                 let tx = tx.clone();
                 let build = Box::new(move || Box::new(f).build(tx));
@@ -103,7 +103,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         drop(stats_tx);
 
         let (rx, _) = rx.into_parts();
-        DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, waker)
+        DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, dispatched)
     }
 
     /// Run the dataflow and drain every produced item into a `Vec`. Shortcut

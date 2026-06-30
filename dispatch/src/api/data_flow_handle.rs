@@ -1,5 +1,6 @@
 use crate::stats::DataFlowStats;
 use crate::worker::WorkerWaker;
+use crate::{Dispatched, InFlightGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -17,9 +18,12 @@ pub struct DataFlowHandle<T> {
     stats_rx: mpsc::Receiver<DataFlowStats>,
     /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
-    /// Shared with the [`DataFlowDispatcher`](crate::DataFlowDispatcher) so that cancel callers (which
-    /// may not be on a worker thread) can still wake any parked worker.
+    /// Waker for the node group this dataflow was dispatched to, so that cancel callers
+    /// (which may not be on a worker thread) can wake that node's parked workers.
     waker: Arc<WorkerWaker>,
+    /// Releases the node group's in-flight count when this handle is dropped, so the
+    /// least-loaded selection sees the load disappear once the query is done.
+    _in_flight: InFlightGuard,
 }
 
 impl<T> DataFlowHandle<T> {
@@ -28,14 +32,15 @@ impl<T> DataFlowHandle<T> {
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
         stats_rx: mpsc::Receiver<DataFlowStats>,
         cancelled: Arc<AtomicBool>,
-        waker: Arc<WorkerWaker>,
+        dispatched: Dispatched,
     ) -> Self {
         Self {
             rx,
             err_rx,
             stats_rx,
             cancelled,
-            waker,
+            waker: dispatched.waker,
+            _in_flight: dispatched.guard,
         }
     }
 

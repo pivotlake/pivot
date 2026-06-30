@@ -53,7 +53,8 @@
 // a published API — so allow public docs to reference private items.
 #![allow(rustdoc::private_intra_doc_links)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use core_affinity::CoreId;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
@@ -72,6 +73,7 @@ pub mod worker;
 mod api;
 mod data_flow;
 mod functions;
+mod numa;
 mod operations;
 #[cfg(feature = "perf")]
 mod profiler;
@@ -132,28 +134,66 @@ pub type Identifier = usize;
 /// their next iteration.
 pub struct Shutdown {
     flag: Arc<AtomicBool>,
-    waker: Arc<WorkerWaker>,
+    /// One waker per NUMA node group; shutdown wakes every group.
+    wakers: Vec<Arc<WorkerWaker>>,
 }
 
 impl Shutdown {
     pub fn shutdown(&self) {
         self.flag.store(true, Ordering::Relaxed);
-        // Workers parked on the waker won't observe `exit_flag` until someone
-        // wakes them. Notify so every parked worker returns from
-        // `wait_if_unchanged` and sees the flag on its next loop iteration.
-        self.waker.notify();
+        // Workers parked on a waker won't observe `exit_flag` until someone
+        // wakes them. Notify every group's waker so every parked worker returns
+        // from `wait_if_unchanged` and sees the flag on its next loop iteration.
+        for waker in &self.wakers {
+            waker.notify();
+        }
     }
+}
+
+/// One NUMA node's worker group: the channels feeding its workers, the waker that
+/// parks/unparks them, and a count of dataflows currently dispatched to it (used to
+/// pick the least-loaded node). Every worker in a group shares a node-local memory
+/// ring, so a dataflow dispatched here keeps all its CPU and memory on one node.
+#[derive(Clone)]
+struct DispatchHandle {
+    senders: Vec<StdSender<DataFlowBuilder>>,
+    waker: Arc<WorkerWaker>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Decrements a node group's in-flight count when the dataflow's handle is dropped.
+/// Held by [`DataFlowHandle`](crate::DataFlowHandle) so a node's load reflects only
+/// dataflows whose results are still being consumed.
+pub struct InFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What a successful dispatch hands back: the chosen node's waker (so the consumer can
+/// wake those workers to cancel) and a guard that releases the node's load on drop.
+pub struct Dispatched {
+    pub(crate) waker: Arc<WorkerWaker>,
+    pub(crate) guard: InFlightGuard,
 }
 
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
-    senders: Vec<StdSender<DataFlowBuilder>>,
+    /// One worker group per NUMA node. A dataflow is dispatched to exactly one.
+    handles: Vec<DispatchHandle>,
+    /// Workers in each node group (equal across groups), and the size every
+    /// dataflow's operator chain is built for.
+    workers_per_node: usize,
+    /// Ring slots per node group, used to size group-by working memory.
     buffers: usize,
-    /// Shared [`WorkerWaker`] handed to every worker on startup. Non-worker
-    /// threads (e.g. the embedding server) can call `waker().notify()` to
-    /// kick idle workers out of their park; worker threads access the same
-    /// instance through their thread-local [`crate::worker::worker_waker`].
-    waker: Arc<WorkerWaker>,
+    /// When set, dispatch is forced to this node group instead of the least-loaded
+    /// one. Set on a per-call clone (see [`pin_to_node`](Self::pin_to_node)) so maintenance
+    /// fan-outs can target every node in turn; `None` on the shared handle.
+    pinned_node: Option<usize>,
     /// Whether every dataflow launched through this handle is marked profiled.
     /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling))
     /// so profiling (and the exclusive execution it triggers) is scoped to one
@@ -180,26 +220,60 @@ impl DataFlowDispatcher {
 }
 
 impl DataFlowDispatcher {
-    /// Send each worker their pre-built `DataFlow` bundle. Each worker
-    /// receives exactly one builder with their specific resources.
-    pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) {
-        for (sender, builder) in self.senders.iter().zip(builders) {
+    /// Index of the node group to dispatch the next dataflow to: the pinned node if
+    /// one is set, otherwise the one with the fewest in-flight dataflows (ties go to
+    /// the lowest index). Spreading across nodes by load keeps both nodes busy under
+    /// concurrent queries while each individual dataflow stays node-local.
+    fn select_target_node(&self) -> usize {
+        if let Some(node) = self.pinned_node {
+            return node;
+        }
+        (0..self.handles.len())
+            .min_by_key(|&node| self.handles[node].in_flight.load(Ordering::Relaxed))
+            .expect("at least one node group")
+    }
+
+    /// Dispatch one pre-built `DataFlow` bundle to a single node group: each of that
+    /// node's workers receives exactly one builder. Returns the node's waker and an
+    /// in-flight guard for the resulting [`DataFlowHandle`](crate::DataFlowHandle).
+    pub fn push_data_flow(
+        &self,
+        builders: impl IntoIterator<Item = DataFlowBuilder>,
+    ) -> Dispatched {
+        let handle = &self.handles[self.select_target_node()];
+        for (sender, builder) in handle.senders.iter().zip(builders) {
             sender.send(builder).unwrap();
         }
+        handle.in_flight.fetch_add(1, Ordering::Relaxed);
         // Wake idle workers so they pick up the new dataflow without
         // waiting out their park.
-        self.waker.notify();
+        handle.waker.notify();
+        Dispatched {
+            waker: handle.waker.clone(),
+            guard: InFlightGuard {
+                in_flight: handle.in_flight.clone(),
+            },
+        }
     }
 
-    /// Borrow the shared waker so callers outside a worker thread (e.g.
-    /// cancellation handles, the embedding server's shutdown path) can wake
-    /// parked workers without going through the worker-thread TLS.
-    pub fn waker(&self) -> &Arc<WorkerWaker> {
-        &self.waker
+    /// A clone of this dispatcher that forces dispatch to `node` rather than the
+    /// least-loaded one. Used by [`run_on_workers`](Self::run_on_workers) to reach
+    /// every node in turn, and to pin one-shot setup to a known node.
+    fn pin_to_node(&self, node: usize) -> Self {
+        let mut dispatcher = self.clone();
+        dispatcher.pinned_node = Some(node);
+        dispatcher
     }
 
+    /// Workers in one node group: the size every dataflow's operator chain is built
+    /// for, since a dataflow runs on exactly one group.
     pub fn worker_count(&self) -> usize {
-        self.senders.len()
+        self.workers_per_node
+    }
+
+    /// Total workers across all node groups.
+    pub fn total_worker_count(&self) -> usize {
+        self.workers_per_node * self.handles.len()
     }
 
     /// Ship a `FnOnce() -> T` to worker 0 and return its result.
@@ -214,7 +288,7 @@ impl DataFlowDispatcher {
         F: FnOnce() -> T + Send + 'static,
     {
         let spec = OperatorSpec::new(
-            self.clone(),
+            self.pin_to_node(0),
             std::iter::once(NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))),
         );
         let mut results = spec.collect()?;
@@ -233,13 +307,17 @@ impl DataFlowDispatcher {
     where
         F: Fn() + Clone + Send + 'static,
     {
-        let factories = (0..self.worker_count()).map(|_| {
-            let f = f.clone();
-            NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))
-        });
-        OperatorSpec::new(self.clone(), factories)
-            .collect()
-            .expect("run_on_workers dataflow failed");
+        // Per-worker setup must touch every physical worker, so dispatch a one-shot
+        // dataflow to each node group in turn (a single dispatch only reaches one node).
+        for node in 0..self.handles.len() {
+            let factories = (0..self.workers_per_node).map(|_| {
+                let f = f.clone();
+                NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))
+            });
+            OperatorSpec::new(self.pin_to_node(node), factories)
+                .collect()
+                .expect("run_on_workers dataflow failed");
+        }
     }
 }
 
@@ -252,8 +330,8 @@ impl DataFlowDispatcher {
 /// [`exit`](Self::exit).
 ///
 /// `Dispatch` does not actively schedule — [`push_data_flow`](DataFlowDispatcher::push_data_flow)
-/// just sends one `DataFlowBuilder` to each worker. The workers themselves drive
-/// execution in their own event loops.
+/// just sends one `DataFlowBuilder` to each worker of the chosen node group. The workers
+/// themselves drive execution in their own event loops.
 pub struct Dispatch {
     dataflow_dispatcher: DataFlowDispatcher,
     handles: Vec<JoinHandle<()>>,
@@ -261,64 +339,103 @@ pub struct Dispatch {
 }
 
 impl Dispatch {
-    /// Spawn `worker_count` worker threads (capped by available cores) and return a
-    /// `Dispatch` that owns them. `buffers` sets the size of the shared ring (in 2MB
-    /// slots) used for all worker memory contexts. `disk_cache` is the optional
-    /// disk cache for remote reads, shared by every worker's requester (`None`
-    /// disables it). Blocks until every worker has finished pre-faulting and is
-    /// ready for work.
+    /// Spawn up to `worker_count` worker threads and return a `Dispatch` that owns them.
+    ///
+    /// Cores are grouped by NUMA node; `worker_count` is split evenly across nodes (each
+    /// group is the same size, leftover cores dropped). Each node group gets its own
+    /// memory ring of `buffers / node_count` 2MB slots, first-touched by that node's
+    /// workers so it stays node-local, plus its own caches and waker. A dataflow is later
+    /// dispatched to exactly one group, so it never spans nodes. `disk_cache` is the
+    /// optional disk cache for remote reads, shared by every worker's requester (`None`
+    /// disables it). Blocks until every worker has finished pre-faulting.
     pub fn spin_up(
         worker_count: usize,
         buffers: usize,
         disk_cache: Option<Arc<crate::io::DiskCache>>,
     ) -> Self {
         let cores = core_affinity::get_core_ids().unwrap();
-        info!("Setting up io...");
+        let groups = numa::balance_worker_groups(numa::group_cores_by_node(cores), worker_count);
+        Self::spin_up_groups(groups, buffers, disk_cache)
+    }
 
-        let cores: Vec<_> = cores.into_iter().take(worker_count).collect();
-        let mut threads = vec![];
-        info!("Creating memory context ({})...", cores.len());
-        let barrier = Arc::new(Barrier::new(cores.len() + 1));
-        let mut senders = vec![];
-        let mut memory_context_factories = MemoryContextFactory::create_many(cores.len(), buffers);
+    /// Spawn one self-contained worker group per entry in `core_groups` (every group must
+    /// be the same length). The total ring budget `buffers` is divided evenly across the
+    /// groups. Shared by [`spin_up`](Self::spin_up) and tests that inject a synthetic
+    /// multi-node topology on a single-node machine.
+    fn spin_up_groups(
+        core_groups: Vec<Vec<CoreId>>,
+        buffers: usize,
+        disk_cache: Option<Arc<crate::io::DiskCache>>,
+    ) -> Self {
+        // Empty groups would size the ready barrier for one phantom worker and then
+        // spawn none, deadlocking the barrier wait below. Fail loudly instead.
+        assert!(
+            !core_groups.is_empty(),
+            "no cores available to spin up workers"
+        );
+        let workers_per_node = core_groups[0].len();
+        let node_count = core_groups.len();
+        debug_assert!(
+            core_groups.iter().all(|group| group.len() == workers_per_node),
+            "node groups must be equal-sized"
+        );
+        let total_workers = workers_per_node * node_count;
+        let per_node_buffers = (buffers / node_count).max(1);
+        info!("Starting {total_workers} workers across {node_count} node group(s)...");
+
+        let barrier = Arc::new(Barrier::new(total_workers + 1));
         let should_exit = Arc::new(AtomicBool::new(false));
-        let waker = Arc::new(WorkerWaker::new());
-        info!("Starting workers...");
-        for (i, core) in cores.into_iter().enumerate() {
-            let (tx, rx) = channel();
-            senders.push(tx);
-            threads.push(Worker::create(
-                i,
-                worker_count,
-                core,
-                should_exit.clone(),
-                memory_context_factories.pop().unwrap(),
-                disk_cache.clone(),
-                rx,
-                barrier.clone(),
-                waker.clone(),
-            ));
+
+        let mut threads = vec![];
+        let mut handles = vec![];
+        for group in core_groups {
+            let waker = Arc::new(WorkerWaker::new());
+            let mut factories =
+                MemoryContextFactory::create_many(workers_per_node, per_node_buffers);
+            let mut senders = vec![];
+            for (node_local_idx, core) in group.into_iter().enumerate() {
+                let (tx, rx) = channel();
+                senders.push(tx);
+                threads.push(Worker::create(
+                    node_local_idx,
+                    workers_per_node,
+                    core,
+                    should_exit.clone(),
+                    factories.pop().unwrap(),
+                    disk_cache.clone(),
+                    rx,
+                    barrier.clone(),
+                    waker.clone(),
+                ));
+            }
+            handles.push(DispatchHandle {
+                senders,
+                waker,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+            });
         }
         barrier.wait();
         info!("All workers have begun...");
 
+        let wakers = handles.iter().map(|h| h.waker.clone()).collect();
         Dispatch {
             dataflow_dispatcher: DataFlowDispatcher {
-                senders,
-                buffers,
-                waker: waker.clone(),
+                handles,
+                workers_per_node,
+                buffers: per_node_buffers,
+                pinned_node: None,
                 #[cfg(feature = "perf")]
                 profiled: false,
             },
             handles: threads,
             shutdown: Shutdown {
                 flag: should_exit,
-                waker,
+                wakers,
             },
         }
     }
 
-    /// Number of active worker threads (one per core).
+    /// Total number of active worker threads across all node groups.
     pub fn workers(&self) -> usize {
         self.handles.len()
     }
@@ -341,5 +458,91 @@ impl Dispatch {
 
     pub fn into_parts(self) -> (Vec<JoinHandle<()>>, Shutdown) {
         (self.handles, self.shutdown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Node-group dispatch: a dataflow stays on one group, maintenance fan-out
+    //! reaches every group, and a group's load clears once its dataflow is done.
+    //! Each worker's ring pointer identifies its group (one ring per group), so a
+    //! synthetic two-group topology is testable on a single-node machine.
+
+    use super::*;
+    use crate::operations::nullary::OneShotNullaryFactory;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// Build `node_count` groups of `workers_per_node` workers from real core ids,
+    /// duplicating the first core so the test runs on any machine.
+    fn synthetic_groups(node_count: usize, workers_per_node: usize) -> Vec<Vec<CoreId>> {
+        let core = core_affinity::get_core_ids().unwrap()[0];
+        (0..node_count).map(|_| vec![core; workers_per_node]).collect()
+    }
+
+    /// Run a one-shot-per-worker dataflow that returns each worker's ring pointer.
+    fn ring_pointers_for_one_dataflow(dispatcher: &DataFlowDispatcher) -> Vec<usize> {
+        let factories = (0..dispatcher.worker_count()).map(|_| {
+            NullaryOperatorFactory::new(OneShotNullaryFactory::new(|| {
+                memory_ctx().ring() as *const _ as usize
+            }))
+        });
+        OperatorSpec::new(dispatcher.clone(), factories)
+            .collect()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_dataflow_runs_on_a_single_node_group() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+
+        let rings = ring_pointers_for_one_dataflow(dispatch.dispatcher());
+
+        assert_eq!(rings.len(), 2, "ran on one group's workers");
+        assert_eq!(
+            rings.iter().collect::<HashSet<_>>().len(),
+            1,
+            "every worker shared one ring, so the dataflow stayed on one node"
+        );
+        dispatch.exit();
+    }
+
+    #[test]
+    fn run_on_workers_reaches_every_node_group() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let seen = Arc::new(Mutex::new(HashSet::new()));
+
+        let collector = seen.clone();
+        dispatch.dispatcher().run_on_workers(move || {
+            collector
+                .lock()
+                .unwrap()
+                .insert(memory_ctx().ring() as *const _ as usize);
+        });
+
+        assert_eq!(seen.lock().unwrap().len(), 2, "touched both node groups");
+        dispatch.exit();
+    }
+
+    #[test]
+    fn equal_load_selects_the_lowest_node_index() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+
+        let node = dispatch.dispatcher().select_target_node();
+
+        assert_eq!(node, 0);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn node_load_returns_to_zero_after_a_dataflow_completes() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+
+        ring_pointers_for_one_dataflow(dispatch.dispatcher());
+
+        for handle in &dispatch.dataflow_dispatcher.handles {
+            assert_eq!(handle.in_flight.load(Ordering::Relaxed), 0);
+        }
+        dispatch.exit();
     }
 }

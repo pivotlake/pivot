@@ -197,8 +197,10 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 /// thread with affinity to a CPU which continuously requests work from the dispatcher and does it.
 ///
 /// The main idea of a Worker is to keep everything possible "local" to it, to prevent
-/// context-switching/CPU cache-invalidation and in the future allow NUMA optimizations etc. We try
-/// to make our physical CPU cores first class citizens.
+/// context-switching/CPU cache-invalidation. Workers are grouped by NUMA node (see
+/// [`Dispatch::spin_up`](crate::Dispatch::spin_up)); each group shares a node-local memory
+/// ring and a dataflow runs on one group, so a worker's index is relative to its group. We
+/// try to make our physical CPU cores first class citizens.
 ///
 /// The Worker receives dataflows from the Dispatcher and runs them- the logic is outlined is as
 /// follows:
