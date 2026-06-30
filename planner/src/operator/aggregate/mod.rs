@@ -1,8 +1,11 @@
 //! [`Aggregate`] — GROUP BY + aggregate functions.
 //!
-//! [`Aggregate::compile`] is a router: it inspects the groups and aggregate
-//! expressions and dispatches to one of a handful of lowering strategies, each
-//! in its own submodule:
+//! [`Aggregate::compile`] first lowers every computed group key and aggregate
+//! argument (e.g. the `column1 * column2` in `SUM(column1 * column2)`) into a
+//! leading projected column via [`Aggregate::materialize_inputs`], so the rest
+//! of compilation only ever reads column indices. It then routes on the groups
+//! and aggregate expressions to one of a handful of lowering strategies, each in
+//! its own submodule:
 //!
 //! | query shape | strategy |
 //! |---|---|
@@ -84,6 +87,29 @@ fn render(exprs: &[Expression]) -> String {
 
 impl Aggregate {
     pub fn compile(
+        &self,
+        input: RecordBatchOperatorSpec,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        // Materialise every computed group key and aggregate argument (e.g. the
+        // `column1 * column2` in `SUM(column1 * column2)`) into a leading
+        // projected column. From here every group key and every aggregate
+        // argument is a plain column reference, so the slot builders below only
+        // ever read column indices, never run an expression. When nothing needs
+        // materialising (the common all-plain-column case) the input and `self`
+        // are reused as-is, with no projection and no clone.
+        match self.materialize_inputs(input)? {
+            (input, Some(resolved)) => resolved.compile_resolved(input),
+            (input, None) => self.compile_resolved(input),
+        }
+    }
+
+    /// Compile a *resolved* aggregate: one whose group keys and aggregate
+    /// arguments are all plain column references, because
+    /// [`materialize_inputs`](Self::materialize_inputs) has already projected
+    /// every computed one into a column. Picks the strategy for the query shape
+    /// (global, grouped, or one of the `COUNT(DISTINCT)` paths; see the
+    /// module-level table) and builds it.
+    fn compile_resolved(
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
@@ -199,25 +225,25 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
             };
             let (kind, column) = match func {
                 AggregateFunc::CountStar(_) => (AggregationKind::CountStar, 0),
-                AggregateFunc::Count(a) => (AggregationKind::Count, a.column.column_idx),
-                AggregateFunc::Sum(a) => (AggregationKind::Sum, a.column.column_idx),
+                AggregateFunc::Count(a) => (AggregationKind::Count, a.column().column_idx),
+                AggregateFunc::Sum(a) => (AggregationKind::Sum, a.column().column_idx),
                 AggregateFunc::Min(a) => (
                     extreme_kind(
-                        &a.column.return_type,
+                        &a.column().return_type,
                         AggregationKind::StrMin,
                         AggregationKind::Min,
                     )
                     .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
-                    a.column.column_idx,
+                    a.column().column_idx,
                 ),
                 AggregateFunc::Max(a) => (
                     extreme_kind(
-                        &a.column.return_type,
+                        &a.column().return_type,
                         AggregationKind::StrMax,
                         AggregationKind::Max,
                     )
                     .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
-                    a.column.column_idx,
+                    a.column().column_idx,
                 ),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
             };
@@ -275,7 +301,7 @@ pub(super) fn temporal_output_type(t: &Type) -> Option<DataType> {
 fn aggregate_value_temporal(e: &Expression) -> Option<DataType> {
     match e {
         Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a)) => {
-            temporal_output_type(&a.column.return_type)
+            temporal_output_type(&a.column().return_type)
         }
         _ => None,
     }
@@ -321,7 +347,8 @@ fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
     exprs.iter().any(|e| {
         matches!(
             e,
-            Expression::AggregateFunc(AggregateFunc::Sum(a)) if a.column.return_type == Type::Int64
+            Expression::AggregateFunc(AggregateFunc::Sum(a)) if a.column().return_type == Type::Int64
         )
     })
 }
+

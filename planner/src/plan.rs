@@ -146,7 +146,7 @@ impl PlanNode {
                             a.expressions.get(slot),
                             Some(Expression::AggregateFunc(
                                 AggregateFunc::Min(x) | AggregateFunc::Max(x)
-                            )) if x.column.return_type == crate::types::Type::Utf8
+                            )) if x.argument.result_type().ok() == Some(crate::types::Type::Utf8)
                         );
                         if !string_extreme {
                             a.output_limit = Some(GroupLimit::TopK { slot, limit });

@@ -2,6 +2,7 @@
 
 use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
+use crate::types::Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
@@ -169,6 +170,7 @@ impl DatePartKind {
 pub struct DatePart {
     pub kind: DatePartKind,
     pub source: Box<Expression>,
+    pub return_type: Type,
 }
 
 impl DatePart {
@@ -187,7 +189,11 @@ impl DatePart {
             });
         }
         let source = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(DatePart { kind, source })
+        Ok(DatePart {
+            kind,
+            source,
+            return_type: Type::Int64,
+        })
     }
 }
 
@@ -286,5 +292,29 @@ mod tests {
         );
 
         assert_eq!(*only_column(&rows[0]), 2024);
+    }
+
+    #[rstest]
+    fn group_by_epoch_groups_on_the_int(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "ts",
+            &[(
+                "EventTime",
+                Type::Timestamp,
+                Arc::new(Int64Array::from(vec![0i64, 0, 3600])) as ArrayRef,
+            )],
+        );
+
+        // `extract(epoch …)` is the stored epoch-seconds int (DuckDB types it
+        // DOUBLE, but pivot computes Int64), so it must be groupable as an
+        // integer key: the two rows at second 0 collapse into one group.
+        let rows = run(
+            &mut testing_planner,
+            "SELECT extract(epoch FROM EventTime) AS e, count(*) AS n \
+             FROM ts GROUP BY extract(epoch FROM EventTime)",
+        );
+
+        let zero = rows.iter().find(|r| r["e"] == 0).unwrap();
+        assert_eq!(zero["n"], 2);
     }
 }

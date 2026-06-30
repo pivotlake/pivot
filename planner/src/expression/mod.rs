@@ -158,10 +158,14 @@ impl Expression {
             // `make_date`/`make_timestamp` produce the temporal type they convert to.
             Expression::Function(Function::TemporalConvert(c)) => Ok(c.result.clone()),
             Expression::Function(Function::RegexpReplace(_)) => Ok(Type::Utf8),
-            // Integer-valued scalar functions: a date part (`extract(minute …)`),
-            // a byte length, and integer arithmetic (`a * 2`, `ip - 1`).
-            Expression::Function(Function::DatePart(_) | Function::Length(_)) => Ok(Type::Int64),
-            Expression::Function(Function::Arithmetic(_)) => Ok(Type::Int64),
+            // A date part (`extract(minute …)`) and a byte length each carry the
+            // type they evaluate to.
+            Expression::Function(Function::DatePart(d)) => Ok(d.return_type.clone()),
+            Expression::Function(Function::Length(l)) => Ok(l.return_type.clone()),
+            // Arithmetic carries DuckDB's bound result type, so a float/decimal
+            // operand surfaces as `DOUBLE`/`DECIMAL` here (which the grouping and
+            // aggregation paths then reject).
+            Expression::Function(Function::Arithmetic(a)) => Ok(a.return_type.clone()),
             // Everything else (comparisons, `contains`, `Divide`'s Float64
             // quotient, …) has no type we use for grouping.
             _ => Err(compile::Error::IndeterminateResultType(self.clone())),
