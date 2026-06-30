@@ -846,3 +846,157 @@ fn unsupported_scalar_function_returns_error(mut testing_planner: TestingPlanner
         .plan("SELECT lower(name) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }
+
+// Aggregates over expressions. example_table: a=[1..5], b=[10,20,30,40,50],
+// c=[100..500], name. `a * b` per row: 10, 40, 90, 160, 250.
+
+#[rstest]
+fn global_sum_over_product(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT SUM(a * b) AS s FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["s"], 550); // 10 + 40 + 90 + 160 + 250
+}
+
+#[rstest]
+fn global_sum_over_nested_product(mut testing_planner: TestingPlanner) {
+    // A nested expression argument: the whole `(a * b) * c` is one computed
+    // argument, compiled (recursively) into a single materialised column.
+    let results = testing_planner
+        .planner
+        .plan("SELECT SUM((a * b) * c) AS s FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    // (1*10)*100 + (2*20)*200 + (3*30)*300 + (4*40)*400 + (5*50)*500.
+    assert_eq!(rows[0]["s"], 225_000);
+}
+
+#[rstest]
+fn global_min_max_over_product(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT MIN(a * b) AS lo, MAX(a * b) AS hi FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows[0]["lo"], 10);
+    assert_eq!(rows[0]["hi"], 250);
+}
+
+#[rstest]
+fn grouped_sum_over_product(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, SUM(a * b) AS s FROM example_table GROUP BY name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
+    assert_eq!(alice["s"], 260); // 1*10 + 5*50
+    let bob = rows.iter().find(|r| r["name"] == "bob").unwrap();
+    assert_eq!(bob["s"], 40); // 2*20
+}
+
+#[rstest]
+fn aggregate_argument_mixed_with_plain_aggregate(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT SUM(a * b) AS s, SUM(c) AS t, COUNT(*) AS n FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows[0]["s"], 550);
+    assert_eq!(rows[0]["t"], 1500); // 100 + 200 + 300 + 400 + 500
+    assert_eq!(rows[0]["n"], 5);
+}
+
+#[rstest]
+fn count_distinct_over_product(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .planner
+        .plan("SELECT COUNT(DISTINCT a * b) AS d FROM example_table")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    assert_eq!(rows[0]["d"], 5); // {10, 40, 90, 160, 250} all distinct
+}
+
+#[rstest]
+fn grouped_count_distinct_over_product(mut testing_planner: TestingPlanner) {
+    // alice's two rows give a*b of 10 and 250 (two distinct values).
+    let results = testing_planner
+        .planner
+        .plan("SELECT name, COUNT(DISTINCT a * b) AS d FROM example_table GROUP BY name")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    let alice = rows.iter().find(|r| r["name"] == "alice").unwrap();
+    assert_eq!(alice["d"], 2);
+    let bob = rows.iter().find(|r| r["name"] == "bob").unwrap();
+    assert_eq!(bob["d"], 1);
+}
+
+#[rstest]
+fn computed_group_key_with_computed_aggregate_argument(mut testing_planner: TestingPlanner) {
+    // Group by a computed key (a bucket) and aggregate a computed argument: both
+    // are materialised into leading columns before the aggregate.
+    let results = testing_planner
+        .planner
+        .plan(
+            "SELECT CASE WHEN a <= 3 THEN 1 ELSE 0 END AS bucket, SUM(a * b) AS s \
+             FROM example_table GROUP BY CASE WHEN a <= 3 THEN 1 ELSE 0 END",
+        )
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+
+    // bucket 1 (a in 1,2,3): 10 + 40 + 90 = 140; bucket 0 (a in 4,5): 160 + 250 = 410.
+    let low = rows.iter().find(|r| r["bucket"] == 1).unwrap();
+    assert_eq!(low["s"], 140);
+    let high = rows.iter().find(|r| r["bucket"] == 0).unwrap();
+    assert_eq!(high["s"], 410);
+}

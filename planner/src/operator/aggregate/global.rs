@@ -89,12 +89,18 @@ impl Aggregate {
                 Expression::AggregateFunc(AggregateFunc::Max(a)) => (a, false),
                 _ => return Ok(None),
             };
+            // Stats answer only a `MIN`/`MAX` over a plain column. A computed
+            // argument (`MIN(a * b)`) has no column stats to read, so decline and
+            // let the materialised scan-based path handle it.
+            let Expression::Ref(column) = agg.argument.as_ref() else {
+                return Ok(None);
+            };
             // Only the integer/temporal columns the scan-based global path emits
             // as Int64 are sound here: their stats cast losslessly to Int64.
             // Float/decimal/boolean/Int128 would silently truncate or overflow
             // (and the scan path doesn't support them either), so decline and
             // let the ordinary path handle, or reject, them.
-            match agg.column.return_type {
+            match column.return_type {
                 Type::Int8
                 | Type::Int16
                 | Type::Int32
@@ -105,7 +111,7 @@ impl Aggregate {
             }
             // The aggregate's ref indexes the scan's output columns; map it back
             // to the table column the stats are kept under.
-            let table_col = match scan.columns.get(agg.column.column_idx) {
+            let table_col = match scan.columns.get(column.column_idx) {
                 Some(Expression::Ref(r)) => r.column_idx,
                 _ => return Ok(None),
             };
@@ -119,7 +125,7 @@ impl Aggregate {
             // losslessly to the target. A cast failure is just another "can't
             // answer from stats": fall back to the scan rather than failing.
             let target =
-                super::temporal_output_type(&agg.column.return_type).unwrap_or(DataType::Int64);
+                super::temporal_output_type(&agg.column().return_type).unwrap_or(DataType::Int64);
             let arr = scalar.into_inner();
             let Ok(casted) = arrow::compute::cast(&arr, &target) else {
                 return Ok(None);

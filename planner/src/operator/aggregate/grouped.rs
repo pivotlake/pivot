@@ -14,20 +14,21 @@
 //!   ([`IntKeyExtractor`]/[`StringKeyExtractor`]); two integer keys pack into
 //!   [`IntPairKeyExtractor`]; anything else (3+ keys, mixed types) byte-encodes
 //!   the tuple with [`RowKeyExtractor`]. *Computed* keys (`date_trunc(...)`,
-//!   `ip - 1`, `CASE …`) are first materialised into leading columns (see
-//!   [`Aggregate::materialize_group_keys`]), so from the dispatch's view every
-//!   key is a column.
+//!   `ip - 1`, `CASE …`) and computed aggregate arguments (`SUM(a * b)`) are
+//!   first materialised into leading columns (see
+//!   [`Aggregate::materialize_inputs`]), so from the dispatch's view every key
+//!   and aggregate argument is a column.
 //! * **value** — recognised signatures lower to a branch-free [`Compiled`]
 //!   tuple; every other shape folds each slot by kind in `Dynamic<N>` (numeric,
 //!   string, or mixed; branch-free `+` when all-additive), in `i128` when a slot
 //!   needs the width (see [`Aggregate`]'s rule) else the narrow `i64`.
 
 use super::{Aggregate, aggregation_slots, row_key_schema, sum_reads_wide_column};
-use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
-use crate::expression::{AggregateFunc, Expression};
+use crate::compile::{Error, ExprEvalFn, ExprFn};
+use crate::expression::{AggregateFunc, Expression, Ref};
 use crate::types::Type;
 use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, CountSlot, Distinct, Dynamic, GroupLimit,
@@ -36,92 +37,176 @@ use dispatch::{
 };
 use std::sync::Arc;
 
-/// The output of [`Aggregate::materialize_group_keys`]: the (possibly
-/// re-projected) input, the resolved `(column, type)` group keys, and the
-/// shift `n` applied to the original columns (the count of materialised
-/// computed keys).
-type MaterializedGroupKeys = (RecordBatchOperatorSpec, Vec<(usize, Type)>, usize);
-
 impl Aggregate {
     pub(super) fn compile_grouped(
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Resolve the group keys to `(column, type)` pairs over a (possibly
-        // re-projected) input. Any computed key has been materialised into a
-        // leading column, so from here every key is just a column and each
-        // aggregate's value column shifts right past the `n` materialised keys.
-        let (input, keys, n) = self.materialize_group_keys(input)?;
-        build_group_by_operator(input, &keys, &self.expressions, n, self.output_limit)
+        // Every group key and aggregate argument is a plain column after
+        // `materialize_inputs`, so resolve the keys directly and build the
+        // operator with no further column shift.
+        let keys = self.resolved_keys();
+        build_group_by_operator(input, &keys, &self.expressions, self.output_limit)
     }
 
-    /// Resolve the group keys into `(column, type)` pairs over a (possibly
-    /// re-projected) input, materialising any *computed* key (one that is not a
-    /// plain column) into a leading column cast to a canonical `Int64`/`Utf8View`
-    /// so its type is known to the extractor. Returns the shift `n` (the number
-    /// of computed keys) applied to the original columns, so the caller can
-    /// offset its value/aggregate columns; `n` is 0 when every key is already a
-    /// plain column. A computed key mixed with plain keys works the same way: the
-    /// plain keys shift right past the materialised ones.
-    ///
-    /// Shared by the general grouped path and the two-level `COUNT(DISTINCT)`
-    /// lowering, so a computed group key is supported uniformly by both.
-    pub(super) fn materialize_group_keys(
-        &self,
-        input: RecordBatchOperatorSpec,
-    ) -> Result<MaterializedGroupKeys, Error> {
-        let computed: Vec<&Expression> = self
-            .groups
-            .iter()
-            .filter(|g| !matches!(g, Expression::Ref(_)))
-            .collect();
-
-        if computed.is_empty() {
-            let keys = self
-                .groups
-                .iter()
-                .map(|g| match g {
-                    Expression::Ref(r) => (r.column_idx, r.return_type.clone()),
-                    _ => unreachable!("no computed keys"),
-                })
-                .collect();
-            return Ok((input, keys, 0));
-        }
-
-        // Canonical type of each computed key (the type its column is cast to
-        // below), derived from the key's static result type. The order matches
-        // `computed`, i.e. the order computed keys appear in the GROUP BY.
-        let computed_types: Vec<Type> = computed
-            .iter()
-            .map(|g| canonical_group_key_type(g.result_type()?))
-            .collect::<Result<_, _>>()?;
-        let n = computed.len();
-        let input = project_keys(input, &computed, &computed_types)?;
-
-        // Computed keys occupy the leading columns `0..n` (in GROUP BY order);
-        // plain keys keep their column shifted right by `n`.
-        let mut next = 0;
-        let keys = self
-            .groups
+    /// The group keys as `(column, type)` pairs. Every key is a plain column
+    /// reference once [`materialize_inputs`](Self::materialize_inputs) has run,
+    /// so this never sees a computed key. Shared by the general grouped path and
+    /// the two-level `COUNT(DISTINCT)` lowering.
+    pub(super) fn resolved_keys(&self) -> Vec<(usize, Type)> {
+        self.groups
             .iter()
             .map(|g| match g {
-                Expression::Ref(r) => (r.column_idx + n, r.return_type.clone()),
-                _ => {
-                    let key = (next, computed_types[next].clone());
-                    next += 1;
-                    key
-                }
+                Expression::Ref(r) => (r.column_idx, r.return_type.clone()),
+                _ => unreachable!("group keys are materialised before lowering"),
             })
+            .collect()
+    }
+
+    /// Lower every *computed* group key and aggregate argument into a leading
+    /// projected column, returning the re-projected input and a resolved
+    /// aggregate whose group keys and aggregate arguments are all plain column
+    /// references. This is the single entry point to compilation, so every later
+    /// slot builder reads a column index and never evaluates an expression.
+    ///
+    /// The materialised columns take the leading positions in a fixed order: the
+    /// computed group keys (in GROUP BY order), then the computed aggregate
+    /// arguments (in expression order). Each keeps a canonical type
+    /// (`Int64`/`Utf8View`, or `Date`/`Timestamp` for a temporal one) so it is
+    /// typed for the extractor and the numeric readers. The original input columns
+    /// follow, shifted right by that count, and every surviving plain reference is
+    /// shifted to match.
+    ///
+    /// ```text
+    ///   SELECT date_trunc('day', ts), SUM(a * b)
+    ///   GROUP BY date_trunc('day', ts)
+    ///
+    ///   input cols    [ ts    a    b ]            the aggregate's child output
+    ///       |
+    ///       v  prepend the 1 computed key, then the 1 computed argument,
+    ///       |  shifting the original columns right by 2:
+    ///       v
+    ///   projected     [ trunc(ts) | a*b | ts    a    b ]
+    ///                     #0 key    #1    #2   #3   #4
+    ///       |
+    ///       v  the resolved aggregate now reads only those leading columns:
+    ///       v
+    ///   GROUP BY #0,  SUM(#1)
+    /// ```
+    ///
+    /// Returns `None` for the resolved aggregate when nothing is computed (the
+    /// input is handed back untouched), so a plain-column aggregate keeps its
+    /// fast path with no projection and no clone.
+    pub(super) fn materialize_inputs(
+        &self,
+        input: RecordBatchOperatorSpec,
+    ) -> Result<(RecordBatchOperatorSpec, Option<Aggregate>), Error> {
+        // The computed sub-expressions to materialise and their canonical column
+        // types, group keys first then aggregate arguments.
+        let mut computed: Vec<&Expression> = Vec::new();
+        let mut types: Vec<Type> = Vec::new();
+        for g in &self.groups {
+            if !matches!(g, Expression::Ref(_)) {
+                let result = g.result_type()?;
+                let ty = canonical_input_type(&result)
+                    .ok_or(Error::DataTypeNotSupportedForGroupBy(result))?;
+                computed.push(g);
+                types.push(ty);
+            }
+        }
+        for e in &self.expressions {
+            let Expression::AggregateFunc(func) = e else {
+                continue;
+            };
+            // Only an argument that is not already a plain column needs one.
+            for arg in func.arguments().filter(|a| !matches!(a, Expression::Ref(_))) {
+                let ty = canonical_input_type(&arg.result_type()?)
+                    .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?;
+                computed.push(arg);
+                types.push(ty);
+            }
+        }
+
+        // Nothing computed: reuse the input untouched and let the caller lower
+        // `self` directly (every key and argument is already a column).
+        if computed.is_empty() {
+            return Ok((input, None));
+        }
+
+        let shift = computed.len();
+        let input = project_leading_columns(input, &computed, &types)?;
+
+        // Draw the leading materialised columns in the same order they were
+        // pushed: group keys first, then aggregate arguments. `next` walks them.
+        let mut next = 0;
+        let groups = self
+            .groups
+            .iter()
+            .map(|g| resolve_to_column(g, shift, &types, &mut next))
             .collect();
-        Ok((input, keys, n))
+        let expressions = self
+            .expressions
+            .iter()
+            .map(|e| rewrite_arguments(e, shift, &types, &mut next))
+            .collect::<Result<_, _>>()?;
+
+        Ok((
+            input,
+            Some(Aggregate {
+                groups,
+                expressions,
+                output_limit: self.output_limit,
+            }),
+        ))
+    }
+}
+
+/// Rewrite an aggregate so each of its arguments is a plain column reference over
+/// the materialised input (see [`resolve_to_column`]). `COUNT(*)` has no argument
+/// and passes through unchanged. `next` continues the column walk from the group
+/// keys, in expression then argument order.
+fn rewrite_arguments(
+    e: &Expression,
+    shift: usize,
+    types: &[Type],
+    next: &mut usize,
+) -> Result<Expression, Error> {
+    let mut resolved = e.clone();
+    let Expression::AggregateFunc(func) = &mut resolved else {
+        return Err(Error::UnsupportedAggregateExpression(e.clone()));
+    };
+    for arg in func.arguments_mut() {
+        *arg = resolve_to_column(arg, shift, types, next);
+    }
+    Ok(resolved)
+}
+
+/// Resolve a materialised group key or aggregate argument to the plain column
+/// reference that now holds it: a reference shifts right past the `shift` leading
+/// columns; a computed expression takes the next leading column (advancing
+/// `next`), as a synthesised reference with no source name.
+fn resolve_to_column(e: &Expression, shift: usize, types: &[Type], next: &mut usize) -> Expression {
+    match e {
+        Expression::Ref(r) => Expression::Ref(Ref {
+            column_idx: r.column_idx + shift,
+            ..r.clone()
+        }),
+        _ => {
+            let column = *next;
+            *next += 1;
+            Expression::Ref(Ref {
+                column_idx: column,
+                return_type: types[column].clone(),
+                name: None,
+            })
+        }
     }
 }
 
 /// Build a grouped-aggregate operator from the aggregate `exprs`. The semantic
 /// layer over [`dispatch_group_by`]: resolve `exprs` to value slots via the shared
 /// [`aggregation_slots`] (the single place aggregate semantics map to an
-/// [`AggregationKind`]), shifting each value column right past the `key_shift`
-/// materialised group keys; coalesce duplicate-valued aggregates and re-expand the
+/// [`AggregationKind`]); coalesce duplicate-valued aggregates and re-expand the
 /// output around the [`dispatch_group_by`] call. The entry point for any level that
 /// has aggregates: the general grouped path and each level of the two-level
 /// `COUNT(DISTINCT)` lowering (whose inner/outer levels are *synthetic* expression
@@ -130,7 +215,6 @@ pub(super) fn build_group_by_operator(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
     exprs: &[Expression],
-    key_shift: usize,
     output_limit: Option<GroupLimit>,
 ) -> Result<RecordBatchOperatorSpec, Error> {
     // Coalesce aggregates that fold to the same value so each is scattered/merged
@@ -155,17 +239,7 @@ pub(super) fn build_group_by_operator(
     }
     let unique_exprs: Vec<Expression> = unique.iter().map(|e| (*e).clone()).collect();
 
-    let slots: Vec<AggregationSlot> = aggregation_slots(&unique_exprs)?
-        .into_iter()
-        .map(|s| {
-            // Shift the column index past the leading key columns; keep the kind and
-            // declared output type the slot was built with.
-            AggregationSlot {
-                column: s.column + key_shift,
-                ..s
-            }
-        })
-        .collect();
+    let slots = aggregation_slots(&unique_exprs)?;
     let sig = signatures(&unique_exprs);
 
     // A pushed-down Top-K sorts by a value slot identified by expression index;
@@ -250,53 +324,44 @@ fn fold_key(e: &Expression) -> Result<FoldKey, Error> {
     };
     Ok(match func {
         AggregateFunc::CountStar(_) | AggregateFunc::Count(_) => FoldKey::Count,
-        AggregateFunc::Sum(a) => FoldKey::Sum(a.column.column_idx),
-        AggregateFunc::Min(a) => FoldKey::Min(a.column.column_idx),
-        AggregateFunc::Max(a) => FoldKey::Max(a.column.column_idx),
+        AggregateFunc::Sum(a) => FoldKey::Sum(a.column().column_idx),
+        AggregateFunc::Min(a) => FoldKey::Min(a.column().column_idx),
+        AggregateFunc::Max(a) => FoldKey::Max(a.column().column_idx),
         _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
     })
 }
 
-/// The column type a computed group key is materialised as. String keys group
-/// on their own value; integer and temporal keys group on the `Int64` they are
-/// cast to (the bit pattern preserves distinctness). Any other result type is
-/// rejected rather than silently coerced to an integer.
-fn canonical_group_key_type(result_type: Type) -> Result<Type, Error> {
+/// The canonical column type a computed group key or aggregate argument is
+/// materialised as. Strings and temporal values keep their own type (a temporal
+/// key/value flows through the same int-ify/restore path a plain temporal column
+/// does, so its output is restored to `Date`/`Timestamp` rather than left a raw
+/// int); integer widths are widened to the `Int64` the numeric readers consume.
+/// Any other result type has no materialised column, so the caller rejects it
+/// rather than silently coercing it.
+fn canonical_input_type(result_type: &Type) -> Option<Type> {
     match result_type {
-        Type::Utf8 => Ok(Type::Utf8),
-        Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 | Type::Date | Type::Timestamp => {
-            Ok(Type::Int64)
-        }
-        other => Err(Error::DataTypeNotSupportedForGroupBy(other)),
+        Type::Utf8 => Some(Type::Utf8),
+        Type::Date => Some(Type::Date),
+        Type::Timestamp => Some(Type::Timestamp),
+        Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 => Some(Type::Int64),
+        _ => None,
     }
 }
 
-/// Evaluate each `key` per batch, cast it to its canonical `Int64`/`Utf8View`
-/// type, and prepend them as leading columns `k0, k1, …`. The original columns
-/// follow, shifted right by `keys.len()`, so the aggregates can still read their
-/// value columns. `types` are the canonical key types from
-/// [`canonical_group_key_type`], so only `Utf8` and `Int64` reach here.
-fn project_keys(
+/// Evaluate each `expr` per batch, cast it to the physical arrow type of its
+/// canonical [`canonical_input_type`] (`Utf8View`/`Int64`/`Date32`/`Timestamp`),
+/// and prepend them as leading columns `k0, k1, …`. The original columns follow,
+/// shifted right by `exprs.len()`, so the aggregates can still read their value
+/// columns.
+fn project_leading_columns(
     input: RecordBatchOperatorSpec,
-    keys: &[&Expression],
+    exprs: &[&Expression],
     types: &[Type],
 ) -> Result<RecordBatchOperatorSpec, Error> {
     let builders: Arc<Vec<ExprFn>> =
-        Arc::new(keys.iter().map(|k| k.compile()).collect::<Result<_, _>>()?);
-    let targets: Arc<Vec<DataType>> = Arc::new(
-        types
-            .iter()
-            .map(|t| match t {
-                Type::Utf8 => DataType::Utf8View,
-                Type::Int64 => DataType::Int64,
-                other => {
-                    unreachable!(
-                        "canonical_group_key_type yields only Utf8 or Int64, got {other:?}"
-                    )
-                }
-            })
-            .collect(),
-    );
+        Arc::new(exprs.iter().map(|k| k.compile()).collect::<Result<_, _>>()?);
+    let targets: Arc<Vec<DataType>> =
+        Arc::new(types.iter().map(crate::types::physical_arrow_type).collect());
     Ok(input.project(move || {
         let mut evals: Vec<ExprEvalFn> = builders.iter().map(|b| b()).collect();
         let targets = targets.clone();
@@ -305,15 +370,9 @@ fn project_keys(
             let mut fields: Vec<Field> = Vec::with_capacity(width);
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(width);
             for (i, eval) in evals.iter_mut().enumerate() {
-                let arr: ArrayRef = match eval(&batch) {
-                    ExprResult::Array(a) => a,
-                    // A constant key: broadcast it to the batch length so it can
-                    // sit beside the per-row columns.
-                    ExprResult::Scalar(s) => {
-                        let indices = UInt32Array::from(vec![0u32; batch.num_rows()]);
-                        arrow::compute::take(&s.into_inner(), &indices, None).unwrap()
-                    }
-                };
+                // A constant column (e.g. `GROUP BY 1`) is broadcast to the batch
+                // length so it can sit beside the per-row columns.
+                let arr = eval(&batch).into_array(batch.num_rows());
                 let casted = arrow::compute::cast(&arr, &targets[i]).unwrap();
                 fields.push(Field::new(format!("k{i}"), targets[i].clone(), true));
                 columns.push(casted);
@@ -346,7 +405,7 @@ fn signatures(exprs: &[Expression]) -> Vec<Sig> {
         .iter()
         .map(|e| match e {
             Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
-                Sig::Sum(a.column.return_type.clone())
+                Sig::Sum(a.column().return_type.clone())
             }
             Expression::AggregateFunc(AggregateFunc::CountStar(_) | AggregateFunc::Count(_)) => {
                 Sig::Count
@@ -609,6 +668,34 @@ mod tests {
         // The group-by computes on the int key but the emitted key column must be
         // restored to a real Date32 so it renders as a date.
         assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Date32);
+    }
+
+    #[rstest]
+    fn group_by_computed_timestamp_emits_a_timestamp(mut testing_planner: TestingPlanner) {
+        use arrow_array::TimestampSecondArray;
+        use arrow_schema::TimeUnit;
+
+        testing_planner.add_table(
+            "events",
+            &[(
+                "ts",
+                Type::Timestamp,
+                Arc::new(TimestampSecondArray::from(vec![0i64, 3600, 90_000])) as ArrayRef,
+            )],
+        );
+
+        // A computed temporal group key is materialised into a leading column;
+        // it must still be restored to its TIMESTAMP type on output, not left the
+        // raw epoch-seconds int the group-by computes on.
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT date_trunc('day', ts) AS d, count(*) FROM events GROUP BY date_trunc('day', ts)",
+        );
+
+        assert_eq!(
+            batches[0].schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Second, None)
+        );
     }
 
     #[rstest]

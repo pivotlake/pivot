@@ -24,7 +24,7 @@ use crate::catalog::{Catalog, QueryContext};
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
-use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar, UInt32Array};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, RecordBatchOperatorSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -254,6 +254,19 @@ impl ExprResult {
         match self {
             ExprResult::Array(a) => a,
             ExprResult::Scalar(s) => s,
+        }
+    }
+
+    /// The result as a full column of `num_rows` rows: an [`Array`](Self::Array)
+    /// passes through; a [`Scalar`](Self::Scalar) (e.g. `SELECT 1`) is broadcast
+    /// to that length so it can sit beside the per-row columns.
+    pub fn into_array(self, num_rows: usize) -> ArrayRef {
+        match self {
+            ExprResult::Array(a) => a,
+            ExprResult::Scalar(s) => {
+                let indices = UInt32Array::from(vec![0u32; num_rows]);
+                arrow::compute::take(&s.into_inner(), &indices, None).unwrap()
+            }
         }
     }
 }

@@ -1,8 +1,8 @@
 //! [`Projection`] — computes a list of output expressions from its child.
 
-use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
+use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::Expression;
-use arrow_array::{ArrayRef, RecordBatch, UInt32Array};
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field, Schema};
 use dispatch::RecordBatchOperatorSpec;
 use duckdb_planner::operator as duckdb_operator;
@@ -94,18 +94,12 @@ impl Projection {
             let mut evals: Vec<ExprEvalFn> = builders.iter().map(|b| b()).collect();
             move |batch: RecordBatch| {
                 let num_rows = batch.num_rows();
+                // A constant projection (e.g. `SELECT 1`) yields a length-1 scalar;
+                // `into_array` broadcasts it to the batch's row count so every output
+                // column has the same length.
                 let columns: Vec<ArrayRef> = evals
                     .iter_mut()
-                    .map(|eval| match eval(&batch) {
-                        ExprResult::Array(a) => a,
-                        // A constant projection (e.g. `SELECT 1`) yields a length-1
-                        // scalar; broadcast it to the batch's row count so every output
-                        // column has the same length.
-                        ExprResult::Scalar(s) => {
-                            let indices = UInt32Array::from(vec![0u32; num_rows]);
-                            arrow::compute::take(&s.into_inner(), &indices, None).unwrap()
-                        }
-                    })
+                    .map(|eval| eval(&batch).into_array(num_rows))
                     .collect();
                 let fields: Vec<Field> = columns
                     .iter()

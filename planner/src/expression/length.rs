@@ -2,6 +2,7 @@
 
 use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
+use crate::types::{self, Type};
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use duckdb_planner::expression as duckdb_expression;
@@ -17,6 +18,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct Length {
     pub input: Box<Expression>,
+    pub return_type: Type,
 }
 
 impl TryFrom<duckdb_expression::Function> for Length {
@@ -30,8 +32,9 @@ impl TryFrom<duckdb_expression::Function> for Length {
                 actual,
             });
         }
+        let return_type = types::type_from_logical(f.return_type)?;
         let input = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(Length { input })
+        Ok(Length { input, return_type })
     }
 }
 
