@@ -206,6 +206,14 @@ impl MemoryContext {
     pub fn get_write_buffer(&self, prefer_zeroed: bool) -> WriteBuffer {
         loop {
             if let Some(idx) = self.pop_free_idx(prefer_zeroed) {
+                // A slot listed in the free pool must genuinely be free, i.e. owned
+                // by no cache. If a cache still owns it, it leaked into the pool
+                // while live and is about to be handed out under two owners.
+                debug_assert_eq!(
+                    self.clock.owner(idx),
+                    Owner::Free,
+                    "pooled slot {idx} still owned by a cache",
+                );
                 if let Some(r) = memory_ctx().ring().try_write(idx) {
                     return r;
                 } else {

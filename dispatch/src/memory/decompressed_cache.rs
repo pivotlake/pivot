@@ -135,9 +135,15 @@ impl DecompressedCache {
             block
         };
         drop(block.data); // releases the slots' write buffers to the free pool
-        // Hand the requested slot straight back if it is now free (skipping a
-        // pool round-trip); otherwise it returns to the pool on its own.
-        memory_ctx().ring().try_write(slot_idx)
+        // Take a buffer back *through* the pool (`pop_free_idx` removes its deque
+        // entry). Grabbing `slot_idx` out-of-band with a bare `try_write` would
+        // leave a dangling pool entry: the slot would be live *and* still listed
+        // as free, so a later pop would hand the same slot out a second time
+        // (one writer at a time, but two owners over time - the double-ownership
+        // that corrupts the compressed cache). The freed slot may not be the one
+        // popped here; it returns through the pool cleanly on a later pop.
+        let idx = memory_ctx().pop_free_idx(false)?;
+        memory_ctx().ring().try_write(idx)
     }
 
     /// Whether the cache holds no blocks. `get_write_buffer` checks this to decide
