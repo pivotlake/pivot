@@ -60,7 +60,7 @@ use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
     DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, KeyExtractor,
     LimitFactory, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
-    UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    UnaryFactory, UnaryOperator, UnaryOperatorFactory, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -564,6 +564,52 @@ impl RecordBatchOperatorSpec {
             worker_count,
             buffers,
         ))
+    }
+
+    /// Hash join: build a hash table from `build`'s rows keyed on
+    /// `build_key_column`, then probe it with `self`'s rows keyed on
+    /// `probe_key_column`, emitting the probe rows whose key matches.
+    ///
+    /// Both sides are plain unary operators. The build dataflow runs to
+    /// completion first (populating the shared
+    /// shared join table); only then is the probe stage appended to `self`.
+    /// Coordination is by sequencing plus the shared table,
+    /// not a fused binary operator.
+    pub fn join(
+        self,
+        build: RecordBatchOperatorSpec,
+        build_key_column: usize,
+        probe_key_column: usize,
+    ) -> Self {
+        let worker_count = self.worker_count();
+        let (build_factories, probe_factories, _gate) =
+            create_join_factories(build_key_column, probe_key_column, worker_count);
+
+        // Run the build dataflow to completion. Each build head feeds a JoinBuild
+        // unary sink (RecordBatch -> ()) that populates the shared hash table; the
+        // dataflow itself produces no output rows. Reuses the same generic
+        // UnaryOperatorFactory wiring as `map`, with `()` as the output type.
+        let (build_dispatcher, build_heads) = build.into_parts();
+        let build_siblings = Arc::new(AtomicUsize::new(worker_count));
+        let build_ops: Vec<_> = stealable::<RecordBatch>(worker_count)
+            .into_iter()
+            .zip(build_factories)
+            .zip(build_heads)
+            .map(|((channel_factory, join_build), head)| {
+                UnaryOperatorFactory::new(
+                    RecordBatchFactoryBridge::new(head),
+                    join_build,
+                    channel_factory,
+                    build_siblings.clone(),
+                )
+            })
+            .collect();
+        OperatorSpec::new(build_dispatcher, build_ops)
+            .collect()
+            .expect("join build pipeline failed");
+
+        // The probe stage reads the now-populated hash table and emits matches.
+        self.unary(probe_factories)
     }
 
     /// Execute the dataflow and collect all output batches.

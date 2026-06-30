@@ -1,6 +1,6 @@
+use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer};
 use std::cell::UnsafeCell;
 use std::ops::{Index, IndexMut};
-use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer};
 
 pub const PTR_SHIFT: u32 = 16;
 
@@ -9,10 +9,10 @@ const fn build_tag_table() -> [u16; 2048] {
     let mut i = 0u32;
     while i < 2048 {
         let mut tag: u16 = 0;
-        tag |= 1 << (i & 0xF);           // bits 0-3
-        tag |= 1 << ((i >> 3) & 0xF);    // bits 3-6 (overlapping)
-        tag |= 1 << ((i >> 6) & 0xF);    // bits 6-9 (overlapping)
-        tag |= 1 << ((i >> 8) & 0xF);    // bits 8-10 (only 3 useful bits, max 7)
+        tag |= 1 << (i & 0xF); // bits 0-3
+        tag |= 1 << ((i >> 3) & 0xF); // bits 3-6 (overlapping)
+        tag |= 1 << ((i >> 6) & 0xF); // bits 6-9 (overlapping)
+        tag |= 1 << ((i >> 8) & 0xF); // bits 8-10 (only 3 useful bits, max 7)
         table[i as usize] = tag;
         i += 1;
     }
@@ -76,16 +76,6 @@ impl<B: PtrBuffer> Directory<B> {
 }
 
 #[inline(always)]
-pub fn prefetch_ptr(ptr: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = ptr;
-}
-
-#[inline(always)]
 pub fn prefetch_ptr_l2(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -101,11 +91,6 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
         unsafe { &*self.entries.get() }
     }
 
-    #[inline(always)]
-    fn entries_mut(&self) -> &mut B {
-        unsafe { &mut *self.entries.get() }
-    }
-
     /// Read entry at slot (0-indexed into real slots, sentinel is slot -1).
     #[inline(always)]
     pub fn entry(&self, slot: usize) -> u64 {
@@ -118,7 +103,7 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     /// Caller must ensure exclusive access to this slot.
     #[inline(always)]
     pub fn set_entry(&self, slot: usize, value: u64) {
-        self.entries_mut()[slot] = value;
+        unsafe { (&mut *self.entries.get())[slot] = value };
     }
 
     /// Add `value` to the entry at slot.
@@ -127,12 +112,7 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     /// Caller must ensure exclusive access to this slot.
     #[inline(always)]
     pub unsafe fn add_to_entry(&self, slot: usize, value: u64) {
-        self.entries_mut()[slot] += value;
-    }
-
-    #[inline(always)]
-    pub unsafe fn sub_to_entry(&self, slot: usize, value: u64) {
-        self.entries_mut()[slot] -= value;
+        unsafe { (&mut *self.entries.get())[slot] += value };
     }
 
     /// OR `value` into the entry at slot.
@@ -141,17 +121,7 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     /// Caller must ensure exclusive access to this slot.
     #[inline(always)]
     pub unsafe fn or_to_entry(&self, slot: usize, value: u64) {
-        self.entries_mut()[slot] |= value;
-    }
-
-    /// Prefetch the directory entry for the slot where `hash` would land.
-    #[inline(always)]
-    pub fn prefetch_l1(&self, hash: u64) {
-        let slot = self.slot_for(hash);
-        let ptr = &self.entries()[slot] as *const u64 as *const u8;
-        prefetch_ptr(ptr);
-        // let ptr = &self.entries()[slot + 2] as *const u64 as *const u8;
-        // prefetch_ptr(ptr);
+        unsafe { (&mut *self.entries.get())[slot] |= value };
     }
 
     #[inline(always)]
@@ -169,21 +139,11 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
         (stored & probe) == probe
     }
 
-    #[inline(always)]
-    pub fn bloom(&self, slot: usize) -> u16 {
-        (self.entries()[slot] & 0xFFFF) as u16
-    }
-
     /// End-pointer (exclusive) stored in the upper 48 bits.
     /// Slot -1 reads the sentinel (always 0).
     #[inline(always)]
     pub fn end_ptr(&self, slot: isize) -> usize {
         (self.entries()[(slot) as usize] >> PTR_SHIFT) as usize
-    }
-
-    #[inline(always)]
-    pub fn entry_at_raw_slot(&self, slot: usize) -> usize {
-        self.entries()[slot] as usize
     }
 }
 

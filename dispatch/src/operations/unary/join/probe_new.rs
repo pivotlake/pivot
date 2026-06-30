@@ -1,29 +1,26 @@
-use std::cell::UnsafeCell;
-use std::cmp::min;
-use std::hint::black_box;
-use std::mem;
-use std::ops::{Index, IndexMut, Sub};
-use std::ptr::null;
-use std::sync::{Arc, LazyLock};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
-use ahash::RandomState;
-use arrow_array::types::Int64Type;
-use arrow_array::{Array, ArrayAccessor, Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
-use rand::{Rng, SeedableRng};
-use rand::rngs::SmallRng;
-use crate::memory::{MultiSlabBuffer, SlabAllocator, BUFFER_SIZE};
+#![allow(dead_code)]
+#![allow(clippy::needless_range_loop)]
+
+use crate::RECORD_BATCH_SIZE;
+use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::Unary;
-use crate::operations::unary::join::directory::{prefetch_ptr, prefetch_ptr_l2, Directory, JoinDirectory, PtrBuffer, PTR_SHIFT};
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::Value;
+use crate::operations::unary::join::directory::{
+    Directory, JoinDirectory, PtrBuffer, prefetch_ptr_l2,
+};
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
-use crate::RECORD_BATCH_SIZE;
-use crate::worker::WORKER_IDX;
+use ahash::RandomState;
+use arrow_array::types::Int64Type;
+use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use std::cmp::min;
+use std::mem;
+use std::ops::{Index, IndexMut};
+use std::ptr::null;
+use std::sync::{Arc, LazyLock};
 
 const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
@@ -46,18 +43,16 @@ pub struct Probe {
 
     matched_indexes: Box<[usize; RECORD_BATCH_SIZE]>,
     allocator: SlabAllocator,
-    total: usize,
-    shared_total: Arc<AtomicUsize>,
     hashes: Box<[u64; RING_SIZE]>,
     matched_slots: Box<[(usize, usize); RING_SIZE]>,
     next_matched_slots: Box<[(usize, usize); RING_SIZE]>,
 
-    lineitem_keys: JoinPrimitiveBuilder::<Int64Type>,
-    order_keys: JoinPrimitiveBuilder::<Int64Type>
+    lineitem_keys: JoinPrimitiveBuilder<Int64Type>,
+    order_keys: JoinPrimitiveBuilder<Int64Type>,
 }
 
 impl Probe {
-    pub fn new(table: JoinTable, hash_state: RandomState, key_column: usize, shared_total: Arc<AtomicUsize>) -> Self {
+    pub fn new(table: JoinTable, hash_state: RandomState, key_column: usize) -> Self {
         let mut allocator = SlabAllocator::new(false);
         Self {
             table,
@@ -72,20 +67,26 @@ impl Probe {
 
             matched_indexes: Box::new([0; RECORD_BATCH_SIZE]),
             allocator: SlabAllocator::new(false),
-            total: 0,
-            shared_total,
             next_matched_slots: Box::new([(0, 0); RING_SIZE]),
-            lineitem_keys: JoinPrimitiveBuilder::<Int64Type>::new(&mut allocator, RECORD_BATCH_SIZE),
+            lineitem_keys: JoinPrimitiveBuilder::<Int64Type>::new(
+                &mut allocator,
+                RECORD_BATCH_SIZE,
+            ),
             order_keys: JoinPrimitiveBuilder::<Int64Type>::new(&mut allocator, RECORD_BATCH_SIZE),
         }
     }
 
-    pub fn run<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(&mut self, directory: &Directory<B>, col: &Int64Array) {
-        self.lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-        self.order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+    pub fn run<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(
+        &mut self,
+        directory: &Directory<B>,
+        col: &Int64Array,
+    ) {
+        self.lineitem_keys =
+            JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        self.order_keys =
+            JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
 
         let mut output = 0;
-
 
         let arena = unsafe { &*self.table.arena.get() };
 
@@ -99,7 +100,9 @@ impl Probe {
         // Prepopulate hashes for first RING_SIZE elements
         for i in 0..min(PREFETCH_LENGTH, col.len()) {
             hashes[i] = self.hash_state.hash_one(unsafe { col.value_unchecked(i) });
-            prefetch_ptr_l2(directory.ptr_for_slot((hashes[i] >> directory.shift) as usize) as *const u8);
+            prefetch_ptr_l2(
+                directory.ptr_for_slot((hashes[i] >> directory.shift) as usize) as *const u8,
+            );
         }
         let mut arena_outer_idx = 0usize;
 
@@ -189,7 +192,10 @@ impl Probe {
             let value = unsafe { col.value_unchecked(idx + PREFETCH_LENGTH) };
             let hash_offset = (idx + PREFETCH_LENGTH) & MASK;
             hashes[hash_offset] = self.hash_state.hash_one(value);
-            prefetch_ptr_l2(directory.ptr_for_slot((hashes[hash_offset] >> directory.shift) as usize) as *const u8);
+            prefetch_ptr_l2(
+                directory.ptr_for_slot((hashes[hash_offset] >> directory.shift) as usize)
+                    as *const u8,
+            );
 
             // bloom check, arena
             let touch_offset = idx & MASK;
@@ -199,7 +205,7 @@ impl Probe {
                 // let slot = directory.slot_for(hash) as isize;
                 // arena_ptrs[arena_size & MASK] = slot;
                 // arena_size += 1;
-                self.total += 1;
+                // Bloom matches are materialized by the active ProbeArray path.
             }
             idx += 1;
         }
@@ -208,7 +214,7 @@ impl Probe {
             let hash_offset = (end_offset + j) & MASK;
             let hash = hashes[hash_offset];
             if directory.matches_bloom(hash) {
-                self.total += 1;
+                // Bloom matches are materialized by the active ProbeArray path.
             }
         }
 
@@ -220,16 +226,12 @@ impl Probe {
             &mut self.lineitem_keys,
             JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE),
         );
-        RecordBatch::try_new(
+        let _ = RecordBatch::try_new(
             PROBE_SCHEMA.clone(),
-            vec![
-                lineitem.into_array(output),
-                order.into_array(output),
-            ],
+            vec![lineitem.into_array(output), order.into_array(output)],
         );
     }
 }
-
 
 impl Unary<RecordBatch, RecordBatch> for Probe {
     fn consume<S: Sender<RecordBatch>>(
@@ -248,8 +250,10 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         let join_dir = unsafe { &*self.table.directory.get() };
         match join_dir {
             JoinDirectory::Contiguous(dir) => {
-                let lineitem_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
-                let order_keys = JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+                let lineitem_keys =
+                    JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+                let order_keys =
+                    JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
                 ProbeArray {
                     row_idx: 0,
                     hash_state: self.hash_state.clone(),
@@ -264,25 +268,22 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
                     lineitem_builder: lineitem_keys,
                     order_builder: order_keys,
                     output_idx: 0,
-                    shared_total: self.shared_total.clone(),
-                    total: 0,
                     sender,
                     allocator: &mut self.allocator,
                     last_output: 0,
-                }.run()
+                }
+                .run()
                 // self.run(dir, col)
-            },
+            }
             JoinDirectory::NonContiguous(_dir) => {
                 panic!("oh no")
-            },
+            }
         };
 
         Ok(())
-
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
-        self.shared_total.fetch_add(mem::take(&mut self.total), Ordering::Relaxed);
         Ok(true)
     }
 }
@@ -461,9 +462,12 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
 // }
 //
 
-
-
-struct ProbeArray<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sender<RecordBatch>> {
+struct ProbeArray<
+    'a,
+    'b,
+    B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+    S: Sender<RecordBatch>,
+> {
     row_idx: usize,
     hash_state: RandomState,
     col: &'b Int64Array,
@@ -481,20 +485,19 @@ struct ProbeArray<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrB
     matched_idx: usize,
 
     // builders: Vec<JoinPrimitiveBuilder::<Int64Type>>,
-    lineitem_builder: JoinPrimitiveBuilder::<Int64Type>,
-    order_builder: JoinPrimitiveBuilder::<Int64Type>,
+    lineitem_builder: JoinPrimitiveBuilder<Int64Type>,
+    order_builder: JoinPrimitiveBuilder<Int64Type>,
     output_idx: usize,
-
-    shared_total: Arc<AtomicUsize>,
-    total: usize,
 
     sender: &'a mut S,
     allocator: &'a mut SlabAllocator,
-    
-    last_output: usize
+
+    last_output: usize,
 }
 
-impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sender<RecordBatch>> ProbeArray<'a, 'b, B, S> {
+impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sender<RecordBatch>>
+    ProbeArray<'a, 'b, B, S>
+{
     #[inline(never)]
     fn flush(&mut self) {
         if self.output_idx == 0 {
@@ -511,17 +514,21 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
         // let builders = mem::replace(&mut self.builders, vec![]);
         let batch = RecordBatch::try_new(
             PROBE_SCHEMA.clone(),
-            vec![lineitem.into_array(self.output_idx), order.into_array(self.output_idx)],
+            vec![
+                lineitem.into_array(self.output_idx),
+                order.into_array(self.output_idx),
+            ],
             // builders.into_iter().map(|b| b.into_array(self.output_idx)).collect()
         )
-            .unwrap();
+        .unwrap();
         self.sender.send(batch).unwrap();
         self.output_idx = 0;
     }
 
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
-        let next_matched_slots: &mut [(usize, usize); PREFETCH_LENGTH] = &mut self.matched_slots[self.matched_idx];
+        let next_matched_slots: &mut [(usize, usize); PREFETCH_LENGTH] =
+            &mut self.matched_slots[self.matched_idx];
         let mut size = self.matched_size[self.matched_idx];
         let mut row_idx = self.row_idx;
         let shift = self.directory.shift;
@@ -557,10 +564,9 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
         }
         self.matched_size[self.matched_idx] = size;
         self.row_idx = row_idx;
-        
+
         self.last_output = size;
     }
-
 
     #[inline(always)]
     pub fn build_output<const PREFETCH_NEXT: bool>(&mut self) {
@@ -619,11 +625,16 @@ impl<'a,'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Send
     #[inline(always)]
     pub fn bootstrap_initial_hashes(&mut self) {
         for i in 0..min(PREFETCH_LENGTH, self.col.len()) {
-            self.hashes[i] = self.hash_state.hash_one(unsafe { self.col.value_unchecked(i) });
-            prefetch_ptr_l2(self.directory.ptr_for_slot((self.hashes[i] >> self.directory.shift) as usize) as *const u8);
+            self.hashes[i] = self
+                .hash_state
+                .hash_one(unsafe { self.col.value_unchecked(i) });
+            prefetch_ptr_l2(
+                self.directory
+                    .ptr_for_slot((self.hashes[i] >> self.directory.shift) as usize)
+                    as *const u8,
+            );
         }
     }
-
 
     #[inline(always)]
     fn swap_matched_slots(&mut self) {

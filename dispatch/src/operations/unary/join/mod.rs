@@ -1,35 +1,43 @@
-mod factory;
-mod directory;
-mod primitive_builder;
-/// An earlier, heavily instrumented probe implementation kept for reference. The
-/// wired probe is [`probe_new`]; this module is compiled but not used.
-#[allow(dead_code)]
-mod probe;
 mod build;
+mod directory;
+mod factory;
 #[allow(dead_code)]
 mod pipeline;
+mod primitive_builder;
 mod probe_new;
 
-use std::cell::UnsafeCell;
-use std::sync::Arc;
-pub use factory::{JoinBuildFactory, JoinProbeFactory, create_for_workers as create_join_factories};
 use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::directory::JoinDirectory;
-
+pub(crate) use factory::create_for_workers as create_join_factories;
+use std::cell::UnsafeCell;
+use std::sync::Arc;
 
 // pub(crate) type Value = (u64, u64);
 pub(crate) type Value = u32;
 
-/// Shared hash table state returned by [`JoinBuildFactory::create_for_workers`].
-/// Hand this to the probe side after the build pipeline completes.
-pub struct JoinTable {
-    pub directory: Arc<UnsafeCell<JoinDirectory>>,
-    pub arena: Arc<UnsafeCell<MultiSlabBuffer<Value>>>,
+/// Interior-mutable storage shared by partitioned build workers.
+pub(crate) struct JoinCell<T>(UnsafeCell<T>);
+
+impl<T> JoinCell<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    pub(crate) fn get(&self) -> *mut T {
+        self.0.get()
+    }
 }
 
-unsafe impl Send for JoinTable {}
+// Build workers mutate disjoint directory partitions and arena ranges. The API
+// keeps the raw cell private so only that partitioned build protocol can write.
+unsafe impl<T: Send> Send for JoinCell<T> {}
+unsafe impl<T: Send> Sync for JoinCell<T> {}
 
-unsafe impl Sync for JoinTable {}
+/// Shared hash-table state handed from the build factories to the probe factories.
+pub(crate) struct JoinTable {
+    pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
+    pub(crate) arena: Arc<JoinCell<MultiSlabBuffer<Value>>>,
+}
 
 #[cfg(test)]
 mod tests {
@@ -74,7 +82,7 @@ mod tests {
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
     ) -> JoinResult {
-        init_test_free_pool(256);
+        init_test_free_pool(16);
         let workers = build_worker_batches.len();
         let (builds, probes, gate) = factory::create_for_workers(0, 0, workers);
 
@@ -193,10 +201,7 @@ mod tests {
     #[test]
     fn two_build_workers() {
         let r = build_and_probe(
-            vec![
-                vec![int64_batch(&[10, 20])],
-                vec![int64_batch(&[30, 40])],
-            ],
+            vec![vec![int64_batch(&[10, 20])], vec![int64_batch(&[30, 40])]],
             vec![int64_batch(&[10, 30])],
         );
 
@@ -207,10 +212,7 @@ mod tests {
 
     #[test]
     fn empty_build_no_matches() {
-        let r = build_and_probe(
-            vec![vec![int64_batch(&[])]],
-            vec![int64_batch(&[10])],
-        );
+        let r = build_and_probe(vec![vec![int64_batch(&[])]], vec![int64_batch(&[10])]);
 
         assert!(r.batches.is_empty());
     }
@@ -302,20 +304,14 @@ mod tests {
 
     #[test]
     fn gate_opens_after_build_completes() {
-        let r = build_and_probe(
-            vec![vec![int64_batch(&[10, 20])]],
-            vec![int64_batch(&[10])],
-        );
+        let r = build_and_probe(vec![vec![int64_batch(&[10, 20])]], vec![int64_batch(&[10])]);
 
         assert!(r.gate.load(Ordering::Relaxed));
     }
 
     #[test]
     fn gate_opens_even_with_empty_build() {
-        let r = build_and_probe(
-            vec![vec![int64_batch(&[])]],
-            vec![int64_batch(&[10])],
-        );
+        let r = build_and_probe(vec![vec![int64_batch(&[])]], vec![int64_batch(&[10])]);
 
         assert!(r.gate.load(Ordering::Relaxed));
     }
