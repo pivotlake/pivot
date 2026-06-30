@@ -220,17 +220,13 @@ impl DataFlowDispatcher {
 }
 
 impl DataFlowDispatcher {
-    /// Index of the node group to dispatch the next dataflow to: the pinned node if
-    /// one is set, otherwise the one with the fewest in-flight dataflows (ties go to
-    /// the lowest index). Spreading across nodes by load keeps both nodes busy under
-    /// concurrent queries while each individual dataflow stays node-local.
+    /// Index of the node group to dispatch the next dataflow to. Always the first
+    /// NUMA node (node 0) so a dataflow runs entirely on one socket with node-local
+    /// memory — the fastest, most stable config for memory-bound work on a
+    /// multi-socket box. `pinned_node` still overrides, which is how
+    /// [`run_on_workers`](Self::run_on_workers) reaches every node in turn.
     fn select_target_node(&self) -> usize {
-        if let Some(node) = self.pinned_node {
-            return node;
-        }
-        (0..self.handles.len())
-            .min_by_key(|&node| self.handles[node].in_flight.load(Ordering::Relaxed))
-            .expect("at least one node group")
+        self.pinned_node.unwrap_or(0)
     }
 
     /// Dispatch one pre-built `DataFlow` bundle to a single node group: each of that
