@@ -91,6 +91,23 @@ impl<T: Copy> SlabVec<T> {
         self.last_len += 1;
     }
 
+    /// Total number of elements pushed. Every chunk before the last is full at its
+    /// [`chunk_cap`](Self::chunk_cap); the last holds `last_len`.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        let n = self.chunks.len();
+        if n == 0 {
+            return 0;
+        }
+        (0..n - 1).map(Self::chunk_cap).sum::<usize>() + self.last_len
+    }
+
+    /// Whether no elements have been pushed.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Visit each chunk's elements as one contiguous slice, in insertion order.
     /// The last chunk holds `last_len` elements; every earlier one is full at its
     /// [`chunk_cap`](Self::chunk_cap). Centralises the unsafe base/length logic so
