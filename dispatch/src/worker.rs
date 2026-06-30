@@ -272,6 +272,13 @@ impl Worker {
             let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 WORKER_IDX.set(idx);
                 NUM_WORKERS.set(num_workers);
+                // Pin to this worker's core BEFORE touching any memory, so everything
+                // this worker first-faults — its node-local ring (via `prefault_buffers`),
+                // free pools, and io_uring buffers — lands on this core's NUMA node. Pages
+                // are placed where first written under the default policy, so prefaulting
+                // before pinning would scatter the ring across nodes and defeat the
+                // per-node split.
+                core_affinity::set_for_current(core);
                 // Register this worker's OS tid so the server can scope a
                 // `perf record -t` to the worker pool.
                 #[cfg(feature = "perf")]
@@ -296,7 +303,6 @@ impl Worker {
                 init_memory_context(memory_context_factory.create_memory_ctx());
                 debug!("Pre-faulting for worker {:?}", idx);
                 memory_ctx().prefault_buffers();
-                core_affinity::set_for_current(core);
                 worker
             }));
             debug!("Waiting for barrier for worker {:?}", idx);
