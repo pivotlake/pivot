@@ -12,9 +12,11 @@
 //!
 //! `Fold` is numeric-only: every op folds an owned, `'static` value (`()` / `i64`)
 //! with no per-worker or shared state, so it carries no context. String extremes
-//! ([`StrMin`]/[`StrMax`]) need a value arena and a borrowed `&str`, so they are
-//! *not* folds — they expose inherent methods used only by the runtime
-//! [`Dynamic`](super::container::Dynamic) container's string arms.
+//! ([`StrMin`]/[`StrMax`]) need a value arena and a borrowed `&str`; float ops
+//! ([`SumF`]/[`MinF`]/[`MaxF`]) reinterpret their cell as an `f64`. Neither is a
+//! `Fold` (the float ops *could* be, but have no `Compiled` call site); both
+//! expose inherent methods used only by the runtime
+//! [`Dynamic`](super::container::Dynamic) container's string/float arms.
 //!
 //! A fixed numeric signature is a tuple of (read, fold) pairs
 //! ([`Compiled`](super::container::Compiled)); a runtime signature folds each slot
@@ -22,11 +24,13 @@
 
 mod count;
 mod extreme;
+mod float;
 mod string;
 mod sum;
 
 pub use count::Count;
 pub use extreme::{Max, Min};
+pub use float::{MaxF, MinF, SumF};
 pub use string::{StrMax, StrMin};
 pub use sum::{Sum, WideSum};
 

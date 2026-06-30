@@ -28,6 +28,7 @@ mod table_function;
 mod top_n;
 
 pub use aggregate::Aggregate;
+pub(crate) use aggregate::is_float_type;
 pub use create_table::CreateTable;
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;

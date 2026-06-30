@@ -200,12 +200,22 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
             let (kind, column) = match func {
                 AggregateFunc::CountStar(_) => (AggregationKind::CountStar, 0),
                 AggregateFunc::Count(a) => (AggregationKind::Count, a.column.column_idx),
-                AggregateFunc::Sum(a) => (AggregationKind::Sum, a.column.column_idx),
+                AggregateFunc::Sum(a) => {
+                    // A `SUM` over a float column folds in `f64`; over an integer one
+                    // in the planner's `i64`/`i128` width.
+                    let kind = if is_float_type(&a.column.return_type) {
+                        AggregationKind::SumFloat
+                    } else {
+                        AggregationKind::Sum
+                    };
+                    (kind, a.column.column_idx)
+                }
                 AggregateFunc::Min(a) => (
                     extreme_kind(
                         &a.column.return_type,
                         AggregationKind::StrMin,
                         AggregationKind::Min,
+                        AggregationKind::MinFloat,
                     )
                     .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
                     a.column.column_idx,
@@ -215,6 +225,7 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                         &a.column.return_type,
                         AggregationKind::StrMax,
                         AggregationKind::Max,
+                        AggregationKind::MaxFloat,
                     )
                     .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
                     a.column.column_idx,
@@ -231,19 +242,22 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
 }
 
 /// The MIN/MAX kind for a column of type `ty`: the byte-wise `string` extreme for
-/// a `Utf8` column (folded through the value container's arena path), the
-/// `numeric` extreme for the integer widths the executor can read
-/// (`Int16`/`Int32`/`Int64`) and for `Date`/`Timestamp` (which the reader sees as
-/// the int they store, after [`Aggregate::int_ify_temporal_values`]). `None` for
-/// any other type, so the caller reports a clean `UnsupportedAggregateExpression`
-/// rather than a worker panic in the reader.
+/// a `Utf8` column (folded through the value container's arena path), the `float`
+/// extreme for a `Float64`/`Decimal` column (folded in `f64`), the `numeric`
+/// extreme for the integer widths the executor can read (`Int16`/`Int32`/`Int64`)
+/// and for `Date`/`Timestamp` (which the reader sees as the int they store, after
+/// [`Aggregate::int_ify_temporal_values`]). `None` for any other type, so the
+/// caller reports a clean `UnsupportedAggregateExpression` rather than a worker
+/// panic in the reader.
 fn extreme_kind(
     ty: &Type,
     string: AggregationKind,
     numeric: AggregationKind,
+    float: AggregationKind,
 ) -> Option<AggregationKind> {
     match ty {
         Type::Utf8 => Some(string),
+        _ if is_float_type(ty) => Some(float),
         // UInt8/16/32 fold losslessly through the reader's i64 accumulator;
         // UInt64 is excluded (it would wrap above i64::MAX) so it reports a clean
         // unsupported error rather than a silently wrong extreme.
@@ -258,6 +272,12 @@ fn extreme_kind(
         | Type::Timestamp => Some(numeric),
         _ => None,
     }
+}
+
+/// Whether `ty` is a floating-point column the float aggregates fold in `f64`.
+/// Both `Float64` (DuckDB `DOUBLE`) and `Decimal` carry an arrow `Float64` column.
+pub(crate) fn is_float_type(ty: &Type) -> bool {
+    matches!(ty, Type::Float64 | Type::Decimal)
 }
 
 /// The arrow output type of a temporal `Type`, or `None` for a non-temporal one.

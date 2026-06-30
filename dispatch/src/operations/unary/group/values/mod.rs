@@ -9,8 +9,8 @@
 //! It is built from one trait and two containers:
 //!
 //! - an **`Aggregation`** op — fully typed to its own input array and cell
-//!   ([`Count`], [`Sum<T>`](Sum), [`Min<T>`](Min), [`Max<T>`](Max), [`StrMin`],
-//!   [`StrMax`]).
+//!   ([`Count`], [`Sum<T>`](Sum), [`Min<T>`](Min), [`Max<T>`](Max), the string
+//!   extremes [`StrMin`]/[`StrMax`], and the float ops [`SumF`]/[`MinF`]/[`MaxF`]).
 //! - **containers** — [`Compiled`] (a fixed *numeric* tuple
 //!   of ops, branch-free) and [`Dynamic`] (a runtime
 //!   signature folded per slot, generic over the width — the path for any string
@@ -31,7 +31,7 @@ pub mod read;
 pub use cell::{Cell, Numeric};
 pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, SumSlot};
 pub use distinct::Distinct;
-pub use fold::{Count, Fold, Max, Min, StrMax, StrMin, Sum, WideSum};
+pub use fold::{Count, Fold, Max, MaxF, Min, MinF, StrMax, StrMin, Sum, SumF, WideSum};
 pub use read::{IntRead, NoRead, Read, StrRead};
 
 /// Which per-group aggregate a value slot computes during consume — a pure
@@ -60,6 +60,13 @@ pub enum AggregationKind {
     StrMin,
     /// `MAX(col)` over a string (`Utf8`) column.
     StrMax,
+    /// `SUM(col)` over a `Float64` column: its cell holds the running `f64`'s
+    /// bits and its fold ([`SumF`]) accumulates in `f64`, not the integer path.
+    SumFloat,
+    /// `MIN(col)` over a `Float64` column.
+    MinFloat,
+    /// `MAX(col)` over a `Float64` column.
+    MaxFloat,
 }
 
 impl AggregationKind {
