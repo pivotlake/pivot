@@ -1,38 +1,39 @@
 //! A cache of decompressed blocks, sharing the ring's CLOCK
 //! ([`Clock`](super::clock::Clock)) with the compressed
-//! [`CompressedCache`](super::compressed_cache::CompressedCache).
+//! [`CompressedCache`](super::compressed_cache::CompressedCache), and modelled on
+//! it: a cached block sits in its ring slot(s) at `used == 0`, owned via the clock
+//! (no held pin). A [`get`](DecompressedCache::get) reconstructs a zero-copy view
+//! with `try_read`; eviction acquires the slots with `try_write` first and only
+//! then removes the block - never the drop-into-pool-then-grab dance.
 //!
-//! A block is bytes that were decompressed from a contiguous source range of a
-//! file (a [`FileLocation`] plus a byte offset and length). The cache retains the
-//! ring-backed `Bytes` keyed by that source range, so a later read of the same
-//! range skips decompression and reuses the bytes. It carries no knowledge of
-//! what produced the bytes.
+//! ## Per-file maps
 //!
-//! ## Everything stays on the ring
-//!
-//! The cached payload is the exact same ring-backed `Bytes` the consumer uses; a
-//! hit clones them (an `Arc` bump, no byte copy) and releasing memory just drops
-//! them, returning the slot to the free pool. Nothing is ever migrated between
-//! heap and ring.
+//! `files` maps a [`FileLocation`] to its own `RwLock`'d table of `offset -> block`
+//! (like [`CompressedCache`]'s `file_maps`), so a `get` only contends on one file's
+//! lock. `reverse` maps each ring slot to the block key that owns it, so the
+//! evictor - which only has a slot index - can find the block.
 //!
 //! ## Eviction
 //!
 //! The cache claims each block's slots in the shared clock as
-//! [`Owner::Decompressed`], whose lower tier max (1 vs 2) makes them age out
-//! first. When the sweep picks a decompressed victim it calls
-//! [`reclaim`](DecompressedCache::reclaim), dropping the block that owns
-//! that slot. The compressed source pages age out more slowly (tier max 2), so an
-//! evicted decompressed block falls back to an in-memory re-decompress rather than
-//! a disk read.
+//! [`Owner::Decompressed`], whose lower tier max makes them age out before
+//! compressed pages. The clock picks a slot and calls
+//! [`reclaim`](DecompressedCache::reclaim), which `try_write`s every slot of that
+//! slot's block (in sorted order, deadlock-free); if any slot is still pinned by a
+//! reader it releases the rest and bails, so the block stays cached. The compressed
+//! source pages age out more slowly, so an evicted decompressed block falls back to
+//! an in-memory re-decompress rather than a disk read.
 
 use crate::env::get_env_var_with_default;
 use crate::io::FileLocation;
 use crate::memory::clock::Owner;
 use crate::memory::context::memory_ctx;
+use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::write_buffer::WriteBuffer;
 use ahash::HashMap;
 use bytes::Bytes;
-use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Identity of a cached decompressed block: the file, the byte offset of its
 /// source bytes, and their length. Unique per block. The length is part of the
@@ -45,29 +46,29 @@ pub struct BlockKey {
     pub len: usize,
 }
 
-/// A retained decompressed block.
-struct CachedBlock {
-    /// The decompressed bytes, ring-backed (one `Bytes` per 2 MB slot).
-    data: Vec<Bytes>,
-    /// The ring slots `data` lives in (one per `Bytes`).
+/// A cached decompressed block: the ring slots holding its bytes (one per 2 MB),
+/// each slot's valid byte length, and the source `len` from its [`BlockKey`] (so a
+/// `get` can reject a same-offset key of a different size).
+struct DecompBlock {
     slots: Vec<usize>,
-}
-
-#[derive(Default)]
-struct Inner {
-    /// Block lookup, keyed by source range.
-    blocks: HashMap<BlockKey, CachedBlock>,
-    /// Reverse index, so the shared clock's evictor can find the block that owns a
-    /// victim slot.
-    slot_to_block: HashMap<usize, BlockKey>,
+    lens: Vec<usize>,
+    key_len: usize,
 }
 
 /// A cache of decompressed blocks, shared across workers behind an `Arc` like the
 /// [`CompressedCache`](super::compressed_cache::CompressedCache).
 pub struct DecompressedCache {
-    inner: Mutex<Inner>,
-    /// Kill switch (`PIVOT_DECOMPRESSED_CACHE`, default on). When off, `get`/
-    /// `insert` are no-ops, so behaviour matches a build without the cache.
+    /// Per-file: file -> (source offset -> block). `get` only locks one file's table.
+    files: RwLock<HashMap<FileLocation, RwLock<HashMap<usize, DecompBlock>>>>,
+    /// slot -> the key whose block owns it, so `reclaim` (which only has a slot
+    /// index) can find and remove the block.
+    reverse: RwLock<HashMap<usize, BlockKey>>,
+    /// Number of ring slots currently bound `Decompressed` (mapped or orphaned by a
+    /// pending invalidate/clear). Drives [`is_empty`](Self::is_empty); a slot is
+    /// only subtracted when the clock actually reclaims it.
+    count: AtomicUsize,
+    /// Kill switch (`PIVOT_DECOMPRESSED_CACHE`, default on). When off, `get` is a
+    /// no-op and `insert` returns the bytes uncached.
     enabled: bool,
 }
 
@@ -80,118 +81,262 @@ impl Default for DecompressedCache {
 impl DecompressedCache {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
+            files: RwLock::new(HashMap::default()),
+            reverse: RwLock::new(HashMap::default()),
+            count: AtomicUsize::new(0),
             enabled: get_env_var_with_default("PIVOT_DECOMPRESSED_CACHE", true),
         }
     }
 
-    /// Look up a block. On a hit, marks its slots used in the shared clock and
-    /// returns a clone of its ring-backed bytes (an `Arc` bump per buffer, no byte
-    /// copy).
+    /// Look up a block. On a hit, pins each of its slots with `try_read`, refreshes
+    /// the clock, and returns one zero-copy `Bytes` view per slot. Misses (returning
+    /// `None`, releasing any pins taken) if the block is absent, its size doesn't
+    /// match `key.len`, or a slot is mid-reclaim (`WRITING`).
     pub fn get(&self, key: &BlockKey) -> Option<Vec<Bytes>> {
         if !self.enabled {
             return None;
         }
-        let inner = self.inner.lock().unwrap();
-        let block = inner.blocks.get(key)?;
-        for &slot in &block.slots {
-            memory_ctx().clock().touch(slot);
+        let files = self.files.read().unwrap();
+        let table = files.get(&key.location)?.read().unwrap();
+        let block = table.get(&key.offset)?;
+        if block.key_len != key.len {
+            return None;
         }
-        Some(block.data.clone())
+        let mut views = Vec::with_capacity(block.slots.len());
+        for (&slot, &len) in block.slots.iter().zip(&block.lens) {
+            // `?` on a failed `try_read` drops `views`, releasing the pins already
+            // taken, and the whole lookup misses.
+            let read = memory_ctx().ring().try_read(slot)?;
+            memory_ctx().clock().touch(slot);
+            views.push(Bytes::from_owner(read).slice(..len));
+        }
+        Some(views)
     }
 
-    /// Retain `data` (occupying ring `slots` at `key`) claiming those slots in the
-    /// shared clock as decompressed. A block already present is left as is (the new
-    /// `data` is dropped, freeing its slots).
-    pub fn insert(&self, key: BlockKey, data: Vec<Bytes>, slots: Vec<usize>) {
-        if !self.enabled {
-            return;
+    /// Cache the page just decompressed into `write_buffers` (one per 2 MB slot,
+    /// `lens[i]` valid bytes each) and return the bytes to hand the decoder. If it
+    /// caches, each buffer is converted to a read pin so its slot becomes resident
+    /// at `used == 0` once the decoder drops the returned `Bytes`; otherwise (cache
+    /// off, empty page, or the block already cached) the `WriteBuffer`-backed bytes
+    /// are returned and their slots return to the pool on drop.
+    pub fn insert(
+        &self,
+        key: BlockKey,
+        write_buffers: Vec<WriteBuffer>,
+        lens: Vec<usize>,
+    ) -> Vec<Bytes> {
+        if !self.enabled || write_buffers.is_empty() {
+            return transient(write_buffers, &lens);
         }
-        let mut inner = self.inner.lock().unwrap();
-        if inner.blocks.contains_key(&key) {
-            return;
+        let slots: Vec<usize> = write_buffers.iter().map(|b| b.slot_idx).collect();
+
+        // Claim `offset` under the file's write lock (so two workers decompressing
+        // the same page don't both cache it); on a dup, leave this copy transient.
+        if !self.claim(&key, &slots, &lens) {
+            return transient(write_buffers, &lens);
+        }
+
+        // Record the reverse index and clock ownership while the slots are still
+        // `WRITING` (held by `write_buffers`), so the evictor can't touch them yet.
+        {
+            let mut reverse = self.reverse.write().unwrap();
+            for &slot in &slots {
+                reverse.insert(slot, key.clone());
+            }
         }
         for &slot in &slots {
             memory_ctx().clock().bind(slot, Owner::Decompressed);
-            inner.slot_to_block.insert(slot, key.clone());
         }
-        inner.blocks.insert(key, CachedBlock { data, slots });
+        self.count.fetch_add(slots.len(), Ordering::Relaxed);
+
+        // Convert each buffer to a read pin (`used == 1`); when the decoder drops
+        // the returned views the slot drops to `used == 0` - resident, not pooled.
+        write_buffers
+            .into_iter()
+            .zip(&lens)
+            .map(|(buffer, &len)| Bytes::from_owner(ReadBuffer::from(buffer)).slice(..len))
+            .collect()
     }
 
-    /// Drop the block that owns ring slot `slot_idx` - the shared clock picked it
-    /// as a victim - releasing all of its slots. Returns `slot_idx` writable when
-    /// it frees immediately; `None` if a live query still pins the block (its
-    /// slots return to the pool when that query ends) or the slot was already
-    /// reclaimed. The block's bytes drop after the lock is released.
-    pub fn reclaim(&self, slot_idx: usize) -> Option<WriteBuffer> {
-        let block = {
-            let mut inner = self.inner.lock().unwrap();
-            let key = inner.slot_to_block.get(&slot_idx)?.clone();
-            let block = inner.blocks.remove(&key)?;
-            for &slot in &block.slots {
-                inner.slot_to_block.remove(&slot);
-                memory_ctx().clock().release(slot);
+    /// Insert the block's forward entry under the file's write lock, creating the
+    /// file's table if needed. Returns `false` if `offset` is already cached.
+    fn claim(&self, key: &BlockKey, slots: &[usize], lens: &[usize]) -> bool {
+        loop {
+            {
+                let files = self.files.read().unwrap();
+                if let Some(table) = files.get(&key.location) {
+                    let mut table = table.write().unwrap();
+                    if table.contains_key(&key.offset) {
+                        return false;
+                    }
+                    table.insert(
+                        key.offset,
+                        DecompBlock {
+                            slots: slots.to_vec(),
+                            lens: lens.to_vec(),
+                            key_len: key.len,
+                        },
+                    );
+                    return true;
+                }
             }
-            block
+            // File absent: create its (empty) table, then retry the claim above.
+            self.files
+                .write()
+                .unwrap()
+                .entry(key.location.clone())
+                .or_default();
+        }
+    }
+
+    /// The clock picked `slot` as a victim. Evict the whole block it belongs to:
+    /// `try_write` every one of the block's slots (sorted, so concurrent evictors
+    /// can't deadlock), and only on acquiring them all remove the block and recycle
+    /// the slots. If any slot is still pinned by a reader, release the ones taken
+    /// without pooling them (the block stays cached) and return `None`. Returns the
+    /// requested slot writable; the block's other slots return to the pool.
+    pub fn reclaim(&self, slot: usize) -> Option<WriteBuffer> {
+        let key = self.reverse.read().unwrap().get(&slot).cloned();
+        let Some(key) = key else {
+            return self.reclaim_orphan(slot);
         };
-        drop(block.data); // releases the slots' write buffers to the free pool
-        // Take a buffer back *through* the pool (`pop_free_idx` removes its deque
-        // entry). Grabbing `slot_idx` out-of-band with a bare `try_write` would
-        // leave a dangling pool entry: the slot would be live *and* still listed
-        // as free, so a later pop would hand the same slot out a second time
-        // (one writer at a time, but two owners over time - the double-ownership
-        // that corrupts the compressed cache). The freed slot may not be the one
-        // popped here; it returns through the pool cleanly on a later pop.
-        let idx = memory_ctx().pop_free_idx(false)?;
-        memory_ctx().ring().try_write(idx)
+
+        let mut block_slots = {
+            let files = self.files.read().unwrap();
+            let entry = files.get(&key.location).and_then(|table| {
+                table
+                    .read()
+                    .unwrap()
+                    .get(&key.offset)
+                    .map(|b| b.slots.clone())
+            });
+            match entry {
+                Some(slots) => slots,
+                None => return self.reclaim_orphan(slot),
+            }
+        };
+        block_slots.sort_unstable();
+
+        // Acquire every slot of the block, in order. Any miss → release and bail.
+        let mut buffers = Vec::with_capacity(block_slots.len());
+        for &s in &block_slots {
+            match memory_ctx().ring().try_write(s) {
+                Some(buffer) => buffers.push(buffer),
+                None => {
+                    for buffer in buffers {
+                        release_without_pool(buffer);
+                    }
+                    return None;
+                }
+            }
+        }
+
+        // Hold all the block's slots exclusively: drop the block and recycle them.
+        if let Some(table) = self.files.read().unwrap().get(&key.location) {
+            table.write().unwrap().remove(&key.offset);
+        }
+        {
+            let mut reverse = self.reverse.write().unwrap();
+            for &s in &block_slots {
+                reverse.remove(&s);
+            }
+        }
+        for &s in &block_slots {
+            memory_ctx().clock().release(s);
+        }
+        self.count.fetch_sub(block_slots.len(), Ordering::Relaxed);
+
+        // Hand `slot` back; the rest return to the pool when their buffers drop.
+        let pos = buffers.iter().position(|b| b.slot_idx == slot)?;
+        Some(buffers.swap_remove(pos))
     }
 
-    /// Whether the cache holds no blocks. `get_write_buffer` checks this to decide
-    /// whether eviction would have to fall through to the compressed cache.
+    /// Reclaim a slot the reverse map doesn't know about - an orphan left
+    /// `Decompressed` by [`invalidate`](Self::invalidate)/[`clear`](Self::clear).
+    /// Only touches a slot the clock still marks `Decompressed` (so a stray call for
+    /// an unowned slot is a no-op).
+    fn reclaim_orphan(&self, slot: usize) -> Option<WriteBuffer> {
+        if memory_ctx().clock().owner(slot) != Owner::Decompressed {
+            return None;
+        }
+        let buffer = memory_ctx().ring().try_write(slot)?;
+        if memory_ctx().clock().owner(slot) != Owner::Decompressed {
+            release_without_pool(buffer);
+            return None;
+        }
+        self.reverse.write().unwrap().remove(&slot);
+        memory_ctx().clock().release(slot);
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        Some(buffer)
+    }
+
+    /// Whether the cache currently owns no ring slots. `get_write_buffer` checks
+    /// this to decide whether eviction would have to fall through to the compressed
+    /// cache.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().blocks.is_empty()
+        self.count.load(Ordering::Relaxed) == 0
     }
 
-    /// Drop every block belonging to `location` (e.g. when its file descriptor is
-    /// reopened), releasing their slots, so a stale block can't serve a later read.
+    /// Drop every block belonging to `location` (e.g. when its fd is reopened) so a
+    /// stale block can't serve a later read. The slots stay `Decompressed` and are
+    /// recycled lazily by the clock (via [`reclaim_orphan`](Self::reclaim_orphan)).
     pub fn invalidate(&self, location: &FileLocation) {
         if !self.enabled {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
-        let stale: Vec<BlockKey> = inner
-            .blocks
-            .keys()
-            .filter(|key| &key.location == location)
-            .cloned()
-            .collect();
-        for key in stale {
-            self.remove_block(&mut inner, &key);
-        }
-    }
-
-    /// Drop every cached block, returning how many were dropped. Backs
-    /// `drop_cache()`.
-    pub fn clear(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap();
-        for &slot in inner.slot_to_block.keys() {
-            memory_ctx().clock().release(slot);
-        }
-        inner.slot_to_block.clear();
-        let dropped = inner.blocks.len();
-        inner.blocks.clear();
-        dropped
-    }
-
-    /// Remove one block and release its slots from the clock and reverse index.
-    fn remove_block(&self, inner: &mut Inner, key: &BlockKey) {
-        if let Some(block) = inner.blocks.remove(key) {
-            for &slot in &block.slots {
-                inner.slot_to_block.remove(&slot);
-                memory_ctx().clock().release(slot);
+        let table = self.files.write().unwrap().remove(location);
+        if let Some(table) = table {
+            let mut reverse = self.reverse.write().unwrap();
+            for block in table.into_inner().unwrap().into_values() {
+                for slot in block.slots {
+                    reverse.remove(&slot);
+                }
             }
         }
     }
+
+    /// Drop every cached block, returning how many were dropped. Frees each free
+    /// slot to the pool immediately; a slot still pinned by a reader stays
+    /// `Decompressed` and is recycled lazily by the clock. Backs `drop_cache()`.
+    pub fn clear(&self) -> usize {
+        let files = std::mem::take(&mut *self.files.write().unwrap());
+        let mut reverse = self.reverse.write().unwrap();
+        let mut dropped = 0;
+        for table in files.into_values() {
+            for block in table.into_inner().unwrap().into_values() {
+                dropped += 1;
+                for slot in block.slots {
+                    reverse.remove(&slot);
+                    if let Some(buffer) = memory_ctx().ring().try_write(slot) {
+                        memory_ctx().clock().release(slot);
+                        self.count.fetch_sub(1, Ordering::Relaxed);
+                        drop(buffer); // returns the slot to the pool
+                    }
+                }
+            }
+        }
+        dropped
+    }
+}
+
+/// Build `WriteBuffer`-backed (uncached, pooled-on-drop) views from the buffers.
+fn transient(write_buffers: Vec<WriteBuffer>, lens: &[usize]) -> Vec<Bytes> {
+    write_buffers
+        .into_iter()
+        .zip(lens)
+        .map(|(buffer, &len)| Bytes::from_owner(buffer).slice(..len))
+        .collect()
+}
+
+/// Drop a `WriteBuffer` without returning its slot to the pool: forget it and reset
+/// `used` to 0, leaving the slot resident (still owned, not free). Used when a
+/// multi-slot reclaim bails after acquiring only some of a block's slots.
+fn release_without_pool(buffer: WriteBuffer) {
+    let slot = buffer.slot_idx;
+    std::mem::forget(buffer);
+    memory_ctx()
+        .ring()
+        .set_slot_used(slot, 0, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -200,12 +345,10 @@ mod tests {
     use crate::memory::context::{init_test_free_pool, memory_ctx};
     use std::sync::{Arc, OnceLock};
 
-    /// A ring-backed one-slot block (the same shape the decompressor produces):
-    /// its bytes plus the slot they occupy.
-    fn ring_block() -> (Vec<Bytes>, Vec<usize>) {
-        let buffer = memory_ctx().get_write_buffer(false);
-        let slot = buffer.slot_idx;
-        (vec![Bytes::from_owner(buffer)], vec![slot])
+    /// A fresh write buffer over one ring slot (the shape the decompressor feeds
+    /// `insert`).
+    fn ring_write() -> WriteBuffer {
+        memory_ctx().get_write_buffer(false)
     }
 
     /// A fresh, independent local location (distinct cache key bucket).
@@ -237,7 +380,9 @@ mod tests {
 
     fn for_test(enabled: bool) -> DecompressedCache {
         DecompressedCache {
-            inner: Mutex::new(Inner::default()),
+            files: RwLock::new(HashMap::default()),
+            reverse: RwLock::new(HashMap::default()),
+            count: AtomicUsize::new(0),
             enabled,
         }
     }
@@ -250,31 +395,12 @@ mod tests {
     }
 
     #[test]
-    fn a_different_length_at_the_same_offset_misses() {
-        init_test_free_pool(2);
-        let cache = for_test(true);
-        let (data, slots) = ring_block();
-        let stored = BlockKey {
-            len: 100,
-            ..test_key(0)
-        };
-        cache.insert(stored, data, slots);
-
-        let same_offset_other_len = BlockKey {
-            len: 200,
-            ..test_key(0)
-        };
-
-        assert!(cache.get(&same_offset_other_len).is_none());
-    }
-
-    #[test]
     fn a_hit_is_ring_backed_and_copy_free() {
         init_test_free_pool(2);
         let cache = for_test(true);
-        let (data, slots) = ring_block();
-        let ptr = data[0].as_ptr();
-        cache.insert(test_key(0), data, slots);
+        let buffer = ring_write();
+        let ptr = buffer.as_slice().as_ptr();
+        cache.insert(test_key(0), vec![buffer], vec![1]);
 
         let hit = cache.get(&test_key(0)).unwrap();
 
@@ -282,18 +408,55 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_drops_the_owning_block_and_returns_the_slot() {
+    fn a_different_length_at_the_same_offset_misses() {
+        init_test_free_pool(2);
+        let cache = for_test(true);
+        cache.insert(
+            BlockKey {
+                len: 100,
+                ..test_key(0)
+            },
+            vec![ring_write()],
+            vec![1],
+        );
+
+        let other = BlockKey {
+            len: 200,
+            ..test_key(0)
+        };
+
+        assert!(cache.get(&other).is_none());
+    }
+
+    #[test]
+    fn insert_is_a_noop_when_the_offset_is_already_cached() {
+        init_test_free_pool(2);
+        let cache = for_test(true);
+        cache.insert(test_key(0), vec![ring_write()], vec![1]);
+        let dup = ring_write();
+        let dup_slot = dup.slot_idx;
+
+        // The dup is returned transient (WriteBuffer-backed): dropping it pools the
+        // slot, which the next allocation hands back.
+        drop(cache.insert(test_key(0), vec![dup], vec![1]));
+
+        assert_eq!(memory_ctx().get_write_buffer(false).slot_idx, dup_slot);
+    }
+
+    #[test]
+    fn reclaim_evicts_the_owning_block_and_returns_the_slot() {
         init_test_free_pool(1);
         let cache = for_test(true);
-        let (data, slots) = ring_block();
-        let slot = slots[0];
-        cache.insert(test_key(0), data, slots);
+        let buffer = ring_write();
+        let slot = buffer.slot_idx;
+        drop(cache.insert(test_key(0), vec![buffer], vec![1])); // drop the view → resident
 
         let reclaimed = cache.reclaim(slot);
 
-        assert!(
-            reclaimed.is_some(),
-            "the freed slot is handed straight back"
+        assert_eq!(
+            reclaimed.unwrap().slot_idx,
+            slot,
+            "the freed slot is handed back"
         );
         assert!(cache.is_empty(), "its block was evicted");
     }
@@ -312,10 +475,8 @@ mod tests {
         let cache = for_test(true);
         let a = new_file();
         let b = new_file();
-        let (da, sa) = ring_block();
-        let (db, sb) = ring_block();
-        cache.insert(key_for(&a), da, sa);
-        cache.insert(key_for(&b), db, sb);
+        cache.insert(key_for(&a), vec![ring_write()], vec![1]);
+        cache.insert(key_for(&b), vec![ring_write()], vec![1]);
 
         cache.invalidate(&a);
 
@@ -327,10 +488,8 @@ mod tests {
     fn clear_drops_everything() {
         init_test_free_pool(4);
         let cache = for_test(true);
-        let (d0, s0) = ring_block();
-        let (d1, s1) = ring_block();
-        cache.insert(test_key(0), d0, s0);
-        cache.insert(test_key(1), d1, s1);
+        drop(cache.insert(test_key(0), vec![ring_write()], vec![1]));
+        drop(cache.insert(test_key(1), vec![ring_write()], vec![1]));
 
         let dropped = cache.clear();
 
@@ -342,9 +501,9 @@ mod tests {
     fn disabled_cache_is_a_noop() {
         init_test_free_pool(1);
         let cache = for_test(false);
-        let (data, slots) = ring_block();
 
-        cache.insert(test_key(0), data, slots);
+        // insert returns the bytes transient; nothing is cached.
+        drop(cache.insert(test_key(0), vec![ring_write()], vec![1]));
 
         assert!(cache.get(&test_key(0)).is_none());
         assert!(cache.is_empty());

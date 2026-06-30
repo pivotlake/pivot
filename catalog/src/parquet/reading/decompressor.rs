@@ -17,7 +17,7 @@ use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::memory::{BUFFER_SIZE, BlockKey, memory_ctx};
+use dispatch::memory::{BUFFER_SIZE, BlockKey, WriteBuffer, memory_ctx};
 use snap::raw::Decoder;
 use thiserror::Error;
 
@@ -68,16 +68,13 @@ impl Decompressor {
         let data = match memory_ctx().decompressed_cache().get(&key) {
             Some(cached) => cached,
             None => {
-                let (data, slots) = self.decompress_bytes(&page)?;
-                // A zero-length page occupies no ring slot, so there is nothing to
-                // cache (and nothing for the clock to evict); re-decompressing an
-                // empty page is free anyway.
-                if !slots.is_empty() {
-                    memory_ctx()
-                        .decompressed_cache()
-                        .insert(key, data.clone(), slots);
-                }
-                data
+                // `insert` caches the page (binding its slots so a later read skips
+                // snappy) and returns the bytes to decode; a zero-length page yields
+                // no buffers and is left uncached.
+                let (write_buffers, lens) = self.decompress_to_buffers(&page)?;
+                memory_ctx()
+                    .decompressed_cache()
+                    .insert(key, write_buffers, lens)
             }
         };
 
@@ -103,10 +100,14 @@ impl Decompressor {
         })
     }
 
-    /// Snappy-decompress the page body into freshly allocated ring buffers,
-    /// returning one ring-backed [`Bytes`] per 2 MB slot, plus the slots they
-    /// occupy (so the cache can register them with the shared clock).
-    fn decompress_bytes(&mut self, page: &CompressedPage) -> Result<(Vec<Bytes>, Vec<usize>)> {
+    /// Snappy-decompress the page body into freshly allocated ring buffers (one per
+    /// 2 MB slot), returning the write buffers plus each one's valid byte length.
+    /// The cache turns these into resident, read-pinned slots; an unached page's
+    /// buffers return to the pool when the decoder drops them.
+    fn decompress_to_buffers(
+        &mut self,
+        page: &CompressedPage,
+    ) -> Result<(Vec<WriteBuffer>, Vec<usize>)> {
         let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
 
         let uncompressed_size = page.header.uncompressed_page_size as usize;
@@ -119,15 +120,14 @@ impl Decompressor {
 
         self.decoder.decompress_scattered(&input, output_bufs)?;
 
-        let slots: Vec<usize> = write_buffers.iter().map(|b| b.slot_idx).collect();
-        let mut data = Vec::with_capacity(num_buffers);
+        let mut lens = Vec::with_capacity(num_buffers);
         let mut remaining = uncompressed_size;
-        for write_buffer in write_buffers {
+        for _ in 0..num_buffers {
             let chunk_len = remaining.min(BUFFER_SIZE);
-            data.push(Bytes::from_owner(write_buffer).slice(..chunk_len));
+            lens.push(chunk_len);
             remaining -= chunk_len;
         }
-        Ok((data, slots))
+        Ok((write_buffers, lens))
     }
 }
 
