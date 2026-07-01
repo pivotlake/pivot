@@ -40,20 +40,31 @@ impl<T: Send> StealableChannelFactory<T> {
     }
 }
 
-/// Order peer stealers so this worker's same-node peers come first. Same-node peers
-/// are a contiguous global-index range, since `spin_up` assigns global indices per
-/// node group in order: `[base, base + workers_per_node)` where `base = global_idx -
-/// node_local_idx`. When the NUMA thread-locals aren't set (tests / single-node), all
-/// peers are treated as same-node and order is unchanged.
-fn order_same_node_first<T>(mut stealers: Vec<(usize, Stealer<T>)>) -> Vec<Stealer<T>> {
+/// Keep only this worker's **same-NUMA-node** peer stealers. Items flowing through a
+/// stealable channel (compressed/decompressed pages, `RecordBatch`es with ring-backed
+/// string views) carry references into the producing worker's node-local ring; stealing
+/// one to another node would resolve those references against the wrong node's memory
+/// (corrupt data), so a worker must only steal from its own node. Cross-node
+/// rebalancing happens instead at the scan's row-group source, which re-reads a whole
+/// row group fresh into the stealing node's cache.
+///
+/// Same-node peers are a contiguous global-index range, since `spin_up` assigns global
+/// indices per node group in order: `[base, base + workers_per_node)` where `base =
+/// global_idx - node_local_idx`. When the NUMA thread-locals aren't set (tests /
+/// single-node), all peers are same-node.
+fn same_node_stealers<T>(stealers: Vec<(usize, Stealer<T>)>) -> Vec<Stealer<T>> {
     let gi = WORKER_IDX.get();
     let nli = NODE_LOCAL_IDX.get();
     let wpn = WORKERS_PER_NODE.get();
-    if gi != usize::MAX && nli != usize::MAX && wpn != usize::MAX {
-        let base = gi - nli;
-        stealers.sort_by_key(|(j, _)| !(base <= *j && *j < base + wpn));
+    if gi == usize::MAX || nli == usize::MAX || wpn == usize::MAX {
+        return stealers.into_iter().map(|(_, s)| s).collect();
     }
-    stealers.into_iter().map(|(_, s)| s).collect()
+    let base = gi - nli;
+    stealers
+        .into_iter()
+        .filter(|(j, _)| base <= *j && *j < base + wpn)
+        .map(|(_, s)| s)
+        .collect()
 }
 
 impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
@@ -62,7 +73,7 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
 
     fn build(self) -> (Rc<Worker<T>>, StealableReceiver<T>) {
         let worker = Rc::new(self.worker);
-        let stealers = order_same_node_first(self.stealers);
+        let stealers = same_node_stealers(self.stealers);
         (worker.clone(), StealableReceiver::new(worker, stealers))
     }
 }
