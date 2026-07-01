@@ -20,7 +20,7 @@ on:
         type: boolean
         default: true
       push_docker:
-        description: "Build the pivot server image and push it to Docker Hub (giladkl/pivot)."
+        description: "Build multi-arch (amd64+arm64) pivot and operator images and push to Docker Hub (giladkl/pivot, giladkl/pivot-operator)."
         type: boolean
         default: true
 
@@ -34,7 +34,7 @@ on:
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
 # For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
 # DOCKERHUB_TOKEN secrets are used; that account must have push access to
-# giladkl/pivot.
+# giladkl/pivot and giladkl/pivot-operator.
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,8 +58,10 @@ jobs:
           if [ "${{ inputs.build_aarch64 }}" = "true" ]; then
             legs+=('{"arch":"aarch64","runner":"ubuntu-24.04-arm"}')
           fi
-          if [ ${#legs[@]} -eq 0 ]; then
-            echo "::error::Select at least one architecture (build_x86_64 / build_aarch64)."
+          # A run with no binary arch is valid when it only pushes images; the
+          # binary `deploy` job then gets an empty matrix and is skipped.
+          if [ ${#legs[@]} -eq 0 ] && [ "${{ inputs.push_docker }}" != "true" ]; then
+            echo "::error::Select at least one architecture (build_x86_64 / build_aarch64) or enable push_docker."
             exit 1
           fi
           include=$(IFS=,; echo "[${legs[*]}]")
@@ -67,12 +69,13 @@ jobs:
           echo "Building: $include"
 
   # Bring the self-hosted GCP VMs online when opted in: ci-runner-x86 (x86_64
-  # binary build + Docker image build) and ci-runner-aarch64 (aarch64 binary
-  # build). Each box only wakes when something that runs on it is selected.
+  # binary + amd64 Docker builds) and ci-runner-aarch64 (aarch64 binary + arm64
+  # Docker builds). Each box only wakes when something that runs on it is
+  # selected.
   start-ci:
     name: Start GCP runner
     # Resume the box when anything that runs on it is selected: the x86_64 binary
-    # build or the Docker image build.
+    # build or the amd64 Docker image builds.
     if: ${{ inputs.use_gcp_runner && (inputs.build_x86_64 || inputs.push_docker) }}
     runs-on: ubuntu-latest
     steps:
@@ -83,7 +86,8 @@ jobs:
 
   start-ci-arm:
     name: Start GCP ARM runner
-    if: ${{ inputs.use_gcp_runner && inputs.build_aarch64 }}
+    # Resume the ARM box for the aarch64 binary build or the arm64 Docker builds.
+    if: ${{ inputs.use_gcp_runner && (inputs.build_aarch64 || inputs.push_docker) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,9 +99,10 @@ jobs:
 
   deploy:
     needs: [matrix, start-ci, start-ci-arm]
-    # The start jobs are skipped unless opted in, so accept their skipped
-    # results too.
-    if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
+    # Skip entirely on a docker-only run (no binary arch), so the empty binary
+    # matrix is never evaluated (an empty matrix would fail the run). The start
+    # jobs are skipped unless opted in, so accept their skipped results too.
+    if: ${{ always() && (inputs.build_x86_64 || inputs.build_aarch64) && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
     name: Build ${{ matrix.arch }} release + upload to GCS
     # Each arch builds on its native self-hosted box when opted in (gcp-builder
     # is X64, gcp-builder-arm is ARM64); otherwise on the hosted runner from the
@@ -169,22 +174,89 @@ jobs:
           echo "  $BUCKET/pivotdb-server-$ARCH-$SHA"
           echo "  $BUCKET/pivotdb-server-$ARCH-latest"
 
-  # Build the pivot server image and push it to Docker Hub (giladkl/pivot),
-  # tagged with both the commit SHA and `latest`. Independent of the binary
-  # matrix above, but shares the self-hosted gcp-builder when opted in, so it
-  # waits on start-ci to resume the box.
+  # Build the pivot server image for each arch on a native runner (no emulation —
+  # the DuckDB C++ build is far too slow under QEMU) and push each by digest.
+  # `docker-merge` then assembles the multi-arch manifest. When opted in each arch
+  # builds on its native self-hosted box (gcp-builder is X64, gcp-builder-arm is
+  # ARM64); otherwise on the hosted runner from the matrix.
   docker:
-    name: Build & push Docker image
-    needs: [start-ci]
-    # start-ci is skipped unless opted in, so accept its skipped result too.
-    if: ${{ always() && inputs.push_docker && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
-    # Build on the self-hosted gcp-builder when opted in (like the binary legs);
-    # otherwise fall back to a hosted runner.
-    runs-on: ${{ inputs.use_gcp_runner && 'gcp-builder' || 'ubuntu-latest' }}
+    name: Build pivot image (${{ matrix.arch }})
+    needs: [start-ci, start-ci-arm]
+    # The start jobs are skipped unless opted in, so accept their skipped results.
+    if: ${{ always() && inputs.push_docker && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ inputs.use_gcp_runner && (matrix.arch == 'amd64' && 'gcp-builder' || 'gcp-builder-arm') || matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # Unique builder name per job. These self-hosted boxes run several runners
+      # sharing one Docker daemon; without a unique name a sibling job's buildx
+      # cleanup (docker buildx rm) tears down this build's BuildKit mid-run
+      # (graceful_stop).
+      - uses: docker/setup-buildx-action@v3
+        with:
+          name: builder-${{ github.run_id }}-${{ github.job }}-${{ matrix.arch }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=giladkl/pivot,push-by-digest=true,name-canonical=true,push=true
+          # Plain per-arch manifests (no attestation index) so their digests
+          # compose cleanly into the merged manifest list below.
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=server-${{ matrix.arch }}
+          # ignore-error so a transient Actions Cache outage never fails the build.
+          cache-to: type=gha,scope=server-${{ matrix.arch }},mode=max,ignore-error=true
+
+      # runner.temp is unique per job and cleaned at job start, so on the
+      # persistent self-hosted runners it holds only this build's digest (a
+      # shared /tmp/digests would accumulate stale digests across runs).
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-pivot-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+
+  # Assemble the per-arch digests into one multi-arch manifest tagged with the
+  # commit SHA and `latest`.
+  docker-merge:
+    name: Merge pivot manifest
+    needs: [docker]
+    if: ${{ always() && inputs.push_docker && needs.docker.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-pivot-*
+          merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
 
@@ -194,17 +266,107 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & push
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t giladkl/pivot:${{ github.sha }} \
+            -t giladkl/pivot:latest \
+            $(printf 'giladkl/pivot@sha256:%s ' *)
+          docker buildx imagetools inspect giladkl/pivot:${{ github.sha }}
+
+  # Same native-per-arch build for the operator/router image. It is
+  # self-contained (no submodules, no DuckDB). When opted in each arch builds on
+  # its native self-hosted box (gcp-builder / gcp-builder-arm); otherwise on the
+  # hosted runner from the matrix.
+  docker-operator:
+    name: Build operator image (${{ matrix.arch }})
+    needs: [start-ci, start-ci-arm]
+    # The start jobs are skipped unless opted in, so accept their skipped results.
+    if: ${{ always() && inputs.push_docker && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ inputs.use_gcp_runner && (matrix.arch == 'amd64' && 'gcp-builder' || 'gcp-builder-arm') || matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unique builder name per job (shared-daemon multi-runner box); see the
+      # pivot build job for why.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          name: builder-${{ github.run_id }}-${{ github.job }}-${{ matrix.arch }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push by digest
+        id: build
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: server/Dockerfile
-          push: true
-          tags: |
-            giladkl/pivot:${{ github.sha }}
-            giladkl/pivot:latest
-          cache-from: type=gha,scope=server
-          cache-to: type=gha,scope=server,mode=max
+          context: operator
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=giladkl/pivot-operator,push-by-digest=true,name-canonical=true,push=true
+          # Plain per-arch manifests (no attestation index) so their digests
+          # compose cleanly into the merged manifest list below.
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=operator-${{ matrix.arch }}
+          # ignore-error so a transient Actions Cache outage never fails the build.
+          cache-to: type=gha,scope=operator-${{ matrix.arch }},mode=max,ignore-error=true
+
+      # runner.temp is unique per job and cleaned at job start, so on the
+      # persistent self-hosted runners it holds only this build's digest (a
+      # shared /tmp/digests would accumulate stale digests across runs).
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          touch "${{ runner.temp }}/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-operator-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+
+  docker-operator-merge:
+    name: Merge operator manifest
+    needs: [docker-operator]
+    if: ${{ always() && inputs.push_docker && needs.docker-operator.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-operator-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t giladkl/pivot-operator:${{ github.sha }} \
+            -t giladkl/pivot-operator:latest \
+            $(printf 'giladkl/pivot-operator@sha256:%s ' *)
+          docker buildx imagetools inspect giladkl/pivot-operator:${{ github.sha }}
 
   # NOTE: no stop job here. Each self-hosted box runs an hourly if-unused cron
   # (suspend on ci-runner-x86, stop on ci-runner-aarch64) that only takes it down when

@@ -221,12 +221,52 @@ fn init_tracing() {
         .init();
 }
 
-/// Returns the total physical memory of the machine in bytes.
+/// Returns the memory available to this process in bytes: the smaller of the
+/// machine's physical memory and this process's cgroup memory limit. Inside a
+/// container the cgroup limit is the pod's memory limit, so the server sizes its
+/// buffer pool to the pod rather than to the whole node (which would OOM-kill a
+/// small pod).
 pub fn get_total_memory() -> usize {
-    sysinfo::System::new_with_specifics(
+    let host = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
     )
-    .total_memory() as usize
+    .total_memory() as usize;
+    match cgroup_memory_limit() {
+        Some(limit) => host.min(limit),
+        None => host,
+    }
+}
+
+/// This process's cgroup memory limit in bytes, or `None` when unlimited or
+/// unreadable (e.g. not on Linux). Handles cgroup v2 (`memory.max`) and v1
+/// (`memory.limit_in_bytes`); `"max"` and the v1 near-`u64::MAX` sentinel both
+/// mean unlimited.
+fn cgroup_memory_limit() -> Option<usize> {
+    fn parse(contents: &str) -> Option<usize> {
+        let trimmed = contents.trim();
+        if trimmed == "max" {
+            return None;
+        }
+        let value: u64 = trimmed.parse().ok()?;
+        // cgroup v1 reports "unlimited" as a huge sentinel; treat any absurdly
+        // large value as no limit.
+        if value >= u64::MAX / 2 {
+            return None;
+        }
+        Some(value as usize)
+    }
+    // cgroup v2 unified hierarchy first, then v1.
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if let Some(limit) = parse(&contents) {
+                return Some(limit);
+            }
+        }
+    }
+    None
 }
 
 /// Build the remote-read disk cache from the `--disk-cache-*` flags, or `None`

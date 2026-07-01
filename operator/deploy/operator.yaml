@@ -1,0 +1,100 @@
+# The pivot operator: a cluster-scoped controller that reconciles PivotEndpoint
+# resources in any namespace. Apply after deploy/crd.yaml.
+#
+# Set PIVOT_ROUTER_IMAGE and the Deployment image to the image carrying the
+# pivot-operator / pivot-router binaries (operator/Dockerfile, or the full
+# Dockerfile). For a local kind cluster, `kind load docker-image` the image and
+# keep imagePullPolicy: IfNotPresent.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pivot-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pivot-operator
+  namespace: pivot-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pivot-operator
+rules:
+  # Watch and update the endpoints it reconciles.
+  - apiGroups: ["pivot.epsio.io"]
+    resources: ["pivotendpoints", "pivotendpoints/status"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  # Self-apply the CRD on startup.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch", "create", "patch", "update"]
+  # Manage the per-endpoint router Deployment and Service.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Create the router's RBAC. The verbs the operator grants to routers
+  # (pods + pivotendpoints reads) must also appear here, or the API server
+  # rejects the Role creation as privilege escalation.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pivot-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pivot-operator
+subjects:
+  - kind: ServiceAccount
+    name: pivot-operator
+    namespace: pivot-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pivot-operator
+  namespace: pivot-system
+  labels:
+    app.kubernetes.io/name: pivot-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pivot-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pivot-operator
+    spec:
+      serviceAccountName: pivot-operator
+      containers:
+        - name: operator
+          # Published operator image; override with your own registry via
+          # kustomize `images:`. The router pods reuse it automatically.
+          image: giladkl/pivot-operator:latest
+          imagePullPolicy: IfNotPresent
+          command: ["pivot-operator"]
+          env:
+            # The operator discovers its own image from this pod and stamps it
+            # onto the router pods it creates, so only the image above needs
+            # setting. To use a different router image, set PIVOT_ROUTER_IMAGE.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUST_LOG
+              value: info

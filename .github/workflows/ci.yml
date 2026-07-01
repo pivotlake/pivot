@@ -113,6 +113,19 @@ jobs:
 
       - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
 
+  # Build the operator pod image (operator + router binaries). Self-contained —
+  # no submodules and no DuckDB build — so it stays cheap.
+  operator-image:
+    needs: [matrix, start-ci]
+    if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
+    name: build operator image
+    runs-on: ${{ needs.matrix.outputs.runner }}
+    env:
+      DOCKER_BUILDKIT: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t pivot-operator:ci operator/
+
   # NOTE: we deliberately do NOT suspend the VM here. ci-runner-x86 runs an hourly
   # `suspend-if-unused` cron that suspends it only when no ci/deploy run is active
   # (across pivotdb + epsio). An unconditional stop job here would suspend the box

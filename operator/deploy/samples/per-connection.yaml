@@ -1,0 +1,23 @@
+# A per-connection endpoint: every psql session gets its own freshly-spawned
+# pivot pod, torn down when the session ends. The server sizes its buffer pool
+# from the pod's memory limit (below), so no memory flag is needed.
+# `serviceType: LoadBalancer` is the default; on a local kind cluster use
+# NodePort (or ClusterIP + port-forward).
+apiVersion: pivot.epsio.io/v1alpha1
+kind: PivotEndpoint
+metadata:
+  name: analytics-ephemeral
+  namespace: default
+spec:
+  mode: perConnection
+  image: giladkl/pivot:latest
+  serviceType: LoadBalancer
+  resources:
+    cpu: "1"
+    memory: "2Gi"
+  args: []
+  # Cap concurrent sessions; extra sessions are rejected.
+  maxPods: 50
+  # Keep a disconnected pod for 60s so quick reconnects reuse it.
+  reuseIdlePods: true
+  idleTimeoutSeconds: 60

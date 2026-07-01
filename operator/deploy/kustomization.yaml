@@ -1,0 +1,18 @@
+# One-command install of the operator: the CRD, RBAC, namespace, and the
+# operator Deployment.
+#
+#   kubectl apply -k operator/deploy
+#
+# Point it at your pushed operator image without editing operator.yaml:
+#
+#   cd operator/deploy
+#   kustomize edit set image giladkl/pivot-operator:latest=<registry>/pivot-operator:<tag>
+#
+# The router pods reuse the operator image automatically, so that is the only
+# image to set here; endpoints name the pivot server image in their own
+# `spec.image`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - crd.yaml
+  - operator.yaml

@@ -1,0 +1,17 @@
+# A shared endpoint: all psql sessions are routed to a long-lived pool of pivot
+# pods (here just one, so every session shares the same pod). Pods outlive
+# sessions. Increase sharedReplicas to round-robin sessions across several pods.
+apiVersion: pivot.epsio.io/v1alpha1
+kind: PivotEndpoint
+metadata:
+  name: analytics-shared
+  namespace: default
+spec:
+  mode: shared
+  image: giladkl/pivot:latest
+  serviceType: LoadBalancer
+  sharedReplicas: 1
+  resources:
+    cpu: "4"
+    memory: "8Gi"
+  args: []

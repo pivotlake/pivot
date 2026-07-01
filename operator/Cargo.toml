@@ -1,0 +1,46 @@
+[package]
+name = "operator"
+version = "0.1.0"
+edition = "2024"
+description = "Kubernetes operator and connection-routing proxy for the pivotdb postgres-wire server"
+
+[lib]
+name = "operator"
+path = "src/lib.rs"
+
+# The controller that reconciles `PivotEndpoint` resources into a router
+# Deployment + load-balancer Service + RBAC.
+[[bin]]
+name = "pivot-operator"
+path = "src/bin/operator.rs"
+
+# The data-plane connection router: fronts psql sessions and spawns/routes them
+# to pivot backend pods.
+[[bin]]
+name = "pivot-router"
+path = "src/bin/router.rs"
+
+# Prints the `PivotEndpoint` CustomResourceDefinition as YAML.
+[[bin]]
+name = "pivot-crdgen"
+path = "src/bin/crdgen.rs"
+
+[dependencies]
+kube = { version = "1.1", features = ["runtime", "derive", "client"] }
+k8s-openapi = { version = "0.25", features = ["latest"] }
+schemars = "0.8"
+tokio = { version = "1.40", features = ["rt-multi-thread", "net", "macros", "sync", "signal", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+futures = "0.3"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+
+[dev-dependencies]
+tokio-postgres = "0.7"

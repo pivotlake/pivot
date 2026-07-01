@@ -1,0 +1,148 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: pivotendpoints.pivot.epsio.io
+spec:
+  group: pivot.epsio.io
+  names:
+    categories: []
+    kind: PivotEndpoint
+    plural: pivotendpoints
+    shortNames:
+    - pep
+    singular: pivotendpoint
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .status.address
+      name: Address
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for PivotEndpointSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              args:
+                description: Extra command-line arguments appended to the pivot server invocation, e.g. `["--path", "gs://bucket/db"]`.
+                items:
+                  type: string
+                type: array
+              autoBind:
+                description: Inject `--bind 0.0.0.0:<port>` so the pivot server accepts connections from the router over the pod network. Defaults to true. Set false for a backend image that already listens on all interfaces (e.g. stock postgres) or takes a different bind flag.
+                nullable: true
+                type: boolean
+              command:
+                description: Override the container entrypoint. Leave unset to use the image's own entrypoint (the pivot image runs `pivotdb-server`).
+                items:
+                  type: string
+                type: array
+              env:
+                description: Extra environment variables for the pivot container.
+                items:
+                  description: A single environment variable injected into the pivot container.
+                  properties:
+                    name:
+                      type: string
+                    value:
+                      type: string
+                  required:
+                  - name
+                  - value
+                  type: object
+                type: array
+              idleTimeoutSeconds:
+                description: (`perConnection` only) Seconds an idle reused pod is kept before it is torn down. Requires `reuseIdlePods`. Without reuse, pods are deleted immediately on disconnect.
+                format: int64
+                nullable: true
+                type: integer
+              image:
+                description: Container image for the pivot backend pods (the postgres-wire server).
+                type: string
+              maxPods:
+                description: (`perConnection` only) Cap on concurrently live pivot pods. Sessions arriving past the cap are rejected. Unset means no cap.
+                format: int32
+                nullable: true
+                type: integer
+              mode:
+                description: Whether each psql session gets its own pivot pod, or all sessions share a long-lived pod set.
+                enum:
+                - perConnection
+                - shared
+                type: string
+              port:
+                description: Port the pivot server listens on inside its container. Defaults to 5432.
+                format: int32
+                nullable: true
+                type: integer
+              resources:
+                description: Sizing for each spawned pivot pod.
+                nullable: true
+                properties:
+                  cpu:
+                    description: CPU request, e.g. `"500m"` or `"2"`.
+                    nullable: true
+                    type: string
+                  cpuLimit:
+                    description: CPU limit. Defaults to `cpu` when omitted.
+                    nullable: true
+                    type: string
+                  memory:
+                    description: Memory request, e.g. `"512Mi"` or `"4Gi"`.
+                    nullable: true
+                    type: string
+                  memoryLimit:
+                    description: Memory limit. Defaults to `memory` when omitted.
+                    nullable: true
+                    type: string
+                type: object
+              reuseIdlePods:
+                description: (`perConnection` only) Keep a disconnected pod around and hand it to the next session instead of deleting it, reaping it only after `idleTimeoutSeconds`. Defaults to false (delete on disconnect).
+                nullable: true
+                type: boolean
+              serviceType:
+                description: Kubernetes Service type for the endpoint's address. Defaults to `LoadBalancer`. Use `NodePort` or `ClusterIP` where a cloud LB is not available (e.g. a local kind cluster).
+                nullable: true
+                type: string
+              sharedReplicas:
+                description: (`shared` only) Number of shared pivot pods to keep ready. Defaults to 1 (all sessions share one pod).
+                format: int32
+                nullable: true
+                type: integer
+            required:
+            - image
+            - mode
+            type: object
+          status:
+            description: Observed state, written back by the operator.
+            nullable: true
+            properties:
+              address:
+                description: The resolved address psql clients connect to (LB ingress, or `<host>:<nodePort>` for NodePort), once known.
+                nullable: true
+                type: string
+              observedGeneration:
+                description: The `.metadata.generation` this status reflects.
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: Human-readable lifecycle phase, e.g. `Pending`, `Ready`.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: PivotEndpoint
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
