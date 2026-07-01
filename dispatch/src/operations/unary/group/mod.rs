@@ -215,7 +215,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         // it must not take the radix scatter path (which materialises — and thus
         // persists — every row's string before any comparison). Disable the switch
         // when any value slot is a string extreme; numeric signatures keep radix.
-        let radix = if value_slots.iter().any(|s| s.kind.is_string_extreme()) {
+        let radix = if value_slots.iter().any(|s| s.is_string_extreme()) {
             radix.without_radix()
         } else {
             radix
@@ -1300,8 +1300,8 @@ mod tests {
             &[10, 7, 30, 5, 20],
         );
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View), // MIN(name) — string
-            AggregationSlot::new(AggregationKind::Max, 2, DataType::Int64),       // MAX(v)    — int
+            AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name) — string
+            AggregationSlot::new(AggregationKind::Max, 2, DataType::Int64),    // MAX(v)    — int
         ];
         type Mix = Dynamic<2, i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
@@ -1336,8 +1336,8 @@ mod tests {
             &[10, 7, 30, 5, 20],
         );
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View), // MIN(name)
-            AggregationSlot::new(AggregationKind::StrMax, 1, DataType::Utf8View), // MAX(name)
+            AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name)
+            AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View), // MAX(name)
         ];
         type Mix = Dynamic<2, i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
@@ -1377,8 +1377,8 @@ mod tests {
         let w0 = mixed_key_batch(&[1, 1], &["mango", long_z], &[1, 2]);
         let w1 = mixed_key_batch(&[1, 1], &[long_a, "mint"], &[3, 4]);
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View),
-            AggregationSlot::new(AggregationKind::StrMax, 1, DataType::Utf8View),
+            AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
+            AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
         type Mix = Dynamic<2, i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
@@ -1417,8 +1417,8 @@ mod tests {
         let batch = mixed_key_batch(&ids, &names, &vals);
 
         let slots = vec![
-            AggregationSlot::new(AggregationKind::StrMin, 1, DataType::Utf8View),
-            AggregationSlot::new(AggregationKind::StrMax, 1, DataType::Utf8View),
+            AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
+            AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
         type Mix = Dynamic<2, i128>;
         // A threshold the in-place table crosses well before N groups — a numeric

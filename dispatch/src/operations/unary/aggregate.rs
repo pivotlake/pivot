@@ -12,12 +12,14 @@
 //!
 //! A [`Slot`] owns one aggregate's whole lifecycle - fold batches in, merge a
 //! sibling worker's accumulator, render the output column - so each op's logic
-//! reads in one place. The numeric ops reuse the grouped path's
-//! [`Fold`] impls ([`Sum`]/[`Min`]/[`Max`]); the string extremes keep an owned
-//! `String` winner instead of the grouped path's arena key, since a global
-//! extreme is a single value per slot. There is no `Avg`: DuckDB lowers `AVG(x)`
-//! to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a `Count`
-//! slot.
+//! reads in one place. The integer ops reuse the grouped path's [`Fold`] impls
+//! ([`Sum`]/[`Min`]/[`Max`]); a float column accumulates in `f64`; the string
+//! extremes keep an owned `String` winner instead of the grouped path's arena key,
+//! since a global extreme is a single value per slot. A `SUM`/`MIN`/`MAX`'s value
+//! family (integer / float / string) is picked from the slot's declared
+//! `output_type`, not the `MIN`/`MAX` kind. There is no `Avg`: DuckDB lowers
+//! `AVG(x)` to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a
+//! `Count` slot.
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
@@ -28,10 +30,12 @@ use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
-    UInt32Type,
+    ArrowPrimitiveType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
+    UInt8Type, UInt16Type, UInt32Type,
 };
-use arrow_array::{Array, ArrayRef, Int64Array, PrimitiveArray, RecordBatch, StringViewArray};
+use arrow_array::{
+    Array, ArrayRef, Float64Array, Int64Array, PrimitiveArray, RecordBatch, StringViewArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -104,6 +108,56 @@ impl NumOp {
             NumOp::Max => fold_primitive_column::<A, Max<A>, T>(arr),
         }
     }
+
+    /// Combine two `f64` accumulators by this op. `MIN`/`MAX` order with
+    /// [`f64::total_cmp`] so the extreme is deterministic regardless of fold order
+    /// (NaN sorts greatest, matching DuckDB).
+    fn merge_float(self, a: f64, b: f64) -> f64 {
+        match self {
+            NumOp::Sum => a + b,
+            NumOp::Min => {
+                if b.total_cmp(&a).is_lt() {
+                    b
+                } else {
+                    a
+                }
+            }
+            NumOp::Max => {
+                if b.total_cmp(&a).is_gt() {
+                    b
+                } else {
+                    a
+                }
+            }
+        }
+    }
+
+    /// Reduce one batch's float column by this op, or `None` if the column is
+    /// empty. The float counterpart of [`reduce_column`](NumOp::reduce_column);
+    /// `REAL`/`DOUBLE` both accumulate in `f64`.
+    fn reduce_float_column(self, arr: &dyn Array) -> Option<f64> {
+        match arr.data_type() {
+            DataType::Float32 => self.reduce_float_primitive::<Float32Type>(arr.as_primitive()),
+            DataType::Float64 => self.reduce_float_primitive::<Float64Type>(arr.as_primitive()),
+            other => panic!("float aggregate: unsupported column type {other:?}"),
+        }
+    }
+
+    /// The float row loop: fold every value of a float column into an `f64` by this
+    /// op, or `None` if the column is empty.
+    fn reduce_float_primitive<T: ArrowPrimitiveType>(self, arr: &PrimitiveArray<T>) -> Option<f64>
+    where
+        T::Native: Into<f64>,
+    {
+        assert_eq!(
+            arr.null_count(),
+            0,
+            "aggregate input must not contain NULLs"
+        );
+        let mut values = arr.values().iter().map(|&v| v.into());
+        let first = values.next()?;
+        Some(values.fold(first, |a, b| self.merge_float(a, b)))
+    }
 }
 
 /// The hot numeric loop: fold every value of an integer column into an
@@ -140,6 +194,14 @@ enum Slot<A: Numeric> {
         column: usize,
         acc: Option<A>,
     },
+    /// `SUM`/`MIN`/`MAX` over a `REAL`/`DOUBLE` column, accumulating in `f64`
+    /// (independent of the integer width `A`). The output narrows to `Float32` for
+    /// a `REAL` slot via the slot's declared `output_type` cast.
+    Float {
+        op: NumOp,
+        column: usize,
+        acc: Option<f64>,
+    },
     /// `MIN`/`MAX` over a `Utf8View` column.
     Str {
         is_max: bool,
@@ -149,36 +211,36 @@ enum Slot<A: Numeric> {
 }
 
 impl<A: Numeric> Slot<A> {
-    /// The empty accumulator for `spec` - the only match on [`AggregationKind`].
+    /// The empty accumulator for `spec`. A `SUM`/`MIN`/`MAX`'s value family is
+    /// decided by the column's declared `output_type`, not the kind: a `Utf8View`
+    /// extreme keeps an owned `String`, a floating column an `f64`, else the integer
+    /// width `A`.
     fn build(spec: &AggregationSlot) -> Self {
         let column = spec.column;
-        match spec.kind {
-            AggregationKind::CountStar | AggregationKind::Count => Slot::Count { count: 0 },
-            AggregationKind::Sum => Slot::Num {
-                op: NumOp::Sum,
+        let op = match spec.kind {
+            AggregationKind::CountStar | AggregationKind::Count => return Slot::Count { count: 0 },
+            AggregationKind::Sum => NumOp::Sum,
+            AggregationKind::Min => NumOp::Min,
+            AggregationKind::Max => NumOp::Max,
+        };
+        if spec.is_string_extreme() {
+            Slot::Str {
+                is_max: matches!(op, NumOp::Max),
                 column,
                 acc: None,
-            },
-            AggregationKind::Min => Slot::Num {
-                op: NumOp::Min,
+            }
+        } else if spec.output_type.is_floating() {
+            Slot::Float {
+                op,
                 column,
                 acc: None,
-            },
-            AggregationKind::Max => Slot::Num {
-                op: NumOp::Max,
+            }
+        } else {
+            Slot::Num {
+                op,
                 column,
                 acc: None,
-            },
-            AggregationKind::StrMin => Slot::Str {
-                is_max: false,
-                column,
-                acc: None,
-            },
-            AggregationKind::StrMax => Slot::Str {
-                is_max: true,
-                column,
-                acc: None,
-            },
+            }
         }
     }
 
@@ -190,6 +252,11 @@ impl<A: Numeric> Slot<A> {
                 let op = *op;
                 let reduced = op.reduce_column::<A>(batch.column(*column).as_ref());
                 fold_into(acc, reduced, |a, b| op.merge(a, b));
+            }
+            Slot::Float { op, column, acc } => {
+                let op = *op;
+                let reduced = op.reduce_float_column(batch.column(*column).as_ref());
+                fold_into(acc, reduced, |a, b| op.merge_float(a, b));
             }
             Slot::Str {
                 is_max,
@@ -211,6 +278,10 @@ impl<A: Numeric> Slot<A> {
                 let op = *op;
                 fold_into(acc, other, |a, b| op.merge(a, b));
             }
+            (Slot::Float { op, acc, .. }, Slot::Float { acc: other, .. }) => {
+                let op = *op;
+                fold_into(acc, other, |a, b| op.merge_float(a, b));
+            }
             (Slot::Str { is_max, acc, .. }, Slot::Str { acc: other, .. }) => {
                 fold_into(acc, other, str_extreme_fn(*is_max));
             }
@@ -230,6 +301,12 @@ impl<A: Numeric> Slot<A> {
             Slot::Num { op, acc, .. } => (
                 Field::new(op.column_name(), A::data_type(), true),
                 A::scalar_array(acc),
+            ),
+            // Renders `Float64`; the outputter casts to the slot's declared
+            // `output_type` (narrowing to `Float32` for a `REAL` slot).
+            Slot::Float { op, acc, .. } => (
+                Field::new(op.column_name(), DataType::Float64, true),
+                Arc::new(Float64Array::from(vec![acc])),
             ),
             Slot::Str { is_max, acc, .. } => (
                 Field::new(if is_max { "max" } else { "min" }, DataType::Utf8View, true),
@@ -494,14 +571,18 @@ mod tests {
         AggregationSlot::new(kind, column, test_output_type(kind))
     }
 
-    /// The output type a test slot of `kind` declares: `Decimal128` for a sum,
-    /// `Utf8View` for a string extreme, `Int64` otherwise (the accumulator's
-    /// natural width for a count or numeric extreme over the int columns tests
-    /// use).
+    /// A `MIN`/`MAX` over a string column, declared as `Utf8View` (which is how the
+    /// operator picks the string extreme over the numeric one).
+    fn str_slot(kind: AggregationKind, column: usize) -> AggregationSlot {
+        AggregationSlot::new(kind, column, arrow_schema::DataType::Utf8View)
+    }
+
+    /// The output type a numeric test slot of `kind` declares: `Decimal128` for a
+    /// sum, `Int64` otherwise (the accumulator's natural width for a count or numeric
+    /// extreme over the int columns tests use).
     fn test_output_type(kind: AggregationKind) -> arrow_schema::DataType {
         match kind {
             AggregationKind::Sum => arrow_schema::DataType::Decimal128(38, 0),
-            AggregationKind::StrMin | AggregationKind::StrMax => arrow_schema::DataType::Utf8View,
             _ => arrow_schema::DataType::Int64,
         }
     }
@@ -639,8 +720,8 @@ mod tests {
         let ops = build::<i64>(
             1,
             vec![
-                slot(AggregationKind::StrMin, 0),
-                slot(AggregationKind::StrMax, 0),
+                str_slot(AggregationKind::Min, 0),
+                str_slot(AggregationKind::Max, 0),
             ],
         );
 
@@ -662,8 +743,8 @@ mod tests {
         let ops = build::<i64>(
             3,
             vec![
-                slot(AggregationKind::StrMin, 0),
-                slot(AggregationKind::StrMax, 0),
+                str_slot(AggregationKind::Min, 0),
+                str_slot(AggregationKind::Max, 0),
             ],
         );
 
@@ -699,7 +780,7 @@ mod tests {
         let ops = build::<i64>(
             1,
             vec![
-                slot(AggregationKind::StrMin, 0),
+                str_slot(AggregationKind::Min, 0),
                 slot(AggregationKind::Sum, 1),
             ],
         );
@@ -708,5 +789,69 @@ mod tests {
 
         assert_eq!(col_str(&out.items[0], 0), "apple");
         assert_eq!(col_i128(&out.items[0], 1), 6); // SUM is Decimal128
+    }
+
+    fn make_f64_batch(values: &[f64]) -> RecordBatch {
+        let array = Float64Array::from(values.to_vec());
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, false)])),
+            vec![Arc::new(array)],
+        )
+        .unwrap()
+    }
+
+    /// A float slot declares a floating `output_type`, which is how the operator
+    /// accumulates it in `f64`.
+    fn float_slot(kind: AggregationKind, column: usize) -> AggregationSlot {
+        AggregationSlot::new(kind, column, DataType::Float64)
+    }
+
+    fn col_f64(batch: &RecordBatch, i: usize) -> f64 {
+        batch.column(i).as_primitive::<Float64Type>().value(0)
+    }
+
+    #[test]
+    fn float_sum_over_batches() {
+        let ops = build::<i64>(1, vec![float_slot(AggregationKind::Sum, 0)]);
+
+        let out = run_consumers(
+            ops,
+            vec![vec![make_f64_batch(&[1.5, 2.25]), make_f64_batch(&[0.25])]],
+        );
+
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(col_f64(&out.items[0], 0), 4.0);
+    }
+
+    #[test]
+    fn float_min_max_merge_across_workers() {
+        let ops = build::<i64>(
+            3,
+            vec![
+                float_slot(AggregationKind::Min, 0),
+                float_slot(AggregationKind::Max, 0),
+            ],
+        );
+
+        let out = run_consumers(
+            ops,
+            vec![
+                vec![make_f64_batch(&[10.5, 4.5])],
+                vec![make_f64_batch(&[-3.5, 20.5])],
+                vec![make_f64_batch(&[7.0])],
+            ],
+        );
+
+        assert_eq!(col_f64(&out.items[0], 0), -3.5); // min
+        assert_eq!(col_f64(&out.items[0], 1), 20.5); // max
+    }
+
+    #[test]
+    fn empty_input_float_sum_is_null() {
+        let ops = build::<i64>(1, vec![float_slot(AggregationKind::Sum, 0)]);
+
+        let out = run_consumers(ops, vec![vec![]]);
+
+        assert!(out.items[0].column(0).is_null(0));
     }
 }

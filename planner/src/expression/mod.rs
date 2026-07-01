@@ -125,6 +125,8 @@ impl Expression {
                 arrow_schema::DataType::Int16 => Ok(Type::Int16),
                 arrow_schema::DataType::Int32 => Ok(Type::Int32),
                 arrow_schema::DataType::Int64 => Ok(Type::Int64),
+                arrow_schema::DataType::Float32 => Ok(Type::Float32),
+                arrow_schema::DataType::Float64 => Ok(Type::Float64),
                 _ => Err(compile::Error::IndeterminateResultType(self.clone())),
             },
             // A CASE's branches are unified to one type by DuckDB, so the ELSE

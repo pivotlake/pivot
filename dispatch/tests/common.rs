@@ -3,7 +3,7 @@
 //! Parquet-specific helpers live in `catalog`'s copy of this file, alongside the
 //! Parquet reader tests that moved there.
 
-use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray, UInt64Array};
+use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringViewArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use std::ops::Deref;
 use std::sync::{Arc, Once};
@@ -89,6 +89,20 @@ pub fn collect_i64s(batches: &[RecordBatch], col: usize) -> Vec<i64> {
         .iter()
         .flat_map(|b| {
             let a = b.column(col).as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..a.len()).map(move |i| a.value(i))
+        })
+        .collect()
+}
+
+pub fn collect_f64s(batches: &[RecordBatch], col: usize) -> Vec<f64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let a = b
+                .column(col)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
             (0..a.len()).map(move |i| a.value(i))
         })
         .collect()

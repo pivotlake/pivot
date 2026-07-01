@@ -259,8 +259,7 @@ pub(super) fn build_group_by_operator(
 
     // Cell width: i128 when a string extreme needs its 128-bit `ArenaKey` cell, or
     // when a SUM reads a 64-bit column; else the narrow i64 entry.
-    let wide =
-        slots.iter().any(|s| s.kind.is_string_extreme()) || sum_reads_wide_column(&unique_exprs);
+    let wide = slots.iter().any(|s| s.is_string_extreme()) || sum_reads_wide_column(&unique_exprs);
 
     let grouped = dispatch_group_by(input, keys, slots, &sig, wide, output_limit)?;
 
@@ -347,6 +346,9 @@ fn canonical_input_type(result_type: &Type) -> Option<Type> {
         Type::Date => Some(Type::Date),
         Type::Timestamp => Some(Type::Timestamp),
         Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 => Some(Type::Int64),
+        // A computed float aggregate argument (`SUM(a * b)`) materialises as the
+        // Float64 the float readers consume.
+        Type::Float32 | Type::Float64 => Some(Type::Float64),
         _ => None,
     }
 }
@@ -543,12 +545,14 @@ pub(super) fn dispatch_group_by(
     // Whether every slot folds additively (COUNT/SUM, no MIN/MAX or string
     // extreme): the `ONLY_ADDITIVE` `Dynamic` then merges branch-free (`a + b`) and
     // prunes its non-additive arms, skipping the per-slot kind dispatch (~1.5-2% on
-    // a low-card grouped aggregate).
+    // a low-card grouped aggregate). A float `SUM` (a floating `output_type`) is
+    // excluded: its cell holds `f64` bits, so the branch-free integer `a + b` would
+    // corrupt it.
     let all_additive = slots.iter().all(|s| {
         matches!(
             s.kind,
             AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
-        )
+        ) && !s.output_type.is_floating()
     });
 
     // The leaf combiner: both monomorphisation axes meet here, building the GROUP
@@ -654,11 +658,139 @@ mod tests {
     use crate::test_support::*;
     use crate::types::Type;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Date32Type;
-    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_array::types::{Date32Type, Float64Type};
+    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array};
     use arrow_schema::DataType;
     use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    fn grouped_aggregates_over_double_are_float64(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "metrics",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "v",
+                    Type::Float64,
+                    Arc::new(Float64Array::from(vec![1.5, 0.5, 4.0])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(v), MIN(v), MAX(v) FROM metrics GROUP BY g ORDER BY g",
+        );
+
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64); // SUM
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64); // MIN
+        assert_eq!(schema.field(3).data_type(), &DataType::Float64); // MAX
+        let sum = batches[0].column(1).as_primitive::<Float64Type>();
+        assert_eq!(sum.value(0), 2.0); // group 1: 1.5 + 0.5
+        assert_eq!(sum.value(1), 4.0); // group 2
+    }
+
+    #[rstest]
+    fn grouped_sum_over_real_widens_min_stays_real(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "reals",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "v",
+                    Type::Float32,
+                    Arc::new(Float32Array::from(vec![1.5f32, 2.5, 4.0])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(v), MIN(v) FROM reals GROUP BY g ORDER BY g",
+        );
+
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Float64); // SUM(REAL) widens to DOUBLE
+        assert_eq!(schema.field(2).data_type(), &DataType::Float32); // MIN(REAL) stays REAL
+    }
+
+    #[rstest]
+    fn grouped_mixed_int64_and_double_sum(mut testing_planner: TestingPlanner) {
+        // A wide (i64) integer SUM forces the i128 cell; the float SUM rides the
+        // same cell with its f64 bits bit-punned in. Each renders its own type.
+        use arrow_array::Int64Array;
+        use arrow_array::types::Decimal128Type;
+        testing_planner.add_table(
+            "mixed",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "i",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![10i64, 20, 7])) as ArrayRef,
+                ),
+                (
+                    "d",
+                    Type::Float64,
+                    Arc::new(Float64Array::from(vec![1.5, 2.5, 4.0])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(i), SUM(d) FROM mixed GROUP BY g ORDER BY g",
+        );
+
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(38, 0)); // SUM(int)
+        assert_eq!(schema.field(2).data_type(), &DataType::Float64); // SUM(double)
+        assert_eq!(
+            batches[0]
+                .column(1)
+                .as_primitive::<Decimal128Type>()
+                .value(0),
+            30 // group 1: 10 + 20
+        );
+        assert_eq!(
+            batches[0].column(2).as_primitive::<Float64Type>().value(0),
+            4.0
+        ); // 1.5 + 2.5
+    }
+
+    #[rstest]
+    fn global_avg_over_double_is_float64(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "avgd",
+            &[(
+                "v",
+                Type::Float64,
+                Arc::new(Float64Array::from(vec![2.0, 4.0])) as ArrayRef,
+            )],
+        );
+
+        let batches = run_batches(&mut testing_planner, "SELECT AVG(v) FROM avgd");
+
+        assert_eq!(batches[0].column(0).data_type(), &DataType::Float64);
+        assert_eq!(
+            batches[0].column(0).as_primitive::<Float64Type>().value(0),
+            3.0
+        );
+    }
 
     #[rstest]
     fn group_by_date_emits_dates(mut testing_planner: TestingPlanner) {
