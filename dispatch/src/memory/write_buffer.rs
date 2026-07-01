@@ -1,5 +1,5 @@
 use crate::memory::BUFFER_SIZE;
-use crate::memory::context::memory_ctx;
+use crate::memory::context::{MemoryContext, current_ctx_ptr};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::Ordering;
@@ -26,6 +26,15 @@ pub struct WriteBuffer {
     /// Whether the memory was zeroed when this buffer was acquired.
     /// Callers can check this to skip redundant zeroing.
     pub zeroed: bool,
+    /// The memory context (NUMA node domain) this slot belongs to, captured at
+    /// acquisition. The slot is returned here on drop even if that happens on a
+    /// different node's worker thread; see [`Ring::try_write`]. Null only if the
+    /// buffer was somehow acquired with no context installed (tests).
+    ///
+    /// Type-erased to `*const ()` so it doesn't drag `MemoryContext`'s (non
+    /// unwind-safe) interior mutability into `WriteBuffer`, which must stay
+    /// `RefUnwindSafe` to cross the worker's `catch_unwind`.
+    pub(crate) owner: *const (),
 }
 
 impl WriteBuffer {
@@ -44,12 +53,31 @@ impl WriteBuffer {
         unsafe {
             std::ptr::write_bytes(self.ptr, 0, BUFFER_SIZE);
         }
-        memory_ctx()
-            .ring()
-            .set_slot_used(self.slot_idx, 0, Ordering::Release);
-        memory_ctx().ring().set_slot_zeroed(self.slot_idx, true);
-        memory_ctx().push_free_idx(self.slot_idx, true);
+        self.release(true);
         mem::forget(self);
+    }
+
+    /// Return this slot to its owning context's ring and free pool, marking it
+    /// `zeroed` or dirty. The slot always belongs to `self.owner`'s NUMA domain,
+    /// which may not be the domain of the thread doing the release (a shared
+    /// group-by arena can drop off-node). When releasing off the owning worker we
+    /// must route through the pool's cross-thread injector rather than its
+    /// single-producer local deque.
+    fn release(&self, zeroed: bool) {
+        let owner = if self.owner.is_null() {
+            current_ctx_ptr() as *const ()
+        } else {
+            self.owner
+        };
+        let ctx = unsafe { &*(owner as *const MemoryContext) };
+        ctx.ring().set_slot_zeroed(self.slot_idx, zeroed);
+        ctx.ring()
+            .set_slot_used(self.slot_idx, 0, Ordering::Release);
+        if std::ptr::eq(owner, current_ctx_ptr() as *const ()) {
+            ctx.push_free_idx(self.slot_idx, zeroed);
+        } else {
+            ctx.push_free_idx_via_injector(self.slot_idx, zeroed);
+        }
     }
 }
 
@@ -85,10 +113,6 @@ impl AsMut<[u8]> for WriteBuffer {
 /// Marks the slot as unused (dirty) and returns it to the free pool.
 impl Drop for WriteBuffer {
     fn drop(&mut self) {
-        memory_ctx().ring().set_slot_zeroed(self.slot_idx, false);
-        memory_ctx()
-            .ring()
-            .set_slot_used(self.slot_idx, 0, Ordering::Release);
-        memory_ctx().push_free_idx(self.slot_idx, false);
+        self.release(false);
     }
 }

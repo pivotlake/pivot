@@ -159,6 +159,13 @@ impl Ring {
                 ptr: slot.buffer, // *mut u8 from the mmap
                 slot_idx: idx,
                 zeroed: slot.zeroed.load(Ordering::Relaxed),
+                // A slot is always acquired on the worker that owns its memory
+                // domain, so the current context is this buffer's home. Captured
+                // here so the buffer returns to *this* ring/pool even if it is
+                // dropped on another node's worker (e.g. a shared group-by arena
+                // dropped off-node) — otherwise the slot would be freed against
+                // the wrong node's ring and pool.
+                owner: crate::memory::context::current_ctx_ptr() as *const (),
             });
         }
         None

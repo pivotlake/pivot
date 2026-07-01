@@ -28,6 +28,13 @@ pub fn memory_ctx() -> &'static MemoryContext {
     unsafe { &*MEMORY_CTX_PTR.get() }
 }
 
+/// Raw pointer to the calling thread's installed [`MemoryContext`], or null if
+/// none is installed. Used to tag each [`WriteBuffer`] with its owning domain so
+/// it can be freed against the right node even when dropped on another thread.
+pub(crate) fn current_ctx_ptr() -> *const MemoryContext {
+    MEMORY_CTX_PTR.get()
+}
+
 /// True when a [`MemoryContext`] is installed on the current thread - i.e. the
 /// caller is running on a dispatch worker (or a test that called
 /// `init_test_free_pool`). Worker-only APIs that reach into the per-thread
@@ -151,6 +158,18 @@ impl MemoryContext {
             self.zeroed_pool.push(idx)
         } else {
             self.dirty_pool.push(idx)
+        }
+    }
+
+    /// Return a free index through the pool's cross-thread injector only, never
+    /// the per-worker local deque. Used when releasing a buffer from a thread
+    /// that does not own this context (a shared arena dropped off-node): the
+    /// local deque is single-producer and only its owning worker may push to it.
+    pub(crate) fn push_free_idx_via_injector(&self, idx: usize, zeroed: bool) {
+        if zeroed {
+            self.zeroed_pool.push_via_injector(idx)
+        } else {
+            self.dirty_pool.push_via_injector(idx)
         }
     }
 

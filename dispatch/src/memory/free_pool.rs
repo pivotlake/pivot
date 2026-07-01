@@ -132,6 +132,16 @@ impl FreePool {
             self.injectors[home_worker].push(idx);
         }
     }
+
+    /// Return an index straight to its home worker's injector, skipping the
+    /// local-deque fast path. Safe to call from any thread (the injector is
+    /// multi-producer), unlike [`push`](Self::push) whose local deque may only be
+    /// pushed to by its owning worker. Used to release a buffer whose owning
+    /// worker is not the current thread.
+    pub(crate) fn push_via_injector(&self, idx: usize) {
+        let home_worker = idx % self.injectors.len();
+        self.injectors[home_worker].push(idx);
+    }
 }
 
 #[cfg(test)]
