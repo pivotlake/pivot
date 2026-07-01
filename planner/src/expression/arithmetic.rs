@@ -126,4 +126,28 @@ mod tests {
             vec![22, 44, 66, 88, 110]
         );
     }
+
+    // `1.5` is a DECIMAL literal and `1.5e0` a DOUBLE literal in DuckDB, so the
+    // two cases exercise both halves of the `Type::Float64 | Type::Decimal`
+    // scalar arm. Both multiply column `a` (1..5) to the same f64-exact result.
+    #[rstest]
+    #[case::decimal_literal("SELECT 1.5 * a FROM example_table")]
+    #[case::double_literal("SELECT 1.5e0 * a FROM example_table")]
+    fn float_scalar_times_column(mut testing_planner: TestingPlanner, #[case] sql: &str) {
+        let mut rows = run(&mut testing_planner, sql);
+
+        rows.sort_by(|l, r| {
+            only_column(l)
+                .as_f64()
+                .unwrap()
+                .total_cmp(&only_column(r).as_f64().unwrap())
+        });
+
+        assert_eq!(
+            rows.iter()
+                .map(|r| only_column(r).as_f64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1.5, 3.0, 4.5, 6.0, 7.5]
+        );
+    }
 }

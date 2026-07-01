@@ -15,8 +15,8 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar,
+    StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use duckdb_planner::ScalarValue;
@@ -45,11 +45,13 @@ pub enum Type {
     /// executor emits `SUM` as a `Decimal128(38, 0)` column matching this
     /// width, so large sums (e.g. `SUM(user_id)`) stay exact.
     Int128,
-    /// DuckDB `DOUBLE` — the result type of `AVG`.
+    /// DuckDB `DOUBLE`: the result type of `AVG`, and the type of a double
+    /// constant (e.g. `1.5e0`). Pivot carries it as a `Float64` column.
     Float64,
-    /// DuckDB `DECIMAL` — the result type of integer division (`AVG` lowers to
-    /// `sum / count`, whose `/` yields DECIMAL). Pivot computes it as `Float64`,
-    /// so this only needs to round-trip through plan translation.
+    /// DuckDB `DECIMAL`: the result type of integer division (`AVG` lowers to
+    /// `sum / count`, whose `/` yields DECIMAL) and the type of a decimal
+    /// constant (e.g. `1.5`). Pivot computes it as a `Float64`, so a decimal
+    /// constant is materialized and computed in f64, not exact decimal.
     Decimal,
     Utf8,
     /// DuckDB `DATE` — days since the epoch. The source parquet stores it as a
@@ -213,6 +215,12 @@ pub fn build_scalar_value(
             UInt64Array::new_scalar(parse_scalar::<u64>(&raw_value, logical_type.clone())?)
                 .into_inner(),
         ),
+        // DuckDB serialises a DOUBLE or DECIMAL constant as its decimal string
+        // ("1.5"); both map to a Float64 column in the executor, so parse to f64.
+        Type::Float64 | Type::Decimal => Arc::new(
+            Float64Array::new_scalar(parse_scalar::<f64>(&raw_value, logical_type.clone())?)
+                .into_inner(),
+        ),
         Type::Utf8 => Arc::new(StringViewArray::new_scalar(raw_value).into_inner()),
         // DuckDB serialises a DATE constant as "YYYY-MM-DD"; let arrow parse it
         // to a Date32 (days since epoch). Comparisons coerce both sides to a
@@ -233,10 +241,11 @@ pub fn build_scalar_value(
                 .value(0);
             Arc::new(arrow_array::Date32Array::new_scalar(days).into_inner())
         }
-        // SUM/AVG result types and TIMESTAMP never appear as query *constants*
-        // (TIMESTAMP shows up only as a column / date_trunc result), so we don't
-        // need to materialise them as scalar literals.
-        Type::Int128 | Type::Float64 | Type::Decimal | Type::Timestamp => {
+        // `HUGEINT` and `TIMESTAMP` literals (a big-integer constant, or
+        // `TIMESTAMP '...'`) can reach here, but pivot has no scalar
+        // materialization for them yet, so they are rejected rather than
+        // silently mishandled.
+        Type::Int128 | Type::Timestamp => {
             return Err(Error::UnsupportedScalarType(pivot_type));
         }
     };

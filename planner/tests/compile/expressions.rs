@@ -681,12 +681,10 @@ fn arithmetic_does_not_truncate_floats(mut testing_planner: TestingPlanner) {
         ],
     );
 
-    // `f` is a DOUBLE column, `n` an INTEGER column (a float *constant* isn't
-    // supported, so both operands must be columns). DuckDB casts `n` to DOUBLE,
-    // but the bridge unwraps that column cast, so the operands reach the kernel
-    // with mismatched types (Float64 array vs Int32 array) and hit the coercion
-    // branch. Coercing both to Int64 there would truncate `f` (1.5 -> 1) before
-    // adding; the result must keep the fractional input.
+    // `f` is a DOUBLE column, `n` an INTEGER column. DuckDB casts `n` to DOUBLE
+    // and the plan keeps that cast, so both operands reach the kernel as Float64
+    // and the sum keeps the fractional input rather than truncating `f`
+    // (1.5 -> 1) before adding.
     let results = testing_planner
         .planner
         .plan("SELECT f + n FROM mixed")
