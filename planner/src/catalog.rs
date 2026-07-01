@@ -21,10 +21,10 @@ use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
+use duckdb_planner::Expr;
 use duckdb_planner::catalog_provider::{
     DuckDBBind, DuckDBTable, ScalarFunctionDef, TableFunctionDef,
 };
-use duckdb_planner::expression::TableFilter as DuckDBTableFilter;
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
@@ -219,9 +219,13 @@ impl DuckDBTable for DuckDBTableAdapter {
 
     fn pushdown_filter(
         &mut self,
-        filter: DuckDBTableFilter,
+        filter: Expr<'_>,
     ) -> duckdb_planner::catalog_provider::Result<bool> {
-        let filter: TableFilter = filter.try_into()?;
+        // Translate the borrowed DuckDB filter expression into a Pivot one (the
+        // only filter shape the bridge pushes is a bound expression).
+        let filter = TableFilter::Expression(Box::new(crate::expression::Expression::from_handle(
+            filter,
+        )?));
         Ok(self.table.pushdown_filter(filter)?)
     }
 }

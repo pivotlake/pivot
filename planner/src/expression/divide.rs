@@ -1,10 +1,9 @@
 //! [`Divide`] — SQL `lhs / rhs` (float division).
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 
 /// SQL `lhs / rhs`. Used by `AVG`, which DuckDB lowers to `sum(x) / count(x)`.
@@ -12,23 +11,6 @@ use std::fmt::{self, Display};
 pub struct Divide {
     pub left: Box<Expression>,
     pub right: Box<Expression>,
-}
-
-impl TryFrom<duckdb_expression::Function> for Divide {
-    type Error = Error;
-    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
-        if f.params.len() != 2 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 2,
-                actual,
-            });
-        }
-        let right = Box::new(Expression::try_from(f.params.remove(1))?);
-        let left = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(Divide { left, right })
-    }
 }
 
 impl Display for Divide {

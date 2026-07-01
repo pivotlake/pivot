@@ -1,11 +1,10 @@
 //! [`InList`] — an `input IN (v0, v1, …)` membership test.
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::boolean::or;
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_ord::cmp::eq;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -15,20 +14,6 @@ use std::sync::Arc;
 pub struct InList {
     pub input: Box<Expression>,
     pub values: Vec<Expression>,
-}
-
-impl TryFrom<duckdb_expression::InList> for InList {
-    type Error = Error;
-    fn try_from(i: duckdb_expression::InList) -> Result<Self, Self::Error> {
-        Ok(InList {
-            input: Box::<Expression>::try_from(i.input)?,
-            values: i
-                .values
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
 }
 
 impl Display for InList {

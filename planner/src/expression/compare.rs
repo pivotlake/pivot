@@ -3,12 +3,11 @@
 use super::Error;
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::{Type, type_from_logical};
+use crate::types::Type;
 use arrow_array::{ArrayRef, BooleanArray, Datum, RecordBatch};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::ArrowError;
 use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -62,18 +61,6 @@ pub struct Compare {
     pub right: Box<Expression>,
     pub compare_type: CompareType,
     pub return_type: Type,
-}
-
-impl TryFrom<duckdb_expression::Compare> for Compare {
-    type Error = Error;
-    fn try_from(c: duckdb_expression::Compare) -> Result<Self, Self::Error> {
-        Ok(Compare {
-            left: Box::<Expression>::try_from(c.left)?,
-            right: Box::<Expression>::try_from(c.right)?,
-            compare_type: c.compare_type.try_into()?,
-            return_type: type_from_logical(c.return_type)?,
-        })
-    }
 }
 
 impl Display for Compare {

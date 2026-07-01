@@ -1,10 +1,8 @@
 //! [`CreateTable`] — `CREATE TABLE` with an explicit column list.
 
-use crate::catalog::{Catalog, Column, CreateTableRequest};
+use crate::catalog::{Catalog, CreateTableRequest};
 use crate::compile::Error;
-use crate::types::type_from_logical;
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::Arc;
 
@@ -16,34 +14,6 @@ pub struct CreateTable {
     pub temporary: bool,
     pub has_query: bool,
     pub constraint_count: usize,
-}
-
-impl TryFrom<duckdb_operator::CreateTable> for CreateTable {
-    type Error = super::Error;
-
-    fn try_from(create_table: duckdb_operator::CreateTable) -> Result<Self, Self::Error> {
-        Ok(Self {
-            request: CreateTableRequest {
-                name: create_table.name,
-                columns: create_table
-                    .columns
-                    .into_iter()
-                    .map(|column| {
-                        Ok(Column {
-                            name: column.name,
-                            col_type: type_from_logical(column.col_type)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, super::Error>>()?,
-                options: create_table.options,
-                if_not_exists: create_table.if_not_exists,
-            },
-            or_replace: create_table.or_replace,
-            temporary: create_table.temporary,
-            has_query: create_table.has_query,
-            constraint_count: create_table.constraint_count,
-        })
-    }
 }
 
 impl fmt::Display for CreateTable {

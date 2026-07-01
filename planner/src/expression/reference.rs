@@ -1,10 +1,8 @@
 //! [`Ref`] — a bound column reference.
 
-use super::Error;
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
-use crate::types::{Type, type_from_logical};
+use crate::types::Type;
 use arrow_array::RecordBatch;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 
 /// A bound column reference (points at a column by index in the input).
@@ -15,22 +13,6 @@ pub struct Ref {
     /// The column's source name from DuckDB's binding, when known. Display-only;
     /// `None` for synthesized references, which fall back to the `#idx` form.
     pub name: Option<String>,
-}
-
-impl TryFrom<duckdb_expression::Ref> for Ref {
-    type Error = Error;
-    fn try_from(r: duckdb_expression::Ref) -> Result<Self, Self::Error> {
-        Ok(Ref {
-            column_idx: r.column_idx,
-            return_type: type_from_logical(r.return_type)?,
-            // Drop DuckDB's positional aliases (e.g. "0" for an unnamed computed
-            // group key): an all-digit name carries no more than the index does
-            // and reads as a constant in a plan dump, so fall back to `#idx`.
-            name: r
-                .name
-                .filter(|n| !n.is_empty() && !n.bytes().all(|b| b.is_ascii_digit())),
-        })
-    }
 }
 
 impl Display for Ref {

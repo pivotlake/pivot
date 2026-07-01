@@ -10,12 +10,11 @@
 //! and days→`Date32` is the same for an `Int32` source (a cheap widening cast
 //! for a narrower integer like ClickBench's `UInt16` `EventDate`).
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, TimeUnit};
-use duckdb_planner::expression as duckdb_expression;
+use arrow_schema::DataType;
 use std::fmt::{self, Display};
 
 /// A unary integer→temporal conversion. `result` is the pivot type the call
@@ -24,68 +23,21 @@ use std::fmt::{self, Display};
 #[derive(Debug, Clone)]
 pub struct TemporalConvert {
     /// Display name of the originating function (`make_date` / `make_timestamp`).
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The pivot type this call produces, for `result_type`.
     pub result: Type,
     /// The arrow type the integer source is cast into.
-    target: DataType,
+    pub(crate) target: DataType,
     /// `target`'s physical integer type (`Int32` for `Date32`, `Int64` for
     /// `Timestamp`). A source already of this type reinterprets straight to
     /// `target`; a narrower one (e.g. `UInt16`) widens through it first, since
     /// arrow has no direct `UInt16`→`Date32` cast.
-    via: DataType,
+    pub(crate) via: DataType,
     /// The integer source expression.
-    source: Box<Expression>,
+    pub(crate) source: Box<Expression>,
 }
 
 impl TemporalConvert {
-    /// `make_date(days)` → `Date32`.
-    pub(super) fn make_date(f: duckdb_expression::Function) -> Result<Self, Error> {
-        Self::build(
-            "make_date",
-            Type::Date,
-            DataType::Date32,
-            DataType::Int32,
-            f,
-        )
-    }
-
-    /// `make_timestamp(seconds)` → `Timestamp(Second)`.
-    pub(super) fn make_timestamp(f: duckdb_expression::Function) -> Result<Self, Error> {
-        Self::build(
-            "make_timestamp",
-            Type::Timestamp,
-            DataType::Timestamp(TimeUnit::Second, None),
-            DataType::Int64,
-            f,
-        )
-    }
-
-    fn build(
-        name: &'static str,
-        result: Type,
-        target: DataType,
-        via: DataType,
-        mut f: duckdb_expression::Function,
-    ) -> Result<Self, Error> {
-        if f.params.len() != 1 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 1,
-                actual,
-            });
-        }
-        let source = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(TemporalConvert {
-            name,
-            result,
-            target,
-            via,
-            source,
-        })
-    }
-
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         let target = self.target.clone();
         let via = self.via.clone();

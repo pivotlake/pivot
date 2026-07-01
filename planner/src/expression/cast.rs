@@ -5,12 +5,11 @@
 //! arrow [`DataType`] at runtime. A temporal target casts to its real arrow type
 //! (`Date32`/`Timestamp`), every other to its physical storage type.
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::{self, Type};
+use crate::types::Type;
 use arrow_array::{RecordBatch, Scalar};
 use arrow_schema::DataType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 
 /// A `CAST(source AS target)`. `target` is the pivot type (used for the result
@@ -19,22 +18,8 @@ use std::fmt::{self, Display};
 #[derive(Debug, Clone)]
 pub struct Cast {
     pub target: Type,
-    target_arrow: DataType,
-    source: Box<Expression>,
-}
-
-impl TryFrom<duckdb_expression::Cast> for Cast {
-    type Error = Error;
-    fn try_from(c: duckdb_expression::Cast) -> Result<Self, Self::Error> {
-        let target = types::type_from_logical(c.target_type)?;
-        let target_arrow = types::physical_arrow_type(&target);
-        let source = Box::new(Expression::try_from(*c.child)?);
-        Ok(Cast {
-            target,
-            target_arrow,
-            source,
-        })
-    }
+    pub(crate) target_arrow: DataType,
+    pub(crate) source: Box<Expression>,
 }
 
 impl Display for Cast {

@@ -14,6 +14,7 @@ struct ExtractPlanResult;
 // CXX as opaque types by their real names.
 using LogicalOperator = duckdb::LogicalOperator;
 using Expression = duckdb::Expression;
+using Value = duckdb::Value;
 
 struct DuckPlannerContext {
 	rust::Box<CatalogContext> catalog;  // owns the CatalogContext; must outlive db
@@ -107,8 +108,7 @@ uint8_t lo_get_dynamic_filter_comparison(const LogicalOperator &op, size_t index
 rust::String lo_get_function_name(const LogicalOperator &op);
 bool lo_get_has_named_params(const LogicalOperator &op);
 size_t lo_get_param_count(const LogicalOperator &op);
-uint8_t lo_get_param_type(const LogicalOperator &op, size_t index);
-rust::String lo_get_param_value(const LogicalOperator &op, size_t index);
+const Value &lo_get_param(const LogicalOperator &op, size_t index);
 
 // ---- CreateTable ----
 rust::String lo_create_table_name(const LogicalOperator &op);
@@ -144,8 +144,26 @@ uint8_t expr_return_type(const Expression &expr);
 bool expr_has_alias(const Expression &expr);
 rust::String expr_alias(const Expression &expr);
 
-uint8_t expr_constant_type(const Expression &expr);
-rust::String expr_constant_value(const Expression &expr);
+const Value &expr_constant(const Expression &expr);
+
+uint8_t value_type(const Value &v);
+bool value_bool(const Value &v);
+int8_t value_i8(const Value &v);
+int16_t value_i16(const Value &v);
+int32_t value_i32(const Value &v);
+int64_t value_i64(const Value &v);
+uint8_t value_u8(const Value &v);
+uint16_t value_u16(const Value &v);
+uint32_t value_u32(const Value &v);
+uint64_t value_u64(const Value &v);
+float value_f32(const Value &v);
+double value_f64(const Value &v);
+rust::String value_string(const Value &v);
+int32_t value_date(const Value &v);
+int64_t value_timestamp(const Value &v);
+int32_t value_interval_months(const Value &v);
+int32_t value_interval_days(const Value &v);
+int64_t value_interval_micros(const Value &v);
 
 size_t expr_ref_index(const Expression &expr);
 size_t expr_columnref_index(const Expression &expr);

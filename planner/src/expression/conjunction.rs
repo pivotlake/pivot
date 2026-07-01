@@ -1,12 +1,10 @@
 //! [`Conjunction`] — a boolean `AND`/`OR` over child predicates.
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::boolean::{and, or};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
-use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -24,25 +22,6 @@ pub enum ConjunctionOp {
 pub struct Conjunction {
     pub op: ConjunctionOp,
     pub children: Vec<Expression>,
-}
-
-impl TryFrom<duckdb_expression::Conjunction> for Conjunction {
-    type Error = Error;
-    fn try_from(c: duckdb_expression::Conjunction) -> Result<Self, Self::Error> {
-        let op = if c.conjunction_type.clone() as u8 == ExpressionType::CONJUNCTION_OR as u8 {
-            ConjunctionOp::Or
-        } else {
-            ConjunctionOp::And
-        };
-        Ok(Conjunction {
-            op,
-            children: c
-                .children
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
 }
 
 impl Display for Conjunction {

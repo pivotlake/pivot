@@ -1,12 +1,11 @@
 //! [`Between`] — a `BETWEEN` range test.
 
+use super::Expression;
 use super::compare::CmpKernel;
-use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::boolean::and;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ord::cmp::{gt, gt_eq, lt, lt_eq};
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -20,19 +19,6 @@ pub struct Between {
     pub upper: Box<Expression>,
     pub lower_inclusive: bool,
     pub upper_inclusive: bool,
-}
-
-impl TryFrom<duckdb_expression::Between> for Between {
-    type Error = Error;
-    fn try_from(b: duckdb_expression::Between) -> Result<Self, Self::Error> {
-        Ok(Between {
-            input: Box::<Expression>::try_from(b.input)?,
-            lower: Box::<Expression>::try_from(b.lower)?,
-            upper: Box::<Expression>::try_from(b.upper)?,
-            lower_inclusive: b.lower_inclusive,
-            upper_inclusive: b.upper_inclusive,
-        })
-    }
 }
 
 impl Display for Between {

@@ -3,9 +3,8 @@
 //! aggregates have no per-row `compile`; they are lowered by the Aggregate
 //! operator (see [`crate::compile`]).
 
-use super::{Error, Expression, Ref};
+use super::{Expression, Ref};
 use crate::types::Type;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 
 #[derive(Debug, Clone)]
@@ -13,24 +12,6 @@ pub struct CountStar {
     pub params: Vec<Expression>,
     /// DuckDB's declared result type for the call (`BIGINT`).
     pub return_type: Type,
-}
-
-impl TryFrom<duckdb_expression::AggregateFunc> for CountStar {
-    type Error = Error;
-    fn try_from(a: duckdb_expression::AggregateFunc) -> Result<Self, Self::Error> {
-        if a.aggregate_function != "count_star" {
-            return Err(Error::UnsupportedAggregateFunction(a.aggregate_function));
-        }
-        let return_type = crate::types::type_from_logical(a.return_type)?;
-        Ok(CountStar {
-            params: a
-                .params
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-            return_type,
-        })
-    }
 }
 
 /// A single-argument numeric aggregate (`SUM(col)` / `SUM(a * b)`). Carries the
@@ -59,25 +40,6 @@ impl NumericAggregate {
             Expression::Ref(r) => r,
             other => unreachable!("aggregate argument not materialised to a column: {other}"),
         }
-    }
-}
-
-impl TryFrom<duckdb_expression::AggregateFunc> for NumericAggregate {
-    type Error = Error;
-    fn try_from(a: duckdb_expression::AggregateFunc) -> Result<Self, Self::Error> {
-        if a.params.len() != 1 {
-            return Err(Error::InvalidParameterCount {
-                function: a.aggregate_function,
-                expected: 1,
-                actual: a.params.len(),
-            });
-        }
-        let return_type = crate::types::type_from_logical(a.return_type)?;
-        let argument = Expression::try_from(a.params.into_iter().next().unwrap())?;
-        Ok(NumericAggregate {
-            argument: Box::new(argument),
-            return_type,
-        })
     }
 }
 
@@ -142,30 +104,6 @@ impl AggregateFunc {
             | AggregateFunc::CountDistinct(a) => Some(a.argument.as_mut()),
         }
         .into_iter()
-    }
-}
-
-impl TryFrom<duckdb_expression::AggregateFunc> for AggregateFunc {
-    type Error = Error;
-    fn try_from(a: duckdb_expression::AggregateFunc) -> Result<Self, Self::Error> {
-        // DISTINCT is only supported for `COUNT` so far; reject `SUM(DISTINCT)`
-        // etc. rather than silently computing the non-distinct aggregate.
-        if a.distinct && a.aggregate_function != "count" {
-            return Err(Error::UnsupportedAggregateFunction(format!(
-                "DISTINCT {}",
-                a.aggregate_function
-            )));
-        }
-        match a.aggregate_function.as_str() {
-            "count_star" => Ok(AggregateFunc::CountStar(a.try_into()?)),
-            "sum" => Ok(AggregateFunc::Sum(a.try_into()?)),
-            "avg" => Ok(AggregateFunc::Avg(a.try_into()?)),
-            "min" => Ok(AggregateFunc::Min(a.try_into()?)),
-            "max" => Ok(AggregateFunc::Max(a.try_into()?)),
-            "count" if a.distinct => Ok(AggregateFunc::CountDistinct(a.try_into()?)),
-            "count" => Ok(AggregateFunc::Count(a.try_into()?)),
-            _ => Err(Error::UnsupportedAggregateFunction(a.aggregate_function)),
-        }
     }
 }
 

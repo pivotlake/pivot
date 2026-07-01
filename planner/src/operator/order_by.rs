@@ -6,7 +6,7 @@
 use crate::compile::Error;
 use crate::expression::Expression;
 use dispatch::{OrderBy as DispatchOrderBy, RecordBatchOperatorSpec};
-use duckdb_planner::operator as duckdb_operator;
+use duckdb_planner::duckdb_bridge::duckdb_types::OrderType;
 use std::fmt;
 
 /// Sort direction specification for an ORDER BY clause.
@@ -17,12 +17,17 @@ pub enum OrderByDirection {
     Desc,
 }
 
-impl From<duckdb_operator::OrderByDirection> for OrderByDirection {
-    fn from(d: duckdb_operator::OrderByDirection) -> Self {
-        match d {
-            duckdb_operator::OrderByDirection::Default => OrderByDirection::Default,
-            duckdb_operator::OrderByDirection::Asc => OrderByDirection::Asc,
-            duckdb_operator::OrderByDirection::Desc => OrderByDirection::Desc,
+impl From<OrderType> for OrderByDirection {
+    /// Map a DuckDB `OrderType` to a direction, treating anything other than an
+    /// explicit `ASCENDING`/`DESCENDING` (i.e. `INVALID`/`ORDER_DEFAULT`) as
+    /// [`OrderByDirection::Default`].
+    fn from(d: OrderType) -> Self {
+        if d == OrderType::ASCENDING {
+            OrderByDirection::Asc
+        } else if d == OrderType::DESCENDING {
+            OrderByDirection::Desc
+        } else {
+            OrderByDirection::Default
         }
     }
 }
@@ -44,16 +49,6 @@ pub struct OrderByNode {
     pub expression: Expression,
 }
 
-impl TryFrom<duckdb_operator::OrderByNode> for OrderByNode {
-    type Error = super::Error;
-    fn try_from(n: duckdb_operator::OrderByNode) -> Result<Self, Self::Error> {
-        Ok(OrderByNode {
-            direction: n.direction.into(),
-            expression: n.expression.try_into()?,
-        })
-    }
-}
-
 impl fmt::Display for OrderByNode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} {}", self.expression, self.direction)
@@ -64,19 +59,6 @@ impl fmt::Display for OrderByNode {
 #[derive(Debug)]
 pub struct OrderBy {
     pub order_bys: Vec<OrderByNode>,
-}
-
-impl TryFrom<duckdb_operator::OrderBy> for OrderBy {
-    type Error = super::Error;
-    fn try_from(o: duckdb_operator::OrderBy) -> Result<Self, Self::Error> {
-        Ok(OrderBy {
-            order_bys: o
-                .order_bys
-                .into_iter()
-                .map(OrderByNode::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
 }
 
 impl fmt::Display for OrderBy {

@@ -5,7 +5,6 @@ use crate::expression::Expression;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field, Schema};
 use dispatch::RecordBatchOperatorSpec;
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::Arc;
 
@@ -13,19 +12,6 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct Projection {
     pub projections: Vec<Expression>,
-}
-
-impl TryFrom<duckdb_operator::Projection> for Projection {
-    type Error = super::Error;
-    fn try_from(p: duckdb_operator::Projection) -> Result<Self, Self::Error> {
-        Ok(Projection {
-            projections: p
-                .projections
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
 }
 
 impl fmt::Display for Projection {
