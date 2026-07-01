@@ -113,14 +113,16 @@ impl TableFunction for SeriesTableFunction {
 
 impl SeriesTableFunction {
     fn parse_i64_args(&self, args: &[ScalarValue]) -> Result<Vec<i64>, Error> {
+        // DuckDB binds `range`/`generate_series`'s integer overload as BIGINT, so
+        // the arguments always arrive as `Int64`; anything else (e.g. the
+        // `TIMESTAMP, INTERVAL` overload) pivot doesn't support here.
         args.iter()
-            .map(|arg| {
-                arg.raw_value.parse::<i64>().map_err(|_| {
-                    invalid_argument(
-                        self.name,
-                        format!("expected an integer, got '{}'", arg.raw_value),
-                    )
-                })
+            .map(|arg| match arg {
+                ScalarValue::Int64(v) => Ok(*v),
+                other => Err(invalid_argument(
+                    self.name,
+                    format!("expected an integer, got '{other}'"),
+                )),
             })
             .collect()
     }

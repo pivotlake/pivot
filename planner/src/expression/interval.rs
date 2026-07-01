@@ -8,40 +8,14 @@
 //! output type like every other temporal expression. Month and year intervals
 //! are calendar-variable, so they need real calendar math and are rejected here.
 
+use super::Expression;
 use super::arithmetic::ArithmeticOp;
-use super::{Error, Expression};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::{self, Type, physical_arrow_type};
+use crate::types::{Type, physical_arrow_type};
 use arrow::compute::kernels::numeric::{add_wrapping, sub_wrapping};
 use arrow_array::{ArrayRef, Datum, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::DataType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
-
-const SECS_PER_DAY: i64 = 86_400;
-const MICROS_PER_SEC: i64 = 1_000_000;
-
-/// A DuckDB `INTERVAL`'s three independent components. The bridge serializes them
-/// into the constant's `raw_value` as `"<months> <days> <micros>"` (months are
-/// calendar-variable, so they stay separate from the fixed day/microsecond parts).
-struct IntervalParts {
-    months: i32,
-    days: i32,
-    micros: i64,
-}
-
-/// Parse the bridge's `"<months> <days> <micros>"` interval encoding.
-fn parse_interval(raw: &str) -> Result<IntervalParts, Error> {
-    let malformed = || Error::UnsupportedInterval(format!("malformed interval constant '{raw}'"));
-    let [months, days, micros] = raw.split_whitespace().collect::<Vec<_>>()[..] else {
-        return Err(malformed());
-    };
-    Ok(IntervalParts {
-        months: months.parse().map_err(|_| malformed())?,
-        days: days.parse().map_err(|_| malformed())?,
-        micros: micros.parse().map_err(|_| malformed())?,
-    })
-}
 
 /// `date`/`timestamp` ± `INTERVAL`, reduced to a constant integer offset.
 #[derive(Debug, Clone)]
@@ -56,43 +30,6 @@ pub struct IntervalArithmetic {
 }
 
 impl IntervalArithmetic {
-    /// Build from a DuckDB `+`/`-` whose `params[interval_idx]` is an `INTERVAL`
-    /// constant; the other operand is the temporal value. The caller (in
-    /// [`Function::try_from`](super::Function)) has already located the interval.
-    pub(super) fn try_build(
-        f: duckdb_expression::Function,
-        interval_idx: usize,
-    ) -> Result<Self, Error> {
-        if f.params.len() != 2 {
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 2,
-                actual: f.params.len(),
-            });
-        }
-        let op = match f.function.as_str() {
-            "+" => ArithmeticOp::Add,
-            "-" => ArithmeticOp::Sub,
-            other => return Err(Error::UnsupportedScalarFunction(other.to_string())),
-        };
-        // DuckDB types the `+`/`-` itself, so its return type is the temporal
-        // result (DATE for whole-day intervals, TIMESTAMP otherwise).
-        let result = types::type_from_logical(f.return_type.clone())?;
-        let interval = match &f.params[interval_idx] {
-            duckdb_expression::Expression::Constant(scalar) => parse_interval(&scalar.raw_value)?,
-            _ => unreachable!("caller selected an interval constant"),
-        };
-        let offset = interval_offset(&interval, &result)?;
-        let mut params = f.params;
-        let operand = Box::new(Expression::try_from(params.swap_remove(1 - interval_idx))?);
-        Ok(IntervalArithmetic {
-            op,
-            operand,
-            offset,
-            result,
-        })
-    }
-
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         let result_arrow = physical_arrow_type(&self.result);
         // The physical int the temporal result reinterprets through.
@@ -135,34 +72,6 @@ fn apply(ints: &dyn Datum, offset: i64, op: ArithmeticOp, int_arrow: &DataType) 
     match int_arrow {
         DataType::Int32 => kernel(ints, &Int32Array::new_scalar(offset as i32)).unwrap(),
         _ => kernel(ints, &Int64Array::new_scalar(offset)).unwrap(),
-    }
-}
-
-/// Reduce an interval to a constant offset in the result's unit. Months/years are
-/// calendar-variable (rejected); a `DATE` only takes whole-day intervals, a
-/// `TIMESTAMP` takes days plus a sub-day part truncated to whole seconds (pivot
-/// stores timestamps at second granularity, so any sub-second part is dropped).
-fn interval_offset(interval: &IntervalParts, result: &Type) -> Result<i64, Error> {
-    if interval.months != 0 {
-        return Err(Error::UnsupportedInterval(
-            "month and year intervals require calendar arithmetic".to_string(),
-        ));
-    }
-    match result {
-        Type::Date => {
-            if interval.micros != 0 {
-                return Err(Error::UnsupportedInterval(
-                    "sub-day interval applied to a DATE".to_string(),
-                ));
-            }
-            Ok(interval.days as i64)
-        }
-        Type::Timestamp => {
-            Ok(interval.days as i64 * SECS_PER_DAY + interval.micros / MICROS_PER_SEC)
-        }
-        other => Err(Error::UnsupportedInterval(format!(
-            "interval arithmetic on a non-temporal {other}"
-        ))),
     }
 }
 

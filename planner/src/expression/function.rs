@@ -2,14 +2,12 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DatePartKind, DateTrunc, Divide, Error, IntervalArithmetic,
-    Length, RegexpReplace, TemporalConvert,
+    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, RegexpReplace,
+    TemporalConvert,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::Type;
 use arrow_array::{Int64Array, RecordBatch, TimestampSecondArray};
-use duckdb_planner::LogicalTypeId;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -28,7 +26,7 @@ pub struct ScalarFunctionSignature {
 /// The binding signature for a pivot-defined scalar function `name`, or `None`
 /// for names pivot doesn't define (DuckDB's own built-ins like `+`/`length`,
 /// which DuckDB binds itself and pivot only intercepts at compile time). The
-/// compile-time mapping of the same names lives in [`Function::try_from`].
+/// compile-time mapping of the same names lives in [`Function::from_handle`].
 pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
     match name {
         "drop_cache" => Some(ScalarFunctionSignature {
@@ -76,61 +74,6 @@ pub enum Function {
     /// compiles, so every row of the statement sees the same instant. Result is
     /// a `TIMESTAMP` (epoch seconds).
     Now,
-}
-
-impl TryFrom<duckdb_expression::Function> for Function {
-    type Error = Error;
-    fn try_from(f: duckdb_expression::Function) -> Result<Self, Self::Error> {
-        match f.function.as_str() {
-            "contains" => Ok(Function::Contains(f.try_into()?)),
-            // `date`/`timestamp` ± `INTERVAL` carries an INTERVAL constant
-            // operand; plain numeric `+`/`-` does not and stays `Arithmetic`.
-            "+" | "-" => match f.params.iter().position(|p| {
-                matches!(p, duckdb_expression::Expression::Constant(c)
-                    if c.logical_type.clone() as u8 == LogicalTypeId::INTERVAL as u8)
-            }) {
-                Some(idx) => Ok(Function::IntervalArithmetic(IntervalArithmetic::try_build(
-                    f, idx,
-                )?)),
-                None => Ok(Function::Arithmetic(f.try_into()?)),
-            },
-            "*" => Ok(Function::Arithmetic(f.try_into()?)),
-            "length" | "strlen" | "len" => Ok(Function::Length(f.try_into()?)),
-            "regexp_replace" => Ok(Function::RegexpReplace(f.try_into()?)),
-            "/" => Ok(Function::Divide(f.try_into()?)),
-            "date_trunc" => Ok(Function::DateTrunc(f.try_into()?)),
-            "make_date" => Ok(Function::TemporalConvert(TemporalConvert::make_date(f)?)),
-            "make_timestamp" => Ok(Function::TemporalConvert(TemporalConvert::make_timestamp(
-                f,
-            )?)),
-            "drop_cache" => {
-                if !f.params.is_empty() {
-                    return Err(Error::InvalidParameterCount {
-                        function: f.function,
-                        expected: 0,
-                        actual: f.params.len(),
-                    });
-                }
-                Ok(Function::DropCache)
-            }
-            "now" => {
-                if !f.params.is_empty() {
-                    return Err(Error::InvalidParameterCount {
-                        function: f.function,
-                        expected: 0,
-                        actual: f.params.len(),
-                    });
-                }
-                Ok(Function::Now)
-            }
-            // `extract(<part> FROM ts)` lowers to a function named after the
-            // part (`minute`, `year`, `dayofweek`, …).
-            name => match DatePartKind::from_function_name(name) {
-                Some(kind) => Ok(Function::DatePart(DatePart::from_function(kind, f)?)),
-                None => Err(Error::UnsupportedScalarFunction(f.function)),
-            },
-        }
-    }
 }
 
 impl Display for Function {

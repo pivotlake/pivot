@@ -1,10 +1,9 @@
 //! [`Case`] — a `CASE WHEN … THEN … ELSE … END` expression.
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::zip::zip;
 use arrow_array::{BooleanArray, RecordBatch};
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 
 /// One `WHEN when THEN then` arm of a [`Case`].
@@ -22,26 +21,6 @@ pub struct CaseCheck {
 pub struct Case {
     pub checks: Vec<CaseCheck>,
     pub else_expr: Box<Expression>,
-}
-
-impl TryFrom<duckdb_expression::Case> for Case {
-    type Error = Error;
-    fn try_from(c: duckdb_expression::Case) -> Result<Self, Self::Error> {
-        let checks = c
-            .checks
-            .into_iter()
-            .map(|check| {
-                Ok(CaseCheck {
-                    when: Box::<Expression>::try_from(check.when)?,
-                    then: Box::<Expression>::try_from(check.then)?,
-                })
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-        Ok(Case {
-            checks,
-            else_expr: Box::<Expression>::try_from(c.else_expr)?,
-        })
-    }
 }
 
 impl Display for Case {

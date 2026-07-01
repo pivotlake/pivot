@@ -106,6 +106,7 @@
 //! - [`compile`] — Lowering from a [`Plan`] into a
 //!   [`RecordBatchOperatorSpec`](dispatch::RecordBatchOperatorSpec).
 
+mod build;
 pub mod catalog;
 pub mod compile;
 pub mod dynamic_filter;
@@ -162,11 +163,11 @@ impl Planner {
     /// Plan a SQL statement into a Pivot [`Plan`].
     ///
     /// The statement is first planned by DuckDB (which resolves references
-    /// through the catalog), then each [`duckdb_planner::PlanNode`] is
-    /// translated into a [`PlanNode`].
+    /// through the catalog), then the resulting plan handles are walked into a
+    /// Pivot [`PlanNode`] tree (see [`build`](crate::build)).
     pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
         let planned = self.planner_context.plan(query)?;
-        let mut root = PlanNode::try_from(planned.root)?;
+        let mut root = build::build_plan(planned.root())?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
         // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
@@ -174,7 +175,7 @@ impl Planner {
         Ok(Plan {
             catalog: self.catalog.clone(),
             root,
-            output_names: planned.output_names,
+            output_names: planned.into_output_names(),
         })
     }
 }

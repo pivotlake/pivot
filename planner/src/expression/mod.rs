@@ -50,12 +50,10 @@ pub use reference::Ref;
 pub use regexp::RegexpReplace;
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
-use crate::types::{self, Type, build_scalar_value};
+use crate::types::{self, Type};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
-use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar};
 use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use thiserror::Error;
 
@@ -77,27 +75,8 @@ pub enum Error {
     },
     #[error("Unsupported interval arithmetic: {0}")]
     UnsupportedInterval(String),
-}
-
-/// Extract a constant string argument (e.g. a regex pattern or a `date_trunc`
-/// unit) from a converted expression, erroring with `context` when the
-/// argument is not a string constant.
-pub(crate) fn constant_string(e: Expression, context: &str) -> Result<String, Error> {
-    match e {
-        Expression::Constant(scalar) => {
-            let (arr, _) = scalar.get();
-            Ok(arr
-                .as_string_view_opt()
-                .ok_or_else(|| {
-                    Error::UnsupportedScalarFunction(format!("{context} must be a string"))
-                })?
-                .value(0)
-                .to_string())
-        }
-        _ => Err(Error::UnsupportedScalarFunction(format!(
-            "{context} must be a constant"
-        ))),
-    }
+    #[error("Unsupported expression type: {0:?}")]
+    UnsupportedExpressionType(ExpressionType),
 }
 
 /// Format an arrow `Scalar<ArrayRef>` constant as `value:Type` for plan
@@ -212,36 +191,6 @@ impl Display for Expression {
     }
 }
 
-impl TryFrom<duckdb_expression::Expression> for Expression {
-    type Error = Error;
-    fn try_from(e: duckdb_expression::Expression) -> Result<Self, Self::Error> {
-        Ok(match e {
-            duckdb_expression::Expression::Ref(r) => Expression::Ref(r.try_into()?),
-            duckdb_expression::Expression::Compare(c) => Expression::Compare(c.try_into()?),
-            duckdb_expression::Expression::Between(b) => Expression::Between(b.try_into()?),
-            duckdb_expression::Expression::Constant(c) => {
-                Expression::Constant(build_scalar_value(c)?)
-            }
-            duckdb_expression::Expression::AggregateFunc(a) => {
-                Expression::AggregateFunc(a.try_into()?)
-            }
-            duckdb_expression::Expression::Function(f) => Expression::Function(f.try_into()?),
-            duckdb_expression::Expression::InList(i) => Expression::InList(i.try_into()?),
-            duckdb_expression::Expression::Conjunction(c) => Expression::Conjunction(c.try_into()?),
-            duckdb_expression::Expression::Case(c) => Expression::Case(c.try_into()?),
-            duckdb_expression::Expression::Not(n) => Expression::Not(n.try_into()?),
-            duckdb_expression::Expression::Cast(c) => Expression::Cast(c.try_into()?),
-        })
-    }
-}
-
-impl TryFrom<Box<duckdb_planner::expression::Expression>> for Box<Expression> {
-    type Error = Error;
-    fn try_from(e: Box<duckdb_planner::expression::Expression>) -> Result<Self, Self::Error> {
-        Ok(Box::new((*e).try_into()?))
-    }
-}
-
 /// A constant comparison against a single column pushed into a table scan.
 #[derive(Debug)]
 pub struct ConstantComparison {
@@ -250,34 +199,11 @@ pub struct ConstantComparison {
     pub constant: Scalar<ArrayRef>,
 }
 
-impl TryFrom<duckdb_expression::ConstantComparison> for ConstantComparison {
-    type Error = Error;
-    fn try_from(c: duckdb_expression::ConstantComparison) -> Result<Self, Self::Error> {
-        Ok(ConstantComparison {
-            column_ref: Box::<Expression>::try_from(c.column_ref)?,
-            compare_type: c.compare_type.try_into()?,
-            constant: build_scalar_value(c.constant)?,
-        })
-    }
-}
-
 /// A filter that was pushed down into a table scan.
 #[derive(Debug)]
 pub enum TableFilter {
     Expression(Box<Expression>),
     ConstantComparison(ConstantComparison),
-}
-
-impl TryFrom<duckdb_expression::TableFilter> for TableFilter {
-    type Error = Error;
-    fn try_from(f: duckdb_expression::TableFilter) -> Result<Self, Self::Error> {
-        Ok(match f {
-            duckdb_expression::TableFilter::Expression(e) => TableFilter::Expression(e.try_into()?),
-            duckdb_expression::TableFilter::ConstantComparison(c) => {
-                TableFilter::ConstantComparison(c.try_into()?)
-            }
-        })
-    }
 }
 
 impl Display for TableFilter {

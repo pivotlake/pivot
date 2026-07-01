@@ -1,11 +1,10 @@
 //! [`Not`] — logical negation (`NOT expr`).
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow::compute::kernels::boolean::not;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch};
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -14,15 +13,6 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct Not {
     pub input: Box<Expression>,
-}
-
-impl TryFrom<duckdb_expression::Not> for Not {
-    type Error = Error;
-    fn try_from(n: duckdb_expression::Not) -> Result<Self, Self::Error> {
-        Ok(Not {
-            input: Box::<Expression>::try_from(n.input)?,
-        })
-    }
 }
 
 impl Display for Not {

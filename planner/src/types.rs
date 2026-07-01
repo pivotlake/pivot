@@ -13,7 +13,6 @@
 //! `type_conversions!` macro from a single list of pairs, so adding a new
 //! type is one entry instead of two near-identical match arms.
 
-use arrow_array::cast::AsArray;
 use arrow_array::{
     ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -89,14 +88,8 @@ impl fmt::Display for Type {
 pub enum Error {
     #[error("Unsupported logical type: {0:?}")]
     UnsupportedLogicalType(LogicalTypeId),
-    #[error("Unsupported scalar type: {0:?}")]
-    UnsupportedScalarType(Type),
-    #[error("Invalid scalar value '{raw_value}' for logical type {logical_type:?}: {reason}")]
-    InvalidScalarValue {
-        logical_type: LogicalTypeId,
-        raw_value: String,
-        reason: String,
-    },
+    #[error("Unsupported scalar constant: {0}")]
+    UnsupportedScalarConstant(ScalarValue),
 }
 
 /// Generates the conversion functions between Pivot's [`Type`], DuckDB's
@@ -166,94 +159,32 @@ type_conversions! {
     (Type::Timestamp, LogicalTypeId::TIMESTAMP, DataType::Timestamp(TimeUnit::Second, None)),
 }
 
-/// Parse a DuckDB [`ScalarValue`] (logical type + raw string) into an arrow
-/// [`Scalar<ArrayRef>`] suitable for use as a constant in the executor.
-pub fn build_scalar_value(
-    ScalarValue {
-        logical_type,
-        raw_value,
-        ..
-    }: ScalarValue,
-) -> Result<Scalar<ArrayRef>, Error> {
-    let pivot_type = type_from_logical(logical_type.clone())?;
-    let array: ArrayRef = match pivot_type {
-        Type::Boolean => Arc::new(
-            BooleanArray::new_scalar(parse_scalar::<bool>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::Int8 => Arc::new(
-            Int8Array::new_scalar(parse_scalar::<i8>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::Int16 => Arc::new(
-            Int16Array::new_scalar(parse_scalar::<i16>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::Int32 => Arc::new(
-            Int32Array::new_scalar(parse_scalar::<i32>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::Int64 => Arc::new(
-            Int64Array::new_scalar(parse_scalar::<i64>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::UInt8 => Arc::new(
-            UInt8Array::new_scalar(parse_scalar::<u8>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::UInt16 => Arc::new(
-            UInt16Array::new_scalar(parse_scalar::<u16>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::UInt32 => Arc::new(
-            UInt32Array::new_scalar(parse_scalar::<u32>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::UInt64 => Arc::new(
-            UInt64Array::new_scalar(parse_scalar::<u64>(&raw_value, logical_type.clone())?)
-                .into_inner(),
-        ),
-        Type::Utf8 => Arc::new(StringViewArray::new_scalar(raw_value).into_inner()),
-        // DuckDB serialises a DATE constant as "YYYY-MM-DD"; let arrow parse it
-        // to a Date32 (days since epoch). Comparisons coerce both sides to a
-        // common numeric type, so this lines up with the integer day-count the
-        // parquet stores for a `DATE` column.
-        Type::Date => {
-            let strs = arrow_array::StringArray::from(vec![raw_value.clone()]);
-            let casted =
-                arrow::compute::cast(&strs, &arrow_schema::DataType::Date32).map_err(|err| {
-                    Error::InvalidScalarValue {
-                        logical_type: logical_type.clone(),
-                        raw_value: raw_value.clone(),
-                        reason: err.to_string(),
-                    }
-                })?;
-            let days = casted
-                .as_primitive::<arrow_array::types::Date32Type>()
-                .value(0);
+/// Convert a typed DuckDB [`ScalarValue`] into an arrow [`Scalar<ArrayRef>`]
+/// suitable for use as a constant in the executor.
+pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error> {
+    let array: ArrayRef = match value {
+        ScalarValue::Boolean(v) => Arc::new(BooleanArray::new_scalar(v).into_inner()),
+        ScalarValue::Int8(v) => Arc::new(Int8Array::new_scalar(v).into_inner()),
+        ScalarValue::Int16(v) => Arc::new(Int16Array::new_scalar(v).into_inner()),
+        ScalarValue::Int32(v) => Arc::new(Int32Array::new_scalar(v).into_inner()),
+        ScalarValue::Int64(v) => Arc::new(Int64Array::new_scalar(v).into_inner()),
+        ScalarValue::UInt8(v) => Arc::new(UInt8Array::new_scalar(v).into_inner()),
+        ScalarValue::UInt16(v) => Arc::new(UInt16Array::new_scalar(v).into_inner()),
+        ScalarValue::UInt32(v) => Arc::new(UInt32Array::new_scalar(v).into_inner()),
+        ScalarValue::UInt64(v) => Arc::new(UInt64Array::new_scalar(v).into_inner()),
+        ScalarValue::Utf8(v) => Arc::new(StringViewArray::new_scalar(v).into_inner()),
+        // DuckDB's DATE is days since the epoch, the same as arrow `Date32`.
+        // Comparisons coerce both sides to a common numeric type, so this lines up
+        // with the integer day-count the parquet stores for a `DATE` column.
+        ScalarValue::Date(days) => {
             Arc::new(arrow_array::Date32Array::new_scalar(days).into_inner())
         }
-        // SUM/AVG result types and TIMESTAMP never appear as query *constants*
-        // (TIMESTAMP shows up only as a column / date_trunc result), so we don't
-        // need to materialise them as scalar literals.
-        Type::Int128 | Type::Float64 | Type::Decimal | Type::Timestamp => {
-            return Err(Error::UnsupportedScalarType(pivot_type));
-        }
+        // SUM/AVG result types, TIMESTAMP, INTERVAL, and types the bridge doesn't
+        // decode never appear as query *constants* we materialise (TIMESTAMP shows
+        // up only as a column/date_trunc result; INTERVAL is consumed by interval
+        // arithmetic; FLOAT/DOUBLE/HUGEINT constants aren't supported).
+        other => return Err(Error::UnsupportedScalarConstant(other)),
     };
 
     Ok(Scalar::new(array))
-}
-
-fn parse_scalar<T>(raw_value: &str, logical_type: LogicalTypeId) -> Result<T, Error>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    raw_value
-        .parse::<T>()
-        .map_err(|err| Error::InvalidScalarValue {
-            logical_type,
-            raw_value: raw_value.to_string(),
-            reason: err.to_string(),
-        })
 }

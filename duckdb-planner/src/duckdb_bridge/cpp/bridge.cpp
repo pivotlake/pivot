@@ -522,12 +522,8 @@ size_t lo_get_param_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalGet>(op).parameters.size();
 }
 
-uint8_t lo_get_param_type(const LogicalOperator &op, size_t index) {
-	return static_cast<uint8_t>(as<duckdb::LogicalGet>(op).parameters[index].type().id());
-}
-
-rust::String lo_get_param_value(const LogicalOperator &op, size_t index) {
-	return rust::String::lossy(as<duckdb::LogicalGet>(op).parameters[index].ToString());
+const Value &lo_get_param(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalGet>(op).parameters[index];
 }
 
 // ---- CreateTable ----
@@ -709,22 +705,70 @@ rust::String expr_alias(const Expression &expr) {
 	return rust::String::lossy(expr.GetAlias());
 }
 
-uint8_t expr_constant_type(const Expression &expr) {
-	return static_cast<uint8_t>(as_expr<duckdb::BoundConstantExpression>(expr).value.type().id());
+const Value &expr_constant(const Expression &expr) {
+	return as_expr<duckdb::BoundConstantExpression>(expr).value;
 }
 
-rust::String expr_constant_value(const Expression &expr) {
-	auto &value = as_expr<duckdb::BoundConstantExpression>(expr).value;
-	// An INTERVAL's string form ("1 month 2 days …") is ambiguous to parse, so
-	// emit its three independent components ("<months> <days> <micros>") for the
-	// Rust side to read directly.
-	if (value.type().id() == duckdb::LogicalTypeId::INTERVAL) {
-		auto interval = value.GetValue<duckdb::interval_t>();
-		return rust::String::lossy(std::to_string(interval.months) + " " +
-		                           std::to_string(interval.days) + " " +
-		                           std::to_string(interval.micros));
-	}
-	return rust::String::lossy(value.ToString());
+// Typed accessors for a DuckDB `Value`, shared by query constants and
+// table-function arguments. The Rust side reads `value_type` first, then calls
+// the matching accessor; `GetValue<T>` returns the stored value untouched when
+// the requested type matches the value's own.
+uint8_t value_type(const Value &v) {
+	return static_cast<uint8_t>(v.type().id());
+}
+bool value_bool(const Value &v) {
+	return v.GetValue<bool>();
+}
+int8_t value_i8(const Value &v) {
+	return v.GetValue<int8_t>();
+}
+int16_t value_i16(const Value &v) {
+	return v.GetValue<int16_t>();
+}
+int32_t value_i32(const Value &v) {
+	return v.GetValue<int32_t>();
+}
+int64_t value_i64(const Value &v) {
+	return v.GetValue<int64_t>();
+}
+uint8_t value_u8(const Value &v) {
+	return v.GetValue<uint8_t>();
+}
+uint16_t value_u16(const Value &v) {
+	return v.GetValue<uint16_t>();
+}
+uint32_t value_u32(const Value &v) {
+	return v.GetValue<uint32_t>();
+}
+uint64_t value_u64(const Value &v) {
+	return v.GetValue<uint64_t>();
+}
+float value_f32(const Value &v) {
+	return v.GetValue<float>();
+}
+double value_f64(const Value &v) {
+	return v.GetValue<double>();
+}
+rust::String value_string(const Value &v) {
+	return rust::String::lossy(v.GetValue<std::string>());
+}
+// DATE is days since the Unix epoch; TIMESTAMP is microseconds since the epoch.
+int32_t value_date(const Value &v) {
+	return v.GetValue<duckdb::date_t>().days;
+}
+int64_t value_timestamp(const Value &v) {
+	return v.GetValue<duckdb::timestamp_t>().value;
+}
+// INTERVAL keeps its three independent components (months are calendar-variable,
+// so they stay separate from the fixed day/microsecond parts).
+int32_t value_interval_months(const Value &v) {
+	return v.GetValue<duckdb::interval_t>().months;
+}
+int32_t value_interval_days(const Value &v) {
+	return v.GetValue<duckdb::interval_t>().days;
+}
+int64_t value_interval_micros(const Value &v) {
+	return v.GetValue<duckdb::interval_t>().micros;
 }
 
 size_t expr_ref_index(const Expression &expr) {

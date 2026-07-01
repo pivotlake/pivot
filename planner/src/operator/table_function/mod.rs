@@ -25,7 +25,6 @@ use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use duckdb_planner::ScalarValue;
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::Arc;
 
@@ -91,25 +90,23 @@ pub struct TableFunctionScan {
     columns: Vec<Expression>,
 }
 
-impl TryFrom<duckdb_operator::TableFunctionScan> for TableFunctionScan {
-    type Error = super::Error;
-
-    fn try_from(scan: duckdb_operator::TableFunctionScan) -> Result<Self, Self::Error> {
-        Ok(Self {
-            function_name: scan.function_name,
-            args: scan.args,
-            columns: scan
-                .columns
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
+impl TableFunctionScan {
+    pub(crate) fn new(
+        function_name: String,
+        args: Vec<ScalarValue>,
+        columns: Vec<Expression>,
+    ) -> Self {
+        Self {
+            function_name,
+            args,
+            columns,
+        }
     }
 }
 
 impl fmt::Display for TableFunctionScan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let args: Vec<&str> = self.args.iter().map(|a| a.raw_value.as_str()).collect();
+        let args: Vec<String> = self.args.iter().map(|a| a.to_string()).collect();
         write!(
             f,
             "TableFunctionScan({}({}))",

@@ -62,7 +62,8 @@ impl TableFunction for MetadataTableFunction {
         ctx: &dyn QueryContext,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let table_name = match args {
-            [name] => name.raw_value.as_str(),
+            [ScalarValue::Utf8(name)] => name.as_str(),
+            [_] => return Err(invalid("metadata() expects a string table name".to_string())),
             _ => {
                 return Err(invalid(format!(
                     "expected a single table name, got {} arguments",

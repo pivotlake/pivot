@@ -15,7 +15,6 @@ use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RecordBatchOperatorSpec, Sender,
     WorkStatus,
 };
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,14 +28,6 @@ const PLAN_COLUMN: &str = "QUERY PLAN";
 /// query never runs.
 #[derive(Debug)]
 pub struct Explain;
-
-impl TryFrom<duckdb_operator::Explain> for Explain {
-    type Error = super::Error;
-
-    fn try_from(_: duckdb_operator::Explain) -> Result<Self, Self::Error> {
-        Ok(Explain)
-    }
-}
 
 impl Explain {
     /// Compile into a source that emits `plan_text` (the formatted child plan,

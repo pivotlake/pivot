@@ -32,7 +32,6 @@ use arrow_schema::DataType;
 use dispatch::{
     AggregationKind, AggregationSlot, GroupLimit, RecordBatchOperatorSpec, RowKeySchema,
 };
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::Arc;
 
@@ -48,25 +47,6 @@ pub struct Aggregate {
     /// group operator then emits only each partition's kept rows instead of
     /// every group.
     pub output_limit: Option<GroupLimit>,
-}
-
-impl TryFrom<duckdb_operator::Aggregate> for Aggregate {
-    type Error = super::Error;
-    fn try_from(a: duckdb_operator::Aggregate) -> Result<Self, Self::Error> {
-        Ok(Aggregate {
-            output_limit: None,
-            groups: a
-                .groups
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-            expressions: a
-                .expressions
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
 }
 
 impl fmt::Display for Aggregate {

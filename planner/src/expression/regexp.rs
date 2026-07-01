@@ -9,12 +9,11 @@
 //! single semantic gap — PCRE2's `$` matches before a trailing newline, the
 //! `regex` crate's does not — is closed by rewriting a trailing `$` to `\z`.
 
-use super::{Error, Expression, constant_string};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
-use duckdb_planner::expression as duckdb_expression;
 use pcre2::bytes::{Regex as Pcre2Regex, RegexBuilder as Pcre2RegexBuilder};
 use regex::bytes::{Regex as BytesRegex, RegexBuilder as BytesRegexBuilder};
 use std::fmt::{self, Display};
@@ -30,36 +29,6 @@ pub struct RegexpReplace {
     pub input: Box<Expression>,
     pub pattern: String,
     pub replacement: String,
-}
-
-impl TryFrom<duckdb_expression::Function> for RegexpReplace {
-    type Error = Error;
-    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
-        // A fourth `options` argument (e.g. 'g' for replace-all) changes the
-        // semantics, so only the three-argument first-match form is accepted.
-        if f.params.len() != 3 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 3,
-                actual,
-            });
-        }
-        let replacement = constant_string(
-            Expression::try_from(f.params.remove(2))?,
-            "regexp_replace: replacement",
-        )?;
-        let pattern = constant_string(
-            Expression::try_from(f.params.remove(1))?,
-            "regexp_replace: pattern",
-        )?;
-        let input = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(RegexpReplace {
-            input,
-            pattern,
-            replacement,
-        })
-    }
 }
 
 impl Display for RegexpReplace {

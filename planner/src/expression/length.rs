@@ -1,11 +1,10 @@
 //! [`Length`] — SQL `length(string)`, the byte length of the string.
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::{self, Type};
+use crate::types::Type;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -19,23 +18,6 @@ use std::sync::Arc;
 pub struct Length {
     pub input: Box<Expression>,
     pub return_type: Type,
-}
-
-impl TryFrom<duckdb_expression::Function> for Length {
-    type Error = Error;
-    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
-        if f.params.len() != 1 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 1,
-                actual,
-            });
-        }
-        let return_type = types::type_from_logical(f.return_type)?;
-        let input = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(Length { input, return_type })
-    }
 }
 
 impl Display for Length {

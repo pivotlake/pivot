@@ -1,12 +1,11 @@
 //! [`Contains`] — SQL `contains(haystack, needle)` substring search.
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Datum, RecordBatch};
 use dispatch::Contains as DispatchContains;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -15,23 +14,6 @@ use std::sync::Arc;
 pub struct Contains {
     pub needle: Box<Expression>,
     pub haystack: Box<Expression>,
-}
-
-impl TryFrom<duckdb_expression::Function> for Contains {
-    type Error = Error;
-    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
-        if f.params.len() != 2 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 2,
-                actual,
-            });
-        }
-        let needle = Box::new(Expression::try_from(f.params.remove(1))?);
-        let haystack = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(Contains { needle, haystack })
-    }
 }
 
 impl Display for Contains {
