@@ -488,4 +488,60 @@ mod tests {
         assert_eq!(*count.lock().unwrap(), 4);
         dispatch.exit();
     }
+
+    /// Regression for cross-node group-by correctness: a high-cardinality string
+    /// GROUP BY run across two node groups must combine every group's partial and
+    /// resolve string keys from whichever node produced them. The small ring forces
+    /// the radix/multi-partition merge path. (Reproduces the multi-node radix-merge
+    /// bug on a single physical machine via two logical memory domains.)
+    #[test]
+    fn high_cardinality_string_group_by_across_nodes() {
+        use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
+        use arrow_schema::DataType;
+
+        const DISTINCT: usize = 5000;
+        const REPS: usize = 3;
+        let keys: Vec<String> = (0..DISTINCT).map(|i| format!("key-{i:08}")).collect();
+        let batches: Vec<RecordBatch> = (0..REPS)
+            .map(|_| {
+                let arr =
+                    StringViewArray::from(keys.iter().map(String::as_str).collect::<Vec<_>>());
+                RecordBatch::try_from_iter(vec![("k", Arc::new(arr) as arrow_array::ArrayRef)])
+                    .unwrap()
+            })
+            .collect();
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 64, None);
+
+        let results = values_input(dispatch.dispatcher(), batches)
+            .record_batches()
+            .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
+                vec![0],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
+                None,
+                (),
+            )
+            .collect()
+            .unwrap();
+
+        let groups: usize = results.iter().map(|b| b.num_rows()).sum();
+        let total: i64 = results
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .sum();
+        dispatch.exit();
+
+        assert_eq!(groups, DISTINCT, "one group per distinct key");
+        assert_eq!(total as usize, DISTINCT * REPS, "counts sum to all rows");
+    }
 }
