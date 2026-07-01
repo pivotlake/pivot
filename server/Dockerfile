@@ -8,7 +8,7 @@
 #
 #   docker build -t pivot -f server/Dockerfile .
 
-FROM rust:1.90-slim-bookworm AS builder
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake clang libclang-dev pkg-config git ca-certificates \
