@@ -330,7 +330,9 @@ impl Dispatch {
         let workers_per_node = core_groups[0].len();
         let node_count = core_groups.len();
         debug_assert!(
-            core_groups.iter().all(|group| group.len() == workers_per_node),
+            core_groups
+                .iter()
+                .all(|group| group.len() == workers_per_node),
             "node groups must be equal-sized"
         );
         let total_workers = workers_per_node * node_count;

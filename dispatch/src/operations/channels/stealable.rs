@@ -32,7 +32,10 @@ pub struct StealableChannelFactory<T: Send> {
 }
 
 impl<T: Send> StealableChannelFactory<T> {
-    pub fn new(worker: Worker<T>, stealers: Vec<(usize, Stealer<T>)>) -> StealableChannelFactory<T> {
+    pub fn new(
+        worker: Worker<T>,
+        stealers: Vec<(usize, Stealer<T>)>,
+    ) -> StealableChannelFactory<T> {
         StealableChannelFactory { worker, stealers }
     }
 }

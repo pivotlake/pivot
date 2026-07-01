@@ -54,10 +54,7 @@ pub fn group_cores_by_node(available: Vec<CoreId>) -> Vec<Vec<CoreId>> {
 /// When `requested_total` is smaller than the node count, only the first `requested_total`
 /// nodes are used with one worker each. Every returned group has the same length (at least
 /// one), and at least one group is returned.
-pub fn balance_worker_groups(
-    groups: Vec<Vec<CoreId>>,
-    requested_total: usize,
-) -> Vec<Vec<CoreId>> {
+pub fn balance_worker_groups(groups: Vec<Vec<CoreId>>, requested_total: usize) -> Vec<Vec<CoreId>> {
     let num_nodes = groups.len().max(1);
     let requested_total = requested_total.max(1);
 
@@ -86,7 +83,10 @@ fn read_node_cpulists() -> Option<Vec<Vec<usize>>> {
         let entry = entry.ok()?;
         let name = entry.file_name();
         let name = name.to_str()?;
-        let Some(index) = name.strip_prefix("node").and_then(|n| n.parse::<usize>().ok()) else {
+        let Some(index) = name
+            .strip_prefix("node")
+            .and_then(|n| n.parse::<usize>().ok())
+        else {
             continue;
         };
         let cpulist = std::fs::read_to_string(entry.path().join("cpulist")).ok()?;

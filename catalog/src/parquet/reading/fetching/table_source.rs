@@ -125,7 +125,11 @@ impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
         // from that node's queue first; the other nodes' queues are the fallback
         // once this node's share is exhausted.
         let node = dispatch::worker::current_node();
-        let node = if node < self.row_groups.len() { node } else { 0 };
+        let node = if node < self.row_groups.len() {
+            node
+        } else {
+            0
+        };
         let own = self.row_groups[node].clone();
         let others = self
             .row_groups
