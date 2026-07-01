@@ -124,7 +124,13 @@ pub fn table_input_with_filter_and_eq_predicates(
     if projection.indices().is_empty() {
         return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
     }
-    let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
+    let injector = RowGroupInjectorFactory::new(
+        table,
+        projection.clone(),
+        filter,
+        scan_order,
+        dispatcher.node_count(),
+    );
     let siblings = Arc::new(AtomicUsize::new(n));
     // One fetcher handles disk and HTTP row groups, bounding each medium's
     // in-flight count separately.

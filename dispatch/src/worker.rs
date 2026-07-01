@@ -180,6 +180,12 @@ pub fn worker_waker() -> &'static WorkerWaker {
     unsafe { &*WORKER_WAKER.get() }
 }
 
+/// This worker thread's NUMA node id (set by [`Worker::create`]). `usize::MAX`
+/// off a worker thread. Used to route a worker to its node-local scan queue.
+pub fn current_node() -> usize {
+    NODE_ID.get()
+}
+
 /// Install a leaked [`WorkerWaker`] on the current test thread.
 ///
 /// Operator code unconditionally calls `worker_waker().notify()` on send

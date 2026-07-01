@@ -227,6 +227,11 @@ impl DataFlowDispatcher {
         self.worker_nodes.clone()
     }
 
+    /// Number of NUMA node groups. Used to shard the scan's row-group queues.
+    pub fn node_count(&self) -> usize {
+        self.groups.len()
+    }
+
     /// Total worker count across all nodes — what an operator chain is sized for,
     /// since a dataflow runs on every worker.
     pub fn worker_count(&self) -> usize {
