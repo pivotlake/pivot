@@ -79,7 +79,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let (err_tx, err_rx) = std::sync::mpsc::channel();
         let (stats_tx, stats_rx) = std::sync::mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let wakers = self.dispatcher.wakers();
+        let waker = self.dispatcher.waker();
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
         self.dispatcher
@@ -103,7 +103,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         drop(stats_tx);
 
         let (rx, _) = rx.into_parts();
-        DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, wakers)
+        DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, waker)
     }
 
     /// Run the dataflow and drain every produced item into a `Vec`. Shortcut

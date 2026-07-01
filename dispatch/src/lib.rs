@@ -134,45 +134,40 @@ pub type Identifier = usize;
 /// their next iteration.
 pub struct Shutdown {
     flag: Arc<AtomicBool>,
-    /// One waker per NUMA node group; shutdown wakes every group.
-    wakers: Vec<Arc<WorkerWaker>>,
+    waker: Arc<WorkerWaker>,
 }
 
 impl Shutdown {
     pub fn shutdown(&self) {
         self.flag.store(true, Ordering::Relaxed);
-        // Workers parked on a waker won't observe `exit_flag` until someone
-        // wakes them. Notify every group's waker so every parked worker returns
-        // from `wait_if_unchanged` and sees the flag on its next loop iteration.
-        for waker in &self.wakers {
-            waker.notify();
-        }
+        // Workers parked on the waker won't observe `exit_flag` until someone
+        // wakes them. Notify so every parked worker returns from
+        // `wait_if_unchanged` and sees the flag on its next loop iteration.
+        self.waker.notify();
     }
-}
-
-/// One NUMA node's worker group: the channels feeding its workers and the waker
-/// that parks/unparks them. A dataflow spans ALL groups (every worker), but each
-/// worker's memory domain (`memory_ctx()`) is its own node's ring/caches — so the
-/// dataflow uses every core while memory stays node-local.
-#[derive(Clone)]
-struct NodeGroup {
-    senders: Vec<StdSender<DataFlowBuilder>>,
-    waker: Arc<WorkerWaker>,
 }
 
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
-    /// One worker group per NUMA node, in node order. Global worker indices are
-    /// assigned in this order (group 0's workers get 0..workers_per_node, etc.), so
-    /// a flat builder list `0..total_workers` zips onto the groups concatenated in
-    /// order — builder `i` reaches the worker whose `WORKER_IDX` is `i`.
-    groups: Vec<NodeGroup>,
+    /// This node's workers' senders, one Vec per NUMA node group, in node order.
+    /// Global worker indices are assigned in this order (group 0's workers get
+    /// 0..workers_per_node, etc.), so a flat builder list `0..total_workers` zips
+    /// onto the groups concatenated in order — builder `i` reaches the worker whose
+    /// `WORKER_IDX` is `i`.
+    groups: Vec<Vec<StdSender<DataFlowBuilder>>>,
+    /// One waker shared by ALL workers on all nodes. A dataflow spans every worker
+    /// and hands work cross-node (work-stealing between operator stages), so a send
+    /// on any node must be able to wake an idle worker on any node — a per-node
+    /// waker would lose cross-node wakeups and deadlock.
+    waker: Arc<WorkerWaker>,
     /// Process-global worker count (all nodes); what every dataflow's operator chain
     /// is sized for, since a dataflow runs on all workers.
     total_workers: usize,
     /// `global_idx -> node_id`, for node-aware work-stealing and scan routing.
     worker_nodes: Arc<Vec<usize>>,
-    /// Ring slots per node, used to size group-by working memory.
+    /// Total ring slots across all nodes. Sizes the group-by's shared key/value
+    /// arenas, whose pointer arrays are indexed by a global buffer index and so must
+    /// cover the buffers every worker (on every node) can take — not just one node's.
     buffers: usize,
     /// Whether every dataflow launched through this handle is marked profiled.
     /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling)).
@@ -203,23 +198,21 @@ impl DataFlowDispatcher {
     /// order). Every node's waker is notified so idle workers pick the work up.
     pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) {
         let mut builders = builders.into_iter();
-        'outer: for group in &self.groups {
-            for sender in &group.senders {
+        'outer: for senders in &self.groups {
+            for sender in senders {
                 match builders.next() {
                     Some(builder) => sender.send(builder).unwrap(),
                     None => break 'outer,
                 }
             }
         }
-        for group in &self.groups {
-            group.waker.notify();
-        }
+        self.waker.notify();
     }
 
-    /// Every node's waker, so a cancel/shutdown caller (off a worker thread) can
-    /// wake all parked workers. Cheap `Arc` clones.
-    pub fn wakers(&self) -> Vec<Arc<WorkerWaker>> {
-        self.groups.iter().map(|g| g.waker.clone()).collect()
+    /// The shared waker, so a cancel/shutdown caller (off a worker thread) can wake
+    /// all parked workers.
+    pub fn waker(&self) -> Arc<WorkerWaker> {
+        self.waker.clone()
     }
 
     /// `global_idx -> node_id` map, for node-aware work-stealing and scan routing.
@@ -346,6 +339,9 @@ impl Dispatch {
 
         let barrier = Arc::new(Barrier::new(total_workers + 1));
         let should_exit = Arc::new(AtomicBool::new(false));
+        // One waker for all workers on all nodes: a dataflow spans every worker and
+        // hands work cross-node, so any send must be able to wake any idle worker.
+        let waker = Arc::new(WorkerWaker::new());
 
         let mut threads = vec![];
         let mut groups = vec![];
@@ -355,7 +351,6 @@ impl Dispatch {
         let mut global_idx = 0;
         let mut worker_nodes = vec![0usize; total_workers];
         for (node_id, group) in core_groups.into_iter().enumerate() {
-            let waker = Arc::new(WorkerWaker::new());
             let mut factories =
                 MemoryContextFactory::create_many(workers_per_node, per_node_buffers);
             let mut senders = vec![];
@@ -381,25 +376,25 @@ impl Dispatch {
                 ));
                 global_idx += 1;
             }
-            groups.push(NodeGroup { senders, waker });
+            groups.push(senders);
         }
         barrier.wait();
         info!("All workers have begun...");
 
-        let wakers = groups.iter().map(|g| g.waker.clone()).collect();
         Dispatch {
             dataflow_dispatcher: DataFlowDispatcher {
                 groups,
+                waker: waker.clone(),
                 total_workers,
                 worker_nodes: Arc::new(worker_nodes),
-                buffers: per_node_buffers,
+                buffers,
                 #[cfg(feature = "perf")]
                 profiled: false,
             },
             handles: threads,
             shutdown: Shutdown {
                 flag: should_exit,
-                wakers,
+                waker,
             },
         }
     }

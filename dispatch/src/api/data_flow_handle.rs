@@ -17,9 +17,9 @@ pub struct DataFlowHandle<T> {
     stats_rx: mpsc::Receiver<DataFlowStats>,
     /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
-    /// Every node group's waker (a dataflow spans all nodes), so cancel callers — which
-    /// may not be on a worker thread — can wake all parked workers.
-    wakers: Vec<Arc<WorkerWaker>>,
+    /// The shared waker (all workers park on it), so cancel callers — which may not
+    /// be on a worker thread — can wake all parked workers.
+    waker: Arc<WorkerWaker>,
 }
 
 impl<T> DataFlowHandle<T> {
@@ -28,14 +28,14 @@ impl<T> DataFlowHandle<T> {
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
         stats_rx: mpsc::Receiver<DataFlowStats>,
         cancelled: Arc<AtomicBool>,
-        wakers: Vec<Arc<WorkerWaker>>,
+        waker: Arc<WorkerWaker>,
     ) -> Self {
         Self {
             rx,
             err_rx,
             stats_rx,
             cancelled,
-            wakers,
+            waker,
         }
     }
 
@@ -43,9 +43,7 @@ impl<T> DataFlowHandle<T> {
     /// iteration of their event loop.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        for waker in &self.wakers {
-            waker.notify();
-        }
+        self.waker.notify();
     }
 
     /// A cheap, `Clone + Send + Sync` handle that can fire cancellation from
@@ -53,7 +51,7 @@ impl<T> DataFlowHandle<T> {
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             cancelled: self.cancelled.clone(),
-            wakers: self.wakers.clone(),
+            waker: self.waker.clone(),
         }
     }
 
@@ -127,15 +125,13 @@ impl<T> Iterator for DataFlowHandle<T> {
 #[derive(Clone)]
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
-    wakers: Vec<Arc<WorkerWaker>>,
+    waker: Arc<WorkerWaker>,
 }
 
 impl CancelToken {
     /// Signal cancellation. Idempotent.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        for waker in &self.wakers {
-            waker.notify();
-        }
+        self.waker.notify();
     }
 }
