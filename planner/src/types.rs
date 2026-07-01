@@ -14,8 +14,8 @@
 //! type is one entry instead of two near-identical match arms.
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, Scalar, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use duckdb_planner::ScalarValue;
@@ -44,7 +44,9 @@ pub enum Type {
     /// executor emits `SUM` as a `Decimal128(38, 0)` column matching this
     /// width, so large sums (e.g. `SUM(user_id)`) stay exact.
     Int128,
-    /// DuckDB `DOUBLE` — the result type of `AVG`.
+    /// DuckDB `REAL`/`FLOAT` — a single-precision float column.
+    Float32,
+    /// DuckDB `DOUBLE` — a double-precision float column and the result type of `AVG`.
     Float64,
     /// DuckDB `DECIMAL` — the result type of integer division (`AVG` lowers to
     /// `sum / count`, whose `/` yields DECIMAL). Pivot computes it as `Float64`,
@@ -74,6 +76,7 @@ impl fmt::Display for Type {
             Type::UInt32 => "UInt32",
             Type::UInt64 => "UInt64",
             Type::Int128 => "Int128",
+            Type::Float32 => "Float32",
             Type::Float64 => "Float64",
             Type::Decimal => "Decimal",
             Type::Utf8 => "Utf8",
@@ -152,6 +155,7 @@ type_conversions! {
     (Type::UInt32,    LogicalTypeId::UINTEGER,  DataType::UInt32),
     (Type::UInt64,    LogicalTypeId::UBIGINT,   DataType::UInt64),
     (Type::Int128,    LogicalTypeId::HUGEINT,   DataType::Decimal128(38, 0)),
+    (Type::Float32,   LogicalTypeId::FLOAT,     DataType::Float32),
     (Type::Float64,   LogicalTypeId::DOUBLE,    DataType::Float64),
     (Type::Decimal,   LogicalTypeId::DECIMAL,   DataType::Float64),
     (Type::Utf8,      LogicalTypeId::VARCHAR,   DataType::Utf8View),
@@ -172,6 +176,8 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::UInt16(v) => Arc::new(UInt16Array::new_scalar(v).into_inner()),
         ScalarValue::UInt32(v) => Arc::new(UInt32Array::new_scalar(v).into_inner()),
         ScalarValue::UInt64(v) => Arc::new(UInt64Array::new_scalar(v).into_inner()),
+        ScalarValue::Float32(v) => Arc::new(Float32Array::new_scalar(v).into_inner()),
+        ScalarValue::Float64(v) => Arc::new(Float64Array::new_scalar(v).into_inner()),
         ScalarValue::Utf8(v) => Arc::new(StringViewArray::new_scalar(v).into_inner()),
         // DuckDB's DATE is days since the epoch, the same as arrow `Date32`.
         // Comparisons coerce both sides to a common numeric type, so this lines up
@@ -182,7 +188,7 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         // SUM/AVG result types, TIMESTAMP, INTERVAL, and types the bridge doesn't
         // decode never appear as query *constants* we materialise (TIMESTAMP shows
         // up only as a column/date_trunc result; INTERVAL is consumed by interval
-        // arithmetic; FLOAT/DOUBLE/HUGEINT constants aren't supported).
+        // arithmetic; HUGEINT/DECIMAL constants aren't supported).
         other => return Err(Error::UnsupportedScalarConstant(other)),
     };
 

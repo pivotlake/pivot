@@ -122,19 +122,28 @@ impl PlanNode {
                 }
                 Step::SetAgg(slot) => {
                     if let Operator::Aggregate(a) = &mut node.operator {
-                        // Don't push top-k onto a string MIN/MAX. A string
-                        // extreme's `sort_key` is its raw `ArenaKey`/StringView
-                        // header bits, not lexicographic order, so a per-partition
-                        // top-k would keep the wrong rows. Leave it to the full
-                        // `TopN` sort above (only the pushdown is skipped).
+                        // Don't push top-k onto a slot whose `sort_key` isn't ordered:
+                        // a string extreme (raw `ArenaKey`/StringView header bits) or a
+                        // float aggregate (the cell holds `f64` bits, so the widened
+                        // sort key is not numerically ordered). A per-partition top-k
+                        // would keep the wrong rows; leave it to the full `TopN` sort
+                        // above (only the pushdown is skipped).
                         use crate::expression::AggregateFunc;
-                        let string_extreme = matches!(
-                            a.expressions.get(slot),
+                        use crate::types::Type;
+                        let unordered_sort_key = match a.expressions.get(slot) {
                             Some(Expression::AggregateFunc(
-                                AggregateFunc::Min(x) | AggregateFunc::Max(x)
-                            )) if x.argument.result_type().ok() == Some(crate::types::Type::Utf8)
-                        );
-                        if !string_extreme {
+                                AggregateFunc::Min(x) | AggregateFunc::Max(x),
+                            )) => matches!(
+                                x.argument.result_type().ok(),
+                                Some(Type::Utf8 | Type::Float32 | Type::Float64)
+                            ),
+                            Some(Expression::AggregateFunc(AggregateFunc::Sum(x))) => matches!(
+                                x.argument.result_type().ok(),
+                                Some(Type::Float32 | Type::Float64)
+                            ),
+                            _ => false,
+                        };
+                        if !unordered_sort_key {
                             a.output_limit = Some(GroupLimit::TopK { slot, limit });
                         }
                     }

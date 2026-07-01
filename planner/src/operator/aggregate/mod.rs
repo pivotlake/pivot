@@ -208,21 +208,13 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                 AggregateFunc::Count(a) => (AggregationKind::Count, a.column().column_idx),
                 AggregateFunc::Sum(a) => (AggregationKind::Sum, a.column().column_idx),
                 AggregateFunc::Min(a) => (
-                    extreme_kind(
-                        &a.column().return_type,
-                        AggregationKind::StrMin,
-                        AggregationKind::Min,
-                    )
-                    .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
+                    extreme_kind(&a.column().return_type, AggregationKind::Min)
+                        .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
                     a.column().column_idx,
                 ),
                 AggregateFunc::Max(a) => (
-                    extreme_kind(
-                        &a.column().return_type,
-                        AggregationKind::StrMax,
-                        AggregationKind::Max,
-                    )
-                    .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
+                    extreme_kind(&a.column().return_type, AggregationKind::Max)
+                        .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
                     a.column().column_idx,
                 ),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
@@ -236,32 +228,31 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
         .collect()
 }
 
-/// The MIN/MAX kind for a column of type `ty`: the byte-wise `string` extreme for
-/// a `Utf8` column (folded through the value container's arena path), the
-/// `numeric` extreme for the integer widths the executor can read
-/// (`Int16`/`Int32`/`Int64`) and for `Date`/`Timestamp` (which the reader sees as
-/// the int they store, after [`Aggregate::int_ify_temporal_values`]). `None` for
-/// any other type, so the caller reports a clean `UnsupportedAggregateExpression`
-/// rather than a worker panic in the reader.
-fn extreme_kind(
-    ty: &Type,
-    string: AggregationKind,
-    numeric: AggregationKind,
-) -> Option<AggregationKind> {
+/// Validate that a column of type `ty` can be a `MIN`/`MAX` argument, returning the
+/// `MIN`/`MAX` `kind` if so. The value family (string / integer / float) is chosen
+/// by the column type at bind, not encoded in the kind: a `Utf8` column folds the
+/// byte extreme through the value arena, an integer/temporal one the numeric extreme
+/// (`Date`/`Timestamp` seen as the int they store, after
+/// [`Aggregate::int_ify_temporal_values`]), a float one in `f64`. `None` for any
+/// other type, so the caller reports a clean `UnsupportedAggregateExpression` rather
+/// than a worker panic in the reader.
+fn extreme_kind(ty: &Type, kind: AggregationKind) -> Option<AggregationKind> {
     match ty {
-        Type::Utf8 => Some(string),
         // UInt8/16/32 fold losslessly through the reader's i64 accumulator;
         // UInt64 is excluded (it would wrap above i64::MAX) so it reports a clean
         // unsupported error rather than a silently wrong extreme.
-        Type::Int8
+        Type::Utf8
+        | Type::Int8
         | Type::Int16
         | Type::Int32
         | Type::Int64
         | Type::UInt8
         | Type::UInt16
         | Type::UInt32
+        | Type::Float32
+        | Type::Float64
         | Type::Date
-        | Type::Timestamp => Some(numeric),
+        | Type::Timestamp => Some(kind),
         _ => None,
     }
 }

@@ -13,7 +13,7 @@ use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::keys::ArenaKey;
 use arrow_array::types::{ArrowPrimitiveType, Decimal128Type, Int64Type};
-use arrow_array::{ArrayRef, Decimal128Array, Int64Array, StringViewArray};
+use arrow_array::{ArrayRef, Decimal128Array, Float64Array, Int64Array, StringViewArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
@@ -82,6 +82,106 @@ impl Numeric for i128 {
         )
     }
 }
+/// Storing an `f64` accumulator in a numeric value cell.
+///
+/// A grouped float `SUM`/`MIN`/`MAX` keeps its running `f64` in the very cell an
+/// integer aggregate would use, bit-punned through [`f64::to_bits`]: the cell holds
+/// the float's raw bits, reinterpreted back on read. The float folds own that
+/// reinterpretation (the cell is just storage), exactly as a string extreme views
+/// its cell as an [`ArenaKey`] through [`StringCell`]. Both widths hold the 64-bit
+/// pattern (`i128` in its low half), so a float slot rides whichever width the rest
+/// of the signature already forces.
+pub trait F64Cell: Cell {
+    /// Pack an `f64`'s bits into the cell.
+    fn from_f64(v: f64) -> Self;
+    /// Read the cell's bits back as the `f64` a float slot stored.
+    fn into_f64(self) -> f64;
+    /// Render a finished column of float cells as a zero-or-near-zero-copy `Float64`
+    /// array. The output phase narrows this to `Float32` for a `REAL` slot via the
+    /// slot's declared `output_type` cast.
+    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef);
+}
+
+impl F64Cell for i64 {
+    #[inline(always)]
+    fn from_f64(v: f64) -> Self {
+        v.to_bits() as i64
+    }
+    #[inline(always)]
+    fn into_f64(self) -> f64 {
+        f64::from_bits(self as u64)
+    }
+    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+        let len = col.len();
+        // Each `i64` cell holds an `f64`'s raw bits, so the same 8-byte slab
+        // reinterprets as an `f64` buffer with no copy.
+        let values = ScalarBuffer::<f64>::new(col.into_buffer(), 0, len);
+        (
+            Field::new(name, DataType::Float64, false),
+            Arc::new(Float64Array::new(values, None)),
+        )
+    }
+}
+
+impl F64Cell for i128 {
+    #[inline(always)]
+    fn from_f64(v: f64) -> Self {
+        // Zero-extend the 64 bits into the low half of the wide cell.
+        v.to_bits() as i128
+    }
+    #[inline(always)]
+    fn into_f64(self) -> f64 {
+        f64::from_bits(self as u64)
+    }
+    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+        let len = col.len();
+        // The f64 bits sit in each cell's low 64; the 16-byte stride can't
+        // reinterpret in place, so gather them back into a fresh Float64 buffer.
+        let cells = ScalarBuffer::<i128>::new(col.into_buffer(), 0, len);
+        let arr = Float64Array::from_iter_values(cells.iter().map(|&c| f64::from_bits(c as u64)));
+        (Field::new(name, DataType::Float64, false), Arc::new(arr))
+    }
+}
+
+/// Storing a re-read wide (`i128`) partial in a numeric value cell.
+///
+/// The two-level `COUNT(DISTINCT)` lowering emits its wide inner partials as
+/// `Decimal128` and re-reads them in the outer level (see
+/// `U128Reader`). Those values are full `i128`s, so
+/// the outer cell must hold an `i128` losslessly. Only the 128-bit cell can, and the
+/// planner always widens this path, so the `i64` arms are the fail-out (a bug if
+/// reached), exactly like [`StringCell`]. Reading a `Decimal128` as `i64` instead
+/// would truncate a per-subgroup `SUM` that overflows `i64`.
+pub trait WideCell: Cell {
+    /// Store a full `i128` partial in the cell.
+    fn from_i128(v: i128) -> Self;
+    /// Read the cell back as the `i128` partial it holds.
+    fn into_i128(self) -> i128;
+}
+
+/// The fail-out: a re-read wide partial requires 128-bit storage, so the planner
+/// must widen. Any `i64` arm being hit is a planning bug.
+const NARROW_WIDE_CELL: &str = "wide (i128) partial re-read requires 128-bit (i128) storage; the planner must widen, so reaching i64 is a bug";
+
+impl WideCell for i128 {
+    #[inline(always)]
+    fn from_i128(v: i128) -> Self {
+        v
+    }
+    #[inline(always)]
+    fn into_i128(self) -> i128 {
+        self
+    }
+}
+impl WideCell for i64 {
+    fn from_i128(_: i128) -> Self {
+        panic!("{NARROW_WIDE_CELL}")
+    }
+    fn into_i128(self) -> i128 {
+        panic!("{NARROW_WIDE_CELL}")
+    }
+}
+
 /// Storing a string extreme's [`ArenaKey`] in a numeric value cell.
 ///
 /// A grouped string `MIN`/`MAX` keeps its winning `ArenaKey` — a 128-bit Arrow
