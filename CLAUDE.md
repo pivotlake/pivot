@@ -16,3 +16,5 @@ things that are extremely mission-specific (for example, if changing GROUP-BY to
 
 Don't return None or have fallbacks when it's not absolutely necessary. We don't want to have silent 
 failures or have unexpected flows.
+
+Never push unformatted code. Before every `git push`, run `cargo fmt` and ensure `cargo fmt --check` passes.
