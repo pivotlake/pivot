@@ -19,6 +19,10 @@ on:
         description: "Build the x86_64 binary on the self-hosted GCP runner (ci-runner2). On by default; uncheck to use a GitHub-hosted runner. The aarch64 build always uses a hosted arm64 runner."
         type: boolean
         default: true
+      push_docker:
+        description: "Build the pivot server image and push it to Docker Hub (giladkl/pivot)."
+        type: boolean
+        default: true
 
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
@@ -26,6 +30,9 @@ on:
 #                 (instance-scoped compute.instanceAdmin.v1 is enough).
 # Required repository variables (unless overridden via the `bucket` input):
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
+# For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
+# DOCKERHUB_TOKEN secrets are used; that account must have push access to
+# giladkl/pivot.
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,13 +65,14 @@ jobs:
           echo "Building: $include"
 
   # Resume the self-hosted GCP VM (ci-runner2) when opted in, so its gcp-builder
-  # runners are online for the x86_64 build. Only the x86_64 leg can use it (the
-  # box is X64); the aarch64 leg always builds on a hosted arm64 runner.
+  # runners are online. The x86_64 binary build and the Docker image build both
+  # run on the box (it is X64); the aarch64 leg always builds on a hosted arm64
+  # runner.
   start-ci:
     name: Start GCP runner
-    # Only the x86_64 build can use the box, so only resume it when that build is
-    # both selected and routed to the self-hosted runner.
-    if: ${{ inputs.use_gcp_runner && inputs.build_x86_64 }}
+    # Resume the box when anything that runs on it is selected: the x86_64 binary
+    # build or the Docker image build.
+    if: ${{ inputs.use_gcp_runner && (inputs.build_x86_64 || inputs.push_docker) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -146,6 +154,43 @@ jobs:
           echo "Uploaded to:"
           echo "  $BUCKET/pivotdb-server-$ARCH-$SHA"
           echo "  $BUCKET/pivotdb-server-$ARCH-latest"
+
+  # Build the pivot server image and push it to Docker Hub (giladkl/pivot),
+  # tagged with both the commit SHA and `latest`. Independent of the binary
+  # matrix above, but shares the self-hosted gcp-builder when opted in, so it
+  # waits on start-ci to resume the box.
+  docker:
+    name: Build & push Docker image
+    needs: [start-ci]
+    # start-ci is skipped unless opted in, so accept its skipped result too.
+    if: ${{ always() && inputs.push_docker && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
+    # Build on the self-hosted gcp-builder when opted in (like the binary legs);
+    # otherwise fall back to a hosted runner.
+    runs-on: ${{ inputs.use_gcp_runner && 'gcp-builder' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: server/Dockerfile
+          push: true
+          tags: |
+            giladkl/pivot:${{ github.sha }}
+            giladkl/pivot:latest
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,scope=server,mode=max
 
   # NOTE: no stop job here. ci-runner2's hourly suspend-if-unused cron suspends
   # the box only when no ci/deploy run is active, so it can't be killed out from

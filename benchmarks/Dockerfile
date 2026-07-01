@@ -4,7 +4,7 @@
 # Submodules (arrow-rs, duckdb-planner/duckdb-sources) must be checked out
 # before docker build — they are referenced by path = "..." in Cargo.toml.
 
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake clang libclang-dev pkg-config git ca-certificates \
