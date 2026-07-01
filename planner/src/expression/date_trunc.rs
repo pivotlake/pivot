@@ -1,12 +1,11 @@
 //! [`DateTrunc`] — SQL `date_trunc(unit, source)`.
 
-use super::{Error, Expression, Function, constant_string};
+use super::{Expression, Function};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, RecordBatch, TimestampSecondArray};
 use arrow_schema::DataType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -17,27 +16,6 @@ use std::sync::Arc;
 pub struct DateTrunc {
     pub unit: String,
     pub source: Box<Expression>,
-}
-
-impl TryFrom<duckdb_expression::Function> for DateTrunc {
-    type Error = Error;
-    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
-        if f.params.len() != 2 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 2,
-                actual,
-            });
-        }
-        let source = Box::new(Expression::try_from(f.params.remove(1))?);
-        let unit = constant_string(
-            Expression::try_from(f.params.remove(0))?,
-            "date_trunc: unit",
-        )?
-        .to_ascii_lowercase();
-        Ok(DateTrunc { unit, source })
-    }
 }
 
 impl Display for DateTrunc {

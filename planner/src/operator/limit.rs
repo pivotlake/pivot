@@ -6,7 +6,6 @@
 
 use crate::compile::Error;
 use dispatch::RecordBatchOperatorSpec;
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 
 /// `LIMIT … OFFSET …` with no ORDER BY.
@@ -15,16 +14,6 @@ pub struct Limit {
     /// `None` for an offset-only query (`OFFSET n` with no upper bound).
     pub limit: Option<usize>,
     pub offset: usize,
-}
-
-impl TryFrom<duckdb_operator::Limit> for Limit {
-    type Error = super::Error;
-    fn try_from(l: duckdb_operator::Limit) -> Result<Self, Self::Error> {
-        Ok(Limit {
-            limit: l.limit,
-            offset: l.offset.unwrap_or(0),
-        })
-    }
 }
 
 impl fmt::Display for Limit {

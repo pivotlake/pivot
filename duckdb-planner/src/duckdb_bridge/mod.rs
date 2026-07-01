@@ -105,6 +105,9 @@ pub mod ffi {
         /// An owning list of synthesized expressions (a `LogicalGet`'s
         /// pushed-down filter conditions). Read via `expr_list_*`.
         type ExpressionList;
+        /// A DuckDB `Value` (a query constant or a table-function argument).
+        /// Opaque; read via the `value_*` accessors after `value_type`.
+        type Value;
 
         fn new_context(catalog: Box<CatalogContext>) -> UniquePtr<DuckPlannerContext>;
         fn extract_plan(ctx: Pin<&mut DuckPlannerContext>, query: &str) -> ExtractPlanResult;
@@ -198,8 +201,7 @@ pub mod ffi {
         fn lo_get_function_name(op: &LogicalOperator) -> String;
         fn lo_get_has_named_params(op: &LogicalOperator) -> bool;
         fn lo_get_param_count(op: &LogicalOperator) -> usize;
-        fn lo_get_param_type(op: &LogicalOperator, index: usize) -> u8;
-        fn lo_get_param_value(op: &LogicalOperator, index: usize) -> String;
+        fn lo_get_param(op: &LogicalOperator, index: usize) -> &Value;
 
         // ---- CreateTable ----
         fn lo_create_table_name(op: &LogicalOperator) -> String;
@@ -258,8 +260,28 @@ pub mod ffi {
         fn expr_between_upper_inclusive(expr: &Expression) -> bool;
 
         // BoundConstantExpression
-        fn expr_constant_type(expr: &Expression) -> u8;
-        fn expr_constant_value(expr: &Expression) -> String;
+        fn expr_constant(expr: &Expression) -> &Value;
+
+        // ---- Value: typed accessors (shared by constants and table-function
+        // arguments). Read `value_type` first, then the matching accessor.
+        fn value_type(v: &Value) -> u8;
+        fn value_bool(v: &Value) -> bool;
+        fn value_i8(v: &Value) -> i8;
+        fn value_i16(v: &Value) -> i16;
+        fn value_i32(v: &Value) -> i32;
+        fn value_i64(v: &Value) -> i64;
+        fn value_u8(v: &Value) -> u8;
+        fn value_u16(v: &Value) -> u16;
+        fn value_u32(v: &Value) -> u32;
+        fn value_u64(v: &Value) -> u64;
+        fn value_f32(v: &Value) -> f32;
+        fn value_f64(v: &Value) -> f64;
+        fn value_string(v: &Value) -> String;
+        fn value_date(v: &Value) -> i32;
+        fn value_timestamp(v: &Value) -> i64;
+        fn value_interval_months(v: &Value) -> i32;
+        fn value_interval_days(v: &Value) -> i32;
+        fn value_interval_micros(v: &Value) -> i64;
 
         // BoundAggregateExpression
         fn expr_aggregate_name(expr: &Expression) -> String;

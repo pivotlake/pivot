@@ -1,10 +1,8 @@
 //! [`Materialize`] — late-materialization fetch of extra columns.
 
-use crate::catalog::{DuckDBTableAdapter, QueryContext, Table};
+use crate::catalog::{QueryContext, Table};
 use crate::compile::Error;
 use dispatch::{Projection as DispatchProjection, RecordBatchOperatorSpec};
-use duckdb_planner::operator as duckdb_operator;
-use std::any::Any;
 use std::fmt;
 
 /// Late-materialization fetch: re-reads `columns` from the table for the rows
@@ -23,22 +21,6 @@ pub struct Materialize {
     pub table: Box<dyn Table>,
     /// Table-schema (storage) column indices to fetch, in output order.
     pub columns: Vec<usize>,
-}
-
-impl TryFrom<duckdb_operator::Materialize> for Materialize {
-    type Error = super::Error;
-    fn try_from(m: duckdb_operator::Materialize) -> Result<Self, Self::Error> {
-        // Mirror `Input`: the resolved DuckDB table is a `DuckDBTableAdapter`
-        // wrapping the pivot `Table`; downcast and take it.
-        let any: Box<dyn Any> = m.table;
-        let wrapper: Box<DuckDBTableAdapter> = any
-            .downcast::<DuckDBTableAdapter>()
-            .expect("Materialize.table should be a DuckDBTableAdapter");
-        Ok(Materialize {
-            table: wrapper.table,
-            columns: m.columns,
-        })
-    }
 }
 
 impl fmt::Display for Materialize {

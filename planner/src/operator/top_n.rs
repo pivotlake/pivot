@@ -5,7 +5,6 @@ use crate::compile::{DynamicFilterSlots, Error};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use dispatch::{OrderBy as DispatchOrderBy, RecordBatchOperatorSpec};
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 
 /// Combined ORDER BY + LIMIT (returns the top N rows).
@@ -18,25 +17,6 @@ pub struct TopN {
     /// publishes its current boundary value into the shared slot so consumer
     /// scans elsewhere in the plan can prune row groups against it.
     pub produces_dynamic_filter: Option<DynamicFilter>,
-}
-
-impl TryFrom<duckdb_operator::TopN> for TopN {
-    type Error = super::Error;
-    fn try_from(t: duckdb_operator::TopN) -> Result<Self, Self::Error> {
-        Ok(TopN {
-            order_bys: t
-                .order_bys
-                .into_iter()
-                .map(OrderByNode::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-            limit: t.limit,
-            offset: t.offset,
-            produces_dynamic_filter: t
-                .produces_dynamic_filter
-                .map(DynamicFilter::try_from)
-                .transpose()?,
-        })
-    }
 }
 
 impl fmt::Display for TopN {

@@ -1,13 +1,11 @@
 //! [`Input`] — scans a [`Table`] from the catalog.
 
 use super::slot_for;
-use crate::catalog::{DuckDBTableAdapter, DynamicScanPredicate, QueryContext, Table};
+use crate::catalog::{DynamicScanPredicate, QueryContext, Table};
 use crate::compile::{DynamicFilterSlots, Error};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use dispatch::{DataFlowDispatcher, Projection as DispatchProjection, RecordBatchOperatorSpec};
-use duckdb_planner::operator as duckdb_operator;
-use std::any::Any;
 use std::fmt;
 
 /// Scans a [`Table`] from the catalog. `columns` lists the requested output
@@ -28,30 +26,6 @@ pub struct Input {
     /// remaining columns for only the surviving rows. Always `false` for
     /// ordinary scans.
     pub emit_row_group_metadata: bool,
-}
-
-impl TryFrom<duckdb_operator::Input> for Input {
-    type Error = super::Error;
-    fn try_from(s: duckdb_operator::Input) -> Result<Self, Self::Error> {
-        let any: Box<dyn Any> = s.table;
-        let wrapper: Box<DuckDBTableAdapter> = any
-            .downcast::<DuckDBTableAdapter>()
-            .expect("Input.table should be a DuckDBTableAdapter");
-        Ok(Input {
-            table: wrapper.table,
-            columns: s
-                .columns
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-            dynamic_filters: s
-                .dynamic_filters
-                .into_iter()
-                .map(DynamicFilter::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-            emit_row_group_metadata: s.emit_row_group_metadata,
-        })
-    }
 }
 
 impl fmt::Display for Input {

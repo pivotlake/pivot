@@ -1,31 +1,65 @@
+use std::fmt;
+
 use crate::duckdb_bridge::duckdb_types::LogicalTypeId;
-use std::fmt::Debug;
 
-impl LogicalTypeId {
-    /// Reconstruct a [`LogicalTypeId`] from the `u8` discriminant the bridge
-    /// reports. DuckDB defines `LogicalTypeId` as `enum class : uint8_t`, so the
-    /// discriminant round-trips exactly.
-    pub(crate) fn from_u8(value: u8) -> Self {
-        unsafe { std::mem::transmute::<u8, LogicalTypeId>(value) }
-    }
-}
-
-impl Debug for LogicalTypeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.clone() as u8)
-    }
-}
-
-/// A constant value from the query, stored as the DuckDB type tag plus its
-/// string representation.
+/// A constant value from the query (or a table-function argument), extracted from
+/// DuckDB as a typed value rather than a string.
 ///
-/// This intentionally avoids a typed enum so that every DuckDB type is
-/// supported without needing a variant for each one — the consumer can
-/// parse `raw_value` according to `logical_type` as needed.
+/// Each variant holds the value already decoded into the corresponding Rust type;
+/// [`Other`](ScalarValue::Other) covers DuckDB types the bridge doesn't decode
+/// into a typed variant (e.g. `HUGEINT`, `DECIMAL`) and carries the logical type
+/// so the consumer can report it.
 #[derive(Debug, Clone)]
-pub struct ScalarValue {
-    /// The DuckDB logical type (e.g. `INTEGER`, `VARCHAR`).
-    pub logical_type: LogicalTypeId,
-    /// The value as a string exactly as DuckDB serialized it (e.g. `"42"`, `"alice"`).
-    pub raw_value: String,
+pub enum ScalarValue {
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
+    Float32(f32),
+    Float64(f64),
+    Utf8(String),
+    /// `DATE`: days since the Unix epoch (1970-01-01).
+    Date(i32),
+    /// `TIMESTAMP`: microseconds since the Unix epoch.
+    Timestamp(i64),
+    /// `INTERVAL` kept as its three independent components.
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
+    /// A DuckDB type the bridge does not decode into a typed variant.
+    Other(LogicalTypeId),
+}
+
+impl fmt::Display for ScalarValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScalarValue::Boolean(v) => write!(f, "{v}"),
+            ScalarValue::Int8(v) => write!(f, "{v}"),
+            ScalarValue::Int16(v) => write!(f, "{v}"),
+            ScalarValue::Int32(v) => write!(f, "{v}"),
+            ScalarValue::Int64(v) => write!(f, "{v}"),
+            ScalarValue::UInt8(v) => write!(f, "{v}"),
+            ScalarValue::UInt16(v) => write!(f, "{v}"),
+            ScalarValue::UInt32(v) => write!(f, "{v}"),
+            ScalarValue::UInt64(v) => write!(f, "{v}"),
+            ScalarValue::Float32(v) => write!(f, "{v}"),
+            ScalarValue::Float64(v) => write!(f, "{v}"),
+            ScalarValue::Utf8(v) => write!(f, "{v}"),
+            ScalarValue::Date(v) => write!(f, "{v}"),
+            ScalarValue::Timestamp(v) => write!(f, "{v}"),
+            ScalarValue::Interval {
+                months,
+                days,
+                micros,
+            } => write!(f, "{months} {days} {micros}"),
+            ScalarValue::Other(ty) => write!(f, "{ty:?}"),
+        }
+    }
 }

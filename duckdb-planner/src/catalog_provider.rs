@@ -6,14 +6,14 @@ use crate::duckdb_bridge::ffi::CatalogGetScalarFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableResult;
 use crate::duckdb_bridge::ffi::DuckDBColumn;
-use crate::expression::TableFilter;
+use crate::handle::Expr;
 
 /// Describes a table that the planner can reference during query planning.
 ///
 /// Implement this trait for tables in your schema and return instances
 /// from [`DuckDBBind::try_bind`]. The planner uses [`duckdb_typed_columns`](DuckDBTable::duckdb_typed_columns)
 /// to resolve column names and types, and attaches the `Box<dyn DuckDBTable>` to the
-/// resulting [`Input`](crate::operator::Input) operator so downstream consumers
+/// resulting scan operator so downstream consumers
 /// can identify which table is being scanned.
 /// Type-erased error that crosses the FFI boundary as a C++ exception (CXX
 /// converts via `Display`).
@@ -35,13 +35,14 @@ pub trait DuckDBTable: Any {
     /// the one resolved table out.
     fn clone_box(&self) -> Box<dyn DuckDBTable>;
 
-    /// Called from DuckDB's `pushdown_complex_filter` hook with the current
-    /// scan-local filter expressions built into a [`TableFilter`].
+    /// Called from DuckDB's `pushdown_complex_filter` hook with a borrowed
+    /// handle to the current scan-local filter expression. The implementor reads
+    /// the handle (translating it however it likes) to decide eligibility.
     ///
     /// Returns `Ok(true)` when the filter was fully consumed by the table
     /// (DuckDB drops it from the scan), `Ok(false)` to keep it. Errors are
     /// surfaced to C++ as exceptions.
-    fn pushdown_filter(&mut self, _filter: TableFilter) -> Result<bool> {
+    fn pushdown_filter(&mut self, _filter: Expr<'_>) -> Result<bool> {
         Ok(false)
     }
 }
@@ -178,6 +179,5 @@ pub(crate) fn pushdown_filter(
         .table
         .as_mut()
         .ok_or_else(|| -> Error { "pushdown_filter called on unbound table".into() })?;
-    let expression = crate::plan_build::build_expression(expr)?;
-    table.pushdown_filter(TableFilter::Expression(Box::new(expression)))
+    table.pushdown_filter(Expr::from_raw(expr))
 }

@@ -1,13 +1,12 @@
 //! [`DatePart`] — SQL `extract(<part> FROM ts)` and its [`DatePartKind`].
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::DataType;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -171,30 +170,6 @@ pub struct DatePart {
     pub kind: DatePartKind,
     pub source: Box<Expression>,
     pub return_type: Type,
-}
-
-impl DatePart {
-    /// Build from a DuckDB function call once its name has been recognised as a
-    /// date part. Validates the single-argument arity.
-    pub(super) fn from_function(
-        kind: DatePartKind,
-        mut f: duckdb_expression::Function,
-    ) -> Result<Self, Error> {
-        if f.params.len() != 1 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 1,
-                actual,
-            });
-        }
-        let source = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(DatePart {
-            kind,
-            source,
-            return_type: Type::Int64,
-        })
-    }
 }
 
 impl Display for DatePart {

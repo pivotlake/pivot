@@ -3,7 +3,7 @@
 //! Each variant of [`Operator`] corresponds to one stage of a plan
 //! (scan a table, project columns, filter rows, aggregate, sort, top-N,
 //! create a table). Operators are produced by convertion from
-//! a [`duckdb_operator::Operator`].
+//! a [`duckdb_planner::handle::Operator`].
 //!
 //! Each operator *kind* lives in its own submodule co-locating the AST type,
 //! its `TryFrom` from the DuckDB operator, its `Display`, and its `compile`
@@ -44,7 +44,6 @@ pub use top_n::TopN;
 use crate::compile::DynamicFilterSlots;
 use crate::expression::{self};
 use dispatch::DynamicFilterSlot;
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
@@ -55,6 +54,10 @@ pub enum Error {
     Expression(#[from] expression::Error),
     #[error("{0}")]
     Type(#[from] crate::types::Error),
+    /// A plan shape pivot doesn't support yet (an unmapped operator, a
+    /// non-constant LIMIT, a table function with named parameters, ...).
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 /// Get-or-create the shared [`DynamicFilterSlot`] for `slot_id` within this
@@ -90,36 +93,6 @@ pub enum Operator {
     Materialize(Materialize),
     /// `EXPLAIN <query>`: renders its child plan as text (see [`Explain`]).
     Explain(Explain),
-}
-
-impl TryFrom<duckdb_operator::Operator> for Operator {
-    type Error = Error;
-
-    fn try_from(op: duckdb_operator::Operator) -> Result<Self, Self::Error> {
-        Ok(match op {
-            duckdb_operator::Operator::Input(s) => Operator::Input(s.try_into()?),
-            duckdb_operator::Operator::TableFunctionScan(t) => {
-                Operator::TableFunctionScan(t.try_into()?)
-            }
-            duckdb_operator::Operator::Projection(p) => Operator::Projection(p.try_into()?),
-            duckdb_operator::Operator::OrderBy(o) => Operator::OrderBy(o.try_into()?),
-            duckdb_operator::Operator::Aggregate(a) => Operator::Aggregate(a.try_into()?),
-            duckdb_operator::Operator::Filter(f) => Operator::Filter(f.try_into()?),
-            duckdb_operator::Operator::TopN(t) => Operator::TopN(t.try_into()?),
-            duckdb_operator::Operator::Limit(l) => Operator::Limit(l.try_into()?),
-            duckdb_operator::Operator::CreateTable(c) => Operator::CreateTable(c.try_into()?),
-            duckdb_operator::Operator::DummyScan(d) => Operator::DummyScan(d.try_into()?),
-            duckdb_operator::Operator::Explain(e) => Operator::Explain(e.try_into()?),
-            duckdb_operator::Operator::Set(s) => Operator::SetVariable(s.try_into()?),
-            duckdb_operator::Operator::Materialize(m) => Operator::Materialize(m.try_into()?),
-            duckdb_operator::Operator::RawInput(_) => {
-                unreachable!("RawInput should be resolved to Input before reaching the planner")
-            }
-            duckdb_operator::Operator::RawMaterialize(_) => {
-                unreachable!("RawMaterialize should be resolved to Materialize before the planner")
-            }
-        })
-    }
 }
 
 impl fmt::Display for Operator {

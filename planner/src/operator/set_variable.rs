@@ -1,6 +1,5 @@
 //! [`SetVariable`] — `SET`/`RESET` of a session variable.
 
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 
 /// `SET <name> = <value>` / `RESET <name>` (the latter arrives with no value).
@@ -14,17 +13,6 @@ use std::fmt;
 pub struct SetVariable {
     pub name: String,
     pub value: Option<String>,
-}
-
-impl TryFrom<duckdb_operator::SetVariable> for SetVariable {
-    type Error = super::Error;
-
-    fn try_from(set: duckdb_operator::SetVariable) -> Result<Self, Self::Error> {
-        Ok(SetVariable {
-            name: set.name,
-            value: set.value,
-        })
-    }
 }
 
 impl fmt::Display for SetVariable {

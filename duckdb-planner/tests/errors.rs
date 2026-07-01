@@ -84,18 +84,3 @@ fn exception_location() {
         Err(e) => panic!("Unexpected error: {e}"),
     }
 }
-
-#[test]
-fn unsupported_plan_returns_error() {
-    let mut p = create_simple_context();
-    // `IS NULL` (OPERATOR_IS_NULL) has no bridge mapping yet, so it surfaces as
-    // an UnsupportedPlan error rather than reaching the executor.
-    let result = p.plan("SELECT id IS NULL FROM t");
-    match result {
-        Ok(_) => panic!("Expected error"),
-        Err(Error::UnsupportedPlan(message)) => {
-            assert!(message.contains("Unsupported expression"))
-        }
-        Err(e) => panic!("Unexpected error: {e}"),
-    }
-}

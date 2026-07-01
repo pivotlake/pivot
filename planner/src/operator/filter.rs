@@ -5,7 +5,6 @@ use crate::expression::Expression;
 use arrow::compute::kernels::boolean::and;
 use arrow_array::{BooleanArray, RecordBatch};
 use dispatch::RecordBatchOperatorSpec;
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::Arc;
 
@@ -13,19 +12,6 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct Filter {
     pub conditions: Vec<Expression>,
-}
-
-impl TryFrom<duckdb_operator::Filter> for Filter {
-    type Error = super::Error;
-    fn try_from(f: duckdb_operator::Filter) -> Result<Self, Self::Error> {
-        Ok(Filter {
-            conditions: f
-                .conditions
-                .into_iter()
-                .map(Expression::try_from)
-                .collect::<Result<Vec<_>, _>>()?,
-        })
-    }
 }
 
 impl fmt::Display for Filter {

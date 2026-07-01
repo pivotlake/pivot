@@ -1,12 +1,11 @@
 //! [`Arithmetic`] — binary integer `+`/`-`/`*` and its [`ArithmeticOp`].
 
-use super::{Error, Expression};
+use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::{self, Type};
+use crate::types::Type;
 use arrow::compute::kernels::numeric::{add_wrapping, mul_wrapping, sub_wrapping};
 use arrow_array::{ArrayRef, Datum, RecordBatch};
 use arrow_schema::ArrowError;
-use duckdb_planner::expression as duckdb_expression;
 use std::fmt::{self, Display};
 
 /// Signature shared by arrow's wrapping arithmetic kernels.
@@ -40,37 +39,6 @@ pub struct Arithmetic {
     pub left: Box<Expression>,
     pub right: Box<Expression>,
     pub return_type: Type,
-}
-
-impl TryFrom<duckdb_expression::Function> for Arithmetic {
-    type Error = Error;
-    fn try_from(mut f: duckdb_expression::Function) -> Result<Self, Self::Error> {
-        let op = match f.function.as_str() {
-            "+" => ArithmeticOp::Add,
-            "-" => ArithmeticOp::Sub,
-            "*" => ArithmeticOp::Mul,
-            _ => return Err(Error::UnsupportedScalarFunction(f.function)),
-        };
-        // Unary forms (e.g. `-x`) bind to the same function names with one
-        // parameter; only the binary forms are supported.
-        if f.params.len() != 2 {
-            let actual = f.params.len();
-            return Err(Error::InvalidParameterCount {
-                function: f.function,
-                expected: 2,
-                actual,
-            });
-        }
-        let return_type = types::type_from_logical(f.return_type)?;
-        let right = Box::new(Expression::try_from(f.params.remove(1))?);
-        let left = Box::new(Expression::try_from(f.params.remove(0))?);
-        Ok(Arithmetic {
-            op,
-            left,
-            right,
-            return_type,
-        })
-    }
 }
 
 impl Display for Arithmetic {

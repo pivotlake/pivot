@@ -12,23 +12,13 @@ use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RecordBatchOperatorSpec, Sender,
     WorkStatus,
 };
-use duckdb_planner::operator as duckdb_operator;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The single-row source under a `FROM`-less `SELECT` (see
-/// [`duckdb_operator::DummyScan`]).
+/// The single-row source under a `FROM`-less `SELECT`.
 #[derive(Debug)]
 pub struct DummyScan;
-
-impl TryFrom<duckdb_operator::DummyScan> for DummyScan {
-    type Error = super::Error;
-
-    fn try_from(_: duckdb_operator::DummyScan) -> Result<Self, Self::Error> {
-        Ok(DummyScan)
-    }
-}
 
 impl fmt::Display for DummyScan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
