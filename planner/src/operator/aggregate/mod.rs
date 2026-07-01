@@ -351,4 +351,3 @@ fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
         )
     })
 }
-

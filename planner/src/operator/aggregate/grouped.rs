@@ -119,7 +119,10 @@ impl Aggregate {
                 continue;
             };
             // Only an argument that is not already a plain column needs one.
-            for arg in func.arguments().filter(|a| !matches!(a, Expression::Ref(_))) {
+            for arg in func
+                .arguments()
+                .filter(|a| !matches!(a, Expression::Ref(_)))
+            {
                 let ty = canonical_input_type(&arg.result_type()?)
                     .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?;
                 computed.push(arg);
@@ -358,10 +361,18 @@ fn project_leading_columns(
     exprs: &[&Expression],
     types: &[Type],
 ) -> Result<RecordBatchOperatorSpec, Error> {
-    let builders: Arc<Vec<ExprFn>> =
-        Arc::new(exprs.iter().map(|k| k.compile()).collect::<Result<_, _>>()?);
-    let targets: Arc<Vec<DataType>> =
-        Arc::new(types.iter().map(crate::types::physical_arrow_type).collect());
+    let builders: Arc<Vec<ExprFn>> = Arc::new(
+        exprs
+            .iter()
+            .map(|k| k.compile())
+            .collect::<Result<_, _>>()?,
+    );
+    let targets: Arc<Vec<DataType>> = Arc::new(
+        types
+            .iter()
+            .map(crate::types::physical_arrow_type)
+            .collect(),
+    );
     Ok(input.project(move || {
         let mut evals: Vec<ExprEvalFn> = builders.iter().map(|b| b()).collect();
         let targets = targets.clone();
