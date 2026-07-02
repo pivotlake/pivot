@@ -263,7 +263,16 @@ fn main() -> Result<(), Error> {
     });
     info!(workers, "initialising dispatch");
     let disk_cache = build_disk_cache(&args);
-    let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE, disk_cache);
+    // Ring size defaults to half of physical memory; `PIVOT_RING_GB` overrides it
+    // (e.g. to fit the ring inside a single NUMA node's memory under `numactl
+    // --membind`).
+    let ring_buffers = match std::env::var("PIVOT_RING_GB") {
+        Ok(v) if v.parse::<usize>().is_ok() => {
+            v.parse::<usize>().unwrap() * 1024 * 1024 * 1024 / BUFFER_SIZE
+        }
+        _ => get_total_memory() / 2 / BUFFER_SIZE,
+    };
+    let dispatch = Dispatch::spin_up(workers, ring_buffers, disk_cache);
 
     let ingests = args.ingests();
 
