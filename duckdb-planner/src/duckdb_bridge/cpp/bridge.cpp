@@ -640,7 +640,11 @@ size_t lo_expression_get_column_count(const LogicalOperator &op) {
 }
 
 const Expression &lo_expression_get_expr(const LogicalOperator &op, size_t row, size_t column) {
-	return *as<duckdb::LogicalExpressionGet>(op).expressions[row][column];
+	// Bounds-checked: the caller sizes `column` by `expr_types`, a different
+	// vector, so a ragged row must fail deterministically (the uncaught
+	// exception terminates) rather than read out of bounds and hand Rust a
+	// dangling reference.
+	return *as<duckdb::LogicalExpressionGet>(op).expressions.at(row).at(column);
 }
 
 // ---- Set / Reset ----

@@ -1,4 +1,4 @@
-//! [`Insert`] — `INSERT INTO <table>` fed by a source plan (a `VALUES` list or
+//! [`Insert`] - `INSERT INTO <table>` fed by a source plan (a `VALUES` list or
 //! any `SELECT`).
 
 use crate::catalog::{Catalog, QueryContext};
@@ -10,7 +10,7 @@ use std::sync::Arc;
 /// `INSERT INTO <table>`, fed by its single child (the source plan).
 ///
 /// Compiles like any other operator: the target table (resolved from the
-/// catalog) wraps the compiled source in the dataflow that writes it — see
+/// catalog) wraps the compiled source in the dataflow that writes it - see
 /// [`Table::insert`](crate::catalog::Table::insert). That dataflow durably
 /// commits every row before finishing and emits a single one-row batch
 /// carrying the written-row count, which the server reports as `INSERT 0 n`

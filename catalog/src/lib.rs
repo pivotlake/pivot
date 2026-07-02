@@ -6,7 +6,7 @@
 //! - [`parquet`] — the engines: the per-query scan pipeline and the
 //!   metadata-fetch (table load) pipeline, both dataflows over the dispatch
 //!   worker pool.
-//! - [`parquet_writing`] — the write-side engine: the streaming pipeline that
+//! - [`parquet_writing`] - the write-side engine: the streaming pipeline that
 //!   encodes `RecordBatch` dataflows into Parquet files, feeding `INSERT`
 //!   ([`ParquetCatalog`]'s `insert`) and external compaction alike.
 //! - [`store`] — the object-store backends (local fs, S3, GCS, in-memory)

@@ -242,7 +242,7 @@ impl Plan {
     /// If this plan is an `INSERT`, return it. An insert compiles and runs
     /// like any other plan, but its dataflow emits a single one-row batch
     /// carrying the written-row count instead of client rows (see
-    /// [`Table::insert`](crate::catalog::Table::insert)) — the server checks
+    /// [`Table::insert`](crate::catalog::Table::insert)) - the server checks
     /// this to reply with the `INSERT 0 n` tag rather than a row stream.
     pub fn as_insert(&self) -> Option<&crate::operator::Insert> {
         match &self.root.operator {

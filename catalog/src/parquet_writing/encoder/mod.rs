@@ -1,4 +1,4 @@
-//! The encoder stage: encode one column chunk into a Parquet column chunk —
+//! The encoder stage: encode one column chunk into a Parquet column chunk -
 //! [`dictionary`]-encoded where it pays, else [`plain`].
 //!
 //! A parallel 1→1 map (one [`ColumnChunkJob`] in, one [`EncodedColumnChunk`]
@@ -7,7 +7,7 @@
 //! [`EncodedColumnChunk::worker_id`](super::types::EncodedColumnChunk)) so a file
 //! assembles in one place. The two strategies live in [`plain`] and
 //! [`dictionary`]; both frame their pages with [`pages`] (which also cuts a chunk
-//! into pages) — see those modules for the on-the-wire format.
+//! into pages) - see those modules for the on-the-wire format.
 
 mod dictionary;
 mod pages;
@@ -17,7 +17,7 @@ mod rle;
 use arrow_array::ArrayRef;
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
-use super::error::WriteResult;
+use super::error::{WriteError, WriteResult};
 use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedPage};
 
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
@@ -53,6 +53,14 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
 pub(in crate::parquet_writing) fn encode_column_chunk(
     values: &ArrayRef,
 ) -> WriteResult<(Option<EncodedPage>, Vec<EncodedPage>)> {
+    // Reject nulls before choosing an encoding: the dictionary cast would
+    // silently fold them into arbitrary keys, and PLAIN's own check only sees
+    // its input (the dictionary path hands it the null-free distinct values).
+    if values.null_count() > 0 {
+        return Err(WriteError::NullsInRequiredColumn {
+            nulls: values.null_count(),
+        });
+    }
     match dictionary::try_encode(values)? {
         Some((dictionary_page, index_page)) => Ok((Some(dictionary_page), vec![index_page])),
         None => Ok((None, plain::encode_chunk(values)?)),

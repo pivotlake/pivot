@@ -308,6 +308,24 @@ async fn rows_affected(client: &Client, sql: &str) -> u64 {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn insert_float_values_lands_and_reads_back(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE metrics_float (v DOUBLE)")
+        .await
+        .unwrap();
+
+    let rows = rows_affected(&conn, "INSERT INTO metrics_float VALUES (1.5), (2.5)").await;
+
+    assert_eq!(rows, 2);
+    let read = select_rows(&conn, "SELECT v FROM metrics_float ORDER BY v").await;
+    assert_eq!(
+        read,
+        vec![vec![Some("1.5".into())], vec![Some("2.5".into())]],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_values_lands_and_reads_back(#[future] conn: Conn) {
     conn.simple_query("CREATE TABLE people_insert (id BIGINT, name VARCHAR)")
         .await

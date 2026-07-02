@@ -64,7 +64,7 @@ impl TableBinding {
     }
 
     /// The query's context as our own concrete
-    /// [`ParquetQueryContext`](super::ParquetQueryContext) — always the case,
+    /// [`ParquetQueryContext`](super::ParquetQueryContext) - always the case,
     /// since a `ParquetCatalog` only ever compiles its own bindings, so a
     /// failed downcast is an error, never a silent fallback.
     fn parquet_context<'a>(
@@ -100,6 +100,38 @@ impl TableBinding {
                     value: scalar_to_json(&p.value)?,
                 })
             })
+    }
+}
+
+/// An INSERT's files written to the store but not yet committed: the table
+/// copy being evolved plus the written files' manifest entries. If the
+/// dataflow never reaches its commit (an error or a cancel drops the fold
+/// holding this), `Drop` deletes the written files, so a failed INSERT does
+/// not strand orphans in the table's data location.
+struct PendingInsert {
+    table: CatalogTable,
+    added: Vec<ManifestEntry>,
+}
+
+impl PendingInsert {
+    /// CAS-commit every written file as one manifest version. Takes the
+    /// entries out first, so the `Drop` cleanup never deletes a file once the
+    /// commit may have landed: a commit whose outcome is unknown (a store
+    /// error mid-CAS) leaks its files rather than risking committed rows.
+    fn commit(mut self) -> crate::Result<()> {
+        let added = std::mem::take(&mut self.added);
+        self.table.commit_added_files(added)
+    }
+}
+
+impl Drop for PendingInsert {
+    fn drop(&mut self) {
+        // Best effort: a delete that fails, or a file still in flight between
+        // the write stage and the fold when the dataflow died, stays behind as
+        // an orphan the manifest never references (storage cost only).
+        for entry in &self.added {
+            let _ = self.table.delete_data_file(&entry.file.path);
+        }
     }
 }
 
@@ -212,30 +244,43 @@ impl Table for TableBinding {
             ROW_GROUPS_PER_FILE,
         );
 
-        // Fan the finished files in to one worker, which writes each into the
-        // table's data location as it streams out (so the whole insert is never
-        // held in memory at once) and, once every file has arrived, commits
-        // them all as **one** manifest version and emits the dataflow's only
-        // output: the one-row count batch `Table::insert` promises. Files get
+        // Write each finished file on whichever worker assembled it, so the
+        // store uploads run in parallel and a file's bytes drop as soon as it
+        // lands (a single writing worker would both serialize the uploads and
+        // let encoded output pile up unboundedly in its inbox). Files get
         // opaque uuid names so concurrent writers never collide.
-        let committed = encoded.fan_in(
-            (table, Vec::new()),
-            |(table, added): &mut (CatalogTable, Vec<ManifestEntry>),
-             encoded: EncodedFile,
-             _sender: &mut dyn Sender<RecordBatch>| {
+        let written = encoded.map_each({
+            let table = Arc::new(table.clone());
+            move |encoded: EncodedFile| {
                 let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
-                let file = table
+                table
                     .write_data_file(path, &encoded.bytes)
-                    .map_err(op_err)?;
-                added.push(ManifestEntry {
-                    file,
-                    partition: encoded.partition,
-                    sort_bounds: encoded.sort_bounds,
-                });
+                    .map(|file| ManifestEntry {
+                        file,
+                        partition: encoded.partition,
+                        sort_bounds: encoded.sort_bounds,
+                    })
+            }
+        });
+
+        // Fan the written files' entries in to one worker and, once every file
+        // has arrived, commit them all as **one** manifest version and emit
+        // the dataflow's only output: the one-row count batch `Table::insert`
+        // promises. If the dataflow dies before the commit (an error, a
+        // cancel), dropping the pending state deletes the written files.
+        let committed = written.fan_in(
+            PendingInsert {
+                table,
+                added: Vec::new(),
+            },
+            |pending: &mut PendingInsert,
+             written: crate::Result<ManifestEntry>,
+             _sender: &mut dyn Sender<RecordBatch>| {
+                pending.added.push(written.map_err(op_err)?);
                 Ok(())
             },
-            move |(mut table, added), sender: &mut dyn Sender<RecordBatch>| {
-                table.commit_added_files(added).map_err(op_err)?;
+            move |pending: PendingInsert, sender: &mut dyn Sender<RecordBatch>| {
+                pending.commit().map_err(op_err)?;
                 // The count is complete: this runs only after every upstream
                 // stage drained, and the channel handoff orders their counter
                 // updates before this read.
@@ -345,8 +390,10 @@ impl TableBinding {
     /// `source`'s columns are already in table-schema order (the planner's
     /// `INSERT` operator reorders an explicit column list), and the planner
     /// guaranteed the logical types line up, so the casts only reconcile
-    /// physical representations and cannot fail; a failure here means a
-    /// planner bug, not bad user data.
+    /// physical representations and cannot fail. Nulls in the data (planner
+    /// casts follow arrow's safe semantics, so an overflowing cast yields a
+    /// null) pass through here; the encoder rejects them with its typed
+    /// `NullsInRequiredColumn` error.
     fn conform_batches(
         &self,
         source: RecordBatchOperatorSpec,

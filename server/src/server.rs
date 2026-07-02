@@ -172,7 +172,7 @@ impl Server {
                     if let Some(task) = &http_task {
                         task.abort();
                     }
-                    // Stop the compacter first — an in-flight merge encodes on
+                    // Stop the compacter first - an in-flight merge encodes on
                     // the workers, which must still be alive.
                     let _ = compact_shutdown_tx.send(true);
                     if let Some(task) = compact_task.take() {

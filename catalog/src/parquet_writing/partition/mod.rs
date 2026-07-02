@@ -3,8 +3,8 @@
 //! and pages.
 //!
 //! This is the pipeline's one and only pipeline-breaker. It fuses what would
-//! otherwise be three separate stages — partition split + accumulate, row-group
-//! cutting, and page planning — because none of them is heavy enough to deserve
+//! otherwise be three separate stages - partition split + accumulate, row-group
+//! cutting, and page planning - because none of them is heavy enough to deserve
 //! its own work-stealing hop (they only reshape data; the one heavy step,
 //! encoding, stays parallel downstream). So everything after this stage is a plain
 //! parallel map ([`encoder`](super::encoder)) or a gather
@@ -14,7 +14,7 @@
 //! partition. When a partition reaches one file's worth of rows it cuts that file
 //! mid-stream (full-size files, no shuffle, skew-immune). At finish each worker
 //! ships its sub-file remainders to worker 0, which consolidates them per
-//! partition and cuts one tail file each — so a partition straddling workers
+//! partition and cuts one tail file each - so a partition straddling workers
 //! leaves one tail file, not one per worker. With no `partition_by` the split is a
 //! no-op (one group, key `None`), so the same stage drives plain writes too.
 //!
@@ -48,7 +48,7 @@ use super::error::WriteResult;
 use super::types::{ColumnChunkJob, PartitionTag, RowGroupHeader, RowGroupSortStats, SortColStat};
 
 /// A partition tuple (a one-row arrow-json object), or `None` for an
-/// unpartitioned write — used directly as the grouping key (`Value` is `Hash +
+/// unpartitioned write - used directly as the grouping key (`Value` is `Hash +
 /// Eq`) and recorded in the manifest.
 type PartitionKey = Option<Value>;
 
@@ -239,9 +239,9 @@ impl Outputter<ColumnChunkJob> for TailOutputter {
 
 /// Cuts one `(partition key, file's worth of rows)` into the file's column-chunk
 /// jobs: assign a `file_id`, cut row groups, and emit one [`ColumnChunkJob`] per
-/// column — stamping the partition/sort/stats provenance into a shared
+/// column - stamping the partition/sort/stats provenance into a shared
 /// [`RowGroupHeader`] per row group. Cheap and serial; shared by the consume path
-/// and the worker-0 tail. Cloneable — the id counters are shared atomics.
+/// and the worker-0 tail. Cloneable - the id counters are shared atomics.
 #[derive(Clone)]
 struct RowGroupBuilder {
     sort_by: Arc<[String]>,
@@ -307,7 +307,7 @@ impl RowGroupBuilder {
     }
 
     /// One row group's per-sort-column min/max (skipping columns whose type has
-    /// no stats — they just get no footer statistics).
+    /// no stats - they just get no footer statistics).
     fn row_group_stats(&self, slice: &RecordBatch, schema: &SchemaRef) -> RowGroupSortStats {
         let mut cols = Vec::new();
         for name in self.sort_by.iter() {

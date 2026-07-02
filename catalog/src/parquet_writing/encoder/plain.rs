@@ -1,6 +1,6 @@
 //! The PLAIN encode path: cut a column chunk into pages and PLAIN-encode each.
 //!
-//! A page's body is the column's values written back to back — fixed-width values
+//! A page's body is the column's values written back to back - fixed-width values
 //! little-endian, BYTE_ARRAY values a 4-byte LE length prefix then the bytes.
 //! [`encode_into`] is also reused by [`dictionary`](super::dictionary) to encode
 //! a dictionary page's distinct values.

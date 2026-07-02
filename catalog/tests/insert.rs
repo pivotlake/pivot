@@ -1,7 +1,7 @@
 //! Blackbox tests for the catalog's `INSERT` path: resolving a table and
 //! compiling an insert through `Table::insert` yields a dataflow that runs a
 //! `RecordBatch` source through the write pipeline, lands committed Parquet
-//! files, and emits the row count — with the rows readable through the
+//! files, and emits the row count - with the rows readable through the
 //! engine's own scan the moment the dataflow finishes.
 
 use std::sync::{Arc, OnceLock};
@@ -228,6 +228,39 @@ fn empty_insert_writes_nothing() {
 
     assert_eq!(rows, 0);
     assert!(catalog.table_files("untouched").unwrap().is_empty());
+}
+
+#[test]
+fn insert_with_nulls_errors_and_leaves_no_files() {
+    let dir = TempDir::new().unwrap();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, "no_nulls", &dir, &[]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let with_null = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let source = values_input(&dispatcher(), vec![with_null]).record_batches();
+    let table = catalog.table("no_nulls").unwrap();
+    let ctx = catalog.query_context();
+    let result = table.insert(source, ctx.as_ref()).unwrap().collect();
+
+    let message = result.unwrap_err().to_string();
+    assert!(message.contains("null"), "clean null rejection: {message}");
+    assert!(catalog.table_files("no_nulls").unwrap().is_empty());
+    let leftover = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|f| f.as_ref().unwrap().path().extension() == Some("parquet".as_ref()))
+        .count();
+    assert_eq!(leftover, 0, "a failed insert deletes the files it wrote");
 }
 
 #[test]

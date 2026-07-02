@@ -219,6 +219,25 @@ fn insert_values_plans_as_insert_over_values(mut testing_planner: TestingPlanner
 }
 
 #[rstest]
+fn insert_float_values_plan(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "measurements",
+        &[(
+            "value",
+            planner::types::Type::Float64,
+            std::sync::Arc::new(arrow_array::Float64Array::from(vec![1.0])),
+        )],
+    );
+
+    let plan = testing_planner
+        .planner
+        .plan("INSERT INTO measurements VALUES (1.5), (2.5)")
+        .unwrap();
+
+    assert!(plan.as_insert().is_some(), "{plan}");
+}
+
+#[rstest]
 fn insert_column_list_maps_source_columns_to_table_order(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .planner

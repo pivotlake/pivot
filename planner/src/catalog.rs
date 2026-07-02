@@ -156,7 +156,7 @@ pub trait Table: Debug + Send + Sync {
     /// compiled source plan, its columns already in table-schema order) and
     /// return the dataflow that writes it. Executing that dataflow durably
     /// commits every row before it finishes, then emits a **single one-row
-    /// batch whose only column is the number of rows written (`UInt64`)** —
+    /// batch whose only column is the number of rows written (`UInt64`)** -
     /// the caller reads the count from that batch, not from a side channel.
     /// `ctx` resolves the backend's current state, exactly as
     /// [`compile`](Table::compile) does.

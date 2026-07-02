@@ -32,7 +32,7 @@ use std::sync::atomic::AtomicUsize;
 /// A spec that reads every file's footer in parallel, streaming one
 /// [`TableFile`] per file: each worker steals files from a shared injector
 /// (the file's [`FileRef`](crate::store::FileRef) rides along on the
-/// [`DataFile`] and lands on the `TableFile`). File order is not preserved —
+/// [`DataFile`] and lands on the `TableFile`). File order is not preserved -
 /// files stream out in whichever order the workers finish.
 pub(crate) fn fetch_table_files_spec(
     dispatcher: &DataFlowDispatcher,

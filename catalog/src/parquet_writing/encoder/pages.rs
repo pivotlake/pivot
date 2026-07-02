@@ -101,7 +101,7 @@ fn for_each_value_len(array: &dyn Array, mut f: impl FnMut(usize)) {
     }
 }
 
-/// Which page to build — everything in the page header except the body sizes,
+/// Which page to build - everything in the page header except the body sizes,
 /// which [`assemble_page`] fills in after compressing.
 pub(super) enum PageKind {
     Data {

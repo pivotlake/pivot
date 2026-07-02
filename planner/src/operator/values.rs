@@ -1,4 +1,4 @@
-//! [`Values`] — a `VALUES` list: rows of expressions each evaluated once.
+//! [`Values`] - a `VALUES` list: rows of expressions each evaluated once.
 
 use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::Expression;
@@ -64,11 +64,22 @@ impl Values {
                             .iter_mut()
                             .map(|row| row[column](&batch).into_array(1))
                             .collect();
+                        // DuckDB bound one logical type per column, but each
+                        // cell's expression picks its own physical arrow
+                        // representation (e.g. `Utf8` vs `Utf8View`), so
+                        // reconcile them to the first cell's before
+                        // concatenating.
+                        let target = cells[0].data_type().clone();
+                        let cells: Vec<ArrayRef> = cells
+                            .iter()
+                            .map(|cell| {
+                                arrow::compute::cast(cell, &target)
+                                    .expect("a column's cells share one logical type")
+                            })
+                            .collect();
                         let cells: Vec<&dyn arrow_array::Array> =
                             cells.iter().map(|a| a.as_ref()).collect();
-                        // Every cell of a column shares the type DuckDB bound
-                        // for it, so concatenation cannot fail.
-                        arrow::compute::concat(&cells).unwrap()
+                        arrow::compute::concat(&cells).expect("cells were cast to one type")
                     })
                     .collect();
                 let fields: Vec<Field> = columns

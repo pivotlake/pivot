@@ -8,7 +8,7 @@
 //! groups) and swaps it into the table in a single log commit.
 //!
 //! The compacter is **location-agnostic**: candidates come from the table's
-//! manifest (paths + sizes — no directory scanning), reads resolve through the
+//! manifest (paths + sizes - no directory scanning), reads resolve through the
 //! catalog (a local path or a presigned URL alike), and writes/deletes go
 //! through the table's [`CatalogTable::write_data_file`] /
 //! [`CatalogTable::delete_data_file`]. A table under an `s3://` database root
@@ -17,7 +17,7 @@
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups and the write pipeline's encode stages
 //! consume those batches directly
-//! ([`catalog::parquet_writing::encode_spec`]) — the data
+//! ([`catalog::parquet_writing::encode_spec`]) - the data
 //! never leaves the pool until finished files stream out. The compacter's own
 //! task only drives that dataflow (from a blocking thread) and does the
 //! log/store bookkeeping.
@@ -32,8 +32,8 @@
 //! The compacter is **deployment-agnostic** for the same reason: it talks to
 //! nothing but the catalog (and through it, the table log and store), so it
 //! can run inside the server or as a separate process over the same database
-//! root. It covers every table of the catalog it is handed and polls — each
-//! round reloads a table to its latest log version before scanning — rather
+//! root. It covers every table of the catalog it is handed and polls - each
+//! round reloads a table to its latest log version before scanning - rather
 //! than being woken by the write path; the writers don't know it exists.
 //!
 //! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
@@ -72,7 +72,7 @@ pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 
 /// A partition with at least this many small files is merged even if they don't
-/// yet add up to a full output — otherwise partitions whose data never reaches
+/// yet add up to a full output - otherwise partitions whose data never reaches
 /// the byte target accumulate small files without bound. Kept well above the
 /// count that fills one byte-target output, so a busy partition always merges on
 /// the byte trigger (full-size outputs); this count trigger is only the safety
@@ -83,7 +83,7 @@ pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 4;
 /// Compacts every table of a catalog into target-sized Parquet files,
 /// entirely off the tables' logs: poll, reload, merge what's eligible. Holds
 /// nothing but a catalog handle, so the hosting process is a deployment
-/// detail — the server bundles one, and a dedicated process can run another
+/// detail - the server bundles one, and a dedicated process can run another
 /// over the same database root.
 pub struct Compacter {
     /// Candidate threshold and merge trigger (see [`DEFAULT_COMPACT_BYTES`]).
@@ -201,8 +201,8 @@ impl Compacter {
         }
     }
 
-    /// One poll round over every table the catalog knows. (Public so tests —
-    /// and a future standalone compacter binary — can drive one round without
+    /// One poll round over every table the catalog knows. (Public so tests -
+    /// and a future standalone compacter binary - can drive one round without
     /// the loop.)
     pub async fn compact_all(&self) {
         self.stats.inner.lock().unwrap().last_sweep_unix_ms = now_unix_ms();
@@ -216,7 +216,7 @@ impl Compacter {
     /// registered), then merge batches of eligible files until none remain.
     /// Each batch is capped at roughly one output file's worth, so a long
     /// backlog (e.g. after a restart) is worked off with bounded memory.
-    /// Errors are logged and end the table's round — the next poll retries.
+    /// Errors are logged and end the table's round - the next poll retries.
     async fn compact_table(&self, mut table: CatalogTable) {
         if let Err(e) = table.refresh() {
             warn!(table = table.name(), error = %e, "compaction: table refresh failed");
@@ -269,7 +269,7 @@ impl Compacter {
     /// log version: files under the target size, oldest-named first, cut off
     /// once they amount to one output file. `None` when there's nothing worth
     /// doing (no table, fewer than two small files, or not enough bytes for a
-    /// full output yet — merging earlier would just rewrite the same rows
+    /// full output yet - merging earlier would just rewrite the same rows
     /// again on the next flush).
     fn next_batch(&self, table: &CatalogTable) -> Option<Vec<FileRef>> {
         // Compaction merges within a single partition: across partitions it
@@ -313,7 +313,7 @@ impl Compacter {
 
             // The partition's small files don't add up to a full output (e.g. a
             // low-traffic partition of a many-partition table). Merge the pile
-            // anyway once enough have accumulated — otherwise such a partition
+            // anyway once enough have accumulated - otherwise such a partition
             // accumulates small files forever, which is what bloats a table to
             // tens of thousands of tiny files. (The merged file is itself a
             // candidate, so it keeps growing toward the target as more arrive.)
@@ -335,12 +335,12 @@ struct CompactJob {
 
 impl CompactJob {
     /// Decode `inputs` and re-encode them as one stream of target-sized row
-    /// groups — a single scan→encode dataflow — then commit: write the merged
+    /// groups - a single scan→encode dataflow - then commit: write the merged
     /// file(s), swap them for the inputs in one manifest version, delete the
     /// inputs. Returns the merged files written.
     fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, CompactError> {
         // Scan just the input files and re-encode their rows into target-sized
-        // merged files — one scan→encode dataflow on the worker pool. The inputs
+        // merged files - one scan→encode dataflow on the worker pool. The inputs
         // share one partition (see `next_batch`), so re-applying the table's
         // partition/sort spec reproduces that partition tuple and recomputes the
         // merged file's sort bounds.
@@ -357,7 +357,7 @@ impl CompactJob {
         .execute();
 
         // Write each merged file into the table's data location as it streams out
-        // — so we never hold them all in memory at once — keeping the partition
+        // - so we never hold them all in memory at once - keeping the partition
         // tuple and sort bounds the pipeline recorded for it. Only the lightweight
         // manifest entries are gathered, for the one atomic swap below.
         let millis = SystemTime::now()
@@ -387,7 +387,7 @@ impl CompactJob {
         let committed = table.replace_data_files(&removed, &added)?;
         if !committed {
             // Another writer (a second compacter over the same root) already
-            // swapped these inputs out. Our merged output was never committed —
+            // swapped these inputs out. Our merged output was never committed -
             // delete it so it doesn't linger as an orphan, and leave the inputs
             // alone: they belong to the swap that won.
             warn!(
@@ -403,7 +403,7 @@ impl CompactJob {
         }
         // Don't delete the swapped-out inputs now: a query that loaded the prior
         // manifest version is still reading them (that's the `404 expected 206`
-        // a reader hits when compaction deletes under it). Record them instead —
+        // a reader hits when compaction deletes under it). Record them instead -
         // they're deleted when this version is pruned, by which point the
         // retention tail guarantees no reader still references them.
         if let Err(e) = table.record_deletions(&removed) {

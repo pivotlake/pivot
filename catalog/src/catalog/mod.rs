@@ -222,19 +222,13 @@ impl ParquetCatalog {
     }
 
     /// A clone of the named table's current state for a writer (an external
-    /// appender, compaction) to evolve — [`append_data_file`](CatalogTable::append_data_file)
+    /// appender, compaction) to evolve - [`append_data_file`](CatalogTable::append_data_file)
     /// or [`replace_data_files`](CatalogTable::replace_data_files). Those commit
     /// a new version by CAS to the shared store, so this catalog's own copy may
     /// lag until its next resolve refreshes it (which is fine — the store is the
     /// source of truth). `None` if no such table exists.
     pub fn table_handle(&self, name: &str) -> Option<CatalogTable> {
         self.tables.read().unwrap().get(name).cloned()
-    }
-
-    /// Whether a table named `name` exists in the catalog (a cheap membership
-    /// check — no clone).
-    pub fn contains_table(&self, name: &str) -> bool {
-        self.tables.read().unwrap().contains_key(name)
     }
 
     /// A snapshot clone of every table the catalog currently holds — for a sweep
@@ -300,7 +294,7 @@ impl ParquetCatalog {
         // Fan the fetched footers in to one worker and commit there once every
         // file has arrived, under the table-set write lock (which serializes
         // in-process creates): CAS-commit the table's own manifest, record it
-        // in the database index, then publish it in the in-memory map —
+        // in the database index, then publish it in the in-memory map -
         // re-checking the name as a race backstop. Emits no rows.
         let tables = self.tables.clone();
         let store = self.store.clone();

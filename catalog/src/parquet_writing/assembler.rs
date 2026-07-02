@@ -3,14 +3,14 @@
 //! A plain `Unary` map: the [`partition`](super::partition) stage routes every
 //! column chunk of a file to `file_id % worker_count`, so all of a file's chunks
 //! arrive at one [`FileAssembler`]. It gathers a row group's chunks (by
-//! `row_group_id`, one per schema column), assembles the row group — laying each
+//! `row_group_id`, one per schema column), assembles the row group - laying each
 //! chunk's dictionary page (if any) and data pages out contiguously and stamping
-//! sort columns' footer `Statistics` — and once a `file_id` has all its
+//! sort columns' footer `Statistics` - and once a `file_id` has all its
 //! `n_row_groups`, builds the file and emits it as an [`EncodedFile`] tagged with
 //! the partition tuple and `sort_bounds` to record in the manifest. Nothing
 //! crosses workers and there is no finish phase: every file completes in
 //! `consume`. (The upstream [`partition`](super::partition) breaker is what makes
-//! this possible — it hands down file-sized units with a known row-group count.)
+//! this possible - it hands down file-sized units with a known row-group count.)
 //!
 //! The footer is fully populated (column `type`/`encodings`/`path_in_schema`/
 //! `codec`/`num_values`/sizes/stats, `dictionary_page_offset` for dict chunks, row
@@ -45,7 +45,7 @@ const REPETITION_REQUIRED: i32 = 0;
 const SNAPPY_CODEC: i32 = 1;
 /// Parquet format version written into the footer.
 const PARQUET_VERSION: i32 = 1;
-/// Parquet `ConvertedType::UTF8` — marks a BYTE_ARRAY column as a string so
+/// Parquet `ConvertedType::UTF8` - marks a BYTE_ARRAY column as a string so
 /// readers surface it as text rather than opaque bytes.
 const CONVERTED_UTF8: i32 = 0;
 
@@ -173,8 +173,8 @@ fn build_stats(sort_stats: &RowGroupSortStats) -> HashMap<usize, Statistics> {
 
 /// Encode a single-element stats array (a sort column's min or max, computed by
 /// the partition stage) into the Parquet `min_value`/`max_value` bytes. The
-/// encoding must match the reader's `decode_scalar` exactly — little-endian for
-/// primitives, raw UTF-8 for strings — or stats-based row-group pruning would
+/// encoding must match the reader's `decode_scalar` exactly - little-endian for
+/// primitives, raw UTF-8 for strings - or stats-based row-group pruning would
 /// silently drop rows.
 fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
     macro_rules! le_bytes {
@@ -254,7 +254,7 @@ fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult
         out.extend_from_slice(&group.bytes);
 
         // Rebase each column's page offsets to the file, and tally the row
-        // group's size and (from any column — all cover the same rows) row count.
+        // group's size and (from any column - all cover the same rows) row count.
         let mut total_byte_size = 0i64;
         let mut group_rows = 0i64;
         let columns: Vec<ColumnChunk> = group
@@ -417,9 +417,9 @@ mod tests {
         })
     }
 
-    /// Encode a batch the way the pipeline does — encode each column into a chunk
+    /// Encode a batch the way the pipeline does - encode each column into a chunk
     /// (dictionary or PLAIN, the encoder's choice) → `assemble_row_group` →
-    /// `build_file` — and return the bytes (a single-row-group file, no stats).
+    /// `build_file` - and return the bytes (a single-row-group file, no stats).
     fn encode(batch: &RecordBatch) -> Vec<u8> {
         let header = header(&batch.schema());
         let chunks: Vec<EncodedColumnChunk> = (0..batch.num_columns())

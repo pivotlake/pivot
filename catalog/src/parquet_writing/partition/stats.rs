@@ -1,4 +1,4 @@
-//! Computes a sort column's min/max — a private helper for the partition stage
+//! Computes a sort column's min/max - a private helper for the partition stage
 //! ([`super`]), which records them as the file's manifest `sort_bounds` and stamps
 //! each row group's into its [`PartitionTag`](super::PartitionTag) for the footer.
 //! The assembler later encodes the row-group min/max into the footer bytes.
@@ -14,7 +14,7 @@ use arrow_schema::DataType;
 
 /// A column's min and max as single-element Arrow arrays, with the column's null
 /// count. `None` when the column is empty/all-null or its type isn't one the
-/// write path (and the reader's `decode_scalar`) supports — in which case the
+/// write path (and the reader's `decode_scalar`) supports - in which case the
 /// column simply gets no statistics (pruning won't apply; never unsound).
 pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef, i64)> {
     let null_count = array.null_count() as i64;

@@ -160,6 +160,8 @@ enum Error {
     WorkerPanic(JoinError),
     #[error("waiter thread panicked: {0}")]
     PlannerPanic(JoinError),
+    #[error("INSERT finished without reporting a row count; whether it committed is unknown")]
+    InsertCountMissing,
 }
 
 impl Error {
@@ -262,13 +264,15 @@ impl PivotQueryHandler {
                 })
                 .await
                 .map_err(Error::PlannerPanic)??;
-                // Cache SELECTs; treat anything else (DDL/DML/…) as a cache
-                // flush — it may invalidate the schema cached plans were built
-                // against — and don't cache it.
+                // Cache SELECTs. INSERT and SET change data or session state,
+                // not the schema cached plans were built against (a compiled
+                // plan re-resolves its tables' files), so they are merely not
+                // cached; anything else (DDL, or any operator variant added
+                // later) flushes the cache since it may change that schema.
                 let mut cache = self.plan_cache.lock().unwrap();
                 if plan_is_cacheable(&plan) {
                     cache.insert(query.clone(), plan.clone());
-                } else {
+                } else if plan.as_insert().is_none() && plan.as_set_variable().is_none() {
                     cache.clear();
                 }
                 plan
@@ -362,12 +366,13 @@ impl PivotQueryHandler {
         // one single-row count batch (see `Table::insert`) rather than client
         // rows: read the count back and answer with the tag instead. The cell
         // is in `DataRow`'s text wire form, an `i32` byte length followed by
-        // the digits.
+        // the digits. A missing count row is an error, not a panic: it can
+        // genuinely happen when the worker pool dies mid-insert.
         if plan.as_insert().is_some() {
             let row = batches
                 .iter()
                 .find_map(|batch| batch.rows.first())
-                .expect("an INSERT dataflow emits one count row");
+                .ok_or(Error::InsertCountMissing)?;
             let (len, digits) = row.data.split_at(4);
             let len = i32::from_be_bytes(len.try_into().unwrap()) as usize;
             let rows = std::str::from_utf8(&digits[..len])

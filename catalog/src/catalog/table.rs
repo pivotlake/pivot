@@ -37,7 +37,7 @@ impl TableFile {
 /// per-file row groups (`files`). The version lives in the manifest, not
 /// alongside it.
 ///
-/// It is a plain **value** — `Clone`, no interior locks. A writer (an insert,
+/// It is a plain **value** - `Clone`, no interior locks. A writer (an insert,
 /// compaction) clones one out of the catalog, mutates its own copy, and lets the
 /// durable manifest be the source of truth: every mutation
 /// ([`append_data_file`](Self::append_data_file),
@@ -156,7 +156,7 @@ impl CatalogTable {
     }
 
     /// Write `bytes` as a new data file at `path` (under the table's location)
-    /// and commit it into the table — an external writer's single-file append,
+    /// and commit it into the table - an external writer's single-file append,
     /// one call for the write and the manifest commit. Idempotent on `path`.
     /// (An `INSERT` writes its files first and commits them all at once via
     /// [`commit_added_files`](Self::commit_added_files).)
@@ -171,37 +171,22 @@ impl CatalogTable {
         self.commit_added_file(file, partition, sort_bounds)
     }
 
-    /// CAS-commit one already-written file into the manifest, retrying past a
-    /// concurrent writer (refresh + retry). A file the manifest already holds is
-    /// an idempotent no-op, so a replayed append can't double-count rows.
-    /// `partition`/`sort_bounds` are the file's partition tuple and sort-key range
-    /// (a partitioning/sorting sink's), each `None` when not recorded.
+    /// CAS-commit one already-written file into the manifest: a single-entry
+    /// [`commit_added_files`](Self::commit_added_files), sharing its retry and
+    /// replay-idempotency semantics. `partition`/`sort_bounds` are the file's
+    /// partition tuple and sort-key range (a partitioning/sorting sink's), each
+    /// `None` when not recorded.
     fn commit_added_file(
         &mut self,
         file: FileRef,
         partition: Option<serde_json::Value>,
         sort_bounds: Option<SortBounds>,
     ) -> crate::Result<()> {
-        loop {
-            if self
-                .manifest
-                .entries
-                .iter()
-                .any(|e| e.file.path == file.path)
-            {
-                return Ok(());
-            }
-            let mut entries = self.manifest.entries.clone();
-            entries.push(ManifestEntry {
-                file: file.clone(),
-                partition: partition.clone(),
-                sort_bounds: sort_bounds.clone(),
-            });
-            if self.try_commit(entries)? {
-                return Ok(());
-            }
-            self.refresh()?;
-        }
+        self.commit_added_files(vec![ManifestEntry {
+            file,
+            partition,
+            sort_bounds,
+        }])
     }
 
     /// CAS-commit a batch of already-written files into the manifest as **one**
@@ -209,12 +194,18 @@ impl CatalogTable {
     /// retrying past concurrent writers. Entries whose path the manifest
     /// already holds are skipped, so a replayed commit can't double-count rows.
     ///
-    /// Touches only the manifest — it never fetches footers, so it is safe to
-    /// call from a dispatch worker (an `INSERT`'s terminal sink): a footer
-    /// fetch drives a nested dataflow on the same pool, which deadlocks the
+    /// Touches only the manifest: it never fetches footers, so it is safe to
+    /// call from a dispatch worker (an `INSERT`'s terminal sink), where a footer
+    /// fetch would drive a nested dataflow on the same pool and deadlock the
     /// worker driving it. Readers fetch the new files' footers lazily via
     /// [`parquet`](Self::parquet).
     pub fn commit_added_files(&mut self, entries: Vec<ManifestEntry>) -> crate::Result<()> {
+        // Start from the latest committed version, not this copy's. A copy can
+        // lag arbitrarily (an insert's copy comes from the catalog map, which
+        // only advances on reads), and a CAS at a version number the pruner has
+        // already deleted would wrongly succeed on the dead slot, committing a
+        // manifest no reader (they resolve the highest version) would ever see.
+        self.reload_manifest_only()?;
         loop {
             let fresh: Vec<ManifestEntry> = entries
                 .iter()
@@ -230,21 +221,25 @@ impl CatalogTable {
             if fresh.is_empty() {
                 return Ok(());
             }
-            // Build the next version in place: losing the CAS below replaces
-            // the whole manifest anyway, so nothing observes the mutation.
-            let base_version = self.manifest.version;
+            // Build the next version in place, undoing it whenever the commit
+            // didn't land, so no exit leaves this copy claiming a version and
+            // entries that were never durably committed.
+            let held = self.manifest.entries.len();
             self.manifest.version += 1;
             self.manifest.entries.extend(fresh);
-            if self.manifest.commit(self.store.as_ref(), &self.name)? {
+            let committed = self.manifest.commit(self.store.as_ref(), &self.name);
+            if let Ok(true) = committed {
                 return Ok(());
             }
-            // Lost the race: the winner committed a version newer than our
-            // base, so a reload from that cursor (cheap, no full directory
+            self.manifest.entries.truncate(held);
+            self.manifest.version -= 1;
+            committed?;
+            // Lost the race: the winner committed a version newer than ours, so
+            // the reload (a cursor list from our version, no full directory
             // scan) must find it; not finding one is a corrupt store.
-            let manifest =
-                TableManifest::load_after(self.store.as_ref(), &self.name, base_version)?
-                    .ok_or_else(|| Error::CommitRaceWithoutWinner(self.name.clone()))?;
-            self.set_manifest(manifest);
+            if !self.reload_manifest_only()? {
+                return Err(Error::CommitRaceWithoutWinner(self.name.clone()));
+            }
         }
     }
 
@@ -253,6 +248,11 @@ impl CatalogTable {
     /// dispatch worker.
     fn set_manifest(&mut self, manifest: TableManifest) {
         self.manifest = manifest;
+        self.retain_manifest_files();
+    }
+
+    /// Drop cached footers for files that are no longer manifest entries.
+    fn retain_manifest_files(&mut self) {
         let kept: HashSet<&str> = self
             .manifest
             .entries
@@ -352,13 +352,7 @@ impl CatalogTable {
     /// Reconcile `files` to the current `manifest`: drop the files no longer in
     /// it, then fetch and append the ones not yet held.
     fn sync_files_to_manifest(&mut self) -> crate::Result<()> {
-        let kept: HashSet<&str> = self
-            .manifest
-            .entries
-            .iter()
-            .map(|e| e.file.path.as_str())
-            .collect();
-        self.files.retain(|f| kept.contains(f.file.path.as_str()));
+        self.retain_manifest_files();
         let missing = self.retrieve_missing_table_files()?;
         self.files.extend(missing);
         Ok(())
@@ -514,8 +508,11 @@ impl CatalogTable {
     }
 
     /// The table's physical arrow schema: each declared column at the physical
-    /// type it is stored and scanned as (e.g. `Utf8View` for a `Utf8` column),
-    /// non-nullable. What a writer conforms incoming batches to.
+    /// type it is stored and scanned as (e.g. `Utf8View` for a `Utf8` column).
+    /// What a writer conforms incoming batches to. The fields are declared
+    /// nullable even though stored columns are required: a null in insert data
+    /// (e.g. from an overflowing cast) must reach the write pipeline's typed
+    /// `NullsInRequiredColumn` error, not fail batch construction with a panic.
     pub fn physical_arrow_schema(&self) -> arrow_schema::SchemaRef {
         let fields: Vec<arrow_schema::Field> = self
             .manifest
@@ -525,7 +522,7 @@ impl CatalogTable {
                 arrow_schema::Field::new(
                     column.name.clone(),
                     planner::types::physical_arrow_type(&column.col_type),
-                    false,
+                    true,
                 )
             })
             .collect();

@@ -1,4 +1,4 @@
-//! The streaming, page-parallel Parquet **write** pipeline — the write-side
+//! The streaming, page-parallel Parquet **write** pipeline - the write-side
 //! mirror of dispatch's read pipeline (indexer → decompressor → decoder), built
 //! from the same operator/channel toolkit. Each pipeline stage is its own module
 //! (a file, or a directory when it has private helpers of its own); the modules
@@ -11,20 +11,20 @@
 //! sits in memory. After the first stage the unit of work is one **column chunk**
 //! (a single column's values for one row group):
 //!
-//! 1. [`partition`] (`RecordBatch → ColumnChunkJob`) — split each batch by its
+//! 1. [`partition`] (`RecordBatch → ColumnChunkJob`) - split each batch by its
 //!    `partition_by` tuple, buffer per partition, and once a partition reaches one
-//!    file's worth, cut it into row groups and emit one job per column — stamping
+//!    file's worth, cut it into row groups and emit one job per column - stamping
 //!    each with its file/partition provenance, `sort_bounds`, and sort-column
 //!    statistics. The sub-file remainder is consolidated per partition on worker
 //!    0. This is the pipeline's only pipeline-breaker, so every later stage is a
 //!    plain parallel map or a gather. (Its partition-tuple and column-statistics
 //!    helpers live in the `partition` directory.)
-//! 2. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) — encode each column
+//! 2. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) - encode each column
 //!    chunk: dictionary-encode it where it pays, else PLAIN; cut into pages and
 //!    snappy-compress. The one heavy stage; finished chunks route back to their
 //!    file's owner worker. (Page cutting and index RLE live in the `encoder`
 //!    directory.)
-//! 3. [`assembler`] (`EncodedColumnChunk → EncodedFile`) — gather a file's column
+//! 3. [`assembler`] (`EncodedColumnChunk → EncodedFile`) - gather a file's column
 //!    chunks, lay each out (the dictionary page, then the data pages) with
 //!    sort-column footer statistics, and emit the finished file.
 //!

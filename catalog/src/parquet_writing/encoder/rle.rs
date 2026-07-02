@@ -1,4 +1,4 @@
-//! RLE/bit-packed hybrid encoder for dictionary indices — the write-side mirror
+//! RLE/bit-packed hybrid encoder for dictionary indices - the write-side mirror
 //! of the reader's `RleDecoder`. Produces the run stream a dictionary data page
 //! carries after its one leading bit-width byte (which the data-page builder
 //! prepends).
@@ -113,7 +113,7 @@ impl RleEncoder {
 }
 
 /// Append a bit-packed run of one group: the indicator (`1 << 1 | 1`) then the
-/// group's values, `bit_width` bits each, LSB-first — exactly `bit_width` bytes.
+/// group's values, `bit_width` bits each, LSB-first - exactly `bit_width` bytes.
 fn put_bit_packed_group(out: &mut Vec<u8>, group: &[u32; GROUP], bit_width: u8) {
     put_vlq(out, (1 << 1) | 1);
     let mut byte = 0u8;
@@ -171,7 +171,7 @@ mod tests {
         }
     }
 
-    /// A reference decoder for the hybrid stream — deliberately simple, to check
+    /// A reference decoder for the hybrid stream - deliberately simple, to check
     /// the encoder round-trips.
     fn decode(stream: &[u8], bit_width: u8, count: usize) -> Vec<u32> {
         let mut values = Vec::new();

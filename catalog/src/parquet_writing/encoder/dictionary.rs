@@ -1,8 +1,8 @@
 //! The dictionary encode path: a PLAIN dictionary page of the distinct values
 //! plus one data page of RLE/bit-packed indices into it.
 //!
-//! Mirrors arrow's policy — try a dictionary, fall back to PLAIN once the
-//! dictionary's distinct values would reach [`DICTIONARY_PAGE_SIZE_LIMIT`] — so
+//! Mirrors arrow's policy - try a dictionary, fall back to PLAIN once the
+//! dictionary's distinct values would reach [`DICTIONARY_PAGE_SIZE_LIMIT`] - so
 //! low-cardinality columns dictionary-encode and high-cardinality ones (e.g.
 //! timestamps) stay PLAIN.
 
@@ -18,13 +18,13 @@ use super::pages::{self, PageKind};
 use super::{plain, rle};
 
 /// Fall back from dictionary to PLAIN once the dictionary's distinct values would
-/// reach this PLAIN-encoded size — arrow's default `dictionary_page_size_limit`.
+/// reach this PLAIN-encoded size - arrow's default `dictionary_page_size_limit`.
 const DICTIONARY_PAGE_SIZE_LIMIT: usize = 1024 * 1024;
 
 /// Dictionary-encode `values` if it pays: build the dictionary, and while its
 /// distinct values stay under [`DICTIONARY_PAGE_SIZE_LIMIT`], return the PLAIN
 /// dictionary page and the RLE-encoded index page. `None` means fall back to
-/// PLAIN — the dictionary grew too large, or the value type doesn't
+/// PLAIN - the dictionary grew too large, or the value type doesn't
 /// dictionary-cast.
 pub(super) fn try_encode(values: &ArrayRef) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
     let dict_type = DataType::Dictionary(

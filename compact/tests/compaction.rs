@@ -173,7 +173,7 @@ fn compaction_merges_inserted_files_and_swaps_catalog() {
 }
 
 /// Compacting a partitioned + sorted table preserves each merged file's
-/// partition tuple and recomputes its sort bounds — it merges within one
+/// partition tuple and recomputes its sort bounds - it merges within one
 /// partition and re-applies the table's spec, rather than dropping the
 /// metadata.
 #[test]
@@ -212,7 +212,7 @@ fn compaction_preserves_partition_and_sort_metadata() {
 }
 
 /// Compaction is location-agnostic: a **store-relative** table (data under the
-/// database root, resolved through the store — the same path a remote `s3://`
+/// database root, resolved through the store - the same path a remote `s3://`
 /// root takes) compacts through the exact same code, with writes and deletes
 /// going through the table's store handle.
 #[test]
@@ -253,7 +253,7 @@ fn compaction_works_on_store_relative_tables() {
 /// The compacter can live in a **separate process**: it holds nothing but a
 /// catalog handle, and each poll round reloads the table from its log. Here
 /// the "server" inserts through one catalog instance while the compacter works
-/// through a second instance over the same database root — and the server sees
+/// through a second instance over the same database root - and the server sees
 /// the swap at its next bind.
 #[test]
 fn compacter_in_another_process_compacts_the_servers_inserts() {

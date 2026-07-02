@@ -24,7 +24,7 @@ pub(crate) type RowGroupId = u64;
 pub(crate) type FileId = u64;
 
 /// One sort column's min/max (+ null count) over a single row group, as
-/// single-element Arrow arrays — written into the row group's footer
+/// single-element Arrow arrays - written into the row group's footer
 /// `Statistics` and aggregated into the file's manifest `sort_bounds`.
 pub(crate) struct SortColStat {
     /// Column index within the schema.

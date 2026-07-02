@@ -1,5 +1,5 @@
 //! Encode selected columns at one row of a `RecordBatch` into a one-row
-//! arrow-json object — the shared primitive behind partition tuples
+//! arrow-json object - the shared primitive behind partition tuples
 //! (`{"ServiceName":"svc-a"}`) and sort-key bounds (`{"Timestamp":100}`).
 
 use std::sync::Arc;

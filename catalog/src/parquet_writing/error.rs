@@ -29,7 +29,7 @@ pub(super) enum WriteError {
     /// physical type (from [`crate::parquet::arrow_to_parquet_physical`]).
     #[error(transparent)]
     Catalog(#[from] crate::parquet::ParquetTableError),
-    /// A row group whose column yielded no pages — an internal invariant break.
+    /// A row group whose column yielded no pages - an internal invariant break.
     #[error("column {column} of a row group produced no pages")]
     MissingPages { column: usize },
     /// Only required (non-null) columns are supported; this one has nulls.
@@ -44,7 +44,7 @@ pub(super) type WriteResult<T> = Result<T, WriteError>;
 
 /// Carry a `WriteError` out of a stage on dispatch's `unary` error channel as the
 /// typed cause, so a helper's `?` lifts straight into a `UnaryResult` (mirrors
-/// `catalog`'s reader). Uses the generic `Operator` variant — the one for
+/// `catalog`'s reader). Uses the generic `Operator` variant - the one for
 /// operators living outside dispatch.
 impl From<WriteError> for dispatch::UnaryError {
     fn from(e: WriteError) -> Self {
