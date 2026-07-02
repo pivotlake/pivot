@@ -810,23 +810,22 @@ fn regexp_replace_first_match_only(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
-fn regexp_replace_escaped_dollar_is_literal(mut testing_planner: TestingPlanner) {
+fn regexp_replace_dollar_is_literal(mut testing_planner: TestingPlanner) {
     testing_planner.add_table(
         "rep",
         &[(
             "s",
             Type::Utf8,
-            Arc::new(StringViewArray::from(vec!["price"])) as ArrayRef,
+            Arc::new(StringViewArray::from(vec!["x"])) as ArrayRef,
         )],
     );
 
-    // `\$` is an escaped literal dollar. The regex crate's replacement dialect
-    // treats a bare `$` as a (here empty, thus deleted) group reference, so it
-    // must be translated to the crate's `$$` escape — otherwise the `$` would
-    // vanish from the output.
+    // `$` (even `$1`) is a literal in the SQL replacement, but the regex crate's
+    // replacement dialect would read `$1` as a group reference, so it must be
+    // escaped to `$$` — otherwise the `$1` would be consumed instead of kept.
     let results = testing_planner
         .planner
-        .plan(r"SELECT regexp_replace(s, 'price', '\$') FROM rep")
+        .plan(r"SELECT regexp_replace(s, 'x', 'a$1b') FROM rep")
         .unwrap()
         .compile(testing_planner.dispatcher())
         .unwrap()
@@ -836,7 +835,40 @@ fn regexp_replace_escaped_dollar_is_literal(mut testing_planner: TestingPlanner)
     let rows = batches_to_json(&results);
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(*only_column(&rows[0]), "$");
+    assert_eq!(*only_column(&rows[0]), "a$1b");
+}
+
+#[rstest]
+fn regexp_jit_replace_extracts_group(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "urls",
+        &[(
+            "url",
+            Type::Utf8,
+            Arc::new(StringViewArray::from(vec![
+                "https://www.example.com/path/x",
+                "http://foo.org/x",
+                "no-match-here",
+            ])) as ArrayRef,
+        )],
+    );
+
+    let results = testing_planner
+        .planner
+        .plan(r"SELECT regexp_jit_replace(url, '^https?://(?:www\.)?([^/]+)/.*', '\1') FROM urls")
+        .unwrap()
+        .compile(testing_planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut got = batches_to_json(&results)
+        .iter()
+        .map(|r| only_column(r).as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    got.sort();
+
+    assert_eq!(got, vec!["example.com", "foo.org", "no-match-here"]);
 }
 
 #[rstest]

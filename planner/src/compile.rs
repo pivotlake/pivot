@@ -73,6 +73,12 @@ pub enum Error {
         #[source]
         source: regex::Error,
     },
+    #[error("Invalid regexp_jit_replace pattern '{pattern}': {source}")]
+    InvalidJitRegexPattern {
+        pattern: String,
+        #[source]
+        source: pcre2::Error,
+    },
     #[error("CREATE TABLE does not support OR REPLACE yet")]
     UnsupportedCreateTableOrReplace,
     #[error("CREATE TEMPORARY TABLE is not supported yet")]
