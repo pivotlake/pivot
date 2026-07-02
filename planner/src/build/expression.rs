@@ -24,7 +24,7 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Ref,
-    RegexpReplace, TemporalConvert,
+    RegexpJitReplace, RegexpReplace, TemporalConvert,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -266,6 +266,9 @@ impl Function {
             "*" => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
             "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
             "regexp_replace" => Ok(Function::RegexpReplace(RegexpReplace::from_handle(func)?)),
+            "regexp_jit_replace" => Ok(Function::RegexpJitReplace(RegexpJitReplace::from_handle(
+                func,
+            )?)),
             "/" => Ok(Function::Divide(Divide::from_handle(func)?)),
             "date_trunc" => Ok(Function::DateTrunc(DateTrunc::from_handle(func)?)),
             "make_date" => Ok(Function::TemporalConvert(TemporalConvert::make_date(func)?)),
@@ -489,21 +492,43 @@ fn interval_offset(interval: &IntervalParts, result: &Type) -> Result<i64, Error
     }
 }
 
+/// Extract the `(input, pattern, replacement)` shared by `regexp_replace` and
+/// `regexp_jit_replace`. Only the three-argument first-match form is accepted: a
+/// fourth `options` argument (e.g. 'g' for replace-all) would change the
+/// semantics. Error contexts are keyed off the function's own name.
+fn regex_replace_args(
+    func: FunctionHandle<'_>,
+) -> Result<(Box<Expression>, String, String), Error> {
+    let name = func.name();
+    let params = function_args(func, 3)?;
+    let replacement = constant_string(
+        Expression::from_handle(params[2])?,
+        &format!("{name}: replacement"),
+    )?;
+    let pattern = constant_string(
+        Expression::from_handle(params[1])?,
+        &format!("{name}: pattern"),
+    )?;
+    let input = Box::new(Expression::from_handle(params[0])?);
+    Ok((input, pattern, replacement))
+}
+
 impl RegexpReplace {
     pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<RegexpReplace, Error> {
-        // A fourth `options` argument (e.g. 'g' for replace-all) changes the
-        // semantics, so only the three-argument first-match form is accepted.
-        let params = function_args(func, 3)?;
-        let replacement = constant_string(
-            Expression::from_handle(params[2])?,
-            "regexp_replace: replacement",
-        )?;
-        let pattern = constant_string(
-            Expression::from_handle(params[1])?,
-            "regexp_replace: pattern",
-        )?;
+        let (input, pattern, replacement) = regex_replace_args(func)?;
         Ok(RegexpReplace {
-            input: Box::new(Expression::from_handle(params[0])?),
+            input,
+            pattern,
+            replacement,
+        })
+    }
+}
+
+impl RegexpJitReplace {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<RegexpJitReplace, Error> {
+        let (input, pattern, replacement) = regex_replace_args(func)?;
+        Ok(RegexpJitReplace {
+            input,
             pattern,
             replacement,
         })

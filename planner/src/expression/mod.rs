@@ -28,6 +28,7 @@ mod length;
 mod not;
 mod reference;
 mod regexp;
+mod regexp_jit;
 
 pub use aggregate::{AggregateFunc, CountStar, NumericAggregate};
 pub use arithmetic::{Arithmetic, ArithmeticOp};
@@ -48,6 +49,7 @@ pub use length::Length;
 pub use not::Not;
 pub use reference::Ref;
 pub use regexp::RegexpReplace;
+pub use regexp_jit::RegexpJitReplace;
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::{self, Type};
@@ -130,13 +132,15 @@ impl Expression {
             Expression::Case(c) => c.else_expr.result_type(),
             // A cast yields its target type.
             Expression::Cast(c) => Ok(c.target.clone()),
-            // `date_trunc` and `now()` yield a timestamp; `regexp_replace` a string.
+            // `date_trunc` and `now()` yield a timestamp; the regex replacers a string.
             Expression::Function(Function::DateTrunc(_) | Function::Now) => Ok(Type::Timestamp),
             // `date`/`timestamp` ± interval keeps the temporal operand's type.
             Expression::Function(Function::IntervalArithmetic(i)) => Ok(i.result.clone()),
             // `make_date`/`make_timestamp` produce the temporal type they convert to.
             Expression::Function(Function::TemporalConvert(c)) => Ok(c.result.clone()),
-            Expression::Function(Function::RegexpReplace(_)) => Ok(Type::Utf8),
+            Expression::Function(Function::RegexpReplace(_) | Function::RegexpJitReplace(_)) => {
+                Ok(Type::Utf8)
+            }
             // A date part (`extract(minute …)`) and a byte length each carry the
             // type they evaluate to.
             Expression::Function(Function::DatePart(d)) => Ok(d.return_type.clone()),

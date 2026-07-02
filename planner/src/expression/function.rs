@@ -2,8 +2,8 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, RegexpReplace,
-    TemporalConvert,
+    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length,
+    RegexpJitReplace, RegexpReplace, TemporalConvert,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::Type;
@@ -45,6 +45,13 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Timestamp,
             volatile: true,
         }),
+        // Not a DuckDB built-in (unlike `regexp_replace`), so its signature is
+        // registered here for DuckDB's binder.
+        "regexp_jit_replace" => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Utf8, Type::Utf8, Type::Utf8],
+            return_type: Type::Utf8,
+            volatile: false,
+        }),
         _ => None,
     }
 }
@@ -56,6 +63,8 @@ pub enum Function {
     Arithmetic(Arithmetic),
     Length(Length),
     RegexpReplace(RegexpReplace),
+    /// `regexp_jit_replace` — like `RegexpReplace` but always PCRE2 JIT-compiled.
+    RegexpJitReplace(RegexpJitReplace),
     Divide(Divide),
     DateTrunc(DateTrunc),
     DatePart(DatePart),
@@ -83,6 +92,7 @@ impl Display for Function {
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
             Function::RegexpReplace(r) => write!(f, "{r}"),
+            Function::RegexpJitReplace(r) => write!(f, "{r}"),
             Function::Divide(d) => write!(f, "{d}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
             Function::DatePart(d) => write!(f, "{d}"),
@@ -101,6 +111,7 @@ impl Function {
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
             Function::RegexpReplace(r) => r.compile(),
+            Function::RegexpJitReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),
             Function::DatePart(d) => d.compile(),
