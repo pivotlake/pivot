@@ -4,20 +4,25 @@
 //! affecting anyone else.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::manifest::PartitionEqFilter;
+use crate::manifest::{ManifestEntry, PartitionEqFilter};
 use crate::parquet::{
-    ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
-    scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, ScanEqualityPredicate, materialize, op_err, row_group_eliminated,
+    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
-use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
-use arrow_schema::{Field, Schema};
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use crate::parquet_writing::{EncodedFile, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, encode_spec};
+use crate::store::ObjectPath;
+use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, Sender};
 use planner::catalog::{
     Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
     Table,
 };
 use planner::expression::{CompareType, Expression, TableFilter};
+
+use super::CatalogTable;
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
 /// DuckDB during binding. Recorded as-is; applied at [`compile`](Table::compile)
@@ -58,20 +63,25 @@ impl TableBinding {
         }
     }
 
-    /// This table's current committed row groups, from the query context (which
-    /// reloads to the latest version and pins). The context is always our own
-    /// [`ParquetQueryContext`](super::ParquetQueryContext) — a `ParquetCatalog`
-    /// only ever compiles its own bindings — so the downcast is an invariant;
-    /// failing it, or the table having been dropped since planning, is an error,
-    /// never a silent empty scan.
-    fn resolve_files(&self, ctx: &dyn QueryContext) -> CatalogResult<Arc<ParquetTable>> {
-        let ctx = ctx
-            .as_any()
+    /// The query's context as our own concrete
+    /// [`ParquetQueryContext`](super::ParquetQueryContext) — always the case,
+    /// since a `ParquetCatalog` only ever compiles its own bindings, so a
+    /// failed downcast is an error, never a silent fallback.
+    fn parquet_context<'a>(
+        &self,
+        ctx: &'a dyn QueryContext,
+    ) -> CatalogResult<&'a super::ParquetQueryContext> {
+        ctx.as_any()
             .downcast_ref::<super::ParquetQueryContext>()
-            .ok_or_else(|| {
-                CatalogError::Other("query context is not a ParquetQueryContext".into())
-            })?;
-        ctx.parquet(&self.name, self.partition_filters())
+            .ok_or_else(|| CatalogError::Other("query context is not a ParquetQueryContext".into()))
+    }
+
+    /// This table's current committed row groups, from the query context (which
+    /// reloads to the latest version and pins). The table having been dropped
+    /// since planning is an error, never a silent empty scan.
+    fn resolve_files(&self, ctx: &dyn QueryContext) -> CatalogResult<Arc<ParquetTable>> {
+        self.parquet_context(ctx)?
+            .parquet(&self.name, self.partition_filters())
     }
 
     /// This binding's pushed equality predicates as partition filters: the column
@@ -183,6 +193,64 @@ impl Table for TableBinding {
         Ok(materialize(input, self.resolve_files(ctx)?, projection))
     }
 
+    fn insert(
+        &self,
+        source: RecordBatchOperatorSpec,
+        ctx: &dyn QueryContext,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        // The write evolves its own copy of the master record (the commit CASes
+        // the shared manifest), independent of the read views this query pinned.
+        let table = self.parquet_context(ctx)?.table(&self.name)?;
+
+        let rows_written = Arc::new(AtomicU64::new(0));
+        let conformed = self.conform_batches(source, &table, rows_written.clone());
+        let encoded = encode_spec(
+            conformed,
+            Arc::from(table.partition_by()),
+            Arc::from(table.sort_by()),
+            ROW_GROUP_ROWS,
+            ROW_GROUPS_PER_FILE,
+        );
+
+        // Fan the finished files in to one worker, which writes each into the
+        // table's data location as it streams out (so the whole insert is never
+        // held in memory at once) and, once every file has arrived, commits
+        // them all as **one** manifest version and emits the dataflow's only
+        // output: the one-row count batch `Table::insert` promises. Files get
+        // opaque uuid names so concurrent writers never collide.
+        let committed = encoded.fan_in(
+            (table, Vec::new()),
+            |(table, added): &mut (CatalogTable, Vec<ManifestEntry>),
+             encoded: EncodedFile,
+             _sender: &mut dyn Sender<RecordBatch>| {
+                let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
+                let file = table
+                    .write_data_file(path, &encoded.bytes)
+                    .map_err(op_err)?;
+                added.push(ManifestEntry {
+                    file,
+                    partition: encoded.partition,
+                    sort_bounds: encoded.sort_bounds,
+                });
+                Ok(())
+            },
+            move |(mut table, added), sender: &mut dyn Sender<RecordBatch>| {
+                table.commit_added_files(added).map_err(op_err)?;
+                // The count is complete: this runs only after every upstream
+                // stage drained, and the channel handoff orders their counter
+                // updates before this read.
+                let count = UInt64Array::from(vec![rows_written.load(Ordering::Relaxed)]);
+                let schema = Schema::new(vec![Field::new("count", DataType::UInt64, false)]);
+                sender.send(
+                    RecordBatch::try_new(Arc::new(schema), vec![Arc::new(count)])
+                        .expect("a one-row count column matches its schema"),
+                )?;
+                Ok(())
+            },
+        );
+        Ok(RecordBatchOperatorSpec::from_spec(committed))
+    }
+
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
         let TableFilter::Expression(expr) = filter else {
             return Ok(false);
@@ -270,6 +338,42 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 }
 
 impl TableBinding {
+    /// Conform `source`'s batches to the table's physical arrow schema,
+    /// counting rows into `rows_written` as they pass: cast each column to its
+    /// declared physical type (e.g. `Utf8` to `Utf8View`) and stamp the
+    /// declared column names, which the partition/sort stages match on.
+    /// `source`'s columns are already in table-schema order (the planner's
+    /// `INSERT` operator reorders an explicit column list), and the planner
+    /// guaranteed the logical types line up, so the casts only reconcile
+    /// physical representations and cannot fail; a failure here means a
+    /// planner bug, not bad user data.
+    fn conform_batches(
+        &self,
+        source: RecordBatchOperatorSpec,
+        table: &CatalogTable,
+        rows_written: Arc<AtomicU64>,
+    ) -> RecordBatchOperatorSpec {
+        let schema = table.physical_arrow_schema();
+        source.project(move || {
+            let rows_written = rows_written.clone();
+            let schema = schema.clone();
+            move |batch: RecordBatch| {
+                rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        arrow_cast::cast(column, field.data_type())
+                            .expect("planner-typed column casts to the table's physical type")
+                    })
+                    .collect();
+                RecordBatch::try_new(schema.clone(), columns)
+                    .expect("conformed columns match the table schema")
+            }
+        })
+    }
+
     /// Clone `parquet`'s row groups and keep only those that survive this
     /// binding's pushed-down predicates — i.e. what [`Table::compile`] actually
     /// scans over the table's current files. A min/max stat that proves no row in

@@ -20,14 +20,15 @@
 
 use crate::query_handler::PivotHandlers;
 use catalog::ParquetCatalog;
+use compact::{Compacter, DEFAULT_COMPACT_POLL};
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
-use ingest::{IngestConfig, Ingestor};
 use pgwire::tokio::process_socket;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
 use tracing::{error, info, warn};
 
@@ -56,15 +57,12 @@ pub struct Server {
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
     handlers: Arc<PivotHandlers>,
-    /// Cloned dispatcher handed to the ingest sources so their Parquet encodes
-    /// run on the same worker pool as queries.
+    /// Cloned dispatcher handed to the dashboard's in-process query console.
     dispatcher: DataFlowDispatcher,
-    /// The concrete catalog, kept so the ingest sources can register (and
-    /// compact) the Parquet files they write. The query handlers hold it as a
+    /// The concrete catalog, kept so the bundled compacter can merge (and swap)
+    /// the Parquet files inserts write. The query handlers hold it as a
     /// `dyn Catalog`.
     catalog: Arc<ParquetCatalog>,
-    /// Ingest sources to start when [`serve`](Self::serve) runs.
-    ingests: Vec<IngestConfig>,
     /// Target size for the bundled compacter (`0` = don't run one).
     compact_bytes: u64,
     /// The compacter's count trigger for sub-target (low-traffic) partitions.
@@ -86,13 +84,11 @@ impl Server {
         bind: SocketAddr,
         dispatch: Dispatch,
         catalog: Arc<ParquetCatalog>,
-        ingests: Vec<IngestConfig>,
         compact_bytes: u64,
         compact_min_files: usize,
     ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
-        // handler needs it to compile every plan, and the ingest sources need
-        // it to encode Parquet on the worker pool.
+        // handler needs it to compile every plan.
         let dispatcher = dispatch.dispatcher().clone();
         let (handles, shutdown) = dispatch.into_parts();
         let mut watchers = JoinSet::new();
@@ -106,7 +102,6 @@ impl Server {
             handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher.clone())),
             dispatcher,
             catalog,
-            ingests,
             compact_bytes,
             compact_min_files,
             http_bind: None,
@@ -134,28 +129,31 @@ impl Server {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, "listening for psql connections");
 
-        // Start the configured ingest sources (OTLP receivers, etc.). They
-        // encode Parquet on the dispatch workers, so they must be drained
-        // before the workers stop. The catalog lets each sink register (and
-        // compact) the files it writes, so ingested rows are queryable as they
-        // land.
-        let ingestor = Ingestor::start(
-            std::mem::take(&mut self.ingests),
-            self.dispatcher.clone(),
-            self.catalog.clone(),
-            self.compact_bytes,
-            self.compact_min_files,
-        )?;
+        // Run the bundled compacter when configured. An in-flight merge
+        // encodes on the dispatch workers, so it must be drained before the
+        // workers stop.
+        let (compact_shutdown_tx, _) = watch::channel(false);
+        let compacter = (self.compact_bytes > 0).then(|| {
+            Arc::new(Compacter::new(
+                self.compact_bytes,
+                self.compact_min_files,
+                DEFAULT_COMPACT_POLL,
+                self.catalog.clone(),
+            ))
+        });
+        let mut compact_task = compacter
+            .clone()
+            .map(|compacter| tokio::spawn(compacter.run(compact_shutdown_tx.subscribe())));
 
         // Optionally serve the bundled web dashboard. It reads the engine's live
-        // state directly - the catalog, the ingestor's stats handle, and the
+        // state directly - the catalog, the compacter's counters, and the
         // dispatcher (for the in-process query console). Read-only except
         // `/api/query`, so on shutdown we just abort the task.
         let http_task = self.http_bind.map(|bind| {
             let state = crate::http::IntrospectState::new(
                 self.catalog.clone(),
                 self.dispatcher.clone(),
-                ingestor.stats(),
+                compacter.clone(),
             );
             tokio::spawn(async move {
                 if let Err(e) = crate::http::serve(bind, state, std::future::pending()).await {
@@ -164,24 +162,21 @@ impl Server {
             })
         });
 
-        // `Option` so the two terminal arms below can each take ownership
-        // without the borrow checker tripping over the loop.
-        let mut ingestor = Some(ingestor);
-
         loop {
             tokio::select! {
                 // Prefer a clean shutdown over a worker exit if both fire on
                 // the same poll: shutdown should look clean.
                 biased;
                 _ = &mut shutdown => {
-                    info!("shutdown signalled, draining ingest then workers");
+                    info!("shutdown signalled, draining compacter then workers");
                     if let Some(task) = &http_task {
                         task.abort();
                     }
-                    // Drain ingest first — the final flush encodes on the
-                    // workers, which must still be alive.
-                    if let Some(ingestor) = ingestor.take() {
-                        ingestor.shutdown().await;
+                    // Stop the compacter first — an in-flight merge encodes on
+                    // the workers, which must still be alive.
+                    let _ = compact_shutdown_tx.send(true);
+                    if let Some(task) = compact_task.take() {
+                        let _ = task.await;
                     }
                     self.shutdown.shutdown();
                     // Wait for every worker to observe the flag and exit. No
@@ -190,13 +185,13 @@ impl Server {
                     return Ok(());
                 }
                 Some(joined) = self.worker_watchers.join_next() => {
-                    // A worker died: flushing would hang on a dead worker, so
-                    // stop the receivers without a final flush.
+                    // A worker died: an in-flight merge would hang on a dead
+                    // worker, so abort the compacter instead of draining it.
                     if let Some(task) = &http_task {
                         task.abort();
                     }
-                    if let Some(ingestor) = ingestor.take() {
-                        ingestor.abort();
+                    if let Some(task) = compact_task.take() {
+                        task.abort();
                     }
                     self.shutdown.shutdown();
                     return Err(match joined {
@@ -272,9 +267,8 @@ mod tests {
             bind(),
             dispatch,
             catalog,
-            vec![],
             0,
-            ingest::DEFAULT_MIN_FILES_TO_MERGE,
+            compact::DEFAULT_MIN_FILES_TO_MERGE,
         );
 
         let join = tokio::spawn(server.serve(Box::pin(async move {

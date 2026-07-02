@@ -36,6 +36,11 @@ pub fn rowid_column_id() -> usize {
 /// [`ScalarValue::Other`].
 fn scalar_from_value(v: &ffi::Value) -> ScalarValue {
     use LogicalTypeId as L;
+    // The typed accessors below read through a NULL as the type's default
+    // value, so NULL must be caught first and kept explicit.
+    if ffi::value_is_null(v) {
+        return ScalarValue::Null(LogicalTypeId::from_u8(ffi::value_type(v)));
+    }
     match LogicalTypeId::from_u8(ffi::value_type(v)) {
         L::BOOLEAN => ScalarValue::Boolean(ffi::value_bool(v)),
         L::TINYINT => ScalarValue::Int8(ffi::value_i8(v)),
@@ -147,6 +152,8 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_GET => Operator::TableFunctionScan(TableFunctionScan { raw: self.raw }),
             L::LOGICAL_CREATE_TABLE => Operator::CreateTable(CreateTable { raw: self.raw }),
+            L::LOGICAL_INSERT => Operator::Insert(Insert { raw: self.raw }),
+            L::LOGICAL_EXPRESSION_GET => Operator::ExpressionGet(ExpressionGet { raw: self.raw }),
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
@@ -176,6 +183,10 @@ pub enum Operator<'plan> {
     /// A scan over a table-valued function (`LOGICAL_GET` with no base table).
     TableFunctionScan(TableFunctionScan<'plan>),
     CreateTable(CreateTable<'plan>),
+    /// An `INSERT` into a base table; its child is the source plan.
+    Insert(Insert<'plan>),
+    /// A scan over a list of to-be-evaluated expression rows (a `VALUES` list).
+    ExpressionGet(ExpressionGet<'plan>),
     /// `SET name = value`.
     Set(Set<'plan>),
     /// `RESET name`.
@@ -225,6 +236,10 @@ define_handles! { ffi::LogicalOperator;
     TableFunctionScan,
     /// A `LogicalCreateTable` with an explicit column list.
     CreateTable,
+    /// A `LogicalInsert`: an `INSERT` into a base table.
+    Insert,
+    /// A `LogicalExpressionGet`: a `VALUES` list of expression rows.
+    ExpressionGet,
     /// A `LogicalSet`: `SET name = value`.
     Set,
     /// A `LogicalReset`: `RESET name`.
@@ -444,6 +459,54 @@ impl<'plan> CreateTable<'plan> {
 
     pub fn constraint_count(self) -> usize {
         ffi::lo_create_constraint_count(self.raw)
+    }
+}
+
+impl<'plan> Insert<'plan> {
+    /// The name of the base table being inserted into.
+    pub fn table_name(self) -> String {
+        ffi::lo_insert_table_name(self.raw)
+    }
+
+    /// For each table column (schema order), the source-plan output column that
+    /// provides it, or `None` when the statement's column list omitted it (the
+    /// column's default would apply). An empty iterator means the statement had
+    /// no explicit column list, so the source columns are already in table
+    /// order.
+    pub fn column_map(self) -> impl Iterator<Item = Option<usize>> + 'plan {
+        (0..ffi::lo_insert_column_map_count(self.raw)).map(move |i| {
+            match ffi::lo_insert_column_map_entry(self.raw, i) {
+                usize::MAX => None,
+                index => Some(index),
+            }
+        })
+    }
+
+    /// Whether an `ON CONFLICT` action other than erroring was requested.
+    pub fn has_on_conflict(self) -> bool {
+        ffi::lo_insert_has_on_conflict(self.raw)
+    }
+
+    /// Whether the statement has a `RETURNING` clause.
+    pub fn returns_rows(self) -> bool {
+        ffi::lo_insert_return_chunk(self.raw)
+    }
+}
+
+impl<'plan> ExpressionGet<'plan> {
+    pub fn row_count(self) -> usize {
+        ffi::lo_expression_get_row_count(self.raw)
+    }
+
+    pub fn column_count(self) -> usize {
+        ffi::lo_expression_get_column_count(self.raw)
+    }
+
+    /// The expression at (`row`, `column`) of the VALUES list.
+    pub fn expr(self, row: usize, column: usize) -> Expr<'plan> {
+        Expr {
+            raw: ffi::lo_expression_get_expr(self.raw, row, column),
+        }
     }
 }
 

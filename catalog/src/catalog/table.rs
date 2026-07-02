@@ -37,7 +37,7 @@ impl TableFile {
 /// per-file row groups (`files`). The version lives in the manifest, not
 /// alongside it.
 ///
-/// It is a plain **value** — `Clone`, no interior locks. A writer (ingest,
+/// It is a plain **value** — `Clone`, no interior locks. A writer (an insert,
 /// compaction) clones one out of the catalog, mutates its own copy, and lets the
 /// durable manifest be the source of truth: every mutation
 /// ([`append_data_file`](Self::append_data_file),
@@ -151,20 +151,15 @@ impl CatalogTable {
         else {
             return Ok(false);
         };
-        self.manifest = manifest;
-        let kept: HashSet<&str> = self
-            .manifest
-            .entries
-            .iter()
-            .map(|e| e.file.path.as_str())
-            .collect();
-        self.files.retain(|f| kept.contains(f.file.path.as_str()));
+        self.set_manifest(manifest);
         Ok(true)
     }
 
     /// Write `bytes` as a new data file at `path` (under the table's location)
-    /// and commit it into the table — the ingest sink's append, one call for the
-    /// write and the manifest commit. Idempotent on `path`.
+    /// and commit it into the table — an external writer's single-file append,
+    /// one call for the write and the manifest commit. Idempotent on `path`.
+    /// (An `INSERT` writes its files first and commits them all at once via
+    /// [`commit_added_files`](Self::commit_added_files).)
     pub fn append_data_file(
         &mut self,
         path: ObjectPath,
@@ -207,6 +202,64 @@ impl CatalogTable {
             }
             self.refresh()?;
         }
+    }
+
+    /// CAS-commit a batch of already-written files into the manifest as **one**
+    /// new version (one `INSERT` = one commit, however many files it produced),
+    /// retrying past concurrent writers. Entries whose path the manifest
+    /// already holds are skipped, so a replayed commit can't double-count rows.
+    ///
+    /// Touches only the manifest — it never fetches footers, so it is safe to
+    /// call from a dispatch worker (an `INSERT`'s terminal sink): a footer
+    /// fetch drives a nested dataflow on the same pool, which deadlocks the
+    /// worker driving it. Readers fetch the new files' footers lazily via
+    /// [`parquet`](Self::parquet).
+    pub fn commit_added_files(&mut self, entries: Vec<ManifestEntry>) -> crate::Result<()> {
+        loop {
+            let fresh: Vec<ManifestEntry> = entries
+                .iter()
+                .filter(|entry| {
+                    !self
+                        .manifest
+                        .entries
+                        .iter()
+                        .any(|held| held.file.path == entry.file.path)
+                })
+                .cloned()
+                .collect();
+            if fresh.is_empty() {
+                return Ok(());
+            }
+            // Build the next version in place: losing the CAS below replaces
+            // the whole manifest anyway, so nothing observes the mutation.
+            let base_version = self.manifest.version;
+            self.manifest.version += 1;
+            self.manifest.entries.extend(fresh);
+            if self.manifest.commit(self.store.as_ref(), &self.name)? {
+                return Ok(());
+            }
+            // Lost the race: the winner committed a version newer than our
+            // base, so a reload from that cursor (cheap, no full directory
+            // scan) must find it; not finding one is a corrupt store.
+            let manifest =
+                TableManifest::load_after(self.store.as_ref(), &self.name, base_version)?
+                    .ok_or_else(|| Error::CommitRaceWithoutWinner(self.name.clone()))?;
+            self.set_manifest(manifest);
+        }
+    }
+
+    /// Swap in `manifest` as this copy's current version, dropping cached
+    /// footers for files no longer in it. No footer fetch, so it is safe on a
+    /// dispatch worker.
+    fn set_manifest(&mut self, manifest: TableManifest) {
+        self.manifest = manifest;
+        let kept: HashSet<&str> = self
+            .manifest
+            .entries
+            .iter()
+            .map(|e| e.file.path.as_str())
+            .collect();
+        self.files.retain(|f| kept.contains(f.file.path.as_str()));
     }
 
     /// Atomically swap a set of this table's files for another — the compaction
@@ -458,6 +511,25 @@ impl CatalogTable {
     /// The table's columns (schema), as the planner's [`Column`]s.
     pub fn columns(&self) -> Vec<Column> {
         self.manifest.columns.clone()
+    }
+
+    /// The table's physical arrow schema: each declared column at the physical
+    /// type it is stored and scanned as (e.g. `Utf8View` for a `Utf8` column),
+    /// non-nullable. What a writer conforms incoming batches to.
+    pub fn physical_arrow_schema(&self) -> arrow_schema::SchemaRef {
+        let fields: Vec<arrow_schema::Field> = self
+            .manifest
+            .columns
+            .iter()
+            .map(|column| {
+                arrow_schema::Field::new(
+                    column.name.clone(),
+                    planner::types::physical_arrow_type(&column.col_type),
+                    false,
+                )
+            })
+            .collect();
+        Arc::new(arrow_schema::Schema::new(fields))
     }
 
     /// Where the table's data lives, relative to the database root (an absolute

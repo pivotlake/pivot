@@ -1,0 +1,28 @@
+[package]
+name = "compact"
+version = "0.1.0"
+edition = "2024"
+description = "Background compaction: merges a table's small Parquet files into target-sized ones and swaps them into the catalog in one commit."
+
+[dependencies]
+dispatch = { path = "../dispatch" }
+# The catalog is compaction's whole world: candidates come from each table's
+# manifest, reads resolve through it, and the merged files are written and
+# swapped in through it (its `parquet_writing` pipeline does the encoding).
+catalog = { path = "../catalog" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# `CreateTableRequest` and the `Catalog` trait (`insert`), to set up tables and
+# land files in the compaction integration tests.
+planner = { path = "../planner" }
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+serde_json = "1"
+tempfile = "3"
+# Strict, spec-compliant reader used only as a test oracle: if arrow-rs's
+# reader accepts the engine's files, other engines (DuckDB, etc.) will too.
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }

@@ -152,6 +152,24 @@ pub trait Table: Debug + Send + Sync {
         unreachable!("materialize called on a table that does not support late materialization")
     }
 
+    /// Compile an `INSERT` into this table: consume `source` (the statement's
+    /// compiled source plan, its columns already in table-schema order) and
+    /// return the dataflow that writes it. Executing that dataflow durably
+    /// commits every row before it finishes, then emits a **single one-row
+    /// batch whose only column is the number of rows written (`UInt64`)** —
+    /// the caller reads the count from that batch, not from a side channel.
+    /// `ctx` resolves the backend's current state, exactly as
+    /// [`compile`](Table::compile) does.
+    ///
+    /// Backends whose tables are read-only keep the default, which errors.
+    fn insert(
+        &self,
+        _source: RecordBatchOperatorSpec,
+        _ctx: &dyn QueryContext,
+    ) -> Result<RecordBatchOperatorSpec> {
+        Err(Error::Other("table does not support INSERT".into()))
+    }
+
     /// Try to push a filter into the table. Returns `Ok(true)` if it was
     /// *FULLY* consumed (no upstream `Filter` operator required), `Ok(false)`
     /// if it was kept above. Errors propagate to the FFI boundary as C++

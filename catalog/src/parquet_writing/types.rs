@@ -9,9 +9,9 @@
 
 use std::sync::Arc;
 
+use crate::manifest::SortBounds;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
-use catalog::SortBounds;
 use dispatch::{Identifier, WorkerIdOutput};
 use serde_json::Value;
 
@@ -65,10 +65,10 @@ pub(crate) struct PartitionTag {
 /// A finished Parquet file from the write pipeline, with the manifest metadata to
 /// record for it (`partition`/`sort_bounds` are `None` for an unpartitioned,
 /// unsorted write).
-pub(crate) struct EncodedFile {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) partition: Option<Value>,
-    pub(crate) sort_bounds: Option<SortBounds>,
+pub struct EncodedFile {
+    pub bytes: Vec<u8>,
+    pub partition: Option<Value>,
+    pub sort_bounds: Option<SortBounds>,
 }
 
 /// The per-row-group metadata every column chunk of a row group shares: its

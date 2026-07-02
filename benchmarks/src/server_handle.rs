@@ -90,7 +90,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
                 .build()
                 .expect("build tokio runtime");
             rt.block_on(async move {
-                let server = Server::new(bind, dispatch, catalog, vec![], 0, 4);
+                let server = Server::new(bind, dispatch, catalog, 0, 4);
                 let _ = server
                     .serve(Box::pin(async move {
                         let _ = shutdown_rx.await;

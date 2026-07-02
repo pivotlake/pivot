@@ -104,7 +104,7 @@ export default function TableDetail({ table, store }: Props) {
           <div className="v tnum">{count(table.row_count)}</div>
         </div>
         <div className="item">
-          <div className="k">Ingest rate</div>
+          <div className="k">Insert rate</div>
           <div className={`v ${(table.rows_per_sec ?? 0) > 0 ? "live" : ""}`}>
             {rate(table.rows_per_sec)}
           </div>

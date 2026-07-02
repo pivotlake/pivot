@@ -11,6 +11,8 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
@@ -603,6 +605,44 @@ size_t lo_create_constraint_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalCreateTable>(op).info->constraints.size();
 }
 
+// ---- Insert ----
+
+rust::String lo_insert_table_name(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalInsert>(op).table.name);
+}
+
+size_t lo_insert_column_map_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalInsert>(op).column_index_map.size();
+}
+
+size_t lo_insert_column_map_entry(const LogicalOperator &op, size_t index) {
+	// DConstants::INVALID_INDEX (an unspecified column) passes through as
+	// usize::MAX; the Rust side reads it as "no source column".
+	return as<duckdb::LogicalInsert>(op).column_index_map[duckdb::PhysicalIndex(index)];
+}
+
+bool lo_insert_has_on_conflict(const LogicalOperator &op) {
+	return as<duckdb::LogicalInsert>(op).on_conflict_info.action_type != duckdb::OnConflictAction::THROW;
+}
+
+bool lo_insert_return_chunk(const LogicalOperator &op) {
+	return as<duckdb::LogicalInsert>(op).return_chunk;
+}
+
+// ---- ExpressionGet (a VALUES list) ----
+
+size_t lo_expression_get_row_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalExpressionGet>(op).expressions.size();
+}
+
+size_t lo_expression_get_column_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalExpressionGet>(op).expr_types.size();
+}
+
+const Expression &lo_expression_get_expr(const LogicalOperator &op, size_t row, size_t column) {
+	return *as<duckdb::LogicalExpressionGet>(op).expressions[row][column];
+}
+
 // ---- Set / Reset ----
 
 rust::String lo_set_name(const LogicalOperator &op) {
@@ -715,6 +755,10 @@ const Value &expr_constant(const Expression &expr) {
 // the requested type matches the value's own.
 uint8_t value_type(const Value &v) {
 	return static_cast<uint8_t>(v.type().id());
+}
+
+bool value_is_null(const Value &v) {
+	return v.IsNull();
 }
 bool value_bool(const Value &v) {
 	return v.GetValue<bool>();

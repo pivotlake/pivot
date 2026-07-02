@@ -19,6 +19,7 @@ mod dummy_scan;
 mod explain;
 mod filter;
 mod input;
+mod insert;
 mod limit;
 mod materialize;
 mod order_by;
@@ -26,6 +27,7 @@ mod projection;
 mod set_variable;
 mod table_function;
 mod top_n;
+mod values;
 
 pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
@@ -33,6 +35,7 @@ pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
+pub use insert::Insert;
 pub use limit::Limit;
 pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
@@ -40,6 +43,7 @@ pub use projection::Projection;
 pub use set_variable::SetVariable;
 pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub use top_n::TopN;
+pub use values::Values;
 
 use crate::compile::DynamicFilterSlots;
 use crate::expression::{self};
@@ -86,6 +90,12 @@ pub enum Operator {
     TopN(TopN),
     Limit(Limit),
     CreateTable(CreateTable),
+    /// `INSERT INTO <table>`; its child is the source plan. Compiles into the
+    /// dataflow that writes and commits the rows, emitting a single one-row
+    /// batch with the written-row count.
+    Insert(Insert),
+    /// A `VALUES` list (rows of expressions over the single-row [`DummyScan`]).
+    Values(Values),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -107,6 +117,8 @@ impl fmt::Display for Operator {
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::Limit(l) => write!(f, "{l}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
+            Operator::Insert(i) => write!(f, "{i}"),
+            Operator::Values(v) => write!(f, "{v}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),

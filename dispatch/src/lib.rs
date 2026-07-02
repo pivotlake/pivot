@@ -111,7 +111,7 @@ pub use operations::{
     StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
-    Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
+    Consumer, DefaultUnaryFactory, FanInFactory, MapFactory, Outputter, PipelineBreaker,
     RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 

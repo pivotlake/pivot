@@ -1,7 +1,8 @@
 //! Background compaction of a table's small Parquet files.
 //!
-//! Frequent flushes keep ingest latency low but litter a table with small
-//! files, and scans pay per file. The [`Compacter`] merges them: whenever the
+//! Every `INSERT` flushes its rows as new Parquet files, which keeps writes
+//! durable and immediately queryable but litters a table with small files, and
+//! scans pay per file. The [`Compacter`] merges them: whenever the
 //! table's files smaller than the target size add up to at least one
 //! target-sized output, it rewrites that batch as one file (with full-size row
 //! groups) and swaps it into the table in a single log commit.
@@ -15,7 +16,8 @@
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups and the write pipeline's encode stages
-//! consume those batches directly ([`parquet_writing::encode_record_batches`]) — the data
+//! consume those batches directly
+//! ([`catalog::parquet_writing::encode_spec`]) — the data
 //! never leaves the pool until finished files stream out. The compacter's own
 //! task only drives that dataflow (from a blocking thread) and does the
 //! log/store bookkeeping.
@@ -32,7 +34,7 @@
 //! can run inside the server or as a separate process over the same database
 //! root. It covers every table of the catalog it is handed and polls — each
 //! round reloads a table to its latest log version before scanning — rather
-//! than being woken by the ingest path; the sinks don't know it exists.
+//! than being woken by the write path; the writers don't know it exists.
 //!
 //! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
 
@@ -49,8 +51,7 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::parquet_writing;
-use crate::sink::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
+use catalog::parquet_writing::{self, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
 
 /// Why one compaction merge failed: either the scan→encode dataflow, or a
 /// catalog write/swap/delete. Both already carry typed causes.
@@ -94,8 +95,8 @@ pub struct Compacter {
     /// How often to re-check the tables' logs for newly-accumulated files.
     poll_interval: Duration,
     catalog: Arc<ParquetCatalog>,
-    /// Monotonic sequence for merged-file names (same collision guard as the
-    /// sink's).
+    /// Monotonic sequence for merged-file names, so two merges committed in
+    /// the same millisecond never collide.
     seq: AtomicU64,
     /// Cumulative work counters, for the introspection API.
     stats: CompactStats,
@@ -294,7 +295,8 @@ impl Compacter {
             if files.len() < 2 {
                 continue;
             }
-            // Oldest first (sink file names embed a timestamp + sequence).
+            // Deterministic order across rounds and processes: batch the same
+            // files whichever compacter looks first.
             files.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
 
             // Take as many small files as it takes to fill one ~target-sized
@@ -312,7 +314,7 @@ impl Compacter {
             // The partition's small files don't add up to a full output (e.g. a
             // low-traffic partition of a many-partition table). Merge the pile
             // anyway once enough have accumulated — otherwise such a partition
-            // accumulates small files forever, which is what bloats a sink to
+            // accumulates small files forever, which is what bloats a table to
             // tens of thousands of tiny files. (The merged file is itself a
             // candidate, so it keeps growing toward the target as more arrive.)
             if batch.len() >= self.min_files {
@@ -345,13 +347,14 @@ impl CompactJob {
         let parquet = self.table.parquet_table_for(&inputs);
         let columns = parquet.schema().fields().len();
         let scan = table_input(&self.dispatcher, &parquet, Projection::all(columns), false);
-        let merged = parquet_writing::encode_record_batches(
+        let merged = parquet_writing::encode_spec(
             scan,
             Arc::from(self.table.partition_by()),
             Arc::from(self.table.sort_by()),
             ROW_GROUP_ROWS,
             ROW_GROUPS_PER_FILE,
-        );
+        )
+        .execute();
 
         // Write each merged file into the table's data location as it streams out
         // — so we never hold them all in memory at once — keeping the partition

@@ -28,13 +28,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender as StdSender, TryRecvError};
 
+use crate::manifest::SortBounds;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ord::partition::partition;
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 use arrow_schema::{Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
-use catalog::SortBounds;
 use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult};
 use serde_json::Value;
 

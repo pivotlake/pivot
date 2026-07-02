@@ -93,12 +93,22 @@ pub enum Error {
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("inserting: {0}")]
+    Insert(#[source] crate::catalog::Error),
+    #[error("INSERT target table `{0}` does not exist")]
+    InsertTableMissing(String),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
     #[error("Unsupported table function: {0}")]
     UnsupportedTableFunction(String),
-    #[error("Invalid argument to table function {function}: {message}")]
-    InvalidTableFunctionArgument { function: String, message: String },
+    #[error("table function {function}: {source}")]
+    TableFunction {
+        function: String,
+        /// The function's own typed error (each implementation defines its
+        /// enum); boxed because the generic planner can't enumerate them.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl Plan {
@@ -235,9 +245,11 @@ impl PlanNode {
                 }
                 o.compile(dispatcher, catalog)
             }
+            crate::Operator::Values(o) => o.compile(inputs.remove(0)),
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
             crate::Operator::Explain(_) => unreachable!("Explain is compiled before its inputs"),
+            crate::Operator::Insert(o) => o.compile(inputs.remove(0), catalog, ctx),
             // SET/RESET is intercepted by the server after planning (it toggles
             // session state, not data), so it should never reach compilation.
             crate::Operator::SetVariable(_) => Err(Error::SetVariableNotCompilable),

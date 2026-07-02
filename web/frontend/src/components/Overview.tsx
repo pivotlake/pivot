@@ -5,7 +5,6 @@ import FlowGraph from "./FlowGraph";
 import SystemMetrics from "./SystemMetrics";
 import Compactor from "./Compactor";
 import TableDetail from "./TableDetail";
-import ReceiverDetail from "./ReceiverDetail";
 
 interface Props {
   overview: Overview | null;
@@ -33,42 +32,31 @@ export default function OverviewTab({ overview, reachable }: Props) {
     );
   }
 
-  const selectedNodeId =
-    selected?.type === "table"
-      ? `table:${selected.name}`
-      : selected?.type === "ingest"
-        ? `ingest:${selected.addr}`
-        : null;
+  const selectedNodeId = selected?.type === "table" ? `table:${selected.name}` : null;
 
-  const drawer =
-    selected?.type === "ingest" ? (
-      <ReceiverDetail
-        ingest={overview?.ingests.find((i) => i.addr === selected.addr) ?? null}
-        tables={overview?.tables ?? []}
-      />
-    ) : (
-      <TableDetail
-        table={
-          selected?.type === "table"
-            ? (overview?.tables.find((t) => t.name === selected.name) ?? null)
-            : null
-        }
-        store={overview?.store ?? ""}
-      />
-    );
+  const drawer = (
+    <TableDetail
+      table={
+        selected?.type === "table"
+          ? (overview?.tables.find((t) => t.name === selected.name) ?? null)
+          : null
+      }
+      store={overview?.store ?? ""}
+    />
+  );
 
   return (
     <div className="overview">
       <div className="flow-pane">
         <div className="pane-head">
-          <h2>Data flow</h2>
-          <p>Ingest receivers and the tables they feed, updating live.</p>
+          <h2>Tables</h2>
+          <p>The catalog's tables and their live row counts, updating live.</p>
         </div>
 
-        {overview && overview.ingests.length === 0 && (
+        {overview && overview.tables.length === 0 && (
           <div className="flow-hint">
-            No ingest receivers configured. Start the server with{" "}
-            <code>--otel 'addr=127.0.0.1:4317,logs'</code> to see live ingest flow into a table.
+            No tables yet. Connect with psql, <code>CREATE TABLE</code> and <code>INSERT</code> to
+            see data land here.
           </div>
         )}
 

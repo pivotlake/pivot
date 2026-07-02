@@ -293,3 +293,144 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
         "expected a structured pgwire error, got: {err}",
     );
 }
+
+/// Rows-affected reported by a statement's command tag (e.g. `INSERT 0 n`).
+async fn rows_affected(client: &Client, sql: &str) -> u64 {
+    let msgs = client.simple_query(sql).await.unwrap();
+    msgs.into_iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::CommandComplete(rows) => Some(rows),
+            _ => None,
+        })
+        .expect("statement completes with a command tag")
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_values_lands_and_reads_back(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let rows = rows_affected(
+        &conn,
+        "INSERT INTO people_insert VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+
+    assert_eq!(rows, 2, "INSERT tag reports the rows written");
+    // The insert returned only after the parquet file was durably committed,
+    // so the rows are immediately visible.
+    let read = select_rows(&conn, "SELECT id, name FROM people_insert ORDER BY id").await;
+    assert_eq!(
+        read,
+        vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), Some("bob".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_accumulates_across_statements(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_twice (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    rows_affected(&conn, "INSERT INTO people_insert_twice VALUES (1, 'a')").await;
+    rows_affected(&conn, "INSERT INTO people_insert_twice VALUES (2, 'b')").await;
+
+    let count = select_one_i64(&conn, "SELECT COUNT(*) FROM people_insert_twice").await;
+    assert_eq!(count, 2);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_with_column_list_reorders_values(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_cols (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    rows_affected(
+        &conn,
+        "INSERT INTO people_insert_cols (name, id) VALUES ('carol', 3)",
+    )
+    .await;
+
+    let read = select_rows(&conn, "SELECT id, name FROM people_insert_cols").await;
+    assert_eq!(read, vec![vec![Some("3".into()), Some("carol".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_select_copies_rows(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_insert_src", dir.path()).await;
+    conn.simple_query("CREATE TABLE people_insert_dst (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let rows = rows_affected(
+        &conn,
+        "INSERT INTO people_insert_dst SELECT id, name FROM people_insert_src WHERE id > 1",
+    )
+    .await;
+
+    assert_eq!(rows, 2);
+    let read = select_rows(&conn, "SELECT id, name FROM people_insert_dst ORDER BY id").await;
+    assert_eq!(
+        read,
+        vec![
+            vec![Some("2".into()), Some("bob".into())],
+            vec![Some("3".into()), Some("carol".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_visible_to_second_connection(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_shared (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    let reader = connect_client(server_port()).await;
+
+    rows_affected(
+        &conn,
+        "INSERT INTO people_insert_shared VALUES (7, 'grace')",
+    )
+    .await;
+
+    let read = select_rows(&reader, "SELECT id, name FROM people_insert_shared").await;
+    assert_eq!(read, vec![vec![Some("7".into()), Some("grace".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_omitting_a_column_errors(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_partial (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let err = conn
+        .simple_query("INSERT INTO people_insert_partial (id) VALUES (1)")
+        .await
+        .unwrap_err();
+
+    let message = err
+        .as_db_error()
+        .expect("the rejection arrives as a structured pgwire error")
+        .message()
+        .to_string();
+    assert!(
+        message.contains("every table column"),
+        "expected the missing-column rejection, got: {message}",
+    );
+}

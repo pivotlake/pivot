@@ -1,9 +1,10 @@
 use crate::operations::channels::{
-    ChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
+    ChannelFactory, FanInChannelFactory, Sender, StealableChannelFactory, fan_in, mpsc_channel,
+    stealable,
 };
 use crate::operations::{
-    DefaultUnaryFactory, Forward, InjectorSourceFactory, MapFactory, RootUnaryOperatorFactory,
-    UnaryFactory, UnaryOperatorFactory,
+    DefaultUnaryFactory, FanInFactory, Forward, InjectorSourceFactory, MapFactory,
+    RootUnaryOperatorFactory, UnaryFactory, UnaryOperatorFactory,
 };
 use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
 use arrow_array::RecordBatch;
@@ -144,6 +145,39 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
             })
             .collect();
         OperatorSpec::new(self.dispatcher, factories)
+    }
+
+    /// Append a fold stage that funnels every worker's output to a **single**
+    /// worker: that worker folds each item into `state` with `consume` (which
+    /// may also emit downstream through the sender) and, once every sibling
+    /// has drained, `finish` consumes the state to emit any final output. The
+    /// other workers' operators receive nothing and emit nothing. This is the
+    /// building block for terminal gather-and-commit stages (e.g. an
+    /// `INSERT`'s write-commit sink).
+    #[allow(clippy::type_complexity)] // the fully-spelled builder factory type is the point
+    pub fn fan_in<O2, St, C, F>(
+        self,
+        state: St,
+        consume: C,
+        finish: F,
+    ) -> OperatorSpec<
+        O2,
+        UnaryOperatorFactory<O, O2, FanInFactory<St, C, F>, FanInChannelFactory<O>, OF>,
+    >
+    where
+        O2: Send + 'static,
+        St: Send + 'static,
+        C: FnMut(&mut St, O, &mut dyn Sender<O2>) -> crate::operations::unary::Result<()>
+            + Send
+            + 'static,
+        F: FnOnce(St, &mut dyn Sender<O2>) -> crate::operations::unary::Result<()> + Send + 'static,
+    {
+        let workers = self.factories.len();
+        let mut fold = Some(FanInFactory::new(state, consume, finish));
+        let unaries: Vec<_> = (0..workers)
+            .map(|_| fold.take().unwrap_or_else(FanInFactory::empty))
+            .collect();
+        self.chain(fan_in::<O>(workers), unaries)
     }
 
     /// Append a parallel 1→1 map stage: every item is transformed by `f` on
