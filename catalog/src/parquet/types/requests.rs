@@ -10,7 +10,7 @@ use dispatch::memory::{CacheLookup, memory_ctx};
 /// The chunk's byte range is looked up in the compressed cache as one
 /// [`CacheLookup`] per contiguous cached/missing run it resolves to. Each lookup's
 /// [`missing`](CacheLookup::missing)
-/// [`MissingBlock`](dispatch::memory::compressed_cache::MissingBlock)s (empty when the
+/// [`MissingExtent`](dispatch::memory::compressed_cache::MissingExtent)s (empty when the
 /// part is fully resident) are queued for IO. Once every block has been filled,
 /// the parts' data is concatenated in file order into the column's `Vec<Bytes>`.
 struct ColumnRequest {

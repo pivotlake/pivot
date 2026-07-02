@@ -55,7 +55,7 @@ impl MemoryContextFactory {
 
         let ring = Arc::new(Ring::new(buffers).unwrap());
         let compressed_cache = Arc::new(CompressedCache::new(buffers));
-        let decompressed_cache = Arc::new(DecompressedCache::new());
+        let decompressed_cache = Arc::new(DecompressedCache::new(buffers));
         let clock = Arc::new(Clock::new(buffers));
         let mut zeroed_pool_factories = PoolFactory::create_many(count);
         let mut dirty_pool_factories = PoolFactory::create_many(count);
