@@ -46,7 +46,7 @@ use crate::expression::{self, Expression};
 use crate::types::Type;
 use dispatch::DynamicFilterSlot;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -70,7 +70,7 @@ pub(super) fn slot_for(slots: &mut DynamicFilterSlots, slot_id: usize) -> Arc<Dy
     Arc::clone(
         slots
             .entry(slot_id)
-            .or_insert_with(|| Arc::new(RwLock::new(None))),
+            .or_insert_with(|| Arc::new(DynamicFilterSlot::new())),
     )
 }
 
