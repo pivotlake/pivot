@@ -1,16 +1,25 @@
 name: Resume GCP runner
 description: >-
-  Resume the suspended self-hosted ci-runner-x86 VM (pivot-ci / me-west1-c)
-  so its gcp-builder runners come online. The box's own hourly suspend-if-unused
-  cron suspends it again once no ci/deploy run is active, so there is no matching
-  stop action.
+  Bring a self-hosted runner VM online so its runners connect: resume it when
+  suspended, start it when stopped, and leave it alone when already running.
+  Each box's own hourly if-unused cron takes it back down once no ci/deploy
+  run is active, so there is no matching stop action.
 
 inputs:
   credentials_json:
     description: >-
       JSON key for a GCP service account with instance-scoped
-      compute.instanceAdmin.v1 on ci-runner-x86 (resume permission).
+      compute.instanceAdmin.v1 on the target VM. Starting a stopped VM also
+      requires iam.serviceAccountUser on the VM's attached service account.
     required: true
+  instance:
+    description: Name of the runner VM to bring online.
+    required: false
+    default: ci-runner-x86
+  zone:
+    description: Zone of the runner VM.
+    required: false
+    default: me-west1-c
 
 runs:
   using: composite
@@ -22,8 +31,33 @@ runs:
     - uses: google-github-actions/setup-gcloud@v2
       with:
         project_id: pivot-ci
-    - name: Resume ci-runner-x86
+    - name: Bring ${{ inputs.instance }} online
       shell: bash
+      env:
+        INSTANCE: ${{ inputs.instance }}
+        ZONE: ${{ inputs.zone }}
       run: |
-        gcloud compute instances resume ci-runner-x86 \
-          --project=pivot-ci --zone=me-west1-c
+        set -euo pipefail
+        # The box may be mid-transition (its cron suspending/stopping it just
+        # as we come up), so poll until it reaches a state we can act on.
+        for _ in $(seq 1 20); do
+          status=$(gcloud compute instances describe "$INSTANCE" \
+            --project=pivot-ci --zone="$ZONE" --format='value(status)')
+          echo "Instance status: $status"
+          case "$status" in
+            RUNNING)
+              exit 0 ;;
+            SUSPENDED)
+              gcloud compute instances resume "$INSTANCE" \
+                --project=pivot-ci --zone="$ZONE"
+              exit 0 ;;
+            TERMINATED)
+              gcloud compute instances start "$INSTANCE" \
+                --project=pivot-ci --zone="$ZONE"
+              exit 0 ;;
+            *)
+              sleep 15 ;;
+          esac
+        done
+        echo "::error::$INSTANCE did not settle into a startable state"
+        exit 1
