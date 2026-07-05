@@ -92,6 +92,7 @@ const SHARED_WINDOW_MAX_FETCH: usize = 1024;
 ///
 /// The comparison *direction* lives with the consumer (which carries the
 /// comparison operator DuckDB chose); this slot holds only the boundary value.
+#[derive(Debug)]
 pub struct DynamicFilterSlot {
     /// The published boundary, i.e. the `fetch`-th best leading key witnessed
     /// so far across all workers. Consumer scans read it for every row group
