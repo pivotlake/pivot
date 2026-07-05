@@ -14,7 +14,9 @@
 //! the dynamic-filter slot helper used by more than one operator.
 
 mod aggregate;
+mod create_secret;
 mod create_table;
+mod drop_secret;
 mod dummy_scan;
 mod explain;
 mod filter;
@@ -28,7 +30,9 @@ mod table_function;
 mod top_n;
 
 pub use aggregate::Aggregate;
+pub use create_secret::CreateSecret;
 pub use create_table::CreateTable;
+pub use drop_secret::DropSecret;
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
@@ -86,6 +90,10 @@ pub enum Operator {
     TopN(TopN),
     Limit(Limit),
     CreateTable(CreateTable),
+    /// `CREATE SECRET` - handled by the server against the catalog, not compiled.
+    CreateSecret(CreateSecret),
+    /// `DROP SECRET` - handled by the server against the catalog, not compiled.
+    DropSecret(DropSecret),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -107,6 +115,8 @@ impl fmt::Display for Operator {
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::Limit(l) => write!(f, "{l}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
+            Operator::CreateSecret(c) => write!(f, "{c}"),
+            Operator::DropSecret(d) => write!(f, "{d}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),

@@ -123,6 +123,14 @@ pub(crate) async fn execute_sql(
     if plan.as_set_variable().is_some() {
         return Ok(Vec::new());
     }
+    // A CREATE/DROP SECRET is a catalog command: apply it and yield no rows.
+    if let Some(command) = plan.as_secret_command() {
+        return tokio::task::spawn_blocking(move || command.apply(catalog.as_ref()))
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|()| Vec::new())
+            .map_err(|e| e.to_string());
+    }
     let plan = Arc::new(plan);
     // Compile and launch the dataflow (with the CopyOut cap) on the blocking
     // pool; `execute_copying` returns the running handle without collecting.
@@ -153,6 +161,8 @@ enum Error {
     Plan(#[from] planner::Error),
     #[error("compile error: {0}")]
     Compile(#[from] planner::compile::Error),
+    #[error(transparent)]
+    Catalog(#[from] planner::catalog::Error),
     #[error(transparent)]
     DataFlow(#[from] dispatch::DataFlowError),
     #[error("waiter thread panicked: {0}")]
@@ -285,6 +295,18 @@ impl PivotQueryHandler {
             });
         }
 
+        // A `CREATE`/`DROP SECRET` is likewise a catalog command that compiles
+        // to no dataflow: apply it to the catalog (on the blocking pool - it
+        // writes to the object store) and acknowledge with its own tag.
+        if let Some(command) = plan.as_secret_command() {
+            let catalog = self.catalog.clone();
+            let tag = command.tag();
+            tokio::task::spawn_blocking(move || command.apply(catalog.as_ref()))
+                .await
+                .map_err(Error::PlannerPanic)??;
+            return Ok(Outcome::Command { tag });
+        }
+
         // When the session ran `SET perf = 1`, start a `perf record` scoped to the
         // worker threads and mark this query's dataflows profiled. Marking them
         // makes the workers run *only* this dataflow for its duration (other
@@ -373,6 +395,9 @@ enum Outcome {
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
     /// for `RESET`; the server decides which names actually mean anything.
     Set { name: String, value: Option<String> },
+    /// A catalog command (`CREATE`/`DROP SECRET`) already applied by
+    /// `run_query`; only its command tag remains to be sent.
+    Command { tag: &'static str },
 }
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
@@ -453,6 +478,19 @@ fn stats_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(STATS_FLAG).is_some_and(|v| v == "on")
 }
 
+/// Whether a statement mentions "secret" anywhere and must be withheld from
+/// logs. Deliberately conservative: any such statement might be a
+/// `CREATE SECRET` carrying credentials in clear text (possibly behind
+/// comments or unusual spellings a keyword parser would miss). A query over
+/// `pivot_secrets()` loses its log line too; a cheap price for never logging
+/// a credential.
+fn statement_mentions_secret(query: &str) -> bool {
+    query
+        .as_bytes()
+        .windows("secret".len())
+        .any(|window| window.eq_ignore_ascii_case(b"secret"))
+}
+
 /// Whether this connection has `perf` on (set via `SET perf = 1`).
 #[cfg(feature = "perf")]
 fn perf_on<C: ClientInfo>(client: &C) -> bool {
@@ -474,16 +512,30 @@ impl SimpleQueryHandler for PivotQueryHandler {
         #[cfg(not(feature = "perf"))]
         let with_perf = false;
 
-        info!(sql = %query, "query received");
+        let withhold = statement_mentions_secret(query);
+        let logged_sql = if withhold {
+            "<statement mentioning a secret; text withheld>"
+        } else {
+            query
+        };
+        info!(sql = %logged_sql, "query received");
         let outcome = self
             .run_query(query, with_stats, with_perf)
             .await
             .map_err(|e| {
-                warn!(error = %e, sql = %query, "query failed");
+                if withhold {
+                    // The error text can echo statement tokens (a parser error
+                    // quotes the source near the fault), so it is withheld
+                    // from the log along with the statement.
+                    warn!(sql = %logged_sql, "query failed; error text withheld");
+                } else {
+                    warn!(error = %e, sql = %logged_sql, "query failed");
+                }
                 e.into_pgwire()
             })?;
 
         let res = match outcome {
+            Outcome::Command { tag } => Response::Execution(Tag::new(tag)),
             Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
             Outcome::Query(res, stats) => {
                 // Send the breakdown as an INFO notice before the rows.
@@ -501,7 +553,7 @@ impl SimpleQueryHandler for PivotQueryHandler {
             }
         };
 
-        info!(sql = %query, "query succeeded");
+        info!(sql = %logged_sql, "query succeeded");
         Ok(vec![res])
     }
 }

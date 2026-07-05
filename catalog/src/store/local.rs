@@ -65,6 +65,67 @@ impl ObjectStore for LocalStore {
         })
     }
 
+    /// Owner-only put: the temp file is created with mode 600 before any bytes
+    /// land, so the secret material is never readable by other users, not even
+    /// briefly.
+    #[cfg(unix)]
+    fn put_private(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let io_err = |source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        };
+        let path = self.path_for(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+        }
+        let tmp = path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(io_err)?;
+        file.write_all(data).map_err(io_err)?;
+        drop(file);
+        std::fs::rename(&tmp, &path).map_err(io_err)
+    }
+
+    /// Whether the file is readable by its owner alone: any group/other
+    /// permission bit disqualifies it, matching DuckDB's check on its stored
+    /// secrets.
+    #[cfg(unix)]
+    fn is_private(&self, key: &ObjectPath) -> Result<bool> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let metadata = std::fs::metadata(self.path_for(key)).map_err(|source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        })?;
+        Ok(metadata.permissions().mode() & 0o077 == 0)
+    }
+
+    /// Off unix there is no mode-600 protection to give, so refuse to write
+    /// the secret at all rather than silently store it world-readable.
+    #[cfg(not(unix))]
+    fn put_private(&self, key: &ObjectPath, _data: &[u8]) -> Result<()> {
+        Err(StoreError::Config(format!(
+            "cannot write `{key}` owner-only on this platform; local persistent secrets require a unix filesystem"
+        )))
+    }
+
+    /// Off unix the permission bits cannot be checked, so refuse to vouch for
+    /// the file rather than silently load credentials other users may read.
+    #[cfg(not(unix))]
+    fn is_private(&self, key: &ObjectPath) -> Result<bool> {
+        Err(StoreError::Config(format!(
+            "cannot verify `{key}` is owner-only on this platform; local persistent secrets require a unix filesystem"
+        )))
+    }
+
     fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {

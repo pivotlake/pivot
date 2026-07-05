@@ -13,7 +13,7 @@
 //! rule prevents implementing a foreign trait for `Box<dyn Table>` directly.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::expression::{CompareType, TableFilter};
 use crate::operator::TableFunction;
@@ -68,6 +68,75 @@ pub struct CreateTableRequest {
     pub columns: Vec<Column>,
     pub options: HashMap<String, String>,
     pub if_not_exists: bool,
+}
+
+/// Whether a secret option's value is sensitive and must render as `redacted`
+/// anywhere a human might read it - operator `Display`, logs, or a secrets
+/// listing. Matches DuckDB's redaction set for S3 secrets.
+pub fn secret_option_is_redacted(key: &str) -> bool {
+    ["secret", "session_token"]
+        .iter()
+        .any(|redacted| key.eq_ignore_ascii_case(redacted))
+}
+
+/// Description of a secret to create - produced by translating a
+/// `CREATE SECRET` statement, consumed by [`Catalog::create_secret`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSecretRequest {
+    pub name: String,
+    /// The secret's TYPE (e.g. `s3`), lowercased.
+    pub secret_type: String,
+    /// How the secret's values were produced (`config` for explicit values).
+    pub provider: String,
+    /// Path prefixes the secret applies to; the longest matching prefix wins
+    /// when a path looks a secret up.
+    pub scope: Vec<String>,
+    /// The key-value options (`key_id`, `secret`, `region`, ...), keys
+    /// lowercased. Ordered so displays and listings are deterministic.
+    pub options: BTreeMap<String, String>,
+    /// A temporary secret lives in memory only and is gone on restart; a
+    /// persistent one is written to the catalog's store.
+    pub temporary: bool,
+    pub or_replace: bool,
+    pub if_not_exists: bool,
+}
+
+/// Description of a secret to drop - produced by translating a `DROP SECRET`
+/// statement, consumed by [`Catalog::drop_secret`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSecretRequest {
+    pub name: String,
+    pub if_exists: bool,
+    /// `Some(true)` drops only a temporary secret, `Some(false)` only a
+    /// persistent one, `None` whichever holds the name (erroring when both do).
+    pub temporary: Option<bool>,
+}
+
+/// A bound secret statement, ready to apply to a [`Catalog`]. Like `SET`, a
+/// secret statement compiles to no dataflow: the server extracts it from the
+/// plan ([`Plan::as_secret_command`](crate::Plan::as_secret_command)) and
+/// applies it here, acknowledging with [`tag`](Self::tag).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretCommand {
+    Create(CreateSecretRequest),
+    Drop(DropSecretRequest),
+}
+
+impl SecretCommand {
+    pub fn apply(self, catalog: &dyn Catalog) -> Result<()> {
+        match self {
+            SecretCommand::Create(request) => catalog.create_secret(request),
+            SecretCommand::Drop(request) => catalog.drop_secret(request),
+        }
+    }
+
+    /// The command tag acknowledging this statement on the wire.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            SecretCommand::Create(_) => "CREATE SECRET",
+            SecretCommand::Drop(_) => "DROP SECRET",
+        }
+    }
 }
 
 /// An opaque per-query context, created once per [`Plan::compile`](crate::Plan::compile)
@@ -267,6 +336,21 @@ pub trait Catalog: Debug + Send + Sync {
         request: CreateTableRequest,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec>;
+
+    /// Create a secret (and, unless it is temporary, persist it in the
+    /// catalog's durable storage). Secrets are control-plane metadata: this
+    /// runs synchronously on the coordinator, no dataflow. The default rejects
+    /// the statement, for backends that hold no secrets.
+    fn create_secret(&self, _request: CreateSecretRequest) -> Result<()> {
+        Err(Error::Other("this catalog does not support secrets".into()))
+    }
+
+    /// Drop a secret by name (see [`DropSecretRequest`] for the qualifier
+    /// semantics). The default rejects the statement, for backends that hold
+    /// no secrets.
+    fn drop_secret(&self, _request: DropSecretRequest) -> Result<()> {
+        Err(Error::Other("this catalog does not support secrets".into()))
+    }
 
     /// A backend-specific table-valued function by `name`, or `None`. This is how
     /// a catalog contributes functions only it can answer (e.g. `metadata`, which

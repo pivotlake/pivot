@@ -15,7 +15,7 @@ use catalog::ParquetCatalog;
 use dispatch::Dispatch;
 use rstest::fixture;
 use server::Server;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 pub fn pick_free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -68,6 +68,23 @@ pub fn server_port() -> u16 {
         wait_until_listening(bind);
         port
     })
+}
+
+/// Run `sql` and decode every `DataRow` in the response into
+/// `Vec<Option<String>>` (text format). Non-row messages (e.g. `RowDescription`,
+/// `CommandComplete`) are dropped - tests assert on data only.
+pub async fn select_rows(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    let msgs = client.simple_query(sql).await.unwrap();
+    msgs.into_iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(
+                (0..r.len())
+                    .map(|i| r.get(i).map(|s| s.to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .collect()
 }
 
 pub async fn connect_client(port: u16) -> Client {

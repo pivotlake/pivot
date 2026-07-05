@@ -31,6 +31,7 @@
 
 mod binding;
 mod metadata_function;
+mod secrets_function;
 mod table;
 
 pub use binding::TableBinding;
@@ -44,14 +45,16 @@ use crate::manifest::{
     self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
 };
 use crate::parquet::{ParquetTable, ParquetTableError};
+use crate::secrets::SecretsRegistry;
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
 use planner::TableFunction;
 use planner::catalog::{
-    Catalog, CreateTableRequest, Error as CatalogError, QueryContext, Result as CatalogResult,
-    Table,
+    Catalog, CreateSecretRequest, CreateTableRequest, DropSecretRequest, Error as CatalogError,
+    QueryContext, Result as CatalogResult, Table,
 };
+use secrets_function::SecretsTableFunction;
 pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
@@ -82,6 +85,8 @@ pub enum Error {
     Store(#[from] store::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
+    #[error(transparent)]
+    Secrets(#[from] crate::secrets::Error),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(transparent)]
@@ -125,6 +130,11 @@ pub struct ParquetCatalog {
     /// [`new`]: Self::new
     store: Arc<dyn ObjectStore>,
 
+    /// The database's secrets (`CREATE SECRET`): held here as catalog state,
+    /// persisted through the store, and shared with the store itself so
+    /// request signing resolves credentials created at runtime.
+    secrets: Arc<SecretsRegistry>,
+
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
     dispatcher: DataFlowDispatcher,
@@ -149,6 +159,7 @@ impl ParquetCatalog {
         Self {
             tables: Arc::new(RwLock::new(HashMap::new())),
             store: Arc::new(LocalStore::new(root)),
+            secrets: Arc::new(SecretsRegistry::new()),
             dispatcher,
         }
     }
@@ -159,7 +170,13 @@ impl ParquetCatalog {
     /// manifest (schema + file list) and fetch its files' footers, building the
     /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
-        let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
+        // The store is born holding the (still empty) secrets registry and the
+        // persisted secrets are loaded first, so every read after that
+        // bootstrap one can already resolve secret credentials. (The bootstrap
+        // reads themselves authenticate from the environment.)
+        let secrets = Arc::new(SecretsRegistry::new());
+        let store: Arc<dyn ObjectStore> = open_store(uri, secrets.clone())?.into();
+        secrets.load(store.as_ref())?;
         let manifest = CatalogManifest::load(store.as_ref())?;
 
         let mut tables = HashMap::new();
@@ -171,6 +188,7 @@ impl ParquetCatalog {
         Ok(Self {
             tables: Arc::new(RwLock::new(tables)),
             store,
+            secrets,
             dispatcher: dispatcher.clone(),
         })
     }
@@ -417,11 +435,30 @@ impl Catalog for ParquetCatalog {
         Ok(self.create(request, dispatcher)?)
     }
 
+    fn create_secret(&self, request: CreateSecretRequest) -> CatalogResult<()> {
+        self.secrets
+            .create_secret(request, self.store.as_ref())
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
+    fn drop_secret(&self, request: DropSecretRequest) -> CatalogResult<()> {
+        self.secrets
+            .drop_secret(request, self.store.as_ref())
+            .map_err(Error::from)?;
+        Ok(())
+    }
+
     fn table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
-        // `metadata('table')` reports a table's row-group footers; it is
-        // parquet-specific, so it lives here rather than in the generic planner.
+        // These are catalog-specific, so they live here rather than in the
+        // generic planner.
         match name {
+            // `metadata('table')` reports a table's row-group footers.
             "metadata" => Some(Box::new(MetadataTableFunction)),
+            // `pivot_secrets()` lists the registered secrets, redacted.
+            "pivot_secrets" => Some(Box::new(SecretsTableFunction {
+                secrets: self.secrets.clone(),
+            })),
             _ => None,
         }
     }

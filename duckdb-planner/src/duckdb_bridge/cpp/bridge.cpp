@@ -14,6 +14,10 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
+#include "duckdb/planner/operator/logical_create_secret.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/parsed_data/extra_drop_info.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -107,6 +111,10 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
       db(nullptr, &this->config),
       con(db) {
         con.Query("SET disabled_optimizers='compressed_materialization,empty_result_pullup'");
+	// Pivot owns secret storage (its catalog), so keep the embedded planner's
+	// own secret manager fully in-memory: binding a CREATE SECRET must never
+	// read or create DuckDB's on-disk secret directory (~/.duckdb).
+	con.Query("SET allow_persistent_secrets=false");
 
 	// Set catalog context on the storage extension and attach the pivot catalog as default
 	auto ext = duckdb::StorageExtension::Find(
@@ -601,6 +609,111 @@ bool lo_create_has_query(const LogicalOperator &op) {
 
 size_t lo_create_constraint_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalCreateTable>(op).info->constraints.size();
+}
+
+// ---- CreateSecret ----
+
+static const duckdb::CreateSecretInput &secret_input(const LogicalOperator &op) {
+	return as<duckdb::LogicalCreateSecret>(op).secret_input;
+}
+
+rust::String lo_create_secret_name(const LogicalOperator &op) {
+	return rust::String::lossy(secret_input(op).name);
+}
+
+rust::String lo_create_secret_type(const LogicalOperator &op) {
+	return rust::String::lossy(secret_input(op).type);
+}
+
+rust::String lo_create_secret_provider(const LogicalOperator &op) {
+	return rust::String::lossy(secret_input(op).provider);
+}
+
+rust::String lo_create_secret_storage(const LogicalOperator &op) {
+	return rust::String::lossy(secret_input(op).storage_type);
+}
+
+uint8_t lo_create_secret_persist_type(const LogicalOperator &op) {
+	return static_cast<uint8_t>(secret_input(op).persist_type);
+}
+
+bool lo_create_secret_if_not_exists(const LogicalOperator &op) {
+	return secret_input(op).on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
+}
+
+bool lo_create_secret_or_replace(const LogicalOperator &op) {
+	return secret_input(op).on_conflict == duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+}
+
+size_t lo_create_secret_scope_count(const LogicalOperator &op) {
+	return secret_input(op).scope.size();
+}
+
+rust::String lo_create_secret_scope(const LogicalOperator &op, size_t index) {
+	return rust::String::lossy(secret_input(op).scope[index]);
+}
+
+size_t lo_create_secret_option_count(const LogicalOperator &op) {
+	return secret_input(op).options.size();
+}
+
+// The options are an unordered map; index into it deterministically by
+// iteration order so key and value accessors agree within one plan.
+static std::pair<const string &, const duckdb::Value &> secret_option_at(const LogicalOperator &op, size_t index) {
+	auto &options = secret_input(op).options;
+	auto it = options.begin();
+	std::advance(it, index);
+	return {it->first, it->second};
+}
+
+rust::String lo_create_secret_option_key(const LogicalOperator &op, size_t index) {
+	return rust::String::lossy(secret_option_at(op, index).first);
+}
+
+bool lo_create_secret_option_is_null(const LogicalOperator &op, size_t index) {
+	return secret_option_at(op, index).second.IsNull();
+}
+
+rust::String lo_create_secret_option_value(const LogicalOperator &op, size_t index) {
+	return rust::String::lossy(secret_option_at(op, index).second.ToString());
+}
+
+// ---- Drop (secrets only) ----
+
+// A LOGICAL_DROP is a LogicalSimple carrying the parser's DropInfo.
+static const duckdb::DropInfo &drop_info(const LogicalOperator &op) {
+	return as<duckdb::LogicalSimple>(op).info->Cast<duckdb::DropInfo>();
+}
+
+bool lo_drop_is_secret(const LogicalOperator &op) {
+	return drop_info(op).type == duckdb::CatalogType::SECRET_ENTRY;
+}
+
+rust::String lo_drop_secret_name(const LogicalOperator &op) {
+	return rust::String::lossy(drop_info(op).name);
+}
+
+bool lo_drop_secret_if_exists(const LogicalOperator &op) {
+	return drop_info(op).if_not_found == duckdb::OnEntryNotFound::RETURN_NULL;
+}
+
+static const duckdb::ExtraDropSecretInfo *extra_drop_secret_info(const LogicalOperator &op) {
+	auto &extra = drop_info(op).extra_drop_info;
+	if (!extra) {
+		return nullptr;
+	}
+	return &extra->Cast<duckdb::ExtraDropSecretInfo>();
+}
+
+uint8_t lo_drop_secret_persist_type(const LogicalOperator &op) {
+	auto *extra = extra_drop_secret_info(op);
+	auto persist_mode = extra ? extra->persist_mode : duckdb::SecretPersistType::DEFAULT;
+	return static_cast<uint8_t>(persist_mode);
+}
+
+rust::String lo_drop_secret_storage(const LogicalOperator &op) {
+	auto *extra = extra_drop_secret_info(op);
+	return rust::String::lossy(extra ? extra->secret_storage : "");
 }
 
 // ---- Set / Reset ----

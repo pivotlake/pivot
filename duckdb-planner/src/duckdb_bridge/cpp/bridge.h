@@ -124,6 +124,28 @@ bool lo_create_temporary(const LogicalOperator &op);
 bool lo_create_has_query(const LogicalOperator &op);
 size_t lo_create_constraint_count(const LogicalOperator &op);
 
+// ---- CreateSecret ----
+rust::String lo_create_secret_name(const LogicalOperator &op);
+rust::String lo_create_secret_type(const LogicalOperator &op);
+rust::String lo_create_secret_provider(const LogicalOperator &op);
+rust::String lo_create_secret_storage(const LogicalOperator &op);
+uint8_t lo_create_secret_persist_type(const LogicalOperator &op);
+bool lo_create_secret_if_not_exists(const LogicalOperator &op);
+bool lo_create_secret_or_replace(const LogicalOperator &op);
+size_t lo_create_secret_scope_count(const LogicalOperator &op);
+rust::String lo_create_secret_scope(const LogicalOperator &op, size_t index);
+size_t lo_create_secret_option_count(const LogicalOperator &op);
+rust::String lo_create_secret_option_key(const LogicalOperator &op, size_t index);
+bool lo_create_secret_option_is_null(const LogicalOperator &op, size_t index);
+rust::String lo_create_secret_option_value(const LogicalOperator &op, size_t index);
+
+// ---- Drop (secrets only) ----
+bool lo_drop_is_secret(const LogicalOperator &op);
+rust::String lo_drop_secret_name(const LogicalOperator &op);
+bool lo_drop_secret_if_exists(const LogicalOperator &op);
+uint8_t lo_drop_secret_persist_type(const LogicalOperator &op);
+rust::String lo_drop_secret_storage(const LogicalOperator &op);
+
 // ---- Set / Reset ----
 rust::String lo_set_name(const LogicalOperator &op);
 rust::String lo_set_value(const LogicalOperator &op);

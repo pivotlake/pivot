@@ -95,6 +95,8 @@ pub enum Error {
     CreateTable(#[source] crate::catalog::Error),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
+    #[error("CREATE/DROP SECRET is a catalog command, not a compilable query")]
+    SecretNotCompilable,
     #[error("Unsupported table function: {0}")]
     UnsupportedTableFunction(String),
     #[error("Invalid argument to table function {function}: {message}")]
@@ -241,6 +243,11 @@ impl PlanNode {
             // SET/RESET is intercepted by the server after planning (it toggles
             // session state, not data), so it should never reach compilation.
             crate::Operator::SetVariable(_) => Err(Error::SetVariableNotCompilable),
+            // CREATE/DROP SECRET is likewise intercepted by the server after
+            // planning and applied to the catalog directly.
+            crate::Operator::CreateSecret(_) | crate::Operator::DropSecret(_) => {
+                Err(Error::SecretNotCompilable)
+            }
         }
     }
 }

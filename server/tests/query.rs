@@ -15,30 +15,13 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use common::{Conn, conn, connect_client, server_port};
+use common::{Conn, conn, connect_client, select_rows, server_port};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rstest::rstest;
 use tempfile::TempDir;
 use tokio_postgres::{Client, SimpleQueryMessage};
-
-/// Run `sql` and decode every `DataRow` in the response into
-/// `Vec<Option<String>>` (text format). Non-row messages (e.g. `RowDescription`,
-/// `CommandComplete`) are dropped — tests assert on data only.
-async fn select_rows(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
-    let msgs = client.simple_query(sql).await.unwrap();
-    msgs.into_iter()
-        .filter_map(|m| match m {
-            SimpleQueryMessage::Row(r) => Some(
-                (0..r.len())
-                    .map(|i| r.get(i).map(|s| s.to_string()))
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
-        })
-        .collect()
-}
 
 /// Write `batch` as a single parquet file inside a fresh tempdir and return
 /// the directory (kept alive by the caller — drop it to clean up).

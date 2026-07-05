@@ -1,28 +1,51 @@
 //! S3 (and S3-compatible) backend: blocking HTTP via [`ureq`], requests signed
 //! with SigV4 via `aws_sigv4::http_request::sign` (a pure function — no runtime).
 //!
-//! Credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
+//! Bootstrap credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
 //! `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`); region from
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
+//!
+//! Once the catalog's [`SecretsRegistry`] is loaded, each data request first
+//! looks its object's `s3://bucket/key` URL up there (`CREATE SECRET`, longest
+//! scope prefix wins) and signs with the matching secret's credentials; a
+//! request no secret covers keeps the environment credentials. So a secret
+//! created mid-session takes effect on the very next request. Two deliberate
+//! carve-outs:
+//!
+//! - the catalog's own control-plane files (`_pivot...`) always sign with the
+//!   environment credentials, so a secret can never cut the catalog off from
+//!   its manifests or from the secrets file itself;
+//! - only credentials are consumed from a secret. Its `region`/`endpoint`
+//!   options are stored and listed but do not re-point this store, whose
+//!   endpoint, host, and signing region are fixed when the database opens.
 
 use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use crate::secrets::SecretsRegistry;
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub struct S3Store {
+    /// The bucket the store addresses - the authority of the `s3://bucket/key`
+    /// URLs secrets are scoped by.
+    bucket: String,
     /// In-bucket prefix under which this catalog's keys live.
     prefix: String,
     region: String,
     access_key: String,
     secret_key: String,
     session_token: Option<String>,
+    /// The catalog's secrets: per-request credential resolution (see the
+    /// module doc). Still empty while the catalog bootstraps; until it loads,
+    /// requests sign with the environment credentials above.
+    secrets: Arc<SecretsRegistry>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
     /// hosted) or `http://localhost:9000/bucket` (path-style endpoint override).
     base: String,
@@ -32,9 +55,10 @@ pub struct S3Store {
 }
 
 impl S3Store {
-    /// Parse `s3://bucket/prefix` and resolve credentials/region/endpoint from
-    /// the environment.
-    pub fn from_uri(uri: &str) -> Result<Self> {
+    /// Parse `s3://bucket/prefix` and resolve bootstrap credentials/region/
+    /// endpoint from the environment; `secrets` overrides credentials per
+    /// request once loaded.
+    pub fn from_uri(uri: &str, secrets: Arc<SecretsRegistry>) -> Result<Self> {
         let rest = uri
             .strip_prefix("s3://")
             .or_else(|| uri.strip_prefix("s3a://"))
@@ -69,15 +93,81 @@ impl S3Store {
         };
 
         Ok(Self {
+            bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             region,
             access_key,
             secret_key,
             session_token,
+            secrets,
             base,
             host,
             agent: ureq::AgentBuilder::new().build(),
         })
+    }
+
+    /// Whether the in-bucket `object` key is one of the catalog's own
+    /// control-plane files under the database prefix (`_pivot...`: the
+    /// database manifest, the table manifests, the secrets file).
+    fn is_control_plane(&self, object: &str) -> bool {
+        let prefix = self.prefix.trim_matches('/');
+        let relative = if prefix.is_empty() {
+            Some(object)
+        } else {
+            object
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_prefix('/'))
+        };
+        relative.is_some_and(|key| key.starts_with("_pivot"))
+    }
+
+    /// The identity for a request on the in-bucket `object` key: the secret
+    /// whose scope best matches the object's `s3://` URL, or the environment
+    /// credentials this store was opened with when no secret covers it. A
+    /// matching secret must carry `key_id` and `secret`; a half-configured
+    /// secret is an error, not a silent fallback.
+    ///
+    /// The catalog's own control-plane files always sign with the environment
+    /// credentials: a secret must never be able to cut the catalog off from
+    /// its manifests or from the secrets file itself, which would make the
+    /// secret impossible to persist, the database impossible to open, and the
+    /// secret impossible to drop.
+    ///
+    /// Only credentials come from the secret. The signing region stays the
+    /// store's own: this store's endpoint and host are fixed at open, and a
+    /// SigV4 signature must name the region baked into that host.
+    fn signing_identity(&self, object: &str) -> Result<Credentials> {
+        let matched = if self.is_control_plane(object) {
+            None
+        } else {
+            self.secrets
+                .lookup(&format!("s3://{}/{object}", self.bucket), "s3")
+        };
+        let Some(secret) = matched else {
+            return Ok(Credentials::new(
+                &self.access_key,
+                &self.secret_key,
+                self.session_token.clone(),
+                None,
+                "catalog-env",
+            ));
+        };
+
+        let required = |key: &str| {
+            secret.option(key).map(str::to_string).ok_or_else(|| {
+                StoreError::Config(format!(
+                    "secret `{}` matches s3://{}/{object} but carries no `{key}`",
+                    secret.name, self.bucket
+                ))
+            })
+        };
+        Ok(Credentials::new(
+            required("key_id")?,
+            required("secret")?,
+            secret.option("session_token").map(str::to_string),
+            None,
+            "catalog-secret",
+        ))
     }
 
     /// Full request URL for an in-bucket object name (already prefixed).
@@ -86,23 +176,18 @@ impl S3Store {
     }
 
     /// Compute the SigV4 headers (Authorization, x-amz-date, x-amz-content-sha256,
-    /// optional x-amz-security-token) to attach to a request. `query` is the
-    /// canonical query string (without leading `?`), included in the signature.
+    /// optional x-amz-security-token) to attach to a request on the in-bucket
+    /// `object` key, signed with the identity [`signing_identity`](Self::signing_identity)
+    /// resolves for it.
     fn sign(
         &self,
         method: &str,
+        object: &str,
         url: &str,
         extra_headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Vec<(String, String)>> {
-        let creds = Credentials::new(
-            &self.access_key,
-            &self.secret_key,
-            self.session_token.clone(),
-            None,
-            "catalog-env",
-        );
-        let identity = creds.into();
+        let identity = self.signing_identity(object)?.into();
 
         let mut settings = SigningSettings::default();
         settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
@@ -153,7 +238,7 @@ impl ObjectStore for S3Store {
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
-        let signed = self.sign("GET", &url, &[], &[])?;
+        let signed = self.sign("GET", &object, &url, &[], &[])?;
         let req = Self::apply(self.agent.get(&url), &signed);
         match req.call() {
             Ok(resp) => {
@@ -174,7 +259,7 @@ impl ObjectStore for S3Store {
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
-        let signed = self.sign("PUT", &url, &[], data)?;
+        let signed = self.sign("PUT", &object, &url, &[], data)?;
         let req = Self::apply(self.agent.put(&url), &signed);
         match req.send_bytes(data) {
             Ok(_) => Ok(()),
@@ -188,7 +273,7 @@ impl ObjectStore for S3Store {
         // S3 conditional write: `If-None-Match: *` fails the PUT with 412 when
         // the object already exists. A 409 means another conditional write on
         // the same key is in flight — also "lost the race" to the caller.
-        let signed = self.sign("PUT", &url, &[("if-none-match", "*")], data)?;
+        let signed = self.sign("PUT", &object, &url, &[("if-none-match", "*")], data)?;
         // `sign` returns only the auth headers it derives (Authorization,
         // x-amz-date, …); `if-none-match` is a request header we sign but must
         // also send ourselves. Its name is in the signature's `SignedHeaders`,
@@ -204,7 +289,7 @@ impl ObjectStore for S3Store {
     fn delete(&self, key: &ObjectPath) -> Result<()> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
-        let signed = self.sign("DELETE", &url, &[], &[])?;
+        let signed = self.sign("DELETE", &object, &url, &[], &[])?;
         let req = Self::apply(self.agent.delete(&url), &signed);
         match req.call() {
             // DELETE is idempotent; a missing key is the goal state.
@@ -221,7 +306,7 @@ impl ObjectStore for S3Store {
             percent_encode(&object_prefix)
         );
         let url = format!("{}/?{}", self.base, query);
-        let signed = self.sign("GET", &url, &[], &[])?;
+        let signed = self.sign("GET", &object_prefix, &url, &[], &[])?;
         let req = Self::apply(self.agent.get(&url), &signed);
         let body = match req.call() {
             Ok(resp) => resp
@@ -259,14 +344,7 @@ impl S3Store {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
 
-        let creds = Credentials::new(
-            &self.access_key,
-            &self.secret_key,
-            self.session_token.clone(),
-            None,
-            "catalog-env",
-        );
-        let identity = creds.into();
+        let identity = self.signing_identity(&object)?.into();
 
         let mut settings = SigningSettings::default();
         settings.signature_location = SignatureLocation::QueryParams;

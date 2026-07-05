@@ -9,7 +9,7 @@
 //! hand, is passed in at [`compile`](crate::compile) time — it represents
 //! "what worker pool runs this plan" and isn't a property of the plan itself.
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, SecretCommand};
 use crate::expression::Expression;
 use crate::operator::{self, Operator, OrderByDirection, SetVariable};
 use dispatch::GroupLimit;
@@ -235,6 +235,21 @@ impl Plan {
     pub fn as_set_variable(&self) -> Option<&SetVariable> {
         match &self.root.operator {
             Operator::SetVariable(set) if self.root.inputs.is_empty() => Some(set),
+            _ => None,
+        }
+    }
+
+    /// If this plan is a `CREATE`/`DROP SECRET`, return it as an owned
+    /// [`SecretCommand`]. Like `SET`, a secret statement is a catalog command
+    /// that compiles to nothing - the server checks this first and applies it
+    /// to the catalog directly.
+    pub fn as_secret_command(&self) -> Option<SecretCommand> {
+        if !self.root.inputs.is_empty() {
+            return None;
+        }
+        match &self.root.operator {
+            Operator::CreateSecret(create) => Some(SecretCommand::Create(create.request.clone())),
+            Operator::DropSecret(drop) => Some(SecretCommand::Drop(drop.request.clone())),
             _ => None,
         }
     }

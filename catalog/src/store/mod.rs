@@ -12,9 +12,11 @@
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
+use crate::secrets::SecretsRegistry;
 use dispatch::io::AuthHeader;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 mod gcs;
 mod local;
@@ -152,6 +154,23 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// index, which a single server writes on the occasional `CREATE TABLE`.)
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
 
+    /// Like [`put`](Self::put), but for secret material: a local backend
+    /// restricts the object to the owning user (mode 600). Remote backends
+    /// store it as a normal object - there, the bucket's access policy is the
+    /// boundary, the same one that already guards the data.
+    fn put_private(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
+        self.put(key, data)
+    }
+
+    /// Whether `key` is readable only by the owning user. A local backend
+    /// checks the file's permission bits, so a secrets file another user can
+    /// read is refused on load (as DuckDB refuses its stored secrets). Remote
+    /// backends answer true: access there is governed by the bucket policy,
+    /// not mode bits.
+    fn is_private(&self, _key: &ObjectPath) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Create `key` with `data` only if it does not already exist — the
     /// compare-and-swap the versioned [table manifest](crate::manifest) builds
     /// its commits on. `Ok(true)` means this writer created the object; `Ok(false)`
@@ -199,9 +218,14 @@ pub trait ObjectStore: Debug + Send + Sync {
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
 /// `gs://bucket/prefix`, or a local path (optionally `file://`).
-pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
+///
+/// `secrets` is the catalog's registry (usually still empty here - the
+/// catalog loads it through this very store right after opening): a backend
+/// that authenticates from secrets resolves credentials through it on every
+/// request, so secrets created at runtime apply immediately.
+pub fn open_store(uri: &str, secrets: Arc<SecretsRegistry>) -> Result<Box<dyn ObjectStore>> {
     if uri.starts_with("s3://") || uri.starts_with("s3a://") {
-        Ok(Box::new(S3Store::from_uri(uri)?))
+        Ok(Box::new(S3Store::from_uri(uri, secrets)?))
     } else if uri.starts_with("gs://") {
         Ok(Box::new(GcsStore::from_uri(uri)?))
     } else {
@@ -263,12 +287,13 @@ mod tests {
     #[test]
     fn open_store_routes_local_and_file_uri() {
         let dir = tempfile::tempdir().unwrap();
-        let store = open_store(dir.path().to_str().unwrap()).unwrap();
+        let secrets = Arc::new(SecretsRegistry::new());
+        let store = open_store(dir.path().to_str().unwrap(), secrets.clone()).unwrap();
         let key = ObjectPath::new("k");
         store.put(&key, b"v").unwrap();
         // Reopening through a `file://` URI lands on the same root.
         let uri = format!("file://{}", dir.path().to_str().unwrap());
-        let reopened = open_store(&uri).unwrap();
+        let reopened = open_store(&uri, secrets).unwrap();
         assert_eq!(reopened.get(&key).unwrap().unwrap(), b"v");
     }
 }

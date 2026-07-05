@@ -147,6 +147,10 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_GET => Operator::TableFunctionScan(TableFunctionScan { raw: self.raw }),
             L::LOGICAL_CREATE_TABLE => Operator::CreateTable(CreateTable { raw: self.raw }),
+            L::LOGICAL_CREATE_SECRET => Operator::CreateSecret(CreateSecret { raw: self.raw }),
+            L::LOGICAL_DROP if ffi::lo_drop_is_secret(self.raw) => {
+                Operator::DropSecret(DropSecret { raw: self.raw })
+            }
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
@@ -176,6 +180,10 @@ pub enum Operator<'plan> {
     /// A scan over a table-valued function (`LOGICAL_GET` with no base table).
     TableFunctionScan(TableFunctionScan<'plan>),
     CreateTable(CreateTable<'plan>),
+    /// `CREATE SECRET name (TYPE ..., ...)`.
+    CreateSecret(CreateSecret<'plan>),
+    /// `DROP SECRET name` (a `LOGICAL_DROP` over a secret entry).
+    DropSecret(DropSecret<'plan>),
     /// `SET name = value`.
     Set(Set<'plan>),
     /// `RESET name`.
@@ -225,6 +233,10 @@ define_handles! { ffi::LogicalOperator;
     TableFunctionScan,
     /// A `LogicalCreateTable` with an explicit column list.
     CreateTable,
+    /// A `LogicalCreateSecret`: the bound `CREATE SECRET` input.
+    CreateSecret,
+    /// A `LogicalSimple` `LOGICAL_DROP` over a secret entry.
+    DropSecret,
     /// A `LogicalSet`: `SET name = value`.
     Set,
     /// A `LogicalReset`: `RESET name`.
@@ -444,6 +456,100 @@ impl<'plan> CreateTable<'plan> {
 
     pub fn constraint_count(self) -> usize {
         ffi::lo_create_constraint_count(self.raw)
+    }
+}
+
+/// The `[TEMPORARY | PERSISTENT]` qualifier of a secret statement, mirroring
+/// DuckDB's `SecretPersistType`. `Default` means the statement carried neither
+/// keyword; the consumer picks the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretPersistMode {
+    Default,
+    Temporary,
+    Persistent,
+}
+
+impl SecretPersistMode {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => SecretPersistMode::Default,
+            1 => SecretPersistMode::Temporary,
+            2 => SecretPersistMode::Persistent,
+            other => unreachable!("invalid SecretPersistType discriminant {other}"),
+        }
+    }
+}
+
+impl<'plan> CreateSecret<'plan> {
+    /// The secret's name; empty when the statement gave none.
+    pub fn name(self) -> String {
+        ffi::lo_create_secret_name(self.raw)
+    }
+
+    /// The secret's TYPE (e.g. `s3`), lowercased by the binder.
+    pub fn secret_type(self) -> String {
+        ffi::lo_create_secret_type(self.raw)
+    }
+
+    /// The secret's PROVIDER; empty when the statement omitted it (the type's
+    /// default provider applies).
+    pub fn provider(self) -> String {
+        ffi::lo_create_secret_provider(self.raw)
+    }
+
+    /// The explicit `IN <storage>` clause, or `None`.
+    pub fn storage(self) -> Option<String> {
+        let storage = ffi::lo_create_secret_storage(self.raw);
+        (!storage.is_empty()).then_some(storage)
+    }
+
+    pub fn persist_mode(self) -> SecretPersistMode {
+        SecretPersistMode::from_u8(ffi::lo_create_secret_persist_type(self.raw))
+    }
+
+    pub fn if_not_exists(self) -> bool {
+        ffi::lo_create_secret_if_not_exists(self.raw)
+    }
+
+    pub fn or_replace(self) -> bool {
+        ffi::lo_create_secret_or_replace(self.raw)
+    }
+
+    /// The user-provided SCOPE path prefixes; empty when the statement gave none.
+    pub fn scope(self) -> impl Iterator<Item = String> + 'plan {
+        (0..ffi::lo_create_secret_scope_count(self.raw))
+            .map(move |i| ffi::lo_create_secret_scope(self.raw, i))
+    }
+
+    /// The bound key-value options (KEY_ID, SECRET, REGION, ...), keys
+    /// lowercased and values validated by the binder. A `None` value is SQL
+    /// NULL (which the consumer rejects rather than storing).
+    pub fn options(self) -> impl Iterator<Item = (String, Option<String>)> + 'plan {
+        (0..ffi::lo_create_secret_option_count(self.raw)).map(move |i| {
+            let value = (!ffi::lo_create_secret_option_is_null(self.raw, i))
+                .then(|| ffi::lo_create_secret_option_value(self.raw, i));
+            (ffi::lo_create_secret_option_key(self.raw, i), value)
+        })
+    }
+}
+
+impl<'plan> DropSecret<'plan> {
+    pub fn name(self) -> String {
+        ffi::lo_drop_secret_name(self.raw)
+    }
+
+    pub fn if_exists(self) -> bool {
+        ffi::lo_drop_secret_if_exists(self.raw)
+    }
+
+    pub fn persist_mode(self) -> SecretPersistMode {
+        SecretPersistMode::from_u8(ffi::lo_drop_secret_persist_type(self.raw))
+    }
+
+    /// The explicit `FROM <storage>` clause, or `None`.
+    pub fn storage(self) -> Option<String> {
+        let storage = ffi::lo_drop_secret_storage(self.raw);
+        (!storage.is_empty()).then_some(storage)
     }
 }
 

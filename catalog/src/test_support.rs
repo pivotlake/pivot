@@ -19,8 +19,9 @@
 //! happens-before to every later reader. Tests isolate themselves under a unique
 //! key prefix within the shared bucket rather than per-test containers.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use crate::secrets::SecretsRegistry;
 use crate::store::{DataFileSource, ObjectPath, ObjectStore, open_store};
 use testcontainers::core::ContainerPort;
 use testcontainers::runners::SyncRunner;
@@ -34,12 +35,26 @@ const S3_ACCESS_KEY: &str = "minioadmin";
 const S3_SECRET_KEY: &str = "minioadmin";
 const S3_REGION: &str = "us-east-1";
 
-/// A backend addressable as a catalog root: the root URI and a store opened on
-/// it. Drop order is irrelevant — the store holds no container; the containers
+/// A backend addressable as a catalog root: the root URI, a store opened on
+/// it, and the secrets registry that store resolves credentials through.
+/// Drop order is irrelevant - the store holds no container; the containers
 /// live for the whole binary in [`containers`].
 pub struct Backend {
     pub root: String,
     pub store: Box<dyn ObjectStore>,
+    pub secrets: Arc<SecretsRegistry>,
+}
+
+impl Backend {
+    fn open(root: String) -> Self {
+        let secrets = Arc::new(SecretsRegistry::new());
+        let store = open_store(&root, secrets.clone()).expect("open store");
+        Backend {
+            root,
+            store,
+            secrets,
+        }
+    }
 }
 
 /// A fresh local-filesystem backend (always available). The returned `TempDir`
@@ -47,17 +62,14 @@ pub struct Backend {
 pub fn local() -> (tempfile::TempDir, Backend) {
     let dir = tempfile::TempDir::new().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
-    let store = open_store(&root).expect("open local store");
-    (dir, Backend { root, store })
+    (dir, Backend::open(root))
 }
 
 /// An S3 backend rooted at `s3://<bucket>/<prefix>`, or `None` when MinIO could
 /// not be started (no Docker). `prefix` should be unique per test.
 pub fn s3(prefix: &str) -> Option<Backend> {
     containers().s3.as_ref()?;
-    let root = format!("s3://{BUCKET}/{prefix}");
-    let store = open_store(&root).expect("open s3 store");
-    Some(Backend { root, store })
+    Some(Backend::open(format!("s3://{BUCKET}/{prefix}")))
 }
 
 /// A GCS backend rooted at `gs://<bucket>/<prefix>`, or `None` when
@@ -65,9 +77,7 @@ pub fn s3(prefix: &str) -> Option<Backend> {
 /// per test.
 pub fn gcs(prefix: &str) -> Option<Backend> {
     containers().gcs.as_ref()?;
-    let root = format!("gs://{BUCKET}/{prefix}");
-    let store = open_store(&root).expect("open gcs store");
-    Some(Backend { root, store })
+    Some(Backend::open(format!("gs://{BUCKET}/{prefix}")))
 }
 
 /// Fetch an object through [`ObjectStore::source`] exactly as the engine would:

@@ -11,18 +11,20 @@ use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
-    Aggregate as AggregateView, CreateTable as CreateTableView, Filter as FilterView,
-    Limit as LimitView, OrderBy as OrderByView, OrderKey, Projection as ProjectionView,
-    Reset as ResetView, Set as SetView, TableFunctionScan as TableFunctionScanView,
-    TableScan as TableScanView, TopN as TopNView,
+    Aggregate as AggregateView, CreateSecret as CreateSecretView, CreateTable as CreateTableView,
+    DropSecret as DropSecretView, Filter as FilterView, Limit as LimitView, OrderBy as OrderByView,
+    OrderKey, Projection as ProjectionView, Reset as ResetView, SecretPersistMode, Set as SetView,
+    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
 };
 
 use super::{BuildCtx, build_scan_columns};
-use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, Table};
+use crate::catalog::{
+    Column, CreateSecretRequest, CreateTableRequest, DropSecretRequest, DuckDBTableAdapter, Table,
+};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
-    Aggregate, CreateTable, Error as OperatorError, Filter, Input, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN,
+    Aggregate, CreateSecret, CreateTable, DropSecret, Error as OperatorError, Filter, Input, Limit,
+    OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN,
 };
 use crate::types::type_from_logical;
 
@@ -157,6 +159,98 @@ impl CreateTable {
             temporary: view.temporary(),
             has_query: view.has_query(),
             constraint_count: view.constraint_count(),
+        })
+    }
+}
+
+impl CreateSecret {
+    pub(crate) fn from_handle(view: CreateSecretView<'_>) -> Result<CreateSecret, OperatorError> {
+        if let Some(storage) = view.storage() {
+            return Err(OperatorError::Unsupported(format!(
+                "CREATE SECRET IN {storage} is not supported: pivot stores secrets in its catalog"
+            )));
+        }
+        let secret_type = view.secret_type();
+        // An unnamed secret gets the type's default name, as in DuckDB.
+        let name = match view.name() {
+            name if name.is_empty() => format!("__default_{secret_type}"),
+            name => name,
+        };
+        // The binder leaves the provider empty when the statement omitted it;
+        // the registered types all default to explicit config values.
+        let provider = match view.provider() {
+            provider if provider.is_empty() => "config".to_string(),
+            provider => provider,
+        };
+        let scope = match view.scope().collect::<Vec<String>>() {
+            scope if scope.is_empty() => default_secret_scope(&secret_type)?,
+            scope => scope,
+        };
+        Ok(CreateSecret {
+            request: CreateSecretRequest {
+                name,
+                secret_type,
+                provider,
+                scope,
+                options: view
+                    .options()
+                    .map(|(key, value)| match value {
+                        Some(value) => Ok((key, value)),
+                        None => Err(OperatorError::Unsupported(format!(
+                            "secret option `{key}` cannot be NULL"
+                        ))),
+                    })
+                    .collect::<Result<_, _>>()?,
+                // Pivot's catalog is a durable shared database, so an
+                // unqualified CREATE SECRET persists (DuckDB, embedded,
+                // defaults to temporary instead).
+                temporary: view.persist_mode() == SecretPersistMode::Temporary,
+                or_replace: view.or_replace(),
+                if_not_exists: view.if_not_exists(),
+            },
+        })
+    }
+}
+
+/// The scope a secret of `secret_type` applies to when the statement gave
+/// none, matching DuckDB's per-type defaults. Lives beside the other
+/// per-statement defaults (name, provider) so every secret request leaves the
+/// planner fully resolved. A type registered with the binder but missing here
+/// is rejected rather than stored with a scope that matches nothing.
+fn default_secret_scope(secret_type: &str) -> Result<Vec<String>, OperatorError> {
+    match secret_type {
+        "s3" => Ok(vec![
+            "s3://".to_string(),
+            "s3n://".to_string(),
+            "s3a://".to_string(),
+        ]),
+        other => Err(OperatorError::Unsupported(format!(
+            "secret type {other:?} has no default scope; give the secret an explicit SCOPE"
+        ))),
+    }
+}
+
+impl DropSecret {
+    pub(crate) fn from_handle(view: DropSecretView<'_>) -> Result<DropSecret, OperatorError> {
+        if let Some(storage) = view.storage() {
+            return Err(OperatorError::Unsupported(format!(
+                "DROP SECRET FROM {storage} is not supported: pivot stores secrets in its catalog"
+            )));
+        }
+        Ok(DropSecret {
+            request: DropSecretRequest {
+                // DuckDB's parser lowercases a CREATE SECRET name but passes a
+                // DROP SECRET name through verbatim (its own catalog set is
+                // case-insensitive); pivot's registry matches exactly, so
+                // mirror the CREATE-side lowering here.
+                name: view.name().to_ascii_lowercase(),
+                if_exists: view.if_exists(),
+                temporary: match view.persist_mode() {
+                    SecretPersistMode::Default => None,
+                    SecretPersistMode::Temporary => Some(true),
+                    SecretPersistMode::Persistent => Some(false),
+                },
+            },
         })
     }
 }

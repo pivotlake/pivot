@@ -284,3 +284,66 @@ macro_rules! local_s3_tests {
 }
 
 local_s3_tests!(put_if_absent_is_a_cas);
+
+/// S3 data requests sign with the secret whose scope covers the object (the
+/// whole point of `CREATE SECRET`): a bucket-wide secret with bogus
+/// credentials makes the very next data read fail auth, while the catalog's
+/// control-plane traffic (persisting the secret itself, dropping it) keeps the
+/// bootstrap credentials, so the bad secret can always be persisted and
+/// dropped. S3-only - MinIO actually enforces signatures; the local backend
+/// has no auth to exercise.
+#[test]
+fn s3_signs_data_requests_with_matching_secret() {
+    use std::collections::BTreeMap;
+
+    use planner::catalog::{CreateSecretRequest, DropSecretRequest};
+
+    let Some(b) = harness::s3("secret-signing") else {
+        return;
+    };
+    let key = ObjectPath::new("guarded/object");
+    b.store.put(&key, b"payload").unwrap();
+    let read_before = b.store.get(&key);
+
+    // A bucket-wide persistent secret with bogus credentials: its own persist
+    // (a control-plane write) still succeeds, then it takes over data signing.
+    b.secrets
+        .create_secret(
+            CreateSecretRequest {
+                name: "bogus".to_string(),
+                secret_type: "s3".to_string(),
+                provider: "config".to_string(),
+                scope: vec!["s3://".to_string()],
+                options: BTreeMap::from([
+                    ("key_id".to_string(), "wrong-key".to_string()),
+                    ("secret".to_string(), "wrong-secret".to_string()),
+                ]),
+                temporary: false,
+                or_replace: false,
+                if_not_exists: false,
+            },
+            b.store.as_ref(),
+        )
+        .unwrap();
+    let denied = b.store.get(&key).unwrap_err();
+    b.secrets
+        .drop_secret(
+            DropSecretRequest {
+                name: "bogus".to_string(),
+                if_exists: false,
+                temporary: None,
+            },
+            b.store.as_ref(),
+        )
+        .unwrap();
+    let read_after = b.store.get(&key);
+
+    // Before the secret and after its drop, the environment credentials serve
+    // the read; while it exists, data requests sign with it and fail auth.
+    assert_eq!(read_before.unwrap().unwrap(), b"payload");
+    assert!(
+        denied.to_string().contains("403"),
+        "expected an auth failure, got: {denied}"
+    );
+    assert_eq!(read_after.unwrap().unwrap(), b"payload");
+}

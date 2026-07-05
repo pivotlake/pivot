@@ -131,6 +131,35 @@ mod bodies {
 
         assert_eq!(count, 3);
     }
+
+    /// A persistent `CREATE SECRET` lands in the database root, so a fresh
+    /// server opened on the same root lists it (values still redacted). The
+    /// scope points away from the backing bucket so the store's own requests
+    /// keep their bootstrap credentials.
+    pub async fn secret_persists_across_reopen(b: &Backend) {
+        let client = connect_client(start_server_on(&b.root)).await;
+        client
+            .simple_query(
+                "CREATE SECRET reopen_secret (TYPE s3, KEY_ID 'AKIAEXAMPLE', \
+                 SECRET 'hunter2', SCOPE 's3://elsewhere')",
+            )
+            .await
+            .unwrap();
+
+        let reopened = connect_client(start_server_on(&b.root)).await;
+
+        let listed = reopened
+            .simple_query("SELECT secret_string FROM pivot_secrets() WHERE name = 'reopen_secret'")
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|msg| match msg {
+                SimpleQueryMessage::Row(row) => Some(row.get(0).unwrap().to_string()),
+                _ => None,
+            })
+            .expect("reopened server lists the persisted secret");
+        assert_eq!(listed, "key_id=AKIAEXAMPLE;secret=redacted");
+    }
 }
 
 // --- backend matrix --------------------------------------------------------
@@ -177,6 +206,7 @@ macro_rules! bucket_tests {
 
 bucket_tests!(create_table_and_count);
 bucket_tests!(count_with_filter);
+bucket_tests!(secret_persists_across_reopen);
 
 /// KNOWN BUG (`#[ignore]`d until fixed): `SELECT COUNT(*)` with no predicate
 /// returns 0 instead of the row count. DuckDB scans `COUNT(*)` with a

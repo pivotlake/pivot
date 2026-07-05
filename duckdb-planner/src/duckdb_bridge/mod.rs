@@ -217,6 +217,43 @@ pub mod ffi {
         fn lo_create_has_query(op: &LogicalOperator) -> bool;
         fn lo_create_constraint_count(op: &LogicalOperator) -> usize;
 
+        // ---- CreateSecret ----
+        fn lo_create_secret_name(op: &LogicalOperator) -> String;
+        /// The secret's TYPE (e.g. `s3`), lowercased by the binder.
+        fn lo_create_secret_type(op: &LogicalOperator) -> String;
+        /// The secret's PROVIDER; empty when the statement omitted it (the
+        /// type's default provider applies).
+        fn lo_create_secret_provider(op: &LogicalOperator) -> String;
+        /// The explicit `IN <storage>` clause; empty when the statement had none.
+        fn lo_create_secret_storage(op: &LogicalOperator) -> String;
+        /// DuckDB `SecretPersistType` discriminant (default / temporary /
+        /// persistent).
+        fn lo_create_secret_persist_type(op: &LogicalOperator) -> u8;
+        fn lo_create_secret_if_not_exists(op: &LogicalOperator) -> bool;
+        fn lo_create_secret_or_replace(op: &LogicalOperator) -> bool;
+        fn lo_create_secret_scope_count(op: &LogicalOperator) -> usize;
+        fn lo_create_secret_scope(op: &LogicalOperator, index: usize) -> String;
+        /// The bound key-value options (KEY_ID, SECRET, REGION, ...), keys
+        /// lowercased and values cast by the binder.
+        fn lo_create_secret_option_count(op: &LogicalOperator) -> usize;
+        fn lo_create_secret_option_key(op: &LogicalOperator, index: usize) -> String;
+        /// Whether the option's bound value is SQL NULL; `lo_create_secret_option_value`
+        /// would render that as the literal string `NULL`, so check first.
+        fn lo_create_secret_option_is_null(op: &LogicalOperator, index: usize) -> bool;
+        fn lo_create_secret_option_value(op: &LogicalOperator, index: usize) -> String;
+
+        // ---- Drop (secrets only) ----
+        /// Whether this `LOGICAL_DROP` drops a secret (vs a table/view/...,
+        /// which pivot doesn't handle).
+        fn lo_drop_is_secret(op: &LogicalOperator) -> bool;
+        fn lo_drop_secret_name(op: &LogicalOperator) -> String;
+        fn lo_drop_secret_if_exists(op: &LogicalOperator) -> bool;
+        /// DuckDB `SecretPersistType` discriminant of the `DROP
+        /// [TEMPORARY|PERSISTENT] SECRET` qualifier (default when unqualified).
+        fn lo_drop_secret_persist_type(op: &LogicalOperator) -> u8;
+        /// The explicit `FROM <storage>` clause; empty when the statement had none.
+        fn lo_drop_secret_storage(op: &LogicalOperator) -> String;
+
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> String;
         fn lo_set_value(op: &LogicalOperator) -> String;
