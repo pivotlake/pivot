@@ -26,7 +26,7 @@ use dispatch::{Receiver, RootChannelFactory};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::parquet::{RowGroupFilter, ScanOrder};
 
@@ -58,7 +58,7 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 /// can't be pruned (missing stats are never eliminated), so they must be read
 /// regardless — they go last. Reordering is purely an optimization: any order is
 /// correct (the Top-N re-sorts), this just minimizes how much gets read.
-fn steal_order(table: &ParquetTable, order: ScanOrder) -> Vec<usize> {
+fn steal_order(table: &ParquetTable, order: &ScanOrder) -> Vec<usize> {
     let n = table.row_groups.len();
     let mut keyed: Vec<(usize, Scalar<ArrayRef>)> = Vec::with_capacity(n);
     let mut unkeyed: Vec<usize> = Vec::new();
@@ -145,6 +145,61 @@ pub struct RowGroupInjectorFactory {
     node_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
     projection: Projection,
     filter: Option<RowGroupFilter>,
+    speculation: Option<SpeculationGate>,
+}
+
+/// A Top-N scan's dynamic boundary starts empty and only *tightens* as the
+/// operator consumes rows, so every claim admitted early is judged by a
+/// boundary weaker than the one a moment later - and a claim is a read that
+/// cannot be retracted. Crucially, a boundary that has a value is not yet a
+/// boundary worth trusting: the first published value comes from whichever
+/// batch happened to consume first, and letting the whole pool claim the
+/// entire scan the instant one appears prunes against that lottery ticket
+/// (sometimes near-optimal, sometimes keeping half the table).
+///
+/// The gate therefore never "opens": every claim holds a ticket, capped by an
+/// allowance on *outstanding* claims (claimed but not yet fully decoded,
+/// tracked by the scan's shared counter). Row groups are handed out
+/// most-promising-first, so the throttled front claims are exactly the ones
+/// the boundary needs to converge, and each admitted round tightens it before
+/// deeper row groups are judged. Once the boundary is tight enough to prune
+/// the next row group, the sorted order means the entire remaining queue
+/// prunes too - pruned claims release their ticket immediately, so draining
+/// the tail is a cheap stats check per row group, not a read. A boundary that
+/// never arms (or a scan the boundary cannot prune) converges to an
+/// unthrottled scan through the allowance ramp (see
+/// [`RowGroupInjector::acquire_speculation_ticket`]).
+const MAX_SPECULATIVE_ROW_GROUPS: usize = 16;
+
+/// Shared state for throttling a Top-N scan's claims while its boundary
+/// converges.
+#[derive(Clone)]
+pub struct SpeculationGate {
+    /// Row groups claimed but not yet fully decoded, scan-wide (incremented on
+    /// claim here, decremented by the decoders).
+    outstanding: Arc<AtomicUsize>,
+    /// Total row groups ever admitted by this scan, for the allowance ramp.
+    total_claims: Arc<AtomicUsize>,
+    /// Whether the exhausted-queue broadcast has fired (see
+    /// [`SpeculationGate::wake_all_if_exhausted`]).
+    exhausted_wake: Arc<AtomicBool>,
+}
+
+impl SpeculationGate {
+    /// Broadcast-wake the pool once when the scan's queues drain. Workers the
+    /// gate turned away park without having finished their pipelines (a denied
+    /// claim is a no-op pass, indistinguishable from an idle one), and neither
+    /// the drain nor the finish cascade wakes them on its own — pruned claims
+    /// send nothing downstream, and the finish protocol needs *every* worker
+    /// to run its own finalization. Without this wake the query hangs with the
+    /// pool parked one step short of done.
+    fn wake_all_if_exhausted(&self, queues: &[Injector<QueryRowGroupMetadata>]) {
+        if queues.iter().all(|queue| queue.is_empty())
+            && !self.exhausted_wake.swap(true, Ordering::Relaxed)
+        {
+            dispatch::worker::waker_set().notify_all();
+        }
+    }
 }
 
 impl RowGroupInjectorFactory {
@@ -161,12 +216,18 @@ impl RowGroupInjectorFactory {
         projection: Projection,
         filter: Option<RowGroupFilter>,
         scan_order: Option<ScanOrder>,
+        outstanding_row_groups: Arc<AtomicUsize>,
         node_count: usize,
     ) -> Self {
         let node_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>> =
             Arc::new((0..node_count).map(|_| Injector::new()).collect());
+        let speculation = scan_order.as_ref().map(|_| SpeculationGate {
+            outstanding: outstanding_row_groups,
+            total_claims: Arc::new(AtomicUsize::new(0)),
+            exhausted_wake: Arc::new(AtomicBool::new(false)),
+        });
         let order = match scan_order {
-            Some(order) => steal_order(table, order),
+            Some(order) => steal_order(table, &order),
             None => plain_scan_order(table, &projection),
         };
         for row_group_idx in order {
@@ -177,6 +238,7 @@ impl RowGroupInjectorFactory {
             node_queues,
             projection,
             filter,
+            speculation,
         }
     }
 }
@@ -192,6 +254,7 @@ impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
             node_queues: self.node_queues,
             projection: self.projection,
             filter: self.filter,
+            speculation: self.speculation,
         }
     }
 }
@@ -205,6 +268,7 @@ pub struct RowGroupInjector {
     node: usize,
     projection: Projection,
     filter: Option<RowGroupFilter>,
+    speculation: Option<SpeculationGate>,
 }
 
 impl Receiver<RowGroupRequest> for RowGroupInjector {
@@ -228,9 +292,18 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         if queue.is_empty() {
             return None;
         }
+        let ticket = self.acquire_speculation_ticket()?;
         match queue.steal() {
-            Steal::Success(s) => self.admit(s),
-            Steal::Empty | Steal::Retry => None,
+            Steal::Success(s) => {
+                if let Some(gate) = &self.speculation {
+                    gate.wake_all_if_exhausted(&self.node_queues);
+                }
+                self.admit(s, ticket)
+            }
+            Steal::Empty | Steal::Retry => {
+                ticket.release();
+                None
+            }
         }
     }
 
@@ -242,13 +315,23 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
         for offset in 0..queue_count {
             let queue = &self.node_queues[(self.node + offset) % queue_count];
             while !queue.is_empty() {
+                let ticket = self.acquire_speculation_ticket()?;
                 match queue.steal() {
-                    Steal::Empty => break,
-                    Steal::Retry => continue,
+                    Steal::Empty => {
+                        ticket.release();
+                        break;
+                    }
+                    Steal::Retry => {
+                        ticket.release();
+                        continue;
+                    }
                     // Skip row groups the filter prunes; keep claiming rather
                     // than handing the worker a no-op.
                     Steal::Success(s) => {
-                        if let Some(req) = self.admit(s) {
+                        if let Some(gate) = &self.speculation {
+                            gate.wake_all_if_exhausted(&self.node_queues);
+                        }
+                        if let Some(req) = self.admit(s, ticket) {
                             return Some(req);
                         }
                     }
@@ -259,16 +342,77 @@ impl Receiver<RowGroupRequest> for RowGroupInjector {
     }
 }
 
+/// A reserved slot in the speculation allowance, held from queue pop to claim
+/// admission (see [`RowGroupInjector::acquire_speculation_ticket`]).
+enum SpeculationTicket<'a> {
+    /// The scan is not throttled (no Top-N boundary): claims need no
+    /// reservation.
+    Unthrottled,
+    /// A claim's reservation in the speculation allowance; release it if no
+    /// row group is actually claimed against it.
+    Reserved(&'a SpeculationGate),
+}
+
+impl SpeculationTicket<'_> {
+    fn release(self) {
+        if let SpeculationTicket::Reserved(gate) = self {
+            gate.outstanding.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 impl RowGroupInjector {
     /// Apply the row-group filter and wrap the survivor in a [`RowGroupRequest`];
     /// `None` if the filter proves it holds no matching row.
-    fn admit(&self, s: QueryRowGroupMetadata) -> Option<RowGroupRequest> {
+    fn admit(
+        &self,
+        s: QueryRowGroupMetadata,
+        ticket: SpeculationTicket<'_>,
+    ) -> Option<RowGroupRequest> {
         if let Some(filter) = &self.filter
             && !filter(s.get_metadata())
         {
+            ticket.release();
             return None;
         }
+        if let SpeculationTicket::Reserved(gate) = &ticket {
+            // The ticket becomes the claim's outstanding count (the decoder
+            // releases it when the row group completes). While throttled the
+            // pool is mostly parked (gated claims are no-op passes) and a
+            // claim, unlike a channel send, wakes nobody on its own; waking
+            // one sibling per admitted claim lets the working set grow with
+            // the allowance.
+            gate.total_claims.fetch_add(1, Ordering::Relaxed);
+            dispatch::worker::worker_waker().notify_one();
+        }
         Some(RowGroupRequest::from(s, &self.projection))
+    }
+
+    /// Reserve a slot in the speculation allowance, or `None` when the scan is
+    /// currently throttled (the allowance already claimed). The reservation
+    /// happens *before* the queue pop and atomically (reserve, then check), so
+    /// a burst of workers racing the gate cannot collectively overshoot it:
+    /// each one either holds a counted slot or backs off.
+    ///
+    /// The allowance ramps instead of staying a fixed cap: every *admitted*
+    /// claim raises it, so a scan whose boundary can't keep up — a selective
+    /// filter above it, a boundary with no publisher, statistics it can't
+    /// prune — opens up geometrically instead of trickling forever, and a
+    /// boundary that never helps converges to an unthrottled scan. Pruned
+    /// claims release their ticket without raising the allowance, so a
+    /// well-converged boundary keeps the scan at the small cap while the
+    /// remaining queue drains as cheap stats checks.
+    fn acquire_speculation_ticket(&self) -> Option<SpeculationTicket<'_>> {
+        let Some(speculation) = &self.speculation else {
+            return Some(SpeculationTicket::Unthrottled);
+        };
+        let allowance =
+            MAX_SPECULATIVE_ROW_GROUPS.max(speculation.total_claims.load(Ordering::Relaxed) / 2);
+        if speculation.outstanding.fetch_add(1, Ordering::Relaxed) >= allowance {
+            speculation.outstanding.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(SpeculationTicket::Reserved(speculation))
     }
 }
 
