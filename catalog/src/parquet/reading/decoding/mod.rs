@@ -54,6 +54,9 @@ pub struct DecoderFactory {
     /// with its fetcher; decremented as row groups finish so the fetcher's
     /// claim backpressure releases (see `RowGroupFetcher`).
     pub pending_row_groups: Arc<AtomicUsize>,
+    /// The scan-wide equivalent, shared with the row-group injector; releases
+    /// the speculative-claim throttle of an unarmed Top-N scan.
+    pub outstanding_row_groups: Arc<AtomicUsize>,
 }
 
 impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
@@ -66,6 +69,7 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
             self.add_row_group_metadata,
             self.eq_predicates,
             self.pending_row_groups,
+            self.outstanding_row_groups,
         )
     }
 }
@@ -96,6 +100,8 @@ pub struct Decoder {
     /// backpressure; decremented once per row group as it completes
     /// (exhausted or pruned).
     pending_row_groups: Arc<AtomicUsize>,
+    /// The scan-wide count, shared with the row-group injector.
+    outstanding_row_groups: Arc<AtomicUsize>,
 }
 
 impl Decoder {
@@ -105,6 +111,7 @@ impl Decoder {
         add_row_group_metadata: bool,
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
         pending_row_groups: Arc<AtomicUsize>,
+        outstanding_row_groups: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             batch_size,
@@ -115,12 +122,14 @@ impl Decoder {
             add_row_group_metadata,
             eq_predicates,
             pending_row_groups,
+            outstanding_row_groups,
         }
     }
 
     /// Mark one claimed row group fully decoded (or pruned), releasing its
     /// share of the fetcher's claim backpressure.
     fn release_claim(&self) {
+        self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
         let previous = self.pending_row_groups.fetch_sub(1, Ordering::Relaxed);
         // An underflow means this decoder released a claim its own fetcher
         // never made, i.e. the row group's decode landed on a different worker
@@ -443,8 +452,10 @@ mod tests {
             Projection::all_from_schema(table.schema()),
             false,
             Arc::new(Vec::new()),
-            // Standalone decoder: no fetcher made claims, so seed the counter
-            // high enough that releases never hit the underflow assertion.
+            // A standalone decoder has no fetcher making claims, so seed the
+            // counters high enough that releases never hit the underflow
+            // assertion.
+            Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
         )
     }
@@ -456,6 +467,7 @@ mod tests {
             false,
             Arc::new(vec![predicate]),
             // The claim-release counters; seeded like `new_decoder`'s.
+            Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
         )
     }

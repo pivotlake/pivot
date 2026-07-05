@@ -34,6 +34,7 @@ pub(crate) fn read_parquet<OF>(
     add_row_group_metadata: bool,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     pending_row_groups: Vec<Arc<AtomicUsize>>,
+    outstanding_row_groups: Arc<AtomicUsize>,
 ) -> RecordBatchOperatorSpec
 where
     OF: OperatorFactory<RowGroupBuffer> + Send + 'static,
@@ -61,6 +62,7 @@ where
                     add_row_group_metadata,
                     eq_predicates: eq_predicates.clone(),
                     pending_row_groups: pending,
+                    outstanding_row_groups: outstanding_row_groups.clone(),
                 })
                 .collect(),
         );
@@ -135,11 +137,17 @@ pub fn table_input_with_filter_and_eq_predicates(
     if projection.indices().is_empty() {
         return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
     }
+    // Counts the row groups the whole scan has claimed but not yet fully
+    // decoded. The injector increments it on claim, the decoders decrement
+    // it, and a Top-N scan throttles its claims against it while its boundary
+    // converges (see `RowGroupInjector`).
+    let outstanding_row_groups = Arc::new(AtomicUsize::new(0));
     let injector = RowGroupInjectorFactory::new(
         table,
         projection.clone(),
         filter,
         scan_order,
+        outstanding_row_groups.clone(),
         dispatcher.topology().node_count,
     );
     let siblings = Arc::new(AtomicUsize::new(n));
@@ -165,6 +173,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         add_row_group_metadata,
         eq_predicates,
         pending_row_groups,
+        outstanding_row_groups,
     )
 }
 
@@ -210,5 +219,8 @@ pub fn materialize(
         false,
         Arc::new(Vec::new()),
         pending_row_groups,
+        // The materializer path claims by explicit row-group requests, not the
+        // injector, so this count is never consulted.
+        Arc::new(AtomicUsize::new(0)),
     )
 }
