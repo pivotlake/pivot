@@ -25,12 +25,7 @@ pub fn row_group_filter_from(predicates: Vec<DynamicScanPredicate>) -> Option<Ro
     }
     Some(Arc::new(move |row_group: &RowGroupMetadata| -> bool {
         for pred in &predicates {
-            let Some(constant) = pred
-                .slot
-                .read()
-                .expect("dynamic filter slot poisoned")
-                .clone()
-            else {
+            let Some(constant) = pred.slot.boundary() else {
                 continue;
             };
             // Dynamic predicates only target top-level columns. DuckDB does
