@@ -108,7 +108,7 @@ jobs:
             id=$(aws ec2 describe-instances \
               --filters "Name=tag:Name,Values=$NAME_FILTER" \
                         "Name=instance-state-name,Values=stopped" \
-              --query 'Instances[0].InstanceId' --output text)
+              --query 'Reservations[0].Instances[0].InstanceId' --output text)
             if [ "$id" = "None" ] || [ -z "$id" ]; then
               echo "::error::no stopped instance matching Name=$NAME_FILTER; set the PERF_AWS_INSTANCE_ID variable."
               exit 1
@@ -118,7 +118,7 @@ jobs:
           echo "Using instance $id"
 
           state=$(aws ec2 describe-instances --instance-ids "$id" \
-            --query 'Instances[0].State.Name' --output text)
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
           echo "Current state: $state"
           if [ "$state" != "running" ]; then
             aws ec2 start-instances --instance-ids "$id" >/dev/null
@@ -126,7 +126,7 @@ jobs:
           aws ec2 wait instance-running --instance-ids "$id"
 
           ip=$(aws ec2 describe-instances --instance-ids "$id" \
-            --query 'Instances[0].PublicIpAddress' --output text)
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
           if [ "$ip" = "None" ] || [ -z "$ip" ]; then
             echo "::error::instance $id has no public IP to ssh to."
             exit 1
