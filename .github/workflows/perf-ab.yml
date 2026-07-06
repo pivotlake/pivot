@@ -1,9 +1,12 @@
 name: Perf A/B
 
 # Compare pivotdb performance across two commits ("before" vs "after") on a
-# dedicated AWS perf box. Builds a PGO binary per commit, times the ClickBench
-# query set on the full single-hit dataset (pivot only, no DuckDB), and prints a
-# per-query cold/hot diff. Fails the run if any query's hot time regresses.
+# dedicated AWS perf box. Builds a PGO pivotdb-server per commit and times each
+# through the ClickBench pivot-parquet harness (per-query server restart + OS
+# page-cache drop, the faithful ClickBench methodology) on the single-hit
+# dataset. Prints a per-query cold/hot diff and fails the run if any query's hot
+# time regresses. Optionally (run_duckdb) also times DuckDB (parquet,
+# partitioned) once as a reference and scores the after build against it.
 #
 # The perf box is a normally-STOPPED EC2 instance: this workflow starts it, runs
 # on it, and stops it again (even on failure). Manual trigger only, so the box
@@ -15,6 +18,8 @@ name: Perf A/B
 #       StopInstances on the perf box.
 #   PERF_SSH_KEY
 #       Private key authorised for the box's login user.
+# The ClickBench harness fork (Epsio-Labs/ClickBench) is public, so it is
+# checked out with the default token — no extra secret needed.
 # Required repository variables:
 #   PERF_AWS_INSTANCE_ID  — the EC2 instance id of the perf box. If empty, a
 #                           stopped instance whose Name tag matches
@@ -25,6 +30,8 @@ name: Perf A/B
 #   PERF_SSH_USER         (ubuntu)
 #   PERF_HITS_PATH        (~/hits)             — full dataset for measurement
 #   PERF_PGO_SUBSET_PATH  (~/hits-pgo-subset)  — small subset for PGO profiling
+#   PERF_DUCKDB_DATA      (empty)              — directory of partitioned
+#                         hits_*.parquet, required only when run_duckdb is on
 
 on:
   workflow_dispatch:
@@ -38,17 +45,29 @@ on:
         required: false
         default: ""
       query:
-        description: "Comma-separated query ids (e.g. 7,20). Empty = all."
+        description: "Comma-separated ClickBench query numbers, 0-based (e.g. 7,20). Empty = all 43."
         required: false
         default: ""
       iterations:
-        description: "Iterations per query (iteration 1 = cold, rest = hot)."
+        description: "Tries per query (try 1 = cold, min of the rest = hot). ClickBench default is 3."
         required: false
-        default: "6"
+        default: "3"
       regression_pct:
         description: "Hot-time regression threshold (percent) that fails the run."
         required: false
         default: "5"
+      clickbench_ref:
+        description: "Ref of the ClickBench fork (Epsio-Labs/ClickBench) providing the pivot-parquet harness."
+        required: false
+        default: "pivotdb-ab-server-bin"
+      run_duckdb:
+        description: "Also time DuckDB (parquet, partitioned) as a reference. Needs the PERF_DUCKDB_DATA variable."
+        type: boolean
+        default: false
+      server_env:
+        description: "Extra env for both server builds/runs, space-separated KEY=VALUE (e.g. PIVOT_DECOMPRESSED_CACHE=true PIVOT_RING_GB=20)."
+        required: false
+        default: ""
 
 jobs:
   perf-ab:
@@ -68,6 +87,16 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+
+      # The ClickBench pivot-parquet harness lives in the fork, not this repo;
+      # check it out (pinned to clickbench_ref) so the harness version is
+      # explicit rather than whatever happens to be on the box.
+      - name: Check out ClickBench harness
+        uses: actions/checkout@v4
+        with:
+          repository: Epsio-Labs/ClickBench
+          ref: ${{ inputs.clickbench_ref }}
+          path: clickbench-src
 
       - name: Resolve before/after commits
         env:
@@ -108,7 +137,7 @@ jobs:
             id=$(aws ec2 describe-instances \
               --filters "Name=tag:Name,Values=$NAME_FILTER" \
                         "Name=instance-state-name,Values=stopped" \
-              --query 'Instances[0].InstanceId' --output text)
+              --query 'Reservations[0].Instances[0].InstanceId' --output text)
             if [ "$id" = "None" ] || [ -z "$id" ]; then
               echo "::error::no stopped instance matching Name=$NAME_FILTER; set the PERF_AWS_INSTANCE_ID variable."
               exit 1
@@ -118,7 +147,7 @@ jobs:
           echo "Using instance $id"
 
           state=$(aws ec2 describe-instances --instance-ids "$id" \
-            --query 'Instances[0].State.Name' --output text)
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
           echo "Current state: $state"
           if [ "$state" != "running" ]; then
             aws ec2 start-instances --instance-ids "$id" >/dev/null
@@ -126,7 +155,7 @@ jobs:
           aws ec2 wait instance-running --instance-ids "$id"
 
           ip=$(aws ec2 describe-instances --instance-ids "$id" \
-            --query 'Instances[0].PublicIpAddress' --output text)
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
           if [ "$ip" = "None" ] || [ -z "$ip" ]; then
             echo "::error::instance $id has no public IP to ssh to."
             exit 1
@@ -178,9 +207,23 @@ jobs:
       - name: Sync both source trees to the box
         run: |
           set -euo pipefail
-          rsync_opts=(-az --delete \
+          # --checksum --no-times: a fresh git checkout on the runner stamps
+          # every file with the current time. With plain -a, rsync's -t would
+          # force the box files' mtimes to match those new source mtimes even
+          # when --checksum finds the content identical (a metadata-only update),
+          # so cargo would still rebuild arrow+duckdb from scratch every run.
+          # --checksum picks transfers by content hash, and --no-times stops the
+          # mtime from being touched on unchanged files, so their mtimes stay
+          # stable and cargo reuses the persistent target-pgo* artifacts between
+          # runs on the same machine. (Verified: -t alone re-stamps mtimes even
+          # under --checksum; --no-times is what actually preserves them.)
+          #
+          # clickbench-src is a sibling checkout inside the workspace, not part
+          # of the pivot tree — exclude it here and sync it on its own below.
+          rsync_opts=(-az --checksum --no-times --delete \
             --exclude='.git' --exclude='target' \
-            --exclude='target-pgogen' --exclude='target-pgouse')
+            --exclude='target-pgogen' --exclude='target-pgouse' \
+            --exclude='clickbench-src')
           ssh perf 'mkdir -p ~/perf-ab'
 
           # AFTER first (already checked out at the run's commit), then BEFORE.
@@ -192,6 +235,10 @@ jobs:
           git submodule update --init --recursive --quiet
           rsync "${rsync_opts[@]}" -e "ssh -F $HOME/.ssh/config" ./ perf:perf-ab/before/
 
+          # The ClickBench harness (whole repo — the adapter references ../lib).
+          rsync -az --delete --exclude='.git' \
+            -e "ssh -F $HOME/.ssh/config" clickbench-src/ perf:perf-ab/ClickBench/
+
           scp -F "$HOME/.ssh/config" /tmp/bench-ab.sh perf:/tmp/bench-ab.sh
 
       - name: Run A/B benchmark (detached, polled)
@@ -199,10 +246,26 @@ jobs:
           QUERY: ${{ inputs.query }}
           ITERATIONS: ${{ inputs.iterations }}
           REGRESSION_PCT: ${{ inputs.regression_pct }}
+          RUN_DUCKDB: ${{ inputs.run_duckdb }}
+          DUCKDB_DATA: ${{ vars.PERF_DUCKDB_DATA }}
+          SERVER_ENV: ${{ inputs.server_env }}
         run: |
           set -euo pipefail
           query_arg=""
           [ -n "$QUERY" ] && query_arg="--query $QUERY"
+
+          # Single-quote so a multi-pair value reaches bench-ab.sh as one arg.
+          env_arg=""
+          [ -n "$SERVER_ENV" ] && env_arg="--server-env '$SERVER_ENV'"
+
+          duckdb_arg=""
+          if [ "$RUN_DUCKDB" = "true" ]; then
+            if [ -z "$DUCKDB_DATA" ]; then
+              echo "::error::run_duckdb is on but the PERF_DUCKDB_DATA variable (partitioned hits_*.parquet dir) is unset."
+              exit 1
+            fi
+            duckdb_arg="--duckdb-data $DUCKDB_DATA"
+          fi
 
           # Compose the launch command on the runner (all inputs interpolated
           # here) and ship it as a file, so the box just runs it. bench-ab.sh
@@ -214,11 +277,12 @@ jobs:
           setsid bash /tmp/bench-ab.sh \
             --before-dir '~/perf-ab/before' \
             --after-dir '~/perf-ab/after' \
+            --clickbench-dir '~/perf-ab/ClickBench' \
             --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
             --iterations '$ITERATIONS' --regression-pct '$REGRESSION_PCT' \
             --report /tmp/ab-report.txt \
             --before-label '${BEFORE_SHA:0:12}' --after-label '${AFTER_SHA:0:12}' \
-            $query_arg >/tmp/ab.log 2>&1 </dev/null &
+            $query_arg $duckdb_arg $env_arg >/tmp/ab.log 2>&1 </dev/null &
           EOF
           scp -F "$HOME/.ssh/config" /tmp/launch.sh perf:/tmp/launch.sh
           ssh perf 'bash /tmp/launch.sh'
@@ -228,23 +292,42 @@ jobs:
           # before the liveness check could false-positive on a missing PID file.
           sleep 10
 
-          # Poll a fresh ssh for the sentinel; also watch the PID so an
-          # untrappable kill (OOM) ends the wait instead of hanging forever.
-          while ! ssh perf "grep -q 'BENCH-AB COMPLETE' /tmp/ab.log 2>/dev/null"; do
-            if ! ssh perf "kill -0 \$(cat /tmp/bench-ab.pid 2>/dev/null) 2>/dev/null"; then
-              echo "::error::A/B process vanished without a sentinel (likely OOM/kill)."
-              ssh perf 'tail -n 60 /tmp/ab.log' || true
-              exit 1
-            fi
-            ssh perf 'tail -n 2 /tmp/ab.log' 2>/dev/null || true
-            sleep 20
+          # Poll for completion. Each tick is ONE ssh round-trip that checks
+          # liveness *before* grepping the sentinel — the ordering is what makes
+          # it race-free: bench-ab.sh's EXIT trap writes the sentinel before the
+          # process dies, so once the PID is confirmed gone the log is fully
+          # flushed. Hence "pid alive" => keep waiting; "pid gone + sentinel" =>
+          # done; "pid gone + no sentinel" => an untrappable kill (OOM/SIGKILL),
+          # the only genuine failure. No sleep-and-hope needed.
+          while true; do
+            state=$(ssh perf '
+              if kill -0 "$(cat /tmp/bench-ab.pid 2>/dev/null)" 2>/dev/null; then
+                echo alive
+              elif grep -q "BENCH-AB COMPLETE" /tmp/ab.log 2>/dev/null; then
+                echo done
+              else
+                echo dead
+              fi')
+            case "$state" in
+              done) break ;;
+              dead)
+                echo "::error::A/B process vanished without a sentinel (likely OOM/kill)."
+                ssh perf 'tail -n 60 /tmp/ab.log' || true
+                exit 1 ;;
+              *)
+                ssh perf 'tail -n 2 /tmp/ab.log' 2>/dev/null || true
+                sleep 20 ;;
+            esac
           done
 
           exit_line=$(ssh perf "grep -o 'BENCH-AB COMPLETE exit=[0-9]*' /tmp/ab.log | tail -1")
           code="${exit_line##*=}"
           echo "A/B exit code: ${code:-unknown}"
 
+          # Pull the report and the full box-side log back so they can be
+          # attached as an artifact (the box's /tmp is wiped when it stops).
           scp -F "$HOME/.ssh/config" perf:/tmp/ab-report.txt ab-report.txt || true
+          scp -F "$HOME/.ssh/config" perf:/tmp/ab.log ab-full.log || true
           {
             echo "## pivotdb Perf A/B"
             echo ""
@@ -260,6 +343,18 @@ jobs:
             exit 1
           fi
           echo "No hot regression past the threshold."
+
+      # Downloadable copy of the report + full box log, so results survive
+      # beyond the job summary and are available even when the run failed.
+      - name: Upload A/B report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-ab-report
+          path: |
+            ab-report.txt
+            ab-full.log
+          if-no-files-found: ignore
 
       - name: Stop the perf box
         if: ${{ always() && env.INSTANCE_ID != '' }}
