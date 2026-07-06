@@ -498,6 +498,10 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "58.0.0"
+dependencies = [
+ "serde_core",
+ "serde_json",
+]
 
 [[package]]
 name = "arrow-schema"
@@ -1186,6 +1190,8 @@ dependencies = [
  "crossbeam-deque",
  "dispatch",
  "parquet 58.0.0",
+ "parquet-variant",
+ "parquet-variant-compute",
  "planner",
  "quick-xml",
  "ring",
@@ -3200,6 +3206,9 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
+ "parquet-variant",
+ "parquet-variant-compute",
+ "parquet-variant-json",
  "paste",
  "seq-macro",
  "snap 1.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -3238,6 +3247,45 @@ dependencies = [
  "thrift",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "parquet-variant"
+version = "58.0.0"
+dependencies = [
+ "arrow-schema 58.0.0",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "simdutf8",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-compute"
+version = "58.0.0"
+dependencies = [
+ "arrow 58.0.0",
+ "arrow-schema 58.0.0",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "parquet-variant",
+ "parquet-variant-json",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-json"
+version = "58.0.0"
+dependencies = [
+ "arrow-schema 58.0.0",
+ "base64",
+ "chrono",
+ "parquet-variant",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]
