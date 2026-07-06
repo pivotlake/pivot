@@ -12,6 +12,7 @@
 //! row group that has enough data. Exhausted row groups are removed immediately.
 
 use crate::parquet::DecompressedPage;
+use crate::parquet::types::leaves::leaf_count;
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::table::ParquetTable;
@@ -69,15 +70,34 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
     }
 }
 
-/// Builds a new [`Schema`] containing only the fields selected by `projection`.
+/// Builds the projected output [`Schema`]. The projection lists leaf
+/// (column-chunk) indices; this folds them back to the top-level fields that own
+/// them, emitting each owning field once in the order its first leaf appears, so
+/// a struct (variant) column's leaves project as the single nested field they
+/// belong to, and a flat schema is the identity. Whole top-level fields are
+/// expected to be projected together (the only granularity scans build).
 fn project_schema(schema: &Schema, projection: &Projection) -> Schema {
-    let fields: Vec<_> = projection
-        .indices()
-        .iter()
-        .map(|&i| schema.field(i).clone())
-        .collect();
-
+    let owner = field_owner_per_leaf(schema);
+    let mut fields = Vec::new();
+    let mut last: Option<usize> = None;
+    for &leaf in projection.indices() {
+        let field = owner[leaf];
+        if last != Some(field) {
+            fields.push(schema.field(field).clone());
+            last = Some(field);
+        }
+    }
     Schema::new(fields)
+}
+
+/// Maps each leaf (column-chunk) index to the top-level field that owns it: a
+/// primitive field owns one leaf, a struct field its whole leaf run.
+fn field_owner_per_leaf(schema: &Schema) -> Vec<usize> {
+    let mut owner = Vec::new();
+    for (i, field) in schema.fields().iter().enumerate() {
+        owner.extend(std::iter::repeat_n(i, leaf_count(field)));
+    }
+    owner
 }
 
 /// Accumulates [`DecompressedPage`]s and emits Arrow [`RecordBatch`]es.

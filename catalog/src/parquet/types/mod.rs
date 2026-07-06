@@ -1,5 +1,6 @@
 pub mod arrow_map;
 pub mod filter_mask;
+pub(crate) mod leaves;
 pub mod metadata;
 pub mod page;
 pub mod projection;
