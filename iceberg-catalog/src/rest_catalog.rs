@@ -1,10 +1,11 @@
 //! The [`planner::catalog::Catalog`] implementation over a REST catalog.
 //! Binding resolves a table's schema; each query's [`QueryContext`] then
-//! resolves the table's *current* snapshot once and materializes its Parquet
-//! row groups, shared by every scan of that table in the query. Resolving the
-//! snapshot per query (not per bind) matters because the server caches plans
-//! by SQL text: a reused plan must still see commits made since it was bound,
-//! and a self-join's two bindings must read one consistent snapshot.
+//! resolves the table's *current* snapshot once - via iceberg-rust's
+//! `plan_files` scan planning - and materializes its Parquet row groups,
+//! shared by every scan of that table in the query. Resolving the snapshot per
+//! query (not per bind) matters because the server caches plans by SQL text: a
+//! reused plan must still see commits made since it was bound, and a
+//! self-join's two bindings must read one consistent snapshot.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -14,14 +15,24 @@ use catalog::TableFile;
 use catalog::parquet::{ParquetTable, load_table_files, materialize, table_input};
 use catalog::store::DataFile;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use futures::TryStreamExt;
+use iceberg::Catalog as IcebergCatalog;
+use iceberg::CatalogBuilder as _;
+use iceberg::scan::FileScanTask;
+use iceberg::spec::DataFileFormat;
+use iceberg::{NamespaceIdent, TableIdent};
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
+};
 use planner::catalog::{
     Catalog, Column, CreateTableRequest, DynamicScanPredicate, QueryContext,
     Result as CatalogResult, Table,
 };
 use planner::types::physical_arrow_type;
 
-use crate::client::RestClient;
-use crate::{Error, Result, manifest, warehouse::WarehouseReader};
+use crate::storage::PivotStorageFactory;
+use crate::warehouse::WarehouseReader;
+use crate::{Error, Result, schema};
 
 /// How to reach the REST catalog. `uri` is the endpoint root (e.g.
 /// `http://localhost:8181`); the rest is optional.
@@ -38,6 +49,11 @@ pub struct IcebergRestConfig {
     /// must quote such a name as one identifier (`FROM "ns.table"`), since
     /// the planner's binder exposes a single schema.
     pub default_namespace: String,
+    /// Extra catalog properties passed through to the REST client verbatim
+    /// (e.g. OAuth settings). Storage credentials are *not* configured here:
+    /// warehouse reads go through `catalog::store`, which resolves them from
+    /// the environment like the rest of pivot.
+    pub props: HashMap<String, String>,
 }
 
 impl IcebergRestConfig {
@@ -47,7 +63,46 @@ impl IcebergRestConfig {
             warehouse: None,
             token: None,
             default_namespace: "default".to_string(),
+            props: HashMap::new(),
         }
+    }
+}
+
+/// The async iceberg client plus the small runtime that drives it, shared by
+/// the catalog and its query contexts. All calls are `block_on` at the two
+/// control-plane entry points (bind, per-query snapshot pin); the scan data
+/// path never touches it.
+struct RestHandle {
+    runtime: tokio::runtime::Runtime,
+    catalog: RestCatalog,
+}
+
+impl RestHandle {
+    /// Load `ident`'s current table state, `Ok(None)` when the catalog has no
+    /// such table (or namespace).
+    fn load_table(&self, ident: &TableIdent) -> Result<Option<iceberg::table::Table>> {
+        match self.runtime.block_on(self.catalog.load_table(ident)) {
+            Ok(table) => Ok(Some(table)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    iceberg::ErrorKind::TableNotFound | iceberg::ErrorKind::NamespaceNotFound
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Plan `table`'s current snapshot: the live data files, resolved by the
+    /// upstream implementation (field ids, delete files, format versions). A
+    /// table with no snapshot yet plans to an empty list.
+    fn plan_files(&self, table: &iceberg::table::Table) -> Result<Vec<FileScanTask>> {
+        self.runtime.block_on(async {
+            let scan = table.scan().select_all().build()?;
+            Ok(scan.plan_files().await?.try_collect().await?)
+        })
     }
 }
 
@@ -56,7 +111,7 @@ impl IcebergRestConfig {
 /// its snapshot's Parquet files directly from the warehouse's object store,
 /// through the engine's usual range-read path.
 pub struct IcebergRestCatalog {
-    client: Arc<RestClient>,
+    handle: Arc<RestHandle>,
     reader: Arc<WarehouseReader>,
     default_namespace: Vec<String>,
     /// The pool footer loads run on, captured here because query contexts are
@@ -67,23 +122,38 @@ pub struct IcebergRestCatalog {
 impl std::fmt::Debug for IcebergRestCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergRestCatalog")
-            .field("client", &self.client)
             .field("default_namespace", &self.default_namespace)
             .finish_non_exhaustive()
     }
 }
 
 impl IcebergRestCatalog {
-    /// Connect to the catalog service (fetching `/v1/config`), failing fast on
-    /// an unreachable or misconfigured endpoint.
+    /// Connect to the catalog service, failing fast on an unreachable or
+    /// misconfigured endpoint (the client is lazy, so reachability is probed
+    /// with a namespace listing).
     pub fn connect(config: IcebergRestConfig, dispatcher: DataFlowDispatcher) -> Result<Self> {
-        let client = RestClient::connect(
-            &config.uri,
-            config.warehouse.as_deref(),
-            config.token.clone(),
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(Error::Runtime)?;
+
+        let mut props = config.props;
+        props.insert(REST_CATALOG_PROP_URI.to_string(), config.uri);
+        if let Some(warehouse) = config.warehouse {
+            props.insert(REST_CATALOG_PROP_WAREHOUSE.to_string(), warehouse);
+        }
+        if let Some(token) = config.token {
+            props.insert("token".to_string(), token);
+        }
+        let catalog = runtime.block_on(
+            RestCatalogBuilder::default()
+                .with_storage_factory(Arc::new(PivotStorageFactory))
+                .load("pivot", props),
         )?;
+        runtime.block_on(catalog.list_namespaces(None))?;
+
         Ok(Self {
-            client: Arc::new(client),
+            handle: Arc::new(RestHandle { runtime, catalog }),
             reader: Arc::new(WarehouseReader::default()),
             default_namespace: split_name(&config.default_namespace),
             dispatcher,
@@ -94,6 +164,21 @@ impl IcebergRestCatalog {
     /// the catalog has no such table. The snapshot to scan is resolved later,
     /// per query, through the [`QueryContext`].
     fn resolve(&self, name: &str) -> Result<Option<IcebergTable>> {
+        let ident = self.parse_ident(name);
+        let Some(loaded) = self.handle.load_table(&ident)? else {
+            return Ok(None);
+        };
+        Ok(Some(IcebergTable {
+            name: name.to_string(),
+            columns: schema::map_columns(loaded.metadata().current_schema(), name)?,
+            ident,
+        }))
+    }
+
+    /// `name` as an iceberg table identity: `a.b.c` names table `c` in
+    /// namespace `[a, b]`; an unqualified name lives in the configured default
+    /// namespace.
+    fn parse_ident(&self, name: &str) -> TableIdent {
         let mut parts = split_name(name);
         let table_name = parts.pop().expect("split_name yields at least one part");
         let namespace = if parts.is_empty() {
@@ -101,16 +186,10 @@ impl IcebergRestCatalog {
         } else {
             parts
         };
-
-        let Some(loaded) = self.client.load_table(&namespace, &table_name)? else {
-            return Ok(None);
-        };
-        Ok(Some(IcebergTable {
-            name: name.to_string(),
-            columns: loaded.metadata.map_columns(name)?,
-            namespace,
+        TableIdent::new(
+            NamespaceIdent::from_vec(namespace).expect("parts are non-empty"),
             table_name,
-        }))
+        )
     }
 }
 
@@ -138,7 +217,7 @@ impl Catalog for IcebergRestCatalog {
 
     fn query_context(&self) -> Box<dyn QueryContext> {
         Box::new(IcebergQueryContext {
-            client: self.client.clone(),
+            handle: self.handle.clone(),
             reader: self.reader.clone(),
             dispatcher: self.dispatcher.clone(),
             pinned: Mutex::new(HashMap::new()),
@@ -161,7 +240,7 @@ impl Catalog for IcebergRestCatalog {
 /// materialize, and a self-join's second binding all read one consistent
 /// snapshot and agree on row-group indices.
 struct IcebergQueryContext {
-    client: Arc<RestClient>,
+    handle: Arc<RestHandle>,
     reader: Arc<WarehouseReader>,
     dispatcher: DataFlowDispatcher,
     pinned: Mutex<HashMap<String, Arc<ParquetTable>>>,
@@ -174,51 +253,42 @@ impl QueryContext for IcebergQueryContext {
 }
 
 impl IcebergQueryContext {
-    /// `table`'s scan view for this query: resolve its current snapshot, walk
-    /// the manifest list to the live data files, fetch their footers over the
-    /// worker pool, and pin the result. A table dropped since planning is an
-    /// error, never a silent empty scan.
+    /// `table`'s scan view for this query: plan its current snapshot's live
+    /// data files, fetch their footers over the worker pool, and pin the
+    /// result. A table dropped since planning is an error, never a silent
+    /// empty scan.
     fn pin_scan_view(&self, table: &IcebergTable) -> Result<Arc<ParquetTable>> {
         if let Some(parquet) = self.pinned.lock().unwrap().get(&table.name) {
             return Ok(parquet.clone());
         }
 
-        let loaded = self
-            .client
-            .load_table(&table.namespace, &table.table_name)?
-            .ok_or_else(|| {
-                Error::Metadata(format!(
-                    "table `{}` no longer exists (dropped since planning?)",
-                    table.name
-                ))
-            })?;
-        let parquet = match loaded.metadata.find_current_manifest_list()? {
-            Some(manifest_list) => self.build_scan_view(table, &manifest_list)?,
-            // No snapshot yet: the table exists but holds no data.
-            None => Arc::new(ParquetTable::new(Vec::new())),
-        };
-        self.pinned
-            .lock()
-            .unwrap()
-            .insert(table.name.clone(), parquet.clone());
-        Ok(parquet)
-    }
+        let loaded = self.handle.load_table(&table.ident)?.ok_or_else(|| {
+            Error::Unsupported(format!(
+                "table `{}` no longer exists (dropped since planning?)",
+                table.name
+            ))
+        })?;
+        let tasks = self.handle.plan_files(&loaded)?;
 
-    /// Materialize the snapshot behind `manifest_list` into a scannable
-    /// [`ParquetTable`], validating every file against the binding's schema.
-    fn build_scan_view(
-        &self,
-        table: &IcebergTable,
-        manifest_list: &str,
-    ) -> Result<Arc<ParquetTable>> {
-        let manifests = manifest::parse_manifest_list(&self.reader.fetch(manifest_list)?)?;
-        if let Some(deletes) = manifests.iter().find(|entry| entry.content != 0) {
-            return Err(Error::Unsupported(format!(
-                "`{}` is a delete manifest; iceberg row-level deletes are not supported",
-                deletes.path
-            )));
+        let mut data_files: Vec<DataFile> = Vec::with_capacity(tasks.len());
+        for task in &tasks {
+            if !task.deletes.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "`{}` carries row-level delete files; iceberg deletes are not supported",
+                    task.data_file_path
+                )));
+            }
+            if task.data_file_format != DataFileFormat::Parquet {
+                return Err(Error::Unsupported(format!(
+                    "data file `{}` has format {}; only PARQUET is supported",
+                    task.data_file_path, task.data_file_format
+                )));
+            }
+            data_files.push(
+                self.reader
+                    .locate_data_file(&task.data_file_path, task.file_size_in_bytes)?,
+            );
         }
-        let data_files = self.fetch_data_files(&manifests)?;
 
         let table_files: Vec<TableFile> = load_table_files(&self.dispatcher, &data_files)?;
         for file in &table_files {
@@ -228,47 +298,12 @@ impl IcebergQueryContext {
             .iter()
             .flat_map(|file| file.row_groups().iter().cloned())
             .collect();
-        Ok(Arc::new(ParquetTable::new(row_groups)))
-    }
-
-    /// Fetch and parse every (data) manifest, locating each live data file for
-    /// reading. The manifests are independent object-store GETs, so they are
-    /// fanned out over a few scoped threads instead of paying one blocking
-    /// round-trip per manifest; results keep manifest-list order.
-    fn fetch_data_files(&self, manifests: &[manifest::ManifestFile]) -> Result<Vec<DataFile>> {
-        const FETCH_THREADS: usize = 8;
-
-        let chunk_size = manifests.len().div_ceil(FETCH_THREADS).max(1);
-        let chunk_results: Vec<Result<Vec<DataFile>>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = manifests
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        let mut files = Vec::new();
-                        for entry in chunk {
-                            for file in manifest::parse_manifest(&self.reader.fetch(&entry.path)?)?
-                            {
-                                files.push(self.reader.locate_data_file(
-                                    &file.file_path,
-                                    file.file_size_in_bytes as u64,
-                                )?);
-                            }
-                        }
-                        Ok(files)
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("manifest fetch thread panicked"))
-                .collect()
-        });
-
-        let mut data_files = Vec::new();
-        for chunk in chunk_results {
-            data_files.extend(chunk?);
-        }
-        Ok(data_files)
+        let parquet = Arc::new(ParquetTable::new(row_groups));
+        self.pinned
+            .lock()
+            .unwrap()
+            .insert(table.name.clone(), parquet.clone());
+        Ok(parquet)
     }
 }
 
@@ -318,8 +353,7 @@ struct IcebergTable {
     /// context's pin key.
     name: String,
     columns: Vec<Column>,
-    namespace: Vec<String>,
-    table_name: String,
+    ident: TableIdent,
 }
 
 impl IcebergTable {

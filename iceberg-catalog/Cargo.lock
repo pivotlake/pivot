@@ -2846,18 +2846,19 @@ dependencies = [
 name = "iceberg-catalog"
 version = "0.1.0"
 dependencies = [
- "apache-avro",
  "arrow-array 58.0.0",
  "arrow-schema 58.0.0",
+ "async-trait",
+ "bytes",
  "catalog",
  "dispatch",
+ "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
  "parquet 58.0.0",
  "planner",
  "serde",
- "serde_json",
  "server",
  "testcontainers",
  "testcontainers-modules",
@@ -2865,6 +2866,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tracing",
+ "typetag",
  "ureq",
 ]
 

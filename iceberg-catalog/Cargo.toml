@@ -10,28 +10,38 @@ dispatch = { path = "../dispatch" }
 # which are read through catalog's footer-load and scan pipelines and its
 # object-store backends (S3/GCS/local).
 catalog = { path = "../catalog" }
-# Iceberg manifest lists and manifests are Avro object-container files.
-apache-avro = "0.21"
-# The REST protocol and table metadata are JSON over blocking HTTP, matching
-# catalog's convention of keeping control-plane I/O off any async runtime.
-ureq = { version = "2", features = ["json"] }
+# The upstream Iceberg implementation, used kernel-style: its REST catalog
+# client and `plan_files` scan planning resolve a snapshot to its live data
+# files (by field id, with delete-file awareness); pivot brings its own storage
+# (a FileIO over catalog::store) and its own Parquet scan.
+iceberg = "0.9"
+iceberg-catalog-rest = "0.9"
+# iceberg's API is async; the catalog owns one small runtime and calls it with
+# block_on, confined to the control plane (bind + per-query snapshot pin) - the
+# scan data path stays on dispatch's ring.
+tokio = { version = "1", features = ["rt"] }
+futures = "0.3"
+# Implementing iceberg's Storage/StorageFactory traits (object-safe serde) for
+# the catalog::store-backed FileIO.
+async-trait = "0.1"
+typetag = "0.2"
+bytes = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
-# The upstream Iceberg implementation as the test oracle: it creates tables and
-# commits snapshots against the local REST catalog, so our reader is verified
-# against metadata written by an independent implementation.
-iceberg = "0.9"
-iceberg-catalog-rest = "0.9"
+# The test oracle writes through iceberg's own opendal storage (not our
+# FileIO), keeping the writer independent of the code under test.
+iceberg-storage-opendal = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Bring up MinIO and the REST catalog service in Docker for integration tests;
 # catalog's `test-support` feature contributes the bucket-creation helper.
 testcontainers = { version = "0.24", features = ["blocking"] }
 testcontainers-modules = { version = "0.12", features = ["minio"] }
 catalog = { path = "../catalog", features = ["test-support"] }
+# Poll the REST fixture for readiness.
+ureq = "2"
 # Write the Parquet data files the committed snapshots point at (the same
 # writer-as-oracle pattern catalog's own tests use) and read scan output.
 parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
@@ -41,4 +51,3 @@ arrow-schema = { path = "../arrow-rs/arrow-schema" }
 # (dev-dependency cycles are fine with cargo; server depends on us normally).
 server = { path = "../server" }
 tokio-postgres = "0.7"
-iceberg-storage-opendal = "0.9"

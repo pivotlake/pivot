@@ -19,14 +19,12 @@ pub(crate) struct WarehouseReader {
 }
 
 impl WarehouseReader {
-    /// Fetch the object at `uri` in full - manifest lists and manifests, the
-    /// small metadata reads. A missing object is an error: every URI we fetch
-    /// was named by committed metadata, so absence means a broken table.
-    pub(crate) fn fetch(&self, uri: &str) -> Result<Vec<u8>> {
+    /// Fetch the object at `uri` in full (`Ok(None)` when it does not exist) -
+    /// manifest lists, manifests, and metadata JSON, the small reads iceberg's
+    /// planning does through [`storage`](crate::storage).
+    pub(crate) fn try_fetch(&self, uri: &str) -> Result<Option<Vec<u8>>> {
         let (store, key) = self.resolve_store(uri)?;
-        store.get(&key)?.ok_or_else(|| Error::MissingObject {
-            uri: uri.to_string(),
-        })
+        Ok(store.get(&key)?)
     }
 
     /// Locate the Parquet data file at `uri` for the engine: its identity keeps

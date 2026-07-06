@@ -2,16 +2,20 @@
 //! an existing Iceberg REST catalog and scan their Parquet data files through
 //! the `catalog` crate's read pipeline.
 //!
-//! The moving parts, one module each:
+//! The metadata side (REST protocol, table metadata, manifest resolution) is
+//! iceberg-rust, used kernel-style: its `plan_files` scan planning resolves a
+//! snapshot to its live data files, while pivot brings its own storage and its
+//! own Parquet scan. The moving parts, one module each:
 //!
-//! - [`client`] - the REST protocol (`/v1/config`, `loadTable`) over blocking
-//!   HTTP, mirroring `catalog::store`'s no-async-runtime convention.
-//! - [`metadata`] - the table-metadata JSON (schema, current snapshot) and the
-//!   mapping from Iceberg column types to planner [`Type`](planner::types::Type)s.
-//! - [`manifest`] - the Avro manifest list and manifest files a snapshot's data
-//!   file set is recorded in.
-//! - [`warehouse`] - resolving the absolute `s3://`/`gs://`/`file://` URIs those
-//!   files sit at onto `catalog::store` backends the engine can range-read.
+//! - [`storage`] - iceberg's `FileIO` implemented over `catalog::store`, so
+//!   metadata reads use the same object-store backends and environment
+//!   credentials as everything else (no second storage stack).
+//! - [`schema`] - the mapping from an Iceberg schema to planner
+//!   [`Type`](planner::types::Type)s; unsupported types fail the resolve
+//!   naming the column.
+//! - [`warehouse`] - resolving the absolute `s3://`/`gs://`/`file://` URIs
+//!   Iceberg metadata records onto `catalog::store` backends the engine can
+//!   range-read.
 //! - [`rest_catalog`] - the [`IcebergRestCatalog`] tying it together: a
 //!   [`planner::catalog::Catalog`] whose tables pin one snapshot per query.
 //!
@@ -23,10 +27,9 @@
 // private modules; this is not a published API, so allow it (as catalog does).
 #![allow(rustdoc::private_intra_doc_links)]
 
-mod client;
-mod manifest;
-mod metadata;
 mod rest_catalog;
+mod schema;
+mod storage;
 mod warehouse;
 
 pub use rest_catalog::{IcebergRestCatalog, IcebergRestConfig};
@@ -36,10 +39,10 @@ pub use rest_catalog::{IcebergRestCatalog, IcebergRestConfig};
 /// table"; a failed scan fails the query) - never a silent empty result.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("iceberg rest request to `{url}` failed: {message}")]
-    Http { url: String, message: String },
-    #[error("unexpected response from `{url}`: {message}")]
-    UnexpectedResponse { url: String, message: String },
+    #[error(transparent)]
+    Iceberg(#[from] iceberg::Error),
+    #[error("starting the iceberg catalog runtime: {0}")]
+    Runtime(std::io::Error),
     #[error(
         "column `{column}` of table `{table}` has iceberg type `{iceberg_type}`, which pivot does not support"
     )]
@@ -54,16 +57,10 @@ pub enum Error {
         "a data file of table `{table}` does not match its schema ({detail}); iceberg schema evolution is not supported"
     )]
     DataFileSchemaMismatch { table: String, detail: String },
-    #[error("invalid table metadata: {0}")]
-    Metadata(String),
     #[error(
         "unsupported data file uri `{0}` (expected s3://, gs://, file://, or an absolute path)"
     )]
     UnsupportedUri(String),
-    #[error("`{uri}` does not exist in the object store")]
-    MissingObject { uri: String },
-    #[error("parsing avro manifest: {0}")]
-    Avro(#[from] apache_avro::Error),
     #[error(transparent)]
     Store(#[from] catalog::store::StoreError),
     #[error("loading data file footers: {0}")]
