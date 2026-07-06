@@ -12,6 +12,7 @@ use crate::parquet::reading::decoding::column_decoders::{
     BytesViewDecoder, ColumnDecoder, PrimitiveColumnDecoder,
 };
 use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
+use crate::parquet::types::leaves::{leaf_fields, nest_leaves_into_columns};
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
@@ -135,7 +136,10 @@ impl RowGroupDecoder {
     ) -> Result<Self> {
         let pruned = row_group_metadata.pruned_flag();
         let columns = row_group_metadata.columns();
-        let fields = schema.fields();
+        // Decoders are per leaf (column chunk), so their type comes from the
+        // file's leaf fields; `schema` here is the (possibly nested) output the
+        // decoded leaves reassemble into.
+        let leaves = leaf_fields(row_group_metadata.get_metadata().schema.fields());
         let mut prunable_columns = Vec::new();
         let column_decoders = projection
             .column_indices
@@ -161,7 +165,7 @@ impl RowGroupDecoder {
                     None
                 };
                 column_decoder_for_type(
-                    fields[schema_idx].data_type(),
+                    leaves[col_idx].data_type(),
                     columns[col_idx].max_def_level,
                     eq_value,
                 )
@@ -241,11 +245,15 @@ impl RowGroupDecoder {
         );
 
         if size > 0 && available > 0 {
-            let columns = self
+            let leaf_arrays = self
                 .column_decoders
                 .iter_mut()
                 .map(|c| c.read(allocator, available).map_err(Error::from))
                 .collect::<Result<Vec<_>>>()?;
+            // Fold the decoded leaf arrays back under their struct parents to
+            // match the (possibly nested) output schema.
+            let columns =
+                nest_leaves_into_columns(self.schema.fields(), &mut leaf_arrays.into_iter());
             let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
             let batch = if self.add_row_group_metadata {
                 with_row_group_metadata(record_batch, self.row_group_idx, self.row_offset)

@@ -186,6 +186,9 @@ fn build_row_groups(
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
     let schema = Arc::new(schema);
+    // Column chunks are per leaf (depth-first), so statistics are decoded against
+    // the leaf's type, not the j-th top-level field's (they differ under nesting).
+    let leaves = super::leaves::leaf_fields(schema.fields());
 
     let row_groups = file_meta
         .row_groups
@@ -201,7 +204,7 @@ fn build_row_groups(
                     let meta = cc.meta_data.expect("missing column metadata");
                     let statistics = meta
                         .statistics
-                        .and_then(|s| decode_statistics(s, schema.field(j).data_type()));
+                        .and_then(|s| decode_statistics(s, leaves[j].data_type()));
                     let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                         && data_pages_all_dictionary(meta.encoding_stats.as_deref());
                     ColumnChunkMeta {
@@ -346,7 +349,11 @@ fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
         .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
 }
 
-/// Convert flat SchemaElement list to Arrow Schema + max definition levels per leaf column.
+/// Convert the footer's flat depth-first `SchemaElement` list (a tree, each
+/// group carrying its `num_children`) into the nested Arrow [`Schema`] plus the
+/// per-leaf maximum definition levels (in column-chunk order). A group element
+/// becomes a `Struct` field; a primitive element a leaf. The root (element 0) is
+/// the enclosing group.
 fn schema_elements_to_arrow(
     elements: &[crate::parquet::types::thrift::footer::SchemaElement],
 ) -> Result<(Schema, Vec<i16>)> {
@@ -356,28 +363,54 @@ fn schema_elements_to_arrow(
             "empty schema",
         )));
     }
-
-    // Element 0 is the root group
-    let num_children = elements[0].num_children.unwrap_or(0) as usize;
-    let mut fields = Vec::with_capacity(num_children);
-    let mut def_levels = Vec::with_capacity(num_children);
-
-    for elem in elements.iter().skip(1).take(num_children) {
-        // repetition_type: 0=REQUIRED, 1=OPTIONAL, 2=REPEATED
-        let nullable = elem.repetition_type == Some(1);
-        let def_level: i16 = if nullable { 1 } else { 0 };
-
-        let data_type = super::arrow_map::parquet_to_arrow(
-            elem.physical_type,
-            elem.converted_type,
-            elem.logical_type.as_ref(),
-        )?;
-
-        fields.push(Field::new(&elem.name, data_type, nullable));
-        def_levels.push(def_level);
+    let mut def_levels = Vec::new();
+    let mut cursor = 1; // element 0 is the root group
+    let mut fields = Vec::new();
+    for _ in 0..elements[0].num_children.unwrap_or(0) {
+        let (field, next) = parse_schema_element(elements, cursor, 0, &mut def_levels)?;
+        fields.push(field);
+        cursor = next;
     }
-
     Ok((Schema::new(fields), def_levels))
+}
+
+/// Parse the subtree rooted at `elements[idx]`. `parent_def` is the definition
+/// level contributed by ancestors (each optional ancestor adds one). Returns the
+/// Arrow field and the index just past this subtree, appending one entry per
+/// leaf to `def_levels` in depth-first (column-chunk) order.
+fn parse_schema_element(
+    elements: &[crate::parquet::types::thrift::footer::SchemaElement],
+    idx: usize,
+    parent_def: i16,
+    def_levels: &mut Vec<i16>,
+) -> Result<(Field, usize)> {
+    let elem = &elements[idx];
+    // repetition_type: 0=REQUIRED, 1=OPTIONAL, 2=REPEATED.
+    let nullable = elem.repetition_type == Some(1);
+    let def_level = parent_def + nullable as i16;
+
+    match elem.num_children {
+        Some(n) if n > 0 => {
+            let mut children = Vec::with_capacity(n as usize);
+            let mut cursor = idx + 1;
+            for _ in 0..n {
+                let (child, next) = parse_schema_element(elements, cursor, def_level, def_levels)?;
+                children.push(child);
+                cursor = next;
+            }
+            let data_type = DataType::Struct(children.into());
+            Ok((Field::new(&elem.name, data_type, nullable), cursor))
+        }
+        _ => {
+            def_levels.push(def_level);
+            let data_type = super::arrow_map::parquet_to_arrow(
+                elem.physical_type,
+                elem.converted_type,
+                elem.logical_type.as_ref(),
+            )?;
+            Ok((Field::new(&elem.name, data_type, nullable), idx + 1))
+        }
+    }
 }
 
 #[cfg(test)]
