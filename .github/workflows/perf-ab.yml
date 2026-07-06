@@ -228,16 +228,32 @@ jobs:
           # before the liveness check could false-positive on a missing PID file.
           sleep 10
 
-          # Poll a fresh ssh for the sentinel; also watch the PID so an
-          # untrappable kill (OOM) ends the wait instead of hanging forever.
-          while ! ssh perf "grep -q 'BENCH-AB COMPLETE' /tmp/ab.log 2>/dev/null"; do
-            if ! ssh perf "kill -0 \$(cat /tmp/bench-ab.pid 2>/dev/null) 2>/dev/null"; then
-              echo "::error::A/B process vanished without a sentinel (likely OOM/kill)."
-              ssh perf 'tail -n 60 /tmp/ab.log' || true
-              exit 1
-            fi
-            ssh perf 'tail -n 2 /tmp/ab.log' 2>/dev/null || true
-            sleep 20
+          # Poll for completion. Each tick is ONE ssh round-trip that checks
+          # liveness *before* grepping the sentinel — the ordering is what makes
+          # it race-free: bench-ab.sh's EXIT trap writes the sentinel before the
+          # process dies, so once the PID is confirmed gone the log is fully
+          # flushed. Hence "pid alive" => keep waiting; "pid gone + sentinel" =>
+          # done; "pid gone + no sentinel" => an untrappable kill (OOM/SIGKILL),
+          # the only genuine failure. No sleep-and-hope needed.
+          while true; do
+            state=$(ssh perf '
+              if kill -0 "$(cat /tmp/bench-ab.pid 2>/dev/null)" 2>/dev/null; then
+                echo alive
+              elif grep -q "BENCH-AB COMPLETE" /tmp/ab.log 2>/dev/null; then
+                echo done
+              else
+                echo dead
+              fi')
+            case "$state" in
+              done) break ;;
+              dead)
+                echo "::error::A/B process vanished without a sentinel (likely OOM/kill)."
+                ssh perf 'tail -n 60 /tmp/ab.log' || true
+                exit 1 ;;
+              *)
+                ssh perf 'tail -n 2 /tmp/ab.log' 2>/dev/null || true
+                sleep 20 ;;
+            esac
           done
 
           exit_line=$(ssh perf "grep -o 'BENCH-AB COMPLETE exit=[0-9]*' /tmp/ab.log | tail -1")
