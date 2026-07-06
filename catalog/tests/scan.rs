@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Int64Array, RecordBatch, StringViewArray, StructArray};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray, StructArray};
 use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -141,6 +141,41 @@ fn scan_nested_struct_column() {
     assert_eq!(
         got.column(1).as_any().downcast_ref::<Int64Array>().unwrap(),
         &Int64Array::from(vec![10, 20, 30])
+    );
+}
+
+#[test]
+fn scan_variant_column() {
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{GetOptions, json_to_variant, variant_get};
+
+    let dispatch = dispatch(1);
+    // A VARIANT-tagged column written by arrow-rs; pivot must read its binary
+    // metadata/value leaves back as binary (not string) so `variant_get` works.
+    let json: ArrayRef = Arc::new(StringArray::from(vec![r#"{"age":30}"#, r#"{"age":25}"#]));
+    let variant = json_to_variant(&json).unwrap();
+    let field = variant.field("doc");
+    let doc = variant.into_inner();
+    let batch =
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(doc) as _]).unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    // Two leaves: `doc.metadata`, `doc.value`.
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let age_field = Arc::new(Field::new("age", DataType::Int64, true));
+    let ages = variant_get(
+        results[0].column(0),
+        GetOptions::new_with_path(VariantPath::try_from("age").unwrap())
+            .with_as_type(Some(age_field)),
+    )
+    .unwrap();
+    let ages = ages.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(
+        (0..ages.len()).map(|i| ages.value(i)).collect::<Vec<_>>(),
+        vec![30, 25]
     );
 }
 

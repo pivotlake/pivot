@@ -473,6 +473,7 @@ fn parse_schema_element(
     parent_def: i16,
     def_levels: &mut Vec<i16>,
 ) -> Result<(Field, usize)> {
+    use crate::parquet::types::thrift::footer::LogicalType;
     let elem = &elements[idx];
     // repetition_type: 0=REQUIRED, 1=OPTIONAL, 2=REPEATED.
     let nullable = elem.repetition_type == Some(1);
@@ -480,6 +481,7 @@ fn parse_schema_element(
 
     match elem.num_children {
         Some(n) if n > 0 => {
+            let is_variant = elem.logical_type == Some(LogicalType::Variant);
             let mut children = Vec::with_capacity(n as usize);
             let mut cursor = idx + 1;
             for _ in 0..n {
@@ -487,10 +489,15 @@ fn parse_schema_element(
                 children.push(child);
                 cursor = next;
             }
-            Ok((
-                Field::new(&elem.name, DataType::Struct(children.into()), nullable),
-                cursor,
-            ))
+            let field = Field::new(&elem.name, DataType::Struct(children.into()), nullable);
+            // Re-mark the group so a reconstructed variant re-tags VARIANT if
+            // the table is re-written (e.g. by compaction).
+            let field = if is_variant {
+                field.with_metadata(variant_extension_metadata())
+            } else {
+                field
+            };
+            Ok((field, cursor))
         }
         _ => {
             def_levels.push(def_level);
@@ -502,6 +509,19 @@ fn parse_schema_element(
             Ok((Field::new(&elem.name, data_type, nullable), idx + 1))
         }
     }
+}
+
+/// The Arrow field metadata that marks a struct as a Parquet variant.
+fn variant_extension_metadata() -> std::collections::HashMap<String, String> {
+    use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
+    [
+        (
+            EXTENSION_TYPE_NAME_KEY.to_owned(),
+            "arrow.parquet.variant".to_owned(),
+        ),
+        (EXTENSION_TYPE_METADATA_KEY.to_owned(), String::new()),
+    ]
+    .into()
 }
 
 #[cfg(test)]

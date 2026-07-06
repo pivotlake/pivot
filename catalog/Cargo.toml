@@ -63,9 +63,15 @@ catalog = { path = ".", features = ["test-support"] }
 # `test-util` exposes dispatch's single-operator test harness for the moved
 # Parquet reader unit/integration tests.
 dispatch = { path = "../dispatch", features = ["test-util"] }
-parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+# `variant_experimental` so `ArrowWriter` emits the VARIANT logical type for an
+# extension-tagged variant field (the variant scan test reads it back).
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap", "variant_experimental"] }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
+# Build a variant column (`json_to_variant`) and extract a path (`variant_get`)
+# in the variant scan test.
+parquet-variant = { path = "../arrow-rs/parquet-variant" }
+parquet-variant-compute = { path = "../arrow-rs/parquet-variant-compute" }
 tempfile = "3"
 core_affinity = "0.8.3"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
