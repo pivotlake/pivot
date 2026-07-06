@@ -4,8 +4,8 @@ use crate::{general_err, thrift_struct};
 use std::io::Write;
 
 // LogicalType is a thrift union where most variants are empty structs. We model
-// the ones whose arrow type pivot decodes natively: String, Integer, Date, and
-// Timestamp; everything else is `Other`.
+// the ones whose arrow type pivot decodes natively: String, Integer, Date,
+// Timestamp, and Variant; everything else is `Other`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalType {
     String,
@@ -20,6 +20,10 @@ pub enum LogicalType {
         unit: TimeUnit,
         is_adjusted_to_utc: bool,
     },
+    /// Marks a group as a Parquet `variant` (its `metadata`/`value` children are
+    /// binary). The writer emits it; the reader uses it to read those leaves as
+    /// binary rather than the default string.
+    Variant,
     Other,
 }
 
@@ -84,6 +88,11 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for LogicalType {
                     is_adjusted_to_utc,
                 }
             }
+            // VARIANT: a (possibly empty) VariantType struct we don't read into.
+            16 => {
+                prot.skip(field_ident.field_type)?;
+                LogicalType::Variant
+            }
             // Any other variant — skip it
             _ => {
                 prot.skip(field_ident.field_type)?;
@@ -109,23 +118,31 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for LogicalType {
     }
 }
 
-// Stub WriteThrift/WriteThriftField impls needed to satisfy thrift_struct! bounds
 impl WriteThrift for LogicalType {
     const ELEMENT_TYPE: ElementType = ElementType::Struct;
 
-    fn write_thrift<W: Write>(&self, _writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
-        unimplemented!("LogicalType serialization not needed")
+    fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
+        match self {
+            // VARIANT union member: field 16, an (empty) VariantType struct.
+            LogicalType::Variant => {
+                writer.write_empty_struct(16, 0)?;
+            }
+            other => unimplemented!("LogicalType serialization for {other:?} not implemented"),
+        }
+        writer.write_struct_end()
     }
 }
 
 impl WriteThriftField for LogicalType {
     fn write_thrift_field<W: Write>(
         &self,
-        _writer: &mut ThriftCompactOutputProtocol<W>,
-        _field_id: i16,
-        _last_field_id: i16,
+        writer: &mut ThriftCompactOutputProtocol<W>,
+        field_id: i16,
+        last_field_id: i16,
     ) -> Result<i16> {
-        unimplemented!("LogicalType serialization not needed")
+        writer.write_field_begin(FieldType::Struct, field_id, last_field_id)?;
+        self.write_thrift(writer)?;
+        Ok(field_id)
     }
 }
 

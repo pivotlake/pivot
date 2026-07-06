@@ -41,6 +41,8 @@ arrow-ord = { path = "arrow-rs/arrow-ord" }
 arrow-schema = { path = "arrow-rs/arrow-schema" }
 arrow-select = { path = "arrow-rs/arrow-select" }
 parquet = { path = "arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+parquet-variant = { path = "arrow-rs/parquet-variant" }
+parquet-variant-compute = { path = "arrow-rs/parquet-variant-compute" }
 
 ahash = "0.8.12"
 bytes = "1.11.0"
