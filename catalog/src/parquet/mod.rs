@@ -37,8 +37,7 @@ pub use reading::{
 };
 
 mod metadata;
-pub use metadata::create_load_and_commit_spec;
-pub(crate) use metadata::load_table_files;
+pub use metadata::{create_load_and_commit_spec, load_table_files};
 
 mod row_group_stats;
 pub use row_group_stats::{

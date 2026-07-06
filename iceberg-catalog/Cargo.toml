@@ -1,0 +1,44 @@
+[package]
+name = "iceberg-catalog"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+planner = { path = "../planner" }
+dispatch = { path = "../dispatch" }
+# The Parquet engine: an Iceberg table resolves to a set of Parquet data files,
+# which are read through catalog's footer-load and scan pipelines and its
+# object-store backends (S3/GCS/local).
+catalog = { path = "../catalog" }
+# Iceberg manifest lists and manifests are Avro object-container files.
+apache-avro = "0.21"
+# The REST protocol and table metadata are JSON over blocking HTTP, matching
+# catalog's convention of keeping control-plane I/O off any async runtime.
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# The upstream Iceberg implementation as the test oracle: it creates tables and
+# commits snapshots against the local REST catalog, so our reader is verified
+# against metadata written by an independent implementation.
+iceberg = "0.9"
+iceberg-catalog-rest = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Bring up MinIO and the REST catalog service in Docker for integration tests;
+# catalog's `test-support` feature contributes the bucket-creation helper.
+testcontainers = { version = "0.24", features = ["blocking"] }
+testcontainers-modules = { version = "0.12", features = ["minio"] }
+catalog = { path = "../catalog", features = ["test-support"] }
+# Write the Parquet data files the committed snapshots point at (the same
+# writer-as-oracle pattern catalog's own tests use) and read scan output.
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+arrow-array = { path = "../arrow-rs/arrow-array" }
+arrow-schema = { path = "../arrow-rs/arrow-schema" }
+# End-to-end coverage: a pivotdb server whose query catalog is this crate's
+# (dev-dependency cycles are fine with cargo; server depends on us normally).
+server = { path = "../server" }
+tokio-postgres = "0.7"
+iceberg-storage-opendal = "0.9"

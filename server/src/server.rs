@@ -48,20 +48,25 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// A pivotdb server instance.
 ///
 /// Holds the TCP bind address, a [`JoinSet`] watching every dispatch worker
-/// thread, and the shared pgwire handlers bundle (query / startup / cancel
-/// handlers) used by every connection. Construct one with [`Server::new`] and
-/// drive it with [`Server::serve`].
+/// thread, and the catalog queries resolve against (from which [`serve`]
+/// builds the pgwire handler bundle every connection shares). Construct one
+/// with [`Server::new`] and drive it with [`Server::serve`].
+///
+/// [`serve`]: Server::serve
 pub struct Server {
     bind: SocketAddr,
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
-    handlers: Arc<PivotHandlers>,
+    /// The catalog queries resolve and plan against: the [`ParquetCatalog`]
+    /// by default, or an external backend swapped in with
+    /// [`with_query_catalog`](Self::with_query_catalog). The pgwire handler
+    /// bundle is built from it once, when [`serve`](Self::serve) starts.
+    query_catalog: Arc<dyn planner::catalog::Catalog>,
     /// Cloned dispatcher handed to the ingest sources so their Parquet encodes
     /// run on the same worker pool as queries.
     dispatcher: DataFlowDispatcher,
     /// The concrete catalog, kept so the ingest sources can register (and
-    /// compact) the Parquet files they write. The query handlers hold it as a
-    /// `dyn Catalog`.
+    /// compact) the Parquet files they write.
     catalog: Arc<ParquetCatalog>,
     /// Ingest sources to start when [`serve`](Self::serve) runs.
     ingests: Vec<IngestConfig>,
@@ -103,7 +108,7 @@ impl Server {
             bind,
             shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher.clone())),
+            query_catalog: catalog.clone(),
             dispatcher,
             catalog,
             ingests,
@@ -120,6 +125,16 @@ impl Server {
         self
     }
 
+    /// Resolve and plan queries against `catalog` instead of the
+    /// [`ParquetCatalog`] passed to [`new`](Self::new) - how an external
+    /// backend (e.g. an Iceberg REST catalog) becomes the server's catalog.
+    /// Ingest, compaction, and the dashboard keep the concrete
+    /// [`ParquetCatalog`]; only the query path is redirected.
+    pub fn with_query_catalog(mut self, catalog: Arc<dyn planner::catalog::Catalog>) -> Self {
+        self.query_catalog = catalog;
+        self
+    }
+
     /// Run the accept loop until `shutdown` resolves or a worker exits.
     ///
     /// On `shutdown`, we flip the shared exit flag (the `Arc<AtomicBool>` we
@@ -133,6 +148,13 @@ impl Server {
     ) -> Result<()> {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, "listening for psql connections");
+
+        // The shared pgwire handler bundle (query / startup / cancel handlers)
+        // every connection uses, over whichever catalog queries resolve against.
+        let handlers = Arc::new(PivotHandlers::new(
+            self.query_catalog.clone(),
+            self.dispatcher.clone(),
+        ));
 
         // Start the configured ingest sources (OTLP receivers, etc.). They
         // encode Parquet on the dispatch workers, so they must be drained
@@ -217,7 +239,7 @@ impl Server {
                 accept = listener.accept() => {
                     match accept {
                         Ok((socket, peer)) => {
-                            let handlers = self.handlers.clone();
+                            let handlers = handlers.clone();
                             tokio::spawn(async move {
                                 info!(?peer, "connection accepted");
                                 if let Err(e) = process_socket(socket, None, handlers).await {

@@ -132,7 +132,7 @@ fn start_s3() -> Option<Container<MinIO>> {
     set_env("AWS_ACCESS_KEY_ID", S3_ACCESS_KEY);
     set_env("AWS_SECRET_ACCESS_KEY", S3_SECRET_KEY);
     set_env("AWS_REGION", S3_REGION);
-    if let Err(e) = s3_create_bucket(&endpoint) {
+    if let Err(e) = create_s3_bucket(&endpoint, BUCKET) {
         eprintln!("[test_support] skipping S3 backend — bucket create failed: {e}");
         return None;
     }
@@ -166,16 +166,19 @@ fn start_gcs() -> Option<Container<GenericImage>> {
     Some(container)
 }
 
-/// `PUT /<bucket>` against MinIO, SigV4-signed (mirrors the catalog's own S3
-/// signing). A 409 means the bucket already exists — fine.
-fn s3_create_bucket(endpoint: &str) -> Result<(), String> {
+/// `PUT /<bucket>` against a MinIO endpoint using its default root credentials,
+/// SigV4-signed (mirrors the catalog's own S3 signing). A 409 means the bucket
+/// already exists — fine. Public so other crates' harnesses (e.g. the Iceberg
+/// warehouse rig) can bootstrap their own buckets without re-deriving the
+/// signing dance.
+pub fn create_s3_bucket(endpoint: &str, bucket: &str) -> Result<(), String> {
     use aws_credential_types::Credentials;
     use aws_sigv4::http_request::{
         PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
     };
     use aws_sigv4::sign::v4;
 
-    let url = format!("{endpoint}/{BUCKET}");
+    let url = format!("{endpoint}/{bucket}");
     let host = endpoint.split("://").nth(1).unwrap_or(endpoint);
 
     let creds = Credentials::new(S3_ACCESS_KEY, S3_SECRET_KEY, None, None, "harness");

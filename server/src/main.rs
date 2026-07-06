@@ -12,6 +12,7 @@ use std::time::Duration;
 use catalog::ParquetCatalog;
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch};
+use iceberg_catalog::{IcebergRestCatalog, IcebergRestConfig};
 use ingest::{IngestConfig, OtelConfig, Signal};
 use server::{Error, Server};
 use tracing::{error, info};
@@ -33,6 +34,30 @@ struct Args {
     /// in-memory catalog — tables vanish on restart and must each name a `path`.
     #[arg(long)]
     path: Option<PathBuf>,
+
+    /// Serve queries from an existing Iceberg REST catalog at this URI (e.g.
+    /// `http://localhost:8181`): unqualified table names resolve in
+    /// `--iceberg-namespace`; another namespace is addressed by quoting the
+    /// full name as one identifier (`SELECT * FROM "ns.table"`, since the SQL
+    /// layer exposes a single schema an unquoted `ns.table` does not parse as
+    /// a namespace). Scans read the warehouse's Parquet files directly from
+    /// object storage, with credentials from the environment (`AWS_*` etc.).
+    /// Read-only: `CREATE TABLE` and ingest are unavailable, so it conflicts
+    /// with `--path`, `--otel*`, and `--compact`; `--http-bind` conflicts too,
+    /// as the dashboard introspects the Parquet catalog. Set
+    /// `PIVOT_ICEBERG_TOKEN` to authenticate to the catalog with a bearer
+    /// token.
+    #[arg(long, value_name = "URI", conflicts_with_all = ["path", "otel", "otel_config", "compact", "http_bind"])]
+    iceberg_rest: Option<String>,
+
+    /// Warehouse identifier passed to the REST catalog's config endpoint, for
+    /// services hosting several warehouses.
+    #[arg(long, value_name = "NAME", requires = "iceberg_rest")]
+    iceberg_warehouse: Option<String>,
+
+    /// The namespace unqualified table names resolve in (default: `default`).
+    #[arg(long, value_name = "NAMESPACE", requires = "iceberg_rest")]
+    iceberg_namespace: Option<String>,
 
     /// Enable the on-disk cache for remote (S3/GCS) object reads, storing cached
     /// byte ranges under this directory (persists across restarts). Omit to
@@ -287,6 +312,23 @@ fn main() -> Result<(), Error> {
         None => Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone())),
     };
 
+    // When an Iceberg REST catalog is configured it becomes the catalog every
+    // query resolves against (the ParquetCatalog above stays empty and only
+    // backs the code paths that require the concrete type).
+    let iceberg_catalog = args.iceberg_rest.as_deref().map(|uri| {
+        let mut config = IcebergRestConfig::new(uri);
+        config.warehouse = args.iceberg_warehouse.clone();
+        config.token = std::env::var("PIVOT_ICEBERG_TOKEN").ok();
+        if let Some(namespace) = &args.iceberg_namespace {
+            config.default_namespace = namespace.clone();
+        }
+        info!(uri, "connecting to iceberg rest catalog");
+        IcebergRestCatalog::connect(config, dispatch.dispatcher().clone()).unwrap_or_else(|e| {
+            error!("failed to connect to iceberg rest catalog `{uri}`: {e}");
+            std::process::exit(1);
+        })
+    });
+
     rt.block_on(async move {
         let compact_bytes = if args.compact { args.compact_bytes } else { 0 };
         let mut server = Server::new(
@@ -299,6 +341,9 @@ fn main() -> Result<(), Error> {
         );
         if let Some(addr) = args.http_bind {
             server = server.with_http_bind(addr);
+        }
+        if let Some(iceberg) = iceberg_catalog {
+            server = server.with_query_catalog(Arc::new(iceberg));
         }
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;

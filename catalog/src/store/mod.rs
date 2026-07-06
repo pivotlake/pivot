@@ -210,6 +210,23 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     }
 }
 
+/// Percent-encode a URL path segment or query value per RFC 3986 (unreserved
+/// characters pass through; everything else - including `/` - is encoded).
+/// Shared by the S3 backend's query strings and callers building their own
+/// HTTP request paths (e.g. the Iceberg REST client).
+pub fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// The final path segment of a raw object-store key string (a backend's listing
 /// response), as the manifest records the object's name.
 pub(crate) fn key_name(key: &str) -> String {

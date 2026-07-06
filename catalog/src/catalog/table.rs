@@ -27,7 +27,7 @@ impl TableFile {
     }
 
     /// This file's row groups, in file-local order.
-    pub(crate) fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
+    pub fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
         &self.row_groups
     }
 }

@@ -68,7 +68,7 @@ fn fetch_table_file_factories(
 /// fetch stage already emits `TableFile`s, so the dataflow's typed `collect`
 /// drains them directly — no terminal sink. Drives the dataflow, so it must run
 /// on the **coordinator**, not inside a `run_on_worker` closure.
-pub(crate) fn load_table_files(
+pub fn load_table_files(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
 ) -> Result<Vec<TableFile>, dispatch::DataFlowError> {

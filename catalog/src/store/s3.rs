@@ -6,7 +6,10 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key,
+    percent_encode,
+};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -328,21 +331,6 @@ fn env_any(keys: &[&str]) -> Option<String> {
 fn env_req(key: &str) -> Result<String> {
     std::env::var(key)
         .map_err(|_| StoreError::Config(format!("environment variable {key} not set")))
-}
-
-/// Percent-encode an S3 object key for a query-string value per RFC 3986
-/// (unreserved chars pass through; `/` is encoded since it's a query value).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
