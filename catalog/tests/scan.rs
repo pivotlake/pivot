@@ -2,8 +2,9 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::cast::AsArray;
+use arrow_array::{Int64Array, RecordBatch, StringViewArray, StructArray};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -81,6 +82,173 @@ fn scan_empty_projection_emits_row_count() {
 
     assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
     assert!(results.iter().all(|b| b.num_columns() == 0));
+}
+
+#[test]
+fn scan_nested_struct_column() {
+    let dispatch = dispatch(1);
+    // A struct column `user{id, name}` alongside a scalar `ts`, written by
+    // arrow-rs (a trusted nested writer) and read back through pivot.
+    let inner = Fields::from(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8View, false),
+    ]);
+    let user = StructArray::new(
+        inner.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as _,
+            Arc::new(StringViewArray::from(vec!["a", "bb", "ccc"])) as _,
+        ],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("user", DataType::Struct(inner), false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(user) as _,
+            Arc::new(Int64Array::from(vec![10, 20, 30])) as _,
+        ],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    // Three leaves (`user.id`, `user.name`, `ts`) reassemble into two columns.
+    let results = table_input(&dispatch, &table, Projection::all(3), false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    let got = &results[0];
+    assert_eq!(got.num_columns(), 2);
+    let user = got.column(0).as_struct();
+    assert_eq!(
+        user.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap(),
+        &Int64Array::from(vec![1, 2, 3])
+    );
+    assert_eq!(
+        user.column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap(),
+        &StringViewArray::from(vec!["a", "bb", "ccc"])
+    );
+    assert_eq!(
+        got.column(1).as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![10, 20, 30])
+    );
+}
+
+/// A batch laid out `a, s{x, y}, b`: four leaves where a struct sits between
+/// scalars, so leaf (column-chunk) indices and top-level field indices diverge.
+fn struct_between_scalars_batch() -> RecordBatch {
+    let inner = Fields::from(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Utf8View, false),
+    ]);
+    let s = StructArray::new(
+        inner.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![10, 20])) as _,
+            Arc::new(StringViewArray::from(vec!["p", "q"])) as _,
+        ],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("s", DataType::Struct(inner), false),
+        Field::new("b", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2])) as _,
+            Arc::new(s) as _,
+            Arc::new(Int64Array::from(vec![100, 200])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+#[test]
+fn scan_struct_between_scalars_keeps_leaf_order() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(&dispatch, &[struct_between_scalars_batch()], false);
+
+    let results = table_input(&dispatch, &table, Projection::all(4), false)
+        .collect()
+        .unwrap();
+
+    let got = &results[0];
+    assert_eq!(got.num_columns(), 3);
+    let s = got.column(1).as_struct();
+    assert_eq!(
+        got.column(0).as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![1, 2])
+    );
+    assert_eq!(
+        s.column(0).as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![10, 20])
+    );
+    assert_eq!(
+        s.column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap(),
+        &StringViewArray::from(vec!["p", "q"])
+    );
+    assert_eq!(
+        got.column(2).as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![100, 200])
+    );
+}
+
+#[test]
+fn scan_scalar_after_struct() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(&dispatch, &[struct_between_scalars_batch()], false);
+
+    // `b` is top-level field 2 but leaf 3; projecting its leaf must decode
+    // that chunk, not the struct's second leaf.
+    let results = table_input(&dispatch, &table, Projection::columns([3]), false)
+        .collect()
+        .unwrap();
+
+    let got = &results[0];
+    assert_eq!(got.num_columns(), 1);
+    assert_eq!(got.schema().field(0).name(), "b");
+    assert_eq!(collect_i64s(&results, 0), vec![100, 200]);
+}
+
+#[test]
+fn scan_struct_only() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(&dispatch, &[struct_between_scalars_batch()], false);
+
+    // The struct's two leaves project as one nested column.
+    let results = table_input(&dispatch, &table, Projection::columns([1, 2]), false)
+        .collect()
+        .unwrap();
+
+    let got = &results[0];
+    assert_eq!(got.num_columns(), 1);
+    let s = got.column(0).as_struct();
+    assert_eq!(
+        s.column(0).as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![10, 20])
+    );
+    assert_eq!(
+        s.column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap(),
+        &StringViewArray::from(vec!["p", "q"])
+    );
 }
 
 #[test]
