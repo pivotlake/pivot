@@ -587,6 +587,8 @@ pub(super) fn dispatch_group_by(
                 4 => build_group_by!($K, Dynamic<4, $acc, $add>, $cfg),
                 5 => build_group_by!($K, Dynamic<5, $acc, $add>, $cfg),
                 6 => build_group_by!($K, Dynamic<6, $acc, $add>, $cfg),
+                7 => build_group_by!($K, Dynamic<7, $acc, $add>, $cfg),
+                8 => build_group_by!($K, Dynamic<8, $acc, $add>, $cfg),
                 n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
             }
         };
