@@ -278,6 +278,7 @@ mod tests {
                 .collect(),
             num_rows,
             file_row_group_idx: 0,
+            live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })]))
     }
 

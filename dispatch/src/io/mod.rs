@@ -25,7 +25,7 @@
 mod backend;
 
 use crate::Identifier;
-use crate::memory::compressed_cache::MissingBlock;
+use crate::memory::compressed_cache::MissingExtent;
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -305,7 +305,7 @@ impl Hash for RemoteFile {
 /// alive for the read's whole flight.
 pub struct FsRequest {
     pub file: Arc<File>,
-    pub block: MissingBlock,
+    pub block: MissingExtent,
 }
 
 /// An HTTP(S) read request: read `block` (a byte range) from `remote` into its
@@ -318,12 +318,12 @@ pub struct FsRequest {
 /// the transport stays a type-level fact the whole way.
 pub struct HttpRequest {
     pub remote: Arc<RemoteFile>,
-    pub block: MissingBlock,
+    pub block: MissingExtent,
 }
 
 /// A read request that knows how many bytes it transfers, so stats can total
 /// the bytes read alongside the request count. Both transports read a
-/// [`MissingBlock`], so both report its byte length.
+/// [`MissingExtent`], so both report its byte length.
 pub trait ReadyBytesLen {
     fn ready_bytes_len(&self) -> u64;
 }

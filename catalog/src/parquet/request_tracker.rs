@@ -58,7 +58,7 @@ pub(crate) struct ReadRequest {
     pub location: FileLocation,
     pub offset: usize,
     pub len: usize,
-    /// Address of the cache slot region this read fills (`MissingBlock::dest`).
+    /// Address of the cache slot region this read fills (`MissingExtent::dest`).
     pub dest: usize,
 }
 
@@ -309,7 +309,7 @@ impl<T: PendingRequest> RequestTracker<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch::memory::compressed_cache::MissingBlock;
+    use dispatch::memory::compressed_cache::MissingExtent;
     use dispatch::memory::{init_test_free_pool, memory_ctx};
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -350,7 +350,7 @@ mod tests {
     }
 
     /// Wrap a cache missing-block as a local `FsRequest`.
-    fn as_fs_request(location: &FileLocation, block: MissingBlock) -> FsRequest {
+    fn as_fs_request(location: &FileLocation, block: MissingExtent) -> FsRequest {
         match location {
             FileLocation::Local(file) => FsRequest {
                 file: file.clone(),

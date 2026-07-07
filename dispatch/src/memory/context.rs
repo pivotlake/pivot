@@ -55,7 +55,7 @@ impl MemoryContextFactory {
 
         let ring = Arc::new(Ring::new(buffers).unwrap());
         let compressed_cache = Arc::new(CompressedCache::new(buffers));
-        let decompressed_cache = Arc::new(DecompressedCache::new());
+        let decompressed_cache = Arc::new(DecompressedCache::new(buffers));
         let clock = Arc::new(Clock::new(buffers));
         let mut zeroed_pool_factories = PoolFactory::create_many(count);
         let mut dirty_pool_factories = PoolFactory::create_many(count);
@@ -211,7 +211,7 @@ impl MemoryContext {
                 // while live and is about to be handed out under two owners.
                 debug_assert_eq!(
                     self.clock.owner(idx),
-                    Owner::Free,
+                    None,
                     "pooled slot {idx} still owned by a cache",
                 );
                 if let Some(r) = memory_ctx().ring().try_write(idx) {
@@ -222,11 +222,12 @@ impl MemoryContext {
                 }
             }
 
-            // Pool empty: evict via the shared clock, which surrenders
-            // decompressed pages preferentially (they age out faster). Panic only
-            // when there is nothing cheap to reclaim - an empty decompressed cache
-            // means we would be evicting the compressed cache, the
-            // memory-pressure signal `PANIC_ON_EVICT` guards.
+            // Pool empty: evict via the shared clock, which takes from whichever
+            // tier is over its target share (decompressed, in the common case of
+            // a large decompressed working set). Panic only when there is nothing
+            // cheap to reclaim - an empty decompressed cache means we would be
+            // evicting the compressed cache, the memory-pressure signal
+            // `PANIC_ON_EVICT` guards.
             if *PANIC_ON_EVICT && self.decompressed_cache.is_empty() {
                 panic!("Evicting");
             }
@@ -234,23 +235,30 @@ impl MemoryContext {
         }
     }
 
-    /// Evict a ring slot via the shared CLOCK and return it writable. The sweep
-    /// picks victims across both caches, routing each to its owner's reclaim:
-    /// compressed runs to [`CompressedCache::reclaim`], decompressed
-    /// pages to [`DecompressedCache::reclaim`]. Decompressed pages age out
-    /// faster (lower clock tier), so they are surrendered first.
+    /// Evict a ring slot via the shared CLOCK and return it writable. Each
+    /// iteration re-picks which tier to take from - compressed while its share
+    /// of cached slots exceeds the target percentage, decompressed otherwise
+    /// (see [`Clock::preferred_victim_tier`]) - advances that tier's hand, and
+    /// routes the victim to its cache's reclaim.
     pub(crate) fn evict(&self) -> WriteBuffer {
         // Livelock guard. When a query's working set exceeds the ring, every
         // worker spins here finding nothing evictable (near-100% CPU, ~0 forward
-        // progress, and the loop has no cancellation point). A healthy CLOCK finds
-        // a victim within a few sweeps (counters reach zero in at most their tier
-        // max), so far more than that is abnormal: warn and sleep to let peer
-        // workers / ingest release slots; if it still finds nothing, the cache is
-        // genuinely exhausted, so panic to abort the offending query.
+        // progress, and the loop has no cancellation point). A healthy hand finds
+        // a victim within the lives ceiling's worth of revolutions (a counter
+        // reaches zero in at most that many), so more than both hands' worth
+        // combined is abnormal: warn and sleep to let peer workers / ingest
+        // release slots; if it still finds nothing, the cache is genuinely
+        // exhausted, so panic to abort the offending query.
         let ring_len = self.ring.len() as u64;
-        let warn_at = 4 * ring_len;
+        let max_lives = self.clock.max_lives() as u64;
+        let warn_at = (2 * max_lives + 2) * ring_len;
         let mut iterations: u64 = 0;
         let mut panic_at: Option<u64> = None;
+        // A hand that has swept the full lives ceiling's worth of revolutions
+        // without reclaiming anything (every candidate pinned) is stuck; fall
+        // through to the other tier regardless of share rather than spinning
+        // into the guard while evictable slots exist there.
+        let mut ticks_without_success: u64 = 0;
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
@@ -265,14 +273,28 @@ impl MemoryContext {
                 );
             }
 
-            let (slot_idx, victim) = self.clock.advance();
-            let reclaimed = match victim {
-                Some(Owner::Compressed) => self.compressed_cache.reclaim(slot_idx),
-                Some(Owner::Decompressed) => self.decompressed_cache.reclaim(slot_idx),
-                Some(Owner::Free) | None => None,
-            };
-            if let Some(write_buffer) = reclaimed {
-                return write_buffer;
+            let mut tier = self.clock.preferred_victim_tier();
+            if ticks_without_success > (max_lives + 1) * ring_len {
+                tier = match tier {
+                    Owner::Compressed => Owner::Decompressed,
+                    Owner::Decompressed => Owner::Compressed,
+                };
+                // Re-arm after one fruitless revolution of the other hand too, so
+                // the fallback alternates between the tiers instead of latching
+                // onto one that may be empty while the preferred tier's pins have
+                // long been released.
+                if ticks_without_success > (max_lives + 2) * ring_len {
+                    ticks_without_success = 0;
+                }
+            }
+
+            let reclaimed = self.clock.advance(tier).and_then(|slot| match tier {
+                Owner::Compressed => self.compressed_cache.reclaim(slot),
+                Owner::Decompressed => self.decompressed_cache.reclaim(slot),
+            });
+            match reclaimed {
+                Some(write_buffer) => return write_buffer,
+                None => ticks_without_success += 1,
             }
         }
     }
