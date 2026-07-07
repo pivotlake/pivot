@@ -10,6 +10,6 @@ SELECT
     AVG(l_discount) AS avg_disc,
     COUNT(*) AS count_order
 FROM tpch_flat
-WHERE l_shipdate <= DATE '1998-09-02'
+WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY
 GROUP BY l_returnflag, l_linestatus
 ORDER BY l_returnflag, l_linestatus;
