@@ -45,19 +45,19 @@ use std::sync::atomic::Ordering::Relaxed;
 static MAX_LIVES: LazyLock<u8> = LazyLock::new(|| get_env_var_with_default("PIVOT_MAX_LIVES", 16));
 
 /// The per-touch bump of a slot whose same-bytes twin in the other tier has
-/// died (env `PIVOT_REINFORCE_BUMP`, default 10). Ordinary slots gain 1 life
+/// died (env `PIVOT_REINFORCE_BUMP`, default 6). Ordinary slots gain 1 life
 /// per touch; a last-copy slot gains this much, so under eviction pressure
 /// that drains everyone, a block that is still being read AND has no other
 /// copy climbs while equally-hot backed blocks sink - the hand then feeds on
 /// blocks whose eviction costs a re-decompress, never a disk read.
 static REINFORCE_BUMP: LazyLock<u8> =
-    LazyLock::new(|| get_env_var_with_default("PIVOT_REINFORCE_BUMP", 10));
+    LazyLock::new(|| get_env_var_with_default("PIVOT_REINFORCE_BUMP", 6));
 
 /// Target share of cached slots the compressed tier should occupy, in percent
-/// (env `PIVOT_COMPRESSED_CACHE_PCT`, default 10). The evictor evicts from the
+/// (env `PIVOT_COMPRESSED_CACHE_PCT`, default 30). The evictor evicts from the
 /// compressed tier only while its share exceeds this.
 static COMPRESSED_SHARE_PCT: LazyLock<usize> =
-    LazyLock::new(|| get_env_var_with_default("PIVOT_COMPRESSED_CACHE_PCT", 10));
+    LazyLock::new(|| get_env_var_with_default("PIVOT_COMPRESSED_CACHE_PCT", 30));
 
 /// The cache owning a ring slot; a free slot has no owner (`None`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

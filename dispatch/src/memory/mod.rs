@@ -29,6 +29,9 @@ pub use decompressed_cache::{BlockKey, DecompressedCache, Segment};
 pub mod clock;
 pub use clock::{Clock, Owner};
 
+mod fill_cursor;
+pub use fill_cursor::FillCursor;
+
 mod free_pool;
 
 mod write_buffer;
