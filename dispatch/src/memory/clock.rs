@@ -54,10 +54,18 @@ static REINFORCE_BUMP: LazyLock<u8> =
     LazyLock::new(|| get_env_var_with_default("PIVOT_REINFORCE_BUMP", 10));
 
 /// Target share of cached slots the compressed tier should occupy, in percent
-/// (env `PIVOT_COMPRESSED_CACHE_PCT`, default 10). The evictor evicts from the
+/// (env `PIVOT_COMPRESSED_CACHE_PCT`, default 30). The evictor evicts from the
 /// compressed tier only while its share exceeds this.
+///
+/// The default is deliberately conservative: the share is a fraction of the
+/// RING, so the compressed floor it grants shrinks with the pool. Lower
+/// targets buy more decompressed coverage but hit a cliff once the floor
+/// drops below a scan's compressed working set tail (measured: a 1.5 GB
+/// floor turns a warm sub-second scan into seconds of per-pass disk reads,
+/// while the same workload thrives on a 2.4 GB floor). Tune per deployment
+/// only with the ring size in hand.
 static COMPRESSED_SHARE_PCT: LazyLock<usize> =
-    LazyLock::new(|| get_env_var_with_default("PIVOT_COMPRESSED_CACHE_PCT", 10));
+    LazyLock::new(|| get_env_var_with_default("PIVOT_COMPRESSED_CACHE_PCT", 30));
 
 /// The cache owning a ring slot; a free slot has no owner (`None`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -362,7 +370,7 @@ mod tests {
     fn decompressed_is_preferred_while_compressed_is_under_its_target_share() {
         let clock = Clock::new(16);
 
-        // 1 compressed / 11 total = 9%, under the 10% default target.
+        // 1 compressed / 11 total = 9%, under the default target.
         clock.bind(0, Owner::Compressed);
         for slot in 1..11 {
             clock.bind(slot, Owner::Decompressed);
