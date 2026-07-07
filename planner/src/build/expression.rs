@@ -168,7 +168,7 @@ impl AggregateFunc {
         let return_type = type_from_logical(view.return_type())?;
         let params = view
             .children()
-            .map(build_aggregate_param)
+            .map(Expression::from_handle)
             .collect::<Result<Vec<_>, _>>()?;
 
         // DISTINCT is only supported for `COUNT` so far; reject `SUM(DISTINCT)`
@@ -217,16 +217,6 @@ impl AggregateFunc {
             _ => Err(Error::UnsupportedAggregateFunction(function)),
         }
     }
-}
-
-/// Build an aggregate's argument, stripping any leading cast(s) DuckDB inserted:
-/// the reducers fold the raw input column (an `AVG`/`SUM` keeps its narrow
-/// accumulator), so the cast would only force a widening copy.
-fn build_aggregate_param(mut e: Expr<'_>) -> Result<Expression, Error> {
-    while let DuckExpression::Cast(cast) = e.expression() {
-        e = cast.child();
-    }
-    Expression::from_handle(e)
 }
 
 /// Build a single-argument numeric aggregate's payload, validating the arity.
