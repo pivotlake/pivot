@@ -77,6 +77,12 @@ impl Decompressor {
             };
             match memory_ctx().decompressed_cache().get(&key) {
                 Some(cached) => cached,
+                // An empty page decompresses to no bytes, and the snappy decoder
+                // panics if handed zero output buffers. This happens for the
+                // dictionary page of an all-null column, e.g. the unused `value`
+                // fallback leaf of a shredded variant path (every value went to
+                // its typed leaf). Nothing to cache either.
+                None if page.header.uncompressed_page_size == 0 => Vec::new(),
                 None => {
                     // Reserve the page's output region in the cache (packed into
                     // shared slots via this worker's fill cursor), decompress

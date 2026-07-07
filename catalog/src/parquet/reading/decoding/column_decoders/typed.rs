@@ -23,6 +23,7 @@ use crate::parquet::types::thrift::general::Encoding;
 use crate::parquet::types::thrift::headers::DataPageHeader;
 use arrow_array::ArrayRef;
 use bytes::Bytes;
+use dispatch::arrays::ValidityBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
 
@@ -32,10 +33,54 @@ pub enum ValueDecoder<P: DecodePlain> {
     Rle(RleDecoder),
 }
 
+/// Decode `n` values into `builder` (a dictionary page looks each index up in
+/// `dict`). Shared by the required and nullable read loops.
+fn decode_run<D, B, P>(decoder: &mut ValueDecoder<P>, builder: &mut B, dict: &Option<D>, n: usize)
+where
+    D: Dict<Builder = B, Item = B::Element>,
+    B: ArrayBuilder,
+    P: DecodePlain<Builder = B>,
+{
+    match decoder {
+        ValueDecoder::Plain(p) => p.read(builder, n),
+        ValueDecoder::Rle(r) => r.read(builder, dict.as_ref().expect("No dict available!"), n),
+    }
+}
+
+/// Advance past `n` values without decoding them (a filtered-out run).
+fn skip_run<P: DecodePlain>(decoder: &mut ValueDecoder<P>, n: usize) {
+    match decoder {
+        ValueDecoder::Plain(p) => p.skip(n),
+        ValueDecoder::Rle(r) => r.skip(n),
+    }
+}
+
+/// A nullable page's definition levels: `present[i]` is whether logical row `i`
+/// holds a value (vs a null), consumed run-wise via a cursor.
+struct DefLevels {
+    present: Vec<bool>,
+    pos: usize,
+}
+
+impl DefLevels {
+    /// The next run of equal present/null rows, capped at `max`.
+    fn next_run(&mut self, max: usize) -> (bool, usize) {
+        let present = self.present[self.pos];
+        let run = self.present[self.pos..]
+            .iter()
+            .take_while(|&&p| p == present)
+            .count()
+            .min(max);
+        self.pos += run;
+        (present, run)
+    }
+}
+
 /// State for the page currently being read.
 ///
-/// Tracks the value decoder, the optional filter mask cursor, and how many
-/// rows remain in the page.
+/// Tracks the value decoder, the optional filter mask cursor, how many rows
+/// remain in the page, and, for a nullable column, the page's definition
+/// levels (which logical rows are null).
 pub struct ReadPage<
     D: Dict<Builder = B, Item = B::Element>,
     B: ArrayBuilder,
@@ -47,6 +92,9 @@ pub struct ReadPage<
     running_filter_mask_opt: Option<RunningFilterMask>,
     /// Rows left to decode in this page.
     pub(crate) remaining: usize,
+    /// Definition levels for a page with nulls; `None` for a required column or
+    /// an all-present page.
+    def_levels: Option<DefLevels>,
     phantom_data: PhantomData<(D, B)>,
 }
 
@@ -66,33 +114,52 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
                 Some(m) => m.next_run(read_left),
                 None => (true, read_left),
             };
-
-            match &mut self.decoder {
-                ValueDecoder::Plain(p) => {
-                    if keep {
-                        p.read(builder, next_run)
-                    } else {
-                        p.skip(next_run)
-                    }
-                }
-                ValueDecoder::Rle(r) => {
-                    if keep {
-                        r.read(
-                            builder,
-                            dict.as_ref().expect("No dict available!"),
-                            next_run,
-                        )
-                    } else {
-                        r.skip(next_run)
-                    }
-                }
-            }
-
             if keep {
+                decode_run(&mut self.decoder, builder, dict, next_run);
                 read_left -= next_run;
+            } else {
+                skip_run(&mut self.decoder, next_run);
             }
         }
         self.remaining -= builder.len() - current_len;
+    }
+
+    /// Like [`read_into`](Self::read_into) but for a page with nulls: each
+    /// logical row is decoded as a value (present) or appended as a null, per
+    /// the page's definition levels, and a validity bit is pushed for each.
+    /// (The value stream holds only the present values.) Filtered nullable
+    /// reads aren't supported yet; they only arise with predicate pushdown
+    /// onto a nullable column, which lands with shredded-leaf pushdown.
+    pub fn read_into_nullable(
+        &mut self,
+        dict: &Option<D>,
+        builder: &mut B,
+        validity: &mut ValidityBuilder,
+        size: usize,
+    ) {
+        assert!(
+            self.running_filter_mask_opt.is_none(),
+            "filtered reads of a nullable column are not yet supported",
+        );
+        let def = self
+            .def_levels
+            .as_mut()
+            .expect("nullable page has def levels");
+        let to_read = size.min(self.remaining);
+        let mut left = to_read;
+        while left > 0 {
+            let (present, run) = def.next_run(left);
+            if present {
+                decode_run(&mut self.decoder, builder, dict, run);
+            } else {
+                // Null slots: advance the builder over uninitialised values that
+                // `validity` masks off.
+                builder.spare_mut(run);
+            }
+            validity.append_n(run, present);
+            left -= run;
+        }
+        self.remaining -= to_read;
     }
 }
 
@@ -204,25 +271,25 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
         };
 
         let mut position = ReaderPosition::default();
+        let rows = page.rows();
 
-        let non_null_count = if self.max_def_level > 0 {
-            // Skip past the definition level bytes so `position` points at the values.
+        // A nullable column's pages prefix the values with definition levels;
+        // decode them (advancing `position` past them). An all-present page
+        // yields `None` and decodes by the fast, non-null path below.
+        let def_levels = if self.max_def_level > 0 {
             let mut reader = MultiBufferReader::new(&page.data, &mut position);
             let def_level_byte_len = reader.read_u32_le() as usize;
-            let def_levels = decode_def_levels(&mut reader, page.rows(), def_level_byte_len);
-            let non_null = def_levels.iter().filter(|&&v| v).count();
-            if non_null != page.rows() {
-                return Err(Error::NullableColumnsNotSupported);
-            }
-            non_null
+            decode_def_levels(&mut reader, rows, def_level_byte_len, self.max_def_level)
+                .map(|present| DefLevels { present, pos: 0 })
         } else {
-            page.rows()
+            None
         };
 
         self.read_page = Some(ReadPage {
             decoder: self.create_decoder(page.header, page.data, position)?,
             running_filter_mask_opt: page.filter_mask.map(RunningFilterMask::new),
-            remaining: non_null_count,
+            remaining: rows,
+            def_levels,
             phantom_data: Default::default(),
         });
 
@@ -316,6 +383,11 @@ where
         if let Some(d) = self.dict.as_ref() {
             d.register_onto(&mut builder)
         }
+        // Validity is built lazily on slab memory only once a page actually has
+        // a null. A required column, and a nullable one whose pages are all
+        // present (e.g. a variant's `value` leaf), never allocates a bitmap and
+        // takes the same fast path as before.
+        let mut validity: Option<ValidityBuilder> = None;
 
         while builder.len() < size {
             if self.read_page.is_none() {
@@ -327,7 +399,22 @@ where
 
             let remaining = size - builder.len();
             let read_page = self.read_page.as_mut().unwrap();
-            read_page.read_into(&self.dict, &mut builder, remaining);
+            if read_page.def_levels.is_some() {
+                // This page has nulls: ensure a bitmap exists (backfilling the
+                // rows decoded so far as present), then scatter values and nulls.
+                let v = validity.get_or_insert_with(|| {
+                    let mut vb = ValidityBuilder::with_capacity(allocator, size);
+                    vb.append_n(builder.len(), true);
+                    vb
+                });
+                read_page.read_into_nullable(&self.dict, &mut builder, v, remaining);
+            } else {
+                let before = builder.len();
+                read_page.read_into(&self.dict, &mut builder, remaining);
+                if let Some(v) = &mut validity {
+                    v.append_n(builder.len() - before, true);
+                }
+            }
 
             if read_page.remaining == 0 {
                 self.read_page = None;
@@ -335,7 +422,8 @@ where
             }
         }
 
-        Ok(builder.into_array(None))
+        let null_buffer = validity.map(|v| v.into_buffer());
+        Ok(builder.into_array(null_buffer))
     }
 }
 
