@@ -19,7 +19,7 @@ use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::memory::{BUFFER_SIZE, BlockKey, WriteBuffer, memory_ctx};
+use dispatch::memory::{BlockKey, memory_ctx};
 use snap::raw::Decoder;
 use thiserror::Error;
 
@@ -78,18 +78,23 @@ impl Decompressor {
             match memory_ctx().decompressed_cache().get(&key) {
                 Some(cached) => cached,
                 None => {
-                    // `insert` caches the page (binding its slots so a later read skips
-                    // snappy) and returns the bytes to decode; a zero-length page yields
-                    // no buffers and is left uncached. The header is stored alongside it,
-                    // opaque to the cache, so a later `get_range` hit can hand a caller a
-                    // full page identity without touching disk (see
-                    // `requests::parse_page_header`).
-                    let (write_buffers, total_len) = self.decompress_to_buffers(&page)?;
+                    // Reserve the page's output region in the cache (packed into
+                    // shared slots via this worker's fill cursor), decompress
+                    // straight into it, and insert. The header is stored
+                    // alongside it, opaque to the cache, so a later `get_range`
+                    // hit can hand a caller a full page identity without touching
+                    // disk (see `requests::parse_page_header`).
+                    let uncompressed_size = page.header.uncompressed_page_size as usize;
+                    let mut reservation = memory_ctx()
+                        .decompressed_cache()
+                        .reserve(&key, uncompressed_size);
+                    let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
+                    self.decoder
+                        .decompress_scattered(&input, reservation.as_mut_slices())?;
                     memory_ctx().decompressed_cache().insert(
                         key,
                         serialize_header(&page.header),
-                        write_buffers,
-                        total_len,
+                        reservation,
                         page.row_group
                             .get_metadata()
                             .live_decompressed_pages
@@ -119,30 +124,6 @@ impl Decompressor {
             data: payload,
             idx: page.page_idx,
         })
-    }
-
-    /// Snappy-decompress the page body into freshly allocated ring buffers (one per
-    /// 2 MB slot), returning the write buffers plus the decompressed total length
-    /// (the cache derives each slot's valid bytes from it). The cache turns these
-    /// into resident, read-pinned slots; an uncached page's buffers return to the
-    /// pool when the decoder drops them.
-    fn decompress_to_buffers(
-        &mut self,
-        page: &CompressedPage,
-    ) -> Result<(Vec<WriteBuffer>, usize)> {
-        let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
-
-        let uncompressed_size = page.header.uncompressed_page_size as usize;
-        let num_buffers = uncompressed_size.div_ceil(BUFFER_SIZE);
-        let mut write_buffers: Vec<_> = (0..num_buffers)
-            .map(|_| memory_ctx().get_write_buffer(false))
-            .collect();
-
-        let output_bufs: Vec<&mut [u8]> = write_buffers.iter_mut().map(|b| b.as_mut()).collect();
-
-        self.decoder.decompress_scattered(&input, output_bufs)?;
-
-        Ok((write_buffers, uncompressed_size))
     }
 }
 
