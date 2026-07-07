@@ -43,8 +43,6 @@ pub enum Error {
     DictPageEmpty,
     #[error("Unsupported encoding: {0}")]
     UnsupportedEncoding(Encoding),
-    #[error("Nullable columns are not yet supported (encountered nulls in data page)")]
-    NullableColumnsNotSupported,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
