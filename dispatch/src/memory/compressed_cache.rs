@@ -48,6 +48,7 @@
 use crate::io::FileLocation;
 use crate::memory::clock::Owner;
 use crate::memory::context::memory_ctx;
+use crate::memory::fill_cursor::FillCursor;
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::ring::BUFFER_SIZE;
 use crate::memory::write_buffer::WriteBuffer;
@@ -131,31 +132,6 @@ struct Tenant {
     location: FileLocation,
     /// The run's first file block - the key into `location`'s extent map.
     first_file_block: usize,
-}
-
-/// A worker's bump cursor over a shared fill slot. The slot is held as a
-/// [`ReadBuffer`] (a reader pin) so runs already packed into it stay readable and
-/// pinned while the worker keeps filling its tail. One per worker, owned by its
-/// [`MemoryContext`](crate::memory::context).
-pub struct FillCursor {
-    /// The slot currently being packed, pinned. `None` before the first miss and
-    /// after [`CompressedCache::clear`].
-    buffer: Option<Arc<ReadBuffer>>,
-    /// Ring slot index of `buffer`.
-    slot_idx: usize,
-    /// Bump pointer: the next free block in `buffer` (0..=512).
-    next_slot_block: u16,
-}
-
-impl FillCursor {
-    /// An empty cursor - the next miss takes a fresh fill buffer.
-    pub fn empty() -> Self {
-        FillCursor {
-            buffer: None,
-            slot_idx: 0,
-            next_slot_block: 0,
-        }
-    }
 }
 
 /// The result of a [`CompressedCache::get`] over one resolved run: the looked-up bytes
@@ -470,12 +446,12 @@ impl CompressedCache {
         start_offset: usize,
         end_offset: usize,
     ) -> Option<ResolvedRun> {
-        let cursor = memory_ctx().fill_cursor();
-        if cursor.buffer.is_none() || cursor.next_slot_block as usize == BLOCKS_PER_SLOT {
+        let cursor = memory_ctx().compressed_fill_cursor();
+        if cursor.is_exhausted() {
             // Rotation may evict, so no map lock is held across it.
             self.rotate_fill_buffer(cursor);
         }
-        let first_slot_block = cursor.next_slot_block as usize;
+        let first_slot_block = cursor.next_byte / BLOCK_SIZE;
         // Blocks the run may cover: whichever runs out first, the request or the room
         // left in the fill slot.
         let requested_blocks =
@@ -489,7 +465,7 @@ impl CompressedCache {
             requested_blocks,
         )?;
 
-        cursor.next_slot_block = extent.first_slot_block + extent.block_count;
+        cursor.next_byte = (extent.first_slot_block + extent.block_count) as usize * BLOCK_SIZE;
         let pin = cursor.buffer.clone().unwrap();
         let data = extent.clipped_bytes(&pin, start_offset, end_offset);
         Some(ResolvedRun {
@@ -576,7 +552,7 @@ impl CompressedCache {
         memory_ctx().clock().bind(slot_idx, Owner::Compressed);
         cursor.buffer = Some(Arc::new(ReadBuffer::from(write_buffer))); // used = 1, Release
         cursor.slot_idx = slot_idx;
-        cursor.next_slot_block = 0;
+        cursor.next_byte = 0;
     }
 
     /// Borrow ring slot `idx`'s cache metadata. `valid` is always safe to touch;
@@ -738,7 +714,7 @@ impl CompressedCache {
     pub fn clear(&self) -> usize {
         // Release this worker's fill pin first, so its own fill slot is recyclable
         // below rather than skipped as pinned.
-        memory_ctx().fill_cursor().buffer = None;
+        memory_ctx().compressed_fill_cursor().buffer = None;
 
         // Drain every file's extents, collecting the slots they lived in.
         let mut slots = HashSet::new();
@@ -828,7 +804,7 @@ mod tests {
 
     /// Drop this worker's fill pin so its current fill slot becomes evictable.
     fn release_fill_cursor() {
-        memory_ctx().fill_cursor().buffer = None;
+        memory_ctx().compressed_fill_cursor().buffer = None;
     }
 
     /// A deterministic byte for absolute file offset `off`, so cache contents are
@@ -879,21 +855,26 @@ mod tests {
 
     /// Insert one resident decompressed block over `[offset, offset + len)` of
     /// `FD()` into the shared context's decompressed cache, returning its slot.
+    /// Reserves a full slot's worth of bytes so each block occupies its own
+    /// slot, then drops the fill pin so the slot is ordinarily evictable.
     fn insert_decompressed(offset: usize, len: usize) -> usize {
         use crate::memory::decompressed_cache::BlockKey;
-        let buffer = memory_ctx().get_write_buffer(false);
-        let slot = buffer.slot_idx;
-        drop(memory_ctx().decompressed_cache().insert(
-            BlockKey {
-                location: FD(),
-                offset,
-                len,
-            },
+        let cache = memory_ctx().decompressed_cache();
+        let key = BlockKey {
+            location: FD(),
+            offset,
+            len,
+        };
+        let reservation = cache.reserve(&key, crate::memory::BUFFER_SIZE);
+        drop(cache.insert(
+            key,
             vec![Bytes::from(vec![0u8])],
-            vec![buffer],
-            1,
+            reservation,
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         ));
+        let cursor = memory_ctx().decompressed_fill_cursor();
+        let slot = cursor.slot_idx;
+        cache.release_cursor(cursor);
         slot
     }
 

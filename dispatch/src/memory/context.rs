@@ -1,7 +1,8 @@
 use crate::env::get_env_var_with_default;
 use crate::memory::clock::{Clock, Owner};
-use crate::memory::compressed_cache::{CompressedCache, FillCursor};
+use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
+use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
 use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
 use crate::worker::{NUM_WORKERS, WORKER_IDX};
@@ -80,7 +81,8 @@ impl MemoryContextFactory {
             clock: self.clock,
             dirty_pool: self.dirty_pool_factory.create_pool(),
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
-            fill_cursor: UnsafeCell::new(FillCursor::empty()),
+            compressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
+            decompressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
         }
     }
 }
@@ -93,12 +95,13 @@ pub struct MemoryContext {
     clock: Arc<Clock>,
     dirty_pool: FreePool,
     zeroed_pool: FreePool,
-    /// This worker's bump cursor for packing missed reads into a shared fill buffer
-    /// (see [`CompressedCache`]). Per-thread, so interior-mutable without a lock - the
-    /// `&'static MemoryContext` is really thread-local, so there is never a second
-    /// accessor. Mirrors the `UnsafeCell` discipline the compressed cache uses for its
-    /// per-slot metadata.
-    fill_cursor: UnsafeCell<FillCursor>,
+    /// This worker's bump cursors for packing entries into shared fill slots, one
+    /// per cache (see [`CompressedCache`] and [`DecompressedCache`]). Per-thread, so
+    /// interior-mutable without a lock - the `&'static MemoryContext` is really
+    /// thread-local, so there is never a second accessor. Mirrors the `UnsafeCell`
+    /// discipline the caches use for their per-slot metadata.
+    compressed_fill_cursor: UnsafeCell<FillCursor>,
+    decompressed_fill_cursor: UnsafeCell<FillCursor>,
 }
 
 impl MemoryContext {
@@ -131,12 +134,20 @@ impl MemoryContext {
         self.ring.as_ref()
     }
 
-    /// This worker's fill cursor (the bump allocator the compressed cache packs missed
-    /// reads into). Sound because the context is per-thread, so the returned `&mut`
-    /// never aliases another accessor on the same thread.
+    /// This worker's compressed-cache fill cursor (the bump allocator missed reads
+    /// are packed into). Sound because the context is per-thread, so the returned
+    /// `&mut` never aliases another accessor on the same thread.
     #[allow(clippy::mut_from_ref)] // interior mutability; per-thread, single accessor
-    pub(crate) fn fill_cursor(&self) -> &mut FillCursor {
-        unsafe { &mut *self.fill_cursor.get() }
+    pub(crate) fn compressed_fill_cursor(&self) -> &mut FillCursor {
+        unsafe { &mut *self.compressed_fill_cursor.get() }
+    }
+
+    /// This worker's decompressed-cache fill cursor (the bump allocator pages are
+    /// packed into). Same soundness argument as
+    /// [`compressed_fill_cursor`](Self::compressed_fill_cursor).
+    #[allow(clippy::mut_from_ref)] // interior mutability; per-thread, single accessor
+    pub(crate) fn decompressed_fill_cursor(&self) -> &mut FillCursor {
+        unsafe { &mut *self.decompressed_fill_cursor.get() }
     }
 
     /// Return a buffer index to the pool.
