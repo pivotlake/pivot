@@ -102,6 +102,21 @@ impl Aggregate {
             return self.compile_global_distinct(input, a);
         }
 
+        // Reject any group key whose type no extractor can encode, naming the
+        // offending column so the error points at the right key rather than the
+        // first one. Every group key is a plain column reference here (computed
+        // keys were materialised into columns), so the source name is to hand.
+        for group in &self.groups {
+            if let Expression::Ref(r) = group
+                && !is_groupable_key_type(&r.return_type)
+            {
+                return Err(Error::DataTypeNotSupportedForGroupBy {
+                    column: r.name.clone(),
+                    data_type: r.return_type.clone(),
+                });
+            }
+        }
+
         // Aggregates compute on the int a temporal column stores (a DATE is Int32
         // days, a TIMESTAMP is Int64 seconds), so reinterpret any temporal value
         // column to that int before the readers see it, and restore the temporal
@@ -281,17 +296,17 @@ fn aggregate_value_temporal(e: &Expression) -> Option<DataType> {
 /// Map group-key types to the arrow types the [`RowKeyExtractor`](dispatch::RowKeyExtractor)
 /// encodes, in key order. Shared by the general grouped path
 /// ([`grouped`]) and the `COUNT(DISTINCT)` two-level lowering
-/// ([`grouped_distinct`]). Returns `None` if any key has a
-/// type the row encoding doesn't support, so the caller reports it unsupported
-/// rather than panicking in `RowKeySchema::new`.
+/// ([`grouped_distinct`]). Returns `Err` with the first key type the row
+/// encoding doesn't support, so the caller can name the offending key rather
+/// than panicking in `RowKeySchema::new`.
 pub(super) fn row_key_schema<'a>(
     types: impl IntoIterator<Item = &'a Type>,
-) -> Option<RowKeySchema> {
+) -> Result<RowKeySchema, Type> {
     let arrow = types
         .into_iter()
-        .map(row_key_arrow_type)
-        .collect::<Option<Vec<_>>>()?;
-    Some(RowKeySchema::new(arrow))
+        .map(|t| row_key_arrow_type(t).ok_or_else(|| t.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(RowKeySchema::new(arrow))
 }
 
 /// The arrow type the row encoder uses for one group-key column, or `None` for a
@@ -309,6 +324,15 @@ fn row_key_arrow_type(t: &Type) -> Option<DataType> {
     let dt = crate::types::physical_arrow_type(t);
     let dt = temporal_to_int(&dt).unwrap_or(dt);
     (dt.is_integer() || dt == DataType::Utf8View).then_some(dt)
+}
+
+/// Whether any key extractor can group on this type. The dedicated single/pair/
+/// int-string extractors handle exactly the integer widths and `Utf8`; every
+/// other groupable type (`Date`/`Timestamp`) rides the row encoder. A type this
+/// rejects (`Float`/`Boolean`/`Decimal`/`Int128`) has no grouping path at all,
+/// so the caller can reject it up front and name the offending column.
+pub(super) fn is_groupable_key_type(t: &Type) -> bool {
+    row_key_arrow_type(t).is_some()
 }
 
 /// The accumulator-width rule shared by the global and grouped paths: `i128`

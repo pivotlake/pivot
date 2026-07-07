@@ -38,7 +38,12 @@ impl Aggregate {
                 Type::Int64 => input
                     .group_by_distinct_count::<HashOnlyIntKeyExtractor<Int64Type>>(distinct_cols),
                 Type::Utf8 => input.group_by_distinct_count::<StringKeyExtractor>(distinct_cols),
-                dt => return Err(Error::DataTypeNotSupportedForGroupBy(dt.clone())),
+                dt => {
+                    return Err(Error::DataTypeNotSupportedForGroupBy {
+                        column: distinct.column().name.clone(),
+                        data_type: dt.clone(),
+                    });
+                }
             };
         // Per-partition distinct counts are i64; their total can't exceed the
         // row count, so the narrow accumulator suffices. The result is the
