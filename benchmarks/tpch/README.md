@@ -38,23 +38,16 @@ their results match DuckDB on the same flat parquet.
 | q14 | Promotion Effect | promo share of revenue |
 | q19 | Discounted Revenue | multi-branch predicate |
 
-### Engine constraints these queries work around
+### Engine constraint these queries work around
 
-Float (`DOUBLE`) aggregation and float scalar constants require the float
-support on main; without it every money query fails. Given that, three shapes
-still have to be avoided, so the SQL is written accordingly:
+The queries are the standard TPC-H text (interval arithmetic, `LIKE 'x%'`, and
+up to eight aggregates per group are all supported). One structural limit
+remains:
 
-- **At most six aggregate expressions per GROUP BY.** q10 would need seven to
-  return every customer column, so it drops `c_comment`.
 - **No float column as a GROUP BY key.** Standard q10 groups by `c_acctbal`
   (a `DOUBLE`); instead it groups by `o_custkey` alone (which determines every
-  other customer column) and pulls the rest through `MIN()`.
-- **No date +/- interval.** DuckDB folds `DATE '...' - INTERVAL '90' DAY` into a
-  TIMESTAMP constant the bridge can't take, so q01 uses the pre-folded date
-  literal `DATE '1998-09-02'`.
-- **`LIKE 'x%'` (prefix) is unsupported** (DuckDB lowers it to `prefix()`); q14
-  uses `LIKE '%PROMO%'`, which routes through the supported `contains` path and
-  is equivalent on TPC-H data (`PROMO` only ever appears as the leading syllable).
+  other customer column) and pulls the rest through `MIN()`. The output is
+  identical.
 
 **Not included, by design.** A lineitem-grain flat table can't express queries
 that live at a different grain or need anti-joins:
