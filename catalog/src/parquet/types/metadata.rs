@@ -13,7 +13,7 @@ use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::FileLocation;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Decoded min/max (and counts) for one column of a row group. Each bound is an
 /// arrow [`Scalar<ArrayRef>`] — the same shape the planner uses for SQL
@@ -76,6 +76,13 @@ pub struct RowGroupMetadata {
     /// not be conflated with the row group's *global* index, which is simply
     /// its position in the table's flat `row_groups` list.
     pub file_row_group_idx: usize,
+    /// How many of this row group's pages are currently resident in the
+    /// decompressed cache. The cache itself maintains it (a clone rides on every
+    /// cached page, incremented on insert and decremented when the page leaves);
+    /// the scan feed reads it to hand out cache-covered row groups first, so a
+    /// repeated scan consumes what's already decompressed before its own churn
+    /// can evict it.
+    pub live_decompressed_pages: Arc<AtomicUsize>,
 }
 
 impl RowGroupMetadata {

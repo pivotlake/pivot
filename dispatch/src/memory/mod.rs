@@ -24,7 +24,7 @@ pub mod compressed_cache;
 pub use compressed_cache::CacheLookup;
 
 pub mod decompressed_cache;
-pub use decompressed_cache::{BlockKey, DecompressedCache};
+pub use decompressed_cache::{BlockKey, DecompressedCache, Segment};
 
 pub mod clock;
 pub use clock::{Clock, Owner};
