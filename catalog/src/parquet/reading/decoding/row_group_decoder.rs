@@ -11,7 +11,9 @@ use crate::parquet::reading::decoding::column_decoders;
 use crate::parquet::reading::decoding::column_decoders::{
     BytesViewDecoder, ColumnDecoder, PrimitiveColumnDecoder,
 };
-use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
+use crate::parquet::reading::record_batch_metadata::{
+    with_row_group_metadata, with_row_group_metadata_from_indices,
+};
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
@@ -108,6 +110,11 @@ pub struct RowGroupDecoder {
     row_offset: usize,
     /// Whether to append row-group-id / row-index metadata columns.
     add_row_group_metadata: bool,
+    /// The query's surviving row positions, when the scan is filtered. Emitted
+    /// rows are exactly these positions in order, so the metadata row-index
+    /// column must be stamped from them (a dense range would renumber the rows
+    /// and break anything addressing the row group by original position).
+    filtered_indices: Option<Arc<Vec<u32>>>,
     /// Projected-column positions that carry a pushed-down equality constant
     /// whose column chunk is sound to prune by (all data pages dictionary
     /// encoded). When any such column's dictionary excludes its constant, the
@@ -180,6 +187,7 @@ impl RowGroupDecoder {
                 .unwrap_or(row_group_metadata.num_rows() as usize),
             row_offset: 0,
             add_row_group_metadata,
+            filtered_indices: row_group_metadata.filtered_indices().clone(),
             prunable_columns,
             pruned,
         })
@@ -248,7 +256,20 @@ impl RowGroupDecoder {
                 .collect::<Result<Vec<_>>>()?;
             let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
             let batch = if self.add_row_group_metadata {
-                with_row_group_metadata(record_batch, self.row_group_idx, self.row_offset)
+                // The row-index column carries each row's ORIGINAL position in
+                // the row group. A filtered scan emits only the surviving
+                // positions, so stamp those; only an unfiltered scan may use
+                // the dense range.
+                match &self.filtered_indices {
+                    Some(indices) => with_row_group_metadata_from_indices(
+                        record_batch,
+                        self.row_group_idx,
+                        &indices[self.row_offset..self.row_offset + available],
+                    ),
+                    None => {
+                        with_row_group_metadata(record_batch, self.row_group_idx, self.row_offset)
+                    }
+                }
             } else {
                 record_batch
             };

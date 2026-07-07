@@ -114,6 +114,33 @@ pub fn table_input_with_filter_and_eq_predicates(
     scan_order: Option<ScanOrder>,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
+    table_input_with_condition_cache(
+        dispatcher,
+        table,
+        projection,
+        add_row_group_metadata,
+        filter,
+        scan_order,
+        eq_predicates,
+        None,
+    )
+}
+
+/// Like [`table_input_with_filter_and_eq_predicates`] but additionally seeding
+/// each row group with positions already known to survive the query's filter
+/// (from a condition cache), aligned to `table.row_groups`. Cached-empty row
+/// groups are skipped outright; the rest read only their surviving positions.
+#[allow(clippy::too_many_arguments)]
+pub fn table_input_with_condition_cache(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    projection: Projection,
+    add_row_group_metadata: bool,
+    filter: Option<RowGroupFilter>,
+    scan_order: Option<ScanOrder>,
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    cached_positions: Option<Vec<Option<Arc<Vec<u32>>>>>,
+) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
     // A projection with no data columns can't go through the column-driven page
     // pipeline (it would fetch nothing and emit no rows), so route it to a source
@@ -124,7 +151,13 @@ pub fn table_input_with_filter_and_eq_predicates(
     if projection.indices().is_empty() {
         return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
     }
-    let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
+    let injector = RowGroupInjectorFactory::new(
+        table,
+        projection.clone(),
+        filter,
+        scan_order,
+        cached_positions,
+    );
     let siblings = Arc::new(AtomicUsize::new(n));
     // One fetcher handles disk and HTTP row groups, bounding each medium's
     // in-flight count separately.

@@ -30,10 +30,12 @@ pub(crate) fn http_readahead() -> usize {
 mod request_tracker;
 
 mod reading;
+pub(crate) use reading::visit_row_group_runs;
 pub use reading::{
     DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory, MaterializerFactory,
     RowGroupDecoderError, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    global_row_group, materialize, row_index, table_input, table_input_with_condition_cache,
+    table_input_with_filter, table_input_with_filter_and_eq_predicates, with_row_group_metadata,
 };
 
 mod metadata;
@@ -63,6 +65,7 @@ pub(crate) mod test_utils {
     pub fn dummy_row_group() -> Arc<RowGroupMetadata> {
         Arc::new(RowGroupMetadata {
             location: FileLocation::Local(Arc::new(std::fs::File::open("/dev/null").unwrap())),
+            file_path: Arc::from("/dev/null"),
             schema: Arc::new(Schema::empty()),
             columns: vec![],
             num_rows: 0,
@@ -73,6 +76,6 @@ pub(crate) mod test_utils {
 
     pub fn dummy_metadata(filtered_indices: Option<Vec<u32>>) -> QueryRowGroupMetadata {
         let table = ParquetTable::new(vec![dummy_row_group()]);
-        QueryRowGroupMetadata::new(&table, 0, filtered_indices)
+        QueryRowGroupMetadata::new(&table, 0, filtered_indices.map(Arc::new))
     }
 }

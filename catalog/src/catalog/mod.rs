@@ -30,10 +30,13 @@
 //! pushdown accumulates on that binding alone.
 
 mod binding;
+mod condition_cache;
+mod condition_observer;
 mod metadata_function;
 mod table;
 
 pub use binding::TableBinding;
+pub use condition_cache::{ConditionCacheStats, QueryConditionCache};
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -128,6 +131,11 @@ pub struct ParquetCatalog {
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
     dispatcher: DataFlowDispatcher,
+
+    /// Cross-query cache of filter results per row group (see
+    /// [`QueryConditionCache`]). Shared with every query context and with each
+    /// table (which invalidates entries when files leave its manifest).
+    condition_cache: Arc<QueryConditionCache>,
 }
 
 impl std::fmt::Debug for ParquetCatalog {
@@ -150,6 +158,7 @@ impl ParquetCatalog {
             tables: Arc::new(RwLock::new(HashMap::new())),
             store: Arc::new(LocalStore::new(root)),
             dispatcher,
+            condition_cache: Arc::new(QueryConditionCache::from_env()),
         }
     }
 
@@ -161,10 +170,11 @@ impl ParquetCatalog {
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
         let manifest = CatalogManifest::load(store.as_ref())?;
+        let condition_cache = Arc::new(QueryConditionCache::from_env());
 
         let mut tables = HashMap::new();
         for entry in &manifest.tables {
-            let table = Self::load_table(dispatcher, &store, entry)?;
+            let table = Self::load_table(dispatcher, &store, entry, condition_cache.clone())?;
             tables.insert(entry.name.clone(), table);
         }
 
@@ -172,6 +182,7 @@ impl ParquetCatalog {
             tables: Arc::new(RwLock::new(tables)),
             store,
             dispatcher: dispatcher.clone(),
+            condition_cache,
         })
     }
 
@@ -183,6 +194,7 @@ impl ParquetCatalog {
         dispatcher: &DataFlowDispatcher,
         store: &Arc<dyn ObjectStore>,
         entry: &CatalogManifestTableEntry,
+        condition_cache: Arc<QueryConditionCache>,
     ) -> Result<CatalogTable> {
         let manifest = TableManifest::load(store.as_ref(), &entry.name)?;
         let files = manifest
@@ -202,7 +214,21 @@ impl ParquetCatalog {
             table_files,
             store.clone(),
             dispatcher.clone(),
+            condition_cache,
         ))
+    }
+
+    /// The catalog's cross-query condition cache, for introspection and tests.
+    pub fn condition_cache(&self) -> &Arc<QueryConditionCache> {
+        &self.condition_cache
+    }
+
+    /// Replace the condition cache, e.g. to size or disable it
+    /// programmatically instead of via the environment. Call before creating
+    /// or loading tables so they all share the replacement.
+    pub fn with_condition_cache(mut self, condition_cache: Arc<QueryConditionCache>) -> Self {
+        self.condition_cache = condition_cache;
+        self
     }
 
     /// Resolve `name` to a fresh [`TableBinding`] (same semantics as
@@ -304,6 +330,7 @@ impl ParquetCatalog {
         let tables = self.tables.clone();
         let store = self.store.clone();
         let pool = dispatcher.clone();
+        let condition_cache = self.condition_cache.clone();
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
             &files,
@@ -322,6 +349,7 @@ impl ParquetCatalog {
                     sort_by,
                     store.clone(),
                     pool,
+                    condition_cache,
                 )?;
                 // Record name → location in the database index.
                 let mut index = CatalogManifest::load(store.as_ref())?;
@@ -406,6 +434,7 @@ impl Catalog for ParquetCatalog {
         Box::new(ParquetQueryContext {
             tables: self.tables.clone(),
             pinned: Mutex::new(HashMap::new()),
+            condition_cache: self.condition_cache.clone(),
         })
     }
 
@@ -447,9 +476,16 @@ pub(super) struct ParquetQueryContext {
     /// which is correct — they never share an index space. The filter half is each
     /// `(column, JSON constant)` sorted, the hashable form of the predicates.
     pinned: Mutex<PinnedScanViews>,
+    /// The catalog's cross-query condition cache, handed to each scan's binding.
+    condition_cache: Arc<QueryConditionCache>,
 }
 
 impl ParquetQueryContext {
+    /// The catalog's cross-query condition cache.
+    pub(super) fn condition_cache(&self) -> &Arc<QueryConditionCache> {
+        &self.condition_cache
+    }
+
     /// Table `name`'s committed row groups for the files that can match
     /// `partition_filters` — the partition-pruned scan view, pinned on first ask
     /// and returned from the pin thereafter. Footers are fetched lazily here, only

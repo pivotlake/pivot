@@ -9,7 +9,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::parquet::{ParquetTable, table_input};
+use catalog::parquet::{ParquetTable, row_index, table_input, table_input_with_condition_cache};
 use common::*;
 use dispatch::{AggregationKind, AggregationSlot, Projection};
 
@@ -139,6 +139,97 @@ fn materialize_rejects_corrupt_footer_without_panicking() {
         result.is_err(),
         "a footer longer than the file must error, not panic"
     );
+}
+
+#[test]
+fn scan_with_cached_positions_reads_only_those_rows() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(
+        &dispatch,
+        &[strings_and_ints(
+            &["a", "b", "c", "d", "e"],
+            &[10, 20, 30, 40, 50],
+        )],
+        true,
+    );
+
+    let results = table_input_with_condition_cache(
+        &dispatch,
+        &table,
+        Projection::columns([1]),
+        false,
+        None,
+        None,
+        Arc::new(Vec::new()),
+        Some(vec![Some(Arc::new(vec![1, 3]))]),
+    )
+    .collect()
+    .unwrap();
+
+    let mut vals = collect_i64s(&results, 0);
+    vals.sort();
+    assert_eq!(vals, vec![20, 40]);
+}
+
+#[test]
+fn scan_with_cached_empty_positions_skips_the_row_group() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(
+        &dispatch,
+        &[strings_and_ints(&["a", "b", "c"], &[1, 2, 3])],
+        true,
+    );
+
+    let results = table_input_with_condition_cache(
+        &dispatch,
+        &table,
+        Projection::columns([1]),
+        false,
+        None,
+        None,
+        Arc::new(Vec::new()),
+        Some(vec![Some(Arc::new(vec![]))]),
+    )
+    .collect()
+    .unwrap();
+
+    assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[test]
+fn filtered_scan_row_index_metadata_keeps_original_positions() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table(
+        &dispatch,
+        &[strings_and_ints(
+            &["a", "b", "c", "d", "e"],
+            &[10, 20, 30, 40, 50],
+        )],
+        true,
+    );
+
+    let results = table_input_with_condition_cache(
+        &dispatch,
+        &table,
+        Projection::columns([1]),
+        true,
+        None,
+        None,
+        Arc::new(Vec::new()),
+        Some(vec![Some(Arc::new(vec![0, 2, 4]))]),
+    )
+    .collect()
+    .unwrap();
+
+    let mut positions: Vec<u32> = results
+        .iter()
+        .flat_map(|b| row_index(b).values().iter().copied())
+        .collect();
+    positions.sort();
+    assert_eq!(positions, vec![0, 2, 4]);
+    let mut vals = collect_i64s(&results, 0);
+    vals.sort();
+    assert_eq!(vals, vec![10, 30, 50]);
 }
 
 #[test]

@@ -16,7 +16,7 @@ use std::sync::Arc;
 pub(crate) type CmpKernel =
     fn(&dyn Datum, &dyn Datum) -> std::result::Result<BooleanArray, ArrowError>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompareType {
     Equal,
     NotEqual,

@@ -109,11 +109,19 @@ impl RowGroupInjectorFactory {
     /// in that key's order so the most-promising are stolen first and the
     /// boundary prunes the rest; otherwise decompressed-cache-covered row groups
     /// go first (see [`cache_first_order`]), falling back to file order.
+    ///
+    /// `cached_positions`, when present, is aligned to `table.row_groups`: a
+    /// `Some(positions)` entry means those row positions are already known to
+    /// survive the query's filter, so the scan reads only them. A row group
+    /// whose known positions are empty is not enqueued at all (nothing to
+    /// fetch); one whose positions cover every row scans plain (cheaper than an
+    /// all-true mask).
     pub fn new(
         table: &Arc<ParquetTable>,
         projection: Projection,
         filter: Option<RowGroupFilter>,
         scan_order: Option<ScanOrder>,
+        cached_positions: Option<Vec<Option<Arc<Vec<u32>>>>>,
     ) -> Self {
         let injector = Arc::new(Injector::new());
         let order = match scan_order {
@@ -121,7 +129,23 @@ impl RowGroupInjectorFactory {
             None => cache_first_order(table),
         };
         for row_group_idx in order {
-            injector.push(QueryRowGroupMetadata::new(table, row_group_idx, None));
+            let positions = cached_positions
+                .as_ref()
+                .and_then(|cached| cached[row_group_idx].clone());
+            let filtered_indices = match positions {
+                Some(positions) if positions.is_empty() => continue,
+                Some(positions)
+                    if positions.len() == table.row_groups[row_group_idx].num_rows as usize =>
+                {
+                    None
+                }
+                other => other,
+            };
+            injector.push(QueryRowGroupMetadata::new(
+                table,
+                row_group_idx,
+                filtered_indices,
+            ));
         }
         Self {
             row_groups: injector,

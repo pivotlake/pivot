@@ -109,6 +109,7 @@
 mod build;
 pub mod catalog;
 pub mod compile;
+pub mod condition_key;
 pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;

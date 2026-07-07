@@ -66,6 +66,11 @@ pub struct RowGroupMetadata {
     /// The open file holding this row group's bytes (local file or remote
     /// object) — what the fetcher reads from and the compressed cache keys on.
     pub location: FileLocation,
+    /// The file's store-relative resolved path. Unlike `location` (an open fd
+    /// or a presigned URL, both process-transient), this is stable across
+    /// queries and restarts, so together with `file_row_group_idx` it
+    /// identifies the row group durably (cross-query caches key on it).
+    pub file_path: Arc<str>,
     /// Arrow schema describing the columns in this row group.
     pub schema: SchemaRef,
     /// Per-column-chunk byte layout (offsets and sizes).
@@ -104,7 +109,9 @@ pub struct QueryRowGroupMetadata {
     /// The underlying static row-group metadata.
     pub row_group_metadata: Arc<RowGroupMetadata>,
     /// Sorted row indices to read, or `None` to read the full row group.
-    pub filtered_indices: Option<Vec<u32>>,
+    /// Shared (`Arc`) because a cross-query condition cache hands the same
+    /// positions to many queries without copying them.
+    pub filtered_indices: Option<Arc<Vec<u32>>>,
     /// The row group's global index — its position in the table's flat
     /// `row_groups` list, which is how the materializer addresses it back.
     pub row_group_index: usize,
@@ -116,7 +123,11 @@ pub struct QueryRowGroupMetadata {
 }
 
 impl QueryRowGroupMetadata {
-    pub fn new(table: &ParquetTable, index: usize, filtered_indices: Option<Vec<u32>>) -> Self {
+    pub fn new(
+        table: &ParquetTable,
+        index: usize,
+        filtered_indices: Option<Arc<Vec<u32>>>,
+    ) -> Self {
         Self {
             row_group_metadata: table.row_groups[index].clone(),
             filtered_indices,
@@ -160,7 +171,7 @@ impl QueryRowGroupMetadata {
         self.row_group_index
     }
 
-    pub fn filtered_indices(&self) -> &Option<Vec<u32>> {
+    pub fn filtered_indices(&self) -> &Option<Arc<Vec<u32>>> {
         &self.filtered_indices
     }
 }

@@ -25,6 +25,9 @@ pub mod store;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
-pub use catalog::{CatalogTable, Error, ParquetCatalog, Result, TableBinding};
+pub use catalog::{
+    CatalogTable, ConditionCacheStats, Error, ParquetCatalog, QueryConditionCache, Result,
+    TableBinding,
+};
 pub use manifest::{ManifestEntry, PartitionEqFilter, SortBounds};
 pub use store::FileRef;

@@ -265,6 +265,7 @@ mod tests {
         let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
             location: dispatch::io::FileLocation::Local(file),
+            file_path: Arc::from("/dev/null"),
             schema,
             columns: (0..num_cols)
                 .map(|_| ColumnChunkMeta {
@@ -438,7 +439,7 @@ mod tests {
         init_test_free_pool(4);
         let schema = i32_schema(&["a"]);
         let table = make_test_table(schema, 3);
-        let metadata = QueryRowGroupMetadata::new(&table, 0, Some(vec![]));
+        let metadata = QueryRowGroupMetadata::new(&table, 0, Some(Arc::new(vec![])));
         let page = make_skipped_page(metadata, 0, 3, 0);
 
         let out = run_unary(new_decoder(&table, 1024), vec![page]);

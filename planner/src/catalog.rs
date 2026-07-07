@@ -15,10 +15,11 @@
 use std::any::Any;
 use std::collections::HashMap;
 
+use crate::condition_key::ConditionKey;
 use crate::expression::{CompareType, TableFilter};
 use crate::operator::TableFunction;
 use crate::types::{Type, logical_from_type};
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::Expr;
@@ -48,6 +49,26 @@ pub struct DynamicScanPredicate {
     pub column_idx: usize,
     pub compare_type: CompareType,
     pub slot: Arc<DynamicFilterSlot>,
+}
+
+/// Reports one filter batch to the backend's condition cache: the batch (which
+/// carries the scan's row-group/row-index metadata columns) and the boolean
+/// mask its filter just evaluated. Provided by the backend, called by the
+/// scan-adjacent filter on every batch.
+pub type ConditionObserverFn = Arc<dyn Fn(&RecordBatch, &BooleanArray) + Send + Sync>;
+
+/// A scan compiled with condition-cache awareness
+/// ([`Table::compile_with_condition_cache`]).
+pub struct ConditionCachedScan {
+    pub spec: RecordBatchOperatorSpec,
+    /// Present when at least one row group misses the cache: the scan then
+    /// emits row-group metadata and the filter above must report every batch
+    /// here so complete row groups get published.
+    pub observer: Option<ConditionObserverFn>,
+    /// True when the metadata columns were appended solely for observation and
+    /// must be stripped after the filter (false when the caller itself
+    /// requested them, e.g. a late-materialized narrow scan).
+    pub strip_metadata: bool,
 }
 
 /// A single column in a [`Table`]'s schema: name plus Pivot [`Type`].
@@ -125,6 +146,36 @@ pub trait Table: Debug + Send + Sync {
         emit_row_group_metadata: bool,
         ctx: &dyn QueryContext,
     ) -> Result<RecordBatchOperatorSpec>;
+
+    /// Like [`compile`](Table::compile), but aware of the filter conjunction
+    /// (`condition`) sitting directly above the scan, so a backend with a
+    /// condition cache can inject already-known surviving row positions and
+    /// hand back an observer for the filter to populate the cache with.
+    ///
+    /// The default ignores the condition and compiles a plain scan (no
+    /// injection, no observer), which is always correct — backends without a
+    /// condition cache never see any behavior change.
+    fn compile_with_condition_cache(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        projection: Projection,
+        dynamic_filters: Vec<DynamicScanPredicate>,
+        emit_row_group_metadata: bool,
+        _condition: &ConditionKey,
+        ctx: &dyn QueryContext,
+    ) -> Result<ConditionCachedScan> {
+        Ok(ConditionCachedScan {
+            spec: self.compile(
+                dispatcher,
+                projection,
+                dynamic_filters,
+                emit_row_group_metadata,
+                ctx,
+            )?,
+            observer: None,
+            strip_metadata: false,
+        })
+    }
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;

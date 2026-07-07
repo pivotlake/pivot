@@ -5,18 +5,20 @@
 
 use std::sync::Arc;
 
+use crate::catalog::condition_observer::build_condition_observer;
 use crate::manifest::PartitionEqFilter;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
-    scan_order_from, table_input_with_filter_and_eq_predicates,
+    scan_order_from, table_input_with_condition_cache,
 };
 use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
 use arrow_schema::{Field, Schema};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
-    Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
-    Table,
+    Column, ConditionCachedScan, DynamicScanPredicate, Error as CatalogError, QueryContext,
+    Result as CatalogResult, Table,
 };
+use planner::condition_key::ConditionKey;
 use planner::expression::{CompareType, Expression, TableFilter};
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
@@ -132,34 +134,80 @@ impl Table for TableBinding {
         // reloads once and pins), so a reused cached plan scans data committed
         // since it was planned.
         let current = self.resolve_files(ctx)?;
-
-        // Equality predicates additionally let the decoder skip row groups whose
-        // dictionary for that column excludes the constant.
-        let eq_predicates: Vec<ScanEqualityPredicate> = self
-            .predicates
-            .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
-            .map(|p| ScanEqualityPredicate {
-                column_idx: p.column_idx,
-                value: p.value.clone(),
-            })
-            .collect();
-
         // Prune the row groups by the pushed-down predicates' stats. No footer
         // re-read — the cache already holds the materialized row groups.
         let parquet = Arc::new(self.pruned_parquet(&current));
-        // Order the scan by the Top-N's key so its boundary tightens after the
-        // first row group and the rest get pruned, instead of racing file order.
-        let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(self.build_scan(
             dispatcher,
             &parquet,
             projection,
+            dynamic_filters,
             emit_row_group_metadata,
-            row_group_filter_from(dynamic_filters),
-            scan_order,
-            Arc::new(eq_predicates),
+            None,
         ))
+    }
+
+    fn compile_with_condition_cache(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        projection: Projection,
+        dynamic_filters: Vec<DynamicScanPredicate>,
+        emit_row_group_metadata: bool,
+        condition: &ConditionKey,
+        ctx: &dyn QueryContext,
+    ) -> CatalogResult<ConditionCachedScan> {
+        let query_ctx = ctx
+            .as_any()
+            .downcast_ref::<super::ParquetQueryContext>()
+            .ok_or_else(|| {
+                CatalogError::Other("query context is not a ParquetQueryContext".into())
+            })?;
+        let cache = query_ctx.condition_cache().clone();
+        // A zero-column projection routes to the metadata-only scan, which
+        // reads nothing worth caching positions for.
+        if !cache.enabled() || projection.indices().is_empty() {
+            return Ok(ConditionCachedScan {
+                spec: self.compile(
+                    dispatcher,
+                    projection,
+                    dynamic_filters,
+                    emit_row_group_metadata,
+                    ctx,
+                )?,
+                observer: None,
+                strip_metadata: false,
+            });
+        }
+
+        let current = self.resolve_files(ctx)?;
+        // Stats pruning FIRST, then the cache lookup against that exact pruned
+        // table: the lookup vector, the injected positions, the observer, and
+        // the scan's row-group ids all share one index space by construction.
+        let parquet = Arc::new(self.pruned_parquet(&current));
+        let cached: Vec<Option<Arc<Vec<u32>>>> = parquet
+            .row_groups()
+            .iter()
+            .map(|rg| cache.get(&rg.file_path, rg.file_row_group_idx, condition))
+            .collect();
+        let observe = cached.iter().any(Option::is_none);
+        let observer = observe
+            .then(|| build_condition_observer(cache.clone(), condition.clone(), &parquet, &cached));
+        let spec = self.build_scan(
+            dispatcher,
+            &parquet,
+            projection,
+            dynamic_filters,
+            emit_row_group_metadata || observe,
+            Some(cached),
+        );
+        Ok(ConditionCachedScan {
+            spec,
+            observer,
+            // Metadata appended solely for observation is stripped above the
+            // filter; a late-materialized narrow scan keeps it for its
+            // Materialize.
+            strip_metadata: observe && !emit_row_group_metadata,
+        })
     }
 
     fn columns(&self) -> Vec<Column> {
@@ -270,6 +318,43 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 }
 
 impl TableBinding {
+    /// Assemble the scan dataflow over an already-pruned table view, optionally
+    /// seeding row groups with cached surviving positions.
+    fn build_scan(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        parquet: &Arc<ParquetTable>,
+        projection: Projection,
+        dynamic_filters: Vec<DynamicScanPredicate>,
+        emit_row_group_metadata: bool,
+        cached_positions: Option<Vec<Option<Arc<Vec<u32>>>>>,
+    ) -> RecordBatchOperatorSpec {
+        // Equality predicates additionally let the decoder skip row groups whose
+        // dictionary for that column excludes the constant.
+        let eq_predicates: Vec<ScanEqualityPredicate> = self
+            .predicates
+            .iter()
+            .filter(|p| matches!(p.compare_type, CompareType::Equal))
+            .map(|p| ScanEqualityPredicate {
+                column_idx: p.column_idx,
+                value: p.value.clone(),
+            })
+            .collect();
+        // Order the scan by the Top-N's key so its boundary tightens after the
+        // first row group and the rest get pruned, instead of racing file order.
+        let scan_order = scan_order_from(&dynamic_filters);
+        table_input_with_condition_cache(
+            dispatcher,
+            parquet,
+            projection,
+            emit_row_group_metadata,
+            row_group_filter_from(dynamic_filters),
+            scan_order,
+            Arc::new(eq_predicates),
+            cached_positions,
+        )
+    }
+
     /// Clone `parquet`'s row groups and keep only those that survive this
     /// binding's pushed-down predicates — i.e. what [`Table::compile`] actually
     /// scans over the table's current files. A min/max stat that proves no row in

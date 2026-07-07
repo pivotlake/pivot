@@ -171,9 +171,10 @@ pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 pub(crate) fn row_groups_from_footer(
     footer: &[u8],
     location: dispatch::io::FileLocation,
+    file_path: Arc<str>,
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    build_row_groups(file_meta, location)
+    build_row_groups(file_meta, location, file_path)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
@@ -183,6 +184,7 @@ pub(crate) fn row_groups_from_footer(
 fn build_row_groups(
     file_meta: FileMetaData,
     location: dispatch::io::FileLocation,
+    file_path: Arc<str>,
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
     let schema = Arc::new(schema);
@@ -216,6 +218,7 @@ fn build_row_groups(
                 .collect();
             RowGroupMetadata {
                 location: location.clone(),
+                file_path: file_path.clone(),
                 schema: schema.clone(),
                 columns,
                 num_rows,

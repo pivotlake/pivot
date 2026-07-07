@@ -15,6 +15,7 @@
 use dispatch::io::AuthHeader;
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 mod gcs;
 mod local;
@@ -68,8 +69,13 @@ impl FileRef {
         store: &dyn ObjectStore,
         location: &ObjectPath,
     ) -> Result<DataFile> {
-        let source = store.source(&location.resolve(&self.path))?;
-        Ok(DataFile { file: self, source })
+        let resolved = location.resolve(&self.path);
+        let source = store.source(&resolved)?;
+        Ok(DataFile {
+            file: self,
+            resolved_path: Arc::from(resolved.as_str()),
+            source,
+        })
     }
 }
 
@@ -81,6 +87,10 @@ impl FileRef {
 #[derive(Clone, Debug)]
 pub struct DataFile {
     pub file: FileRef,
+    /// The file's store-relative resolved path: stable across queries and
+    /// process restarts (unlike the read `source`, which may be a presigned
+    /// URL or an open fd), so caches key on it.
+    pub resolved_path: Arc<str>,
     pub source: DataFileSource,
 }
 
@@ -117,11 +127,13 @@ impl DataFile {
     /// filesystem path (these constructors feed the whole-directory readers,
     /// where the path is the file's identity directly).
     pub fn local(path: PathBuf, size: u64) -> Self {
+        let path_string = path.to_string_lossy().into_owned();
         Self {
             file: FileRef {
-                path: ObjectPath::new(path.to_string_lossy().into_owned()),
+                path: ObjectPath::new(path_string.clone()),
                 size,
             },
+            resolved_path: Arc::from(path_string.as_str()),
             source: DataFileSource::Local(path),
         }
     }
@@ -134,6 +146,7 @@ impl DataFile {
                 path: ObjectPath::new(url.path()),
                 size,
             },
+            resolved_path: Arc::from(url.path()),
             source: DataFileSource::Remote { url, auth: None },
         }
     }
@@ -257,6 +270,33 @@ mod tests {
         assert_eq!(
             object_key("", &ObjectPath::new("/shared/a.parquet")),
             "shared/a.parquet"
+        );
+    }
+
+    #[test]
+    fn into_data_file_stamps_location_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(dir.path().to_str().unwrap()).unwrap();
+        let location = ObjectPath::new("events");
+        let relative = FileRef {
+            path: ObjectPath::new("a.parquet"),
+            size: 1,
+        };
+        let absolute = FileRef {
+            path: ObjectPath::new("/shared/a.parquet"),
+            size: 1,
+        };
+
+        let relative_file = relative.clone().into_data_file(store.as_ref(), &location);
+        let absolute_file = absolute.clone().into_data_file(store.as_ref(), &location);
+
+        assert_eq!(
+            &*relative_file.unwrap().resolved_path,
+            location.resolve(&relative.path).as_str()
+        );
+        assert_eq!(
+            &*absolute_file.unwrap().resolved_path,
+            location.resolve(&absolute.path).as_str()
         );
     }
 

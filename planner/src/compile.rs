@@ -21,6 +21,7 @@
 //!
 
 use crate::catalog::{Catalog, QueryContext};
+use crate::condition_key::{ConditionKeyOutcome, build_condition_key};
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
@@ -202,6 +203,18 @@ impl PlanNode {
             return Ok(spec);
         }
 
+        // Peephole: a stack of Filters sitting directly on a table scan hands
+        // its whole conjunction to the table, which may answer row groups from
+        // a condition cache (injecting known surviving positions) and provide
+        // an observer to populate it. Fires at the topmost filter of the stack
+        // (recursion reaches it first); any non-cacheable shape falls through
+        // to the generic path below unchanged.
+        if let crate::Operator::Filter(_) = &self.operator
+            && let Some(spec) = try_compile_condition_cached_scan(self, dispatcher, ctx, slots)?
+        {
+            return Ok(spec);
+        }
+
         // EXPLAIN renders its (already-optimized) child plan as text and emits
         // that. The child is formatted here, not compiled, so the explained
         // query never runs. This must happen before the input-compile loop below.
@@ -243,6 +256,93 @@ impl PlanNode {
             crate::Operator::SetVariable(_) => Err(Error::SetVariableNotCompilable),
         }
     }
+}
+
+/// Compile a `Filter[-> Filter] -> Input` chain through the table's condition
+/// cache. `Some(spec)` when the chain matched and compiled; `Ok(None)` when the
+/// shape or the conjunction is not cacheable, sending the caller down the
+/// generic path with zero behavior change.
+fn try_compile_condition_cached_scan(
+    node: &PlanNode,
+    dispatcher: &DataFlowDispatcher,
+    ctx: &dyn QueryContext,
+    slots: &mut DynamicFilterSlots,
+) -> Result<Option<RecordBatchOperatorSpec>, Error> {
+    // Walk the adjacent Filter nodes down to the scan, collecting the stack
+    // top-down. Anything else in between (a projection, a limit) breaks the
+    // chain; the peephole then fires again lower if a filter sits under it.
+    let mut filter_stack: Vec<&crate::operator::Filter> = Vec::new();
+    let mut current = node;
+    let input = loop {
+        match &current.operator {
+            crate::Operator::Filter(filter) if current.inputs.len() == 1 => {
+                filter_stack.push(filter);
+                current = &current.inputs[0];
+            }
+            crate::Operator::Input(input) => break input,
+            _ => return Ok(None),
+        }
+    };
+
+    let Some(scan_output_names) = input.build_scan_output_names() else {
+        return Ok(None);
+    };
+    // Bottom-up (pushdown predicates first), matching the order the generic
+    // path would evaluate the stack in.
+    let conditions: Vec<&Expression> = filter_stack
+        .iter()
+        .rev()
+        .flat_map(|filter| filter.conditions.iter())
+        .collect();
+    let condition = match build_condition_key(&conditions, &scan_output_names) {
+        ConditionKeyOutcome::Cacheable(condition) => condition,
+        ConditionKeyOutcome::NotCacheable => return Ok(None),
+    };
+
+    let compiled = input.compile_with_condition(dispatcher, ctx, slots, &condition)?;
+    match compiled.observer {
+        // Nothing to observe (cache disabled, backend without a cache, or every
+        // row group already answered): compile the stack per node exactly as
+        // the generic path would. Injected row groups re-evaluate to all-true.
+        None => {
+            let mut spec = compiled.spec;
+            for filter in filter_stack.iter().rev() {
+                spec = filter.compile(spec)?;
+            }
+            Ok(Some(spec))
+        }
+        // Observing: the stack must run as ONE fused filter, because the
+        // observer's completeness accounting counts every scanned row; a lower
+        // filter dropping rows first would leave row groups forever
+        // incomplete. The metadata columns ride behind the data columns, so
+        // the conditions' positional references are unaffected.
+        Some(observer) => {
+            let mut spec = crate::operator::Filter::compile_observed(
+                conditions.into_iter(),
+                compiled.spec,
+                observer,
+            )?;
+            if compiled.strip_metadata {
+                spec = strip_trailing_metadata_columns(spec);
+            }
+            Ok(Some(spec))
+        }
+    }
+}
+
+/// Drop the trailing row-group-metadata columns a scan appended for
+/// observation, restoring the schema everything above the filter expects.
+fn strip_trailing_metadata_columns(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+    spec.project(|| {
+        |batch: RecordBatch| {
+            let metadata_columns = dispatch::trailing_metadata_columns(&batch.schema());
+            if metadata_columns == 0 {
+                return batch;
+            }
+            let kept: Vec<usize> = (0..batch.num_columns() - metadata_columns).collect();
+            batch.project(&kept).unwrap()
+        }
+    })
 }
 
 /// What an evaluated expression produces for one input batch: either a

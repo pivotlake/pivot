@@ -93,6 +93,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
         // `TableFile`.
         let DataFile {
             file: file_ref,
+            resolved_path,
             source,
         } = file;
         let size = file_ref.size as usize;
@@ -109,9 +110,9 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
             }
         };
 
-        let slot = self
-            .tracker
-            .admit_request(FooterRead::start(file_ref, location, size));
+        let slot =
+            self.tracker
+                .admit_request(FooterRead::start(file_ref, resolved_path, location, size));
         self.advance(slot, sender)
     }
 
@@ -167,6 +168,9 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 struct FooterRead {
     /// The file's durable identity, stamped onto the emitted [`TableFile`].
     file: FileRef,
+    /// The file's store-relative resolved path, stamped onto each row group as
+    /// its stable cross-query identity.
+    resolved_path: Arc<str>,
     /// The open file (it keeps the handle alive, and travels into the row
     /// groups as their location).
     location: FileLocation,
@@ -196,10 +200,11 @@ impl PendingRequest for FooterRead {
 impl FooterRead {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
-    fn start(file: FileRef, location: FileLocation, size: usize) -> Self {
+    fn start(file: FileRef, resolved_path: Arc<str>, location: FileLocation, size: usize) -> Self {
         memory_ctx().compressed_cache().open_entry(location.clone());
         let mut request = Self {
             file,
+            resolved_path,
             location,
             size,
             lookups: Vec::new(),
@@ -296,6 +301,10 @@ impl FooterRead {
             &bytes[start..bytes.len() - 8]
         };
 
-        Ok(Some(row_groups_from_footer(footer, self.location.clone())?))
+        Ok(Some(row_groups_from_footer(
+            footer,
+            self.location.clone(),
+            self.resolved_path.clone(),
+        )?))
     }
 }

@@ -92,6 +92,23 @@ async fn create_table_and_query(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn repeated_filtered_query_returns_identical_rows(#[future] conn: Conn) {
+    // The second run answers the filter from the condition cache (positions
+    // recorded by the first run), so it must return exactly the same rows.
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_repeat", dir.path()).await;
+    let sql = "SELECT id, name FROM people_repeat WHERE name LIKE '%o%' AND id <> 3";
+
+    let first = select_rows(&conn, sql).await;
+    let second = select_rows(&conn, sql).await;
+
+    assert_eq!(first, vec![vec![Some("2".into()), Some("bob".into())]]);
+    assert_eq!(second, first);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn second_connection_sees_table_created_by_first(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     let reader = connect_client(server_port()).await;

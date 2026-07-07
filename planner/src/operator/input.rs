@@ -1,8 +1,9 @@
 //! [`Input`] — scans a [`Table`] from the catalog.
 
 use super::slot_for;
-use crate::catalog::{DynamicScanPredicate, QueryContext, Table};
+use crate::catalog::{ConditionCachedScan, DynamicScanPredicate, QueryContext, Table};
 use crate::compile::{DynamicFilterSlots, Error};
+use crate::condition_key::ConditionKey;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use dispatch::{DataFlowDispatcher, Projection as DispatchProjection, RecordBatchOperatorSpec};
@@ -58,6 +59,61 @@ impl Input {
         ctx: &dyn QueryContext,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        let (projection, dynamic_filters) = self.build_projection_and_filters(slots)?;
+        self.table
+            .compile(
+                dispatcher,
+                projection,
+                dynamic_filters,
+                self.emit_row_group_metadata,
+                ctx,
+            )
+            .map_err(Error::TableScan)
+    }
+
+    /// Like [`compile`](Self::compile), but handing the table the filter
+    /// conjunction sitting directly above the scan, so a condition-caching
+    /// backend can inject known positions and return an observer.
+    pub(crate) fn compile_with_condition(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        ctx: &dyn QueryContext,
+        slots: &mut DynamicFilterSlots,
+        condition: &ConditionKey,
+    ) -> Result<ConditionCachedScan, Error> {
+        let (projection, dynamic_filters) = self.build_projection_and_filters(slots)?;
+        self.table
+            .compile_with_condition_cache(
+                dispatcher,
+                projection,
+                dynamic_filters,
+                self.emit_row_group_metadata,
+                condition,
+                ctx,
+            )
+            .map_err(Error::TableScan)
+    }
+
+    /// The scan's projected column names, in output batch position order (the
+    /// space the filter conditions' column references index into). `None` when
+    /// a reference falls outside the table schema or a scanned column is not a
+    /// plain reference.
+    pub(crate) fn build_scan_output_names(&self) -> Option<Vec<String>> {
+        let schema = self.table.columns();
+        self.columns
+            .iter()
+            .filter_map(|e| match e {
+                Expression::Ref(r) if r.column_idx == usize::MAX => None,
+                Expression::Ref(r) => Some(schema.get(r.column_idx).map(|c| c.name.clone())),
+                _ => Some(None),
+            })
+            .collect()
+    }
+
+    fn build_projection_and_filters(
+        &self,
+        slots: &mut DynamicFilterSlots,
+    ) -> Result<(DispatchProjection, Vec<DynamicScanPredicate>), Error> {
         let column_indices: Vec<usize> = self
             .columns
             .iter()
@@ -71,15 +127,7 @@ impl Input {
             .collect::<Result<Vec<_>, _>>()?;
         let projection = DispatchProjection::columns(column_indices);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
-        self.table
-            .compile(
-                dispatcher,
-                projection,
-                dynamic_filters,
-                self.emit_row_group_metadata,
-                ctx,
-            )
-            .map_err(Error::TableScan)
+        Ok((projection, dynamic_filters))
     }
 }
 

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
+use crate::catalog::condition_cache::QueryConditionCache;
 use crate::manifest::{FIRST_VERSION, ManifestEntry, PartitionEqFilter, SortBounds, TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
@@ -57,12 +58,16 @@ pub struct CatalogTable {
     /// The pool a reload/commit fetches footers on, so the mutators need no
     /// dispatcher passed in.
     dispatcher: DataFlowDispatcher,
+    /// The catalog's cross-query condition cache: entries for files this table
+    /// drops from its manifest (compaction, deletion) are invalidated here.
+    condition_cache: Arc<QueryConditionCache>,
 }
 
 impl CatalogTable {
     /// Reassemble a persisted table from its loaded `manifest` and the per-file
     /// row groups (`files`) just fetched for it — the reopen path. Does not
     /// persist anything; the manifest it was loaded from is already durable.
+    #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn new(
         name: String,
         location: ObjectPath,
@@ -70,6 +75,7 @@ impl CatalogTable {
         files: Vec<TableFile>,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
+        condition_cache: Arc<QueryConditionCache>,
     ) -> Self {
         Self {
             name,
@@ -78,6 +84,7 @@ impl CatalogTable {
             files,
             store,
             dispatcher,
+            condition_cache,
         }
     }
 
@@ -96,6 +103,7 @@ impl CatalogTable {
         sort_by: Vec<String>,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
+        condition_cache: Arc<QueryConditionCache>,
     ) -> crate::Result<Self> {
         // Files discovered at CREATE TABLE carry no partition metadata (opaque
         // paths, footers not parsed for it); the partitioning sink records it on
@@ -121,6 +129,7 @@ impl CatalogTable {
             files,
             store,
             dispatcher,
+            condition_cache,
         })
     }
 
@@ -133,6 +142,7 @@ impl CatalogTable {
         else {
             return Ok(false);
         };
+        self.invalidate_dropped_condition_entries(&manifest);
         self.manifest = manifest;
         self.sync_files_to_manifest()?;
         Ok(true)
@@ -151,6 +161,7 @@ impl CatalogTable {
         else {
             return Ok(false);
         };
+        self.invalidate_dropped_condition_entries(&manifest);
         self.manifest = manifest;
         let kept: HashSet<&str> = self
             .manifest
@@ -294,6 +305,27 @@ impl CatalogTable {
             &resolved,
         )?;
         Ok(())
+    }
+
+    /// Reclaim condition-cache memory for the files `new_manifest` drops
+    /// relative to this copy's current manifest (compaction rewrites, deletes).
+    /// Hygiene only: a dropped path is never queried again, so a missed
+    /// invalidation (e.g. a drifted copy that skipped versions) merely leaves
+    /// entries for the least-recently-used eviction to reclaim.
+    fn invalidate_dropped_condition_entries(&self, new_manifest: &TableManifest) {
+        let kept: HashSet<&str> = new_manifest
+            .entries
+            .iter()
+            .map(|e| e.file.path.as_str())
+            .collect();
+        let dropped: Vec<String> = self
+            .manifest
+            .entries
+            .iter()
+            .filter(|e| !kept.contains(e.file.path.as_str()))
+            .map(|e| self.location.resolve(&e.file.path).as_str().to_string())
+            .collect();
+        self.condition_cache.invalidate_files(dropped);
     }
 
     /// Reconcile `files` to the current `manifest`: drop the files no longer in
