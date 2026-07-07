@@ -3,7 +3,9 @@ mod common;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, StringViewArray, StructArray};
+use arrow_array::{
+    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, StringViewArray, StructArray,
+};
 use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -145,6 +147,75 @@ fn scan_nested_struct_column() {
 }
 
 #[test]
+fn scan_nullable_column() {
+    let dispatch = dispatch(1);
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+    let values = Int64Array::from(vec![Some(1), None, Some(3), None, Some(5)]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as _]).unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap(),
+        &Int64Array::from(vec![Some(1), None, Some(3), None, Some(5)])
+    );
+}
+
+#[test]
+fn scan_nullable_float_with_boundary_nulls() {
+    let dispatch = dispatch(1);
+    let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, true)]));
+    let values = Float64Array::from(vec![None, Some(1.5), Some(-2.0), None]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as _]).unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap(),
+        &Float64Array::from(vec![None, Some(1.5), Some(-2.0), None])
+    );
+}
+
+/// Regression: an all-null dictionary-encoded column writes a dictionary page
+/// with zero uncompressed bytes; the decompressor must not hand the snappy
+/// decoder zero output buffers (it panics). Not variant-specific.
+#[test]
+fn scan_all_null_dictionary_column() {
+    let dispatch = dispatch(1);
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
+    let values = Int64Array::from(vec![None, None, None]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as _]).unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true); // dictionary enabled
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap(),
+        &Int64Array::from(vec![None, None, None])
+    );
+}
+
+#[test]
 fn scan_variant_column() {
     use parquet_variant::VariantPath;
     use parquet_variant_compute::{GetOptions, json_to_variant, variant_get};
@@ -176,6 +247,133 @@ fn scan_variant_column() {
     assert_eq!(
         (0..ages.len()).map(|i| ages.value(i)).collect::<Vec<_>>(),
         vec![30, 25]
+    );
+}
+
+#[test]
+fn scan_shredded_variant() {
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{
+        GetOptions, ShreddedSchemaBuilder, json_to_variant, shred_variant, variant_get,
+    };
+
+    let dispatch = dispatch(1);
+    // A VARIANT-tagged column with `age` shredded into a typed `typed_value`
+    // leaf (null where a row lacks it), written by arrow-rs; pivot reconstructs
+    // the shredded variant and `variant_get` reads the typed leaf.
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"age":30}"#,
+        r#"{"name":"bob"}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let field = shredded.field("doc");
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![field])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    // Four leaves: `metadata`, `value`, `typed_value.age.value`,
+    // `typed_value.age.typed_value`.
+    let results = table_input(&dispatch, &table, Projection::all(4), false)
+        .collect()
+        .unwrap();
+
+    let as_int = Some(Arc::new(Field::new("age", DataType::Int64, true)));
+    let ages = variant_get(
+        results[0].column(0),
+        GetOptions::new_with_path(VariantPath::try_from("age").unwrap()).with_as_type(as_int),
+    )
+    .unwrap();
+    assert_eq!(
+        ages.as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![Some(30), None])
+    );
+}
+
+#[test]
+fn scan_shredded_variant_with_a_leading_null() {
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{
+        GetOptions, ShreddedSchemaBuilder, json_to_variant, shred_variant, variant_get,
+    };
+
+    let dispatch = dispatch(1);
+    // `age` is absent in the first row (the shredded leaf's first def-level run
+    // is "null") and present in the second, exercising the multi-level scatter
+    // when it leads with an absent run.
+    let json: ArrayRef = Arc::new(StringArray::from(vec![r#"{"name":"x"}"#, r#"{"age":42}"#]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let results = table_input(&dispatch, &table, Projection::all(4), false)
+        .collect()
+        .unwrap();
+
+    let ages = variant_get(
+        results[0].column(0),
+        GetOptions::new_with_path(VariantPath::try_from("age").unwrap())
+            .with_as_type(Some(Arc::new(Field::new("age", DataType::Int64, true)))),
+    )
+    .unwrap();
+    assert_eq!(
+        ages.as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![None, Some(42)])
+    );
+}
+
+#[test]
+fn scan_dictionary_encoded_variant() {
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{
+        GetOptions, ShreddedSchemaBuilder, json_to_variant, shred_variant, variant_get,
+    };
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"age":30}"#,
+        r#"{"age":30}"#,
+        r#"{"age":25}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true); // dictionary ENABLED
+
+    let results = table_input(&dispatch, &table, Projection::all(4), false)
+        .collect()
+        .unwrap();
+
+    let ages = variant_get(
+        results[0].column(0),
+        GetOptions::new_with_path(VariantPath::try_from("age").unwrap())
+            .with_as_type(Some(Arc::new(Field::new("age", DataType::Int64, true)))),
+    )
+    .unwrap();
+    assert_eq!(
+        ages.as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![30, 30, 25])
     );
 }
 

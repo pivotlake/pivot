@@ -237,7 +237,11 @@ mod tests {
     /// Helper: build a PLAIN data page with def levels prepended.
     /// `def_bools` indicates present (true) / null (false) for each value.
     /// `strings` are the non-null values in order.
-    fn make_plain_page_with_def_levels(def_bools: &[bool], strings: &[&str]) -> DecompressedPage {
+    fn make_plain_page_with_def_levels(
+        def_bools: &[bool],
+        strings: &[&str],
+        idx: usize,
+    ) -> DecompressedPage {
         let num_values = def_bools.len();
         let mut page_data = Vec::new();
 
@@ -264,14 +268,14 @@ mod tests {
         // PLAIN encoded non-null strings
         page_data.extend_from_slice(&encode_plain_strings(strings));
 
-        make_data_page(page_data, num_values, Encoding::PLAIN, 0)
+        make_data_page(page_data, num_values, Encoding::PLAIN, idx)
     }
 
     /// Nullable column, all values present — output should have no nulls.
     #[test]
     fn test_nullable_all_present() {
         init_test_free_pool(4);
-        let page = make_plain_page_with_def_levels(&[true, true, true], &["aa", "bb", "cc"]);
+        let page = make_plain_page_with_def_levels(&[true, true, true], &["aa", "bb", "cc"], 0);
 
         let mut allocator = SlabAllocator::new(true);
         let mut dec = BytesViewDecoder::<StringViewType>::new(1);
@@ -288,7 +292,6 @@ mod tests {
 
     /// Nullable column with nulls — output must have correct length,
     /// null positions, and non-null values in the right slots.
-    #[ignore]
     #[test]
     fn test_nullable_with_nulls() {
         init_test_free_pool(4);
@@ -296,6 +299,7 @@ mod tests {
         let page = make_plain_page_with_def_levels(
             &[true, false, true, false],
             &["hello", "world"], // only 2 non-null values encoded
+            0,
         );
 
         let mut allocator = SlabAllocator::new(true);
@@ -315,13 +319,13 @@ mod tests {
     }
 
     /// Nullable column where all values are null.
-    #[ignore]
     #[test]
     fn test_nullable_all_null() {
         init_test_free_pool(4);
         let page = make_plain_page_with_def_levels(
             &[false, false, false],
             &[], // no non-null values
+            0,
         );
 
         let mut allocator = SlabAllocator::new(true);
@@ -335,5 +339,62 @@ mod tests {
         assert!(sv.is_null(0));
         assert!(sv.is_null(1));
         assert!(sv.is_null(2));
+    }
+
+    fn nulls(array: &ArrayRef) -> Vec<bool> {
+        let sv = array.as_any().downcast_ref::<StringViewArray>().unwrap();
+        (0..sv.len()).map(|i| sv.is_null(i)).collect()
+    }
+
+    /// First page all-present (validity stays unallocated), second page has a
+    /// null: the second page must allocate validity and backfill the first
+    /// page's rows as present.
+    #[test]
+    fn nulls_appear_only_in_a_later_page() {
+        init_test_free_pool(4);
+        let page0 = make_plain_page_with_def_levels(&[true, true], &["a", "b"], 0);
+        let page1 = make_plain_page_with_def_levels(&[true, false], &["c"], 1);
+
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
+        dec.insert_page(page0, &mut allocator);
+        dec.insert_page(page1, &mut allocator);
+        let result = dec.read(&mut allocator, 4).unwrap();
+
+        assert_eq!(nulls(&result), vec![false, false, false, true]);
+    }
+
+    /// First page has a null, a later page is all-present: the present page must
+    /// extend the already-allocated validity, not drop those rows.
+    #[test]
+    fn nulls_only_in_an_earlier_page() {
+        init_test_free_pool(4);
+        let page0 = make_plain_page_with_def_levels(&[false, true], &["a"], 0);
+        let page1 = make_plain_page_with_def_levels(&[true, true], &["b", "c"], 1);
+
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
+        dec.insert_page(page0, &mut allocator);
+        dec.insert_page(page1, &mut allocator);
+        let result = dec.read(&mut allocator, 4).unwrap();
+
+        assert_eq!(nulls(&result), vec![true, false, false, false]);
+    }
+
+    /// A nullable page read in two slices: the definition-level cursor must
+    /// carry across `read` calls so the null lands in the right row.
+    #[test]
+    fn partial_reads_of_a_nullable_page() {
+        init_test_free_pool(4);
+        let page = make_plain_page_with_def_levels(&[true, false, true, true], &["a", "c", "d"], 0);
+
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
+        dec.insert_page(page, &mut allocator);
+        let first = dec.read(&mut allocator, 2).unwrap();
+        let rest = dec.read(&mut allocator, 2).unwrap();
+
+        assert_eq!(nulls(&first), vec![false, true]);
+        assert_eq!(nulls(&rest), vec![false, false]);
     }
 }
