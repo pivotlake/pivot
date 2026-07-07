@@ -15,7 +15,8 @@
 
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, Scalar, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int64Array, Scalar, StringViewArray, TimestampSecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use duckdb_planner::ScalarValue;
@@ -185,10 +186,17 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Date(days) => {
             Arc::new(arrow_array::Date32Array::new_scalar(days).into_inner())
         }
-        // SUM/AVG result types, TIMESTAMP, INTERVAL, and types the bridge doesn't
-        // decode never appear as query *constants* we materialise (TIMESTAMP shows
-        // up only as a column/date_trunc result; INTERVAL is consumed by interval
-        // arithmetic; HUGEINT/DECIMAL constants aren't supported).
+        // DuckDB's TIMESTAMP is microseconds; pivot carries a timestamp as
+        // second-resolution (`Type::Timestamp` → `Timestamp(Second)`, the same as
+        // `make_timestamp`), so drop to seconds to match. A `date ± interval`
+        // constant lowers to a TIMESTAMP compared against `CAST(date AS TIMESTAMP)`,
+        // which casts the date column to the same second resolution.
+        ScalarValue::Timestamp(micros) => {
+            Arc::new(TimestampSecondArray::new_scalar(micros / 1_000_000).into_inner())
+        }
+        // SUM/AVG result types, INTERVAL, and types the bridge doesn't decode never
+        // appear as query *constants* we materialise (INTERVAL is consumed by
+        // interval arithmetic; HUGEINT/DECIMAL constants aren't supported).
         other => return Err(Error::UnsupportedScalarConstant(other)),
     };
 
