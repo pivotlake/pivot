@@ -2,297 +2,325 @@
 //! aggregates in a single pass.
 //!
 //! A pipeline breaker (see [`pipeline_breaker`](super::pipeline_breaker)): each
-//! worker keeps a local running accumulator per requested aggregate while
-//! consuming batches, then on finalization sends its partials down a shared mpsc
-//! channel. One worker holds the receiver, drains every sibling's partials, folds
+//! worker keeps a local [`Slot`] accumulator per requested aggregate while
+//! consuming batches, then on finalization sends its slots down a shared mpsc
+//! channel. One worker holds the receiver, drains every sibling's slots, merges
 //! them, and emits the single-row result with one output column per aggregate.
-//! The cross-worker merge therefore needs no shared lock — it mirrors
+//! The cross-worker merge therefore needs no shared lock - it mirrors
 //! [`OrderByLimit`](super::order_by_limit), which combines worker partials the
 //! same way.
 //!
-//! The aggregate *kind* is the group module's [`AggregationKind`] /
-//! [`AggregationSlot`], shared with GROUP BY. Each slot accumulates as a
-//! [`Partial`]: a numeric reduction (`COUNT`/`SUM`/`MIN`/`MAX` over an integer
-//! column, in the width `A` the planner picks — `i128` only when a sum reads a
-//! 64-bit column) or a string extreme (`MIN`/`MAX` over a `Utf8` column, kept as
-//! an owned `String`). Unlike the grouped string path there's no value arena: a
-//! global string extreme is a single winner per slot, so the owned string is
-//! cheaper than an `ArenaKey`. `Sum` emits `Int64`/`Decimal128(38, 0)` (the latter
-//! matching DuckDB's `HUGEINT`), `Count` always `Int64`, a string extreme
-//! `Utf8View`. There is no `Avg` kind: DuckDB lowers `AVG(x)` to `sum(x) /
-//! count(x)`, so an average reaches this operator as a `Sum` slot and a `Count`
+//! A [`Slot`] owns one aggregate's whole lifecycle - fold batches in, merge a
+//! sibling worker's accumulator, render the output column - so each op's logic
+//! reads in one place. The numeric ops reuse the grouped path's
+//! [`Fold`] impls ([`Sum`]/[`Min`]/[`Max`]); the string extremes keep an owned
+//! `String` winner instead of the grouped path's arena key, since a global
+//! extreme is a single value per slot. There is no `Avg`: DuckDB lowers `AVG(x)`
+//! to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a `Count`
 //! slot.
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
-    AggregationKind, AggregationSlot, Count, Fold, Max, Min, Numeric, Sum, cast_value_column,
+    AggregationKind, AggregationSlot, Fold, Max, Min, Numeric, Sum, cast_value_column,
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
 use crate::worker::worker_waker;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type,
+    ArrowPrimitiveType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+    UInt32Type,
 };
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::{Array, ArrayRef, Int64Array, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::sync::mpsc;
 
-/// One slot's running accumulator. `None` until the slot sees its first
-/// contribution, so an aggregate over zero rows stays a SQL `NULL` (for
-/// `SUM`/`MIN`/`MAX`) rather than a fabricated `0`/bound — `Count` renders `None`
-/// as `0`. The variant is fixed by the slot kind: integer aggregates accumulate
-/// in `A`, string extremes in an owned `String`.
-#[derive(Clone)]
-enum Partial<A> {
-    Num(Option<A>),
-    Str(Option<String>),
+/// A numeric aggregate op over an integer column, dispatched once per batch
+/// (never per row) into the corresponding monomorphic [`Fold`].
+#[derive(Clone, Copy)]
+enum NumOp {
+    Sum,
+    Min,
+    Max,
 }
 
-impl<A: Numeric> Partial<A> {
-    /// The empty accumulator for a slot of `kind`.
-    fn empty(kind: AggregationKind) -> Self {
-        if kind.is_string_extreme() {
-            Partial::Str(None)
-        } else {
-            Partial::Num(None)
-        }
-    }
-
-    /// Fold a contribution — a batch's partial, or a sibling worker's — into this
-    /// accumulator, take-first: the first value seeds, the rest combine by the
-    /// slot's op (additive for `COUNT`/`SUM`, the extreme for `MIN`/`MAX`). The
-    /// variant always matches `kind`, both built from the same slot.
-    fn fold(&mut self, kind: AggregationKind, other: Partial<A>) {
-        match (self, other) {
-            (Partial::Num(acc), Partial::Num(c)) => {
-                *acc = fold_first(*acc, c, |a, b| merge_num(kind, a, b));
-            }
-            (Partial::Str(acc), Partial::Str(c)) => {
-                let is_max = matches!(kind, AggregationKind::StrMax);
-                // Plain `Ord` extreme, not the arena-keyed StrMin/StrMax::merge
-                // (see `reduce_str_column`).
-                *acc = fold_first(
-                    acc.take(),
-                    c,
-                    |a, b| if is_max { a.max(b) } else { a.min(b) },
-                );
-            }
-            _ => unreachable!("partial variant must match the slot kind"),
-        }
-    }
-
-    /// Build the single output column for this slot from its accumulator. A
-    /// numeric slot renders its width's Arrow type; a string extreme a
-    /// zero-or-one-row `Utf8View`. `None` is `NULL` for everything but `COUNT`,
-    /// which is `0`.
-    fn into_column(self, kind: AggregationKind) -> (Field, ArrayRef) {
+impl NumOp {
+    /// Combine two accumulators by this op - additive for `Sum`, the extreme
+    /// for `Min`/`Max`. Delegates to the grouped path's [`Fold::merge`].
+    fn merge<A: Numeric>(self, a: A, b: A) -> A {
         match self {
-            Partial::Num(total) => num_column::<A>(kind, total),
-            Partial::Str(total) => {
-                let arr: ArrayRef = Arc::new(StringViewArray::from_iter(std::iter::once(
-                    total.as_deref(),
-                )));
-                (Field::new(column_name(kind), DataType::Utf8View, true), arr)
-            }
+            NumOp::Sum => Sum::<A>::merge(a, b),
+            NumOp::Min => Min::<A>::merge(a, b),
+            NumOp::Max => Max::<A>::merge(a, b),
+        }
+    }
+
+    /// The output column name for this op.
+    fn column_name(self) -> &'static str {
+        match self {
+            NumOp::Sum => "sum",
+            NumOp::Min => "min",
+            NumOp::Max => "max",
+        }
+    }
+
+    /// Reduce one batch's integer column by this op, or `None` if the column is
+    /// empty. Dispatches the column width here, once per batch, into a
+    /// monomorphic loop.
+    fn reduce_column<A: Numeric>(self, arr: &dyn Array) -> Option<A> {
+        match arr.data_type() {
+            DataType::Int8 => self.reduce_primitive::<A, Int8Type>(arr.as_primitive()),
+            DataType::Int16 => self.reduce_primitive::<A, Int16Type>(arr.as_primitive()),
+            DataType::Int32 => self.reduce_primitive::<A, Int32Type>(arr.as_primitive()),
+            DataType::Int64 => self.reduce_primitive::<A, Int64Type>(arr.as_primitive()),
+            DataType::UInt8 => self.reduce_primitive::<A, UInt8Type>(arr.as_primitive()),
+            DataType::UInt16 => self.reduce_primitive::<A, UInt16Type>(arr.as_primitive()),
+            DataType::UInt32 => self.reduce_primitive::<A, UInt32Type>(arr.as_primitive()),
+            other => panic!("aggregate: unsupported column type {other:?}"),
+        }
+    }
+
+    /// Dispatch this op into its [`Fold`], hoisting the op match out of the row
+    /// loop: each `(width, op)` pair below is a separate monomorphic
+    /// [`fold_primitive_column`] LLVM vectorises (a per-row op match leaves a
+    /// loop-carried branch the autovectoriser will not lift - ~2x slower on a
+    /// full-column SUM).
+    fn reduce_primitive<A: Numeric, T: ArrowPrimitiveType>(
+        self,
+        arr: &PrimitiveArray<T>,
+    ) -> Option<A>
+    where
+        T::Native: Into<i64>,
+    {
+        assert_eq!(
+            arr.null_count(),
+            0,
+            "aggregate input must not contain NULLs"
+        );
+        match self {
+            NumOp::Sum => fold_primitive_column::<A, Sum<A>, T>(arr),
+            NumOp::Min => fold_primitive_column::<A, Min<A>, T>(arr),
+            NumOp::Max => fold_primitive_column::<A, Max<A>, T>(arr),
         }
     }
 }
 
-/// Take-first fold over two optional partials: the first present value seeds, a
-/// later one combines, and an absent one is dropped. Used at the batch and
-/// cross-worker levels (once per slot, not per row), so the `Option` match here is
-/// cold — the hot per-row reductions ([`reduce_int_column`]/[`reduce_str_column`])
-/// seed from their first element and carry no such check.
-#[inline(always)]
-fn fold_first<T>(acc: Option<T>, c: Option<T>, combine: impl FnOnce(T, T) -> T) -> Option<T> {
-    match (acc, c) {
-        (Some(a), Some(b)) => Some(combine(a, b)),
-        (Some(a), None) => Some(a),
-        (None, c) => c,
-    }
+/// The hot numeric loop: fold every value of an integer column into an
+/// accumulator by the op `F`, or `None` if the column is empty. Monomorphic per
+/// `(width, op)`, iterating the raw native slice.
+fn fold_primitive_column<A: Numeric, F: Fold<Val = i64, Acc = A>, T: ArrowPrimitiveType>(
+    arr: &PrimitiveArray<T>,
+) -> Option<A>
+where
+    T::Native: Into<i64>,
+{
+    let mut values = arr.values().iter().map(|&v| v.into());
+    let first = values.next()?;
+    Some(values.fold(F::seed(first), F::update))
 }
 
-/// Combine two numeric partials by the slot's op `merge` — the single definition
-/// of the additive / extreme fold, shared with the grouped path. The integer ops'
-/// `merge` is width-independent (it folds two already-materialised `A`s).
-#[inline(always)]
-fn merge_num<A: Numeric>(kind: AggregationKind, a: A, b: A) -> A {
-    match kind {
-        AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b),
-        AggregationKind::Sum => Sum::<A>::merge(a, b),
-        AggregationKind::Min => Min::<A>::merge(a, b),
-        AggregationKind::Max => Max::<A>::merge(a, b),
-        AggregationKind::StrMin | AggregationKind::StrMax => {
-            unreachable!("string extreme accumulates as Partial::Str, not numeric")
+/// One aggregate's running accumulator and its whole lifecycle: fold batches in
+/// ([`consume`](Self::consume)), combine a sibling worker's accumulator
+/// ([`merge`](Self::merge)), render the output column
+/// ([`into_column`](Self::into_column)). The op is the variant, so it is matched
+/// in one place per lifecycle step and can never disagree with the accumulator's
+/// shape.
+///
+/// The numeric and string accumulators start `None` so an aggregate over zero
+/// rows stays a SQL `NULL` rather than a fabricated `0`/bound; a count over zero
+/// rows is `0`, so it needs no such distinction.
+enum Slot<A: Numeric> {
+    /// `COUNT(*)` / `COUNT(col)` - with no NULLs, both are the row count.
+    Count { count: i64 },
+    /// `SUM`/`MIN`/`MAX` over an integer column, accumulating in the width `A`
+    /// the planner picks (`i128` only when a sum reads a 64-bit column).
+    Num {
+        op: NumOp,
+        column: usize,
+        acc: Option<A>,
+    },
+    /// `MIN`/`MAX` over a `Utf8View` column.
+    Str {
+        is_max: bool,
+        column: usize,
+        acc: Option<String>,
+    },
+}
+
+impl<A: Numeric> Slot<A> {
+    /// The empty accumulator for `spec` - the only match on [`AggregationKind`].
+    fn build(spec: &AggregationSlot) -> Self {
+        let column = spec.column;
+        match spec.kind {
+            AggregationKind::CountStar | AggregationKind::Count => Slot::Count { count: 0 },
+            AggregationKind::Sum => Slot::Num {
+                op: NumOp::Sum,
+                column,
+                acc: None,
+            },
+            AggregationKind::Min => Slot::Num {
+                op: NumOp::Min,
+                column,
+                acc: None,
+            },
+            AggregationKind::Max => Slot::Num {
+                op: NumOp::Max,
+                column,
+                acc: None,
+            },
+            AggregationKind::StrMin => Slot::Str {
+                is_max: false,
+                column,
+                acc: None,
+            },
+            AggregationKind::StrMax => Slot::Str {
+                is_max: true,
+                column,
+                acc: None,
+            },
+        }
+    }
+
+    /// Fold one batch's contribution into this accumulator.
+    fn consume(&mut self, batch: &RecordBatch) {
+        match self {
+            Slot::Count { count } => *count += batch.num_rows() as i64,
+            Slot::Num { op, column, acc } => {
+                let op = *op;
+                let reduced = op.reduce_column::<A>(batch.column(*column).as_ref());
+                fold_into(acc, reduced, |a, b| op.merge(a, b));
+            }
+            Slot::Str {
+                is_max,
+                column,
+                acc,
+            } => {
+                let reduced = reduce_str_column(*is_max, batch.column(*column).as_ref());
+                fold_into(acc, reduced, str_extreme_fn(*is_max));
+            }
+        }
+    }
+
+    /// Fold a sibling worker's finished accumulator into this one. Every worker
+    /// builds its slots from the same specs, so the variants always match.
+    fn merge(&mut self, other: Slot<A>) {
+        match (self, other) {
+            (Slot::Count { count }, Slot::Count { count: other }) => *count += other,
+            (Slot::Num { op, acc, .. }, Slot::Num { acc: other, .. }) => {
+                let op = *op;
+                fold_into(acc, other, |a, b| op.merge(a, b));
+            }
+            (Slot::Str { is_max, acc, .. }, Slot::Str { acc: other, .. }) => {
+                fold_into(acc, other, str_extreme_fn(*is_max));
+            }
+            _ => unreachable!("every worker builds its slots from the same specs"),
+        }
+    }
+
+    /// Build the single-row output column from the finished accumulator. `None`
+    /// (zero rows aggregated) renders as SQL `NULL`; a count renders its plain
+    /// total (`0` over zero rows, never NULL).
+    fn into_column(self) -> (Field, ArrayRef) {
+        match self {
+            Slot::Count { count } => (
+                Field::new("count", DataType::Int64, false),
+                Arc::new(Int64Array::from(vec![count])),
+            ),
+            Slot::Num { op, acc, .. } => (
+                Field::new(op.column_name(), A::data_type(), true),
+                A::scalar_array(acc),
+            ),
+            Slot::Str { is_max, acc, .. } => (
+                Field::new(if is_max { "max" } else { "min" }, DataType::Utf8View, true),
+                Arc::new(StringViewArray::from_iter(std::iter::once(acc.as_deref()))),
+            ),
         }
     }
 }
 
-/// Reduce one batch's integer column to a partial of `kind` (`SUM`/`MIN`/`MAX`),
-/// or `None` if it contributes nothing (empty or all-NULL). NULLs are skipped
-/// (SQL aggregates ignore them). See `reduce_with!` for the vectorised no-NULL
-/// fast path vs the null-skipping slow path.
-fn reduce_int_column<A: Numeric>(kind: AggregationKind, arr: &dyn Array) -> Option<A> {
-    macro_rules! reduce_primitive {
-        ($ty:ty) => {{
-            let a = arr.as_primitive::<$ty>();
-            if a.is_empty() {
-                return None;
-            }
-            // `reduce_with!` takes the per-op combine so `kind` is hoisted OUT of
-            // the row loop: the no-NULL arm is then a monomorphic reduction LLVM
-            // vectorises (a per-row `merge_num(kind, ..)` left a loop-carried branch
-            // the autovectoriser would not lift — ~2x slower on a full-column SUM).
-            // The NULL arm skips null slots (SQL aggregates ignore NULLs) and so
-            // carries the take-first `Option`; it only runs when NULLs are present.
-            macro_rules! reduce_with {
-                ($merge:expr) => {{
-                    if a.null_count() == 0 {
-                        let mut acc = A::from(unsafe { a.value_unchecked(0) } as i64);
-                        for i in 1..a.len() {
-                            acc = $merge(acc, A::from(unsafe { a.value_unchecked(i) } as i64));
-                        }
-                        Some(acc)
-                    } else {
-                        let mut acc: Option<A> = None;
-                        for i in 0..a.len() {
-                            if a.is_null(i) {
-                                continue;
-                            }
-                            let v = A::from(unsafe { a.value_unchecked(i) } as i64);
-                            acc = Some(match acc {
-                                Some(p) => $merge(p, v),
-                                None => v,
-                            });
-                        }
-                        acc
-                    }
-                }};
-            }
-            match kind {
-                AggregationKind::Sum => reduce_with!(|a, b| Sum::<A>::merge(a, b)),
-                AggregationKind::Min => reduce_with!(|a, b| Min::<A>::merge(a, b)),
-                AggregationKind::Max => reduce_with!(|a, b| Max::<A>::merge(a, b)),
-                _ => unreachable!("reduce_int_column only handles SUM/MIN/MAX"),
-            }
-        }};
+/// Fold an optional contribution (a batch's reduction, or a sibling worker's
+/// accumulator) into `acc`: the first present value seeds, later ones combine,
+/// an absent one (an empty batch) is dropped. Called once per slot per
+/// batch/worker, so the `Option` check is cold - the hot per-row reductions seed
+/// from their first element and carry no such check.
+fn fold_into<T>(acc: &mut Option<T>, contribution: Option<T>, combine: impl FnOnce(T, T) -> T) {
+    if let Some(v) = contribution {
+        *acc = Some(match acc.take() {
+            Some(a) => combine(a, v),
+            None => v,
+        });
     }
+}
 
-    match arr.data_type() {
-        DataType::Int8 => reduce_primitive!(Int8Type),
-        DataType::Int16 => reduce_primitive!(Int16Type),
-        DataType::Int32 => reduce_primitive!(Int32Type),
-        DataType::Int64 => reduce_primitive!(Int64Type),
-        DataType::UInt8 => reduce_primitive!(UInt8Type),
-        DataType::UInt16 => reduce_primitive!(UInt16Type),
-        DataType::UInt32 => reduce_primitive!(UInt32Type),
-        other => panic!("aggregate: unsupported column type {other:?}"),
+/// The string extreme combine: a plain `Ord` compare on the strings themselves.
+/// The grouped `StrMin`/`StrMax::merge` folds arena keys resolved through the
+/// value arena, which the global path has no arena for. `MAX` is const so the
+/// per-row loop carries no branch.
+fn str_extreme<T: Ord, const MAX: bool>(a: T, b: T) -> T {
+    if MAX { a.max(b) } else { a.min(b) }
+}
+
+/// Select the extreme combine for a runtime `is_max` - for the cold fold sites
+/// (once per batch / per sibling worker), where the branch costs nothing.
+fn str_extreme_fn<T: Ord>(is_max: bool) -> fn(T, T) -> T {
+    if is_max {
+        str_extreme::<T, true>
+    } else {
+        str_extreme::<T, false>
     }
 }
 
 /// Reduce one batch's `Utf8View` column to its extreme (`is_max` picks `MAX` vs
-/// `MIN`), or `None` if it contributes nothing (empty or all-NULL). NULLs are
-/// skipped. Keeps a *borrowed* `&str` winner through the loop, allocating the owned
-/// `String` once at the end — no per-row allocation. The grouped
-/// `StrMin`/`StrMax::merge` can't be reused here — it folds arena keys resolved
-/// through the value arena, which the global path has no arena for — so the extreme
-/// is a plain `Ord` compare on the `&str` itself.
+/// `MIN`), or `None` if the column is empty. Keeps a *borrowed* `&str` winner
+/// through the loop, allocating the owned `String` once at the end - no per-row
+/// allocation.
 fn reduce_str_column(is_max: bool, arr: &dyn Array) -> Option<String> {
     let a = arr.as_string_view();
-    if a.null_count() == 0 {
-        if a.is_empty() {
-            return None;
-        }
-        let mut acc: &str = unsafe { a.value_unchecked(0) };
-        for i in 1..a.len() {
-            let v = unsafe { a.value_unchecked(i) };
-            acc = if is_max { acc.max(v) } else { acc.min(v) };
-        }
-        Some(acc.to_string())
+    assert_eq!(a.null_count(), 0, "aggregate input must not contain NULLs");
+    if is_max {
+        reduce_str_extreme::<true>(a)
     } else {
-        let mut acc: Option<&str> = None;
-        for i in 0..a.len() {
-            if a.is_null(i) {
-                continue;
-            }
-            let v = unsafe { a.value_unchecked(i) };
-            acc = Some(match acc {
-                Some(p) => {
-                    if is_max {
-                        p.max(v)
-                    } else {
-                        p.min(v)
-                    }
-                }
-                None => v,
-            });
-        }
-        acc.map(str::to_string)
+        reduce_str_extreme::<false>(a)
     }
 }
 
-/// The output column name for an aggregate of this kind.
-fn column_name(kind: AggregationKind) -> &'static str {
-    match kind {
-        AggregationKind::CountStar | AggregationKind::Count => "count",
-        AggregationKind::Sum => "sum",
-        AggregationKind::Min | AggregationKind::StrMin => "min",
-        AggregationKind::Max | AggregationKind::StrMax => "max",
+/// The hot string loop, monomorphic per extreme.
+fn reduce_str_extreme<const MAX: bool>(a: &StringViewArray) -> Option<String> {
+    if a.is_empty() {
+        return None;
     }
-}
-
-/// Build the single output column for one numeric aggregate slot. `None` means
-/// zero rows were aggregated: a SQL `NULL` for `SUM`/`MIN`/`MAX`, `0` for `COUNT`.
-fn num_column<A: Numeric>(kind: AggregationKind, total: Option<A>) -> (Field, ArrayRef) {
-    match kind {
-        // `Int64` or `Decimal128(38, 0)` per the accumulator width; nullable, so
-        // an empty input emits `NULL` (DuckDB's `SUM`/`MIN`/`MAX` of nothing).
-        AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => (
-            Field::new(column_name(kind), A::data_type(), true),
-            A::scalar_array(total),
-        ),
-        // A count is `0` over zero rows (never NULL) and fits i64; the checked
-        // narrowing panics on the impossible overflow rather than truncating.
-        AggregationKind::Count | AggregationKind::CountStar => {
-            let count = total
-                .map(|v| i64::try_from(v.into()).expect("count exceeds i64::MAX"))
-                .unwrap_or(0);
-            (
-                Field::new(column_name(kind), DataType::Int64, false),
-                Arc::new(Int64Array::from(vec![count])),
-            )
-        }
-        AggregationKind::StrMin | AggregationKind::StrMax => {
-            unreachable!("string extreme renders through Partial::Str")
-        }
+    let mut acc: &str = unsafe { a.value_unchecked(0) };
+    for i in 1..a.len() {
+        let v = unsafe { a.value_unchecked(i) };
+        acc = str_extreme::<_, MAX>(acc, v);
     }
+    Some(acc.to_string())
 }
 
 /// Factory for the aggregate operator. All workers share one mpsc channel; the
-/// first factory gets the receiver, the rest get `None`, so per-worker partials
+/// first factory gets the receiver, the rest get `None`, so per-worker slots
 /// flow to a single collector (the same wiring as [`OrderByLimitFactory`]).
 ///
 /// [`OrderByLimitFactory`]: super::order_by_limit
 pub struct AggregateFactory<A: Numeric> {
-    slots: Arc<Vec<AggregationSlot>>,
-    sender: mpsc::Sender<Vec<Partial<A>>>,
-    receiver: Option<mpsc::Receiver<Vec<Partial<A>>>>,
+    specs: Arc<Vec<AggregationSlot>>,
+    sender: mpsc::Sender<Vec<Slot<A>>>,
+    receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
 }
 
 impl<A: Numeric> AggregateFactory<A> {
-    /// Create one factory per worker, all sharing the same partials channel.
+    /// Create one factory per worker, all sharing the same slots channel.
     pub fn create_for_workers(
-        slots: Vec<AggregationSlot>,
+        specs: Vec<AggregationSlot>,
         worker_count: usize,
     ) -> impl IntoIterator<Item = AggregateFactory<A>> {
-        let slots = Arc::new(slots);
+        let specs = Arc::new(specs);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
 
         (0..worker_count).map(move |_| AggregateFactory {
-            slots: slots.clone(),
+            specs: specs.clone(),
             sender: tx.clone(),
             receiver: rx_opt.take(),
         })
@@ -304,58 +332,34 @@ impl<A: Numeric> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> 
 
     fn build_unary(mut self) -> Self::Unary {
         PipelineBreaker::Consuming(Aggregate::new(
-            self.slots,
+            self.specs,
             self.sender,
             self.receiver.take(),
         ))
     }
 }
 
-/// Per-worker aggregate consumer. Accumulates local partials, then sends them
-/// down the shared channel on finalization.
+/// Per-worker aggregate consumer. Accumulates local slots, then sends them down
+/// the shared channel on finalization.
 pub struct Aggregate<A: Numeric> {
-    slots: Arc<Vec<AggregationSlot>>,
-    local: Vec<Partial<A>>,
-    sender: mpsc::Sender<Vec<Partial<A>>>,
-    receiver: Option<mpsc::Receiver<Vec<Partial<A>>>>,
+    specs: Arc<Vec<AggregationSlot>>,
+    local: Vec<Slot<A>>,
+    sender: mpsc::Sender<Vec<Slot<A>>>,
+    receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
 }
 
 impl<A: Numeric> Aggregate<A> {
     fn new(
-        slots: Arc<Vec<AggregationSlot>>,
-        sender: mpsc::Sender<Vec<Partial<A>>>,
-        receiver: Option<mpsc::Receiver<Vec<Partial<A>>>>,
+        specs: Arc<Vec<AggregationSlot>>,
+        sender: mpsc::Sender<Vec<Slot<A>>>,
+        receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
     ) -> Self {
-        // Empty (take-first) per slot, so an aggregate over zero rows is `NULL`
-        // (or `0` for COUNT) rather than a fabricated seed.
-        let local = slots.iter().map(|s| Partial::empty(s.kind)).collect();
+        let local = specs.iter().map(Slot::build).collect();
         Aggregate {
-            slots,
+            specs,
             local,
             sender,
             receiver,
-        }
-    }
-
-    /// This batch's contribution for one slot (`None` if it contributes nothing —
-    /// an empty column).
-    fn contribution(slot: &AggregationSlot, batch: &RecordBatch) -> Partial<A> {
-        match slot.kind {
-            // COUNT(*) counts every row and never reads a column.
-            AggregationKind::CountStar => Partial::Num(Some(A::from(batch.num_rows() as i64))),
-            // COUNT(c) needs only the non-null count, not the values — read it
-            // straight off the null bitmap instead of scanning the column.
-            AggregationKind::Count => {
-                let col = batch.column(slot.column);
-                Partial::Num(Some(A::from((col.len() - col.null_count()) as i64)))
-            }
-            AggregationKind::Sum | AggregationKind::Min | AggregationKind::Max => {
-                Partial::Num(reduce_int_column::<A>(slot.kind, batch.column(slot.column)))
-            }
-            AggregationKind::StrMin | AggregationKind::StrMax => {
-                let is_max = matches!(slot.kind, AggregationKind::StrMax);
-                Partial::Str(reduce_str_column(is_max, batch.column(slot.column)))
-            }
         }
     }
 }
@@ -368,15 +372,15 @@ impl<A: Numeric> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
         batch: RecordBatch,
         _output: &mut OP,
     ) -> unary::Result<()> {
-        for (local, slot) in self.local.iter_mut().zip(self.slots.iter()) {
-            local.fold(slot.kind, Self::contribution(slot, &batch));
+        for slot in &mut self.local {
+            slot.consume(&batch);
         }
         Ok(())
     }
 
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
-        // Every worker sends its partials (even all-empty, so the merge always
-        // sees a contribution per worker) and wakes the collector. Notifying
+        // Every worker sends its slots (even untouched, so the merge always sees
+        // a contribution per worker) and wakes the collector. Notifying
         // unconditionally after the send avoids the lost-wakeup that bites when
         // a finishing worker drops its sender while the collector is parked.
         self.sender
@@ -384,45 +388,43 @@ impl<A: Numeric> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
             .expect("aggregate collector dropped");
         worker_waker().notify();
 
-        let totals = self.slots.iter().map(|s| Partial::empty(s.kind)).collect();
+        let totals = self.specs.iter().map(Slot::build).collect();
         Ok(self.receiver.map(|rx| AggregateOutputter {
             rx,
-            slots: self.slots,
+            specs: self.specs,
             totals,
         }))
     }
 }
 
-/// Output phase (one worker only): drains every sibling's partials from the
-/// channel, folds them, then emits the single-row result.
+/// Output phase (one worker only): drains every sibling's slots from the
+/// channel, merges them, then emits the single-row result.
 pub struct AggregateOutputter<A: Numeric> {
-    rx: mpsc::Receiver<Vec<Partial<A>>>,
-    slots: Arc<Vec<AggregationSlot>>,
-    totals: Vec<Partial<A>>,
+    rx: mpsc::Receiver<Vec<Slot<A>>>,
+    specs: Arc<Vec<AggregationSlot>>,
+    totals: Vec<Slot<A>>,
 }
 
 impl<A: Numeric> Outputter<RecordBatch> for AggregateOutputter<A> {
     fn output<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
         loop {
             match self.rx.try_recv() {
-                Ok(partial) => {
-                    // Fold each worker's partial with the slot's take-first combine.
-                    for (i, p) in partial.into_iter().enumerate() {
-                        let kind = self.slots[i].kind;
-                        self.totals[i].fold(kind, p);
+                Ok(worker_slots) => {
+                    for (total, slot) in self.totals.iter_mut().zip(worker_slots) {
+                        total.merge(slot);
                     }
                 }
                 // Some siblings haven't finished yet; resume when re-driven.
                 Err(mpsc::TryRecvError::Empty) => return Ok(false),
-                // All senders dropped → every worker's partial is folded in.
+                // All senders dropped → every worker's slots are merged in.
                 Err(mpsc::TryRecvError::Disconnected) => {
                     let (fields, columns): (Vec<Field>, Vec<ArrayRef>) =
                         std::mem::take(&mut self.totals)
                             .into_iter()
-                            .zip(self.slots.iter())
-                            .map(|(total, slot)| {
-                                let (field, column) = total.into_column(slot.kind);
-                                cast_value_column(field, column, &slot.output_type)
+                            .zip(self.specs.iter())
+                            .map(|(slot, spec)| {
+                                let (field, column) = slot.into_column();
+                                cast_value_column(field, column, &spec.output_type)
                             })
                             .unzip();
                     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
@@ -462,14 +464,14 @@ mod tests {
         .unwrap()
     }
 
-    /// Build `n` channel-wired aggregate consumers sharing one partials channel
+    /// Build `n` channel-wired aggregate consumers sharing one slots channel
     /// (the first holds the receiver), mirroring the factory's wiring.
-    fn build<A: Numeric>(n: usize, slots: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
-        let slots = Arc::new(slots);
+    fn build<A: Numeric>(n: usize, specs: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
+        let specs = Arc::new(specs);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
         (0..n)
-            .map(move |_| Aggregate::new(slots.clone(), tx.clone(), rx_opt.take()))
+            .map(move |_| Aggregate::new(specs.clone(), tx.clone(), rx_opt.take()))
             .collect()
     }
 
@@ -600,7 +602,7 @@ mod tests {
     #[test]
     fn min_max_merge_across_workers() {
         // Each worker's partial extreme combines (not adds) at the collector, so
-        // the global MIN/MAX is the extreme of all workers' extremes — including
+        // the global MIN/MAX is the extreme of all workers' extremes - including
         // negatives, which the MAX identity (i64::MIN) must not swallow.
         let ops = build::<i64>(
             3,
@@ -629,25 +631,6 @@ mod tests {
 
         assert_eq!(out.items.len(), 1);
         assert!(out.items[0].column(0).is_null(0)); // SUM of zero rows is NULL
-    }
-
-    #[test]
-    fn min_max_skip_nulls() {
-        let array = Int32Array::from(vec![Some(5), None, Some(2), None, Some(9)]);
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)])),
-            vec![Arc::new(array)],
-        )
-        .unwrap();
-        let ops = build::<i64>(
-            1,
-            vec![slot(AggregationKind::Min, 0), slot(AggregationKind::Max, 0)],
-        );
-
-        let out = run_consumers(ops, vec![vec![batch]]);
-
-        assert_eq!(col_i64(&out.items[0], 0), 2); // min ignores NULLs
-        assert_eq!(col_i64(&out.items[0], 1), 9); // max ignores NULLs
     }
 
     #[test]
@@ -700,8 +683,7 @@ mod tests {
 
     #[test]
     fn string_extreme_mixed_with_numeric() {
-        // A string MIN beside an integer SUM — the heterogeneous mix the
-        // per-slot `Partial` unlocks.
+        // A string MIN beside an integer SUM - a heterogeneous slot mix.
         let schema = Arc::new(Schema::new(vec![
             Field::new("s", DataType::Utf8View, false),
             Field::new("n", DataType::Int32, false),
