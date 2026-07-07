@@ -67,7 +67,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-suite_dir="$here/clickbench"
+crate_dir="$(cd "$here/.." && pwd)"   # benchmarks/ — where the justfile / cargo crate live
+suite_dir="$here"
 
 source_path=""
 native_db=""
@@ -152,7 +153,7 @@ pivot_invoke() {
     # a true cold read within the one warm server session (no restart needed).
     local cold_flag=""
     [[ $drop_caches -eq 1 ]] && cold_flag="--drop-caches"
-    ( cd "$here" && just pgo-use run --release -- \
+    ( cd "$crate_dir" && just pgo-use run --release -- \
         --source "$source_path" --query "$*" --iterations "$iterations" \
         --sleep "$sleep_ms" $skip_flag $cold_flag ) 2>&1
 }

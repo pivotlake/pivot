@@ -23,7 +23,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-official_dir="$here/clickbench/clickhouse-official"
+official_dir="$here/clickhouse-official"
 
 source_path="$HOME/hits_partitioned"
 binary="$HOME/clickhouse"
