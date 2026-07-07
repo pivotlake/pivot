@@ -108,8 +108,11 @@ impl Aggregate {
         for g in &self.groups {
             if !matches!(g, Expression::Ref(_)) {
                 let result = g.result_type()?;
-                let ty = canonical_input_type(&result)
-                    .ok_or(Error::DataTypeNotSupportedForGroupBy(result))?;
+                let ty =
+                    canonical_input_type(&result).ok_or(Error::DataTypeNotSupportedForGroupBy {
+                        column: None,
+                        data_type: result,
+                    })?;
                 computed.push(g);
                 types.push(ty);
             }
@@ -514,8 +517,14 @@ macro_rules! select_key_extractor {
 
         // The general fallback: encode the whole key tuple into one byte blob.
         // Handles a single non-int/string key, 3+ keys, or mixed types.
-        let Some(schema) = row_key_schema($keys.iter().map(|(_, t)| t)) else {
-            return Err(Error::DataTypeNotSupportedForGroupBy($keys[0].1.clone()));
+        let schema = match row_key_schema($keys.iter().map(|(_, t)| t)) {
+            Ok(schema) => schema,
+            Err(unsupported) => {
+                return Err(Error::DataTypeNotSupportedForGroupBy {
+                    column: None,
+                    data_type: unsupported,
+                });
+            }
         };
         $with_key!(RowKeyExtractor, schema)
     }};

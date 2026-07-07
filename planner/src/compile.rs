@@ -57,8 +57,11 @@ pub enum Error {
     UnsupportedAggregateExpressionAmount(usize),
     #[error("Unsupported expression: {0:?}")]
     UnsupportedExpression(Expression),
-    #[error("Unsupported type for group by: {0:?}")]
-    DataTypeNotSupportedForGroupBy(Type),
+    #[error("Unsupported type for group by{}: {data_type:?}", .column.as_deref().map(|c| format!(" of column \"{c}\"")).unwrap_or_default())]
+    DataTypeNotSupportedForGroupBy {
+        column: Option<String>,
+        data_type: Type,
+    },
     #[error("Cannot statically determine the result type of expression: {0:?}")]
     IndeterminateResultType(Expression),
     #[error("Unsupported expression for contains: {0:?}")]
