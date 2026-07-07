@@ -24,7 +24,8 @@ aggregates apply; dates are real `DATE`.
 ## Queries
 
 The suite ships the lineitem-grain queries that are expressible as single-table
-scan+aggregate, numbered to match standard TPC-H:
+scan+aggregate, numbered to match standard TPC-H. All eight run on pivot and
+their results match DuckDB on the same flat parquet.
 
 | Query | TPC-H | Notes |
 |-------|-------|-------|
@@ -32,10 +33,28 @@ scan+aggregate, numbered to match standard TPC-H:
 | q03 | Shipping Priority | group by order, top revenue |
 | q05 | Local Supplier Volume | customer nation == supplier nation, region ASIA |
 | q06 | Forecasting Revenue | single-row scan+filter |
-| q10 | Returned Item Reporting | group by customer, returned lines |
+| q10 | Returned Item Reporting | grouped by o_custkey alone (see constraints) |
 | q12 | Shipping Modes | CASE priority buckets per shipmode |
 | q14 | Promotion Effect | promo share of revenue |
 | q19 | Discounted Revenue | multi-branch predicate |
+
+### Engine constraints these queries work around
+
+Float (`DOUBLE`) aggregation and float scalar constants require the float
+support on main; without it every money query fails. Given that, three shapes
+still have to be avoided, so the SQL is written accordingly:
+
+- **At most six aggregate expressions per GROUP BY.** q10 would need seven to
+  return every customer column, so it drops `c_comment`.
+- **No float column as a GROUP BY key.** Standard q10 groups by `c_acctbal`
+  (a `DOUBLE`); instead it groups by `o_custkey` alone (which determines every
+  other customer column) and pulls the rest through `MIN()`.
+- **No date +/- interval.** DuckDB folds `DATE '...' - INTERVAL '90' DAY` into a
+  TIMESTAMP constant the bridge can't take, so q01 uses the pre-folded date
+  literal `DATE '1998-09-02'`.
+- **`LIKE 'x%'` (prefix) is unsupported** (DuckDB lowers it to `prefix()`); q14
+  uses `LIKE '%PROMO%'`, which routes through the supported `contains` path and
+  is equivalent on TPC-H data (`PROMO` only ever appears as the leading syllable).
 
 **Not included, by design.** A lineitem-grain flat table can't express queries
 that live at a different grain or need anti-joins:
@@ -48,9 +67,10 @@ that live at a different grain or need anti-joins:
 
 ## Oracles
 
-`qNN.tsv` holds the expected pgwire output. Generate them on first run with
-`--update-results` (pivot grading its own output), after confirming the numbers
-against DuckDB on the same flat parquet:
+`qNN.tsv` holds the expected pgwire output. It is **scale-factor specific**
+(TPC-H results scale with the data), so oracles aren't committed — generate them
+for your SF on first run with `--update-results` (pivot grading its own output),
+after confirming the numbers against DuckDB on the same flat parquet:
 
 ```sh
 cd .. && cargo run --release -- --suite tpch --source ~/tpch-data/flat --update-results
