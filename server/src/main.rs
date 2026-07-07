@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use catalog::ParquetCatalog;
 use clap::Parser;
+use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, Dispatch};
 use ingest::{IngestConfig, OtelConfig, Signal};
 use server::{Error, Server};
@@ -263,7 +264,9 @@ fn main() -> Result<(), Error> {
     });
     info!(workers, "initialising dispatch");
     let disk_cache = build_disk_cache(&args);
-    let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE, disk_cache);
+    let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
+    let pool_bytes = get_total_memory() * memory_pct / 100;
+    let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
 
     let ingests = args.ingests();
 
