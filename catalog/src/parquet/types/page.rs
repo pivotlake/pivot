@@ -38,12 +38,24 @@ pub struct CompressedPage {
     /// Absolute byte offset of this page in the file. Unique per page, so it is
     /// the decompressed cache's key.
     pub file_offset: usize,
+    /// This page's total on-disk size (header bytes + compressed payload). Together
+    /// with `file_offset`, this is the decompressed cache's key length - it's what
+    /// lets a cache lookup tell this page apart from a differently-sized one
+    /// written at the same offset by an earlier version of the file.
+    pub span: usize,
     /// Sequential page index within the column chunk.
     pub page_idx: usize,
     /// Thrift page header (type, sizes, encoding info).
     pub header: PageHeader,
-    /// Raw compressed byte buffers making up the page body.
+    /// Raw compressed byte buffers making up the page body. Empty when
+    /// `decompressed` is `Some` - the page's bytes live there instead.
     pub data: Vec<Bytes>,
+    /// This page's bytes, already decompressed - set when a
+    /// [`DecompressedCache`](dispatch::memory::DecompressedCache) range lookup found
+    /// it before any IO was issued (see
+    /// [`requests::ColumnPart`](crate::parquet::types::requests::ColumnPart)).
+    /// `None` for a normal compressed page.
+    pub decompressed: Option<Vec<Bytes>>,
     /// Optional row-level filter mask to propagate to the decoder.
     pub filter_mask: Option<FilterMask>,
 }

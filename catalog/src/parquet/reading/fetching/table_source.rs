@@ -12,8 +12,9 @@ use crate::parquet::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
-use std::cmp::Ordering as CmpOrdering;
+use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use crate::parquet::{RowGroupFilter, ScanOrder};
 
@@ -70,6 +71,27 @@ fn steal_order(table: &ParquetTable, order: ScanOrder) -> Vec<usize> {
     result
 }
 
+/// Steal order for a plain scan: row groups with the most pages still resident
+/// in the decompressed cache go first, so the scan consumes them before its own
+/// churn can evict them - without this, a repeated scan asks for each row group
+/// exactly when its cached pages are the oldest thing in the ring, and hits
+/// nothing. The sort is stable, so ties (a fully cold table in particular) keep
+/// file order.
+fn cache_first_order(table: &ParquetTable) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..table.row_groups.len()).collect();
+    // sort_by_cached_key: the counters move concurrently (other queries insert
+    // and evict pages mid-sort), so each must be read exactly once - a
+    // per-comparison re-read hands the sort an inconsistent ordering.
+    order.sort_by_cached_key(|&idx| {
+        Reverse(
+            table.row_groups[idx]
+                .live_decompressed_pages
+                .load(Ordering::Relaxed),
+        )
+    });
+    order
+}
+
 /// Factory that populates a shared [`Injector`] with every row group in a
 /// table and produces [`RowGroupInjector`] receivers for each worker.
 #[derive(Clone)]
@@ -85,7 +107,8 @@ impl RowGroupInjectorFactory {
     /// offered to it on steal and skipped if it returns `false`. When
     /// `scan_order` is set (a Top-N boundary on one key), row groups are pushed
     /// in that key's order so the most-promising are stolen first and the
-    /// boundary prunes the rest; otherwise they're pushed in file order.
+    /// boundary prunes the rest; otherwise decompressed-cache-covered row groups
+    /// go first (see [`cache_first_order`]), falling back to file order.
     pub fn new(
         table: &Arc<ParquetTable>,
         projection: Projection,
@@ -95,7 +118,7 @@ impl RowGroupInjectorFactory {
         let injector = Arc::new(Injector::new());
         let order = match scan_order {
             Some(order) => steal_order(table, order),
-            None => (0..table.row_groups.len()).collect(),
+            None => cache_first_order(table),
         };
         for row_group_idx in order {
             injector.push(QueryRowGroupMetadata::new(table, row_group_idx, None));
@@ -176,5 +199,41 @@ impl RowGroupInjector {
             return None;
         }
         Some(RowGroupRequest::from(s, &self.projection))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parquet::test_utils::dummy_row_group;
+
+    fn table_of(count: usize) -> Arc<ParquetTable> {
+        Arc::new(ParquetTable::new(
+            (0..count).map(|_| dummy_row_group()).collect(),
+        ))
+    }
+
+    #[test]
+    fn cache_covered_row_groups_are_fed_first() {
+        let table = table_of(3);
+        table.row_groups[1]
+            .live_decompressed_pages
+            .store(5, Ordering::Relaxed);
+        table.row_groups[2]
+            .live_decompressed_pages
+            .store(2, Ordering::Relaxed);
+
+        let order = cache_first_order(&table);
+
+        assert_eq!(order, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn a_cold_table_keeps_file_order() {
+        let table = table_of(4);
+
+        let order = cache_first_order(&table);
+
+        assert_eq!(order, vec![0, 1, 2, 3]);
     }
 }
