@@ -72,6 +72,12 @@ pub(crate) fn load_table_files(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
 ) -> Result<Vec<TableFile>, dispatch::DataFlowError> {
+    // Nothing to fetch: skip the dataflow round-trip entirely. Every query's
+    // compile resolves its table through here, and a warm catalog has no
+    // missing footers, so this is the common case.
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
     OperatorSpec::new(
         dispatcher.clone(),
         fetch_table_file_factories(files, dispatcher.worker_count()),
