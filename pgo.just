@@ -14,7 +14,9 @@
 alias pgo-generate := pgo-gen
 pgo-gen *args:
     mkdir -p {{pgo_dir}}
-    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
+    # RUSTC_WRAPPER= bypasses the kache rustc wrapper (.cargo/config.toml): these
+    # optimized PGO builds are compiled fresh, never restored from cache.
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
         CARGO_TARGET_DIR=target-pgogen cargo {{args}}
     $(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
 
@@ -22,7 +24,7 @@ pgo-gen *args:
 #
 #   just pgo-use bench --bench clickbench
 pgo-use *args:
-    RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
         CARGO_TARGET_DIR=target-pgouse cargo {{args}}
 
 
