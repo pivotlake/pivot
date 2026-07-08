@@ -12,10 +12,11 @@
 //!
 //! A [`Slot`] owns one aggregate's whole lifecycle - fold batches in, merge a
 //! sibling worker's accumulator, render the output column - so each op's logic
-//! reads in one place. The integer ops reuse the grouped path's [`Fold`] impls
-//! ([`Sum`]/[`Min`]/[`Max`]); a float column accumulates in `f64`; the string
-//! extremes keep an owned `String` winner instead of the grouped path's arena key,
-//! since a global extreme is a single value per slot. A `SUM`/`MIN`/`MAX`'s value
+//! reads in one place. Both numeric families reuse the grouped path's ops: the
+//! integer ops its [`Fold`] impls ([`Sum`]/[`Min`]/[`Max`]), the float ops its
+//! [`F64Sum`]/[`F64Min`]/[`F64Max`] (an `f64` bit-punned into the same cell). The
+//! string extremes keep an owned `String` winner instead of the grouped path's arena
+//! key, since a global extreme is a single value per slot. A `SUM`/`MIN`/`MAX`'s value
 //! family (integer / float / string) is picked from the slot's declared
 //! `output_type`, not the `MIN`/`MAX` kind. There is no `Avg`: DuckDB lowers
 //! `AVG(x)` to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a
@@ -23,7 +24,8 @@
 
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
-    AggregationKind, AggregationSlot, Fold, Max, Min, Numeric, Sum, cast_value_column,
+    AggregationKind, AggregationSlot, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, Max, Min,
+    Sum, cast_value_column,
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
@@ -40,8 +42,8 @@ use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::sync::mpsc;
 
-/// A numeric aggregate op over an integer column, dispatched once per batch
-/// (never per row) into the corresponding monomorphic [`Fold`].
+/// A numeric aggregate op (`SUM`/`MIN`/`MAX`) shared by the integer and float
+/// slots, dispatched once per batch (never per row) into its monomorphic op.
 #[derive(Clone, Copy)]
 enum NumOp {
     Sum,
@@ -50,16 +52,6 @@ enum NumOp {
 }
 
 impl NumOp {
-    /// Combine two accumulators by this op - additive for `Sum`, the extreme
-    /// for `Min`/`Max`. Delegates to the grouped path's [`Fold::merge`].
-    fn merge<A: Numeric>(self, a: A, b: A) -> A {
-        match self {
-            NumOp::Sum => Sum::<A>::merge(a, b),
-            NumOp::Min => Min::<A>::merge(a, b),
-            NumOp::Max => Max::<A>::merge(a, b),
-        }
-    }
-
     /// The output column name for this op.
     fn column_name(self) -> &'static str {
         match self {
@@ -69,109 +61,125 @@ impl NumOp {
         }
     }
 
+    // --- integer columns: reduce a batch, then combine partials ---
+
     /// Reduce one batch's integer column by this op, or `None` if the column is
     /// empty. Dispatches the column width here, once per batch, into a
     /// monomorphic loop.
-    fn reduce_column<A: Numeric>(self, arr: &dyn Array) -> Option<A> {
+    fn reduce_int_column<A: IntCell>(self, arr: &dyn Array) -> Option<A> {
         match arr.data_type() {
-            DataType::Int8 => self.reduce_primitive::<A, Int8Type>(arr.as_primitive()),
-            DataType::Int16 => self.reduce_primitive::<A, Int16Type>(arr.as_primitive()),
-            DataType::Int32 => self.reduce_primitive::<A, Int32Type>(arr.as_primitive()),
-            DataType::Int64 => self.reduce_primitive::<A, Int64Type>(arr.as_primitive()),
-            DataType::UInt8 => self.reduce_primitive::<A, UInt8Type>(arr.as_primitive()),
-            DataType::UInt16 => self.reduce_primitive::<A, UInt16Type>(arr.as_primitive()),
-            DataType::UInt32 => self.reduce_primitive::<A, UInt32Type>(arr.as_primitive()),
+            DataType::Int8 => self.reduce_int_primitive::<A, Int8Type>(arr.as_primitive()),
+            DataType::Int16 => self.reduce_int_primitive::<A, Int16Type>(arr.as_primitive()),
+            DataType::Int32 => self.reduce_int_primitive::<A, Int32Type>(arr.as_primitive()),
+            DataType::Int64 => self.reduce_int_primitive::<A, Int64Type>(arr.as_primitive()),
+            DataType::UInt8 => self.reduce_int_primitive::<A, UInt8Type>(arr.as_primitive()),
+            DataType::UInt16 => self.reduce_int_primitive::<A, UInt16Type>(arr.as_primitive()),
+            DataType::UInt32 => self.reduce_int_primitive::<A, UInt32Type>(arr.as_primitive()),
             other => panic!("aggregate: unsupported column type {other:?}"),
         }
     }
 
-    /// Dispatch this op into its [`Fold`], hoisting the op match out of the row
-    /// loop: each `(width, op)` pair below is a separate monomorphic
+    /// Dispatch this op into its [`Fold`]'s `seed`/`update`, hoisting the op match out
+    /// of the row loop: each `(width, op)` pair below is a separate monomorphic
     /// [`fold_primitive_column`] LLVM vectorises (a per-row op match leaves a
     /// loop-carried branch the autovectoriser will not lift - ~2x slower on a
     /// full-column SUM).
-    fn reduce_primitive<A: Numeric, T: ArrowPrimitiveType>(
+    fn reduce_int_primitive<A: IntCell, T: ArrowPrimitiveType>(
         self,
         arr: &PrimitiveArray<T>,
     ) -> Option<A>
     where
         T::Native: Into<i64>,
     {
-        assert_eq!(
-            arr.null_count(),
-            0,
-            "aggregate input must not contain NULLs"
-        );
         match self {
-            NumOp::Sum => fold_primitive_column::<A, Sum<A>, T>(arr),
-            NumOp::Min => fold_primitive_column::<A, Min<A>, T>(arr),
-            NumOp::Max => fold_primitive_column::<A, Max<A>, T>(arr),
+            NumOp::Sum => fold_primitive_column(arr, Sum::<A>::seed, Sum::<A>::update),
+            NumOp::Min => fold_primitive_column(arr, Min::<A>::seed, Min::<A>::update),
+            NumOp::Max => fold_primitive_column(arr, Max::<A>::seed, Max::<A>::update),
         }
     }
 
-    /// Combine two `f64` accumulators by this op. `MIN`/`MAX` order with
-    /// [`f64::total_cmp`] so the extreme is deterministic regardless of fold order
-    /// (NaN sorts greatest, matching DuckDB).
-    fn merge_float(self, a: f64, b: f64) -> f64 {
+    /// Combine two accumulators by this op - additive for `Sum`, the extreme
+    /// for `Min`/`Max`. Delegates to the grouped path's [`Fold::merge`].
+    fn merge<A: IntCell>(self, a: A, b: A) -> A {
         match self {
-            NumOp::Sum => a + b,
-            NumOp::Min => {
-                if b.total_cmp(&a).is_lt() {
-                    b
-                } else {
-                    a
-                }
-            }
-            NumOp::Max => {
-                if b.total_cmp(&a).is_gt() {
-                    b
-                } else {
-                    a
-                }
-            }
+            NumOp::Sum => Sum::<A>::merge(a, b),
+            NumOp::Min => Min::<A>::merge(a, b),
+            NumOp::Max => Max::<A>::merge(a, b),
         }
     }
 
-    /// Reduce one batch's float column by this op, or `None` if the column is
-    /// empty. The float counterpart of [`reduce_column`](NumOp::reduce_column);
-    /// `REAL`/`DOUBLE` both accumulate in `f64`.
-    fn reduce_float_column(self, arr: &dyn Array) -> Option<f64> {
+    // --- float columns: the same three steps, over an `f64` punned into the cell ---
+
+    /// Reduce one batch's float column by this op into a punned `f64` cell, or `None`
+    /// if the column is empty. The float counterpart of
+    /// [`reduce_int_column`](NumOp::reduce_int_column); dispatches the column width
+    /// here, once per batch, into a monomorphic loop.
+    fn reduce_float_column<A: F64Cell>(self, arr: &dyn Array) -> Option<A> {
         match arr.data_type() {
-            DataType::Float32 => self.reduce_float_primitive::<Float32Type>(arr.as_primitive()),
-            DataType::Float64 => self.reduce_float_primitive::<Float64Type>(arr.as_primitive()),
+            DataType::Float32 => self.reduce_float_primitive::<A, Float32Type>(arr.as_primitive()),
+            DataType::Float64 => self.reduce_float_primitive::<A, Float64Type>(arr.as_primitive()),
             other => panic!("float aggregate: unsupported column type {other:?}"),
         }
     }
 
-    /// The float row loop: fold every value of a float column into an `f64` by this
-    /// op, or `None` if the column is empty.
-    fn reduce_float_primitive<T: ArrowPrimitiveType>(self, arr: &PrimitiveArray<T>) -> Option<f64>
+    /// Dispatch this op into its [`F64Sum`]/[`F64Min`]/[`F64Max`] `seed`/`update` out
+    /// of the row loop, hoisting the op match exactly as
+    /// [`reduce_int_primitive`](NumOp::reduce_int_primitive) does - so each
+    /// `(width, op)` is a separate monomorphic [`fold_primitive_column`] with no
+    /// per-row op branch.
+    fn reduce_float_primitive<A: F64Cell, T: ArrowPrimitiveType>(
+        self,
+        arr: &PrimitiveArray<T>,
+    ) -> Option<A>
     where
         T::Native: Into<f64>,
     {
-        assert_eq!(
-            arr.null_count(),
-            0,
-            "aggregate input must not contain NULLs"
-        );
-        let mut values = arr.values().iter().map(|&v| v.into());
-        let first = values.next()?;
-        Some(values.fold(first, |a, b| self.merge_float(a, b)))
+        match self {
+            NumOp::Sum => fold_primitive_column(arr, F64Sum::<A>::seed, F64Sum::<A>::update),
+            NumOp::Min => fold_primitive_column(arr, F64Min::<A>::seed, F64Min::<A>::update),
+            NumOp::Max => fold_primitive_column(arr, F64Max::<A>::seed, F64Max::<A>::update),
+        }
+    }
+
+    /// Combine two float accumulators by this op, reusing the grouped path's
+    /// [`F64Sum`]/[`F64Min`]/[`F64Max`] `merge` - the single source of the float
+    /// `SUM`/`MIN`/`MAX` rule, exactly as [`merge`](NumOp::merge) reuses the integer
+    /// ops. The accumulator is an `f64` bit-punned into the cell `A` (via [`F64Cell`]),
+    /// so this mirrors the integer merge with no separate combine logic.
+    fn merge_float<A: F64Cell>(self, a: A, b: A) -> A {
+        match self {
+            NumOp::Sum => F64Sum::<A>::merge(a, b),
+            NumOp::Min => F64Min::<A>::merge(a, b),
+            NumOp::Max => F64Max::<A>::merge(a, b),
+        }
     }
 }
 
-/// The hot numeric loop: fold every value of an integer column into an
-/// accumulator by the op `F`, or `None` if the column is empty. Monomorphic per
-/// `(width, op)`, iterating the raw native slice.
-fn fold_primitive_column<A: Numeric, F: Fold<Val = i64, Acc = A>, T: ArrowPrimitiveType>(
+/// The hot reduce loop: seed an accumulator `A` from the first value (each native
+/// element converted to the op's value type `V`), then fold the rest in by `update`,
+/// or `None` if the column is empty. `seed`/`update` are an op's own methods passed as
+/// function *items* (not pointers), so each `(width, op)` monomorphises into its own
+/// loop with no indirect call and no per-row op branch. The integer ops pass their
+/// [`Fold`] methods (`V = i64`, a loop the autovectoriser lifts); the float ops their
+/// [`F64Sum`]/[`F64Min`]/[`F64Max`] methods (`V = f64`, a serial `fadd`/select chain -
+/// FP arithmetic is not reassociated without fast-math - so branch-free and inlined,
+/// but not SIMD).
+fn fold_primitive_column<A, V, T: ArrowPrimitiveType>(
     arr: &PrimitiveArray<T>,
+    seed: impl Fn(V) -> A,
+    update: impl Fn(A, V) -> A,
 ) -> Option<A>
 where
-    T::Native: Into<i64>,
+    T::Native: Into<V>,
 {
+    assert_eq!(
+        arr.null_count(),
+        0,
+        "aggregate input must not contain NULLs"
+    );
     let mut values = arr.values().iter().map(|&v| v.into());
     let first = values.next()?;
-    Some(values.fold(F::seed(first), F::update))
+    Some(values.fold(seed(first), update))
 }
 
 /// One aggregate's running accumulator and its whole lifecycle: fold batches in
@@ -184,23 +192,24 @@ where
 /// The numeric and string accumulators start `None` so an aggregate over zero
 /// rows stays a SQL `NULL` rather than a fabricated `0`/bound; a count over zero
 /// rows is `0`, so it needs no such distinction.
-enum Slot<A: Numeric> {
+enum Slot<A: IntCell> {
     /// `COUNT(*)` / `COUNT(col)` - with no NULLs, both are the row count.
     Count { count: i64 },
     /// `SUM`/`MIN`/`MAX` over an integer column, accumulating in the width `A`
     /// the planner picks (`i128` only when a sum reads a 64-bit column).
-    Num {
+    Int {
         op: NumOp,
         column: usize,
         acc: Option<A>,
     },
-    /// `SUM`/`MIN`/`MAX` over a `REAL`/`DOUBLE` column, accumulating in `f64`
-    /// (independent of the integer width `A`). The output narrows to `Float32` for
-    /// a `REAL` slot via the slot's declared `output_type` cast.
+    /// `SUM`/`MIN`/`MAX` over a `REAL`/`DOUBLE` column, accumulating an `f64`
+    /// bit-punned into the same cell `A` the integer path uses (via [`F64Cell`]),
+    /// exactly as a string extreme puns its `ArenaKey`. The output narrows to
+    /// `Float32` for a `REAL` slot via the slot's declared `output_type` cast.
     Float {
         op: NumOp,
         column: usize,
-        acc: Option<f64>,
+        acc: Option<A>,
     },
     /// `MIN`/`MAX` over a `Utf8View` column.
     Str {
@@ -210,11 +219,11 @@ enum Slot<A: Numeric> {
     },
 }
 
-impl<A: Numeric> Slot<A> {
+impl<A: IntCell + F64Cell> Slot<A> {
     /// The empty accumulator for `spec`. A `SUM`/`MIN`/`MAX`'s value family is
     /// decided by the column's declared `output_type`, not the kind: a `Utf8View`
-    /// extreme keeps an owned `String`, a floating column an `f64`, else the integer
-    /// width `A`.
+    /// extreme keeps an owned `String`, a floating column an `f64` punned into `A`,
+    /// else the integer width `A`.
     fn build(spec: &AggregationSlot) -> Self {
         let column = spec.column;
         let op = match spec.kind {
@@ -236,7 +245,7 @@ impl<A: Numeric> Slot<A> {
                 acc: None,
             }
         } else {
-            Slot::Num {
+            Slot::Int {
                 op,
                 column,
                 acc: None,
@@ -248,14 +257,14 @@ impl<A: Numeric> Slot<A> {
     fn consume(&mut self, batch: &RecordBatch) {
         match self {
             Slot::Count { count } => *count += batch.num_rows() as i64,
-            Slot::Num { op, column, acc } => {
+            Slot::Int { op, column, acc } => {
                 let op = *op;
-                let reduced = op.reduce_column::<A>(batch.column(*column).as_ref());
+                let reduced = op.reduce_int_column::<A>(batch.column(*column).as_ref());
                 fold_into(acc, reduced, |a, b| op.merge(a, b));
             }
             Slot::Float { op, column, acc } => {
                 let op = *op;
-                let reduced = op.reduce_float_column(batch.column(*column).as_ref());
+                let reduced = op.reduce_float_column::<A>(batch.column(*column).as_ref());
                 fold_into(acc, reduced, |a, b| op.merge_float(a, b));
             }
             Slot::Str {
@@ -274,7 +283,7 @@ impl<A: Numeric> Slot<A> {
     fn merge(&mut self, other: Slot<A>) {
         match (self, other) {
             (Slot::Count { count }, Slot::Count { count: other }) => *count += other,
-            (Slot::Num { op, acc, .. }, Slot::Num { acc: other, .. }) => {
+            (Slot::Int { op, acc, .. }, Slot::Int { acc: other, .. }) => {
                 let op = *op;
                 fold_into(acc, other, |a, b| op.merge(a, b));
             }
@@ -298,15 +307,16 @@ impl<A: Numeric> Slot<A> {
                 Field::new("count", DataType::Int64, false),
                 Arc::new(Int64Array::from(vec![count])),
             ),
-            Slot::Num { op, acc, .. } => (
+            Slot::Int { op, acc, .. } => (
                 Field::new(op.column_name(), A::data_type(), true),
                 A::scalar_array(acc),
             ),
-            // Renders `Float64`; the outputter casts to the slot's declared
-            // `output_type` (narrowing to `Float32` for a `REAL` slot).
+            // Unpun the cell back to `f64` and render `Float64`; the outputter casts
+            // to the slot's declared `output_type` (narrowing to `Float32` for a
+            // `REAL` slot).
             Slot::Float { op, acc, .. } => (
                 Field::new(op.column_name(), DataType::Float64, true),
-                Arc::new(Float64Array::from(vec![acc])),
+                Arc::new(Float64Array::from(vec![acc.map(F64Cell::into_f64)])),
             ),
             Slot::Str { is_max, acc, .. } => (
                 Field::new(if is_max { "max" } else { "min" }, DataType::Utf8View, true),
@@ -380,13 +390,13 @@ fn reduce_str_extreme<const MAX: bool>(a: &StringViewArray) -> Option<String> {
 /// flow to a single collector (the same wiring as [`OrderByLimitFactory`]).
 ///
 /// [`OrderByLimitFactory`]: super::order_by_limit
-pub struct AggregateFactory<A: Numeric> {
+pub struct AggregateFactory<A: IntCell> {
     specs: Arc<Vec<AggregationSlot>>,
     sender: mpsc::Sender<Vec<Slot<A>>>,
     receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
 }
 
-impl<A: Numeric> AggregateFactory<A> {
+impl<A: IntCell> AggregateFactory<A> {
     /// Create one factory per worker, all sharing the same slots channel.
     pub fn create_for_workers(
         specs: Vec<AggregationSlot>,
@@ -404,7 +414,7 @@ impl<A: Numeric> AggregateFactory<A> {
     }
 }
 
-impl<A: Numeric> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
+impl<A: IntCell + F64Cell> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate<A>>;
 
     fn build_unary(mut self) -> Self::Unary {
@@ -418,14 +428,14 @@ impl<A: Numeric> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> 
 
 /// Per-worker aggregate consumer. Accumulates local slots, then sends them down
 /// the shared channel on finalization.
-pub struct Aggregate<A: Numeric> {
+pub struct Aggregate<A: IntCell> {
     specs: Arc<Vec<AggregationSlot>>,
     local: Vec<Slot<A>>,
     sender: mpsc::Sender<Vec<Slot<A>>>,
     receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
 }
 
-impl<A: Numeric> Aggregate<A> {
+impl<A: IntCell + F64Cell> Aggregate<A> {
     fn new(
         specs: Arc<Vec<AggregationSlot>>,
         sender: mpsc::Sender<Vec<Slot<A>>>,
@@ -441,7 +451,7 @@ impl<A: Numeric> Aggregate<A> {
     }
 }
 
-impl<A: Numeric> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
+impl<A: IntCell + F64Cell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
     type Outputter = AggregateOutputter<A>;
 
     fn consume<OP: Sender<RecordBatch>>(
@@ -476,13 +486,13 @@ impl<A: Numeric> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
 
 /// Output phase (one worker only): drains every sibling's slots from the
 /// channel, merges them, then emits the single-row result.
-pub struct AggregateOutputter<A: Numeric> {
+pub struct AggregateOutputter<A: IntCell> {
     rx: mpsc::Receiver<Vec<Slot<A>>>,
     specs: Arc<Vec<AggregationSlot>>,
     totals: Vec<Slot<A>>,
 }
 
-impl<A: Numeric> Outputter<RecordBatch> for AggregateOutputter<A> {
+impl<A: IntCell + F64Cell> Outputter<RecordBatch> for AggregateOutputter<A> {
     fn output<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
         loop {
             match self.rx.try_recv() {
@@ -543,7 +553,7 @@ mod tests {
 
     /// Build `n` channel-wired aggregate consumers sharing one slots channel
     /// (the first holds the receiver), mirroring the factory's wiring.
-    fn build<A: Numeric>(n: usize, specs: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
+    fn build<A: IntCell + F64Cell>(n: usize, specs: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
         let specs = Arc::new(specs);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);

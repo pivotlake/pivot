@@ -1,13 +1,14 @@
 //! What a slot's value is *stored* as.
 //!
-//! [`Cell`] is a bare marker — any `Copy` value can sit in a slot, so it's a
-//! blanket bound with nothing to implement. *How* cells combine is the
-//! [`Fold`](super::fold)'s job (plain `Ord::min` / `+` for the numeric folds, an
-//! arena compare for the string ones) — never the cell's. The only thing a
-//! numeric width owns is how it renders to Arrow (`NumericArrow`), since that
-//! genuinely depends on the width (`i64 → Int64`, `i128 → Decimal128`). The
-//! [`Numeric`] bound alias bundles that with the std arithmetic the numeric folds
-//! lean on, so a fold can just say `A: Numeric`.
+//! A slot stores a bare [`Cell`] — a plain `Copy` value, in practice an `i64`
+//! (narrow) or `i128` (wide). That raw storage is all there is: [`IntCell`],
+//! [`F64Cell`], [`StringCell`], and [`WideCell`] add no storage of their own, they
+//! are just different ways to *read and write those same bits* — as an integer
+//! accumulator, an `f64`, a string `ArenaKey`, or a passthrough `i128`. *How* a value
+//! combines is the [`Fold`](super::fold)'s job (plain `Ord::min` / `+` for the numeric
+//! folds, an arena compare for the string ones) — never the cell's. [`IntCell`]
+//! additionally owns the Arrow rendering, since that depends on the width
+//! (`i64 → Int64`, `i128 → Decimal128`).
 
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::SharedArena;
@@ -25,11 +26,12 @@ use std::sync::Arc;
 pub trait Cell: Copy + Default + Send + Sync + 'static {}
 impl<T: Copy + Default + Send + Sync + 'static> Cell for T {}
 
-/// A numeric aggregate cell (`i64` narrow / `i128` wide): a [`Cell`] that adds
-/// (`+`), orders (`Ord`), builds from a per-row `i64` and widens to `i128`, and
-/// renders to Arrow (`NumericArrow`). A bound alias — no methods of its own, so
-/// the numeric folds combine with std ops, not cell methods.
-pub trait Numeric: Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<i128> {
+/// The raw `i64` (narrow) / `i128` (wide) storage read as an integer. Bundles the
+/// std arithmetic the numeric folds combine with (`+`, `Ord`, `From<i64>`,
+/// `Into<i128>`) and the width-dependent Arrow rendering (`i64 → Int64`,
+/// `i128 → Decimal128`), so a fold can just say `A: IntCell`. The combine logic lives
+/// in the [`Fold`](super::fold), not here.
+pub trait IntCell: Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<i128> {
     /// The Arrow primitive whose `Native` is this width.
     type Arrow: ArrowPrimitiveType<Native = Self>;
     /// Render a finished grouped column, handing the engine slab to Arrow zero-copy.
@@ -40,7 +42,7 @@ pub trait Numeric: Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<
     /// (an aggregate over zero rows), so the column is nullable.
     fn scalar_array(value: Option<Self>) -> ArrayRef;
 }
-impl Numeric for i64 {
+impl IntCell for i64 {
     type Arrow = Int64Type;
     fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
         let len = col.len();
@@ -58,7 +60,7 @@ impl Numeric for i64 {
     }
 }
 
-impl Numeric for i128 {
+impl IntCell for i128 {
     type Arrow = Decimal128Type;
     fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
         let len = col.len();
@@ -145,13 +147,13 @@ impl F64Cell for i128 {
 
 /// Storing a re-read wide (`i128`) partial in a numeric value cell.
 ///
-/// The two-level `COUNT(DISTINCT)` lowering emits its wide inner partials as
-/// `Decimal128` and re-reads them in the outer level (see
-/// `U128Reader`). Those values are full `i128`s, so
-/// the outer cell must hold an `i128` losslessly. Only the 128-bit cell can, and the
-/// planner always widens this path, so the `i64` arms are the fail-out (a bug if
-/// reached), exactly like [`StringCell`]. Reading a `Decimal128` as `i64` instead
-/// would truncate a per-subgroup `SUM` that overflows `i64`.
+/// When an aggregate's input column is `Decimal128` — the Arrow type a wide
+/// (`i128`) partial is emitted as, so this arises whenever an aggregate re-reads
+/// partials a prior level already widened — the cell must hold that full `i128`
+/// losslessly. Only the 128-bit cell can; the planner always widens such a
+/// signature, so the `i64` arms are the fail-out (a bug if reached), exactly like
+/// [`StringCell`]. Reading the `Decimal128` as `i64` instead would truncate a
+/// partial `SUM` that overflows `i64`.
 pub trait WideCell: Cell {
     /// Store a full `i128` partial in the cell.
     fn from_i128(v: i128) -> Self;

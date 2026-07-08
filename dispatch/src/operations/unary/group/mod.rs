@@ -104,8 +104,9 @@ pub use keys::{
 pub(crate) use values::cast_value_column;
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, Fold, IntRead, Max, MaxSlot, Min, MinSlot, NoRead, Numeric, OpTuple, Read,
-    SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, WideSum, WorkerContext,
+    Dynamic, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead, Max, MaxSlot, Min, MinSlot,
+    NoRead, OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, WideSum,
+    WorkerContext,
 };
 
 use crate::memory::SlabAllocator;

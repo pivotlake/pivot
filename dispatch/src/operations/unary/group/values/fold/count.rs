@@ -3,7 +3,7 @@
 
 use super::Fold;
 use crate::arrays::SlabColumn;
-use crate::operations::unary::group::values::cell::Numeric;
+use crate::operations::unary::group::values::cell::IntCell;
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use std::marker::PhantomData;
@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 /// numeric extremes use; `Compiled` instantiates the default `Count<i64>`.
 pub struct Count<A = i64>(PhantomData<A>);
 
-impl<A: Numeric> Fold for Count<A> {
+impl<A: IntCell> Fold for Count<A> {
     type Val = ();
     type Acc = A;
 

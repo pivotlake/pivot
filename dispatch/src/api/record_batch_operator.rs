@@ -58,8 +58,8 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
-    DynamicFilterSlot, FilterFactory, GroupFactory, GroupLimit, KeyExtractor, LimitFactory,
-    MapFactory, NullaryFactory, NullaryOperatorFactory, Numeric, OrderBy, OrderByLimitFactory,
+    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, KeyExtractor,
+    LimitFactory, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
     UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
@@ -449,7 +449,7 @@ impl RecordBatchOperatorSpec {
     /// columns, computed in a single pass. Emits one single-row output column
     /// per slot (`Decimal128(38, 0)` for SUM, `Int64` for COUNT). `AVG` arrives
     /// pre-lowered to a SUM slot + a COUNT slot with a downstream divide.
-    pub fn aggregate<A: Numeric>(self, slots: Vec<AggregationSlot>) -> Self {
+    pub fn aggregate<A: IntCell + F64Cell>(self, slots: Vec<AggregationSlot>) -> Self {
         let worker_count = self.worker_count();
         self.unary(AggregateFactory::<A>::create_for_workers(
             slots,

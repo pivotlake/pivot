@@ -6,7 +6,7 @@
 
 use super::Fold;
 use crate::arrays::SlabColumn;
-use crate::operations::unary::group::values::cell::Numeric;
+use crate::operations::unary::group::values::cell::IntCell;
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use std::marker::PhantomData;
@@ -17,7 +17,7 @@ pub struct Sum<A = i64>(PhantomData<A>);
 /// `SUM` accumulating in `i128` — the planner picks this for a 64-bit column.
 pub type WideSum = Sum<i128>;
 
-impl<A: Numeric> Fold for Sum<A> {
+impl<A: IntCell> Fold for Sum<A> {
     type Val = i64;
     type Acc = A;
 
