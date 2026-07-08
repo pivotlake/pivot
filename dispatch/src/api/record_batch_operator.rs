@@ -48,7 +48,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::RecordBatch;
 use crossbeam_deque::Worker;
 
 use crate::api::Chain;
@@ -368,7 +368,7 @@ impl RecordBatchOperatorSpec {
     /// ```
     pub fn filter<F, FB>(self, builder: FB) -> Self
     where
-        F: FnMut(&RecordBatch) -> BooleanArray + Send + 'static,
+        F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
