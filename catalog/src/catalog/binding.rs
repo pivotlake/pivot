@@ -22,6 +22,12 @@ use planner::catalog::{
 use planner::condition_key::ConditionKey;
 use planner::expression::{CompareType, Expression, TableFilter};
 
+/// How many known-dense row groups (with no sparse ones) it takes to judge a
+/// whole condition dense and stop observing its scans. Small enough that one
+/// partial first run reaches the verdict; large enough that a couple of
+/// unrepresentative row groups don't end observation of a sparse condition.
+const DENSE_CONDITION_MIN_SAMPLES: usize = 8;
+
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
 /// DuckDB during binding. Recorded as-is; applied at [`compile`](Table::compile)
 /// time after the row-group metadata exists — min/max stats prune row groups,
@@ -193,6 +199,11 @@ impl Table for TableBinding {
         // A dense entry means "known: scan this row group plain" — covered
         // (no observation), but nothing to inject.
         let covered: Vec<bool> = cached.iter().map(Option::is_some).collect();
+        let dense_entries = cached
+            .iter()
+            .filter(|entry| matches!(entry, Some(CachedPositions::Dense)))
+            .count();
+        let sparse_entries = cached.iter().flatten().count() - dense_entries;
         let injected: Vec<Option<Arc<Vec<u32>>>> = cached
             .into_iter()
             .map(|entry| match entry {
@@ -200,7 +211,16 @@ impl Table for TableBinding {
                 Some(CachedPositions::Dense) | None => None,
             })
             .collect();
-        let observe = covered.iter().any(|covered| !covered);
+        // Density is a property of the condition far more than of any row
+        // group: once everything known about this condition is dense, the
+        // uncovered row groups are all but certainly dense too, and masks
+        // would not help them. Skip observing entirely — the scan then runs
+        // exactly as an uncached one. This ends the residual observation of a
+        // scan whose row groups a Top-N boundary keeps skipping (those never
+        // get touched, so per-row-group markers alone never conclude).
+        let assume_condition_dense =
+            sparse_entries == 0 && dense_entries >= DENSE_CONDITION_MIN_SAMPLES;
+        let observe = !assume_condition_dense && covered.iter().any(|covered| !covered);
         let observer = observe.then(|| {
             build_condition_observer(cache.clone(), condition.clone(), &parquet, &covered)
         });
