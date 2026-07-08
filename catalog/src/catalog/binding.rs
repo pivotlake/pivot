@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::catalog::condition_cache::CachedPositions;
 use crate::catalog::condition_observer::build_condition_observer;
 use crate::manifest::PartitionEqFilter;
 use crate::parquet::{
@@ -184,21 +185,32 @@ impl Table for TableBinding {
         // table: the lookup vector, the injected positions, the observer, and
         // the scan's row-group ids all share one index space by construction.
         let parquet = Arc::new(self.pruned_parquet(&current));
-        let cached: Vec<Option<Arc<Vec<u32>>>> = parquet
+        let cached: Vec<Option<CachedPositions>> = parquet
             .row_groups()
             .iter()
             .map(|rg| cache.get(&rg.file_path, rg.file_row_group_idx, condition))
             .collect();
-        let observe = cached.iter().any(Option::is_none);
-        let observer = observe
-            .then(|| build_condition_observer(cache.clone(), condition.clone(), &parquet, &cached));
+        // A dense entry means "known: scan this row group plain" — covered
+        // (no observation), but nothing to inject.
+        let covered: Vec<bool> = cached.iter().map(Option::is_some).collect();
+        let injected: Vec<Option<Arc<Vec<u32>>>> = cached
+            .into_iter()
+            .map(|entry| match entry {
+                Some(CachedPositions::Sparse(positions)) => Some(positions),
+                Some(CachedPositions::Dense) | None => None,
+            })
+            .collect();
+        let observe = covered.iter().any(|covered| !covered);
+        let observer = observe.then(|| {
+            build_condition_observer(cache.clone(), condition.clone(), &parquet, &covered)
+        });
         let spec = self.build_scan(
             dispatcher,
             &parquet,
             projection,
             dynamic_filters,
             emit_row_group_metadata || observe,
-            Some(cached),
+            Some(injected),
         );
         Ok(ConditionCachedScan {
             spec,

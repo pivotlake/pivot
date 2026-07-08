@@ -311,17 +311,19 @@ fn try_compile_condition_cached_scan(
             }
             Ok(Some(spec))
         }
-        // Observing: the stack must run as ONE fused filter, because the
+        // Observing: the stack must run as ONE observed filter, because the
         // observer's completeness accounting counts every scanned row; a lower
         // filter dropping rows first would leave row groups forever
-        // incomplete. The metadata columns ride behind the data columns, so
-        // the conditions' positional references are unaffected.
+        // incomplete. Inside, the stages still evaluate bottom-up on
+        // survivors only (see compile_observed), so an expensive residual
+        // condition costs what the unfused stack would. The metadata columns
+        // ride behind the data columns, so positional references are
+        // unaffected.
         Some(observer) => {
-            let mut spec = crate::operator::Filter::compile_observed(
-                conditions.into_iter(),
-                compiled.spec,
-                observer,
-            )?;
+            let stages: Vec<&crate::operator::Filter> =
+                filter_stack.iter().rev().copied().collect();
+            let mut spec =
+                crate::operator::Filter::compile_observed(&stages, compiled.spec, observer)?;
             if compiled.strip_metadata {
                 spec = strip_trailing_metadata_columns(spec);
             }

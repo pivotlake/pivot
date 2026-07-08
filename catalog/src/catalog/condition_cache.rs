@@ -27,9 +27,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// honored.
 const ENTRY_OVERHEAD_BYTES: usize = 128;
 
+/// A condition keeping more than this fraction of a row group's rows is
+/// recorded as [`CachedPositions::Dense`] instead of storing the positions: a
+/// nearly-all-true mask saves almost no decode work while costing memory and
+/// per-page mask bookkeeping, so a dense row group simply scans plain. The
+/// marker still counts as covered, ending observation for that row group.
+const DENSE_POSITIONS_FRACTION: f64 = 0.5;
+
+/// On overflow, evict down to this fraction of capacity rather than stopping
+/// at the cap: hysteresis amortizes the eviction sweep over many inserts.
+const EVICTION_WATERMARK_FRACTION: f64 = 0.75;
+
 /// A row group's stable identity: the file's resolved path + its file-local
 /// row-group index.
 type RowGroupId = (Arc<str>, usize);
+
+/// A cached filter result for one row group.
+#[derive(Clone)]
+pub enum CachedPositions {
+    /// The sorted surviving row positions; the scan reads only these.
+    Sparse(Arc<Vec<u32>>),
+    /// The condition keeps most of the row group (see
+    /// [`DENSE_POSITIONS_FRACTION`]): scan plain, but skip re-observation.
+    Dense,
+}
 
 /// Cross-query cache of filter results, owned by the catalog and shared with
 /// every query. Bounded by a byte budget with least-recently-used eviction.
@@ -53,7 +74,7 @@ struct CacheState {
 }
 
 struct CacheEntry {
-    positions: Arc<Vec<u32>>,
+    positions: CachedPositions,
     bytes: usize,
     last_used: u64,
 }
@@ -81,11 +102,14 @@ impl QueryConditionCache {
     }
 
     /// Build from the environment: `PIVOT_CONDITION_CACHE` (true/false, default
-    /// true) and `PIVOT_CONDITION_CACHE_MB` (default 64).
+    /// true) and `PIVOT_CONDITION_CACHE_MB` (default 512). The default is sized
+    /// so a handful of moderately selective conditions over a large table fit
+    /// without eviction churn (positions cost 4 bytes per surviving row; dense
+    /// conditions cost a marker only).
     pub fn from_env() -> Self {
         Self::new(
             get_env_var_with_default("PIVOT_CONDITION_CACHE", true),
-            get_env_var_with_default("PIVOT_CONDITION_CACHE_MB", 64usize) * 1024 * 1024,
+            get_env_var_with_default("PIVOT_CONDITION_CACHE_MB", 512usize) * 1024 * 1024,
         )
     }
 
@@ -93,13 +117,13 @@ impl QueryConditionCache {
         self.enabled
     }
 
-    /// The cached surviving positions of `condition` in one row group, if known.
+    /// The cached filter result of `condition` for one row group, if known.
     pub fn get(
         &self,
         file_path: &Arc<str>,
         file_row_group_idx: usize,
         condition: &ConditionKey,
-    ) -> Option<Arc<Vec<u32>>> {
+    ) -> Option<CachedPositions> {
         if !self.enabled {
             return None;
         }
@@ -124,20 +148,29 @@ impl QueryConditionCache {
         }
     }
 
-    /// Record `condition`'s surviving positions for one row group. Idempotent:
-    /// an already-present entry is kept (concurrent identical queries publish
-    /// the same positions).
+    /// Record `condition`'s surviving positions for one row group. A result
+    /// keeping more than [`DENSE_POSITIONS_FRACTION`] of the rows is stored as
+    /// a dense marker (scan plain, stop observing) instead of the positions.
+    /// Idempotent: an already-present entry is kept (concurrent identical
+    /// queries publish the same positions).
     pub fn insert(
         &self,
         file_path: Arc<str>,
         file_row_group_idx: usize,
         condition: &ConditionKey,
         positions: Arc<Vec<u32>>,
+        row_group_num_rows: u64,
     ) {
         if !self.enabled {
             return;
         }
-        let entry_bytes = positions.len() * size_of::<u32>() + ENTRY_OVERHEAD_BYTES;
+        let dense = positions.len() as f64 > row_group_num_rows as f64 * DENSE_POSITIONS_FRACTION;
+        let (positions, entry_bytes) = if dense {
+            (CachedPositions::Dense, ENTRY_OVERHEAD_BYTES)
+        } else {
+            let bytes = positions.len() * size_of::<u32>() + ENTRY_OVERHEAD_BYTES;
+            (CachedPositions::Sparse(positions), bytes)
+        };
         let mut state = self.state.lock().unwrap();
         state.tick += 1;
         let tick = state.tick;
@@ -158,8 +191,9 @@ impl QueryConditionCache {
         );
         state.bytes += entry_bytes;
         self.inserts.fetch_add(1, Ordering::Relaxed);
-        while state.bytes > self.capacity_bytes {
-            evict_least_recently_used(&mut state);
+        if state.bytes > self.capacity_bytes {
+            let watermark = (self.capacity_bytes as f64 * EVICTION_WATERMARK_FRACTION) as usize;
+            evict_to_watermark(&mut state, watermark);
         }
     }
 
@@ -201,27 +235,32 @@ impl QueryConditionCache {
     }
 }
 
-/// Remove the single least-recently-used entry. Linear over the entries; the
-/// cache holds row-group-count-scale entries and evicts rarely, so a scan
-/// beats maintaining an ordering structure on every touch.
-fn evict_least_recently_used(state: &mut CacheState) {
-    let victim = state
+/// Evict least-recently-used entries until the charged bytes drop to
+/// `watermark`. One sorted sweep per overflow (not one scan per evicted
+/// entry): the watermark's hysteresis makes overflows rare, so the sweep
+/// amortizes over many inserts instead of serializing every insert on an
+/// O(entries) scan.
+fn evict_to_watermark(state: &mut CacheState, watermark: usize) {
+    let mut entries: Vec<(u64, ConditionKey, RowGroupId, usize)> = state
         .conditions
         .iter()
         .flat_map(|(condition, row_groups)| {
-            row_groups
-                .iter()
-                .map(move |(id, entry)| (entry.last_used, condition.clone(), id.clone()))
+            row_groups.iter().map(move |(id, entry)| {
+                (entry.last_used, condition.clone(), id.clone(), entry.bytes)
+            })
         })
-        .min_by_key(|(last_used, _, _)| *last_used);
-    let Some((_, condition, id)) = victim else {
-        return;
-    };
-    let row_groups = state.conditions.get_mut(&condition).unwrap();
-    let entry = row_groups.remove(&id).unwrap();
-    state.bytes -= entry.bytes;
-    if row_groups.is_empty() {
-        state.conditions.remove(&condition);
+        .collect();
+    entries.sort_unstable_by_key(|(last_used, _, _, _)| *last_used);
+    for (_, condition, id, bytes) in entries {
+        if state.bytes <= watermark {
+            break;
+        }
+        let row_groups = state.conditions.get_mut(&condition).unwrap();
+        row_groups.remove(&id);
+        state.bytes -= bytes;
+        if row_groups.is_empty() {
+            state.conditions.remove(&condition);
+        }
     }
 }
 
@@ -256,21 +295,30 @@ mod tests {
         Arc::from(name)
     }
 
+    /// The sparse positions of a cached entry, or `None` for absent/dense.
+    fn sparse(cached: Option<CachedPositions>) -> Option<Arc<Vec<u32>>> {
+        match cached {
+            Some(CachedPositions::Sparse(positions)) => Some(positions),
+            Some(CachedPositions::Dense) | None => None,
+        }
+    }
+
     #[test]
     fn insert_then_get_round_trips() {
         let cache = QueryConditionCache::new(true, 1 << 20);
         let key = condition("a", 7);
 
-        cache.insert(path("t/f1.parquet"), 0, &key, Arc::new(vec![1, 5, 9]));
+        cache.insert(path("t/f1.parquet"), 0, &key, Arc::new(vec![1, 5, 9]), 100);
 
         assert_eq!(
-            cache.get(&path("t/f1.parquet"), 0, &key).as_deref(),
+            sparse(cache.get(&path("t/f1.parquet"), 0, &key)).as_deref(),
             Some(&vec![1, 5, 9])
         );
-        assert_eq!(cache.get(&path("t/f1.parquet"), 1, &key), None);
-        assert_eq!(
-            cache.get(&path("t/f1.parquet"), 0, &condition("a", 8)),
-            None
+        assert!(cache.get(&path("t/f1.parquet"), 1, &key).is_none());
+        assert!(
+            cache
+                .get(&path("t/f1.parquet"), 0, &condition("a", 8))
+                .is_none()
         );
     }
 
@@ -279,35 +327,55 @@ mod tests {
         let cache = QueryConditionCache::new(true, 1 << 20);
         let key = condition("a", 7);
 
-        cache.insert(path("f"), 0, &key, Arc::new(vec![1]));
-        cache.insert(path("f"), 0, &key, Arc::new(vec![2]));
+        cache.insert(path("f"), 0, &key, Arc::new(vec![1]), 100);
+        cache.insert(path("f"), 0, &key, Arc::new(vec![2]), 100);
 
-        assert_eq!(cache.get(&path("f"), 0, &key).as_deref(), Some(&vec![1]));
+        assert_eq!(
+            sparse(cache.get(&path("f"), 0, &key)).as_deref(),
+            Some(&vec![1])
+        );
         assert_eq!(cache.stats().inserts, 1);
     }
 
     #[test]
-    fn eviction_drops_the_least_recently_used_entry() {
+    fn eviction_drops_the_least_recently_used_entries() {
         let one_entry = 4 + ENTRY_OVERHEAD_BYTES;
-        let cache = QueryConditionCache::new(true, 2 * one_entry);
+        let cache = QueryConditionCache::new(true, 3 * one_entry);
         let key = condition("a", 7);
-        cache.insert(path("f"), 0, &key, Arc::new(vec![1]));
-        cache.insert(path("f"), 1, &key, Arc::new(vec![2]));
+        cache.insert(path("f"), 0, &key, Arc::new(vec![1]), 100);
+        cache.insert(path("f"), 1, &key, Arc::new(vec![2]), 100);
+        cache.insert(path("f"), 2, &key, Arc::new(vec![3]), 100);
         cache.get(&path("f"), 0, &key);
 
-        cache.insert(path("f"), 2, &key, Arc::new(vec![3]));
+        cache.insert(path("f"), 3, &key, Arc::new(vec![4]), 100);
 
-        assert!(cache.get(&path("f"), 0, &key).is_some());
+        // Overflow evicts down to the watermark, oldest first: the untouched
+        // early entries go, the recently-used and the newest stay.
         assert!(cache.get(&path("f"), 1, &key).is_none());
-        assert!(cache.get(&path("f"), 2, &key).is_some());
+        assert!(cache.get(&path("f"), 3, &key).is_some());
+        assert!(cache.stats().bytes <= 3 * one_entry);
+    }
+
+    #[test]
+    fn a_dense_result_is_marked_not_stored() {
+        let cache = QueryConditionCache::new(true, 1 << 20);
+        let key = condition("a", 7);
+
+        cache.insert(path("f"), 0, &key, Arc::new((0..80).collect()), 100);
+
+        assert!(matches!(
+            cache.get(&path("f"), 0, &key),
+            Some(CachedPositions::Dense)
+        ));
+        assert!(cache.stats().bytes <= ENTRY_OVERHEAD_BYTES);
     }
 
     #[test]
     fn invalidating_a_file_removes_only_its_entries() {
         let cache = QueryConditionCache::new(true, 1 << 20);
         let key = condition("a", 7);
-        cache.insert(path("old"), 0, &key, Arc::new(vec![1]));
-        cache.insert(path("new"), 0, &key, Arc::new(vec![2]));
+        cache.insert(path("old"), 0, &key, Arc::new(vec![1]), 100);
+        cache.insert(path("new"), 0, &key, Arc::new(vec![2]), 100);
 
         cache.invalidate_files(["old"]);
 
@@ -320,7 +388,7 @@ mod tests {
         let cache = QueryConditionCache::new(false, 1 << 20);
         let key = condition("a", 7);
 
-        cache.insert(path("f"), 0, &key, Arc::new(vec![1]));
+        cache.insert(path("f"), 0, &key, Arc::new(vec![1]), 100);
 
         assert!(cache.get(&path("f"), 0, &key).is_none());
         assert_eq!(cache.stats().entries, 0);

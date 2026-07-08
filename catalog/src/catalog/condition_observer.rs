@@ -11,6 +11,8 @@
 //! already-cached row groups emit only their surviving rows. An incomplete
 //! row group is simply never published.
 
+#[cfg(test)]
+use crate::catalog::condition_cache::CachedPositions;
 use crate::catalog::condition_cache::QueryConditionCache;
 use crate::parquet::{ParquetTable, row_index, visit_row_group_runs};
 use arrow_array::{Array, BooleanArray, RecordBatch};
@@ -37,28 +39,29 @@ enum ObservationState {
 
 /// Build the observer for one scan: `observations` aligns with the scanned
 /// `parquet.row_groups()` (the space the batches' row-group ids index), with
-/// already-`cached` row groups pre-marked done so their (position-filtered)
+/// already-`covered` row groups pre-marked done so their (position-filtered)
 /// batches are ignored.
 pub(super) fn build_condition_observer(
     cache: Arc<QueryConditionCache>,
     condition: ConditionKey,
     parquet: &ParquetTable,
-    cached: &[Option<Arc<Vec<u32>>>],
+    covered: &[bool],
 ) -> ConditionObserverFn {
     let observations: Vec<RowGroupObservation> = parquet
         .row_groups()
         .iter()
-        .zip(cached)
-        .map(|(row_group, cached)| RowGroupObservation {
+        .zip(covered)
+        .map(|(row_group, covered)| RowGroupObservation {
             file_path: row_group.file_path.clone(),
             file_row_group_idx: row_group.file_row_group_idx,
             num_rows: row_group.num_rows as u64,
-            state: Mutex::new(match cached {
-                Some(_) => ObservationState::Done,
-                None => ObservationState::Pending {
+            state: Mutex::new(if *covered {
+                ObservationState::Done
+            } else {
+                ObservationState::Pending {
                     rows_seen: 0,
                     positions: Vec::new(),
-                },
+                }
             }),
         })
         .collect();
@@ -106,6 +109,7 @@ fn observe_batch(
                     observation.file_row_group_idx,
                     condition,
                     Arc::new(positions),
+                    observation.num_rows,
                 );
                 *state = ObservationState::Done;
             }
@@ -176,22 +180,33 @@ mod tests {
         Arc::new(QueryConditionCache::new(true, 1 << 20))
     }
 
+    /// The sparse positions of a cached entry, or `None` for absent/dense.
+    fn sparse(cached: Option<CachedPositions>) -> Option<Arc<Vec<u32>>> {
+        match cached {
+            Some(CachedPositions::Sparse(positions)) => Some(positions),
+            Some(CachedPositions::Dense) | None => None,
+        }
+    }
+
     #[test]
     fn publishes_only_at_full_row_group_coverage() {
         let cache = cache();
         let condition = test_condition();
         let table = table_of_rows(6);
-        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[None]);
+        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
 
-        observer(&meta_batch(0, 0, 4), &BooleanArray::from(vec![true; 4]));
+        observer(
+            &meta_batch(0, 0, 4),
+            &BooleanArray::from(vec![true, false, false, false]),
+        );
         let after_partial = cache.stats().inserts;
         observer(&meta_batch(0, 4, 2), &BooleanArray::from(vec![false, true]));
 
         assert_eq!(after_partial, 0);
         let key: Arc<str> = table.row_groups()[0].file_path.clone();
         assert_eq!(
-            cache.get(&key, 0, &condition).as_deref(),
-            Some(&vec![0, 1, 2, 3, 5])
+            sparse(cache.get(&key, 0, &condition)).as_deref(),
+            Some(&vec![0, 5])
         );
     }
 
@@ -199,16 +214,22 @@ mod tests {
     fn out_of_order_batches_publish_sorted_positions() {
         let cache = cache();
         let condition = test_condition();
-        let table = table_of_rows(4);
-        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[None]);
+        let table = table_of_rows(6);
+        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
 
-        observer(&meta_batch(0, 2, 2), &BooleanArray::from(vec![true, true]));
-        observer(&meta_batch(0, 0, 2), &BooleanArray::from(vec![true, false]));
+        observer(
+            &meta_batch(0, 3, 3),
+            &BooleanArray::from(vec![true, false, false]),
+        );
+        observer(
+            &meta_batch(0, 0, 3),
+            &BooleanArray::from(vec![true, false, false]),
+        );
 
         let key: Arc<str> = table.row_groups()[0].file_path.clone();
         assert_eq!(
-            cache.get(&key, 0, &condition).as_deref(),
-            Some(&vec![0, 2, 3])
+            sparse(cache.get(&key, 0, &condition)).as_deref(),
+            Some(&vec![0, 3])
         );
     }
 
@@ -217,15 +238,37 @@ mod tests {
         let cache = cache();
         let condition = test_condition();
         let table = table_of_rows(3);
-        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[None]);
+        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
 
         observer(
             &meta_batch(0, 0, 3),
-            &BooleanArray::from(vec![Some(true), None, Some(true)]),
+            &BooleanArray::from(vec![Some(true), None, Some(false)]),
         );
 
         let key: Arc<str> = table.row_groups()[0].file_path.clone();
-        assert_eq!(cache.get(&key, 0, &condition).as_deref(), Some(&vec![0, 2]));
+        assert_eq!(
+            sparse(cache.get(&key, 0, &condition)).as_deref(),
+            Some(&vec![0])
+        );
+    }
+
+    #[test]
+    fn a_mostly_true_result_publishes_a_dense_marker() {
+        let cache = cache();
+        let condition = test_condition();
+        let table = table_of_rows(4);
+        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
+
+        observer(
+            &meta_batch(0, 0, 4),
+            &BooleanArray::from(vec![true, true, true, false]),
+        );
+
+        let key: Arc<str> = table.row_groups()[0].file_path.clone();
+        assert!(matches!(
+            cache.get(&key, 0, &condition),
+            Some(CachedPositions::Dense)
+        ));
     }
 
     #[test]
@@ -233,12 +276,7 @@ mod tests {
         let cache = cache();
         let condition = test_condition();
         let table = table_of_rows(2);
-        let observer = build_condition_observer(
-            cache.clone(),
-            condition.clone(),
-            &table,
-            &[Some(Arc::new(vec![1]))],
-        );
+        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[true]);
 
         observer(&meta_batch(0, 0, 2), &BooleanArray::from(vec![true, true]));
 
