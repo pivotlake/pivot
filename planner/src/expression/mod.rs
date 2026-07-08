@@ -114,6 +114,35 @@ pub enum Expression {
 }
 
 impl Expression {
+    /// Rough count of the vectorized kernels evaluating this expression runs
+    /// per batch — a cost proxy for deciding whether shrinking a batch before
+    /// evaluating it pays for the row gather (see the `Filter` operator).
+    pub fn count_kernels(&self) -> usize {
+        match self {
+            Expression::Ref(_) | Expression::Constant(_) => 0,
+            Expression::Compare(c) => 1 + c.left.count_kernels() + c.right.count_kernels(),
+            Expression::Between(b) => 2 + b.input.count_kernels(),
+            Expression::AggregateFunc(_) => 1,
+            // Function operands are almost always plain column refs; count the
+            // function itself as one kernel without recursing into variants.
+            Expression::Function(_) => 1,
+            Expression::InList(l) => l.values.len() + l.input.count_kernels(),
+            Expression::Conjunction(c) => {
+                c.children.iter().map(Self::count_kernels).sum::<usize>()
+                    + c.children.len().saturating_sub(1)
+            }
+            Expression::Case(c) => {
+                c.checks
+                    .iter()
+                    .map(|check| 1 + check.when.count_kernels() + check.then.count_kernels())
+                    .sum::<usize>()
+                    + c.else_expr.count_kernels()
+            }
+            Expression::Not(n) => 1 + n.input.count_kernels(),
+            Expression::Cast(c) => 1 + c.source.count_kernels(),
+        }
+    }
+
     /// Static result type of a computed expression. Used to pick a group-key
     /// extractor when grouping on it (e.g. `GROUP BY CASE …`) and to derive
     /// each operator's output types (see `PlanNode::output_types`).

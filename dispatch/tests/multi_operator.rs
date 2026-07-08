@@ -4,6 +4,7 @@
 
 mod common;
 
+use arrow::compute::filter_record_batch;
 use arrow_array::{Array, BooleanArray, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::DataType;
@@ -23,14 +24,15 @@ fn filter_then_project() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
-            move |batch: &RecordBatch| {
-                c.run(
+            move |batch: RecordBatch| {
+                let mask = c.run(
                     batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
-                )
+                );
+                filter_record_batch(&batch, &mask).unwrap()
             }
         })
         .project(|| {
@@ -57,14 +59,15 @@ fn filter_then_count() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
-            move |batch: &RecordBatch| {
-                c.run(
+            move |batch: RecordBatch| {
+                let mask = c.run(
                     batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
-                )
+                );
+                filter_record_batch(&batch, &mask).unwrap()
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -99,15 +102,16 @@ fn filter_then_group_by_then_order_by() {
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
         .filter(|| {
-            move |batch: &RecordBatch| {
+            move |batch: RecordBatch| {
                 let col = batch
                     .column(0)
                     .as_any()
                     .downcast_ref::<StringViewArray>()
                     .unwrap();
-                BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
+                let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
                     col.value(i) != "other.com"
-                }))
+                }));
+                filter_record_batch(&batch, &mask).unwrap()
             }
         })
         .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(

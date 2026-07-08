@@ -2,6 +2,7 @@
 
 use crate::compile::{Error, ExprEvalFn};
 use crate::expression::Expression;
+use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::boolean::and;
 use arrow_array::{BooleanArray, RecordBatch};
 use dispatch::RecordBatchOperatorSpec;
@@ -39,18 +40,54 @@ impl Filter {
         );
         assert!(!filters.is_empty());
 
-        Ok(input.filter(|| {
+        // Conditions apply progressively: each one's survivors are what the
+        // next condition evaluates, so a selective early condition spares the
+        // later ones most of the rows. Gathering the surviving rows costs a
+        // pass over every column, though, so the batch only shrinks while the
+        // remaining conditions are expensive enough to repay it; the tail of
+        // cheap conditions just ANDs masks and gathers once at the end.
+        let remaining_kernels: Vec<usize> = {
+            let per_condition: Vec<usize> = self
+                .conditions
+                .iter()
+                .map(Expression::count_kernels)
+                .collect();
+            (0..per_condition.len())
+                .map(|i| per_condition[i + 1..].iter().sum())
+                .collect()
+        };
+        const SHRINK_KERNEL_THRESHOLD: usize = 4;
+
+        Ok(input.filter(move || {
             let mut eval_fns: Vec<ExprEvalFn> = filters.iter().map(|f| f()).collect();
-            move |batch: &RecordBatch| {
-                eval_fns
-                    .iter_mut()
-                    .map(|f| {
-                        let result = f(batch);
-                        let (arr, _) = result.as_datum().get();
-                        arr.as_any().downcast_ref::<BooleanArray>().unwrap().clone()
-                    })
-                    .reduce(|left, right| and(&left, &right).unwrap())
-                    .unwrap()
+            let remaining_kernels = remaining_kernels.clone();
+            move |batch: RecordBatch| {
+                let mut current = batch;
+                let mut pending: Option<BooleanArray> = None;
+                for (eval, &remaining) in eval_fns.iter_mut().zip(&remaining_kernels) {
+                    if current.num_rows() == 0 {
+                        break;
+                    }
+                    let result = eval(&current);
+                    let (arr, _) = result.as_datum().get();
+                    let mask = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+                    let mask = match pending.take() {
+                        Some(previous) => and(&previous, mask).unwrap(),
+                        None => mask.clone(),
+                    };
+                    if remaining >= SHRINK_KERNEL_THRESHOLD {
+                        current = filter_record_batch(&current, &mask)
+                            .expect("mask length matches the batch");
+                    } else {
+                        pending = Some(mask);
+                    }
+                }
+                match pending {
+                    Some(mask) => {
+                        filter_record_batch(&current, &mask).expect("mask length matches the batch")
+                    }
+                    None => current,
+                }
             }
         }))
     }
