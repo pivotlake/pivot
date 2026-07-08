@@ -22,10 +22,13 @@ use planner::catalog::{
 use planner::condition_key::ConditionKey;
 use planner::expression::{CompareType, Expression, TableFilter};
 
-/// How many known-dense row groups (with no sparse ones) it takes to judge a
-/// whole condition dense and stop observing its scans. Small enough that one
-/// partial first run reaches the verdict; large enough that a couple of
-/// unrepresentative row groups don't end observation of a sparse condition.
+/// How many known-dense row groups it takes (when they also outnumber sparse
+/// ones 4 to 1) to judge a whole condition dense and stop observing its
+/// scans. Small enough that one partial first run reaches the verdict; large
+/// enough that a couple of unrepresentative row groups don't end observation
+/// of a sparse condition. Tolerating a sparse minority matters: density
+/// varies across a real table, and a few sparse outliers must not keep a
+/// plainly dense condition under observation forever.
 const DENSE_CONDITION_MIN_SAMPLES: usize = 8;
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
@@ -219,7 +222,7 @@ impl Table for TableBinding {
         // scan whose row groups a Top-N boundary keeps skipping (those never
         // get touched, so per-row-group markers alone never conclude).
         let assume_condition_dense =
-            sparse_entries == 0 && dense_entries >= DENSE_CONDITION_MIN_SAMPLES;
+            dense_entries >= DENSE_CONDITION_MIN_SAMPLES && dense_entries >= 4 * sparse_entries;
         let observe = !assume_condition_dense && covered.iter().any(|covered| !covered);
         let observer = observe.then(|| {
             build_condition_observer(cache.clone(), condition.clone(), &parquet, &covered)
