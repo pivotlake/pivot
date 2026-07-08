@@ -73,10 +73,11 @@ impl ObjectPath {
     }
 
     /// Resolve `child` against this path as a base directory: an **absolute**
-    /// `child` is taken as-is (it escapes the base — e.g. a file in a shared
-    /// directory); any other `child` is relative to this base and joined under
-    /// it. How a table reads a [`FileRef`](crate::FileRef) whose path may be
-    /// relative to the table's location or absolute.
+    /// `child` is taken as-is (it escapes the base), any other `child` is
+    /// relative to this base and joined under it. How a table's *location*
+    /// resolves against the database root. A committed data file's
+    /// [`FileRef`](crate::FileRef) path is always relative to the table's
+    /// location: its delta log only records files under it.
     pub fn resolve(&self, child: &ObjectPath) -> ObjectPath {
         if child.is_absolute() {
             child.clone()

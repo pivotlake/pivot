@@ -176,12 +176,12 @@ fn create_table_without_a_path_makes_an_empty_table() {
 #[test]
 fn create_table_over_a_missing_path_yields_an_empty_table() {
     // A location with no files yields an empty table — the same as a relative or
-    // no-path location. The catalog does not stat the path (which only makes
-    // sense for a local store; on a bucket an absolute path is just a key).
-    let (_dir, columns) = three_row_table();
+    // no-path location. The location is created if missing: the table's delta
+    // log lives there, so it must exist even before any data does.
+    let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
-    create_table(&catalog, create_request("t", bogus, columns)).unwrap();
+    let missing = dir.path().join("not/created/yet");
+    create_table(&catalog, create_request("t", &missing, columns)).unwrap();
     assert!(catalog.binding("t").is_some());
     assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
@@ -443,11 +443,11 @@ fn metadata_function_honors_column_projection() {
 /// still carries the full schema (an empty batch, not no batch).
 #[test]
 fn metadata_function_on_empty_table() {
-    let (_dir, columns) = three_row_table();
+    let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(
         &catalog,
-        create_request("t", Path::new("/no/such/dir"), columns),
+        create_request("t", &dir.path().join("empty"), columns),
     )
     .unwrap();
 

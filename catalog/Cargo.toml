@@ -29,17 +29,17 @@ bytes = "1.11.0"
 crossbeam-deque = "0.8.6"
 ahash = "0.8.12"
 snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "b896aa24d6c85fa1b40f8746c3cc2185ca4084b9" }
-# Catalog metadata is serialized as JSON: the `_pivot_manifest.json` database
-# manifest and the `_pivot_tables/<table>/<version>.json` table-manifest versions.
+# The `_pivot_manifest.json` database index and the partition/sort metadata
+# riding on delta actions are JSON.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Synchronous object-store access for the catalog control plane (LIST/GET/PUT/
-# conditional-PUT of the manifest and `_pivot_tables/` versions), so the engine
+# Synchronous object-store access for the data plane (PUT of written parquet
+# files, LIST at CREATE TABLE, presigned GET URLs for the ring), so the engine
 # never spins up an async runtime.
 # `ureq` is blocking HTTP + rustls; `aws-sigv4::sign` is a pure sync function we
 # call to sign S3 requests (the tokio it transitively pulls is never driven).
-# Credentials are read from the environment ourselves. GCS uses an OAuth bearer
-# over the JSON API. The hot data path uses none of this — it's on the ring.
+# Credentials are read from the environment ourselves. The hot data path uses
+# none of this; it's on the ring.
 ureq = { version = "2", features = ["json"] }
 aws-sigv4 = "1"
 aws-credential-types = "1"
@@ -51,6 +51,27 @@ ring = "0.17"
 base64 = "0.22"
 # Build/parse the concrete URLs handed to the io_uring HTTP reader.
 url = "2"
+# The table format: each table's schema, specs, and file list live in a Delta
+# Lake transaction log. The statement-facing hot paths (open, per-query
+# reload, committing written files) go through delta-kernel-rs, whose
+# synchronous API the control plane calls directly; its default engine hosts
+# the object stores and the background thread that drives their IO.
+delta_kernel = { version = "0.25.0", default-features = false, features = ["default-engine-base", "arrow"] }
+delta_kernel_default_engine = "0.25.0"
+# The cold paths (CREATE TABLE, compaction's swap, log maintenance) stay on
+# delta-rs, which owns the operations kernel lacks (vacuum, checkpointing
+# with log cleanup). `deltalake-aws` and `deltalake-gcp` are its S3 and GCS
+# log stores (conditional-create commits), registered explicitly at runtime:
+# the `deltalake` meta crate would do it in a pre-main constructor, which
+# allocates before jemalloc (the global allocator) is initialized and aborts.
+# delta-rs is async, so the catalog owns one small tokio runtime dedicated to
+# its log operations; `chrono` only names the vacuum retention period in
+# delta-rs's own duration type.
+deltalake-core = { version = "0.32", features = ["rustls"] }
+deltalake-aws = { version = "0.15", features = ["rustls"] }
+deltalake-gcp = "0.16"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+chrono = { version = "0.4", default-features = false }
 # Optional, behind the `test-support` feature: the in-Docker object-store test
 # harness exposed as `catalog::test_support`. testcontainers brings up MinIO and
 # fake-gcs-server; tempfile backs the local() backend. (The harness's other

@@ -257,11 +257,12 @@ impl Compacter {
                 }
             }
         }
-        // Reclaim the manifest versions left behind by this round's swaps (and
-        // by any appends since the last sweep). Best-effort: a failure here just
-        // leaves the old version files for the next round.
-        if let Err(e) = table.prune_old_versions() {
-            warn!(table = table.name(), error = %e, "compaction: pruning old manifest versions failed");
+        // Upkeep of the table's delta log and data directory: checkpoint the
+        // log, drop entries past the retention horizon, and physically delete
+        // the data files this round's swaps (and earlier ones) tombstoned.
+        // Best-effort: a failure here just leaves the work for the next round.
+        if let Err(e) = table.maintain() {
+            warn!(table = table.name(), error = %e, "compaction: log maintenance failed");
         }
     }
 
@@ -402,13 +403,11 @@ impl CompactJob {
             return Ok(Vec::new());
         }
         // Don't delete the swapped-out inputs now: a query that loaded the prior
-        // manifest version is still reading them (that's the `404 expected 206`
-        // a reader hits when compaction deletes under it). Record them instead -
-        // they're deleted when this version is pruned, by which point the
-        // retention tail guarantees no reader still references them.
-        if let Err(e) = table.record_deletions(&removed) {
-            warn!(error = %e, "compaction: recording deferred deletions failed (inputs will linger as orphans)");
-        }
+        // log version is still reading them (that's the `404 expected 206` a
+        // reader hits when compaction deletes under it). The swap already
+        // tombstoned them in the log; the maintenance sweep deletes them once
+        // the tombstones age past the retention horizon, by which point no
+        // reader still references them.
         Ok(added.into_iter().map(|entry| entry.file).collect())
     }
 }

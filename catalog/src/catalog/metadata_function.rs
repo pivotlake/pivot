@@ -19,7 +19,7 @@ use planner::types::Type;
 use planner::{TableFunction, TableFunctionSignature};
 
 use super::ParquetQueryContext;
-use crate::manifest::PartitionEqFilter;
+use crate::delta::PartitionEqFilter;
 use crate::parquet::RowGroupMetadata;
 use thiserror::Error as ThisError;
 

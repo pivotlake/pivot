@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender as StdSender, TryRecvError};
 
-use crate::manifest::SortBounds;
+use crate::delta::SortBounds;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ord::partition::partition;
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};

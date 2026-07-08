@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use crate::manifest::SortBounds;
+use crate::delta::SortBounds;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::{Identifier, WorkerIdOutput};

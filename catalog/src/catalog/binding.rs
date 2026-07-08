@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::manifest::{ManifestEntry, PartitionEqFilter};
+use crate::delta::{ManifestEntry, PartitionEqFilter};
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, op_err, row_group_eliminated,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,

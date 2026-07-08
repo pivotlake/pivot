@@ -145,6 +145,33 @@ impl ObjectStore for LocalStore {
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
         Ok(DataFileSource::Local(self.path_for(key)))
     }
+
+    fn delta_table_target(&self, location: &ObjectPath) -> Result<super::DeltaTableTarget> {
+        // delta-rs wants an absolute `file://` URL and an existing directory;
+        // creating the table's directory up front is idempotent and lets a
+        // brand-new table's first commit land without a separate mkdir step.
+        let dir = self.path_for(location);
+        std::fs::create_dir_all(&dir).map_err(|source| StoreError::Io {
+            key: location.as_str().to_string(),
+            source,
+        })?;
+        let dir = std::path::absolute(&dir).map_err(|source| StoreError::Io {
+            key: location.as_str().to_string(),
+            source,
+        })?;
+        let uri = url::Url::from_directory_path(&dir)
+            .map_err(|()| {
+                StoreError::Config(format!(
+                    "table path `{}` is not a valid file url",
+                    dir.display()
+                ))
+            })?
+            .to_string();
+        Ok(super::DeltaTableTarget {
+            uri,
+            storage_options: Default::default(),
+        })
+    }
 }
 
 #[cfg(test)]

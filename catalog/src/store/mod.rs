@@ -1,18 +1,23 @@
-//! A generic key→bytes object store — local filesystem, S3, or GCS — and nothing
-//! catalog-specific. It knows how to `get`/`put`/`list`/`delete` objects, do a
-//! conditional create ([`ObjectStore::put_if_absent`], the table log's CAS),
-//! and turn a key into a ring-readable [`DataFile`]; the table manifest,
-//! table log, and catalog build on it one layer up.
+//! A generic key→bytes object store (local filesystem, S3, or GCS) and
+//! nothing catalog-specific. It knows how to `get`/`put`/`list`/`delete`
+//! objects, do a conditional create ([`ObjectStore::put_if_absent`]), turn a
+//! key into a ring-readable [`DataFile`], and name a location as a delta-rs
+//! table target ([`ObjectStore::delta_table_target`]); the delta log layer and
+//! catalog build on it one layer up.
 //!
 //! Everything here is **synchronous** and pulls in no async runtime: local
 //! access is plain `std::fs`; S3/GCS go over [`ureq`] (blocking HTTP + rustls).
 //! S3 requests are signed with `aws_sigv4::http_request::sign` — a pure function
 //! we call inline (the tokio it transitively links is never driven). Credentials
-//! come from the environment. This runs off the io_uring ring on purpose: a
-//! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
-//! per query) next to the hot column-chunk reads, which stay on the ring.
+//! come from the environment. GCS uses an OAuth bearer over the JSON API. This
+//! runs off the io_uring ring on purpose: a LIST isn't a range-GET the ring can
+//! serve, and it's rare and tiny (a few KB per query) next to the hot
+//! column-chunk reads, which stay on the ring. (The delta transaction log is
+//! the one exception: delta-rs drives it on its own dedicated runtime, see
+//! [`crate::delta`].)
 
 use dispatch::io::AuthHeader;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 
@@ -44,13 +49,11 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// A table's data file: its [`ObjectPath`] in the store and its size in bytes.
-/// The single durable file identity — the [table manifest] records a
-/// `Vec<FileRef>`, [`ObjectStore::list`] returns these, and the catalog and
-/// compacter speak them. The path reads the file directly (no re-joining a
-/// location); the size lets a reader locate a Parquet footer without a separate
-/// HEAD/`stat`.
-///
-/// [table manifest]: crate::manifest::TableManifest
+/// The single durable file identity: each committed
+/// [`ManifestEntry`](crate::delta::ManifestEntry) records one,
+/// [`ObjectStore::list`] returns these, and the catalog and compacter speak
+/// them. The path reads the file directly (no re-joining a location); the size
+/// lets a reader locate a Parquet footer without a separate HEAD/`stat`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileRef {
     pub path: ObjectPath,
@@ -152,11 +155,10 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// index, which a single server writes on the occasional `CREATE TABLE`.)
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
 
-    /// Create `key` with `data` only if it does not already exist — the
-    /// compare-and-swap the versioned [table manifest](crate::manifest) builds
-    /// its commits on. `Ok(true)` means this writer created the object; `Ok(false)`
-    /// means the key was already there (the caller lost the race: re-read the
-    /// latest state and retry at the next version).
+    /// Create `key` with `data` only if it does not already exist: a
+    /// compare-and-swap primitive. `Ok(true)` means this writer created the
+    /// object; `Ok(false)` means the key was already there (the caller lost
+    /// the race: re-read the latest state and retry).
     fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool>;
 
     /// Delete `key`. Deleting an object that does not exist is not an error —
@@ -195,6 +197,21 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn describe(&self) -> String {
         format!("{self:?}")
     }
+
+    /// How the delta layer should address a table rooted at `location` within
+    /// this store: the table's full URI plus the storage options its object
+    /// store needs to reach it (credentials, endpoint). The delta transaction
+    /// log lives under this target; the data-plane reads and writes of the
+    /// same files keep going through this store's own methods.
+    fn delta_table_target(&self, location: &ObjectPath) -> Result<DeltaTableTarget>;
+}
+
+/// Where a table's delta log lives: a `file://`/`s3://` table URI and the
+/// storage options to open it with (option names as delta-rs reads them; the
+/// kernel side translates the one key object_store spells differently).
+pub struct DeltaTableTarget {
+    pub uri: String,
+    pub storage_options: HashMap<String, String>,
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,

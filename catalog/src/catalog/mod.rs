@@ -8,23 +8,24 @@
 //! [`ParquetCatalog::open`] on a local directory *or* a remote `s3://`/`gs://`
 //! root — a persisted one.
 //!
-//! Durable state lives in two places, both in the store:
+//! Durable state lives in two places:
 //!
-//! - the [`manifest`] — which tables exist (name, declared schema, location);
-//! - the per-table [`TableManifest`] — *which
-//!   Parquet files* each table consists of, as a sequence of versions committed
-//!   with the store's compare-and-swap. The highest version is the table's
-//!   current file list.
+//! - the [`db_index`](crate::db_index): which tables exist (name, location),
+//!   one JSON document in the store;
+//! - each table's **delta log** ([`crate::delta`]): its declared schema,
+//!   partition/sort specs, and *which Parquet files* it consists of, as a
+//!   sequence of versions committed by compare-and-swap. The latest version is
+//!   the table's current file list.
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version; the flattened scan view a query sees
 //! is derived from those files on demand, so there is no cached copy to drift.
 //! A change swaps `version` + `files` whole. Resolving a table for a query
-//! ([`Catalog::table`]) first **reloads**: one LIST of the table's log
-//! directory; if a newer version exists, only the *new* files' footers are
-//! fetched (over the dispatch pool) and the new file set is swapped in — so a
-//! file committed by an insert, a compaction's swap, or even another process's
-//! commit becomes visible to the very next query.
+//! ([`Catalog::table`]) first **reloads** the delta log; if a newer version
+//! exists, only the *new* files' footers are fetched (over the dispatch pool)
+//! and the new file set is swapped in, so a file committed by an insert, a
+//! compaction's swap, or even another process's commit becomes visible to the
+//! very next query.
 //!
 //! Each resolve hands back a fresh [`TableBinding`], so per-query filter
 //! pushdown accumulates on that binding alone.
@@ -40,9 +41,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::manifest::{
-    self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
-};
+use crate::db_index::{CatalogManifest, CatalogManifestTableEntry};
+use crate::delta::{self, DeltaLog, PartitionEqFilter};
 use crate::parquet::{ParquetTable, ParquetTableError, op_err};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec, Sender};
@@ -76,16 +76,20 @@ pub enum Error {
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
     TableExists(String),
+    #[error(
+        "creating table `{name}`: a delta table already exists at location `{location}` (another table's data, or a log left by a previous database)"
+    )]
+    LocationHasTable { name: String, location: String },
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
     Store(#[from] store::StoreError),
     #[error(transparent)]
-    Manifest(#[from] manifest::Error),
+    Delta(#[from] delta::Error),
+    #[error(transparent)]
+    DbIndex(#[from] crate::db_index::Error),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
-    #[error("table `{0}`: lost a manifest commit race, but no newer version exists to retry on")]
-    CommitRaceWithoutWinner(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -102,8 +106,8 @@ impl From<Error> for CatalogError {
 ///
 /// `CREATE TABLE` compiles to a single dataflow that reads every data file's
 /// footer **once** (in parallel over the worker pool) and, at its terminal
-/// stage, commits the table (its manifest + the database index) and publishes
-/// the entry in this shared map. After that, a table evolves by manifest commits
+/// stage, commits the table (its delta log + the database index) and publishes
+/// the entry in this shared map. After that, a table evolves by log commits
 /// on a [`CatalogTable`] *copy* — a writer takes one with
 /// [`table_handle`](Self::table_handle) and calls
 /// [`append_data_file`](CatalogTable::append_data_file) /
@@ -116,13 +120,14 @@ pub struct ParquetCatalog {
     /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
     /// lock-free value that callers clone out and evolve independently.
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    /// The database's object store — both the table manifests and the tables'
+    /// The database's object store: the database index and the tables'
     /// Parquet data. A local directory by default ([`new`], an ephemeral one
     /// under the temp dir), or the directory / S3 / GCS root a database is
     /// [`open`](Self::open)ed at. The catalog reads and writes a table's data
     /// through this one store: relative locations live under the database root,
     /// an absolute location at the store's own root (the filesystem root, or the
-    /// bucket root).
+    /// bucket root). Each table's delta log lives under its location and is
+    /// driven by delta-rs rather than through this store.
     ///
     /// [`new`]: Self::new
     store: Arc<dyn ObjectStore>,
@@ -157,9 +162,10 @@ impl ParquetCatalog {
 
     /// Open a persisted database rooted at `uri` — a local directory (or
     /// `file://…`), or a remote `s3://…`/`gs://…` object store — reloading every
-    /// table the manifest records at its latest version: read each table's
-    /// manifest (schema + file list) and fetch its files' footers, building the
-    /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
+    /// table the database index records at its latest version: open each
+    /// table's delta log (schema + file list) and fetch its files' footers,
+    /// building the in-memory [`CatalogTable`]. A database with no index yet
+    /// opens empty.
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
         let manifest = CatalogManifest::load(store.as_ref())?;
@@ -177,17 +183,18 @@ impl ParquetCatalog {
         })
     }
 
-    /// Build the in-memory [`CatalogTable`] for one persisted table: read its
-    /// manifest (erroring if the catalog points at a table that has none), then
-    /// locate its committed files under the entry's location and fetch their
-    /// footers over the pool.
+    /// Build the in-memory [`CatalogTable`] for one persisted table: open its
+    /// delta log at the latest version (erroring if the catalog points at a
+    /// table that has none), then locate its committed files under the entry's
+    /// location and fetch their footers over the pool.
     fn load_table(
         dispatcher: &DataFlowDispatcher,
         store: &Arc<dyn ObjectStore>,
         entry: &CatalogManifestTableEntry,
     ) -> Result<CatalogTable> {
-        let manifest = TableManifest::load(store.as_ref(), &entry.name)?;
-        let files = manifest
+        let target = store.delta_table_target(&entry.location)?;
+        let (log, state) = DeltaLog::open(target.uri, target.storage_options, &entry.name)?;
+        let files = state
             .entries
             .iter()
             .map(|f| {
@@ -200,7 +207,8 @@ impl ParquetCatalog {
         Ok(CatalogTable::new(
             entry.name.clone(),
             entry.location.clone(),
-            manifest,
+            Arc::new(log),
+            state,
             table_files,
             store.clone(),
             dispatcher.clone(),
@@ -255,7 +263,7 @@ impl ParquetCatalog {
 
     /// Compile a `CREATE TABLE` to the dataflow that runs it: read every Parquet
     /// footer under the table's location in parallel and, at the final stage,
-    /// record the table in the manifest with the files found, and publish it in
+    /// create the table's delta log with the files found, and publish it in
     /// the catalog map. Fetch and write are one spec —
     /// the caller executes it; nothing happens here but the (cheap, read-only)
     /// directory listing.
@@ -293,7 +301,7 @@ impl ParquetCatalog {
 
         // Fan the fetched footers in to one worker and commit there once every
         // file has arrived, under the table-set write lock (which serializes
-        // in-process creates): CAS-commit the table's own manifest, record it
+        // in-process creates): create the table's delta log, record the table
         // in the database index, then publish it in the in-memory map -
         // re-checking the name as a race backstop. Emits no rows.
         let tables = self.tables.clone();
@@ -474,8 +482,8 @@ impl ParquetQueryContext {
             return Ok(parquet.clone());
         }
 
-        // Build the view: take the master copy, advance its manifest (no footer
-        // I/O), then fetch footers for just the surviving partitions.
+        // Build the view: take the master copy, advance its committed state
+        // (no footer I/O), then fetch footers for just the surviving partitions.
         let mut table = self
             .tables
             .read()
@@ -502,7 +510,7 @@ impl ParquetQueryContext {
 
     /// A copy of table `name`'s master record, independent of the pinned read
     /// views. An `INSERT` evolves it as its writer (the commit CASes the
-    /// shared manifest, so a copy that lags the store just retries);
+    /// shared delta log, so a copy that lags the store just retries);
     /// `metadata()` reads its per-file row groups (after
     /// [`parquet`](Self::parquet) has warmed the footers). Errors if the table
     /// no longer exists (dropped since planning), never a silent miss.

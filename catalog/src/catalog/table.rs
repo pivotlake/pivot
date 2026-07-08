@@ -1,11 +1,11 @@
 //! The catalog's master record of one table: its definition plus its current
-//! content — the files at one manifest version.
+//! content, the files at one delta log version.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
-use crate::manifest::{FIRST_VERSION, ManifestEntry, PartitionEqFilter, SortBounds, TableManifest};
+use crate::delta::{DeltaLog, ManifestEntry, PartitionEqFilter, SortBounds, TableState};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use dispatch::DataFlowDispatcher;
@@ -32,41 +32,45 @@ impl TableFile {
     }
 }
 
-/// The catalog's master record of one table: its [`TableManifest`] (declared
-/// columns + committed file list, at one version) and its current content — the
-/// per-file row groups (`files`). The version lives in the manifest, not
-/// alongside it.
+/// The catalog's master record of one table: its committed [`TableState`]
+/// (declared columns + file list, at one delta log version) and its current
+/// content, the per-file row groups (`files`).
 ///
-/// It is a plain **value** - `Clone`, no interior locks. A writer (an insert,
-/// compaction) clones one out of the catalog, mutates its own copy, and lets the
-/// durable manifest be the source of truth: every mutation
-/// ([`append_data_file`](Self::append_data_file),
-/// [`replace_data_files`](Self::replace_data_files)) commits a new manifest
-/// version by compare-and-swap, retrying past a concurrent writer. Copies drift
+/// It is a plain **value** — `Clone`, no interior locks. A writer (an insert,
+/// compaction) clones one out of the catalog, mutates its own copy, and lets
+/// the delta log be the source of truth: every mutation
+/// ([`commit_added_files`](Self::commit_added_files),
+/// [`replace_data_files`](Self::replace_data_files)) commits a new log version
+/// by compare-and-swap, retrying past a concurrent writer. Copies drift
 /// freely; [`refresh`](Self::refresh) reconciles any copy to the latest version
-/// (re-reading only the footers it doesn't already hold). `store`, `name`, and
-/// `location` are kept so a copy can persist and reload itself.
+/// (re-reading only the footers it doesn't already hold). The shared
+/// [`DeltaLog`] handle, `store`, `name`, and `location` are kept so a copy can
+/// persist and reload itself.
 #[derive(Clone)]
 pub struct CatalogTable {
     name: String,
-    /// Where the table's Parquet data lives in the object store.
+    /// Where the table's Parquet data (and so its delta log) lives in the
+    /// object store.
     location: ObjectPath,
-    pub(super) manifest: TableManifest,
+    pub(super) state: TableState,
     pub(super) files: Vec<TableFile>,
     store: Arc<dyn ObjectStore>,
+    /// The table's delta transaction log, shared by every copy.
+    log: Arc<DeltaLog>,
     /// The pool a reload/commit fetches footers on, so the mutators need no
     /// dispatcher passed in.
     dispatcher: DataFlowDispatcher,
 }
 
 impl CatalogTable {
-    /// Reassemble a persisted table from its loaded `manifest` and the per-file
+    /// Reassemble a persisted table from its loaded `state` and the per-file
     /// row groups (`files`) just fetched for it — the reopen path. Does not
-    /// persist anything; the manifest it was loaded from is already durable.
+    /// persist anything; the log version it was loaded from is already durable.
     pub(super) fn new(
         name: String,
         location: ObjectPath,
-        manifest: TableManifest,
+        log: Arc<DeltaLog>,
+        state: TableState,
         files: Vec<TableFile>,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
@@ -74,18 +78,19 @@ impl CatalogTable {
         Self {
             name,
             location,
-            manifest,
+            state,
             files,
             store,
+            log,
             dispatcher,
         }
     }
 
-    /// Create a brand-new table from freshly-read footers: build its
-    /// [`TableManifest`] (declared `columns` + the loaded files, at
-    /// [`FIRST_VERSION`]) and commit it. The compare-and-swap fails with
-    /// [`Error::TableExists`] if another writer already committed this table's
-    /// first version. The `CREATE TABLE` commit path.
+    /// Create a brand-new table from freshly-read footers: create its delta
+    /// table (declared `columns`, partition/sort specs, and the loaded files
+    /// as the first commit). Fails with [`Error::LocationHasTable`] if a delta
+    /// table already exists at this location (another table's data, or a log
+    /// left behind by a previous database). The `CREATE TABLE` commit path.
     #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn create_new(
         name: String,
@@ -104,60 +109,61 @@ impl CatalogTable {
             .iter()
             .map(|f| ManifestEntry::new(f.file.clone()))
             .collect();
-        let manifest = TableManifest {
-            version: FIRST_VERSION,
+        let target = store.delta_table_target(&location)?;
+        let (log, state) = DeltaLog::create(
+            target.uri,
+            target.storage_options,
             columns,
             partition_by,
             sort_by,
             entries,
-        };
-        if !manifest.commit(store.as_ref(), &name)? {
-            return Err(Error::TableExists(name));
-        }
+        )
+        .map_err(|e| match e {
+            crate::delta::Error::TableExists => Error::LocationHasTable {
+                name: name.clone(),
+                location: location.as_str().to_string(),
+            },
+            other => Error::Delta(other),
+        })?;
         Ok(Self {
             name,
             location,
-            manifest,
+            state,
             files,
             store,
+            log: Arc::new(log),
             dispatcher,
         })
     }
 
-    /// Reload this copy to the latest committed version. Errors if the table has
-    /// no manifest at all (a corrupt catalog). Returns whether it advanced;
-    /// `Ok(false)` means this copy was already current.
+    /// Reload this copy to the latest committed version. Returns whether it
+    /// advanced; `Ok(false)` means this copy was already current.
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let Some(manifest) =
-            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
-        else {
+        let Some(state) = self.log.load_after(self.state.version)? else {
             return Ok(false);
         };
-        self.manifest = manifest;
-        self.sync_files_to_manifest()?;
+        self.state = state;
+        self.sync_files_to_state()?;
         Ok(true)
     }
 
     /// Reload to the latest version *without* fetching any footers: advance the
-    /// manifest and drop cached files no longer in it, but leave fetching the new
+    /// state and drop cached files no longer in it, but leave fetching the new
     /// files' footers to [`parquet`](Self::parquet), which fetches only the
     /// partitions a query actually scans. The read path uses this; a writer still
     /// uses [`refresh`](Self::refresh) (it needs every file's row groups to pick
-    /// compaction candidates). Returns whether it
-    /// advanced.
+    /// compaction candidates). Returns whether it advanced.
     pub fn reload_manifest_only(&mut self) -> crate::Result<bool> {
-        let Some(manifest) =
-            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
-        else {
+        let Some(state) = self.log.load_after(self.state.version)? else {
             return Ok(false);
         };
-        self.set_manifest(manifest);
+        self.set_state(state);
         Ok(true)
     }
 
     /// Write `bytes` as a new data file at `path` (under the table's location)
-    /// and commit it into the table - an external writer's single-file append,
-    /// one call for the write and the manifest commit. Idempotent on `path`.
+    /// and commit it into the table — an external writer's single-file append,
+    /// one call for the write and the log commit. Idempotent on `path`.
     /// (An `INSERT` writes its files first and commits them all at once via
     /// [`commit_added_files`](Self::commit_added_files).)
     pub fn append_data_file(
@@ -168,20 +174,6 @@ impl CatalogTable {
         sort_bounds: Option<SortBounds>,
     ) -> crate::Result<()> {
         let file = self.write_data_file(path, bytes)?;
-        self.commit_added_file(file, partition, sort_bounds)
-    }
-
-    /// CAS-commit one already-written file into the manifest: a single-entry
-    /// [`commit_added_files`](Self::commit_added_files), sharing its retry and
-    /// replay-idempotency semantics. `partition`/`sort_bounds` are the file's
-    /// partition tuple and sort-key range (a partitioning/sorting sink's), each
-    /// `None` when not recorded.
-    fn commit_added_file(
-        &mut self,
-        file: FileRef,
-        partition: Option<serde_json::Value>,
-        sort_bounds: Option<SortBounds>,
-    ) -> crate::Result<()> {
         self.commit_added_files(vec![ManifestEntry {
             file,
             partition,
@@ -189,72 +181,34 @@ impl CatalogTable {
         }])
     }
 
-    /// CAS-commit a batch of already-written files into the manifest as **one**
+    /// Commit a batch of already-written files into the delta log as **one**
     /// new version (one `INSERT` = one commit, however many files it produced),
-    /// retrying past concurrent writers. Entries whose path the manifest
-    /// already holds are skipped, so a replayed commit can't double-count rows.
+    /// retrying past concurrent writers. Entries whose path the log already
+    /// holds are skipped, so a replayed commit can't double-count rows.
     ///
-    /// Touches only the manifest: it never fetches footers, so it is safe to
-    /// call from a dispatch worker (an `INSERT`'s terminal sink), where a footer
+    /// Touches only the log: it never fetches footers, so it is safe to call
+    /// from a dispatch worker (an `INSERT`'s terminal sink), where a footer
     /// fetch would drive a nested dataflow on the same pool and deadlock the
     /// worker driving it. Readers fetch the new files' footers lazily via
     /// [`parquet`](Self::parquet).
     pub fn commit_added_files(&mut self, entries: Vec<ManifestEntry>) -> crate::Result<()> {
-        // Start from the latest committed version, not this copy's. A copy can
-        // lag arbitrarily (an insert's copy comes from the catalog map, which
-        // only advances on reads), and a CAS at a version number the pruner has
-        // already deleted would wrongly succeed on the dead slot, committing a
-        // manifest no reader (they resolve the highest version) would ever see.
-        self.reload_manifest_only()?;
-        loop {
-            let fresh: Vec<ManifestEntry> = entries
-                .iter()
-                .filter(|entry| {
-                    !self
-                        .manifest
-                        .entries
-                        .iter()
-                        .any(|held| held.file.path == entry.file.path)
-                })
-                .cloned()
-                .collect();
-            if fresh.is_empty() {
-                return Ok(());
-            }
-            // Build the next version in place, undoing it whenever the commit
-            // didn't land, so no exit leaves this copy claiming a version and
-            // entries that were never durably committed.
-            let held = self.manifest.entries.len();
-            self.manifest.version += 1;
-            self.manifest.entries.extend(fresh);
-            let committed = self.manifest.commit(self.store.as_ref(), &self.name);
-            if let Ok(true) = committed {
-                return Ok(());
-            }
-            self.manifest.entries.truncate(held);
-            self.manifest.version -= 1;
-            committed?;
-            // Lost the race: the winner committed a version newer than ours, so
-            // the reload (a cursor list from our version, no full directory
-            // scan) must find it; not finding one is a corrupt store.
-            if !self.reload_manifest_only()? {
-                return Err(Error::CommitRaceWithoutWinner(self.name.clone()));
-            }
-        }
+        let state = self.log.commit_added(entries)?;
+        self.set_state(state);
+        Ok(())
     }
 
-    /// Swap in `manifest` as this copy's current version, dropping cached
-    /// footers for files no longer in it. No footer fetch, so it is safe on a
-    /// dispatch worker.
-    fn set_manifest(&mut self, manifest: TableManifest) {
-        self.manifest = manifest;
-        self.retain_manifest_files();
+    /// Swap in `state` as this copy's current version, dropping cached footers
+    /// for files no longer in it. No footer fetch, so it is safe on a dispatch
+    /// worker.
+    fn set_state(&mut self, state: TableState) {
+        self.state = state;
+        self.retain_state_files();
     }
 
-    /// Drop cached footers for files that are no longer manifest entries.
-    fn retain_manifest_files(&mut self) {
+    /// Drop cached footers for files that are no longer committed entries.
+    fn retain_state_files(&mut self) {
         let kept: HashSet<&str> = self
-            .manifest
+            .state
             .entries
             .iter()
             .map(|e| e.file.path.as_str())
@@ -263,9 +217,11 @@ impl CatalogTable {
     }
 
     /// Atomically swap a set of this table's files for another — the compaction
-    /// commit. Commits a new version whose file list is `latest − removed +
-    /// added`, retrying past concurrent commits, so no reader ever sees the rows
-    /// doubled or missing.
+    /// commit. Commits a new log version holding the removed files' tombstones
+    /// and the added files, retrying past concurrent commits, so no reader ever
+    /// sees the rows doubled or missing. The removed files' objects are deleted
+    /// later, by [`maintain`](Self::maintain), once their tombstones age past
+    /// the retention horizon and no live reader can still reference them.
     ///
     /// Returns whether the swap was committed. It is **aborted** (`Ok(false)`,
     /// nothing committed) if any of `removed` is no longer in the latest
@@ -278,91 +234,40 @@ impl CatalogTable {
         removed: &[ObjectPath],
         added: &[ManifestEntry],
     ) -> crate::Result<bool> {
-        loop {
-            if !removed
-                .iter()
-                .all(|p| self.manifest.entries.iter().any(|e| &e.file.path == p))
-            {
-                return Ok(false);
-            }
-            let mut entries: Vec<ManifestEntry> = self
-                .manifest
-                .entries
-                .iter()
-                .filter(|e| !removed.contains(&e.file.path))
-                .cloned()
-                .collect();
-            // The merged files keep the partition tuple / sort bounds the caller
-            // recorded for them (compaction merges within one partition).
-            entries.extend(added.iter().cloned());
-            if self.try_commit(entries)? {
-                return Ok(true);
-            }
-            self.refresh()?;
-        }
-    }
-
-    /// Try to commit `entries` as the next version via compare-and-swap. On
-    /// success, swaps in the new manifest + files (fetching only the new footers)
-    /// and returns `true`; on a CAS conflict returns `false` without touching
-    /// this copy.
-    fn try_commit(&mut self, entries: Vec<ManifestEntry>) -> crate::Result<bool> {
-        let manifest = TableManifest {
-            version: self.manifest.version + 1,
-            columns: self.manifest.columns.clone(),
-            partition_by: self.manifest.partition_by.clone(),
-            sort_by: self.manifest.sort_by.clone(),
-            entries,
-        };
-        if !manifest.commit(self.store.as_ref(), &self.name)? {
+        let Some(state) = self.log.replace(removed.to_vec(), added.to_vec())? else {
             return Ok(false);
-        }
-        self.manifest = manifest;
-        self.sync_files_to_manifest()?;
+        };
+        self.state = state;
+        self.sync_files_to_state()?;
         Ok(true)
     }
 
-    /// Garbage-collect this table's superseded manifest versions, keeping only a
-    /// recent tail (see [`TableManifest::prune_old_versions`]). Each commit
-    /// leaves a new version file behind; this reclaims the old ones so a busy
-    /// table's version directory stays small and the `list` every bind does
-    /// stays cheap. The compacter drives it — it's the background sweep that
-    /// already polls every table.
-    pub fn prune_old_versions(&self) -> crate::Result<()> {
-        TableManifest::prune_old_versions(self.store.as_ref(), &self.name, self.manifest.version)?;
+    /// Background upkeep of this table's delta log and data directory:
+    /// checkpoint the log, drop log entries older than the retention horizon,
+    /// and physically delete the data files whose tombstones have aged past it
+    /// (no live reader still resolves a snapshot that old). Each commit leaves
+    /// a new log entry behind; this keeps the log listing every reload does
+    /// cheap. The compacter drives it; it's the background sweep that already
+    /// polls every table.
+    pub fn maintain(&self) -> crate::Result<()> {
+        self.log.maintain()?;
         Ok(())
     }
 
-    /// Record the just-swapped-out `removed` inputs (paths as they appear in the
-    /// manifest) for *deferred* deletion at this table's current manifest version.
-    /// Their objects are deleted only when that version is pruned
-    /// ([`prune_old_versions`](Self::prune_old_versions)) — so a query still
-    /// reading the prior version never has a file deleted out from under it.
-    pub fn record_deletions(&self, removed: &[ObjectPath]) -> crate::Result<()> {
-        let resolved: Vec<ObjectPath> = removed.iter().map(|p| self.location.resolve(p)).collect();
-        TableManifest::record_deletions(
-            self.store.as_ref(),
-            &self.name,
-            self.manifest.version,
-            &resolved,
-        )?;
-        Ok(())
-    }
-
-    /// Reconcile `files` to the current `manifest`: drop the files no longer in
+    /// Reconcile `files` to the current `state`: drop the files no longer in
     /// it, then fetch and append the ones not yet held.
-    fn sync_files_to_manifest(&mut self) -> crate::Result<()> {
-        self.retain_manifest_files();
+    fn sync_files_to_state(&mut self) -> crate::Result<()> {
+        self.retain_state_files();
         let missing = self.retrieve_missing_table_files()?;
         self.files.extend(missing);
         Ok(())
     }
 
-    /// Fetch the [`TableFile`]s for this table's manifest entries that aren't
+    /// Fetch the [`TableFile`]s for this table's committed entries that aren't
     /// already held — the footers this copy is missing (disjoint from `files`).
     fn retrieve_missing_table_files(&self) -> crate::Result<Vec<TableFile>> {
         let to_fetch: Vec<DataFile> = self
-            .manifest
+            .state
             .entries
             .iter()
             .filter(|e| !self.files.iter().any(|f| f.file.path == e.file.path))
@@ -390,13 +295,13 @@ impl CatalogTable {
     /// The table's partition columns, in order (empty = unpartitioned). A
     /// partitioning writer routes each row to a file by these columns' values.
     pub fn partition_by(&self) -> &[String] {
-        &self.manifest.partition_by
+        &self.state.partition_by
     }
 
     /// The table's sort columns, in order (empty = unsorted). A writer sorts each
     /// file's rows by these before encoding.
     pub fn sort_by(&self) -> &[String] {
-        &self.manifest.sort_by
+        &self.state.sort_by
     }
 
     /// The table's current files as [`FileRef`]s — what a compacter scans to pick
@@ -406,10 +311,10 @@ impl CatalogTable {
     }
 
     /// Each committed file paired with the partition tuple recorded for it (the
-    /// one-row arrow-json object a partitioning writer stamped, or `None`). Reads
-    /// the manifest, so it reflects the current committed version.
+    /// one-row arrow-json object a partitioning writer stamped, or `None`).
+    /// Reads the committed state, so it reflects the current log version.
     pub fn file_partitions(&self) -> Vec<(ObjectPath, Option<serde_json::Value>)> {
-        self.manifest
+        self.state
             .entries
             .iter()
             .map(|e| (e.file.path.clone(), e.partition.clone()))
@@ -419,7 +324,7 @@ impl CatalogTable {
     /// Each committed file paired with its recorded sort-key bounds (the
     /// `sort_by` columns at the file's first/last row, or `None`).
     pub fn file_sort_bounds(&self) -> Vec<(ObjectPath, Option<SortBounds>)> {
-        self.manifest
+        self.state
             .entries
             .iter()
             .map(|e| (e.file.path.clone(), e.sort_bounds.clone()))
@@ -452,7 +357,7 @@ impl CatalogTable {
         })
     }
 
-    /// Delete a data file (a compaction input swapped out of the manifest).
+    /// Delete a data file (a compaction output orphaned by a lost swap race).
     /// `path` resolves against the table's location like any [`FileRef`] path.
     pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
         self.store.delete(&self.location.resolve(path))?;
@@ -461,7 +366,7 @@ impl CatalogTable {
 
     /// A flat scan view of the files whose recorded partition tuple can still
     /// match `filters` — every surviving file's row groups concatenated in
-    /// manifest order, where a row group's global index is simply its position.
+    /// committed order, where a row group's global index is simply its position.
     /// Footers are fetched here, and only for the surviving files, so a query
     /// touching one partition never pays the HTTP to read every other partition's
     /// footer. Fetched footers are cached in `files`, so a second call in the same
@@ -473,10 +378,10 @@ impl CatalogTable {
     /// do: both go through the binding's predicates) to address the same groups.
     pub fn parquet(&mut self, filters: &[PartitionEqFilter]) -> crate::Result<Arc<ParquetTable>> {
         let matching: Vec<ManifestEntry> = self
-            .manifest
+            .state
             .entries
             .iter()
-            .filter(|e| e.maybe_matches_partition(&self.manifest.partition_by, filters))
+            .filter(|e| e.maybe_matches_partition(&self.state.partition_by, filters))
             .cloned()
             .collect();
 
@@ -504,7 +409,7 @@ impl CatalogTable {
 
     /// The table's columns (schema), as the planner's [`Column`]s.
     pub fn columns(&self) -> Vec<Column> {
-        self.manifest.columns.clone()
+        self.state.columns.clone()
     }
 
     /// The table's physical arrow schema: each declared column at the physical
@@ -515,7 +420,7 @@ impl CatalogTable {
     /// `NullsInRequiredColumn` error, not fail batch construction with a panic.
     pub fn physical_arrow_schema(&self) -> arrow_schema::SchemaRef {
         let fields: Vec<arrow_schema::Field> = self
-            .manifest
+            .state
             .columns
             .iter()
             .map(|column| {
@@ -537,14 +442,14 @@ impl CatalogTable {
         self.location.as_str()
     }
 
-    /// Each committed file's manifest path paired with its loaded row groups, in
-    /// manifest order - the source for the `metadata()` table function, where
+    /// Each committed file's path paired with its loaded row groups, in
+    /// committed order - the source for the `metadata()` table function, where
     /// each row group reports the file it belongs to. Only files whose footers
     /// are loaded contribute (a [`parquet`](Self::parquet) call warms them).
     pub(super) fn file_row_groups(&self) -> Vec<(String, Vec<Arc<RowGroupMetadata>>)> {
         let by_path: HashMap<&ObjectPath, &TableFile> =
             self.files.iter().map(|f| (&f.file.path, f)).collect();
-        self.manifest
+        self.state
             .entries
             .iter()
             .filter_map(|e| {
