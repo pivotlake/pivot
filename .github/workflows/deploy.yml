@@ -137,6 +137,9 @@ jobs:
           if [ "${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' }}" = "true" ]; then
             export CC=clang CXX=clang++
           fi
+          # Bypass the kache rustc wrapper (.cargo/config.toml): the shipped
+          # binary is always compiled fresh, never restored from cache.
+          export RUSTC_WRAPPER=
           cargo build --release --bin pivotdb-server
 
       - name: Authenticate to Google Cloud
