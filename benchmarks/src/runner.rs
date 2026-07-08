@@ -155,6 +155,8 @@ pub struct RunOptions {
     /// flush the OS page cache, so each query's first iteration is a true cold
     /// read — without restarting the warm server. Needs passwordless sudo.
     pub drop_caches: bool,
+    /// Statement run once, untimed, after setup and before the first query.
+    pub warmup: Option<String>,
 }
 
 /// Clear pivot's file cache *and* the OS page cache so the next query reads cold
@@ -323,6 +325,10 @@ pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<Su
     let setup_template = read_to_string(&suite.setup_sql_path)?;
     let setup_sql = setup_template.replace("{source}", &opts.source.display().to_string());
     client.simple_query(&setup_sql).await?;
+
+    if let Some(warmup) = &opts.warmup {
+        client.simple_query(warmup).await?;
+    }
 
     let mut runs = Vec::with_capacity(suite.queries.len());
     for query in &suite.queries {
