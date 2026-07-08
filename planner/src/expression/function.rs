@@ -2,7 +2,7 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length,
+    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Prefix,
     RegexpJitReplace, RegexpReplace, TemporalConvert,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
@@ -60,6 +60,7 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
+    Prefix(Prefix),
     Arithmetic(Arithmetic),
     Length(Length),
     RegexpReplace(RegexpReplace),
@@ -89,6 +90,7 @@ impl Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Function::Contains(c) => write!(f, "{c}"),
+            Function::Prefix(p) => write!(f, "{p}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
             Function::RegexpReplace(r) => write!(f, "{r}"),
@@ -108,6 +110,7 @@ impl Function {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         match self {
             Function::Contains(c) => c.compile(),
+            Function::Prefix(p) => p.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
             Function::RegexpReplace(r) => r.compile(),

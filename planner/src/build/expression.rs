@@ -23,7 +23,7 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Ref,
+    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
     RegexpJitReplace, RegexpReplace, TemporalConvert,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
@@ -243,6 +243,8 @@ impl Function {
         let name = func.name();
         match name.as_str() {
             "contains" => Ok(Function::Contains(Contains::from_handle(func)?)),
+            // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`.
+            "prefix" => Ok(Function::Prefix(Prefix::from_handle(func)?)),
             // `date`/`timestamp` ± `INTERVAL` carries an INTERVAL constant operand;
             // plain numeric `+`/`-` does not and stays `Arithmetic`.
             "+" | "-" => match func.children().position(|p| {
@@ -289,6 +291,16 @@ impl Contains {
         Ok(Contains {
             needle: Box::new(Expression::from_handle(params[1])?),
             haystack: Box::new(Expression::from_handle(params[0])?),
+        })
+    }
+}
+
+impl Prefix {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<Prefix, Error> {
+        let params = function_args(func, 2)?;
+        Ok(Prefix {
+            haystack: Box::new(Expression::from_handle(params[0])?),
+            prefix: Box::new(Expression::from_handle(params[1])?),
         })
     }
 }
