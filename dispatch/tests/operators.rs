@@ -5,6 +5,7 @@
 
 mod common;
 
+use arrow::compute::filter_record_batch;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -51,14 +52,15 @@ fn filter_string_contains() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
-            move |batch: &RecordBatch| {
-                c.run(
+            move |batch: RecordBatch| {
+                let mask = c.run(
                     batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
-                )
+                );
+                filter_record_batch(&batch, &mask).unwrap()
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -81,14 +83,15 @@ fn filter_no_matches_returns_zero() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("zzz_no_match");
-            move |batch: &RecordBatch| {
-                c.run(
+            move |batch: RecordBatch| {
+                let mask = c.run(
                     batch
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
-                )
+                );
+                filter_record_batch(&batch, &mask).unwrap()
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -110,15 +113,16 @@ fn filter_integer_column() {
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
         .filter(|| {
-            move |batch: &RecordBatch| {
+            move |batch: RecordBatch| {
                 let col = batch
                     .column(1)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap();
-                BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
+                let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
                     col.value(i) > 20
-                }))
+                }));
+                filter_record_batch(&batch, &mask).unwrap()
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -342,9 +346,9 @@ fn limit_abandons_upstream_after_reaching_count() {
         .record_batches()
         .filter(move || {
             let counter = counter.clone();
-            move |batch: &RecordBatch| {
+            move |batch: RecordBatch| {
                 counter.fetch_add(1, Ordering::Relaxed);
-                BooleanArray::from(vec![true; batch.num_rows()])
+                batch
             }
         })
         .limit(1, 0)

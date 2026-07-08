@@ -1,14 +1,15 @@
-//! Filter operator: keeps rows matching a boolean mask.
+//! Filter operator: keeps rows the filter closure selects.
 //!
-//! The filter closure receives a `&RecordBatch` and returns a [`BooleanArray`] mask.
-//! Rows where the mask is `true` are kept; the rest are dropped. Batches where no
-//! rows match are skipped entirely (no empty batch emitted).
+//! The filter closure receives an owned `RecordBatch` and returns the batch of
+//! surviving rows. Owning the batch lets the closure evaluate multiple
+//! conditions progressively - shrink the batch after each condition, so later
+//! (often costlier) conditions only see rows the earlier ones kept. Batches
+//! where no rows survive are skipped entirely (no empty batch emitted).
 
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::{Unary, UnaryFactory};
-use arrow::compute::filter_record_batch;
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::RecordBatch;
 
 /// Factory that wraps a filter closure. `F` is the per-worker closure created by the
 /// builder passed to [`RecordBatchOperatorSpec::filter`](crate::api::RecordBatchOperatorSpec::filter).
@@ -16,7 +17,7 @@ pub struct FilterFactory<F>(pub F);
 
 impl<F> UnaryFactory<RecordBatch, RecordBatch> for FilterFactory<F>
 where
-    F: FnMut(&RecordBatch) -> BooleanArray + Send + 'static,
+    F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
 {
     type Unary = Filter<F>;
 
@@ -27,27 +28,25 @@ where
 
 pub struct Filter<F>
 where
-    F: FnMut(&RecordBatch) -> BooleanArray + Send,
+    F: FnMut(RecordBatch) -> RecordBatch + Send,
 {
     func: F,
 }
 
 impl<F> Unary<RecordBatch, RecordBatch> for Filter<F>
 where
-    F: FnMut(&RecordBatch) -> BooleanArray + Send,
+    F: FnMut(RecordBatch) -> RecordBatch + Send,
 {
     fn consume<OP: Sender<RecordBatch>>(
         &mut self,
         batch: RecordBatch,
         output: &mut OP,
     ) -> unary::Result<()> {
-        let mask = (self.func)(&batch);
-        debug_assert_eq!(mask.len(), batch.num_rows());
-
-        if mask.true_count() == 0 {
+        let kept = (self.func)(batch);
+        if kept.num_rows() == 0 {
             return Ok(());
         }
-        output.send(filter_record_batch(&batch, &mask)?)?;
+        output.send(kept)?;
         Ok(())
     }
 }
@@ -56,7 +55,7 @@ where
 mod tests {
     use super::*;
     use crate::operations::unary::test_utils::run_unary;
-    use arrow_array::{ArrayRef, Int32Array};
+    use arrow_array::{ArrayRef, BooleanArray, Int32Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -79,9 +78,10 @@ mod tests {
     #[test]
     fn keeps_matching_rows() {
         let filter = Filter {
-            func: |b: &RecordBatch| {
+            func: |b: RecordBatch| {
                 let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-                BooleanArray::from_iter(col.values().iter().map(|v| Some(*v > 3)))
+                let mask = BooleanArray::from_iter(col.values().iter().map(|v| Some(*v > 3)));
+                arrow::compute::filter_record_batch(&b, &mask).unwrap()
             },
         };
 
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn no_matches_produces_no_output() {
         let filter = Filter {
-            func: |_: &RecordBatch| BooleanArray::from(vec![false, false, false]),
+            func: |b: RecordBatch| b.slice(0, 0),
         };
 
         let out = run_unary(filter, vec![batch(&[1, 2, 3])]);
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn all_match() {
         let filter = Filter {
-            func: |b: &RecordBatch| BooleanArray::from(vec![true; b.num_rows()]),
+            func: |b: RecordBatch| b,
         };
 
         let out = run_unary(filter, vec![batch(&[10, 20, 30])]);
@@ -117,9 +117,10 @@ mod tests {
     #[test]
     fn multiple_batches() {
         let filter = Filter {
-            func: |b: &RecordBatch| {
+            func: |b: RecordBatch| {
                 let col = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
-                BooleanArray::from_iter(col.values().iter().map(|v| Some(*v % 2 == 0)))
+                let mask = BooleanArray::from_iter(col.values().iter().map(|v| Some(*v % 2 == 0)));
+                arrow::compute::filter_record_batch(&b, &mask).unwrap()
             },
         };
 
@@ -133,7 +134,7 @@ mod tests {
     #[test]
     fn empty_batch() {
         let filter = Filter {
-            func: |b: &RecordBatch| BooleanArray::from(vec![true; b.num_rows()]),
+            func: |b: RecordBatch| b,
         };
 
         let out = run_unary(filter, vec![batch(&[])]);

@@ -68,6 +68,7 @@
 
 use std::sync::Arc;
 
+use arrow::compute::filter_record_batch;
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
 use arrow_array::{
@@ -298,35 +299,38 @@ fn batch(schema: &Arc<Schema>, cols: Vec<ArrayRef>) -> RecordBatch {
 // Filter predicate closures (representative, allocation-free per batch)
 // ---------------------------------------------------------------------------
 
-/// `column != 0` over an `i16` column.
-fn i16_nonzero_mask(batch: &RecordBatch, col: usize) -> BooleanArray {
+/// Keeps the rows where `column != 0` over an `i16` column.
+fn keep_i16_nonzero(batch: RecordBatch, col: usize) -> RecordBatch {
     let a = batch
         .column(col)
         .as_any()
         .downcast_ref::<Int16Array>()
         .unwrap();
-    (0..a.len()).map(|i| Some(a.value(i) != 0)).collect()
+    let mask: BooleanArray = (0..a.len()).map(|i| Some(a.value(i) != 0)).collect();
+    filter_record_batch(&batch, &mask).unwrap()
 }
 
 /// `column == target` over an `i64` column (point lookup).
-fn i64_eq_mask(batch: &RecordBatch, col: usize, target: i64) -> BooleanArray {
+fn keep_i64_eq(batch: RecordBatch, col: usize, target: i64) -> RecordBatch {
     let a = batch
         .column(col)
         .as_any()
         .downcast_ref::<Int64Array>()
         .unwrap();
-    (0..a.len()).map(|i| Some(a.value(i) == target)).collect()
+    let mask: BooleanArray = (0..a.len()).map(|i| Some(a.value(i) == target)).collect();
+    filter_record_batch(&batch, &mask).unwrap()
 }
 
 /// `column <> ''` over a string column.
-fn nonempty_mask(batch: &RecordBatch, col: usize) -> BooleanArray {
+fn keep_nonempty(batch: RecordBatch, col: usize) -> RecordBatch {
     let a = batch
         .column(col)
         .as_any()
         .downcast_ref::<StringViewArray>()
         .unwrap();
-    // Length lives in the low 32 bits of each view — no UTF-8 decode needed.
-    a.views().iter().map(|&v| Some((v as u32) != 0)).collect()
+    // Length lives in the low 32 bits of each view, no UTF-8 decode needed.
+    let mask: BooleanArray = a.views().iter().map(|&v| Some((v as u32) != 0)).collect();
+    filter_record_batch(&batch, &mask).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +451,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.filter(|| move |b: &RecordBatch| i16_nonzero_mask(b, 0))
+            s.filter(|| move |b: RecordBatch| keep_i16_nonzero(b, 0))
                 .group_by_aggregate::<IntKeyExtractor<Int16Type>, Compiled<(CountSlot,)>>(
                     vec![0],
                     vec![AggregationSlot::new(
@@ -548,7 +552,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
+            s.filter(|| move |b: RecordBatch| keep_nonempty(b, 0))
                 .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
                     vec![0],
                     vec![AggregationSlot::new(
@@ -591,9 +595,10 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         |s| {
             s.filter(|| {
-                move |b: &RecordBatch| {
+                move |b: RecordBatch| {
                     let a = b.column(0).as_any().downcast_ref::<Int16Array>().unwrap();
-                    (0..a.len()).map(|i| Some(a.value(i) == 62)).collect()
+                    let mask: BooleanArray = (0..a.len()).map(|i| Some(a.value(i) == 62)).collect();
+                    filter_record_batch(&b, &mask).unwrap()
                 }
             })
             .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
@@ -714,7 +719,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     .collect()
             },
             move |s| {
-                s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 4))
+                s.filter(|| move |b: RecordBatch| keep_nonempty(b, 4))
                     .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<4, i64, true>>(
                         vec![0, 1],
                         slots.clone(),
@@ -882,13 +887,14 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
         |s| {
             s.filter(|| {
                 let mut contains = Contains::new("google");
-                move |b: &RecordBatch| {
+                move |b: RecordBatch| {
                     let col = b
                         .column(0)
                         .as_any()
                         .downcast_ref::<StringViewArray>()
                         .unwrap();
-                    contains.run(col)
+                    let mask = contains.run(col);
+                    filter_record_batch(&b, &mask).unwrap()
                 }
             })
             .aggregate::<i64>(vec![AggregationSlot::new(
@@ -915,7 +921,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
+            s.filter(|| move |b: RecordBatch| keep_nonempty(b, 0))
                 .aggregate::<i64>(vec![AggregationSlot::new(
                     AggregationKind::CountStar,
                     0,
@@ -943,7 +949,7 @@ fn bench_filter(c: &mut Criterion, d: &DataFlowDispatcher) {
                     .collect()
             },
             move |s| {
-                s.filter(move || move |b: &RecordBatch| i64_eq_mask(b, 0, target))
+                s.filter(move || move |b: RecordBatch| keep_i64_eq(b, 0, target))
                     .aggregate::<i64>(vec![AggregationSlot::new(
                         AggregationKind::CountStar,
                         0,
@@ -989,7 +995,7 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 1))
+            s.filter(|| move |b: RecordBatch| keep_nonempty(b, 1))
                 .order_by_limit(vec![OrderBy::new(0, false, false)], 10)
         },
     );
@@ -1011,7 +1017,7 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 0))
+            s.filter(|| move |b: RecordBatch| keep_nonempty(b, 0))
                 .order_by_limit(vec![OrderBy::new(0, false, false)], 10)
         },
     );
@@ -1043,7 +1049,7 @@ fn bench_order_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 .collect()
         },
         |s| {
-            s.filter(|| move |b: &RecordBatch| nonempty_mask(b, 1))
+            s.filter(|| move |b: RecordBatch| keep_nonempty(b, 1))
                 .order_by_limit(
                     vec![OrderBy::new(0, false, false), OrderBy::new(1, false, false)],
                     10,
