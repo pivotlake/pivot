@@ -28,7 +28,7 @@ pub mod distinct;
 pub mod fold;
 pub mod read;
 
-pub use cell::{Cell, Numeric};
+pub use cell::{Cell, F64Cell, IntCell};
 pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, SumSlot};
 pub use distinct::Distinct;
 pub use fold::{

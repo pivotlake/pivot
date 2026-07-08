@@ -1,6 +1,6 @@
 //! [`U128Sum`]/[`U128Min`]/[`U128Max`] — re-fold a wide (`i128`) partial read from a
-//! `Decimal128` column, the outer level of the two-level `COUNT(DISTINCT)` lowering
-//! (see `U128Reader`).
+//! `Decimal128` column (see `U128Reader`): an aggregate re-reading partials a prior
+//! level already widened.
 //!
 //! Like the [`F64`](super::F64Sum) folds these are inherent helpers, not
 //! [`Fold`](super::Fold)s: the value is a full `i128` held in the cell width `A` via

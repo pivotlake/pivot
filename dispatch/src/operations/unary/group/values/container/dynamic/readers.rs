@@ -74,11 +74,11 @@ impl<'b> F64Reader<'b> {
 
 /// A `Decimal128(38, 0)` column, read as a full `i128`.
 ///
-/// The Arrow type a *wide* (`i128`) cell emits for its `COUNT`/`SUM`/`MIN`/`MAX`
-/// slots. It binds only in the outer level of a two-level aggregate whose inner
-/// level is forced wide (the `COUNT(DISTINCT) + MIN(string)` lowering), which
-/// re-reads its own numeric partials. Reading the full `i128` (rather than
-/// truncating to `i64`) keeps a per-subgroup `SUM` that overflows `i64` exact.
+/// `Decimal128` is the Arrow type a *wide* (`i128`) cell emits for its
+/// `COUNT`/`SUM`/`MIN`/`MAX` slots, so this reader binds whenever such a column is
+/// aggregated — an aggregate re-reading partials a prior level already widened.
+/// Reading the full `i128` (rather than truncating to `i64`) keeps a partial `SUM`
+/// that overflows `i64` exact.
 pub struct U128Reader<'b>(&'b PrimitiveArray<Decimal128Type>);
 
 impl<'b> U128Reader<'b> {

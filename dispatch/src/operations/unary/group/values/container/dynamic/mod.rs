@@ -21,7 +21,7 @@
 
 mod readers;
 
-use super::super::cell::{F64Cell, Numeric, StringCell, WideCell};
+use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
 use super::super::fold::Fold;
 use super::super::read::{Read, StrRead};
 use super::super::{
@@ -137,24 +137,24 @@ impl<'b> BoundSlot<'b> {
 /// a `Min`/`Max` leaves it `false`. Worth ~1.5-2% on a low-card grouped aggregate.
 pub struct Dynamic<
     const N: usize,
-    A: Numeric + StringCell + F64Cell + WideCell = i64,
+    A: IntCell + StringCell + F64Cell + WideCell = i64,
     const ONLY_ADDITIVE: bool = false,
 > {
     cells: [A; N],
 }
 
-impl<const N: usize, A: Numeric + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Copy
+impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Copy
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
 }
-impl<const N: usize, A: Numeric + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Clone
+impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Clone
     for Dynamic<N, A, ONLY_ADDITIVE>
 {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<const N: usize, A: Numeric + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
+impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
     Default for Dynamic<N, A, ONLY_ADDITIVE>
 {
     fn default() -> Self {
@@ -171,13 +171,13 @@ impl<const N: usize, A: Numeric + StringCell + F64Cell + WideCell, const ONLY_AD
 /// [`Dynamic`] value; the output path renders by slot kind regardless.
 pub struct DynamicColumns<
     const N: usize,
-    A: Numeric + StringCell + F64Cell + WideCell,
+    A: IntCell + StringCell + F64Cell + WideCell,
     const ONLY_ADDITIVE: bool,
 > {
     cols: [SlabColumn<A>; N],
 }
 
-impl<const N: usize, A: Numeric + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
+impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
     AggregationValue for Dynamic<N, A, ONLY_ADDITIVE>
 {
     type Reader<'b> = [BoundSlot<'b>; N];
@@ -421,13 +421,13 @@ impl<const N: usize, A: Numeric + StringCell + F64Cell + WideCell, const ONLY_AD
 
     #[inline(always)]
     fn sort_key(&self, slot: usize) -> i128 {
-        // Numeric cells widen to their `ORDER BY` key. A string extreme never feeds
+        // Integer cells widen to their `ORDER BY` key. A string extreme never feeds
         // a top-k (the planner doesn't push one), so its raw bits here are inert.
         self.cells[slot].into()
     }
 }
 
-impl<const N: usize, A: Numeric + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
+impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
     ValueColumns for DynamicColumns<N, A, ONLY_ADDITIVE>
 {
     type Value = Dynamic<N, A, ONLY_ADDITIVE>;
