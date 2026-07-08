@@ -126,10 +126,15 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
 
     /// Like [`read_into`](Self::read_into) but for a page with nulls: each
     /// logical row is decoded as a value (present) or appended as a null, per
-    /// the page's definition levels, and a validity bit is pushed for each.
-    /// (The value stream holds only the present values.) Filtered nullable
-    /// reads aren't supported yet; they only arise with predicate pushdown
-    /// onto a nullable column, which lands with shredded-leaf pushdown.
+    /// the page's definition levels, and a validity bit is pushed for each
+    /// kept row. The value stream holds only the present values.
+    ///
+    /// A filter mask (from a pushed-down predicate) and definition levels are
+    /// combined: filter runs partition the rows into kept/skipped, and within
+    /// each, definition-level runs partition them into present/null. Skipped
+    /// rows still advance the value stream past their present values; only
+    /// kept rows reach the builder and validity. `remaining` and `size` count
+    /// *kept* rows (`DataPage::rows()` is the kept count when filtered).
     pub fn read_into_nullable(
         &mut self,
         dict: &Option<D>,
@@ -137,29 +142,44 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
         validity: &mut ValidityBuilder,
         size: usize,
     ) {
-        assert!(
-            self.running_filter_mask_opt.is_none(),
-            "filtered reads of a nullable column are not yet supported",
-        );
-        let def = self
-            .def_levels
-            .as_mut()
-            .expect("nullable page has def levels");
-        let to_read = size.min(self.remaining);
-        let mut left = to_read;
-        while left > 0 {
-            let (present, run) = def.next_run(left);
-            if present {
-                decode_run(&mut self.decoder, builder, dict, run);
-            } else {
-                // Null slots: advance the builder over uninitialised values that
-                // `validity` masks off.
-                builder.spare_mut(run);
+        let start_len = builder.len();
+        let mut kept_left = size.min(self.remaining);
+        while kept_left > 0 {
+            // A filter run covers kept rows (capped at `kept_left`) or a full
+            // skipped run; the whole page is kept when there's no mask.
+            let (keep, run) = match self.running_filter_mask_opt.as_mut() {
+                Some(m) => m.next_run(kept_left),
+                None => (true, kept_left),
+            };
+            let def = self
+                .def_levels
+                .as_mut()
+                .expect("nullable page has def levels");
+            let mut run_left = run;
+            while run_left > 0 {
+                let (present, n) = def.next_run(run_left);
+                match (keep, present) {
+                    // A kept value decodes; a kept null leaves a slot that
+                    // `validity` masks off.
+                    (true, true) => decode_run(&mut self.decoder, builder, dict, n),
+                    (true, false) => {
+                        builder.spare_mut(n);
+                    }
+                    // Skipped present rows still consume their values; skipped
+                    // nulls have no value in the stream.
+                    (false, true) => skip_run(&mut self.decoder, n),
+                    (false, false) => {}
+                }
+                if keep {
+                    validity.append_n(n, present);
+                }
+                run_left -= n;
             }
-            validity.append_n(run, present);
-            left -= run;
+            if keep {
+                kept_left -= run;
+            }
         }
-        self.remaining -= to_read;
+        self.remaining -= builder.len() - start_len;
     }
 }
 
@@ -271,7 +291,11 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
         };
 
         let mut position = ReaderPosition::default();
-        let rows = page.rows();
+        // Definition levels cover every logical row in the page, but
+        // `page.rows()` is the *kept* count once a filter mask is applied: so
+        // decode `num_values` of them, while `remaining` tracks kept rows.
+        let kept = page.rows();
+        let num_values = page.header.num_values as usize;
 
         // A nullable column's pages prefix the values with definition levels;
         // decode them (advancing `position` past them). An all-present page
@@ -279,8 +303,13 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
         let def_levels = if self.max_def_level > 0 {
             let mut reader = MultiBufferReader::new(&page.data, &mut position);
             let def_level_byte_len = reader.read_u32_le() as usize;
-            decode_def_levels(&mut reader, rows, def_level_byte_len, self.max_def_level)
-                .map(|present| DefLevels { present, pos: 0 })
+            decode_def_levels(
+                &mut reader,
+                num_values,
+                def_level_byte_len,
+                self.max_def_level,
+            )
+            .map(|present| DefLevels { present, pos: 0 })
         } else {
             None
         };
@@ -288,7 +317,7 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
         self.read_page = Some(ReadPage {
             decoder: self.create_decoder(page.header, page.data, position)?,
             running_filter_mask_opt: page.filter_mask.map(RunningFilterMask::new),
-            remaining: rows,
+            remaining: kept,
             def_levels,
             phantom_data: Default::default(),
         });

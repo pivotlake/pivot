@@ -39,6 +39,7 @@ mod tests {
     use crate::parquet::reading::decoding::column_decoders::ColumnDecoder;
     use crate::parquet::reading::decoding::column_decoders::bytes_view::BytesViewDecoder;
     use crate::parquet::test_utils::dummy_metadata;
+    use crate::parquet::types::filter_mask::FilterMask;
     use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
     use crate::parquet::types::thrift::general::Encoding;
     use crate::parquet::types::thrift::headers::PageHeader;
@@ -396,5 +397,47 @@ mod tests {
 
         assert_eq!(nulls(&first), vec![false, true]);
         assert_eq!(nulls(&rest), vec![false, false]);
+    }
+
+    fn set_filter(page: &mut DecompressedPage, mask: FilterMask) {
+        if let DecompressedPageType::Data(d) = &mut page.data {
+            d.filter_mask = Some(mask);
+        }
+    }
+
+    /// Filter + def levels: kept present rows decode their values, and a
+    /// skipped present row still advances the value stream past its value.
+    #[test]
+    fn filtered_nullable_keeps_present_rows() {
+        init_test_free_pool(4);
+        // Rows: present, null, present, present; values for the present rows.
+        let mut page =
+            make_plain_page_with_def_levels(&[true, false, true, true], &["a", "c", "d"], 0);
+        set_filter(&mut page, FilterMask::new(0, 4, &[0, 2])); // keep rows 0 and 2
+
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
+        dec.insert_page(page, &mut allocator);
+        let result = dec.read(&mut allocator, 2).unwrap();
+
+        assert_eq!(extract_strings(&result), vec!["a", "c"]);
+        assert_eq!(nulls(&result), vec![false, false]);
+    }
+
+    /// Filter + def levels where the kept rows are null: each appends a null,
+    /// and the skipped present rows advance the value stream.
+    #[test]
+    fn filtered_nullable_keeps_null_rows() {
+        init_test_free_pool(4);
+        // Rows: null, present, null, present.
+        let mut page = make_plain_page_with_def_levels(&[false, true, false, true], &["b", "d"], 0);
+        set_filter(&mut page, FilterMask::new(0, 4, &[0, 2])); // keep the two null rows
+
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
+        dec.insert_page(page, &mut allocator);
+        let result = dec.read(&mut allocator, 2).unwrap();
+
+        assert_eq!(nulls(&result), vec![true, true]);
     }
 }
