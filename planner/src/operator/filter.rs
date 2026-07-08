@@ -84,6 +84,19 @@ impl Filter {
 fn evaluate_staged_mask(stages: &mut [Vec<ExprEvalFn>], batch: &RecordBatch) -> BooleanArray {
     let (first, rest) = stages.split_first_mut().expect("at least one stage");
     let mut mask = evaluate_mask(first, batch);
+    if rest.is_empty() {
+        return mask;
+    }
+
+    // Conditions reference only the scan's data columns (positional, ahead of
+    // any trailing metadata pair), so the intermediate batches carry just
+    // those. Beyond dropping dead weight, this keeps arrow's take away from
+    // the run-end-encoded row-group column, which it processes one logical
+    // row at a time.
+    let data_columns = batch.num_columns() - dispatch::trailing_metadata_columns(&batch.schema());
+    let data_batch = batch
+        .project(&(0..data_columns).collect::<Vec<_>>())
+        .expect("in-bounds projection");
 
     for stage in rest {
         // A null mask slot excludes its row, exactly as filter_record_batch
@@ -97,7 +110,7 @@ fn evaluate_staged_mask(stages: &mut [Vec<ExprEvalFn>], batch: &RecordBatch) -> 
             return BooleanArray::from(vec![false; batch.num_rows()]);
         }
         let indices = UInt32Array::from(survivors.clone());
-        let sub_batch = take_record_batch(batch, &indices).expect("in-bounds take");
+        let sub_batch = take_record_batch(&data_batch, &indices).expect("in-bounds take");
         let sub_mask = evaluate_mask(stage, &sub_batch);
 
         let mut combined = vec![false; batch.num_rows()];
