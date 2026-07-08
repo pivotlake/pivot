@@ -53,7 +53,11 @@ pub fn server_port() -> u16 {
         let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
         thread::spawn(move || {
-            let dispatch = Dispatch::spin_up(workers, 32, None);
+            // A generous ring (in 2MB slots): the suite creates many tables on
+            // one shared server, and each leaves cached footer/page residue. A
+            // small ring fills with that residue until a query's working set no
+            // longer fits and the eviction guard aborts it.
+            let dispatch = Dispatch::spin_up(workers, 256, None);
             let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
