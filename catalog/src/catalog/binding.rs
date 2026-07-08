@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use crate::manifest::PartitionEqFilter;
+use crate::parquet::types::leaves::{first_leaf, variant_typed_leaf};
+use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
@@ -17,7 +19,7 @@ use planner::catalog::{
     Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
     Table,
 };
-use planner::expression::{CompareType, Expression, TableFilter};
+use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
 /// DuckDB during binding. Recorded as-is; applied at [`compile`](Table::compile)
@@ -26,9 +28,57 @@ use planner::expression::{CompareType, Expression, TableFilter};
 /// upstream `Filter` always runs, so this is a pure optimization.
 #[derive(Clone, Debug)]
 struct PushedPredicate {
+    /// The top-level column the comparison reads. For a variant path this is
+    /// the variant column; the predicate prunes against the path's shredded
+    /// leaf.
     column_idx: usize,
+    /// The path inside the variant column (`CAST(col->'a'->'b' AS T) <cmp>
+    /// const`), empty for a plain column comparison.
+    path: JsonPath,
     compare_type: CompareType,
     value: Scalar<ArrayRef>,
+}
+
+impl PushedPredicate {
+    /// The column-chunk index this predicate's statistics live on in `rg`: the
+    /// column's own leaf for a plain predicate, or the shredded typed leaf for
+    /// a variant path. `None` when the path isn't shredded in this file, so it
+    /// simply can't prune (always sound).
+    fn get_leaf_for_row_group(&self, rg: &RowGroupMetadata) -> Option<usize> {
+        let fields = rg.schema.fields();
+        if self.path.is_empty() {
+            Some(first_leaf(fields, self.column_idx))
+        } else {
+            variant_typed_leaf(fields, self.column_idx, &self.path)
+        }
+    }
+}
+
+/// If `expr` is a read that row-group statistics can prune by, return which
+/// top-level column it reads and the JSON path inside that column (empty for
+/// a plain column). `None` means the expression can't drive pruning.
+///
+/// Two shapes qualify:
+/// - a plain column reference, e.g. the left side of `url = 'x'`;
+/// - a typed JSON read, e.g. the left side of `CAST(d->'age' AS BIGINT) = 30`
+///   (plan build fuses the cast and the extraction chain into one
+///   `VariantGet`). Its statistics live on the file's shredded leaf for that
+///   path.
+///
+/// The `VariantGet` arm doesn't need to consider bare, uncast extractions:
+/// the planner rejects comparisons on untyped variants, so by the time a
+/// comparison reaches pushdown its `as_type` is always set.
+fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPath)> {
+    match expr {
+        Expression::Ref(r) => Some((r.column_idx, Vec::new())),
+        Expression::Function(Function::VariantGet(read)) if read.as_type.is_some() => {
+            match read.input.as_ref() {
+                Expression::Ref(r) => Some((r.column_idx, read.path.clone())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// A catalog table, resolved as a **live handle**: it carries the table's name,
@@ -133,20 +183,27 @@ impl Table for TableBinding {
         // since it was planned.
         let current = self.resolve_files(ctx)?;
 
-        // Equality predicates additionally let the decoder skip row groups whose
-        // dictionary for that column excludes the constant.
+        // Equality predicates additionally let the decoder skip row groups
+        // whose dictionary for that column excludes the constant. Only
+        // plain-column predicates take this path for now. JSON-path predicates
+        // could too, and soundly: the shredding spec requires a value matching
+        // the shredded type to be stored in the typed leaf, so that leaf's
+        // dictionary is just as conclusive as a plain column's. What's missing
+        // is plumbing: the constant is installed on a decoder by top-level
+        // column position, and installing it on a shredded leaf (whose
+        // position differs per file) isn't built yet. Until then JSON-path
+        // predicates still get the min/max pruning below.
         let eq_predicates: Vec<ScanEqualityPredicate> = self
             .predicates
             .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
+            .filter(|p| p.path.is_empty() && matches!(p.compare_type, CompareType::Equal))
             .map(|p| ScanEqualityPredicate {
                 column_idx: p.column_idx,
                 value: p.value.clone(),
             })
             .collect();
 
-        // Prune the row groups by the pushed-down predicates' stats. No footer
-        // re-read — the cache already holds the materialized row groups.
+        // Prune the row groups by the pushed-down predicates' stats.
         let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
@@ -190,9 +247,13 @@ impl Table for TableBinding {
         let Expression::Compare(compare) = expr.as_ref() else {
             return Ok(false);
         };
-        let (reference, constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
-            (Expression::Ref(r), Expression::Constant(k))
-            | (Expression::Constant(k), Expression::Ref(r)) => (r, k),
+        let ((column_idx, path), constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
+            (column, Expression::Constant(k)) | (Expression::Constant(k), column) => {
+                let Some(prunable) = get_prunable_column_and_json_path(column) else {
+                    return Ok(false);
+                };
+                (prunable, k)
+            }
             _ => return Ok(false),
         };
 
@@ -201,7 +262,8 @@ impl Table for TableBinding {
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
         self.predicates.push(PushedPredicate {
-            column_idx: reference.column_idx,
+            column_idx,
+            path,
             compare_type: compare.compare_type,
             value: constant.clone(),
         });
@@ -280,8 +342,10 @@ impl TableBinding {
         let mut parquet = parquet.clone();
         parquet.row_groups_mut().retain(|rg| {
             !self.predicates.iter().any(|p| {
-                row_group_eliminated(rg.as_ref(), p.column_idx, p.compare_type, &p.value)
-                    .unwrap_or(false)
+                p.get_leaf_for_row_group(rg.as_ref()).is_some_and(|leaf| {
+                    row_group_eliminated(rg.as_ref(), leaf, p.compare_type, &p.value)
+                        .unwrap_or(false)
+                })
             })
         });
         parquet
