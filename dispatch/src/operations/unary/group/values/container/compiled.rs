@@ -113,8 +113,9 @@ impl<Ops: OpTuple> Default for Compiled<Ops> {
 /// tied by `for<'b> R: Read<Val<'b> = F::Val>`: every row a `Read` yields is
 /// exactly what its `Fold` consumes. Both `F::Val` and `F::Acc` are lifetime-free
 /// (a numeric op folds an owned `()`/`i64`), so the cell tuple names `F::Acc`
-/// directly — no `'static` pin, no monomorphiser loop (the borrowed `&str` that
-/// caused one belongs to a string extreme, which `Compiled` never carries).
+/// directly, with no `for<'b>` projection or `'static` bound. The only aggregate
+/// value that isn't lifetime-free is a string extreme's borrowed `&str`, and those
+/// never take the `Compiled` path.
 macro_rules! impl_compiled {
     ($($R:ident $F:ident $idx:tt),+) => {
         impl<$($R, $F),+> OpTuple for ($(Pair<$R, $F>,)+)
