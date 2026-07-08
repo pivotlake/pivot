@@ -15,10 +15,11 @@
 //! let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
 //!     .filter(|| {
 //!         let mut contains = Contains::new("google");
-//!         move |batch: &RecordBatch| {
+//!         move |batch: RecordBatch| {
 //!             let col = batch.column(0).as_any()
 //!                 .downcast_ref::<StringViewArray>().unwrap();
-//!             contains.run(col)
+//!             let mask = contains.run(col);
+//!             filter_record_batch(&batch, &mask).unwrap()
 //!         }
 //!     })
 //!     .aggregate::<i64>(vec![AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64)])
@@ -48,7 +49,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::RecordBatch;
 use crossbeam_deque::Worker;
 
 use crate::api::Chain;
@@ -334,12 +335,13 @@ impl RecordBatchOperatorSpec {
         self.factories.len()
     }
 
-    /// Filter rows from each batch using a boolean mask.
+    /// Filter rows from each batch.
     ///
     /// Takes an **outer builder closure** (`FB`) that is called once per worker thread
     /// during setup. The builder returns an **inner closure** (`F`) that is called once
-    /// per `RecordBatch` during execution, returning a [`BooleanArray`] mask of the
-    /// same length indicating which rows to keep.
+    /// per `RecordBatch` during execution, returning the batch with only the rows to
+    /// keep. Evaluating the condition and applying it is left to the closure, so it can
+    /// narrow the batch progressively instead of always materializing a full mask.
     ///
     /// This two-level pattern lets each worker own private mutable state (allocated in
     /// the builder):
@@ -358,17 +360,18 @@ impl RecordBatchOperatorSpec {
     ///     let mut contains = Contains::new("google");
     ///
     ///     // Called once per RecordBatch on this worker.
-    ///     move |batch: &RecordBatch| {
+    ///     move |batch: RecordBatch| {
     ///         let col = batch.column(0).as_any()
     ///             .downcast_ref::<StringViewArray>().unwrap();
-    ///         contains.run(col)
+    ///         let mask = contains.run(col);
+    ///         filter_record_batch(&batch, &mask).unwrap()
     ///     }
     /// })
     /// # ;
     /// ```
     pub fn filter<F, FB>(self, builder: FB) -> Self
     where
-        F: FnMut(&RecordBatch) -> BooleanArray + Send + 'static,
+        F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
