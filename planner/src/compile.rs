@@ -68,6 +68,10 @@ pub enum Error {
     UnsupportedExpressionForContainsNeedle(Expression),
     #[error("Unsupported haystack expression for contains: {0:?}")]
     UnsupportedExpressionForContainsHaystack(Expression),
+    #[error("Unsupported pattern expression for prefix: {0:?}")]
+    UnsupportedExpressionForPrefixPattern(Expression),
+    #[error("Unsupported haystack expression for prefix: {0:?}")]
+    UnsupportedExpressionForPrefixHaystack(Expression),
     #[error("Failed to downcast scalar into string: {0:?}")]
     FailedToDowncastScalarIntoString(Scalar<ArrayRef>),
     #[error("Invalid regexp_replace pattern '{pattern}': {source}")]
