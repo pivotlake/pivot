@@ -92,7 +92,14 @@ impl RowGroupMetadata {
     /// chunk, and for a struct (variant) column it is a binary leaf without
     /// usable stats, so callers simply get `None` and don't prune.
     pub fn column_statistics(&self, column: usize) -> Option<&ColumnStatistics> {
-        let leaf = super::leaves::first_leaf(self.schema.fields(), column);
+        self.leaf_statistics(super::leaves::first_leaf(self.schema.fields(), column))
+    }
+
+    /// Decoded min/max (and counts) for the chunk at `leaf`, a raw column-chunk
+    /// index. For pruning by a leaf that isn't a column's first (a shredded
+    /// variant path's typed leaf); resolve the index against this row group's
+    /// own schema, since leaf positions differ per file.
+    pub fn leaf_statistics(&self, leaf: usize) -> Option<&ColumnStatistics> {
         self.columns.get(leaf).and_then(|c| c.statistics.as_ref())
     }
 }

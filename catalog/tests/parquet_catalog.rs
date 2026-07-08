@@ -5,7 +5,9 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use arrow_array::{ArrayRef, Int32Array, RecordBatch, Scalar, StringViewArray};
+use arrow_array::{
+    ArrayRef, Int32Array, Int64Array, RecordBatch, Scalar, StringArray, StringViewArray,
+};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use parquet::arrow::ArrowWriter;
@@ -19,7 +21,9 @@ use planner::Planner;
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
 };
-use planner::expression::{Compare, CompareType, Expression, Ref, TableFilter};
+use planner::expression::{
+    Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
+};
 use planner::types::Type;
 
 /// A shared single-worker dispatch pool for the whole test binary, handed to
@@ -806,4 +810,111 @@ fn no_partition_filter_builds_every_partitions_files() {
 
     // Without a filter both files are fetched: keep's 1 group + drop's 3.
     assert_eq!(all.row_groups().len(), 4);
+}
+
+// -- Variant shredded-path pushdown --
+
+/// Write one parquet file with a single VARIANT `doc` column whose `age` path
+/// is shredded into a typed Int64 leaf, one row group per age, so a per-group
+/// min/max prune on the shredded leaf is observable.
+fn write_shredded_ages(ages: &[i64]) -> TempDir {
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let rows: Vec<String> = ages.iter().map(|a| format!(r#"{{"age":{a}}}"#)).collect();
+    let json: ArrayRef = Arc::new(StringArray::from(
+        rows.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as ArrayRef],
+    )
+    .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let file = File::create(dir.path().join("docs.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    dir
+}
+
+/// `CAST(doc-><path> AS BIGINT) <cmp> <value>`, the shape plan build pushes for
+/// a typed variant comparison (the cast fused into a typed VariantGet).
+fn variant_filter(path: &str, cmp: CompareType, value: i64) -> TableFilter {
+    let constant = Scalar::new(Arc::new(Int64Array::new_scalar(value).into_inner()) as ArrayRef);
+    TableFilter::Expression(Box::new(Expression::Compare(Compare {
+        left: Box::new(Expression::Function(Function::VariantGet(VariantGet {
+            input: Box::new(Expression::Ref(Ref {
+                column_idx: 0,
+                return_type: Type::Variant,
+                name: None,
+            })),
+            path: vec![path.to_string()],
+            as_type: Some(Type::Int64),
+        }))),
+        right: Box::new(Expression::Constant(constant)),
+        compare_type: cmp,
+        return_type: Type::Boolean,
+    })))
+}
+
+fn shredded_docs_catalog(dir: &Path) -> (Arc<ParquetCatalog>, TableBinding) {
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    let columns = vec![Column {
+        name: "doc".to_string(),
+        col_type: Type::Variant,
+    }];
+    create_table(&catalog, create_request("docs", dir, columns)).unwrap();
+    let binding = catalog.binding("docs").unwrap();
+    (catalog, binding)
+}
+
+#[test]
+fn variant_pushdown_equality_keeps_only_the_matching_row_group() {
+    let dir = write_shredded_ages(&[10, 20, 30]);
+    let (catalog, mut table) = shredded_docs_catalog(dir.path());
+    assert_eq!(row_group_count(&catalog, "docs", &table), 3);
+
+    table
+        .pushdown_filter(variant_filter("age", CompareType::Equal, 20))
+        .unwrap();
+
+    // Only the row group whose shredded `age` leaf holds 20 survives.
+    assert_eq!(row_group_count(&catalog, "docs", &table), 1);
+}
+
+#[test]
+fn variant_pushdown_range_prunes_by_the_shredded_leaf() {
+    let dir = write_shredded_ages(&[10, 20, 30]);
+    let (catalog, mut table) = shredded_docs_catalog(dir.path());
+
+    table
+        .pushdown_filter(variant_filter("age", CompareType::Less, 20))
+        .unwrap();
+
+    // `age < 20` keeps only the group whose min is below 20 (the 10 group).
+    assert_eq!(row_group_count(&catalog, "docs", &table), 1);
+}
+
+/// Soundness: a path this file doesn't shred has no typed leaf to read stats
+/// from, so nothing is pruned and the upstream `Filter` still runs.
+#[test]
+fn variant_pushdown_keeps_all_groups_for_an_unshredded_path() {
+    let dir = write_shredded_ages(&[10, 20, 30]);
+    let (catalog, mut table) = shredded_docs_catalog(dir.path());
+
+    table
+        .pushdown_filter(variant_filter("salary", CompareType::Equal, 20))
+        .unwrap();
+
+    assert_eq!(row_group_count(&catalog, "docs", &table), 3);
 }
