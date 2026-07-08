@@ -57,10 +57,11 @@ fn write_table(dir: &TempDir, groups: usize, rows_per_group: usize) {
             .collect();
         // Mostly-empty names (filtered out), with matches clustered at the
         // front of each row group so later pages are entirely filtered out
-        // (all-false masks). Matches are high-cardinality with some repeats.
+        // (all-false masks). Sparse enough (~3%) that the cache stores
+        // positions rather than a dense marker, so injection is exercised.
         let names: Vec<String> = (0..rows_per_group)
             .map(|i| {
-                if i < 700 && i % 3 == 0 {
+                if i < 300 && i % 3 == 0 {
                     format!("phrase-{:06}", (g * 251 + i * 17) % 4096)
                 } else {
                     String::new()
@@ -115,7 +116,7 @@ const ROWS_PER_GROUP: usize = 3000;
 fn expected_matches() -> i64 {
     (GROUPS as i64)
         * (0..ROWS_PER_GROUP as i64)
-            .filter(|i| *i < 700 && i % 3 == 0)
+            .filter(|i| *i < 300 && i % 3 == 0)
             .count() as i64
 }
 
@@ -128,7 +129,7 @@ fn capacity_thrash_keeps_runs_correct() {
     let catalog = Arc::new(
         ParquetCatalog::new(dispatcher()).with_condition_cache(Arc::new(
             // Room for roughly a quarter of the table's row-group entries.
-            QueryConditionCache::new(true, 10 * (234 * 4 + 128)),
+            QueryConditionCache::new(true, 10 * (100 * 4 + 128)),
         )),
     );
     create_events(&catalog, &dir);

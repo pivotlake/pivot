@@ -188,25 +188,28 @@ mod tests {
         }
     }
 
+    /// A mask over `rows` rows keeping only the positions in `keep` (sparse
+    /// enough to store positions rather than a dense marker).
+    fn sparse_mask(rows: usize, keep: &[usize]) -> BooleanArray {
+        BooleanArray::from((0..rows).map(|row| keep.contains(&row)).collect::<Vec<_>>())
+    }
+
     #[test]
     fn publishes_only_at_full_row_group_coverage() {
         let cache = cache();
         let condition = test_condition();
-        let table = table_of_rows(6);
+        let table = table_of_rows(200);
         let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
 
-        observer(
-            &meta_batch(0, 0, 4),
-            &BooleanArray::from(vec![true, false, false, false]),
-        );
+        observer(&meta_batch(0, 0, 100), &sparse_mask(100, &[7]));
         let after_partial = cache.stats().inserts;
-        observer(&meta_batch(0, 4, 2), &BooleanArray::from(vec![false, true]));
+        observer(&meta_batch(0, 100, 100), &sparse_mask(100, &[50]));
 
         assert_eq!(after_partial, 0);
         let key: Arc<str> = table.row_groups()[0].file_path.clone();
         assert_eq!(
             sparse(cache.get(&key, 0, &condition)).as_deref(),
-            Some(&vec![0, 5])
+            Some(&vec![7, 150])
         );
     }
 
@@ -214,22 +217,16 @@ mod tests {
     fn out_of_order_batches_publish_sorted_positions() {
         let cache = cache();
         let condition = test_condition();
-        let table = table_of_rows(6);
+        let table = table_of_rows(200);
         let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
 
-        observer(
-            &meta_batch(0, 3, 3),
-            &BooleanArray::from(vec![true, false, false]),
-        );
-        observer(
-            &meta_batch(0, 0, 3),
-            &BooleanArray::from(vec![true, false, false]),
-        );
+        observer(&meta_batch(0, 100, 100), &sparse_mask(100, &[20]));
+        observer(&meta_batch(0, 0, 100), &sparse_mask(100, &[3]));
 
         let key: Arc<str> = table.row_groups()[0].file_path.clone();
         assert_eq!(
             sparse(cache.get(&key, 0, &condition)).as_deref(),
-            Some(&vec![0, 3])
+            Some(&vec![3, 120])
         );
     }
 
@@ -237,13 +234,13 @@ mod tests {
     fn null_mask_slots_exclude_their_rows() {
         let cache = cache();
         let condition = test_condition();
-        let table = table_of_rows(3);
+        let table = table_of_rows(100);
         let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
 
-        observer(
-            &meta_batch(0, 0, 3),
-            &BooleanArray::from(vec![Some(true), None, Some(false)]),
-        );
+        let mut mask: Vec<Option<bool>> = vec![Some(false); 100];
+        mask[0] = Some(true);
+        mask[1] = None;
+        observer(&meta_batch(0, 0, 100), &BooleanArray::from(mask));
 
         let key: Arc<str> = table.row_groups()[0].file_path.clone();
         assert_eq!(
@@ -253,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mostly_true_result_publishes_a_dense_marker() {
+    fn a_dense_result_publishes_a_marker_not_positions() {
         let cache = cache();
         let condition = test_condition();
         let table = table_of_rows(4);

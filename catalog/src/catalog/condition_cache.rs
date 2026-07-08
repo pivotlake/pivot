@@ -28,11 +28,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const ENTRY_OVERHEAD_BYTES: usize = 128;
 
 /// A condition keeping more than this fraction of a row group's rows is
-/// recorded as [`CachedPositions::Dense`] instead of storing the positions: a
-/// nearly-all-true mask saves almost no decode work while costing memory and
-/// per-page mask bookkeeping, so a dense row group simply scans plain. The
-/// marker still counts as covered, ending observation for that row group.
-const DENSE_POSITIONS_FRACTION: f64 = 0.5;
+/// recorded as [`CachedPositions::Dense`] instead of storing the positions.
+/// Masked reads only beat a plain scan when survivors are rare: at even a few
+/// percent kept (uniformly spread), no page is entirely skippable and the
+/// decoder's skip/keep run cursor alternates tiny runs, costing more than
+/// decoding straight through — while the positions cost 4 bytes per surviving
+/// row to keep. A dense row group simply scans plain; the marker still counts
+/// as covered, ending observation for that row group.
+const DENSE_POSITIONS_FRACTION: f64 = 0.05;
 
 /// On overflow, evict down to this fraction of capacity rather than stopping
 /// at the cap: hysteresis amortizes the eviction sweep over many inserts.
@@ -361,7 +364,7 @@ mod tests {
         let cache = QueryConditionCache::new(true, 1 << 20);
         let key = condition("a", 7);
 
-        cache.insert(path("f"), 0, &key, Arc::new((0..80).collect()), 100);
+        cache.insert(path("f"), 0, &key, Arc::new((0..10).collect()), 100);
 
         assert!(matches!(
             cache.get(&path("f"), 0, &key),
