@@ -151,6 +151,14 @@ impl QueryConditionCache {
         }
     }
 
+    /// Whether `kept_rows` surviving rows out of `row_group_num_rows` is past
+    /// the dense cutoff. Density only grows as observation progresses, so an
+    /// observer may call this mid-observation and publish a dense marker as
+    /// soon as it triggers, without waiting for full coverage.
+    pub fn exceeds_dense_cutoff(kept_rows: usize, row_group_num_rows: u64) -> bool {
+        kept_rows as f64 > row_group_num_rows as f64 * DENSE_POSITIONS_FRACTION
+    }
+
     /// Record `condition`'s surviving positions for one row group. A result
     /// keeping more than [`DENSE_POSITIONS_FRACTION`] of the rows is stored as
     /// a dense marker (scan plain, stop observing) instead of the positions.
@@ -164,15 +172,46 @@ impl QueryConditionCache {
         positions: Arc<Vec<u32>>,
         row_group_num_rows: u64,
     ) {
+        let entry = if Self::exceeds_dense_cutoff(positions.len(), row_group_num_rows) {
+            CachedPositions::Dense
+        } else {
+            CachedPositions::Sparse(positions)
+        };
+        self.insert_entry(file_path, file_row_group_idx, condition, entry);
+    }
+
+    /// Record that `condition` is dense in one row group (scan it plain, stop
+    /// observing it) without needing the positions. Published mid-observation
+    /// the moment the accumulated positions cross the cutoff.
+    pub fn insert_dense(
+        &self,
+        file_path: Arc<str>,
+        file_row_group_idx: usize,
+        condition: &ConditionKey,
+    ) {
+        self.insert_entry(
+            file_path,
+            file_row_group_idx,
+            condition,
+            CachedPositions::Dense,
+        );
+    }
+
+    fn insert_entry(
+        &self,
+        file_path: Arc<str>,
+        file_row_group_idx: usize,
+        condition: &ConditionKey,
+        positions: CachedPositions,
+    ) {
         if !self.enabled {
             return;
         }
-        let dense = positions.len() as f64 > row_group_num_rows as f64 * DENSE_POSITIONS_FRACTION;
-        let (positions, entry_bytes) = if dense {
-            (CachedPositions::Dense, ENTRY_OVERHEAD_BYTES)
-        } else {
-            let bytes = positions.len() * size_of::<u32>() + ENTRY_OVERHEAD_BYTES;
-            (CachedPositions::Sparse(positions), bytes)
+        let entry_bytes = match &positions {
+            CachedPositions::Sparse(positions) => {
+                positions.len() * size_of::<u32>() + ENTRY_OVERHEAD_BYTES
+            }
+            CachedPositions::Dense => ENTRY_OVERHEAD_BYTES,
         };
         let mut state = self.state.lock().unwrap();
         state.tick += 1;

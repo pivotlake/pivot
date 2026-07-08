@@ -95,6 +95,21 @@ fn observe_batch(
                 positions.push(row_indices.value(logical));
             }
         }
+        // Density only grows, so once past the cutoff the outcome is already
+        // determined: publish the dense marker now instead of accumulating the
+        // rest, ending observation of this row group permanently. Crucially
+        // this also covers row groups a Top-N boundary later skips mid-scan,
+        // which would otherwise never reach full coverage and be re-observed
+        // (and re-accumulated) on every run forever.
+        if QueryConditionCache::exceeds_dense_cutoff(positions.len(), observation.num_rows) {
+            cache.insert_dense(
+                observation.file_path.clone(),
+                observation.file_row_group_idx,
+                condition,
+            );
+            *state = ObservationState::Done;
+            return;
+        }
         *rows_seen += (logical_end - logical_start) as u64;
         match (*rows_seen).cmp(&observation.num_rows) {
             Ordering::Less => {}
@@ -260,6 +275,24 @@ mod tests {
             &meta_batch(0, 0, 4),
             &BooleanArray::from(vec![true, true, true, false]),
         );
+
+        let key: Arc<str> = table.row_groups()[0].file_path.clone();
+        assert!(matches!(
+            cache.get(&key, 0, &condition),
+            Some(CachedPositions::Dense)
+        ));
+    }
+
+    /// Crossing the dense cutoff publishes immediately, without full coverage:
+    /// a row group a Top-N boundary later skips still ends up covered.
+    #[test]
+    fn crossing_the_dense_cutoff_publishes_before_full_coverage() {
+        let cache = cache();
+        let condition = test_condition();
+        let table = table_of_rows(1000);
+        let observer = build_condition_observer(cache.clone(), condition.clone(), &table, &[false]);
+
+        observer(&meta_batch(0, 0, 100), &BooleanArray::from(vec![true; 100]));
 
         let key: Arc<str> = table.row_groups()[0].file_path.clone();
         assert!(matches!(
