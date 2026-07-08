@@ -23,26 +23,6 @@ export interface TableOverview {
   compaction: Compaction | null;
 }
 
-export interface SignalInfo {
-  signal: string;
-  table: string;
-}
-
-export interface Ingest {
-  kind: string;
-  addr: string;
-  flush_rows: number;
-  flush_secs: number;
-  signals: SignalInfo[];
-  /** Cumulative rows ingested by this receiver. */
-  rows: number;
-  bytes: number;
-  files: number;
-  flushes: number;
-  rows_per_sec: number;
-  last_flush_unix_ms: number;
-}
-
 export interface Compaction {
   compactions: number;
   files_merged_in: number;
@@ -69,12 +49,11 @@ export interface SystemInfo {
 }
 
 /** What's selected in the flow graph and shown in the bottom drawer. */
-export type Selection = { type: "table"; name: string } | { type: "ingest"; addr: string };
+export type Selection = { type: "table"; name: string };
 
 export interface Overview {
   store: string;
   tables: TableOverview[];
-  ingests: Ingest[];
   compaction: Compaction | null;
   system: SystemInfo | null;
   connected: boolean;

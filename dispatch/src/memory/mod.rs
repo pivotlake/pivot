@@ -24,13 +24,10 @@ pub mod compressed_cache;
 pub use compressed_cache::CacheLookup;
 
 pub mod decompressed_cache;
-pub use decompressed_cache::{BlockKey, DecompressedCache, Segment};
+pub use decompressed_cache::{BlockKey, DecompressedCache};
 
 pub mod clock;
 pub use clock::{Clock, Owner};
-
-mod fill_cursor;
-pub use fill_cursor::FillCursor;
 
 mod free_pool;
 

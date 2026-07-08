@@ -13,13 +13,11 @@ use crate::parquet::types::page::{
     CompressedPage, DataPage, DecompressedPage, DecompressedPageType,
 };
 use crate::parquet::types::thrift::general::PageType;
-use crate::parquet::types::thrift::headers::PageHeader;
-use crate::parquet::types::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::memory::{BlockKey, memory_ctx};
+use dispatch::memory::{BUFFER_SIZE, BlockKey, memory_ctx};
 use snap::raw::Decoder;
 use thiserror::Error;
 
@@ -52,55 +50,34 @@ impl Default for Decompressor {
 }
 
 impl Decompressor {
-    fn decompress(&mut self, mut page: CompressedPage) -> Result<DecompressedPage> {
+    fn decompress(&mut self, page: CompressedPage) -> Result<DecompressedPage> {
         let is_dict = match page.header.r#type {
             PageType::DATA_PAGE => false,
             PageType::DICTIONARY_PAGE => true,
             other => return Err(Error::UnsupportedPageType(other)),
         };
 
-        // A page already resolved from the decompressed cache before this row
-        // group's IO was even issued (see `requests::ColumnPart::Decompressed`)
-        // carries its bytes here directly - no cache lookup needed, and none of the
-        // races one would otherwise have to reason about between that resolution
-        // and now.
-        let data = if let Some(decompressed) = page.decompressed.take() {
-            decompressed
-        } else {
-            // The decompressed bytes depend only on the compressed input, not on the
-            // per-query filter mask, so a cache hit reuses them across queries; the
-            // mask is attached to the `DataPage` below either way.
-            let key = BlockKey {
-                location: page.row_group.get_metadata().location.clone(),
-                offset: page.file_offset,
-                len: page.span,
-            };
-            match memory_ctx().decompressed_cache().get(&key) {
-                Some(cached) => cached,
-                None => {
-                    // Reserve the page's output region in the cache (packed into
-                    // shared slots via this worker's fill cursor), decompress
-                    // straight into it, and insert. The header is stored
-                    // alongside it, opaque to the cache, so a later `get_range`
-                    // hit can hand a caller a full page identity without touching
-                    // disk (see `requests::parse_page_header`).
-                    let uncompressed_size = page.header.uncompressed_page_size as usize;
-                    let mut reservation = memory_ctx()
+        // The decompressed bytes depend only on the compressed input, not on the
+        // per-query filter mask, so a cache hit reuses them across queries; the
+        // mask is attached to the `DataPage` below either way.
+        let key = BlockKey {
+            location: page.row_group.get_metadata().location.clone(),
+            offset: page.file_offset,
+            len: page.header.compressed_page_size as usize,
+        };
+        let data = match memory_ctx().decompressed_cache().get(&key) {
+            Some(cached) => cached,
+            None => {
+                let (data, slots) = self.decompress_bytes(&page)?;
+                // A zero-length page occupies no ring slot, so there is nothing to
+                // cache (and nothing for the clock to evict); re-decompressing an
+                // empty page is free anyway.
+                if !slots.is_empty() {
+                    memory_ctx()
                         .decompressed_cache()
-                        .reserve(&key, uncompressed_size);
-                    let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
-                    self.decoder
-                        .decompress_scattered(&input, reservation.as_mut_slices())?;
-                    memory_ctx().decompressed_cache().insert(
-                        key,
-                        serialize_header(&page.header),
-                        reservation,
-                        page.row_group
-                            .get_metadata()
-                            .live_decompressed_pages
-                            .clone(),
-                    )
+                        .insert(key, data.clone(), slots);
                 }
+                data
             }
         };
 
@@ -125,19 +102,33 @@ impl Decompressor {
             idx: page.page_idx,
         })
     }
-}
 
-/// Serialize a page's header back to Thrift compact bytes, to store alongside its
-/// decompressed bytes in the cache (opaque to the cache itself - see
-/// `requests::parse_page_header`, which reverses this on a hit). Cheap: a few dozen
-/// bytes, entirely in memory, no relation to the (possibly much larger) page payload.
-fn serialize_header(header: &PageHeader) -> Vec<Bytes> {
-    let mut buf = Vec::new();
-    let mut prot = ThriftCompactOutputProtocol::new(&mut buf);
-    header
-        .write_thrift(&mut prot)
-        .expect("writing to an in-memory buffer cannot fail");
-    vec![Bytes::from(buf)]
+    /// Snappy-decompress the page body into freshly allocated ring buffers,
+    /// returning one ring-backed [`Bytes`] per 2 MB slot, plus the slots they
+    /// occupy (so the cache can register them with the shared clock).
+    fn decompress_bytes(&mut self, page: &CompressedPage) -> Result<(Vec<Bytes>, Vec<usize>)> {
+        let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
+
+        let uncompressed_size = page.header.uncompressed_page_size as usize;
+        let num_buffers = uncompressed_size.div_ceil(BUFFER_SIZE);
+        let mut write_buffers: Vec<_> = (0..num_buffers)
+            .map(|_| memory_ctx().get_write_buffer(false))
+            .collect();
+
+        let output_bufs: Vec<&mut [u8]> = write_buffers.iter_mut().map(|b| b.as_mut()).collect();
+
+        self.decoder.decompress_scattered(&input, output_bufs)?;
+
+        let slots: Vec<usize> = write_buffers.iter().map(|b| b.slot_idx).collect();
+        let mut data = Vec::with_capacity(num_buffers);
+        let mut remaining = uncompressed_size;
+        for write_buffer in write_buffers {
+            let chunk_len = remaining.min(BUFFER_SIZE);
+            data.push(Bytes::from_owner(write_buffer).slice(..chunk_len));
+            remaining -= chunk_len;
+        }
+        Ok((data, slots))
+    }
 }
 
 impl Unary<CompressedPage, DecompressedPage> for Decompressor {
@@ -210,7 +201,6 @@ mod tests {
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,
-            span: compressed.len(),
             page_idx: 0,
             header: PageHeader {
                 r#type: PageType::DATA_PAGE,
@@ -229,7 +219,6 @@ mod tests {
                 data_page_header_v2: None,
             },
             data: vec![Bytes::from(compressed)],
-            decompressed: None,
             filter_mask,
         }
     }
@@ -241,7 +230,6 @@ mod tests {
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,
-            span: compressed.len(),
             page_idx: 0,
             header: PageHeader {
                 r#type: PageType::DICTIONARY_PAGE,
@@ -258,7 +246,6 @@ mod tests {
                 data_page_header_v2: None,
             },
             data: vec![Bytes::from(compressed)],
-            decompressed: None,
             filter_mask: None,
         }
     }
@@ -361,47 +348,6 @@ mod tests {
         };
         assert!(data_page.filter_mask.is_some());
         assert_eq!(data_page.filter_mask.as_ref().unwrap().rows(), 1);
-    }
-
-    /// A page whose `decompressed` field is already set (a decompressed-cache hit
-    /// resolved before this row group's IO was issued) is used directly - no
-    /// decompression, no cache lookup.
-    #[test]
-    fn test_decompressed_field_skips_decompression() {
-        init_test_free_pool(1);
-        let mut page = compressed_data_page(b"never touched", 10, None);
-        // Garbage compressed bytes that would fail to decompress, proving they're
-        // never read: `decompressed` takes priority.
-        page.data = vec![Bytes::from(vec![0xFFu8; 4])];
-        page.decompressed = Some(vec![Bytes::from(vec![7u8, 8, 9])]);
-
-        let out = run_unary(Decompressor::default(), vec![page]);
-
-        let DecompressedPageType::Data(data_page) = &out[0].data else {
-            panic!("expected Data");
-        };
-        let bytes: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
-        assert_eq!(bytes, vec![7, 8, 9]);
-    }
-
-    /// Caching a decompressed page counts it live on its row group's metadata,
-    /// the signal the scan feed uses to schedule cache-covered row groups first.
-    #[test]
-    fn test_cached_page_counts_live_on_its_row_group() {
-        init_test_free_pool(4);
-        let metadata = dummy_metadata(None);
-        let mut page = compressed_data_page(&[7u8; 64], 10, None);
-        page.row_group = metadata.clone();
-
-        let _out = run_unary(Decompressor::default(), vec![page]);
-
-        assert_eq!(
-            metadata
-                .get_metadata()
-                .live_decompressed_pages
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
     }
 
     /// Decompressing the same page identity twice reuses the cached bytes
@@ -530,7 +476,6 @@ mod tests {
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,
-            span: compressed.len(),
             page_idx: 0,
             header: PageHeader {
                 r#type: PageType::INDEX_PAGE,
@@ -543,7 +488,6 @@ mod tests {
                 data_page_header_v2: None,
             },
             data: vec![Bytes::from(compressed)],
-            decompressed: None,
             filter_mask: None,
         };
 

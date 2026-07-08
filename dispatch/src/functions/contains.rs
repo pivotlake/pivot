@@ -136,8 +136,9 @@ impl Contains {
 
         let row_count = array.len();
         let mut bitmap = BooleanBufferBuilder::new(row_count);
+        bitmap.append_n(row_count, false);
 
-        for &view in array.views().iter() {
+        for (i, &view) in array.views().iter().enumerate() {
             let len = view as u32;
 
             let found = if len as usize > MAX_INLINE_STRING_VIEW {
@@ -152,7 +153,7 @@ impl Contains {
                 false
             };
 
-            bitmap.append(found);
+            bitmap.set_bit(i, found);
         }
 
         bitmap.finish().into()

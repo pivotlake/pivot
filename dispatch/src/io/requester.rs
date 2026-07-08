@@ -491,7 +491,7 @@ mod tests {
         let mut split = RemoteReadSplit::default();
         let mut submitted = 0;
         for lookup in &lookups {
-            if let Some(block) = lookup.missing() {
+            for block in lookup.missing() {
                 let req = HttpRequest {
                     remote: remote.clone(),
                     block: block.clone(),
@@ -524,7 +524,7 @@ mod tests {
     fn assert_cached(loc: &FileLocation, offset: usize, len: usize) {
         let hit = memory_ctx().compressed_cache().get(loc, offset, len);
         assert_eq!(hit.len(), 1);
-        assert!(hit[0].missing().is_none(), "expected a cache hit");
+        assert!(hit[0].missing().is_empty(), "expected a cache hit");
         let bytes = hit.into_iter().next().unwrap().into_data();
         assert_eq!(bytes.len(), len);
         for (i, &b) in bytes.iter().enumerate() {
@@ -611,7 +611,7 @@ mod tests {
         let lookups = memory_ctx().compressed_cache().get(loc, offset, len);
         let mut submitted = 0;
         for lookup in &lookups {
-            if let Some(block) = lookup.missing() {
+            for block in lookup.missing() {
                 let req = HttpRequest {
                     remote: remote.clone(),
                     block: block.clone(),

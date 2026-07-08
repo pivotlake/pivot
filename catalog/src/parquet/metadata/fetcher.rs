@@ -241,7 +241,7 @@ impl FooterRead {
             .get(&self.location, offset, len);
         self.remaining = 0;
         for lookup in &self.lookups {
-            if let Some(block) = lookup.missing() {
+            for block in lookup.missing() {
                 match &self.location {
                     FileLocation::Local(file) => self.pending_fs.push(FsRequest {
                         file: file.clone(),

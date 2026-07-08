@@ -122,28 +122,19 @@ impl PlanNode {
                 }
                 Step::SetAgg(slot) => {
                     if let Operator::Aggregate(a) = &mut node.operator {
-                        // Don't push top-k onto a slot whose `sort_key` isn't ordered:
-                        // a string extreme (raw `ArenaKey`/StringView header bits) or a
-                        // float aggregate (the cell holds `f64` bits, so the widened
-                        // sort key is not numerically ordered). A per-partition top-k
-                        // would keep the wrong rows; leave it to the full `TopN` sort
-                        // above (only the pushdown is skipped).
+                        // Don't push top-k onto a string MIN/MAX. A string
+                        // extreme's `sort_key` is its raw `ArenaKey`/StringView
+                        // header bits, not lexicographic order, so a per-partition
+                        // top-k would keep the wrong rows. Leave it to the full
+                        // `TopN` sort above (only the pushdown is skipped).
                         use crate::expression::AggregateFunc;
-                        use crate::types::Type;
-                        let unordered_sort_key = match a.expressions.get(slot) {
+                        let string_extreme = matches!(
+                            a.expressions.get(slot),
                             Some(Expression::AggregateFunc(
-                                AggregateFunc::Min(x) | AggregateFunc::Max(x),
-                            )) => matches!(
-                                x.argument.result_type().ok(),
-                                Some(Type::Utf8 | Type::Float32 | Type::Float64)
-                            ),
-                            Some(Expression::AggregateFunc(AggregateFunc::Sum(x))) => matches!(
-                                x.argument.result_type().ok(),
-                                Some(Type::Float32 | Type::Float64)
-                            ),
-                            _ => false,
-                        };
-                        if !unordered_sort_key {
+                                AggregateFunc::Min(x) | AggregateFunc::Max(x)
+                            )) if x.argument.result_type().ok() == Some(crate::types::Type::Utf8)
+                        );
+                        if !string_extreme {
                             a.output_limit = Some(GroupLimit::TopK { slot, limit });
                         }
                     }
@@ -244,6 +235,18 @@ impl Plan {
     pub fn as_set_variable(&self) -> Option<&SetVariable> {
         match &self.root.operator {
             Operator::SetVariable(set) if self.root.inputs.is_empty() => Some(set),
+            _ => None,
+        }
+    }
+
+    /// If this plan is an `INSERT`, return it. An insert compiles and runs
+    /// like any other plan, but its dataflow emits a single one-row batch
+    /// carrying the written-row count instead of client rows (see
+    /// [`Table::insert`](crate::catalog::Table::insert)) - the server checks
+    /// this to reply with the `INSERT 0 n` tag rather than a row stream.
+    pub fn as_insert(&self) -> Option<&crate::operator::Insert> {
+        match &self.root.operator {
+            Operator::Insert(insert) => Some(insert),
             _ => None,
         }
     }

@@ -19,7 +19,6 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
 use std::fmt::{Debug, Formatter};
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
@@ -220,7 +219,6 @@ fn build_row_groups(
                 columns,
                 num_rows,
                 file_row_group_idx: i,
-                live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
             }
         })
         .collect();

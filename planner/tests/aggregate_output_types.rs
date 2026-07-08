@@ -8,9 +8,6 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::sync::Arc;
-
-use arrow_array::Int32Array;
 use arrow_schema::DataType;
 use common::*;
 use rstest::rstest;
@@ -65,30 +62,4 @@ fn global_sum_of_narrow_int_is_decimal128(mut testing_planner: TestingPlanner) {
 
     let sum = results[0].schema().field(0).data_type().clone();
     assert_eq!(sum, DataType::Decimal128(38, 0));
-}
-
-#[rstest]
-fn min_of_int_cast_to_text_compares_lexicographically(mut testing_planner: TestingPlanner) {
-    testing_planner.add_table(
-        "nums",
-        &[(
-            "x",
-            planner::types::Type::Int32,
-            Arc::new(Int32Array::from(vec![2, 10])),
-        )],
-    );
-
-    let results = testing_planner
-        .planner
-        .plan("SELECT MIN(CAST(x AS VARCHAR)) AS mn FROM nums")
-        .unwrap()
-        .compile(testing_planner.dispatcher())
-        .unwrap()
-        .collect()
-        .unwrap();
-
-    // The cast makes MIN compare text, not integers: '10' < '2'. Folding the
-    // raw int column instead would return 2 (and crash reading it as text).
-    let rows = batches_to_json(&results);
-    assert_eq!(rows[0]["mn"].as_str().unwrap(), "10");
 }

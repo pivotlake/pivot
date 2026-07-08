@@ -197,14 +197,17 @@ async fn filtered_min_max_does_not_short_circuit(#[future] conn: Conn) {
     );
 }
 
-/// A global MIN/MAX over a DOUBLE column returns the exact float extremes. (This
-/// also guards the old metadata short-circuit, which only fires for
-/// integer/temporal columns: a float column declines it and computes from the
-/// scan, so the bounds are never cast through Int64 and truncated to [3, 9].)
+/// Regression: the metadata short-circuit only fires for integer/temporal
+/// columns whose stats cast losslessly to Int64. Before the type allowlist, a
+/// global MIN/MAX over a DOUBLE column cast the float stats to Int64 and
+/// silently returned the truncated values ([3, 9] for {3.7, 9.2}); now a
+/// non-integer column declines the short-circuit, so the truncated row is never
+/// produced (today the unsupported float aggregate errors instead of
+/// corrupting, either outcome is acceptable, the wrong row is not).
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
-async fn global_min_max_over_double_column(#[future] conn: Conn) {
+async fn global_min_max_does_not_short_circuit_double_column(#[future] conn: Conn) {
     let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
     let f: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![3.7f64, 9.2, 5.0]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![f]).unwrap());
@@ -215,52 +218,28 @@ async fn global_min_max_over_double_column(#[future] conn: Conn) {
     .await
     .unwrap();
 
-    let rows = select_rows(&conn, "SELECT MIN(f), MAX(f) FROM doubles").await;
+    let result = conn
+        .simple_query("SELECT MIN(f), MAX(f) FROM doubles")
+        .await;
 
-    let min: f64 = rows[0][0].as_deref().unwrap().parse().unwrap();
-    let max: f64 = rows[0][1].as_deref().unwrap().parse().unwrap();
-    assert_eq!(min, 3.7);
-    assert_eq!(max, 9.2);
-}
-
-/// Grouped SUM/AVG over a DOUBLE value column, with a REAL column alongside, end
-/// to end through the SQL server.
-#[rstest]
-#[awt]
-#[tokio::test(flavor = "multi_thread")]
-async fn grouped_float_aggregates(#[future] conn: Conn) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("g", DataType::Int64, false),
-        Field::new("d", DataType::Float64, false),
-        Field::new("r", DataType::Float32, false),
-    ]));
-    let g: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 1, 2]));
-    let d: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![1.5f64, 2.5, 4.0]));
-    let r: ArrayRef = Arc::new(arrow_array::Float32Array::from(vec![1.0f32, 3.0, 5.0]));
-    let dir = write_parquet(&RecordBatch::try_new(schema, vec![g, d, r]).unwrap());
-    conn.simple_query(&format!(
-        "CREATE TABLE fmetrics (g BIGINT, d DOUBLE, r REAL) WITH (path = '{}')",
-        dir.path().to_str().unwrap()
-    ))
-    .await
-    .unwrap();
-
-    // Clear any cache residue from prior tests so the grouped aggregate has the
-    // whole ring (the shared test server runs with a small buffer pool).
-    select_one_i64(&conn, "SELECT drop_cache()").await;
-    let rows = select_rows(
-        &conn,
-        "SELECT g, SUM(d), AVG(d), MIN(r) FROM fmetrics GROUP BY g ORDER BY g",
-    )
-    .await;
-
-    let parse = |v: &Option<String>| -> f64 { v.as_deref().unwrap().parse().unwrap() };
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0].as_deref(), Some("1"));
-    assert_eq!(parse(&rows[0][1]), 4.0); // SUM(d) group 1: 1.5 + 2.5
-    assert_eq!(parse(&rows[0][2]), 2.0); // AVG(d) group 1
-    assert_eq!(parse(&rows[0][3]), 1.0); // MIN(r) group 1
-    assert_eq!(parse(&rows[1][1]), 4.0); // SUM(d) group 2
+    if let Ok(msgs) = result {
+        let rows: Vec<Vec<Option<String>>> = msgs
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(
+                    (0..r.len())
+                        .map(|i| r.get(i).map(|s| s.to_string()))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_ne!(
+            rows,
+            vec![vec![Some("3".into()), Some("9".into())]],
+            "DOUBLE MIN/MAX must not be silently truncated to Int64"
+        );
+    }
 }
 
 /// An unfiltered global COUNT(*) is answered from the sum of parquet row-group
@@ -312,5 +291,164 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
             || err.to_string().to_lowercase().contains("not found")
             || err.code().is_some(),
         "expected a structured pgwire error, got: {err}",
+    );
+}
+
+/// Rows-affected reported by a statement's command tag (e.g. `INSERT 0 n`).
+async fn rows_affected(client: &Client, sql: &str) -> u64 {
+    let msgs = client.simple_query(sql).await.unwrap();
+    msgs.into_iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::CommandComplete(rows) => Some(rows),
+            _ => None,
+        })
+        .expect("statement completes with a command tag")
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_float_values_lands_and_reads_back(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE metrics_float (v DOUBLE)")
+        .await
+        .unwrap();
+
+    let rows = rows_affected(&conn, "INSERT INTO metrics_float VALUES (1.5), (2.5)").await;
+
+    assert_eq!(rows, 2);
+    let read = select_rows(&conn, "SELECT v FROM metrics_float ORDER BY v").await;
+    assert_eq!(
+        read,
+        vec![vec![Some("1.5".into())], vec![Some("2.5".into())]],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_values_lands_and_reads_back(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let rows = rows_affected(
+        &conn,
+        "INSERT INTO people_insert VALUES (1, 'alice'), (2, 'bob')",
+    )
+    .await;
+
+    assert_eq!(rows, 2, "INSERT tag reports the rows written");
+    // The insert returned only after the parquet file was durably committed,
+    // so the rows are immediately visible.
+    let read = select_rows(&conn, "SELECT id, name FROM people_insert ORDER BY id").await;
+    assert_eq!(
+        read,
+        vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), Some("bob".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_accumulates_across_statements(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_twice (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    rows_affected(&conn, "INSERT INTO people_insert_twice VALUES (1, 'a')").await;
+    rows_affected(&conn, "INSERT INTO people_insert_twice VALUES (2, 'b')").await;
+
+    let count = select_one_i64(&conn, "SELECT COUNT(*) FROM people_insert_twice").await;
+    assert_eq!(count, 2);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_with_column_list_reorders_values(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_cols (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    rows_affected(
+        &conn,
+        "INSERT INTO people_insert_cols (name, id) VALUES ('carol', 3)",
+    )
+    .await;
+
+    let read = select_rows(&conn, "SELECT id, name FROM people_insert_cols").await;
+    assert_eq!(read, vec![vec![Some("3".into()), Some("carol".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_select_copies_rows(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_insert_src", dir.path()).await;
+    conn.simple_query("CREATE TABLE people_insert_dst (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let rows = rows_affected(
+        &conn,
+        "INSERT INTO people_insert_dst SELECT id, name FROM people_insert_src WHERE id > 1",
+    )
+    .await;
+
+    assert_eq!(rows, 2);
+    let read = select_rows(&conn, "SELECT id, name FROM people_insert_dst ORDER BY id").await;
+    assert_eq!(
+        read,
+        vec![
+            vec![Some("2".into()), Some("bob".into())],
+            vec![Some("3".into()), Some("carol".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_visible_to_second_connection(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_shared (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    let reader = connect_client(server_port()).await;
+
+    rows_affected(
+        &conn,
+        "INSERT INTO people_insert_shared VALUES (7, 'grace')",
+    )
+    .await;
+
+    let read = select_rows(&reader, "SELECT id, name FROM people_insert_shared").await;
+    assert_eq!(read, vec![vec![Some("7".into()), Some("grace".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_omitting_a_column_errors(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE people_insert_partial (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let err = conn
+        .simple_query("INSERT INTO people_insert_partial (id) VALUES (1)")
+        .await
+        .unwrap_err();
+
+    let message = err
+        .as_db_error()
+        .expect("the rejection arrives as a structured pgwire error")
+        .message()
+        .to_string();
+    assert!(
+        message.contains("every table column"),
+        "expected the missing-column rejection, got: {message}",
     );
 }

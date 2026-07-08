@@ -4,7 +4,7 @@ import { sql } from "@codemirror/lang-sql";
 import { runQuery, type QueryResult, type TableOverview } from "../api";
 
 export default function Console({ tables }: { tables: TableOverview[] }) {
-  const [sqlText, setSqlText] = useState("SELECT count(*) FROM otel_logs");
+  const [sqlText, setSqlText] = useState("SELECT 1");
   const [result, setResult] = useState<QueryResult | null>(null);
   const [running, setRunning] = useState(false);
   const abortRef = useRef<AbortController | null>(null);

@@ -12,8 +12,17 @@ arrow-ord = { path = "../arrow-rs/arrow-ord" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
 # Encode a pushed-down constant to the same JSON a partition tuple is stamped
-# with (ingest uses arrow-json too), so partition pruning compares like for like.
+# with (the write pipeline uses arrow-json too), so partition pruning compares
+# like for like.
 arrow-json = { path = "../arrow-rs/arrow-json" }
+# The Parquet write pipeline: lexsort + partition (arrow-ord), concat + take
+# (arrow-select), interval arithmetic on sort stats (arrow-arith), dictionary
+# encoding via cast (arrow-cast). `uuid` names inserted files so concurrent
+# writers never collide.
+arrow-select = { path = "../arrow-rs/arrow-select" }
+arrow-arith = { path = "../arrow-rs/arrow-arith" }
+arrow-cast = { path = "../arrow-rs/arrow-cast" }
+uuid = { version = "1", features = ["v4"] }
 thiserror = "2.0.18"
 tracing = "0.1"
 bytes = "1.11.0"

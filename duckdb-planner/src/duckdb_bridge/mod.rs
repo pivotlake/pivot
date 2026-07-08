@@ -217,6 +217,25 @@ pub mod ffi {
         fn lo_create_has_query(op: &LogicalOperator) -> bool;
         fn lo_create_constraint_count(op: &LogicalOperator) -> usize;
 
+        // ---- Insert ----
+        fn lo_insert_table_name(op: &LogicalOperator) -> String;
+        /// Length of the statement's column map (0 when no explicit column list
+        /// was given, meaning the source columns are already in table order).
+        fn lo_insert_column_map_count(op: &LogicalOperator) -> usize;
+        /// The source-plan output column that provides table column `index`, or
+        /// `usize::MAX` (DuckDB's invalid index) when the statement's column
+        /// list omitted it.
+        fn lo_insert_column_map_entry(op: &LogicalOperator, index: usize) -> usize;
+        /// Whether an `ON CONFLICT` action other than erroring was requested.
+        fn lo_insert_has_on_conflict(op: &LogicalOperator) -> bool;
+        /// Whether the statement has a `RETURNING` clause.
+        fn lo_insert_return_chunk(op: &LogicalOperator) -> bool;
+
+        // ---- ExpressionGet (a VALUES list) ----
+        fn lo_expression_get_row_count(op: &LogicalOperator) -> usize;
+        fn lo_expression_get_column_count(op: &LogicalOperator) -> usize;
+        fn lo_expression_get_expr(op: &LogicalOperator, row: usize, column: usize) -> &Expression;
+
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> String;
         fn lo_set_value(op: &LogicalOperator) -> String;
@@ -265,6 +284,7 @@ pub mod ffi {
         // ---- Value: typed accessors (shared by constants and table-function
         // arguments). Read `value_type` first, then the matching accessor.
         fn value_type(v: &Value) -> u8;
+        fn value_is_null(v: &Value) -> bool;
         fn value_bool(v: &Value) -> bool;
         fn value_i8(v: &Value) -> i8;
         fn value_i16(v: &Value) -> i16;

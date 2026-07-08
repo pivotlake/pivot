@@ -11,18 +11,18 @@ use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
-    Aggregate as AggregateView, CreateTable as CreateTableView, Filter as FilterView,
-    Limit as LimitView, OrderBy as OrderByView, OrderKey, Projection as ProjectionView,
-    Reset as ResetView, Set as SetView, TableFunctionScan as TableFunctionScanView,
-    TableScan as TableScanView, TopN as TopNView,
+    Aggregate as AggregateView, CreateTable as CreateTableView, ExpressionGet as ExpressionGetView,
+    Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
+    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
+    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
 };
 
 use super::{BuildCtx, build_scan_columns};
 use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, Table};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
-    Aggregate, CreateTable, Error as OperatorError, Filter, Input, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN,
+    Aggregate, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
+    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::type_from_logical;
 
@@ -158,6 +158,51 @@ impl CreateTable {
             has_query: view.has_query(),
             constraint_count: view.constraint_count(),
         })
+    }
+}
+
+impl Insert {
+    pub(crate) fn from_handle(view: InsertView<'_>) -> Result<Insert, OperatorError> {
+        if view.returns_rows() {
+            return Err(OperatorError::Unsupported(
+                "INSERT ... RETURNING is not supported".to_string(),
+            ));
+        }
+        if view.has_on_conflict() {
+            return Err(OperatorError::Unsupported(
+                "INSERT ... ON CONFLICT is not supported".to_string(),
+            ));
+        }
+        // Every table column must be fed by the statement: an omitted column
+        // would take its default, which pivot doesn't support.
+        let column_map = view
+            .column_map()
+            .map(|source_column| {
+                source_column.ok_or_else(|| {
+                    OperatorError::Unsupported(
+                        "INSERT must provide a value for every table column (column defaults are not supported)"
+                            .to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Insert {
+            table: view.table_name(),
+            column_map,
+        })
+    }
+}
+
+impl Values {
+    pub(crate) fn from_handle(view: ExpressionGetView<'_>) -> Result<Values, OperatorError> {
+        let rows = (0..view.row_count())
+            .map(|row| {
+                (0..view.column_count())
+                    .map(|column| Expression::from_handle(view.expr(row, column)))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Values { rows })
     }
 }
 

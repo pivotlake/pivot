@@ -63,7 +63,7 @@ fn start_server_on(root: &str) -> u16 {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(bind, dispatch, catalog, vec![], 0, 4);
+            let server = Server::new(bind, dispatch, catalog, 0, 4);
             let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
         });
     });

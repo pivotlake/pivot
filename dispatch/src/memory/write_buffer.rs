@@ -51,19 +51,6 @@ impl WriteBuffer {
         memory_ctx().push_free_idx(self.slot_idx, true);
         mem::forget(self);
     }
-
-    /// Give up exclusive write access *without* returning the slot to the pool:
-    /// reset `used` to 0 and skip [`Drop`]'s pool push, leaving the slot resident
-    /// (still owned by whatever cache placed it). Used when an evictor `try_write`s
-    /// a slot it then decides to leave cached. The `Release` publishes the writes a
-    /// later reader's `try_read` Acquire observes.
-    pub fn release_in_place(self) {
-        let slot_idx = self.slot_idx;
-        mem::forget(self);
-        memory_ctx()
-            .ring()
-            .set_slot_used(slot_idx, 0, Ordering::Release);
-    }
 }
 
 unsafe impl Send for WriteBuffer {}

@@ -9,7 +9,7 @@
 //!
 //! Covered: store contract (round-trip `source`, one-level `list`, the
 //! `put_if_absent` CAS), and the table lifecycle end to end — `CREATE TABLE`,
-//! reopen, **appending a file** (ingest registration), and **compaction**
+//! reopen, **appending a file** (a writer's registration), and **compaction**
 //! (replacing files) — all over object storage.
 
 mod common;
@@ -136,7 +136,7 @@ mod bodies {
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }
 
-    /// Registering a new file (the ingest append) makes its rows visible to the
+    /// Registering a new file (a writer's append) makes its rows visible to the
     /// next bind, on top of the existing ones.
     pub fn append_registers_new_file(b: &Backend) {
         let d = dispatch_with_buffers(2, 32);

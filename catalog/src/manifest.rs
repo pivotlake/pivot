@@ -66,7 +66,7 @@ pub struct SortBounds {
 }
 
 /// One file in a table manifest: its store identity ([`FileRef`]) plus the
-/// optional partition tuple and sort-key bounds the partitioning/sorting ingest
+/// optional partition tuple and sort-key bounds a partitioning/sorting writer
 /// sink stamps on it. Both are `None` for files written without that metadata
 /// (an unpartitioned/unsorted table, or compaction output today).
 #[derive(Clone, Serialize, Deserialize)]

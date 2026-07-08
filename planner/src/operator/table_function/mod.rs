@@ -168,11 +168,3 @@ impl TableFunctionScan {
             .collect()
     }
 }
-
-/// Build an `InvalidTableFunctionArgument` error for `function`.
-pub(crate) fn invalid_argument(function: &str, message: String) -> Error {
-    Error::InvalidTableFunctionArgument {
-        function: function.to_string(),
-        message,
-    }
-}

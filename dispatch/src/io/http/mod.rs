@@ -49,7 +49,7 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A single remote range read: fetch `[offset, offset + len)` of `remote` into
 /// `dest` (a pointer into the pinned cache slot, kept alive by the issuing
-/// [`MissingExtent`](crate::memory::compressed_cache::MissingExtent)'s pin).
+/// [`MissingBlock`](crate::memory::compressed_cache::MissingBlock)'s pin).
 ///
 /// `Clone` so a transient transport failure can re-issue the same read on a
 /// fresh connection (see the engine's retry path); the clone aliases the same

@@ -31,10 +31,7 @@ pub mod read;
 pub use cell::{Cell, Numeric};
 pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, SumSlot};
 pub use distinct::Distinct;
-pub use fold::{
-    Count, F64Max, F64Min, F64Sum, Fold, Max, Min, StrMax, StrMin, Sum, U128Max, U128Min, U128Sum,
-    WideSum,
-};
+pub use fold::{Count, Fold, Max, Min, StrMax, StrMin, Sum, WideSum};
 pub use read::{IntRead, NoRead, Read, StrRead};
 
 /// Which per-group aggregate a value slot computes during consume — a pure
@@ -53,12 +50,27 @@ pub enum AggregationKind {
     Count,
     /// `SUM(col)`.
     Sum,
-    /// `MIN(col)`. The value's family (integer / float / string / wide) is decided
-    /// by the column type at bind, not by the kind — a `Utf8` column reads the
-    /// string extreme, a numeric column the numeric one.
+    /// `MIN(col)` over an integer column.
     Min,
-    /// `MAX(col)`. See [`Min`](AggregationKind::Min).
+    /// `MAX(col)` over an integer column.
     Max,
+    /// `MIN(col)` over a string (`Utf8`) column — its cell is an `ArenaKey` and
+    /// its fold ([`StrMin`]) compares the raw bytes through the value arena, not
+    /// the numeric path.
+    StrMin,
+    /// `MAX(col)` over a string (`Utf8`) column.
+    StrMax,
+}
+
+impl AggregationKind {
+    /// Whether this slot is a string extreme (`MIN`/`MAX` over a `Utf8` column),
+    /// whose cell is an [`ArenaKey`](super::ArenaKey). A value signature with any
+    /// such slot must use 128-bit (`i128`) cells and stays off the radix scatter
+    /// path (which would eagerly persist every row's string, winner or not).
+    #[inline(always)]
+    pub fn is_string_extreme(self) -> bool {
+        matches!(self, AggregationKind::StrMin | AggregationKind::StrMax)
+    }
 }
 
 /// One aggregate output slot: which aggregate, over which input column, and the
@@ -87,18 +99,6 @@ impl AggregationSlot {
             column,
             output_type,
         }
-    }
-
-    /// Whether this slot is a string extreme (`MIN`/`MAX` over a `Utf8` column),
-    /// whose cell is an [`ArenaKey`](super::ArenaKey). Read off the declared
-    /// `output_type` (`Utf8View`), since the `MIN`/`MAX` kind alone doesn't say — the
-    /// value family is decided by the column type. A signature with any such slot
-    /// must use 128-bit (`i128`) cells and stays off the radix scatter path (which
-    /// would eagerly persist every row's string, winner or not).
-    #[inline(always)]
-    pub fn is_string_extreme(&self) -> bool {
-        matches!(self.kind, AggregationKind::Min | AggregationKind::Max)
-            && self.output_type == DataType::Utf8View
     }
 }
 

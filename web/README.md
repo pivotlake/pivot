@@ -1,13 +1,12 @@
 # web
 
-The pivotdb web dashboard: a live data-flow view (ingest receivers → tables,
-with real throughput), ingest + compaction counters, system metrics
-(CPU / memory / disk), per-table metadata (columns, file placement), and a SQL
-console.
+The pivotdb web dashboard: a live view of the catalog's tables (row counts and
+insert rates), compaction counters, system metrics (CPU / memory / disk),
+per-table metadata (columns, file placement), and a SQL console.
 
 It is **served by `pivotdb-server` itself** - the dashboard runs in the same
-process as the engine, so it reads live state directly (the catalog, the ingest
-sinks' and compacter's counters, the process's own CPU/memory) and runs the
+process as the engine, so it reads live state directly (the catalog, the
+compacter's counters, the process's own CPU/memory) and runs the
 console's SQL on the same planner + dispatch pool. There is no separate backend.
 
 This directory holds only the **frontend**: a React + TypeScript app (Vite)
@@ -54,7 +53,7 @@ Edit React under `frontend/src` and see changes instantly at
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /api/overview` | Catalog (tables, columns, file placement) + live ingest & compaction counters + CPU/mem/disk. |
+| `GET /api/overview` | Catalog (tables, columns, file placement) + live compaction counters + CPU/mem/disk. |
 | `POST /api/query` | Run SQL in-process; returns columns (with types) and rows. |
 | `GET /api/health` | Liveness. |
 | everything else | The frontend (SPA fallback to `index.html`). |

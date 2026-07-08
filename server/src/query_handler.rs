@@ -100,7 +100,8 @@ fn with_planner<R>(
 /// Run `sql` to completion in-process and return its result batches - the path
 /// the HTTP dashboard uses instead of the Postgres wire. Plans on the blocking
 /// pool (the thread-local DuckDB planner), then compiles and runs on the
-/// dispatch workers. A `SET`/`RESET` is a session no-op here and yields nothing.
+/// dispatch workers. A `SET`/`RESET` is a session no-op here and yields nothing;
+/// an `INSERT` runs to durable commit and yields its one-row count batch.
 ///
 /// Uses [`RecordBatchOperatorSpec::collect`](dispatch::RecordBatchOperatorSpec::collect), which appends a `CopyOut` stage:
 /// each batch's ring-backed buffers are deep-copied to plain heap allocations on
@@ -159,6 +160,8 @@ enum Error {
     WorkerPanic(JoinError),
     #[error("waiter thread panicked: {0}")]
     PlannerPanic(JoinError),
+    #[error("INSERT finished without reporting a row count; whether it committed is unknown")]
+    InsertCountMissing,
 }
 
 impl Error {
@@ -261,13 +264,15 @@ impl PivotQueryHandler {
                 })
                 .await
                 .map_err(Error::PlannerPanic)??;
-                // Cache SELECTs; treat anything else (DDL/DML/…) as a cache
-                // flush — it may invalidate the schema cached plans were built
-                // against — and don't cache it.
+                // Cache SELECTs. INSERT and SET change data or session state,
+                // not the schema cached plans were built against (a compiled
+                // plan re-resolves its tables' files), so they are merely not
+                // cached; anything else (DDL, or any operator variant added
+                // later) flushes the cache since it may change that schema.
                 let mut cache = self.plan_cache.lock().unwrap();
                 if plan_is_cacheable(&plan) {
                     cache.insert(query.clone(), plan.clone());
-                } else {
+                } else if plan.as_insert().is_none() && plan.as_set_variable().is_none() {
                     cache.clear();
                 }
                 plan
@@ -288,7 +293,7 @@ impl PivotQueryHandler {
         // When the session ran `SET perf = 1`, start a `perf record` scoped to the
         // worker threads and mark this query's dataflows profiled. Marking them
         // makes the workers run *only* this dataflow for its duration (other
-        // queries / ingest on the pool pause), so the capture is just this
+        // queries / inserts on the pool pause), so the capture is just this
         // dataflow, and exclusive mode lifts as the dataflows finish. `start`
         // runs on a blocking thread (it sleeps waiting for perf to attach); the
         // guard is stopped off the reactor after drain (its `child.wait()` blocks
@@ -316,8 +321,11 @@ impl PivotQueryHandler {
         // planner thread-local. `execute_with_stats` turns on the dataflow's
         // IO/CPU tally only when the client asked for it.
         let started = Instant::now();
-        let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-            let rows = plan.compile(&dispatcher)?.map(|| |b| PGRowBatch::from(b));
+        let compiled_plan = plan.clone();
+        let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<PGRowBatch>> {
+            let rows = compiled_plan
+                .compile(&dispatcher)?
+                .map(|| |b| PGRowBatch::from(b));
             Ok(if collect_stats {
                 rows.execute_with_stats()
             } else {
@@ -347,6 +355,33 @@ impl PivotQueryHandler {
             let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
         }
 
+        let stats = QueryStats {
+            plan: plan_time,
+            compile: compile_time,
+            exec: exec_time,
+            flow,
+        };
+
+        // An `INSERT` ran through the very same route, but its dataflow emitted
+        // one single-row count batch (see `Table::insert`) rather than client
+        // rows: read the count back and answer with the tag instead. The cell
+        // is in `DataRow`'s text wire form, an `i32` byte length followed by
+        // the digits. A missing count row is an error, not a panic: it can
+        // genuinely happen when the worker pool dies mid-insert.
+        if plan.as_insert().is_some() {
+            let row = batches
+                .iter()
+                .find_map(|batch| batch.rows.first())
+                .ok_or(Error::InsertCountMissing)?;
+            let (len, digits) = row.data.split_at(4);
+            let len = i32::from_be_bytes(len.try_into().unwrap()) as usize;
+            let rows = std::str::from_utf8(&digits[..len])
+                .expect("the INSERT count cell is text")
+                .parse()
+                .expect("the INSERT count cell is an integer");
+            return Ok(Outcome::Insert { rows, stats });
+        }
+
         let fields = batches
             .first()
             .map_or(Arc::new(vec![]), |b| b.fields.clone());
@@ -354,15 +389,7 @@ impl PivotQueryHandler {
             fields,
             stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
         ));
-        Ok(Outcome::Query(
-            response,
-            QueryStats {
-                plan: plan_time,
-                compile: compile_time,
-                exec: exec_time,
-                flow,
-            },
-        ))
+        Ok(Outcome::Query(response, stats))
     }
 }
 
@@ -373,6 +400,9 @@ enum Outcome {
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
     /// for `RESET`; the server decides which names actually mean anything.
     Set { name: String, value: Option<String> },
+    /// An `INSERT`, already run to durable commit; `rows` were written. Ran
+    /// through the same dataflow route as a query, so it has stats too.
+    Insert { rows: u64, stats: QueryStats },
 }
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
@@ -483,23 +513,28 @@ impl SimpleQueryHandler for PivotQueryHandler {
                 e.into_pgwire()
             })?;
 
-        let res = match outcome {
-            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
-            Outcome::Query(res, stats) => {
-                // Send the breakdown as an INFO notice before the rows.
-                if with_stats {
-                    let notice = NoticeResponse::from(ErrorInfo::new(
-                        "INFO".to_string(),
-                        "00000".to_string(),
-                        stats.summary(),
-                    ));
-                    client
-                        .send(PgWireBackendMessage::NoticeResponse(notice))
-                        .await?;
-                }
-                res
-            }
+        let (res, stats) = match outcome {
+            Outcome::Set { name, value } => (apply_set(client, &name, value.as_deref()), None),
+            // The Postgres tag is `INSERT <oid> <rows>`; the oid slot is always
+            // 0 for modern servers.
+            Outcome::Insert { rows, stats } => (
+                Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows as usize)),
+                Some(stats),
+            ),
+            Outcome::Query(res, stats) => (res, Some(stats)),
         };
+
+        // Send the breakdown as an INFO notice before the result.
+        if with_stats && let Some(stats) = stats {
+            let notice = NoticeResponse::from(ErrorInfo::new(
+                "INFO".to_string(),
+                "00000".to_string(),
+                stats.summary(),
+            ));
+            client
+                .send(PgWireBackendMessage::NoticeResponse(notice))
+                .await?;
+        }
 
         info!(sql = %query, "query succeeded");
         Ok(vec![res])

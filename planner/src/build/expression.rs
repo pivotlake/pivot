@@ -23,7 +23,7 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
+    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Ref,
     RegexpJitReplace, RegexpReplace, TemporalConvert,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
@@ -168,7 +168,7 @@ impl AggregateFunc {
         let return_type = type_from_logical(view.return_type())?;
         let params = view
             .children()
-            .map(Expression::from_handle)
+            .map(build_aggregate_param)
             .collect::<Result<Vec<_>, _>>()?;
 
         // DISTINCT is only supported for `COUNT` so far; reject `SUM(DISTINCT)`
@@ -219,6 +219,16 @@ impl AggregateFunc {
     }
 }
 
+/// Build an aggregate's argument, stripping any leading cast(s) DuckDB inserted:
+/// the reducers fold the raw input column (an `AVG`/`SUM` keeps its narrow
+/// accumulator), so the cast would only force a widening copy.
+fn build_aggregate_param(mut e: Expr<'_>) -> Result<Expression, Error> {
+    while let DuckExpression::Cast(cast) = e.expression() {
+        e = cast.child();
+    }
+    Expression::from_handle(e)
+}
+
 /// Build a single-argument numeric aggregate's payload, validating the arity.
 fn numeric_aggregate(
     params: Vec<Expression>,
@@ -243,8 +253,6 @@ impl Function {
         let name = func.name();
         match name.as_str() {
             "contains" => Ok(Function::Contains(Contains::from_handle(func)?)),
-            // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`.
-            "prefix" => Ok(Function::Prefix(Prefix::from_handle(func)?)),
             // `date`/`timestamp` ± `INTERVAL` carries an INTERVAL constant operand;
             // plain numeric `+`/`-` does not and stays `Arithmetic`.
             "+" | "-" => match func.children().position(|p| {
@@ -291,16 +299,6 @@ impl Contains {
         Ok(Contains {
             needle: Box::new(Expression::from_handle(params[1])?),
             haystack: Box::new(Expression::from_handle(params[0])?),
-        })
-    }
-}
-
-impl Prefix {
-    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<Prefix, Error> {
-        let params = function_args(func, 2)?;
-        Ok(Prefix {
-            haystack: Box::new(Expression::from_handle(params[0])?),
-            prefix: Box::new(Expression::from_handle(params[1])?),
         })
     }
 }

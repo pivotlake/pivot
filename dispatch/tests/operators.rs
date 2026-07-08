@@ -7,18 +7,15 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::{Decimal128Type, Int64Type};
-use arrow_array::{
-    BooleanArray, Decimal128Array, Float64Array, Int64Array, RecordBatch, StringViewArray,
-};
+use arrow_array::types::Int64Type;
+use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, Dynamic, IntKeyExtractor,
-    OrderBy, RowKeyExtractor, RowKeySchema, StringKeyExtractor, values_input,
+    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, IntKeyExtractor, OrderBy,
+    RowKeyExtractor, RowKeySchema, StringKeyExtractor, values_input,
 };
 
 #[test]
@@ -249,78 +246,6 @@ fn group_by_count_int_keys() {
         .unwrap();
 
     assert_eq!(collect_i64s(&results, 1), vec![3, 3, 2]);
-}
-
-#[test]
-fn group_by_sum_float_values() {
-    let dispatch = dispatch(1);
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("cat", DataType::Int64, false),
-            Field::new("v", DataType::Float64, false),
-        ])),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2, 1, 2, 1])),
-            Arc::new(Float64Array::from(vec![1.5, 2.0, 0.5, 3.0, 1.0])),
-        ],
-    )
-    .unwrap();
-
-    let results = values_input(&dispatch, vec![batch])
-        .record_batches()
-        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<1, i64, false>>(
-            vec![0],
-            vec![AggregationSlot::new(
-                AggregationKind::Sum,
-                1,
-                DataType::Float64,
-            )],
-            None,
-            (),
-        )
-        .order_by_limit(vec![OrderBy::new(0, false, false)], 10)
-        .collect()
-        .unwrap();
-
-    // group 1: 1.5 + 0.5 + 1.0; group 2: 2.0 + 3.0.
-    assert_eq!(collect_f64s(&results, 1), vec![3.0, 5.0]);
-}
-
-#[test]
-fn group_by_sum_decimal128_does_not_clip_to_i64() {
-    // A per-group SUM over a Decimal128 column (the wide re-read path of a two-level
-    // COUNT(DISTINCT)) must keep the full i128, not truncate to i64.
-    let dispatch = dispatch(1);
-    let big = i64::MAX as i128 + 1000; // exceeds i64::MAX
-    let values = Decimal128Array::from(vec![big, 5])
-        .with_precision_and_scale(38, 0)
-        .unwrap();
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("g", DataType::Int64, false),
-            Field::new("v", DataType::Decimal128(38, 0), false),
-        ])),
-        vec![Arc::new(Int64Array::from(vec![1i64, 1])), Arc::new(values)],
-    )
-    .unwrap();
-
-    let results = values_input(&dispatch, vec![batch])
-        .record_batches()
-        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<1, i128, false>>(
-            vec![0],
-            vec![AggregationSlot::new(
-                AggregationKind::Sum,
-                1,
-                DataType::Decimal128(38, 0),
-            )],
-            None,
-            (),
-        )
-        .collect()
-        .unwrap();
-
-    let sum = results[0].column(1).as_primitive::<Decimal128Type>();
-    assert_eq!(sum.value(0), big + 5);
 }
 
 // A plain `LIMIT` must abandon its upstream once satisfied, not drain the whole

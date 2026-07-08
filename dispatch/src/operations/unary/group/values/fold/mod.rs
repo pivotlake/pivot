@@ -22,17 +22,13 @@
 
 mod count;
 mod extreme;
-mod f64;
 mod string;
 mod sum;
-mod u128;
 
 pub use count::Count;
 pub use extreme::{Max, Min};
-pub use f64::{F64Max, F64Min, F64Sum};
 pub use string::{StrMax, StrMin};
 pub use sum::{Sum, WideSum};
-pub use u128::{U128Max, U128Min, U128Sum};
 
 use super::cell::Cell;
 use crate::arrays::SlabColumn;

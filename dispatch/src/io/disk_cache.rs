@@ -12,7 +12,7 @@
 //! ## Where it plugs in
 //!
 //! Entirely inside [`IORequester`](crate::io::IORequester): when a remote
-//! [`MissingExtent`](crate::memory::compressed_cache::MissingExtent) needs filling, the
+//! [`MissingBlock`](crate::memory::compressed_cache::MissingBlock) needs filling, the
 //! requester asks the disk cache which sub-ranges are already on disk
 //! ([`Object::split_into_segments`]). Present sub-ranges are read from the cache file
 //! (a plain filesystem read into the same pinned slot); absent ones are fetched
@@ -166,7 +166,7 @@ impl Object {
 
     /// Split `[file_offset, file_offset + len)` into maximal present/absent runs
     /// against the resident bitmap. `len` and `file_offset` are `BLOCK_SIZE`
-    /// multiples (guaranteed by the caller - a `MissingExtent` is always block
+    /// multiples (guaranteed by the caller - a `MissingBlock` is always block
     /// aligned).
     pub fn split_into_segments(&self, file_offset: usize, len: usize) -> Vec<Segment> {
         debug_assert_eq!(file_offset % BLOCK_SIZE, 0);

@@ -57,6 +57,8 @@ pub enum Error {
     IORequester(#[from] crate::io::IORequesterError),
     #[error("{0}")]
     Panic(String),
+    #[error("the worker pool shut down while the dataflow was running")]
+    WorkerPoolShutDown,
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;

@@ -5,7 +5,7 @@
 //! [`SERIES_CHUNK_ROWS`] batch each time it is polled, so a huge range never
 //! materializes at once and a downstream `LIMIT`/aggregate stops it early.
 
-use super::{TableFunction, TableFunctionSignature, invalid_argument};
+use super::{TableFunction, TableFunctionSignature};
 use crate::catalog::{Column, QueryContext};
 use crate::compile::Error;
 use crate::types::Type;
@@ -18,9 +18,22 @@ use dispatch::{
 use duckdb_planner::ScalarValue;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use thiserror::Error as ThisError;
 
 /// Rows per batch the series source emits each time it is polled.
 const SERIES_CHUNK_ROWS: usize = 8192;
+
+/// Why a `range`/`generate_series` call cannot compile. Wrapped in
+/// [`Error::TableFunction`] with the function's name.
+#[derive(Debug, ThisError)]
+enum SeriesError {
+    #[error("expected 1 to 3 arguments, got {0}")]
+    WrongArgumentCount(usize),
+    #[error("step must not be zero")]
+    ZeroStep,
+    #[error("expected an integer argument, got '{0}'")]
+    NotAnInteger(String),
+}
 
 /// `range`/`generate_series`. `inclusive` is the only difference: `range` stops
 /// before `stop`, `generate_series` includes it.
@@ -75,18 +88,10 @@ impl TableFunction for SeriesTableFunction {
             [stop] => (0, *stop, 1),
             [start, stop] => (*start, *stop, 1),
             [start, stop, step] => (*start, *stop, *step),
-            _ => {
-                return Err(invalid_argument(
-                    self.name,
-                    format!("expected 1 to 3 arguments, got {}", nums.len()),
-                ));
-            }
+            _ => return Err(self.error(SeriesError::WrongArgumentCount(nums.len()))),
         };
         if step == 0 {
-            return Err(invalid_argument(
-                self.name,
-                "step must not be zero".to_string(),
-            ));
+            return Err(self.error(SeriesError::ZeroStep));
         }
 
         // The column is named after the function so `SELECT *` reports it as
@@ -119,12 +124,18 @@ impl SeriesTableFunction {
         args.iter()
             .map(|arg| match arg {
                 ScalarValue::Int64(v) => Ok(*v),
-                other => Err(invalid_argument(
-                    self.name,
-                    format!("expected an integer, got '{other}'"),
-                )),
+                other => Err(self.error(SeriesError::NotAnInteger(other.to_string()))),
             })
             .collect()
+    }
+
+    /// Wrap one of this function's own errors with its name for the generic
+    /// compile error.
+    fn error(&self, source: SeriesError) -> Error {
+        Error::TableFunction {
+            function: self.name.to_string(),
+            source: Box::new(source),
+        }
     }
 }
 

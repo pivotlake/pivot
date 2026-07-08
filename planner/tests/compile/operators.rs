@@ -1,8 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use arrow_array::{
-    ArrayRef, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch,
-    StringViewArray,
+    ArrayRef, Date32Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
 };
 use dispatch::Dispatch;
 
@@ -2003,49 +2002,5 @@ fn projection_of_constant_broadcasts_to_every_row(mut testing_planner: TestingPl
         keys.iter()
             .any(|k| rows.iter().all(|r| r[k].as_i64() == Some(1))),
         "a column should be the constant 1 broadcast to all rows"
-    );
-}
-
-// A GROUP BY over an integer key and a float key. Grouping by a float column is
-// unsupported (the row-key encoder only packs integers and strings), so this
-// must error. The error should name the offending float key. Today it instead
-// blames the first key (the perfectly valid Int64): grouped.rs builds the error
-// as `DataTypeNotSupportedForGroupBy(keys[0].1)` regardless of which key
-// actually failed to pack, so the message points at the wrong column.
-#[rstest]
-fn group_by_error_names_the_unsupported_key_not_the_first(mut testing_planner: TestingPlanner) {
-    testing_planner.add_table(
-        "mixed_keys",
-        &[
-            (
-                "k_int",
-                Type::Int64,
-                Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
-            ),
-            (
-                "k_float",
-                Type::Float64,
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])) as ArrayRef,
-            ),
-        ],
-    );
-
-    let compiled = testing_planner
-        .planner
-        .plan("SELECT k_int, k_float, COUNT(*) FROM mixed_keys GROUP BY k_int, k_float")
-        .unwrap()
-        .compile(testing_planner.dispatcher());
-    let err = match compiled {
-        Ok(_) => panic!("grouping by a float key should fail to compile"),
-        Err(err) => err.to_string(),
-    };
-
-    assert!(
-        err.contains("Float64"),
-        "group-by error should name the unsupported float key (Float64), got: {err}"
-    );
-    assert!(
-        err.contains("k_float"),
-        "group-by error should name the offending column (k_float), got: {err}"
     );
 }

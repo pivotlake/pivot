@@ -7,13 +7,10 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use catalog::ParquetCatalog;
 use clap::Parser;
-use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, Dispatch};
-use ingest::{IngestConfig, OtelConfig, Signal};
 use server::{Error, Server};
 use tracing::{error, info};
 
@@ -50,34 +47,11 @@ struct Args {
     #[arg(long, default_value_t = 65536, value_name = "N")]
     disk_cache_max_objects: usize,
 
-    /// Start an OTLP/gRPC ingest receiver with the built-in default column
-    /// layout. Repeatable — pass `--otel` once per receiver (each needs a
-    /// distinct `addr` and output dirs).
-    ///
-    /// The value is a comma-separated `key=value` spec. Keys: `addr`, `logs`,
-    /// `traces`, `metrics` (destination per signal — at least one enables the
-    /// receiver), `flush_rows`, `flush_secs`. A destination is a local dir or an
-    /// object-store URL (`gs://bucket/prefix`, `s3://bucket/prefix`; object
-    /// storage is write-only — read it elsewhere). Examples:
-    ///
-    ///   --otel 'addr=0.0.0.0:4317,logs=./otel/logs,traces=./otel/traces'
-    ///   --otel 'addr=0.0.0.0:4318,logs=gs://my-bucket/otel/logs'
-    ///
-    /// To choose the columns (and where each comes from), use `--otel-config`.
-    #[arg(long = "otel", value_name = "SPEC")]
-    otel: Vec<OtelSpec>,
-
-    /// Start an OTLP/gRPC ingest receiver from a TOML file that defines its
-    /// signals and per-column mapping. Repeatable. See `ingest::otel::config`
-    /// for the file format.
-    #[arg(long = "otel-config", value_name = "PATH")]
-    otel_config: Vec<OtelFileSpec>,
-
     /// Run the bundled compacter (OFF by default). The compacter merges and
     /// then deletes a table's small Parquet files, so it mutates the catalog;
     /// leave it off for a read-only server or an external reader, and only the
-    /// process that owns the data (e.g. an ingest sink) should enable it. The
-    /// `--compact-*` tuning flags require this.
+    /// process that owns the data should enable it. The `--compact-*` tuning
+    /// flags require this.
     #[arg(long)]
     compact: bool,
 
@@ -85,7 +59,7 @@ struct Args {
     /// (CPU on the dispatch pool), once they amount to it. Requires `--compact`.
     #[arg(
         long,
-        default_value_t = ingest::DEFAULT_COMPACT_BYTES,
+        default_value_t = compact::DEFAULT_COMPACT_BYTES,
         requires = "compact",
         value_name = "BYTES"
     )]
@@ -97,116 +71,16 @@ struct Args {
     /// frequent sub-target merges. Requires `--compact`.
     #[arg(
         long,
-        default_value_t = ingest::DEFAULT_MIN_FILES_TO_MERGE,
+        default_value_t = compact::DEFAULT_MIN_FILES_TO_MERGE,
         requires = "compact",
         value_name = "N"
     )]
     compact_min_files: usize,
 
-    /// Also serve the bundled web dashboard (data-flow graph, live ingest +
-    /// compaction stats, system metrics, SQL console) on this address. Omit to
-    /// disable.
+    /// Also serve the bundled web dashboard (table graph, live compaction
+    /// stats, system metrics, SQL console) on this address. Omit to disable.
     #[arg(long, value_name = "ADDR")]
     http_bind: Option<SocketAddr>,
-}
-
-impl Args {
-    /// Translate the ingest flags into the configs the server starts. Returns
-    /// an empty vec when no ingest is requested.
-    fn ingests(&self) -> Vec<IngestConfig> {
-        let inline = self.otel.iter().map(|spec| spec.0.clone());
-        let from_file = self.otel_config.iter().map(|spec| spec.0.clone());
-        inline.chain(from_file).map(IngestConfig::Otel).collect()
-    }
-}
-
-/// One `--otel-config` receiver, parsed from a TOML file path.
-#[derive(Clone, Debug)]
-struct OtelFileSpec(OtelConfig);
-
-impl std::str::FromStr for OtelFileSpec {
-    type Err = String;
-
-    fn from_str(path: &str) -> Result<Self, Self::Err> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("reading `{path}`: {e}"))?;
-        OtelConfig::from_toml(&text)
-            .map(OtelFileSpec)
-            .map_err(|e| format!("`{path}`: {e}"))
-    }
-}
-
-/// One `--otel` receiver, parsed from a `key=value,...` spec string.
-#[derive(Clone, Debug)]
-struct OtelSpec(OtelConfig);
-
-impl std::str::FromStr for OtelSpec {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut addr: Option<SocketAddr> = None;
-        let mut logs = false;
-        let mut traces = false;
-        let mut metrics = false;
-        let mut flush_rows = None;
-        let mut flush_secs = None;
-
-        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-            let (key, value) = match part.split_once('=') {
-                Some((k, v)) => (k.trim(), Some(v.trim())),
-                None => (part, None),
-            };
-            match key {
-                "addr" => {
-                    let v = value.ok_or("`addr` expects `addr=<host:port>`")?;
-                    addr = Some(v.parse().map_err(|e| format!("addr `{v}`: {e}"))?);
-                }
-                "flush_rows" => {
-                    let v = value.ok_or("`flush_rows` expects `flush_rows=<n>`")?;
-                    flush_rows = Some(v.parse().map_err(|e| format!("flush_rows `{v}`: {e}"))?);
-                }
-                "flush_secs" => {
-                    let v = value.ok_or("`flush_secs` expects `flush_secs=<n>`")?;
-                    flush_secs = Some(v.parse().map_err(|e| format!("flush_secs `{v}`: {e}"))?);
-                }
-                // Signals are flags: each appends to its `otel_<signal>` table
-                // (which must already exist). Custom tables/columns go through
-                // `--otel-config`.
-                "logs" if value.is_none() => logs = true,
-                "traces" if value.is_none() => traces = true,
-                "metrics" if value.is_none() => metrics = true,
-                "logs" | "traces" | "metrics" => {
-                    return Err(format!(
-                        "`{key}` is a flag (it appends to the `otel_{key}` table); use --otel-config for a custom table"
-                    ));
-                }
-                other => return Err(format!("unknown key `{other}` in --otel spec")),
-            }
-        }
-
-        let addr = match addr {
-            Some(a) => a,
-            None => ingest::DEFAULT_OTLP_ADDR.parse().unwrap(),
-        };
-        let mut cfg = OtelConfig::new(addr);
-        if let Some(rows) = flush_rows {
-            cfg.flush_rows = rows;
-        }
-        if let Some(secs) = flush_secs {
-            cfg.flush_interval = Duration::from_secs(secs);
-        }
-        // The inline spec uses the built-in default column mapping and table for
-        // each enabled signal; `--otel-config` is the route to custom columns.
-        for (signal, enabled) in [
-            (Signal::Logs, logs),
-            (Signal::Traces, traces),
-            (Signal::Metrics, metrics),
-        ] {
-            if enabled {
-                cfg.enable_default(signal).map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(OtelSpec(cfg))
-    }
 }
 
 fn init_tracing() {
@@ -264,11 +138,7 @@ fn main() -> Result<(), Error> {
     });
     info!(workers, "initialising dispatch");
     let disk_cache = build_disk_cache(&args);
-    let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
-    let pool_bytes = get_total_memory() * memory_pct / 100;
-    let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
-
-    let ingests = args.ingests();
+    let dispatch = Dispatch::spin_up(workers, get_total_memory() / 2 / BUFFER_SIZE, disk_cache);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -296,7 +166,6 @@ fn main() -> Result<(), Error> {
             args.bind,
             dispatch,
             catalog,
-            ingests,
             compact_bytes,
             args.compact_min_files,
         );

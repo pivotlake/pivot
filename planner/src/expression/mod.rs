@@ -26,7 +26,6 @@ mod in_list;
 mod interval;
 mod length;
 mod not;
-mod prefix;
 mod reference;
 mod regexp;
 mod regexp_jit;
@@ -48,7 +47,6 @@ pub use in_list::InList;
 pub use interval::IntervalArithmetic;
 pub use length::Length;
 pub use not::Not;
-pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::RegexpReplace;
 pub use regexp_jit::RegexpJitReplace;
@@ -127,8 +125,6 @@ impl Expression {
                 arrow_schema::DataType::Int16 => Ok(Type::Int16),
                 arrow_schema::DataType::Int32 => Ok(Type::Int32),
                 arrow_schema::DataType::Int64 => Ok(Type::Int64),
-                arrow_schema::DataType::Float32 => Ok(Type::Float32),
-                arrow_schema::DataType::Float64 => Ok(Type::Float64),
                 _ => Err(compile::Error::IndeterminateResultType(self.clone())),
             },
             // A CASE's branches are unified to one type by DuckDB, so the ELSE

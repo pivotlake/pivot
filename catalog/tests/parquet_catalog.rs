@@ -352,7 +352,7 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 }
 
 /// Append the file at `path` to table `name` through a cloned-out handle — the
-/// table-level API a writer (ingest) uses: it writes the bytes into the table's
+/// table-level API an external writer uses: it writes the bytes into the table's
 /// location and CAS-commits the file. The catalog's own copy is not touched (a
 /// later `resolve` reconciles it). Recorded by its location-relative name.
 fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
@@ -511,7 +511,7 @@ fn append_data_file_is_idempotent_per_path() {
     assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 4);
 }
 
-/// No table yet (ingest runs before `CREATE TABLE`): there is no handle to
+/// No table yet (a writer starts before `CREATE TABLE`): there is no handle to
 /// append against.
 #[test]
 fn table_handle_for_a_missing_table_is_none() {

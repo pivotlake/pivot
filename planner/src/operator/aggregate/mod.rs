@@ -102,21 +102,6 @@ impl Aggregate {
             return self.compile_global_distinct(input, a);
         }
 
-        // Reject any group key whose type no extractor can encode, naming the
-        // offending column so the error points at the right key rather than the
-        // first one. Every group key is a plain column reference here (computed
-        // keys were materialised into columns), so the source name is to hand.
-        for group in &self.groups {
-            if let Expression::Ref(r) = group
-                && !is_groupable_key_type(&r.return_type)
-            {
-                return Err(Error::DataTypeNotSupportedForGroupBy {
-                    column: r.name.clone(),
-                    data_type: r.return_type.clone(),
-                });
-            }
-        }
-
         // Aggregates compute on the int a temporal column stores (a DATE is Int32
         // days, a TIMESTAMP is Int64 seconds), so reinterpret any temporal value
         // column to that int before the readers see it, and restore the temporal
@@ -223,13 +208,21 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                 AggregateFunc::Count(a) => (AggregationKind::Count, a.column().column_idx),
                 AggregateFunc::Sum(a) => (AggregationKind::Sum, a.column().column_idx),
                 AggregateFunc::Min(a) => (
-                    extreme_kind(&a.column().return_type, AggregationKind::Min)
-                        .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
+                    extreme_kind(
+                        &a.column().return_type,
+                        AggregationKind::StrMin,
+                        AggregationKind::Min,
+                    )
+                    .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
                     a.column().column_idx,
                 ),
                 AggregateFunc::Max(a) => (
-                    extreme_kind(&a.column().return_type, AggregationKind::Max)
-                        .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
+                    extreme_kind(
+                        &a.column().return_type,
+                        AggregationKind::StrMax,
+                        AggregationKind::Max,
+                    )
+                    .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
                     a.column().column_idx,
                 ),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
@@ -243,31 +236,32 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
         .collect()
 }
 
-/// Validate that a column of type `ty` can be a `MIN`/`MAX` argument, returning the
-/// `MIN`/`MAX` `kind` if so. The value family (string / integer / float) is chosen
-/// by the column type at bind, not encoded in the kind: a `Utf8` column folds the
-/// byte extreme through the value arena, an integer/temporal one the numeric extreme
-/// (`Date`/`Timestamp` seen as the int they store, after
-/// [`Aggregate::int_ify_temporal_values`]), a float one in `f64`. `None` for any
-/// other type, so the caller reports a clean `UnsupportedAggregateExpression` rather
-/// than a worker panic in the reader.
-fn extreme_kind(ty: &Type, kind: AggregationKind) -> Option<AggregationKind> {
+/// The MIN/MAX kind for a column of type `ty`: the byte-wise `string` extreme for
+/// a `Utf8` column (folded through the value container's arena path), the
+/// `numeric` extreme for the integer widths the executor can read
+/// (`Int16`/`Int32`/`Int64`) and for `Date`/`Timestamp` (which the reader sees as
+/// the int they store, after [`Aggregate::int_ify_temporal_values`]). `None` for
+/// any other type, so the caller reports a clean `UnsupportedAggregateExpression`
+/// rather than a worker panic in the reader.
+fn extreme_kind(
+    ty: &Type,
+    string: AggregationKind,
+    numeric: AggregationKind,
+) -> Option<AggregationKind> {
     match ty {
+        Type::Utf8 => Some(string),
         // UInt8/16/32 fold losslessly through the reader's i64 accumulator;
         // UInt64 is excluded (it would wrap above i64::MAX) so it reports a clean
         // unsupported error rather than a silently wrong extreme.
-        Type::Utf8
-        | Type::Int8
+        Type::Int8
         | Type::Int16
         | Type::Int32
         | Type::Int64
         | Type::UInt8
         | Type::UInt16
         | Type::UInt32
-        | Type::Float32
-        | Type::Float64
         | Type::Date
-        | Type::Timestamp => Some(kind),
+        | Type::Timestamp => Some(numeric),
         _ => None,
     }
 }
@@ -296,17 +290,17 @@ fn aggregate_value_temporal(e: &Expression) -> Option<DataType> {
 /// Map group-key types to the arrow types the [`RowKeyExtractor`](dispatch::RowKeyExtractor)
 /// encodes, in key order. Shared by the general grouped path
 /// ([`grouped`]) and the `COUNT(DISTINCT)` two-level lowering
-/// ([`grouped_distinct`]). Returns `Err` with the first key type the row
-/// encoding doesn't support, so the caller can name the offending key rather
-/// than panicking in `RowKeySchema::new`.
+/// ([`grouped_distinct`]). Returns `None` if any key has a
+/// type the row encoding doesn't support, so the caller reports it unsupported
+/// rather than panicking in `RowKeySchema::new`.
 pub(super) fn row_key_schema<'a>(
     types: impl IntoIterator<Item = &'a Type>,
-) -> Result<RowKeySchema, Type> {
+) -> Option<RowKeySchema> {
     let arrow = types
         .into_iter()
-        .map(|t| row_key_arrow_type(t).ok_or_else(|| t.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(RowKeySchema::new(arrow))
+        .map(row_key_arrow_type)
+        .collect::<Option<Vec<_>>>()?;
+    Some(RowKeySchema::new(arrow))
 }
 
 /// The arrow type the row encoder uses for one group-key column, or `None` for a
@@ -324,15 +318,6 @@ fn row_key_arrow_type(t: &Type) -> Option<DataType> {
     let dt = crate::types::physical_arrow_type(t);
     let dt = temporal_to_int(&dt).unwrap_or(dt);
     (dt.is_integer() || dt == DataType::Utf8View).then_some(dt)
-}
-
-/// Whether any key extractor can group on this type. The dedicated single/pair/
-/// int-string extractors handle exactly the integer widths and `Utf8`; every
-/// other groupable type (`Date`/`Timestamp`) rides the row encoder. A type this
-/// rejects (`Float`/`Boolean`/`Decimal`/`Int128`) has no grouping path at all,
-/// so the caller can reject it up front and name the offending column.
-pub(super) fn is_groupable_key_type(t: &Type) -> bool {
-    row_key_arrow_type(t).is_some()
 }
 
 /// The accumulator-width rule shared by the global and grouped paths: `i128`

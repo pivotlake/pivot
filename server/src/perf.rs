@@ -4,10 +4,10 @@
 //! `PIVOT_PERF_DIR` set, each query spawns its own `perf record` scoped to the
 //! dispatch worker threads (`-t <tids>`). The query's dataflows are marked
 //! profiled, which makes the workers run *only* that dataflow for its duration
-//! (other queries and ingest encode on the pool pause; see
+//! (other queries and insert encodes on the pool pause; see
 //! [`dispatch::DataFlowDispatcher::with_profiling`]). So the recording captures
 //! just the dataflow under study: nothing else runs on the worker threads, and
-//! non-worker threads (ingest receive/decode) aren't recorded at all. One fresh
+//! non-worker threads aren't recorded at all. One fresh
 //! report per query lands in the configured dir.
 //!
 //! Without the `perf` feature this module is not compiled, `libc` is not pulled

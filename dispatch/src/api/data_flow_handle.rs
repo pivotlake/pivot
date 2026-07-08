@@ -72,22 +72,14 @@ impl<T> DataFlowHandle<T> {
         // Drain to channel close (every worker has dropped its sender, finished
         // or cancelled) so all stats have been reported before we fold them. Keep
         // the first error rather than returning on it, so a failed query's IO is
-        // still tallied.
+        // still tallied. The iterator itself surfaces an error queued by a
+        // worker that failed without producing an item (a panic, a shutdown).
         for item in &mut self {
             match item {
                 Ok(value) => items.push(value),
                 Err(e) if error.is_none() => error = Some(e),
                 Err(_) => {}
             }
-        }
-        // A worker that panicked (or otherwise failed without queueing an `Err`
-        // item) reports on the separate error channel before dropping its
-        // sender, so check it once the output channel has closed. Without this a
-        // panicking operator surfaces as a silent empty result.
-        if error.is_none()
-            && let Ok(e) = self.err_rx.try_recv()
-        {
-            error = Some(e);
         }
         let mut stats = DataFlowStats::default();
         while let Ok(worker_stats) = self.stats_rx.try_recv() {
@@ -110,9 +102,16 @@ impl<T> Iterator for DataFlowHandle<T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Ok(e) = self.err_rx.try_recv() {
-            Some(Err(e))
-        } else {
-            self.rx.recv().ok().map(Ok)
+            return Some(Err(e));
+        }
+        match self.rx.recv() {
+            Ok(item) => Some(Ok(item)),
+            // The output channel closed. A worker that failed without queueing
+            // an item (a panic, the pool shutting down) reports on the error
+            // channel before dropping its sender, so check it once more here;
+            // ending the stream silently would let a consumer mistake a
+            // truncated result for a complete one.
+            Err(_) => self.err_rx.try_recv().ok().map(Err),
         }
     }
 }

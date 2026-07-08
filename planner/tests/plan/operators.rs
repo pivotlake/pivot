@@ -204,3 +204,82 @@ fn reset_variable_carries_no_value(mut testing_planner: TestingPlanner) {
     assert_eq!(set.name, "pivot_stats");
     assert_eq!(set.value, None);
 }
+
+#[rstest]
+fn insert_values_plans_as_insert_over_values(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("INSERT INTO example_table VALUES (1, 10, 100, 'zoe'), (2, 20, 200, 'yan')")
+        .unwrap();
+
+    let rendered = plan.to_string();
+    assert!(plan.as_insert().is_some(), "root is an Insert: {rendered}");
+    assert!(rendered.contains("Insert(example_table)"), "{rendered}");
+    assert!(rendered.contains("Values("), "{rendered}");
+}
+
+#[rstest]
+fn insert_float_values_plan(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "measurements",
+        &[(
+            "value",
+            planner::types::Type::Float64,
+            std::sync::Arc::new(arrow_array::Float64Array::from(vec![1.0])),
+        )],
+    );
+
+    let plan = testing_planner
+        .planner
+        .plan("INSERT INTO measurements VALUES (1.5), (2.5)")
+        .unwrap();
+
+    assert!(plan.as_insert().is_some(), "{plan}");
+}
+
+#[rstest]
+fn insert_column_list_maps_source_columns_to_table_order(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("INSERT INTO example_table (name, c, b, a) VALUES ('zoe', 300, 30, 3)")
+        .unwrap();
+
+    // Table order is (a, b, c, name); the statement supplies them reversed.
+    let insert = plan.as_insert().unwrap();
+    assert_eq!(insert.column_map, vec![3, 2, 1, 0]);
+}
+
+#[rstest]
+fn insert_select_plans_the_source_subtree(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .planner
+        .plan("INSERT INTO example_table SELECT a, b, c, name FROM example_table WHERE a > 2")
+        .unwrap();
+
+    let rendered = plan.to_string();
+    assert!(plan.as_insert().is_some(), "root is an Insert: {rendered}");
+    assert!(
+        rendered.contains("Input("),
+        "source scan survives: {rendered}"
+    );
+}
+
+#[rstest]
+fn insert_omitting_a_column_is_rejected(mut testing_planner: TestingPlanner) {
+    let result = testing_planner
+        .planner
+        .plan("INSERT INTO example_table (a) VALUES (1)");
+
+    let err = result.expect_err("defaults are unsupported").to_string();
+    assert!(err.contains("every table column"), "{err}");
+}
+
+#[rstest]
+fn insert_returning_is_rejected(mut testing_planner: TestingPlanner) {
+    let result = testing_planner
+        .planner
+        .plan("INSERT INTO example_table VALUES (1, 10, 100, 'zoe') RETURNING a");
+
+    let err = result.expect_err("RETURNING is unsupported").to_string();
+    assert!(err.contains("RETURNING"), "{err}");
+}

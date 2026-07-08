@@ -21,6 +21,7 @@ use planner::{TableFunction, TableFunctionSignature};
 use super::ParquetQueryContext;
 use crate::manifest::PartitionEqFilter;
 use crate::parquet::RowGroupMetadata;
+use thiserror::Error as ThisError;
 
 /// The output columns, in declared order. The single source of truth for both
 /// the binding signature (handed to DuckDB through the bridge) and the emitted
@@ -63,32 +64,33 @@ impl TableFunction for MetadataTableFunction {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let table_name = match args {
             [ScalarValue::Utf8(name)] => name.as_str(),
-            [_] => {
-                return Err(invalid(
-                    "metadata() expects a string table name".to_string(),
-                ));
-            }
-            _ => {
-                return Err(invalid(format!(
-                    "expected a single table name, got {} arguments",
-                    args.len()
-                )));
-            }
+            [_] => return Err(MetadataError::TableNameNotAString.into()),
+            _ => return Err(MetadataError::WrongArgumentCount(args.len()).into()),
         };
 
         let parquet_ctx = ctx
             .as_any()
             .downcast_ref::<ParquetQueryContext>()
-            .ok_or_else(|| invalid("metadata() requires a parquet-backed catalog".to_string()))?;
+            .ok_or(MetadataError::NotAParquetCatalog)?;
         // Warm the table (reload to latest + load every file's footer); metadata
         // wants every file, so no partition filters are applied.
         parquet_ctx
             .parquet(table_name, std::iter::empty::<PartitionEqFilter>())
-            .map_err(|_| invalid(format!("table '{table_name}' does not exist")))?;
+            .map_err(|source| MetadataError::ResolveTable {
+                table: table_name.to_string(),
+                source,
+            })?;
 
-        // Build straight from the catalog's per-file row groups, so each row
+        // Build straight from the table's per-file row groups, so each row
         // group's `file_name` is its real manifest path - no positional guessing.
-        let rows = row_group_rows(&parquet_ctx.file_row_groups(table_name));
+        let table =
+            parquet_ctx
+                .table(table_name)
+                .map_err(|source| MetadataError::ResolveTable {
+                    table: table_name.to_string(),
+                    source,
+                })?;
+        let rows = row_group_rows(&table.file_row_groups());
         let i64_column = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
         let columns: Vec<ArrayRef> = vec![
             i64_column(rows.iter().map(|r| r.file_index).collect()),
@@ -156,9 +158,29 @@ fn row_group_rows(files: &[(String, Vec<Arc<RowGroupMetadata>>)]) -> Vec<RowGrou
         .collect()
 }
 
-fn invalid(message: String) -> Error {
-    Error::InvalidTableFunctionArgument {
-        function: "metadata".to_string(),
-        message,
+/// Why a `metadata()` call cannot compile. Wrapped in
+/// [`Error::TableFunction`] on its way out to the generic planner.
+#[derive(Debug, ThisError)]
+enum MetadataError {
+    #[error("expected a single table-name argument, got {0} arguments")]
+    WrongArgumentCount(usize),
+    #[error("the table name argument must be a string")]
+    TableNameNotAString,
+    #[error("requires a parquet-backed catalog")]
+    NotAParquetCatalog,
+    #[error("resolving table `{table}`: {source}")]
+    ResolveTable {
+        table: String,
+        #[source]
+        source: planner::catalog::Error,
+    },
+}
+
+impl From<MetadataError> for Error {
+    fn from(source: MetadataError) -> Self {
+        Error::TableFunction {
+            function: "metadata".to_string(),
+            source: Box::new(source),
+        }
     }
 }

@@ -23,7 +23,7 @@
 //! ([`Catalog::table`]) first **reloads**: one LIST of the table's log
 //! directory; if a newer version exists, only the *new* files' footers are
 //! fetched (over the dispatch pool) and the new file set is swapped in — so a
-//! file registered by ingest, a compaction's swap, or even another process's
+//! file committed by an insert, a compaction's swap, or even another process's
 //! commit becomes visible to the very next query.
 //!
 //! Each resolve hands back a fresh [`TableBinding`], so per-query filter
@@ -43,9 +43,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::manifest::{
     self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
 };
-use crate::parquet::{ParquetTable, ParquetTableError};
+use crate::parquet::{ParquetTable, ParquetTableError, op_err};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
-use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec, Sender};
 use metadata_function::MetadataTableFunction;
 use planner::TableFunction;
 use planner::catalog::{
@@ -84,6 +84,8 @@ pub enum Error {
     Manifest(#[from] manifest::Error),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
+    #[error("table `{0}`: lost a manifest commit race, but no newer version exists to retry on")]
+    CommitRaceWithoutWinner(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -219,21 +221,14 @@ impl ParquetCatalog {
         &self.dispatcher
     }
 
-    /// A clone of the named table's current state for a writer (ingest,
-    /// compaction) to evolve — [`append_data_file`](CatalogTable::append_data_file)
+    /// A clone of the named table's current state for a writer (an external
+    /// appender, compaction) to evolve - [`append_data_file`](CatalogTable::append_data_file)
     /// or [`replace_data_files`](CatalogTable::replace_data_files). Those commit
     /// a new version by CAS to the shared store, so this catalog's own copy may
     /// lag until its next resolve refreshes it (which is fine — the store is the
     /// source of truth). `None` if no such table exists.
     pub fn table_handle(&self, name: &str) -> Option<CatalogTable> {
         self.tables.read().unwrap().get(name).cloned()
-    }
-
-    /// Whether a table named `name` exists in the catalog (a cheap membership
-    /// check — no clone). Used by ingest to fail fast at startup when a sink's
-    /// table hasn't been created.
-    pub fn contains_table(&self, name: &str) -> bool {
-        self.tables.read().unwrap().contains_key(name)
     }
 
     /// A snapshot clone of every table the catalog currently holds — for a sweep
@@ -250,7 +245,7 @@ impl ParquetCatalog {
     }
 
     /// Table `name`'s current committed files — refreshing to the latest version
-    /// first, so a commit by ingest/compaction (in this process or another) is
+    /// first, so a commit by an insert/compaction (in this process or another) is
     /// reflected. `None` if no such table exists.
     pub fn table_files(&self, name: &str) -> Option<Vec<FileRef>> {
         let mut table = self.table_handle(name)?;
@@ -296,22 +291,26 @@ impl ParquetCatalog {
             .map(|f| f.into_data_file(self.store.as_ref(), &location))
             .collect::<store::Result<Vec<DataFile>>>()?;
 
-        // The commit runs on the dataflow's last worker once the footers are
-        // fetched, under the table-set write lock (which serializes in-process
-        // creates): CAS-commit the table's own manifest, record it in the
-        // database index, then publish it in the in-memory map — re-checking the
-        // name as a race backstop.
+        // Fan the fetched footers in to one worker and commit there once every
+        // file has arrived, under the table-set write lock (which serializes
+        // in-process creates): CAS-commit the table's own manifest, record it
+        // in the database index, then publish it in the in-memory map -
+        // re-checking the name as a race backstop. Emits no rows.
         let tables = self.tables.clone();
         let store = self.store.clone();
         let pool = dispatcher.clone();
-        Ok(crate::parquet::create_load_and_commit_spec(
-            dispatcher,
-            &files,
-            move |loaded: Vec<TableFile>| {
+        let spec = crate::parquet::fetch_table_files_spec(dispatcher, &files).fan_in(
+            Vec::new(),
+            |loaded: &mut Vec<TableFile>,
+             file: TableFile,
+             _sender: &mut dyn Sender<arrow_array::RecordBatch>| {
+                loaded.push(file);
+                Ok(())
+            },
+            move |loaded, _sender| {
                 let mut map = tables.write().unwrap();
                 if map.contains_key(&request.name) {
-                    return Err(Box::new(Error::TableExists(request.name))
-                        as Box<dyn std::error::Error + Send + Sync>);
+                    return Err(op_err(Error::TableExists(request.name)));
                 }
                 let table = CatalogTable::create_new(
                     request.name.clone(),
@@ -322,18 +321,20 @@ impl ParquetCatalog {
                     sort_by,
                     store.clone(),
                     pool,
-                )?;
+                )
+                .map_err(op_err)?;
                 // Record name → location in the database index.
-                let mut index = CatalogManifest::load(store.as_ref())?;
+                let mut index = CatalogManifest::load(store.as_ref()).map_err(op_err)?;
                 index.upsert(CatalogManifestTableEntry::new(
                     request.name.clone(),
                     location,
                 ));
-                index.store(store.as_ref())?;
+                index.store(store.as_ref()).map_err(op_err)?;
                 map.insert(request.name, table);
                 Ok(())
             },
-        ))
+        );
+        Ok(RecordBatchOperatorSpec::from_spec(spec))
     }
 
     /// The location stored for a new table: an explicit `path` (kept as given),
@@ -499,19 +500,23 @@ impl ParquetQueryContext {
         Ok(parquet)
     }
 
-    /// Per-file row groups (path + its row groups, manifest order) for the
-    /// `metadata()` table function. Call after [`parquet`](Self::parquet) has
-    /// warmed the table so its footers are loaded.
-    pub(super) fn file_row_groups(
-        &self,
-        name: &str,
-    ) -> Vec<(String, Vec<Arc<crate::parquet::RowGroupMetadata>>)> {
+    /// A copy of table `name`'s master record, independent of the pinned read
+    /// views. An `INSERT` evolves it as its writer (the commit CASes the
+    /// shared manifest, so a copy that lags the store just retries);
+    /// `metadata()` reads its per-file row groups (after
+    /// [`parquet`](Self::parquet) has warmed the footers). Errors if the table
+    /// no longer exists (dropped since planning), never a silent miss.
+    pub(super) fn table(&self, name: &str) -> CatalogResult<CatalogTable> {
         self.tables
             .read()
             .unwrap()
             .get(name)
-            .map(|table| table.file_row_groups())
-            .unwrap_or_default()
+            .cloned()
+            .ok_or_else(|| {
+                CatalogError::Other(
+                    format!("table {name:?} no longer exists (dropped since planning?)").into(),
+                )
+            })
     }
 }
 

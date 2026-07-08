@@ -28,7 +28,7 @@ use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
 use crate::io::{
     Completion, DataFlowRequest, FailedRead, HttpRequest, RemoteReadSplit, RemoteReadTime,
 };
-use crate::memory::compressed_cache::MissingExtent;
+use crate::memory::compressed_cache::MissingBlock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -80,7 +80,7 @@ struct RequestedRead {
 /// One piece read from the local cache file.
 struct CacheRead {
     read: Identifier,
-    block: MissingExtent,
+    block: MissingBlock,
     /// Keeps the cache file open for the read's lifetime.
     _object: Arc<Object>,
 }
@@ -89,7 +89,7 @@ struct CacheRead {
 /// to that cache file once it lands, `None` for an uncached read.
 struct HttpRead {
     read: Identifier,
-    block: MissingExtent,
+    block: MissingBlock,
     object: Option<Arc<Object>>,
 }
 
@@ -99,7 +99,7 @@ struct CacheWrite {
     file_offset: usize,
     len: usize,
     /// Keeps the source slot pinned until the write has read it.
-    _block: MissingExtent,
+    _block: MissingBlock,
 }
 
 impl CachedHttpEngine {
@@ -162,7 +162,10 @@ impl CachedHttpEngine {
         let mut split = RemoteReadSplit::default();
 
         for seg in &segments {
-            let block = request.request.block.carve(seg.rel_offset, seg.len);
+            let block = request
+                .request
+                .block
+                .carve_sub_block(seg.rel_offset, seg.len);
             if seg.present {
                 split.disk_cache_requests += 1;
                 split.disk_cache_bytes += seg.len as u64;

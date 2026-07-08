@@ -569,9 +569,15 @@ impl Worker {
     pub fn run(&mut self) -> Result<()> {
         loop {
             // Cooperative shutdown: [`crate::Dispatch::exit`] flips this flag
-            // and we exit cleanly so the thread can be reaped.
+            // and we exit cleanly so the thread can be reaped. Fail any
+            // dataflow still in flight before dropping it: its collector is
+            // blocked on the output channel and would otherwise see a clean
+            // close and read the truncated stream as a complete result.
             if self.should_exit.load(Ordering::Relaxed) {
                 debug!("Worker {} exiting via shutdown flag", self.id);
+                for flow in self.data_flows.values() {
+                    flow.bail_and_cancel(crate::data_flow::Error::WorkerPoolShutDown);
+                }
                 return Ok(());
             }
             self.did_work_last_iteration = false;

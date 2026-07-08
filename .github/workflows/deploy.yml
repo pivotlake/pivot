@@ -16,7 +16,7 @@ on:
         type: boolean
         default: true
       use_gcp_runner:
-        description: "Build on the self-hosted GCP runners (ci-runner-x86 for x86_64, ci-runner-aarch64 for aarch64). On by default; uncheck to use GitHub-hosted runners."
+        description: "Build the x86_64 binary on the self-hosted GCP runner (ci-runner-x86). On by default; uncheck to use a GitHub-hosted runner. The aarch64 build always uses a hosted arm64 runner."
         type: boolean
         default: true
       push_docker:
@@ -26,10 +26,8 @@ on:
 
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
-#                 For use_gcp_runner it also needs to bring the runner VMs online:
-#                 instance-scoped compute.instanceAdmin.v1 on ci-runner-x86 and
-#                 ci-runner-aarch64, plus iam.serviceAccountUser on ci-runner-aarch64's
-#                 attached service account (starting a stopped VM requires it).
+#                 For use_gcp_runner it also needs to resume ci-runner-x86
+#                 (instance-scoped compute.instanceAdmin.v1 is enough).
 # Required repository variables (unless overridden via the `bucket` input):
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
 # For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
@@ -66,9 +64,10 @@ jobs:
           echo "include=$include" >> "$GITHUB_OUTPUT"
           echo "Building: $include"
 
-  # Bring the self-hosted GCP VMs online when opted in: ci-runner-x86 (x86_64
-  # binary build + Docker image build) and ci-runner-aarch64 (aarch64 binary
-  # build). Each box only wakes when something that runs on it is selected.
+  # Resume the self-hosted GCP VM (ci-runner-x86) when opted in, so its gcp-builder
+  # runners are online. The x86_64 binary build and the Docker image build both
+  # run on the box (it is X64); the aarch64 leg always builds on a hosted arm64
+  # runner.
   start-ci:
     name: Start GCP runner
     # Resume the box when anything that runs on it is selected: the x86_64 binary
@@ -81,28 +80,15 @@ jobs:
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-  start-ci-arm:
-    name: Start GCP ARM runner
-    if: ${{ inputs.use_gcp_runner && inputs.build_aarch64 }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/resume-gcp-runner
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-          instance: ci-runner-aarch64
-          zone: europe-west3-b
-
   deploy:
-    needs: [matrix, start-ci, start-ci-arm]
-    # The start jobs are skipped unless opted in, so accept their skipped
-    # results too.
-    if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
+    needs: [matrix, start-ci]
+    # start-ci is skipped unless opted in, so accept its skipped result too.
+    if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
     name: Build ${{ matrix.arch }} release + upload to GCS
-    # Each arch builds on its native self-hosted box when opted in (gcp-builder
-    # is X64, gcp-builder-arm is ARM64); otherwise on the hosted runner from the
-    # matrix. Native runners per arch — no emulation.
-    runs-on: ${{ inputs.use_gcp_runner && (matrix.arch == 'x86_64' && 'gcp-builder' || 'gcp-builder-arm') || matrix.runner }}
+    # x86_64 can run on the self-hosted gcp-builder when opted in; aarch64 always
+    # uses a hosted arm64 runner (the box is X64-only). Native runners per arch —
+    # no emulation.
+    runs-on: ${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' && 'gcp-builder' || matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -206,7 +192,6 @@ jobs:
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 
-  # NOTE: no stop job here. Each self-hosted box runs an hourly if-unused cron
-  # (suspend on ci-runner-x86, stop on ci-runner-aarch64) that only takes it down when
-  # no ci/deploy run is active, so it can't be killed out from under a
-  # concurrent run — which an unconditional stop job here would do.
+  # NOTE: no stop job here. ci-runner-x86's hourly suspend-if-unused cron suspends
+  # the box only when no ci/deploy run is active, so it can't be killed out from
+  # under a concurrent run — which an unconditional suspend job here would do.
