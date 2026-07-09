@@ -85,7 +85,11 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
     let thread = thread::Builder::new()
         .name("pivot-bench-server".into())
         .spawn(move || {
+            // The runtime gets few threads on purpose: its default (one per
+            // core) would sit hundreds of mostly-idle threads next to the
+            // pinned dispatch workers and preempt them on every wakeup.
             let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_all()
                 .build()
                 .expect("build tokio runtime");

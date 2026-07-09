@@ -46,6 +46,9 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue> {
 
     sender: mpsc::Sender<(usize, AggregatedTableOutput<K, V>)>,
     receiver: Option<mpsc::Receiver<(usize, AggregatedTableOutput<K, V>)>>,
+    /// Radix scatter config with the per-worker bucket count sized for the pool
+    /// (see [`get_scatter_bucket_count_for_worker`](super::get_scatter_bucket_count_for_worker)).
+    radix: RadixConfig,
 }
 
 impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
@@ -73,6 +76,12 @@ impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<_>();
         let mut rx_opt = Some(rx);
+        let radix = RadixConfig {
+            partitions: crate::operations::unary::group::get_scatter_bucket_count_for_worker(
+                topology.total_workers(),
+            ),
+            ..RadixConfig::DEFAULT
+        };
 
         (0..topology.total_workers()).map(move |_| GroupFactory {
             key_arena: key_arena.clone(),
@@ -87,6 +96,7 @@ impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
             partition_jobs_injected: partition_jobs_injected.clone(),
             sender: tx.clone(),
             receiver: rx_opt.take(),
+            radix,
         })
     }
 }
@@ -110,7 +120,7 @@ impl<K: KeyExtractor, V: AggregationValue> UnaryFactory<RecordBatch, RecordBatch
             self.sender,
             self.receiver.take(),
             self.partition_jobs_injected,
-            RadixConfig::DEFAULT,
+            self.radix,
         ))
     }
 }

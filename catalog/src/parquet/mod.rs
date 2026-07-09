@@ -33,7 +33,8 @@ mod reading;
 pub use reading::{
     DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory, MaterializerFactory,
     RowGroupDecoderError, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    materialize, pending_claim_bound, table_input, table_input_with_filter,
+    table_input_with_filter_and_eq_predicates,
 };
 
 mod metadata;

@@ -31,7 +31,9 @@ use crate::operations::FinishStatus;
 use core_affinity::CoreId;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::thread::Thread;
 
 /// Spin budget while a **dataflow is in flight** but this worker momentarily has
 /// nothing to do (waiting on a pipeline-stage barrier / for a sibling to produce
@@ -44,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// through to a park. Large queries keep workers busy and rarely reach this path.
 const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Barrier, Condvar, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::{result, thread};
 use thiserror::Error;
@@ -78,63 +80,121 @@ pub fn current_node() -> usize {
     NODE_IDX.get()
 }
 
-/// Wake mechanism shared by all workers. Holds a monotonic `wake_count` and a
-/// `Condvar`. Anyone who generates work that idle workers should pick up
-/// (a new dataflow, a sibling-counter transitioning to 0) calls [`notify`](WorkerWaker::notify),
-/// which bumps the count and wakes every waiting worker.
+/// The wake mechanism for one node group's workers. It pairs a monotonic
+/// `wake_count` for lock-free spinners with one parking slot per worker.
+///
+/// Each worker parks on its **own** thread token (`std::thread::park`), never
+/// on a shared primitive. This is what keeps wakeups from collapsing under
+/// load: with one shared condvar, every data send while many workers were
+/// parked woke the whole herd through one contended futex, the woken workers
+/// found nothing, re-parked, and the send path degraded into a syscall storm
+/// (a stable slow mode measured at +45% on scan-heavy queries). With per-worker
+/// slots a send wakes exactly one sleeper, a worker-targeted message wakes
+/// exactly its recipient, and only true broadcast events (a new dataflow,
+/// cancellation, a sibling counter reaching zero) wake everyone.
 ///
 /// Each worker remembers the count it observed at the end of its previous
-/// park. When it next finds no work and tries to sleep, [`wait_if_unchanged`](WorkerWaker::wait_if_unchanged)
-/// parks on the condvar only if the count still matches — if it has advanced,
-/// a `notify` arrived during the work pass and the worker returns immediately
-/// to retry.
-/// State protected by the waker's mutex: the number of currently parked
-/// workers. The wake counter itself lives in a separate atomic so idle workers
-/// can poll it lock-free while spinning before they park (see
-/// [`Worker::clear_dirty_buffer_or_park`]).
-struct WakerState {
-    /// How many workers are currently parked on the condvar. Used by
-    /// `notify` to skip the `notify_all` syscall when nobody is waiting.
-    sleepers: usize,
+/// park. When it next finds no work and tries to sleep,
+/// [`wait_if_unchanged`](WorkerWaker::wait_if_unchanged) parks only if the
+/// count still matches - if it has advanced, a notify arrived during the work
+/// pass and the worker returns immediately to retry.
+struct ParkSlot {
+    /// Whether this worker is currently parked. Whoever swaps it `true -> false`
+    /// (the parker on wakeup, or a notifier claiming the slot) decrements
+    /// `parked_workers`.
+    parked: AtomicBool,
+    /// The worker's thread handle, registered once at worker startup.
+    thread: OnceLock<Thread>,
 }
 
 pub struct WorkerWaker {
-    /// Monotonic counter (wrapping) bumped on every [`WorkerWaker::notify`].
-    /// Lock-free so workers can spin-poll it cheaply before parking; the park
-    /// path re-reads it under `state`'s lock so no wake is lost.
+    /// Monotonic counter (wrapping) bumped on every notify. Lock-free so
+    /// workers can spin-poll it cheaply before parking.
     wake_count: AtomicU64,
-    state: Mutex<WakerState>,
-    /// Workers wait here when idle; `notify` wakes all of them.
-    cond: Condvar,
-}
-
-impl Default for WorkerWaker {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// How many workers are currently parked; lets the hot no-sleeper send
+    /// path skip scanning the slots entirely.
+    parked_workers: AtomicUsize,
+    slots: Box<[ParkSlot]>,
+    /// Rotates [`notify_one`](Self::notify_one)'s scan start so wakes spread
+    /// over the parked workers instead of always reviving the lowest index.
+    next_wake: AtomicUsize,
 }
 
 impl WorkerWaker {
-    pub fn new() -> Self {
+    pub fn new(worker_count: usize) -> Self {
         Self {
             wake_count: AtomicU64::new(0),
-            state: Mutex::new(WakerState { sleepers: 0 }),
-            cond: Condvar::new(),
+            parked_workers: AtomicUsize::new(0),
+            slots: (0..worker_count)
+                .map(|_| ParkSlot {
+                    parked: AtomicBool::new(false),
+                    thread: OnceLock::new(),
+                })
+                .collect(),
+            next_wake: AtomicUsize::new(0),
         }
     }
 
-    /// Bump the wake count and wake all waiting workers. Skips the `notify_all`
-    /// call when no workers are currently parked, avoiding the syscall on
-    /// hot send paths that nobody is waiting on.
-    ///
-    /// The count is bumped *before* taking the lock so a worker about to park
-    /// either observes the new count under the lock (and skips the wait) or is
-    /// already parked (and gets the `notify_all`) — no wake is lost.
+    /// Register the calling thread as this waker's worker `local_idx`. Must be
+    /// called on the worker thread before its first park.
+    pub fn register(&self, local_idx: usize) {
+        self.slots[local_idx]
+            .thread
+            .set(thread::current())
+            .expect("worker slot registered twice");
+    }
+
+    /// Claim `slot` if it is parked and wake its thread. Returns whether a
+    /// wake happened. The claim (`swap`) guarantees a parked worker is woken
+    /// at most once per park, so concurrent notifiers spread over sleepers.
+    fn wake_slot(&self, slot: &ParkSlot) -> bool {
+        if slot.parked.swap(false, Ordering::SeqCst) {
+            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            if let Some(thread) = slot.thread.get() {
+                thread.unpark();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Bump the wake count and wake **one** parked worker, if any. For data
+    /// sends: one new stealable item needs one thief, and any same-node worker
+    /// is a valid one. When nobody is parked (spinners poll the count), this is
+    /// a single atomic bump.
+    pub fn notify_one(&self) {
+        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        if self.parked_workers.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let start = self.next_wake.fetch_add(1, Ordering::Relaxed);
+        for i in 0..self.slots.len() {
+            if self.wake_slot(&self.slots[(start + i) % self.slots.len()]) {
+                return;
+            }
+        }
+    }
+
+    /// Bump the wake count and wake worker `local_idx` if it is parked. For
+    /// messages addressed to a specific worker (see `return_to_worker`).
+    pub fn notify_slot(&self, local_idx: usize) {
+        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        if self.parked_workers.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        self.wake_slot(&self.slots[local_idx]);
+    }
+
+    /// Bump the wake count and wake every parked worker. For events any worker
+    /// may be waiting on: a new dataflow, cancellation, a sibling counter
+    /// reaching zero, a collector publishing merge jobs.
     pub fn notify(&self) {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
-        let state = self.state.lock().unwrap();
-        if state.sleepers > 0 {
-            self.cond.notify_all();
+        if self.parked_workers.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        for slot in &self.slots {
+            self.wake_slot(slot);
         }
     }
 
@@ -144,18 +204,32 @@ impl WorkerWaker {
         self.wake_count.load(Ordering::SeqCst)
     }
 
-    /// If the wake count still matches `last_seen`, block on the condvar until
-    /// a `notify` advances it. If it has already advanced, return immediately
-    /// so the worker re-runs its loop. Returns the wake count observed under
-    /// the lock after the wait, suitable for use as the next iteration's
-    /// `last_seen` — captured atomically with the wait so a concurrent notify
-    /// cannot be lost between sleep cycles.
-    pub fn wait_if_unchanged(&self, last_seen: u64) -> u64 {
-        let mut state = self.state.lock().unwrap();
-        if self.wake_count.load(Ordering::SeqCst) == last_seen {
-            state.sleepers += 1;
-            state = self.cond.wait(state).unwrap();
-            state.sleepers -= 1;
+    /// If the wake count still matches `last_seen`, park worker `local_idx`'s
+    /// thread until a notify wakes it. If the count has already advanced,
+    /// return immediately so the worker re-runs its loop. Returns the current
+    /// wake count, suitable for the next iteration's `last_seen`.
+    ///
+    /// No wake is lost: notifiers bump `wake_count` *before* scanning for
+    /// parked slots, and this publishes `parked` *before* re-checking the
+    /// count, so a concurrent notify either advances the count we then see, or
+    /// sees our slot and unparks it. A leftover unpark token from a notifier
+    /// that claimed the slot after our abort at worst makes the next park
+    /// return early, which the caller treats as an ordinary retry pass.
+    pub fn wait_if_unchanged(&self, last_seen: u64, local_idx: usize) -> u64 {
+        let slot = &self.slots[local_idx];
+        slot.parked.store(true, Ordering::SeqCst);
+        self.parked_workers.fetch_add(1, Ordering::SeqCst);
+        if self.wake_count.load(Ordering::SeqCst) != last_seen {
+            // A notify landed while we were publishing the slot; un-park it
+            // ourselves unless a notifier already claimed (and decremented) it.
+            if slot.parked.swap(false, Ordering::SeqCst) {
+                self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            }
+            return self.wake_count.load(Ordering::SeqCst);
+        }
+        thread::park();
+        if slot.parked.swap(false, Ordering::SeqCst) {
+            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
         }
         self.wake_count.load(Ordering::SeqCst)
     }
@@ -186,11 +260,12 @@ impl WakerSet {
         }
     }
 
-    /// Wake the node group that `worker` (a global worker index) belongs to.
-    /// Used by channels that target a specific worker, so a cross-node send
-    /// wakes the receiver's node rather than the sender's.
+    /// Wake `worker` (a global worker index) if it is parked. Used by channels
+    /// that address a specific worker, so a cross-node send wakes exactly its
+    /// receiver rather than the sender's whole node.
     pub fn notify_worker(&self, worker: usize) {
-        self.node_wakers[worker / self.workers_per_node].notify();
+        self.node_wakers[worker / self.workers_per_node]
+            .notify_slot(worker % self.workers_per_node);
     }
 
     /// Wake every node group. For events whose consumers may be parked on any
@@ -248,12 +323,98 @@ pub fn worker_waker() -> &'static WorkerWaker {
 /// [`crate::Dispatch`]) need a waker installed first or the TLS pointer is
 /// null. The waker is leaked because the pointer is cached in TLS for the
 /// lifetime of the test thread — the binary tears down right after.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Park a thread as the waker's worker `local_idx` and report the wake
+    /// count it returns with.
+    fn park_worker(waker: &Arc<WorkerWaker>, local_idx: usize) -> std::thread::JoinHandle<u64> {
+        let waker = waker.clone();
+        let last_seen = waker.wake_count();
+        std::thread::spawn(move || {
+            waker.register(local_idx);
+            waker.wait_if_unchanged(last_seen, local_idx)
+        })
+    }
+
+    /// Spin until `waker` reports `n` parked workers (bounded, so a regression
+    /// fails the test instead of hanging it).
+    fn await_parked(waker: &WorkerWaker, n: usize) {
+        for _ in 0..2000 {
+            if waker.parked_workers.load(Ordering::SeqCst) == n {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("workers never parked");
+    }
+
+    #[test]
+    fn notify_one_wakes_exactly_one_parked_worker() {
+        let waker = Arc::new(WorkerWaker::new(2));
+        let a = park_worker(&waker, 0);
+        let b = park_worker(&waker, 1);
+        await_parked(&waker, 2);
+
+        waker.notify_one();
+
+        // Exactly one of the two returns; the other stays parked.
+        for _ in 0..2000 {
+            if waker.parked_workers.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 1);
+        waker.notify();
+        assert_eq!(a.join().unwrap(), waker.wake_count());
+        assert_eq!(b.join().unwrap(), waker.wake_count());
+    }
+
+    #[test]
+    fn notify_slot_wakes_the_addressed_worker() {
+        let waker = Arc::new(WorkerWaker::new(2));
+        let a = park_worker(&waker, 0);
+        let b = park_worker(&waker, 1);
+        await_parked(&waker, 2);
+
+        waker.notify_slot(1);
+
+        b.join().unwrap();
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 1);
+        waker.notify();
+        a.join().unwrap();
+    }
+
+    #[test]
+    fn a_notify_before_the_park_is_not_lost() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        waker.register(0);
+        let last_seen = waker.wake_count();
+
+        waker.notify_one();
+
+        // The count advanced, so the park must return immediately.
+        assert_eq!(waker.wait_if_unchanged(last_seen, 0), waker.wake_count());
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) fn install_test_worker_waker() {
-    let waker = Arc::new(WorkerWaker::new());
+    // Size the slots for however many workers the test acts as, so targeted
+    // notifies stay in bounds (test threads never park, but the slot lookup
+    // must be valid).
+    let workers = match NUM_WORKERS.get() {
+        usize::MAX => 1,
+        n => n.max(1),
+    };
+    let waker = Arc::new(WorkerWaker::new(workers));
     init_worker_waker(&waker);
     NODE_IDX.set(0);
-    init_waker_set(WakerSet::new(vec![waker.clone()], NUM_WORKERS.get().max(1)));
+    init_waker_set(WakerSet::new(vec![waker.clone()], workers));
     std::mem::forget(waker);
 }
 
@@ -311,11 +472,13 @@ pub struct Worker {
     /// worker thread.
     waker: Arc<WorkerWaker>,
     /// Wake-count snapshot used to decide whether the next park can sleep.
-    /// Captured under the waker's mutex at the moment of the previous park
-    /// (initialised once at worker startup). Iterations that do work do not
+    /// Initialised once at worker startup. Iterations that do work do not
     /// refresh it — any `notify` they missed will simply make the next park
     /// observe a mismatch and return immediately, so no wake is lost.
     last_seen_wake_count: u64,
+    /// This worker's index within its node group, which is also its park
+    /// slot in the waker.
+    node_local_idx: usize,
 }
 
 impl Worker {
@@ -360,6 +523,8 @@ impl Worker {
                 // `perf record -t` to the worker pool.
                 #[cfg(feature = "perf")]
                 crate::profiler::register_worker_tid(idx);
+                let node_local_idx = idx % waker_set.workers_per_node;
+                waker.register(node_local_idx);
                 let last_seen_wake_count = waker.wake_count();
                 debug!("Initializing worker waker {:?}", idx);
                 init_worker_waker(&waker);
@@ -376,6 +541,7 @@ impl Worker {
                     should_exit,
                     waker,
                     last_seen_wake_count,
+                    node_local_idx,
                 };
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
@@ -609,7 +775,9 @@ impl Worker {
             }
         }
 
-        self.last_seen_wake_count = self.waker.wait_if_unchanged(self.last_seen_wake_count);
+        self.last_seen_wake_count = self
+            .waker
+            .wait_if_unchanged(self.last_seen_wake_count, self.node_local_idx);
     }
 
     fn clear_cancelled_dataflows(&mut self) {

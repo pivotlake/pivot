@@ -36,8 +36,11 @@ impl<T> Clone for MpscSender<T> {
     }
 }
 
-impl<T> Sender<T> for MpscSender<T> {
-    fn send(&mut self, item: T) -> channels::Result<()> {
+impl<T> MpscSender<T> {
+    /// Send without requiring `&mut`, for callers that route through a shared
+    /// sender slice (see `return_to_worker`). The inner mpsc sender is `&self`
+    /// already; the [`Sender`] trait's `&mut` is just its calling convention.
+    pub fn send_ref(&self, item: T) -> channels::Result<()> {
         self.inner
             .send(item)
             .map_err(|_| channels::Error::MpscSendError)?;
@@ -58,6 +61,12 @@ impl<T> Sender<T> for MpscSender<T> {
     }
 }
 
+impl<T> Sender<T> for MpscSender<T> {
+    fn send(&mut self, item: T) -> channels::Result<()> {
+        self.send_ref(item)
+    }
+}
+
 pub struct MpscReceiver<O> {
     inner: mpsc::Receiver<O>,
     count: Arc<AtomicUsize>,
@@ -67,6 +76,7 @@ impl<T> MpscReceiver<T> {
     pub fn new(inner: mpsc::Receiver<T>, count: Arc<AtomicUsize>) -> Self {
         Self { inner, count }
     }
+
     pub fn into_parts(self) -> (mpsc::Receiver<T>, Arc<AtomicUsize>) {
         (self.inner, self.count)
     }

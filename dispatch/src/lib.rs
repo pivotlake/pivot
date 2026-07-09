@@ -89,7 +89,7 @@ pub use io::{FsRequest, HttpRequest};
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
-pub use numa::Topology;
+pub use numa::{Topology, default_worker_count};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 #[cfg(feature = "perf")]
@@ -118,10 +118,13 @@ pub use operations::{
     RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
 };
 
+// `max_background_threads` is capped well below its default (one per core):
+// jemalloc's purger threads are unpinned, and on a box fully occupied by
+// pinned workers every wakeup of an unpinned thread preempts a worker.
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"percpu_arena:percpu,oversize_threshold:0,\
 muzzy_decay_ms:5000,dirty_decay_ms:10000,\
-lg_extent_max_active_fit:8,background_thread:true\0";
+lg_extent_max_active_fit:8,background_thread:true,max_background_threads:2\0";
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -344,7 +347,7 @@ impl Dispatch {
         let should_exit = Arc::new(AtomicBool::new(false));
         let mut memory_factories = MemoryContextFactory::create_for_layout(layout).into_iter();
         let node_wakers: Vec<Arc<WorkerWaker>> = (0..topology.node_count)
-            .map(|_| Arc::new(WorkerWaker::new()))
+            .map(|_| Arc::new(WorkerWaker::new(topology.workers_per_node)))
             .collect();
         let waker_set = WakerSet::new(node_wakers.clone(), topology.workers_per_node);
 
