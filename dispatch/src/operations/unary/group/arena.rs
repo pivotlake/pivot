@@ -33,11 +33,30 @@ impl std::panic::RefUnwindSafe for SharedArena {}
 impl SharedArena {
     /// Create a new shared arena with space for up to `ring()` amount of write buffers.
     pub fn new(buffers: usize) -> Arc<Self> {
+        // The pointer table must never move (`resolve` reads it lock-free), so
+        // it is sized up front for the worst case: every ring slot. Allocate
+        // it zeroed rather than writing nulls (a null pointer is the all-zero
+        // pattern), so the OS backs its pages lazily: a typical query touches
+        // only the first handful of entries, and eagerly writing close to a
+        // megabyte of nulls per arena per query is a measurable fixed cost
+        // on short queries.
+        let ptrs: Box<[UnsafeCell<*mut u8>]> = if buffers == 0 {
+            Box::new([])
+        } else {
+            let layout = std::alloc::Layout::array::<UnsafeCell<*mut u8>>(buffers).unwrap();
+            unsafe {
+                let raw = std::alloc::alloc_zeroed(layout);
+                if raw.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    raw as *mut UnsafeCell<*mut u8>,
+                    buffers,
+                ))
+            }
+        };
         Arc::new(Self {
-            ptrs: (0..buffers)
-                .map(|_| UnsafeCell::new(ptr::null_mut()))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            ptrs,
             next_idx: AtomicU32::new(0),
             buffers: Mutex::new(Vec::new()),
         })

@@ -118,6 +118,11 @@ pub struct WorkerWaker {
     /// Rotates [`notify_one`](Self::notify_one)'s scan start so wakes spread
     /// over the parked workers instead of always reviving the lowest index.
     next_wake: AtomicUsize,
+    /// Bumped on every delegated broadcast ([`notify_delegated`](Self::notify_delegated)).
+    /// A worker that wakes and sees it advanced finishes the broadcast by
+    /// waking every remaining parked sibling (see
+    /// [`finish_delegated_wake`](Self::finish_delegated_wake)).
+    broadcast_epoch: AtomicU64,
 }
 
 impl WorkerWaker {
@@ -132,6 +137,7 @@ impl WorkerWaker {
                 })
                 .collect(),
             next_wake: AtomicUsize::new(0),
+            broadcast_epoch: AtomicU64::new(0),
         }
     }
 
@@ -195,6 +201,59 @@ impl WorkerWaker {
         }
         for slot in &self.slots {
             self.wake_slot(slot);
+        }
+    }
+
+    /// Like [`notify`](Self::notify), but the notifier unparks only a single
+    /// worker, which then wakes the rest of the node itself (see
+    /// [`finish_delegated_wake`](Self::finish_delegated_wake)).
+    ///
+    /// For broadcasts from *coordinator* threads - dispatching a new dataflow
+    /// against a parked pool. An unpark is a syscall, so waking a large pool
+    /// serially from the one unpinned coordinator thread costs it up to
+    /// milliseconds per query (a dominant floor of a small query's latency,
+    /// and jitter for everything behind it on that thread). Delegating moves
+    /// that serial storm onto a woken worker's own pinned, otherwise-idle
+    /// core, while the pool still comes up in one direct wave. Worker-initiated
+    /// broadcasts keep [`notify`](Self::notify): their notifier is already a
+    /// pinned worker with nothing better to do.
+    pub fn notify_delegated(&self) {
+        self.wake_count.fetch_add(1, Ordering::SeqCst);
+        self.broadcast_epoch.fetch_add(1, Ordering::SeqCst);
+        if self.parked_workers.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        // Scan from slot 0 (not the rotating start): together with the
+        // delegate's in-order fan-out this preserves the same wake order as a
+        // direct broadcast, so the downstream claim pattern is unchanged.
+        for slot in &self.slots {
+            if self.wake_slot(slot) {
+                return;
+            }
+        }
+    }
+
+    /// Current broadcast epoch, for initializing a worker's memo.
+    pub fn broadcast_epoch(&self) -> u64 {
+        self.broadcast_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Complete a delegated broadcast: if the broadcast epoch advanced past
+    /// `last_seen` (updating it), unpark every parked sibling. Called by a
+    /// worker whenever it returns from a park, so the one worker
+    /// [`notify_delegated`](Self::notify_delegated) woke fans the wake out to
+    /// the whole node. A worker that re-parks can be woken once more by a
+    /// straggling delegate, which costs it one empty pass.
+    pub fn finish_delegated_wake(&self, last_seen: &mut u64) {
+        let epoch = self.broadcast_epoch.load(Ordering::SeqCst);
+        if epoch != *last_seen {
+            *last_seen = epoch;
+            if self.parked_workers.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            for slot in &self.slots {
+                self.wake_slot(slot);
+            }
         }
     }
 
@@ -275,6 +334,15 @@ impl WakerSet {
             waker.notify();
         }
     }
+
+    /// Broadcast from a coordinator thread (see
+    /// [`WorkerWaker::notify_delegated`]): the coordinator pays one unpark per
+    /// node; the woken worker wakes the rest of its node.
+    pub fn notify_all_delegated(&self) {
+        for waker in self.node_wakers.iter() {
+            waker.notify_delegated();
+        }
+    }
 }
 
 /// Install this thread's view of its node group's [`WorkerWaker`].
@@ -349,6 +417,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         panic!("workers never parked");
+    }
+
+    #[test]
+    fn delegated_broadcast_wakes_every_parked_worker() {
+        // There are more workers here than the single unpark notify_delegated
+        // pays for, so the rest must be woken by the delegate finishing the
+        // broadcast (as the worker loop does after every park). A dead
+        // delegation hangs a join.
+        let waker = Arc::new(WorkerWaker::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let waker = waker.clone();
+                std::thread::spawn(move || {
+                    waker.register(i);
+                    let mut broadcast_memo = waker.broadcast_epoch();
+                    let count = waker.wait_if_unchanged(waker.wake_count(), i);
+                    waker.finish_delegated_wake(&mut broadcast_memo);
+                    count
+                })
+            })
+            .collect();
+        await_parked(&waker, 8);
+
+        waker.notify_delegated();
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), waker.wake_count());
+        }
     }
 
     #[test]
@@ -479,6 +575,9 @@ pub struct Worker {
     /// This worker's index within its node group, which is also its park
     /// slot in the waker.
     node_local_idx: usize,
+    /// Last delegated-broadcast epoch this worker has fanned out (see
+    /// [`WorkerWaker::finish_delegated_wake`]).
+    last_seen_broadcast: u64,
 }
 
 impl Worker {
@@ -526,6 +625,7 @@ impl Worker {
                 let node_local_idx = idx % waker_set.workers_per_node;
                 waker.register(node_local_idx);
                 let last_seen_wake_count = waker.wake_count();
+                let last_seen_broadcast = waker.broadcast_epoch();
                 debug!("Initializing worker waker {:?}", idx);
                 init_worker_waker(&waker);
                 init_waker_set(waker_set);
@@ -542,6 +642,7 @@ impl Worker {
                     waker,
                     last_seen_wake_count,
                     node_local_idx,
+                    last_seen_broadcast,
                 };
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
@@ -778,6 +879,8 @@ impl Worker {
         self.last_seen_wake_count = self
             .waker
             .wait_if_unchanged(self.last_seen_wake_count, self.node_local_idx);
+        self.waker
+            .finish_delegated_wake(&mut self.last_seen_broadcast);
     }
 
     fn clear_cancelled_dataflows(&mut self) {
