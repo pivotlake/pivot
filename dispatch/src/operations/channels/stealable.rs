@@ -22,21 +22,22 @@ use crate::operations::channels::{ChannelFactory, Receiver, Sender};
 use crate::worker::worker_waker;
 use crossbeam_deque::{Stealer, Worker};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// Factory for building one worker's stealable channel endpoint.
 ///
-/// Holds the local [`Worker`] deque and the [`Stealer`] handles for every other worker.
-/// [`stealable()`] creates one factory per worker; each is consumed by [`ChannelFactory::build`]
-/// to produce the sender/receiver pair for that worker.
+/// Holds the local [`Worker`] deque plus a *shared* slice of every worker's
+/// [`Stealer`] and this worker's place in it. Sharing one stealer slice across
+/// all factories keeps channel construction cheap: it is one `Arc` clone per
+/// worker instead of a per-worker stealer list (workers x siblings clones per
+/// stage), which showed up as per-query dispatch latency on large pools.
+/// [`stealable()`] creates one factory per worker; each is consumed by
+/// [`ChannelFactory::build`] to produce the sender/receiver pair for that worker.
 pub struct StealableChannelFactory<T: Send> {
     worker: Worker<T>,
-    stealers: Vec<Stealer<T>>,
-}
-
-impl<T: Send> StealableChannelFactory<T> {
-    pub fn new(worker: Worker<T>, stealers: Vec<Stealer<T>>) -> StealableChannelFactory<T> {
-        StealableChannelFactory { worker, stealers }
-    }
+    stealers: Arc<[Stealer<T>]>,
+    worker_idx: usize,
+    topology: Topology,
 }
 
 impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
@@ -47,7 +48,12 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
         let worker = Rc::new(self.worker);
         (
             worker.clone(),
-            StealableReceiver::new(worker, self.stealers),
+            StealableReceiver {
+                worker,
+                stealers: self.stealers,
+                siblings: self.topology.node_siblings(self.worker_idx),
+                worker_idx: self.worker_idx,
+            },
         )
     }
 }
@@ -55,8 +61,10 @@ impl<T: Send + 'static> ChannelFactory<T> for StealableChannelFactory<T> {
 impl<O> Sender<O> for Rc<Worker<O>> {
     fn send(&mut self, item: O) -> channels::Result<()> {
         self.push(item);
-        // Wake any parked peer so they can steal the freshly-pushed work.
-        worker_waker().notify();
+        // One new item needs one thief: wake a single parked same-node peer.
+        // Waking more would just herd workers into finding nothing (the send
+        // path must stay cheap; see WorkerWaker).
+        worker_waker().notify_one();
         Ok(())
     }
 }
@@ -64,17 +72,17 @@ impl<O> Sender<O> for Rc<Worker<O>> {
 /// Receiving end of a stealable channel.
 ///
 /// Shares an `Rc<Worker<I>>` with the sender (both live on the same worker thread).
-/// [`Receiver::try_recv`] pops from the local deque; [`Receiver::steal`] tries each peer's deque in order
-/// when the local one is empty, enabling cross-worker load balancing.
+/// [`Receiver::try_recv`] pops from the local deque; [`Receiver::steal`] tries its
+/// same-node peers' deques in order when the local one is empty, enabling
+/// cross-worker load balancing within the node.
 pub struct StealableReceiver<I> {
     worker: Rc<Worker<I>>,
-    stealers: Vec<Stealer<I>>,
-}
-
-impl<I> StealableReceiver<I> {
-    pub fn new(worker: Rc<Worker<I>>, stealers: Vec<Stealer<I>>) -> Self {
-        Self { worker, stealers }
-    }
+    /// Every worker's stealer, shared by all receivers of the stage.
+    stealers: Arc<[Stealer<I>]>,
+    /// The slice of `stealers` this worker may steal from (its node's workers).
+    siblings: std::ops::Range<usize>,
+    /// This worker's own index in `stealers`, skipped when stealing.
+    worker_idx: usize,
 }
 
 impl<I> Receiver<I> for StealableReceiver<I> {
@@ -87,8 +95,8 @@ impl<I> Receiver<I> for StealableReceiver<I> {
         self.worker.pop()
     }
 
-    /// Try to steal a message from a peer worker's deque.
-    /// Iterates through all peer stealers, retrying on contention.
+    /// Try to steal a message from a same-node peer worker's deque.
+    /// Iterates through the node's stealers, retrying on contention.
     ///
     /// The `is_empty` pre-check keeps the (very common) all-empty scan cheap:
     /// it is a couple of plain loads, while `steal()` pins a crossbeam epoch
@@ -97,7 +105,11 @@ impl<I> Receiver<I> for StealableReceiver<I> {
     /// its cycles in epoch bookkeeping just discovering there is no work.
     fn steal(&self) -> Option<I> {
         use crossbeam_deque::Steal;
-        for stealer in &self.stealers {
+        for peer in self.siblings.clone() {
+            if peer == self.worker_idx {
+                continue;
+            }
+            let stealer = &self.stealers[peer];
             if stealer.is_empty() {
                 continue;
             }
@@ -122,25 +134,16 @@ pub fn stealable<T: Send>(
     let workers: Vec<_> = (0..topology.total_workers())
         .map(|_| Worker::new_lifo())
         .collect();
-
-    let workers_with_stealers = workers
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            topology
-                .node_siblings(i)
-                .filter(|&j| j != i)
-                .map(|j| workers[j].stealer())
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
+    let stealers: Arc<[Stealer<T>]> = workers.iter().map(Worker::stealer).collect();
 
     workers
         .into_iter()
-        .zip(workers_with_stealers)
-        .map(|(w, s)| StealableChannelFactory {
-            worker: w,
-            stealers: s,
+        .enumerate()
+        .map(move |(worker_idx, worker)| StealableChannelFactory {
+            worker,
+            stealers: stealers.clone(),
+            worker_idx,
+            topology,
         })
 }
 

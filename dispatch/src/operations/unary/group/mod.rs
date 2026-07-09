@@ -182,6 +182,42 @@ fn merge_partition_floor(contributing_workers: usize) -> usize {
 /// cache-resident at high group counts.
 const RADIX_PARTITIONS: usize = 4096;
 
+/// How many scatter streams the whole pool should aim to stay under. This is
+/// a target, not a hard cap: the one-bucket-per-worker floor below may exceed
+/// it on enormous pools.
+///
+/// Every (worker, bucket) pair is one small stream the merge later walks,
+/// prefetch-warms, and tears down, so those fixed costs grow with
+/// `workers x buckets` while the useful bytes per stream shrink.
+/// [`get_scatter_bucket_count_for_worker`] scales the per-worker bucket count
+/// down as the pool grows to hold the total near this target (chosen so
+/// pools of ~128 workers or fewer keep the full [`RADIX_PARTITIONS`]).
+const TARGET_SCATTER_STREAMS: usize = 1 << 19;
+
+/// How many scatter buckets each worker should use when `total_workers`
+/// workers share the pool.
+///
+/// Every worker keeps one output stream per bucket, so the pool as a whole
+/// holds `total_workers * buckets` streams, and each stream costs a fixed
+/// walk and teardown in the merge phase whether or not any rows landed in
+/// it. Small pools can afford the full [`RADIX_PARTITIONS`]; large pools get
+/// a smaller bucket count so the pool-wide stream total stays near
+/// [`TARGET_SCATTER_STREAMS`]. The result is always a power of two (rows are
+/// routed to buckets by hash bits) and never less than one bucket per
+/// worker, because the merge phase creates one job per bucket and fewer
+/// buckets than workers would leave cores idle.
+fn get_scatter_bucket_count_for_worker(total_workers: usize) -> usize {
+    let budget = (TARGET_SCATTER_STREAMS / total_workers.max(1)).max(1);
+    let buckets = if budget.is_power_of_two() {
+        budget
+    } else {
+        budget.next_power_of_two() / 2
+    };
+    buckets
+        .max(total_workers.next_power_of_two())
+        .min(RADIX_PARTITIONS)
+}
+
 /// Per-worker GROUP BY consumer.
 ///
 /// During the consume phase, each worker owns a `Group` that hashes incoming
@@ -604,11 +640,11 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         let output_buffers: Arc<[Buffer]> = self.key_arena.to_arrow_buffers();
         // All jobs are pushed before the injected flag flips, so a drained
         // queue means a finished phase.
-        let mut push_job = |injector: &Injector<PartitionJob<K, V>>,
-                            index: usize,
-                            finale: Option<Arc<PartitionFinale<K, V>>>,
-                            buffers: Arc<Vec<PartitionBuffers<K, V>>>,
-                            tables: Arc<Vec<MultiSlabTable<K, V>>>| {
+        let push_job = |injector: &Injector<PartitionJob<K, V>>,
+                        index: usize,
+                        finale: Option<Arc<PartitionFinale<K, V>>>,
+                        buffers: Arc<Vec<PartitionBuffers<K, V>>>,
+                        tables: Arc<Vec<MultiSlabTable<K, V>>>| {
             injector.push(PartitionJob {
                 buffers,
                 tables,
@@ -757,6 +793,16 @@ mod tests {
     type IntExtractor = IntKeyExtractor<Int32Type>;
     type CountValue = Compiled<(CountSlot,)>;
     type SumValue = Compiled<(SumSlot<Int32Type>,)>;
+
+    #[test]
+    fn scatter_buckets_shrink_as_the_pool_grows() {
+        // Small pools keep the full per-worker resolution; large pools trade
+        // it away to hold the total stream count near the budget.
+        assert_eq!(get_scatter_bucket_count_for_worker(8), RADIX_PARTITIONS);
+        assert_eq!(get_scatter_bucket_count_for_worker(96), RADIX_PARTITIONS);
+        assert_eq!(get_scatter_bucket_count_for_worker(190), 2048);
+        assert_eq!(get_scatter_bucket_count_for_worker(400), 1024);
+    }
 
     fn batch_with_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)]));

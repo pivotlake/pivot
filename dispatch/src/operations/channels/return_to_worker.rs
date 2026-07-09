@@ -12,13 +12,17 @@ use crate::Identifier;
 use crate::operations::channels;
 use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
 use crate::operations::channels::{ChannelFactory, Sender};
+use std::sync::Arc;
 
 /// Factory for building a return-to-worker channel.
 ///
-/// Holds all workers' mpsc senders (so the built [`WorkerAwareSender`] can route to any
-/// worker) and this worker's receiver.
+/// Holds a *shared* slice of all workers' mpsc senders (so the built
+/// [`WorkerAwareSender`] can route to any worker) and this worker's receiver.
+/// Sharing one sender slice keeps construction to one `Arc` clone per worker
+/// instead of workers-squared sender clones per stage, which showed up as
+/// per-query dispatch latency on large pools.
 pub struct ReturnToWorkerMpscFactory<T> {
-    senders: Vec<MpscSender<T>>,
+    senders: Arc<[MpscSender<T>]>,
     receiver: MpscReceiver<T>,
 }
 
@@ -39,11 +43,11 @@ pub trait WorkerIdOutput: 'static {
 /// A sender that routes each message to a specific worker's mpsc channel
 /// based on [`WorkerIdOutput::worker_id`].
 pub struct WorkerAwareSender<O> {
-    senders: Vec<MpscSender<O>>,
+    senders: Arc<[MpscSender<O>]>,
 }
 
 impl<O> WorkerAwareSender<O> {
-    pub fn new(senders: Vec<MpscSender<O>>) -> Self {
+    pub fn new(senders: Arc<[MpscSender<O>]>) -> Self {
         Self { senders }
     }
 }
@@ -51,27 +55,27 @@ impl<O> WorkerAwareSender<O> {
 impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
     fn send(&mut self, item: O) -> channels::Result<()> {
         let worker_idx = item.worker_id();
-        self.senders[worker_idx].send(item)?;
+        self.senders[worker_idx].send_ref(item)?;
         Ok(())
     }
 }
 
 /// Create one [`ReturnToWorkerMpscFactory`] per worker.
 ///
-/// Sets up N mpsc channels (one per worker). Each factory holds all N senders
-/// (for routing) and its own receiver.
+/// Sets up N mpsc channels (one per worker). Each factory holds the shared
+/// sender slice (for routing) and its own receiver.
 pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
     count: usize,
 ) -> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
     let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
         .map(|worker| mpsc_channel_to::<T>(worker))
         .unzip();
+    let senders: Arc<[MpscSender<T>]> = senders.into();
 
-    receivers.into_iter().map(move |rx| {
-        let txs: Vec<_> = senders.to_vec();
-        ReturnToWorkerMpscFactory {
-            senders: txs,
+    receivers
+        .into_iter()
+        .map(move |rx| ReturnToWorkerMpscFactory {
+            senders: senders.clone(),
             receiver: rx,
-        }
-    })
+        })
 }

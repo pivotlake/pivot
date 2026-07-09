@@ -222,6 +222,8 @@ impl RowGroupRequest {
     }
 
     /// Consume this request into a `RowGroupBuffer`.
+    /// Runs on the claiming worker (the fetcher emits from the worker that
+    /// admitted the request), so the buffer records it as the decode owner.
     pub fn into_row_group_buffer(self) -> RowGroupBuffer {
         RowGroupBuffer {
             metadata: self.metadata,
@@ -230,6 +232,7 @@ impl RowGroupRequest {
                 .into_iter()
                 .map(ColumnRequest::into_source)
                 .collect(),
+            worker_id: dispatch::worker::WORKER_IDX.get(),
         }
     }
 }
@@ -248,4 +251,10 @@ pub struct RowGroupBuffer {
     pub metadata: QueryRowGroupMetadata,
     /// Each projected column's resolved parts, in file order.
     pub columns: Vec<Vec<ColumnPart>>,
+    /// The worker every page of this row group returns to for decode. It must
+    /// be the worker that claimed the row group: that worker holds the row
+    /// group's decoder state and accounts for the claim (see
+    /// `RowGroupFetcher`). The middle stages may run on stealing siblings, so
+    /// the id is stamped at claim time, not by whoever runs a stage.
+    pub worker_id: usize,
 }

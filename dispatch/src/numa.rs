@@ -57,6 +57,11 @@ impl Topology {
     }
 }
 
+/// The default worker count is every available core.
+pub fn default_worker_count() -> usize {
+    core_affinity::get_core_ids().map_or(1, |cores| cores.len().max(1))
+}
+
 /// Group the cores this process may run on by NUMA node.
 ///
 /// On Linux, reads each node's `cpulist` from `/sys/devices/system/node/node*/cpulist`

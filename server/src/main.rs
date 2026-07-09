@@ -257,11 +257,7 @@ fn main() -> Result<(), Error> {
     init_tracing();
     let args = Args::parse();
 
-    let workers = args.workers.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    });
+    let workers = args.workers.unwrap_or_else(dispatch::default_worker_count);
     info!(workers, "initialising dispatch");
     let disk_cache = build_disk_cache(&args);
     let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
@@ -270,7 +266,12 @@ fn main() -> Result<(), Error> {
 
     let ingests = args.ingests();
 
+    // A handful of runtime threads handles the wire protocol comfortably; the
+    // default (one per core) would put hundreds of mostly-idle threads next to
+    // the pinned dispatch workers, and every wakeup of an unpinned thread on a
+    // fully occupied box preempts a worker mid-stage.
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()?;
 

@@ -635,7 +635,7 @@ mod tests {
     fn into_outputter_notifies_even_with_no_local_top_k() {
         use crate::worker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
 
-        let waker = Arc::new(WorkerWaker::new());
+        let waker = Arc::new(WorkerWaker::new(1));
         init_worker_waker(&waker);
         init_waker_set(WakerSet::new(vec![waker.clone()], 1));
 

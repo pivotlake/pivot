@@ -26,7 +26,7 @@ use dispatch::{Receiver, RootChannelFactory};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::parquet::{RowGroupFilter, ScanOrder};
 
@@ -94,23 +94,45 @@ fn steal_order(table: &ParquetTable, order: ScanOrder) -> Vec<usize> {
     result
 }
 
-/// Steal order for a plain scan: row groups with the most pages still resident
-/// in the decompressed cache go first, so the scan consumes them before its own
-/// churn can evict them - without this, a repeated scan asks for each row group
-/// exactly when its cached pages are the oldest thing in the ring, and hits
-/// nothing. The sort is stable, so ties (a fully cold table in particular) keep
-/// file order.
-fn cache_first_order(table: &ParquetTable) -> Vec<usize> {
+/// Order a plain scan's row groups for handout, by two keys:
+///
+/// 1. Most decompressed-cache-resident pages first, so the scan consumes them
+///    before its own churn can evict them - without this, a repeated scan asks
+///    for each row group exactly when its cached pages are the oldest thing in
+///    the ring, and hits nothing.
+/// 2. Ties (a fully cold table in particular, where every count is zero) break
+///    to the largest projected compressed size. A row group's whole decode is
+///    pinned to the worker that claims it, so a scan's wall time is the
+///    makespan of placing unequal-cost row groups onto workers; handing out the
+///    biggest first is the classic longest-processing-time rule - the
+///    expensive row groups start immediately and the small ones fill the gaps
+///    behind them. With any other order, a large row group claimed behind
+///    another job sets a whole query's critical path (worst when the row-group
+///    count is close to the worker count, where one unlucky claim adds an
+///    entire extra job to the tail). Cache-resident row groups jumping the LPT
+///    queue can't set that critical path: their decode skips the expensive
+///    decompression, so they are the cheap tail-filler jobs anyway.
+fn plain_scan_order(table: &ParquetTable, projection: &Projection) -> Vec<usize> {
     let mut order: Vec<usize> = (0..table.row_groups.len()).collect();
-    // sort_by_cached_key: the counters move concurrently (other queries insert
-    // and evict pages mid-sort), so each must be read exactly once - a
-    // per-comparison re-read hands the sort an inconsistent ordering.
+    let projected_size = |idx: usize| -> i64 {
+        let row_group = &table.row_groups[idx];
+        projection
+            .indices()
+            .iter()
+            .map(|&col| row_group.columns[col].total_compressed_size)
+            .sum()
+    };
+    // The cache counters move concurrently (other queries insert and evict
+    // pages mid-sort), so each must be read exactly once - a per-comparison
+    // re-read hands the sort an inconsistent ordering. sort_by_cached_key
+    // guarantees the single read.
     order.sort_by_cached_key(|&idx| {
-        Reverse(
+        Reverse((
             table.row_groups[idx]
                 .live_decompressed_pages
                 .load(Ordering::Relaxed),
-        )
+            projected_size(idx),
+        ))
     });
     order
 }
@@ -132,8 +154,8 @@ impl RowGroupInjectorFactory {
     /// `false`. When `scan_order` is set (a Top-N boundary on one key), row
     /// groups are pushed in that key's order so the most-promising are claimed
     /// first and the boundary prunes the rest; otherwise decompressed-cache-covered
-    /// row groups go first (see [`cache_first_order`]), falling back to file
-    /// order.
+    /// row groups go first, largest-first within a tie (see
+    /// [`plain_scan_order`]).
     pub fn new(
         table: &Arc<ParquetTable>,
         projection: Projection,
@@ -145,7 +167,7 @@ impl RowGroupInjectorFactory {
             Arc::new((0..node_count).map(|_| Injector::new()).collect());
         let order = match scan_order {
             Some(order) => steal_order(table, order),
-            None => cache_first_order(table),
+            None => plain_scan_order(table, &projection),
         };
         for row_group_idx in order {
             let node = affinity_node(&table.row_groups[row_group_idx], node_count);
@@ -271,17 +293,49 @@ mod tests {
             .live_decompressed_pages
             .store(2, Ordering::Relaxed);
 
-        let order = cache_first_order(&table);
+        let order = plain_scan_order(&table, &Projection::columns([]));
 
         assert_eq!(order, vec![1, 2, 0]);
     }
 
     #[test]
-    fn a_cold_table_keeps_file_order() {
+    fn equal_size_ties_keep_file_order() {
         let table = table_of(4);
 
-        let order = cache_first_order(&table);
+        let order = plain_scan_order(&table, &Projection::columns([]));
 
         assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    fn sized_row_group(compressed_size: i64) -> Arc<RowGroupMetadata> {
+        let dummy = dummy_row_group();
+        Arc::new(RowGroupMetadata {
+            location: dummy.location.clone(),
+            schema: dummy.schema.clone(),
+            columns: vec![crate::parquet::types::metadata::ColumnChunkMeta {
+                dictionary_page_offset: None,
+                data_page_offset: 0,
+                total_compressed_size: compressed_size,
+                max_def_level: 0,
+                statistics: None,
+                data_pages_all_dictionary: false,
+            }],
+            num_rows: 0,
+            file_row_group_idx: 0,
+            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    #[test]
+    fn a_cold_table_is_claimed_largest_first() {
+        let table = Arc::new(ParquetTable::new(vec![
+            sized_row_group(10),
+            sized_row_group(30),
+            sized_row_group(20),
+        ]));
+
+        let order = plain_scan_order(&table, &Projection::columns([0]));
+
+        assert_eq!(order, vec![1, 2, 0]);
     }
 }

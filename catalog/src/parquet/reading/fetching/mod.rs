@@ -16,10 +16,38 @@
 //!   the finished `RowGroupBuffer` downstream. It keeps disk- and HTTP-backed
 //!   row groups outstanding under separate caps.
 
-pub type RowGroupFetcherFactory = DefaultUnaryFactory<RowGroupFetcher>;
+/// Builds one worker's [`RowGroupFetcher`], carrying that worker's
+/// claimed-but-undecoded row-group count as claim backpressure, bounded by the
+/// scan's claim bound (see [`fetcher::pending_claim_bound`]).
+pub struct RowGroupFetcherFactory {
+    pending_row_groups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    max_pending_row_groups: usize,
+}
+
+impl RowGroupFetcherFactory {
+    pub fn new(
+        pending_row_groups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        max_pending_row_groups: usize,
+    ) -> Self {
+        Self {
+            pending_row_groups,
+            max_pending_row_groups,
+        }
+    }
+}
+
+impl dispatch::UnaryFactory<crate::parquet::RowGroupRequest, crate::parquet::RowGroupBuffer>
+    for RowGroupFetcherFactory
+{
+    type Unary = RowGroupFetcher;
+
+    fn build_unary(self) -> RowGroupFetcher {
+        RowGroupFetcher::new(self.pending_row_groups, self.max_pending_row_groups)
+    }
+}
 mod fetcher;
+pub use fetcher::pending_claim_bound;
 
 mod table_source;
 use crate::parquet::reading::fetching::fetcher::RowGroupFetcher;
-use dispatch::DefaultUnaryFactory;
 pub use table_source::RowGroupInjectorFactory;
