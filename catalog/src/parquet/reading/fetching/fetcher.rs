@@ -19,18 +19,67 @@ use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
 use dispatch::io::{FsRequest, HttpRequest};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Disk-backed read blocks outstanding per worker before admitting another row
 /// group. One keeps disk reads serial — io_uring gives a single read ample
 /// depth.
 const MAX_DISK_IN_FLIGHT: usize = 1;
 
-#[derive(Default)]
+/// Row groups a worker may hold "claimed but not yet fully decoded" before it
+/// stops claiming more, when the table's files are local: the one it is
+/// decoding plus one prefetched next, the minimum that keeps its pipeline
+/// overlapped. A row group's page decode runs only on the worker that claimed
+/// it (the decoder holds per-row-group state), so every claim beyond this
+/// bound serializes decode work on one worker while others may sit idle. That
+/// matters most when a scan has few row groups per worker: its wall time is
+/// `max claims per worker x per-row-group cost`, and a single worker hoarding
+/// a third row group while the queue runs dry sets the whole query's critical
+/// path.
+const MAX_PENDING_LOCAL_ROW_GROUPS: usize = 2;
+
+/// The remote-file counterpart of [`MAX_PENDING_LOCAL_ROW_GROUPS`]. A remote
+/// claim spends most of its life waiting on the network, not decoding, so the
+/// hoarding concern above barely applies while read-ahead depth is the whole
+/// throughput game: a claim's reads must be in flight long before its decode
+/// is due, or every row group pays a full network round trip serially.
+const MAX_PENDING_REMOTE_ROW_GROUPS: usize = 16;
+
+/// How many undecoded row groups one worker may hold claims on while
+/// scanning `table`. Local tables keep claims minimal for decode fairness;
+/// tables with any remote file get read-ahead depth.
+pub fn pending_claim_bound(table: &crate::parquet::ParquetTable) -> usize {
+    let any_remote = table
+        .row_groups()
+        .iter()
+        .any(|rg| matches!(rg.location, dispatch::io::FileLocation::Remote(_)));
+    if any_remote {
+        MAX_PENDING_REMOTE_ROW_GROUPS
+    } else {
+        MAX_PENDING_LOCAL_ROW_GROUPS
+    }
+}
+
 pub struct RowGroupFetcher {
     tracker: RequestTracker<RowGroupRequest>,
+    /// How many row groups this worker has claimed but not fully decoded.
+    /// Incremented here per claim, decremented by the worker's `Decoder` when
+    /// a row group finishes (or prunes), and consulted as claim backpressure.
+    pending_row_groups: Arc<AtomicUsize>,
+    /// The claim bound for this scan (see [`pending_claim_bound`]).
+    max_pending_row_groups: usize,
 }
 
 impl RowGroupFetcher {
+    pub fn new(pending_row_groups: Arc<AtomicUsize>, max_pending_row_groups: usize) -> Self {
+        Self {
+            tracker: RequestTracker::default(),
+            pending_row_groups,
+            max_pending_row_groups,
+        }
+    }
+
     /// A completed read: credit *every* row group waiting on it (they all need
     /// exactly that run, whose bytes are now committed), then emit any that are
     /// done. Credit all before emitting, so a row group listed twice — it needed
@@ -74,6 +123,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         request: RowGroupRequest,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
+        self.pending_row_groups.fetch_add(1, Ordering::Relaxed);
         let slot = self.tracker.admit_request(request);
         // A fully-cached row group has no pending reads and is already done.
         self.emit_if_complete(slot, sender)?;
@@ -91,6 +141,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
     fn ready_for_more_work(&mut self) -> bool {
         self.tracker.disk_in_flight() < MAX_DISK_IN_FLIGHT
             && self.tracker.http_in_flight() < crate::parquet::http_readahead()
+            && self.pending_row_groups.load(Ordering::Relaxed) < self.max_pending_row_groups
     }
 
     fn process_fs_response<S: Sender<RowGroupBuffer>>(

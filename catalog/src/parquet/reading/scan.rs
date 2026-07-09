@@ -22,6 +22,7 @@ use crate::parquet::{
     CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
     MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
     RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
+    pending_claim_bound,
 };
 
 /// Append the index → decompress → decode stages onto a source of
@@ -32,6 +33,7 @@ pub(crate) fn read_parquet<OF>(
     batch_size: usize,
     add_row_group_metadata: bool,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    pending_row_groups: Vec<Arc<AtomicUsize>>,
 ) -> RecordBatchOperatorSpec
 where
     OF: OperatorFactory<RowGroupBuffer> + Send + 'static,
@@ -51,16 +53,26 @@ where
             return_to_worker_mpsc::<DecompressedPage>(n)
                 .into_iter()
                 .collect(),
-            (0..n)
-                .map(|_| DecoderFactory {
+            pending_row_groups
+                .into_iter()
+                .map(|pending| DecoderFactory {
                     batch_size,
                     projection: projection.clone(),
                     add_row_group_metadata,
                     eq_predicates: eq_predicates.clone(),
+                    pending_row_groups: pending,
                 })
                 .collect(),
         );
     RecordBatchOperatorSpec::from_spec(decoded)
+}
+
+/// One claimed-but-not-fully-decoded row-group counter per worker, shared by
+/// the worker's fetcher (increments and gates claims) and its decoder
+/// (decrements as row groups complete). See `RowGroupFetcher` for why claims
+/// are bounded this way.
+fn pending_row_group_counters(n: usize) -> Vec<Arc<AtomicUsize>> {
+    (0..n).map(|_| Arc::new(AtomicUsize::new(0))).collect()
 }
 
 /// A [`RecordBatchOperatorSpec`] that scans a Parquet table.
@@ -131,12 +143,15 @@ pub fn table_input_with_filter_and_eq_predicates(
         dispatcher.topology().node_count,
     );
     let siblings = Arc::new(AtomicUsize::new(n));
+    let pending_row_groups = pending_row_group_counters(n);
     // One fetcher handles disk and HTTP row groups, bounding each medium's
-    // in-flight count separately.
-    let factories: Vec<_> = (0..n)
-        .map(|_| {
+    // in-flight count separately, plus its worker's undecoded-claims count.
+    let claim_bound = pending_claim_bound(table);
+    let factories: Vec<_> = pending_row_groups
+        .iter()
+        .map(|pending| {
             RootUnaryOperatorFactory::new(
-                RowGroupFetcherFactory::new(),
+                RowGroupFetcherFactory::new(pending.clone(), claim_bound),
                 injector.clone(),
                 siblings.clone(),
             )
@@ -149,6 +164,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
         eq_predicates,
+        pending_row_groups,
     )
 }
 
@@ -166,10 +182,13 @@ pub fn materialize(
     let siblings_materializer = Arc::new(AtomicUsize::new(n));
     let siblings_fetcher = Arc::new(AtomicUsize::new(n));
 
+    let pending_row_groups = pending_row_group_counters(n);
+    let claim_bound = pending_claim_bound(&table);
     let factories: Vec<_> = stealable::<RecordBatch>(dispatcher.topology())
         .into_iter()
         .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
-        .map(|(rb_ch, rq_ch)| {
+        .zip(pending_row_groups.iter())
+        .map(|((rb_ch, rq_ch), pending)| {
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(
                     RecordBatchFactoryBridge::new(heads.pop_front().unwrap()),
@@ -177,7 +196,7 @@ pub fn materialize(
                     rb_ch,
                     siblings_materializer.clone(),
                 ),
-                RowGroupFetcherFactory::new(),
+                RowGroupFetcherFactory::new(pending.clone(), claim_bound),
                 rq_ch,
                 siblings_fetcher.clone(),
             )
@@ -190,5 +209,6 @@ pub fn materialize(
         RECORD_BATCH_SIZE,
         false,
         Arc::new(Vec::new()),
+        pending_row_groups,
     )
 }

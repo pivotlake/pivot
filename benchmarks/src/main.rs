@@ -145,12 +145,7 @@ fn canonicalise_query(input: &str) -> String {
 }
 
 fn workers_or_default(arg: Option<usize>) -> usize {
-    arg.or_else(|| core_affinity::get_core_ids().map(|ids| ids.len()))
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        })
+    arg.unwrap_or_else(dispatch::default_worker_count)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

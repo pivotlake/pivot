@@ -35,7 +35,6 @@ use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
-use dispatch::worker::WORKER_IDX;
 
 pub type IndexerFactory = DefaultUnaryFactory<Indexer>;
 
@@ -74,91 +73,102 @@ enum PagePayload {
     Decompressed(Vec<Bytes>),
 }
 
-/// Build one `CompressedPage`, attaching the current query's filter mask and
-/// advancing `cursor`.
-fn build_page(
+/// Carries the context for emitting one column's pages: the column's
+/// identity, the query's view of the row group, the worker that claimed it,
+/// and the running [`PageCursor`] threaded across the column's parts.
+struct ColumnPageBuilder {
     col_idx: usize,
-    query_row_group_metadata: &QueryRowGroupMetadata,
-    file_offset: usize,
-    span: usize,
-    header: PageHeader,
-    payload: PagePayload,
-    cursor: &mut PageCursor,
-) -> CompressedPage {
-    let (page_idx, row_offset) = cursor.advance(&header);
-    let filter_mask = (header.r#type == PageType::DATA_PAGE)
-        .then(|| {
-            query_row_group_metadata
-                .filtered_indices()
-                .as_ref()
-                .map(|f| {
-                    FilterMask::new(
-                        row_offset,
-                        row_offset + header.data_page_num_values() as u32,
-                        f,
-                    )
-                })
-        })
-        .flatten();
-    let (data, decompressed) = match payload {
-        PagePayload::Compressed(bytes) => (bytes, None),
-        PagePayload::Decompressed(bytes) => (Vec::new(), Some(bytes)),
-    };
-
-    CompressedPage {
-        worker_id: WORKER_IDX.get(),
-        row_group: query_row_group_metadata.clone(),
-        column_idx: col_idx,
-        file_offset,
-        span,
-        page_idx,
-        data,
-        decompressed,
-        filter_mask,
-        header,
-    }
+    query_row_group_metadata: QueryRowGroupMetadata,
+    worker_id: usize,
+    cursor: PageCursor,
 }
 
-/// Walk a `Compressed` part's raw byte stream and Thrift-parse it into pages,
-/// appending each to `pages`. Each iteration reads a page header, then slices out
-/// the compressed payload via [`MultiBufferReader::copy_out_buffers`] (zero-copy).
-fn parse_compressed_pages(
-    col_idx: usize,
-    part_offset: usize,
-    query_row_group_metadata: &QueryRowGroupMetadata,
-    buffers: &[Bytes],
-    cursor: &mut PageCursor,
-    pages: &mut Vec<CompressedPage>,
-) -> Result<(), ParquetError> {
-    let mut position = ReaderPosition::default();
-    let buffers_length = buffers.len();
-    let mut reader = MultiBufferReader::new(buffers, &mut position);
-    loop {
-        // Bytes consumed so far = this page's offset within the part, which the
-        // part's own file offset turns into the page's absolute file offset.
-        let page_start = reader.consumed();
-        let header = {
-            let mut prot = ThriftReadInputProtocol::new(&mut reader);
-            PageHeader::read_thrift_without_stats(&mut prot)?
+impl ColumnPageBuilder {
+    /// Build one `CompressedPage`, attaching the current query's filter mask
+    /// and advancing the cursor.
+    fn build_page(
+        &mut self,
+        file_offset: usize,
+        span: usize,
+        header: PageHeader,
+        payload: PagePayload,
+    ) -> CompressedPage {
+        let (page_idx, row_offset) = self.cursor.advance(&header);
+        let filter_mask = (header.r#type == PageType::DATA_PAGE)
+            .then(|| {
+                self.query_row_group_metadata
+                    .filtered_indices()
+                    .as_ref()
+                    .map(|f| {
+                        FilterMask::new(
+                            row_offset,
+                            row_offset + header.data_page_num_values() as u32,
+                            f,
+                        )
+                    })
+            })
+            .flatten();
+        let (data, decompressed) = match payload {
+            PagePayload::Compressed(bytes) => (bytes, None),
+            PagePayload::Decompressed(bytes) => (Vec::new(), Some(bytes)),
         };
-        let data = reader.copy_out_buffers(header.compressed_page_size as usize);
-        let span = reader.consumed() - page_start;
 
-        pages.push(build_page(
-            col_idx,
-            query_row_group_metadata,
-            part_offset + page_start,
+        CompressedPage {
+            // This is the claimer, not necessarily this worker: the indexer
+            // often runs on a stealing sibling, but the decode must return to
+            // the worker that claimed the row group (it owns the decoder
+            // state and the claim accounting).
+            worker_id: self.worker_id,
+            row_group: self.query_row_group_metadata.clone(),
+            column_idx: self.col_idx,
+            file_offset,
             span,
+            page_idx,
+            data,
+            decompressed,
+            filter_mask,
             header,
-            PagePayload::Compressed(data),
-            cursor,
-        ));
-
-        if reader.remaining_in_cur() == 0 && reader.position().buffer_index == buffers_length - 1 {
-            break;
         }
     }
-    Ok(())
+
+    /// Walk a `Compressed` part's raw byte stream and Thrift-parse it into pages,
+    /// appending each to `pages`. Each iteration reads a page header, then slices out
+    /// the compressed payload via [`MultiBufferReader::copy_out_buffers`] (zero-copy).
+    fn parse_compressed_pages(
+        &mut self,
+        part_offset: usize,
+        buffers: &[Bytes],
+        pages: &mut Vec<CompressedPage>,
+    ) -> Result<(), ParquetError> {
+        let mut position = ReaderPosition::default();
+        let buffers_length = buffers.len();
+        let mut reader = MultiBufferReader::new(buffers, &mut position);
+        loop {
+            // Bytes consumed so far = this page's offset within the part, which the
+            // part's own file offset turns into the page's absolute file offset.
+            let page_start = reader.consumed();
+            let header = {
+                let mut prot = ThriftReadInputProtocol::new(&mut reader);
+                PageHeader::read_thrift_without_stats(&mut prot)?
+            };
+            let data = reader.copy_out_buffers(header.compressed_page_size as usize);
+            let span = reader.consumed() - page_start;
+
+            pages.push(self.build_page(
+                part_offset + page_start,
+                span,
+                header,
+                PagePayload::Compressed(data),
+            ));
+
+            if reader.remaining_in_cur() == 0
+                && reader.position().buffer_index == buffers_length - 1
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Build one column's pages, in file order, from its resolved parts.
@@ -166,32 +176,30 @@ fn build_column_pages(
     col_idx: usize,
     query_row_group_metadata: QueryRowGroupMetadata,
     parts: Vec<ColumnPart>,
+    worker_id: usize,
 ) -> Result<Vec<CompressedPage>, ParquetError> {
-    let mut cursor = PageCursor::default();
+    let mut builder = ColumnPageBuilder {
+        col_idx,
+        query_row_group_metadata,
+        worker_id,
+        cursor: PageCursor::default(),
+    };
     let mut pages = Vec::with_capacity(128);
     for part in parts {
         match part {
-            ColumnPart::Compressed { offset, bytes } => parse_compressed_pages(
-                col_idx,
-                offset,
-                &query_row_group_metadata,
-                &bytes,
-                &mut cursor,
-                &mut pages,
-            )?,
+            ColumnPart::Compressed { offset, bytes } => {
+                builder.parse_compressed_pages(offset, &bytes, &mut pages)?
+            }
             ColumnPart::Decompressed {
                 offset,
                 span,
                 header,
                 data,
-            } => pages.push(build_page(
-                col_idx,
-                &query_row_group_metadata,
+            } => pages.push(builder.build_page(
                 offset,
                 span,
                 *header,
                 PagePayload::Decompressed(data),
-                &mut cursor,
             )),
         }
     }
@@ -208,7 +216,9 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             .columns
             .into_iter()
             .enumerate()
-            .map(|(col_idx, parts)| build_column_pages(col_idx, buffer.metadata.clone(), parts))
+            .map(|(col_idx, parts)| {
+                build_column_pages(col_idx, buffer.metadata.clone(), parts, buffer.worker_id)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::parquet::op_err)?;
 
@@ -331,6 +341,7 @@ mod tests {
         RowGroupBuffer {
             metadata: dummy_metadata(filtered_indices),
             columns,
+            worker_id: 0,
         }
     }
 
