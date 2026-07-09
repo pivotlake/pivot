@@ -169,6 +169,15 @@ impl GroupLimit {
 /// large pool doesn't idle behind too few jobs.
 const PARTITIONS: usize = 64;
 
+/// Minimum merge input (source-table slots scanned) per merge job. Each job
+/// walks its slice of every source table and pays a fixed setup cost (a slab
+/// buffer, a target table, its output batches), so below this much input per
+/// job, more jobs just multiply setup: a group-by with a handful of groups
+/// would otherwise fan out into the full worker-count floor of near-empty
+/// jobs. The cap only bites on small inputs; anything sizable saturates the
+/// floor anyway.
+const MIN_MERGE_INPUT_SLOTS_PER_JOB: usize = 16 * 1024;
+
 /// Compute the merge-phase partition floor. The merge uses at least
 /// [`PARTITIONS`] partitions and at least one job per contributing worker
 /// (rounded up to a power of two, which the hash-top-bits partitioning
@@ -579,10 +588,19 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         let (num_partitions, partition_capacity) = if !any_switched {
             // No worker switched to radix, so every group still sits in an in-place
             // table. Run a partition_floor-way merge, each job sized to its share of
-            // the total group count.
+            // the total group count - but never fan out further than the input
+            // volume justifies (see MIN_MERGE_INPUT_SLOTS_PER_JOB).
+            let input_slots: usize = tables_by_node.iter().flatten().map(|t| t.capacity()).sum();
+            // The count never drops below 2: the merge routes rows by their
+            // hash's top `log2(partitions)` bits, and a 0-bit partition id
+            // has no valid shift (and no benefit over 2 near-empty jobs).
+            let volume_cap = (input_slots / MIN_MERGE_INPUT_SLOTS_PER_JOB)
+                .max(2)
+                .next_power_of_two();
+            let partitions = partition_floor.min(volume_cap);
             (
-                partition_floor,
-                (total_in_place / partition_floor)
+                partitions,
+                (total_in_place / partitions)
                     .next_power_of_two()
                     .max(DEFAULT_CAPACITY),
             )

@@ -213,7 +213,7 @@ impl DataFlowDispatcher {
         }
         // Wake idle workers on every node so they pick up the new dataflow
         // without waiting out their park.
-        self.waker_set.notify_all();
+        self.waker_set.notify_all_delegated();
         Dispatched {
             wakers: self.waker_set.clone(),
         }
