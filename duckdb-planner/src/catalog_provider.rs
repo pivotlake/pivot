@@ -77,9 +77,15 @@ pub struct ScalarFunctionDef {
 }
 
 pub trait DuckDBBind {
-    /// Given a table name, return a table/object that implements [`DuckDBTable`] with column definitions.
-    /// Returns `None` if the table doesn't exist.
-    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>>;
+    /// Given a table name, return a table/object that implements [`DuckDBTable`]
+    /// with column definitions, or `None` if the table doesn't exist.
+    ///
+    /// `statement_handle` is an opaque per-statement context the bridge threads
+    /// from [`extract_plan`](crate::PlannerContext::plan) through the DuckDB
+    /// transaction to here (`0` when none was set). A provider that resolves
+    /// tables against a per-statement view reinterprets it; one that doesn't
+    /// ignores it.
+    fn try_bind(&self, name: &str, statement_handle: usize) -> Option<Box<dyn DuckDBTable>>;
 
     /// Given a function name, return its binding signature, or `None` if the
     /// provider has no such table function. The bridge registers it on demand
@@ -115,8 +121,12 @@ impl CatalogContext {
     }
 }
 
-pub(crate) fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetTableResult {
-    match ctx.provider.try_bind(name) {
+pub(crate) fn catalog_get_table(
+    ctx: &CatalogContext,
+    name: &str,
+    statement_handle: usize,
+) -> CatalogGetTableResult {
+    match ctx.provider.try_bind(name, statement_handle) {
         Some(table) => {
             let columns = table.duckdb_typed_columns();
             CatalogGetTableResult {

@@ -70,14 +70,18 @@ pub struct CreateTableRequest {
     pub if_not_exists: bool,
 }
 
-/// An opaque per-query context, created once per [`Plan::compile`](crate::Plan::compile)
-/// (via [`Catalog::query_context`]) and threaded to every [`Table::compile`]. The
-/// planner treats it as a black box; a backend's [`Table`] downcasts it to its
-/// own concrete context and reads whatever it needs. The catalog, for instance,
-/// uses it to reload + pin each table's files once per query — so a reused
-/// (cached) plan sees data committed since it was planned, and a scan and its
-/// late materialize share one snapshot.
-pub trait QueryContext {
+/// An opaque pinned catalog snapshot a query reads. One is minted (via
+/// [`Catalog::query_context`]) for binding, and a fresh one again for
+/// [`Plan::compile`](crate::Plan::compile) — so a reused (cached) plan compiles
+/// against the latest snapshot rather than the one it was first bound against.
+/// Within compile the single context is threaded to every [`Table::compile`], so
+/// all of a query's scans read one consistent immutable view. The planner treats
+/// it as a black box; a backend's [`Table`] downcasts it to its own concrete
+/// context. The catalog, for instance, recovers the snapshot's per-table row
+/// groups from it.
+///
+/// `Send + Sync` because the binder holds it across the FFI planning callbacks.
+pub trait QueryContext: Send + Sync {
     /// Downcast hook. The trait carries no behaviour of its own — a backend
     /// recovers its concrete context from this and reads whatever it needs.
     fn as_any(&self) -> &dyn Any;
@@ -242,16 +246,20 @@ impl DuckDBTable for DuckDBTableAdapter {
 /// table) on the coordinator and returns the dataflow plan that *writes* the
 /// result into the catalog when executed.
 pub trait Catalog: Debug + Send + Sync {
-    /// Resolve a table name to a fresh, independently-mutable [`Table`], or
-    /// `None` if no such table exists. Each call returns a unique `Box`, so
-    /// per-query filter pushdown can mutate the table without affecting
-    /// concurrent queries.
-    fn table(&self, name: &str) -> Option<Box<dyn Table>>;
+    /// Resolve a table name to a fresh, independently-mutable [`Table`] against
+    /// the snapshot `ctx` pins, or `None` if no such table exists in it. Each
+    /// call returns a unique `Box`, so per-query filter pushdown can mutate the
+    /// table without affecting concurrent queries. `ctx` is the same context the
+    /// query later compiles against, so a table binds and scans against one view;
+    /// always-current backends ignore it.
+    fn table(&self, name: &str, ctx: &dyn QueryContext) -> Option<Box<dyn Table>>;
 
-    /// A fresh [`QueryContext`] for one [`Plan::compile`](crate::Plan::compile).
-    /// Default: an empty context, for always-current backends.
-    fn query_context(&self) -> Box<dyn QueryContext> {
-        Box::new(NoQueryContext)
+    /// The pinned snapshot [`QueryContext`] for one statement — minted before
+    /// planning, used for binding, and threaded to
+    /// [`Plan::compile`](crate::Plan::compile). Default: an empty context, for
+    /// always-current backends.
+    fn query_context(&self) -> Arc<dyn QueryContext> {
+        Arc::new(NoQueryContext)
     }
 
     /// Compile a `CREATE TABLE` statement into the dataflow that writes the new
@@ -281,13 +289,31 @@ pub trait Catalog: Debug + Send + Sync {
 /// Adapts a Pivot [`Catalog`] to DuckDB's [`DuckDBBind`] trait so DuckDB can
 /// resolve table names during SQL binding. Looks up the table on the wrapped
 /// catalog and wraps it in a [`DuckDBTableAdapter`].
+///
+/// Binding must resolve against the same snapshot the query compiles against,
+/// but DuckDB's bind callbacks take no context of their own. Rather than hold
+/// that per-statement snapshot in mutable adapter state, [`Planner`](crate::Planner)
+/// passes it into planning as an opaque handle that the bridge carries on the
+/// DuckDB transaction and hands back to [`try_bind`](DuckDBBind::try_bind) — so
+/// the adapter itself is immutable and shared freely.
 pub struct DuckDBCatalogAdapter {
     pub catalog: Arc<dyn Catalog>,
 }
 
 impl DuckDBBind for DuckDBCatalogAdapter {
-    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
-        let table = self.catalog.table(name)?;
+    fn try_bind(&self, name: &str, statement_handle: usize) -> Option<Box<dyn DuckDBTable>> {
+        // The bridge threads this statement's pinned snapshot context here as an
+        // opaque handle (see `Planner::plan`); `0` means none was bound, so no
+        // table can be resolved.
+        if statement_handle == 0 {
+            return None;
+        }
+        // SAFETY: the handle is the address of the `Box<Arc<dyn QueryContext>>`
+        // that `Planner::plan` keeps alive for the whole planning call, so this
+        // borrow is valid for the duration of `try_bind`.
+        let ctx: &Arc<dyn QueryContext> =
+            unsafe { &*(statement_handle as *const Arc<dyn QueryContext>) };
+        let table = self.catalog.table(name, ctx.as_ref())?;
         Some(Box::new(DuckDBTableAdapter { table }))
     }
 

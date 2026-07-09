@@ -17,28 +17,35 @@
 //!   current file list.
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
-//! per-file row groups at one log version; the flattened scan view a query sees
-//! is derived from those files on demand, so there is no cached copy to drift.
-//! A change swaps `version` + `files` whole. Resolving a table for a query
-//! ([`Catalog::table`]) first **reloads**: one LIST of the table's log
-//! directory; if a newer version exists, only the *new* files' footers are
-//! fetched (over the dispatch pool) and the new file set is swapped in — so a
-//! file registered by ingest, a compaction's swap, or even another process's
-//! commit becomes visible to the very next query.
+//! per-file row groups at one log version.
+//!
+//! Queries do not read `tables` or the object store on their path. Instead a
+//! background refresher rebuilds an immutable [`CatalogSnapshot`] — every table
+//! with all its files' row groups materialized — on an interval
+//! ([`ParquetCatalog::refresh_snapshot`]), advancing each table to its latest
+//! committed version and fetching only new files' footers. A statement pins the
+//! current snapshot for its whole life ([`Catalog::query_context`]) and reads it
+//! in memory for both binding and execution, so the query is internally
+//! consistent and pays no I/O to plan. The trade-off is bounded staleness: a
+//! file registered by ingest, a compaction's swap, or another process's commit
+//! becomes visible only at the next refresh — including this process's own
+//! `CREATE TABLE` and ingested rows.
 //!
 //! Each resolve hands back a fresh [`TableBinding`], so per-query filter
 //! pushdown accumulates on that binding alone.
 
 mod binding;
 mod metadata_function;
+mod snapshot;
 mod table;
 
 pub use binding::TableBinding;
+pub use snapshot::CatalogSnapshot;
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::manifest::{
     self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
@@ -49,8 +56,8 @@ use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
 use planner::TableFunction;
 use planner::catalog::{
-    Catalog, CreateTableRequest, Error as CatalogError, QueryContext, Result as CatalogResult,
-    Table,
+    Catalog, Column, CreateTableRequest, Error as CatalogError, QueryContext,
+    Result as CatalogResult, Table,
 };
 pub use table::CatalogTable;
 pub use table::TableFile;
@@ -128,6 +135,17 @@ pub struct ParquetCatalog {
     /// The worker pool every footer fetch runs on. Held by the catalog because
     /// reloads happen at query-bind time, where no dispatcher is passed in.
     dispatcher: DataFlowDispatcher,
+
+    /// The read-side view queries plan and execute against: an immutable,
+    /// fully-materialized [`CatalogSnapshot`] of every table's row groups,
+    /// rebuilt whole by the background refresher ([`refresh_snapshot`]) on an
+    /// interval. Queries never touch `tables` or the object store on their path;
+    /// they pin the current snapshot for the statement and read it in memory. A
+    /// swap here replaces the whole `Arc`; a statement already holding the prior
+    /// one keeps reading it until it finishes.
+    ///
+    /// [`refresh_snapshot`]: Self::refresh_snapshot
+    snapshot: RwLock<Arc<CatalogSnapshot>>,
 }
 
 impl std::fmt::Debug for ParquetCatalog {
@@ -150,6 +168,7 @@ impl ParquetCatalog {
             tables: Arc::new(RwLock::new(HashMap::new())),
             store: Arc::new(LocalStore::new(root)),
             dispatcher,
+            snapshot: RwLock::new(Arc::new(CatalogSnapshot::empty())),
         }
     }
 
@@ -168,11 +187,17 @@ impl ParquetCatalog {
             tables.insert(entry.name.clone(), table);
         }
 
-        Ok(Self {
+        let catalog = Self {
             tables: Arc::new(RwLock::new(tables)),
             store,
             dispatcher: dispatcher.clone(),
-        })
+            snapshot: RwLock::new(Arc::new(CatalogSnapshot::empty())),
+        };
+        // Publish the initial read-side snapshot from the tables just loaded, so
+        // the first queries have a fully-materialized view before the background
+        // refresher's first tick.
+        catalog.refresh_snapshot()?;
+        Ok(catalog)
     }
 
     /// Build the in-memory [`CatalogTable`] for one persisted table: read its
@@ -205,9 +230,11 @@ impl ParquetCatalog {
         ))
     }
 
-    /// Resolve `name` to a fresh [`TableBinding`] (same semantics as
-    /// [`Catalog::table`] *minus the reload*, and typed). Useful for callers
-    /// (and tests) that need state the [`Table`] trait does not expose.
+    /// Resolve `name` against the live write-side `tables` map (not the query
+    /// snapshot) into a fresh, typed [`TableBinding`]. Unlike [`Catalog::table`],
+    /// which binds against a statement's pinned snapshot, this sees a table the
+    /// instant it is created — so it is for callers (and tests) that want the
+    /// write-side existence authority rather than the bounded-stale read view.
     pub fn binding(&self, name: &str) -> Option<TableBinding> {
         let columns = self.tables.read().unwrap().get(name)?.columns();
         Some(TableBinding::new(name.to_string(), columns))
@@ -240,6 +267,80 @@ impl ParquetCatalog {
     /// (e.g. the compacter) that refreshes and evolves each one independently.
     pub fn tables(&self) -> Vec<CatalogTable> {
         self.tables.read().unwrap().values().cloned().collect()
+    }
+
+    /// The current read-side [`CatalogSnapshot`], pinned by `Arc` clone. A
+    /// statement takes one here and reads it for its whole life; a concurrent
+    /// [`refresh_snapshot`](Self::refresh_snapshot) that publishes a newer one
+    /// does not disturb it.
+    pub fn current_snapshot(&self) -> Arc<CatalogSnapshot> {
+        self.snapshot.read().unwrap().clone()
+    }
+
+    /// Rebuild the read-side snapshot from the latest committed state of every
+    /// table and publish it whole — the background refresher's tick.
+    ///
+    /// For each table it advances a copy to its newest manifest version and
+    /// fetches any new files' footers, reusing everything already loaded; a table
+    /// whose manifest did not advance keeps its existing `Arc<CatalogTable>`, so
+    /// an idle table costs no work or memory. All footer I/O happens here, off
+    /// the query path, so a query later reads a fully-materialized view in
+    /// memory. A table that fails to reload (a transient store error) keeps its
+    /// last good copy rather than vanishing from the snapshot or aborting the
+    /// whole refresh.
+    pub fn refresh_snapshot(&self) -> Result<()> {
+        let previous = self.current_snapshot();
+        let names: Vec<String> = self.tables.read().unwrap().keys().cloned().collect();
+        let mut tables = HashMap::with_capacity(names.len());
+        for name in names {
+            let table = match previous.table(&name) {
+                // Peek the manifest first and only clone + re-materialize when it
+                // advanced; an idle table just shares its existing `Arc`, so a
+                // catalog of mostly-idle tables does no per-tick copying.
+                Some(existing) => {
+                    let advanced = existing.newer_manifest().and_then(|newer| {
+                        newer
+                            .map(|manifest| {
+                                let mut table = (**existing).clone();
+                                table.apply_manifest(manifest).map(|()| Arc::new(table))
+                            })
+                            .transpose()
+                    });
+                    match advanced {
+                        Ok(Some(table)) => table,
+                        Ok(None) => existing.clone(),
+                        Err(error) => {
+                            tracing::warn!(
+                                table = %name,
+                                %error,
+                                "catalog snapshot refresh failed for table; keeping last good copy"
+                            );
+                            existing.clone()
+                        }
+                    }
+                }
+                // A table first seen since the last refresh: load it in full.
+                None => {
+                    let Some(mut table) = self.table_handle(&name) else {
+                        continue;
+                    };
+                    match table.refresh() {
+                        Ok(_) => Arc::new(table),
+                        Err(error) => {
+                            tracing::warn!(
+                                table = %name,
+                                %error,
+                                "catalog snapshot refresh failed for new table; skipping this tick"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            tables.insert(name, table);
+        }
+        *self.snapshot.write().unwrap() = Arc::new(CatalogSnapshot::new(tables));
+        Ok(())
     }
 
     /// A human-readable description of where this database is rooted (local
@@ -392,20 +493,23 @@ impl ParquetCatalog {
 }
 
 impl Catalog for ParquetCatalog {
-    /// Resolve `name` to a [`TableBinding`]: it carries the table's schema and
-    /// (after pushdown) this query's predicates, but no file set. The files are
-    /// read from the query's [`ParquetQueryContext`] when it compiles, so a
-    /// reused (cached) plan always scans the latest committed files. Resolving
-    /// here is pure in-memory and does no I/O. Each binding is its own value, so
-    /// per-query filter pushdown prunes its view without affecting other queries.
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        Some(Box::new(self.binding(name)?))
+    /// Resolve `name` against the statement's pinned snapshot into a
+    /// [`TableBinding`]: it carries the table's schema and (after pushdown) this
+    /// query's predicates, but no file set. The schema comes from `ctx`'s
+    /// snapshot — the same one the query compiles against — so a table not yet in
+    /// the snapshot (created since the last refresh) does not bind, rather than
+    /// binding here and failing at compile. The files are read from the same
+    /// snapshot when it compiles. Each binding is its own value, so per-query
+    /// filter pushdown prunes its view without affecting other queries.
+    fn table(&self, name: &str, ctx: &dyn QueryContext) -> Option<Box<dyn Table>> {
+        let ctx = ctx.as_any().downcast_ref::<ParquetQueryContext>()?;
+        let columns = ctx.schema(name)?;
+        Some(Box::new(TableBinding::new(name.to_string(), columns)))
     }
 
-    fn query_context(&self) -> Box<dyn QueryContext> {
-        Box::new(ParquetQueryContext {
-            tables: self.tables.clone(),
-            pinned: Mutex::new(HashMap::new()),
+    fn query_context(&self) -> Arc<dyn QueryContext> {
+        Arc::new(ParquetQueryContext {
+            snapshot: self.current_snapshot(),
         })
     }
 
@@ -427,91 +531,63 @@ impl Catalog for ParquetCatalog {
     }
 }
 
-/// One pinned scan view per `(table name, partition filter)`. The filter
-/// half is each `(column, JSON constant)` sorted, the hashable form of the
-/// predicates.
-type PinnedScanViews = HashMap<(String, Vec<(String, String)>), Arc<ParquetTable>>;
-
-/// One query's [`QueryContext`]: the concrete context a [`TableBinding`]
-/// downcasts to. The first time a scan asks for a table it reloads the master to
-/// the latest committed version and pins the resulting row groups; later asks
-/// (the same table's late materialize, or a self-join) return that same pinned
-/// `Arc`. So each table reloads at most once per query and every scan of it sees
-/// one consistent snapshot.
+/// One statement's [`QueryContext`]: the pinned [`CatalogSnapshot`] a
+/// [`TableBinding`] downcasts to. Every table reference in the statement — its
+/// schema at bind, its row groups at compile, a self-join's second scan, a late
+/// materialize — reads this one immutable view, so the whole query is consistent
+/// by construction and never touches the object store on its path. Cloning the
+/// `Arc` here is what keeps the snapshot alive for the query even as the
+/// background refresher publishes newer ones.
 pub(super) struct ParquetQueryContext {
-    tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    /// One pinned scan view per `(table, its partition filter)`. The key groups
-    /// exactly the asks that must agree: a scan and its later materialize share a
-    /// `(name, filters)`, so they pin the same view and address the same row-group
-    /// indices. Different filters (a self-join's branches) get their own views,
-    /// which is correct — they never share an index space. The filter half is each
-    /// `(column, JSON constant)` sorted, the hashable form of the predicates.
-    pinned: Mutex<PinnedScanViews>,
+    snapshot: Arc<CatalogSnapshot>,
 }
 
 impl ParquetQueryContext {
-    /// Table `name`'s committed row groups for the files that can match
-    /// `partition_filters` — the partition-pruned scan view, pinned on first ask
-    /// and returned from the pin thereafter. Footers are fetched lazily here, only
-    /// for the surviving partitions, so a one-partition query never reads every
-    /// other partition's footer. Errors if the table no longer exists (dropped
-    /// since planning) or the reload fails, rather than scanning a stale or empty
-    /// file set.
+    /// Table `name`'s row groups for the files that can match
+    /// `partition_filters`, as a partition-pruned scan view built from the
+    /// snapshot's already-loaded footers — pure in-memory, no I/O. Errors if the
+    /// table is not in the snapshot (created since the last refresh, or dropped),
+    /// rather than scanning an empty file set.
     pub(super) fn parquet(
         &self,
         name: &str,
         partition_filters: impl Iterator<Item = PartitionEqFilter>,
     ) -> CatalogResult<Arc<ParquetTable>> {
         let filters: Vec<PartitionEqFilter> = partition_filters.collect();
-        let mut key_filters: Vec<(String, String)> = filters
-            .iter()
-            .map(|f| (f.column.clone(), f.value.to_string()))
-            .collect();
-        key_filters.sort(); // filter order doesn't change the view
-        let key = (name.to_string(), key_filters);
-        if let Some(parquet) = self.pinned.lock().unwrap().get(&key) {
-            return Ok(parquet.clone());
-        }
-
-        // Build the view: take the master copy, advance its manifest (no footer
-        // I/O), then fetch footers for just the surviving partitions.
-        let mut table = self
-            .tables
-            .read()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                CatalogError::Other(
-                    format!("table {name:?} no longer exists (dropped since planning?)").into(),
+        let table = self.snapshot.table(name).ok_or_else(|| {
+            CatalogError::Other(
+                format!(
+                    "table {name:?} is not in the current catalog snapshot \
+                     (created since the last refresh, or dropped?)"
                 )
-            })?;
-        table
-            .reload_manifest_only()
-            .map_err(|e| CatalogError::Other(Box::new(e)))?;
-        let parquet = table
-            .parquet(&filters)
-            .map_err(|e| CatalogError::Other(Box::new(e)))?;
-        // Publish the warmed copy (advanced version + the footers just fetched) so
-        // a later query starts current and re-fetches nothing it already holds.
-        self.tables.write().unwrap().insert(name.to_string(), table);
-        self.pinned.lock().unwrap().insert(key, parquet.clone());
-        Ok(parquet)
+                .into(),
+            )
+        })?;
+        Ok(table.scan_view(&filters))
     }
 
     /// Per-file row groups (path + its row groups, manifest order) for the
-    /// `metadata()` table function. Call after [`parquet`](Self::parquet) has
-    /// warmed the table so its footers are loaded.
+    /// `metadata()` table function, straight from the snapshot.
     pub(super) fn file_row_groups(
         &self,
         name: &str,
     ) -> Vec<(String, Vec<Arc<crate::parquet::RowGroupMetadata>>)> {
-        self.tables
-            .read()
-            .unwrap()
-            .get(name)
+        self.snapshot
+            .table(name)
             .map(|table| table.file_row_groups())
             .unwrap_or_default()
+    }
+
+    /// Table `name`'s columns (schema) in this snapshot — the bind-time lookup.
+    /// `None` if the table is not visible in this snapshot yet.
+    pub(super) fn schema(&self, name: &str) -> Option<Vec<Column>> {
+        self.snapshot.table(name).map(|table| table.columns())
+    }
+
+    /// Whether table `name` is present in this snapshot — a cheap existence
+    /// check that materializes no scan view.
+    pub(super) fn contains_table(&self, name: &str) -> bool {
+        self.snapshot.table(name).is_some()
     }
 }
 

@@ -30,7 +30,7 @@ impl DuckDBTable for UsersTable {
 struct TestCatalog;
 
 impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+    fn try_bind(&self, table_name: &str, _statement_handle: usize) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
             "users" => Some(Box::new(UsersTable)),
             _ => None,
@@ -66,7 +66,7 @@ fn no_memory_leak_across_repeated_plans() {
 
                 for i in 0..per_thread {
                     let plan = ctx
-                        .plan("SELECT id, name FROM users WHERE age <> 0")
+                        .plan("SELECT id, name FROM users WHERE age <> 0", 0)
                         .unwrap();
                     assert_eq!(
                         plan.root().op_type(),

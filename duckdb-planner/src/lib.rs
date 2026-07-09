@@ -32,7 +32,7 @@
 //! struct MyCatalog;
 //!
 //! impl DuckDBBind for MyCatalog {
-//!     fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
+//!     fn try_bind(&self, name: &str, _statement_handle: usize) -> Option<Box<dyn DuckDBTable>> {
 //!         match name {
 //!             "users" => Some(Box::new(UsersTable)),
 //!             _ => None,
@@ -43,7 +43,7 @@
 //! let mut ctx = PlannerContext::new(Arc::new(MyCatalog));
 //!
 //! // Plan a query; walk the root handle.
-//! let plan = ctx.plan("SELECT name FROM users").unwrap();
+//! let plan = ctx.plan("SELECT name FROM users", 0).unwrap();
 //! let root = plan.root();
 //! assert_eq!(root.op_type(), LogicalOperatorType::LOGICAL_PROJECTION);
 //! ```
@@ -126,8 +126,14 @@ impl PlannerContext {
     /// Plan a SQL query: sends the query to DuckDB and returns a [`Plan`] handle
     /// owning the resolved logical plan. The caller walks it through
     /// [`Plan::root`] and the [`LogicalOp`]/[`Expr`] accessors.
-    pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
-        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query);
+    ///
+    /// `statement_handle` is an opaque per-statement context pointer passed to
+    /// the catalog provider's [`try_bind`](crate::catalog_provider::DuckDBBind::try_bind)
+    /// during binding (the bridge carries it on the DuckDB transaction). Pass `0`
+    /// if the provider needs no per-statement context. The pointer must stay
+    /// valid for the duration of this call.
+    pub fn plan(&mut self, query: &str, statement_handle: usize) -> Result<Plan, Error> {
+        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, statement_handle);
         if !result.error_kind.is_empty() {
             return Err(bridge_error(&result));
         }

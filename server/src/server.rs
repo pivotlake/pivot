@@ -26,6 +26,7 @@ use pgwire::tokio::process_socket;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::{JoinError, JoinSet};
@@ -44,6 +45,11 @@ pub enum Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// How often the background task rebuilds the read-side catalog snapshot.
+/// Queries read the last-published snapshot, so this sets the upper bound on how
+/// stale a freshly-ingested file or a compaction swap can be to a reader.
+const SNAPSHOT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A pivotdb server instance.
 ///
@@ -147,6 +153,31 @@ impl Server {
             self.compact_min_files,
         )?;
 
+        // Rebuild the read-side catalog snapshot on an interval. Queries plan and
+        // execute against the last-published snapshot, so this background rebuild
+        // is what makes newly-ingested files and compaction swaps visible to
+        // readers (after a bounded delay). It fetches footers over the dispatch
+        // pool, so each rebuild runs on a blocking thread, not the async reactor.
+        let snapshot_refresher = {
+            let catalog = self.catalog.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(SNAPSHOT_REFRESH_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // The startup snapshot is already published, so wait one interval
+                // before the first rebuild rather than firing immediately.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    let catalog = catalog.clone();
+                    match tokio::task::spawn_blocking(move || catalog.refresh_snapshot()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => error!(?e, "catalog snapshot refresh failed"),
+                        Err(e) => error!(?e, "catalog snapshot refresh task panicked"),
+                    }
+                }
+            })
+        };
+
         // Optionally serve the bundled web dashboard. It reads the engine's live
         // state directly - the catalog, the ingestor's stats handle, and the
         // dispatcher (for the in-process query console). Read-only except
@@ -175,6 +206,7 @@ impl Server {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signalled, draining ingest then workers");
+                    snapshot_refresher.abort();
                     if let Some(task) = &http_task {
                         task.abort();
                     }
@@ -192,6 +224,7 @@ impl Server {
                 Some(joined) = self.worker_watchers.join_next() => {
                     // A worker died: flushing would hang on a dead worker, so
                     // stop the receivers without a final flush.
+                    snapshot_refresher.abort();
                     if let Some(task) = &http_task {
                         task.abort();
                     }

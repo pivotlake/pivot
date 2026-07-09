@@ -78,7 +78,15 @@ pub mod ffi {
     extern "Rust" {
         type CatalogContext;
         type OptionalTableWrapper;
-        fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetTableResult;
+        /// `statement_handle` is the opaque per-statement context the planner
+        /// threaded into [`extract_plan`], carried here by the DuckDB transaction
+        /// (see `PivotTransaction`). The provider reinterprets it to resolve the
+        /// table against that statement's catalog snapshot; `0` means none bound.
+        fn catalog_get_table(
+            ctx: &CatalogContext,
+            name: &str,
+            statement_handle: usize,
+        ) -> CatalogGetTableResult;
         fn catalog_get_table_function(
             ctx: &CatalogContext,
             name: &str,
@@ -110,7 +118,14 @@ pub mod ffi {
         type Value;
 
         fn new_context(catalog: Box<CatalogContext>) -> UniquePtr<DuckPlannerContext>;
-        fn extract_plan(ctx: Pin<&mut DuckPlannerContext>, query: &str) -> ExtractPlanResult;
+        /// `statement_handle` is an opaque per-statement context pointer; the
+        /// bridge stores it on the statement's DuckDB transaction so the catalog's
+        /// `LookupEntry` can hand it back to `catalog_get_table` during binding.
+        fn extract_plan(
+            ctx: Pin<&mut DuckPlannerContext>,
+            query: &str,
+            statement_handle: usize,
+        ) -> ExtractPlanResult;
 
         fn plan_root(plan: &PlanHandle) -> &LogicalOperator;
 

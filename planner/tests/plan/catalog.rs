@@ -68,7 +68,11 @@ struct SingleTableCatalog {
 }
 
 impl Catalog for SingleTableCatalog {
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+    fn table(
+        &self,
+        name: &str,
+        _ctx: &dyn planner::catalog::QueryContext,
+    ) -> Option<Box<dyn Table>> {
         (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn Table>)
     }
 

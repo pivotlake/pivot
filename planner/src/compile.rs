@@ -119,10 +119,10 @@ impl Plan {
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // A cached plan is re-run through here, so this is where it must pick up
-        // data committed since it was planned. The query context reloads each
-        // table a scan touches to its latest version the first time it compiles —
-        // lazily, and once per table, so a table feeding both a scan and a late
-        // materialize reloads a single time and both read one snapshot.
+        // the latest refreshed data. Minting the context here (rather than
+        // reusing the one binding used) pins the current catalog snapshot, so a
+        // reused plan scans the newest refresh, and every table a scan touches
+        // reads one consistent immutable view.
         let ctx = self.catalog.query_context();
         let mut slots = DynamicFilterSlots::new();
         let compiled = self

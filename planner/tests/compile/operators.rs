@@ -1567,7 +1567,11 @@ struct RecordingCatalog {
 }
 
 impl Catalog for RecordingCatalog {
-    fn table(&self, _name: &str) -> Option<Box<dyn Table>> {
+    fn table(
+        &self,
+        _name: &str,
+        _ctx: &dyn planner::catalog::QueryContext,
+    ) -> Option<Box<dyn Table>> {
         None
     }
 

@@ -19,7 +19,6 @@ use planner::types::Type;
 use planner::{TableFunction, TableFunctionSignature};
 
 use super::ParquetQueryContext;
-use crate::manifest::PartitionEqFilter;
 use crate::parquet::RowGroupMetadata;
 
 /// The output columns, in declared order. The single source of truth for both
@@ -80,11 +79,11 @@ impl TableFunction for MetadataTableFunction {
             .as_any()
             .downcast_ref::<ParquetQueryContext>()
             .ok_or_else(|| invalid("metadata() requires a parquet-backed catalog".to_string()))?;
-        // Warm the table (reload to latest + load every file's footer); metadata
-        // wants every file, so no partition filters are applied.
-        parquet_ctx
-            .parquet(table_name, std::iter::empty::<PartitionEqFilter>())
-            .map_err(|_| invalid(format!("table '{table_name}' does not exist")))?;
+        // Confirm the table is in the snapshot before reporting its row groups,
+        // without materializing a scan view we would only discard.
+        if !parquet_ctx.contains_table(table_name) {
+            return Err(invalid(format!("table '{table_name}' does not exist")));
+        }
 
         // Build straight from the catalog's per-file row groups, so each row
         // group's `file_name` is its real manifest path - no positional guessing.

@@ -60,7 +60,7 @@
 //! }
 //!
 //! impl Catalog for MyCatalog {
-//!     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+//!     fn table(&self, name: &str, _ctx: &dyn planner::catalog::QueryContext) -> Option<Box<dyn Table>> {
 //!         self.tables
 //!             .get(name)
 //!             .cloned()
@@ -118,7 +118,7 @@ mod test_support;
 pub mod types;
 use std::sync::Arc;
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, QueryContext};
 pub use operator::{Operator, SetVariable, TableFunction, TableFunctionSignature};
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;
@@ -164,9 +164,21 @@ impl Planner {
     ///
     /// The statement is first planned by DuckDB (which resolves references
     /// through the catalog), then the resulting plan handles are walked into a
-    /// Pivot [`PlanNode`] tree (see the `build` module).
+    /// Pivot [`PlanNode`] tree (see the `build` module). Binding resolves against
+    /// a freshly-minted snapshot context, passed into planning as an opaque
+    /// handle — a pointer to the boxed context, kept alive here for the whole
+    /// call and freed after — which the bridge carries on the DuckDB transaction
+    /// to `try_bind` (see [`DuckDBCatalogAdapter`]). So every table reference in
+    /// the statement resolves against one snapshot. That snapshot is used only to
+    /// resolve schema and is not stored on the returned plan; compile
+    /// independently pins the then-current snapshot, so a reused (cached) plan
+    /// always scans the latest refresh.
     pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
-        let planned = self.planner_context.plan(query)?;
+        let context: Box<Arc<dyn QueryContext>> = Box::new(self.catalog.query_context());
+        let statement_handle = &*context as *const Arc<dyn QueryContext> as usize;
+        let planned = self.planner_context.plan(query, statement_handle);
+        drop(context);
+        let planned = planned?;
         let mut root = build::build_plan(planned.root())?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();

@@ -12,6 +12,12 @@ class StorageExtensionInfo;
 class PivotTransaction : public duckdb::Transaction {
 public:
 	PivotTransaction(duckdb::TransactionManager &manager, duckdb::ClientContext &context);
+
+	// Opaque per-statement context pointer the Rust planner threaded into
+	// `extract_plan`. Set on the active transaction at the top of planning and
+	// read back in `PivotSchemaCatalogEntry::LookupEntry` to resolve tables
+	// against that statement's catalog snapshot. `0` when none was set.
+	size_t statement_context = 0;
 };
 
 class PivotTransactionManager : public duckdb::TransactionManager {

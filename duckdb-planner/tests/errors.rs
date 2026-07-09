@@ -25,7 +25,7 @@ impl DuckDBTable for TTable {
 struct TestCatalog;
 
 impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+    fn try_bind(&self, table_name: &str, _statement_handle: usize) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
             "t" => Some(Box::new(TTable)),
             _ => None,
@@ -40,7 +40,7 @@ fn create_simple_context() -> PlannerContext {
 #[test]
 fn invalid_syntax() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECTTT * FROM t");
+    let result = p.plan("SELECTTT * FROM t", 0);
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => {
@@ -53,7 +53,7 @@ fn invalid_syntax() {
 #[test]
 fn nonexistent_column() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT nonexistent_column FROM t");
+    let result = p.plan("SELECT nonexistent_column FROM t", 0);
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => {
@@ -66,7 +66,7 @@ fn nonexistent_column() {
 #[test]
 fn nonexistent_table() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT * FROM nonexistent_table");
+    let result = p.plan("SELECT * FROM nonexistent_table", 0);
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => assert!(e.exception_message.contains("nonexistent_table")),
@@ -77,7 +77,7 @@ fn nonexistent_table() {
 #[test]
 fn exception_location() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT * FROM nonexistent_table");
+    let result = p.plan("SELECT * FROM nonexistent_table", 0);
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => assert_eq!(e.position.unwrap(), "14"),

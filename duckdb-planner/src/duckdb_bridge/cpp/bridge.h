@@ -42,7 +42,7 @@ struct ExpressionList {
 };
 
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
-ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query);
+ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query, size_t statement_handle);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();

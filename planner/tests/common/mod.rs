@@ -135,7 +135,11 @@ impl TestCatalog {
 }
 
 impl Catalog for TestCatalog {
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+    fn table(
+        &self,
+        name: &str,
+        _ctx: &dyn ::planner::catalog::QueryContext,
+    ) -> Option<Box<dyn Table>> {
         self.tables
             .lock()
             .unwrap()

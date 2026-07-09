@@ -154,7 +154,7 @@ fn create_table_succeeds_with_valid_path() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    assert!(catalog.table("t").is_some());
+    assert!(catalog.binding("t").is_some());
 }
 
 #[test]
@@ -366,7 +366,11 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
 }
 
 /// Run `sql` through a planner over `catalog` and return the result batches.
+/// Queries read the catalog snapshot, which the server rebuilds on an interval;
+/// here we refresh it inline first so the query sees tables and files created in
+/// the test's setup.
 fn run_sql(catalog: &Arc<ParquetCatalog>, sql: &str) -> Vec<RecordBatch> {
+    catalog.refresh_snapshot().unwrap();
     let mut planner = Planner::new(catalog.clone() as Arc<dyn PlannerCatalog>);
     planner
         .plan(sql)

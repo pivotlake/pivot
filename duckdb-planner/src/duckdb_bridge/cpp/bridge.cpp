@@ -1,7 +1,9 @@
 #include "duckdb-planner/src/duckdb_bridge/mod.rs.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/bridge.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
+#include "duckdb-planner/src/duckdb_bridge/cpp/transaction_manager.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -145,7 +147,7 @@ PlanHandle::~PlanHandle() {
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        duckdb::vector<std::string> &result_names) {
+                        duckdb::vector<std::string> &result_names, size_t statement_handle) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
@@ -153,6 +155,13 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 	auto &context = *con.context;
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	context.RunFunctionInTransaction([&]() {
+		// Hand this statement's context to its transaction so the catalog's
+		// LookupEntry (called deep inside the binder, which we can't reach with a
+		// direct argument) can recover it while resolving table names.
+		auto &pivot_catalog = duckdb::Catalog::GetCatalog(context, "pv");
+		duckdb::Transaction::Get(context, pivot_catalog)
+		    .Cast<PivotTransaction>()
+		    .statement_context = statement_handle;
 		duckdb::Planner planner(context);
 		planner.CreatePlan(std::move(statements[0]));
 		// The binder resolves the client-facing result column names before
@@ -171,7 +180,7 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 	return plan;
 }
 
-ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
+ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query, size_t statement_handle) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
 	std::optional<ExtractPlanResult> error;
@@ -180,7 +189,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
 		std::string query_str(query.data(), query.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list);
+		plan = extract_plan_with_names(ctx.con, query_str, name_list, statement_handle);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. This is the standard resolution DuckDB runs before execution;

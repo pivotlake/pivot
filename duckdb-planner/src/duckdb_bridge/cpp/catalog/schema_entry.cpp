@@ -1,6 +1,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/schema_entry.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/catalog.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
+#include "duckdb-planner/src/duckdb_bridge/cpp/transaction_manager.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/common.h"
 
@@ -121,7 +122,14 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		return PivotStorageInfo::Get(db_instance).AddScalarFunctionEntry(std::move(entry));
 	}
 
-	auto result = catalog_get_table(*pivot_catalog.catalog_ctx, table_name);
+	// Recover this statement's context, stashed on its transaction by
+	// `extract_plan`, so the provider resolves the table against the right
+	// catalog snapshot. `0` (no transaction, or none set) means "none bound".
+	size_t statement_handle =
+	    transaction.transaction
+	        ? transaction.transaction->Cast<PivotTransaction>().statement_context
+	        : 0;
+	auto result = catalog_get_table(*pivot_catalog.catalog_ctx, table_name, statement_handle);
 
 	if (!result.found) {
 		return nullptr;
