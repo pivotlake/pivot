@@ -15,6 +15,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
+  # Bypass the kache rustc wrapper (.cargo/config.toml): kache is only
+  # installed on dev machines, and CI caching is handled by rust-cache.
+  RUSTC_WRAPPER: ""
 
 # The self-hosted runners live on the suspended `ci-runner-x86` GCP VM
 # (pivot-ci / me-west1-c) and advertise the `gcp-builder` label. They are
