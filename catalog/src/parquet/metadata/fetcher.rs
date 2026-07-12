@@ -17,7 +17,7 @@ use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
 use std::sync::Arc;
 
-const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
+const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 
 /// Disk-backed footer-read blocks outstanding per worker before admitting
 /// another file. Larger than a column-chunk read's depth: footers are small and
