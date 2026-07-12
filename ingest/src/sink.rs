@@ -276,12 +276,14 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         let path = ObjectPath::new(file_name.clone());
         let appended = tokio::task::spawn_blocking(move || {
             catalog.table_handle(&table).map(|mut handle| {
-                handle.append_data_file(
-                    path,
-                    &encoded.bytes,
-                    encoded.partition,
-                    encoded.sort_bounds,
-                )
+                handle
+                    .append_data_file(path, &encoded.bytes, encoded.partition, encoded.sort_bounds)
+                    .map(|()| {
+                        // Publish the committed copy so the very next query's
+                        // snapshot sees the rows, without waiting for the
+                        // background catalog refresh.
+                        catalog.publish_table(handle);
+                    })
             })
         })
         .await;

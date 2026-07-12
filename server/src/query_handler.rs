@@ -112,39 +112,59 @@ pub(crate) async fn execute_sql(
     dispatcher: dispatch::DataFlowDispatcher,
     sql: String,
 ) -> Result<Vec<arrow_array::RecordBatch>, String> {
-    let plan = {
-        let catalog = catalog.clone();
-        tokio::task::spawn_blocking(move || with_planner(&catalog, |p| p.plan(&sql)))
+    // One transaction per statement: the query binds and compiles against this
+    // snapshot of the catalog. Committed on success, rolled back on failure
+    // (the async block scopes the `?` early-returns so both paths land below).
+    let transaction = catalog.begin_transaction();
+    let result = async {
+        let plan = {
+            let catalog = catalog.clone();
+            let transaction = transaction.clone();
+            tokio::task::spawn_blocking(move || {
+                with_planner(&catalog, |p| p.plan(&sql, transaction))
+            })
             .await
             .map_err(|e| e.to_string())?
             .map_err(|e| e.to_string())?
-    };
-    // A SET/RESET compiles to no dataflow; nothing to return.
-    if plan.as_set_variable().is_some() {
-        return Ok(Vec::new());
-    }
-    let plan = Arc::new(plan);
-    // Compile and launch the dataflow (with the CopyOut cap) on the blocking
-    // pool; `execute_copying` returns the running handle without collecting.
-    let handle = tokio::task::spawn_blocking(
-        move || -> Result<DataFlowHandle<arrow_array::RecordBatch>, String> {
-            let spec = plan.compile(&dispatcher).map_err(|e| e.to_string())?;
-            Ok(spec.execute_copying())
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())??;
-
-    // If this future is dropped before collection finishes - e.g. the HTTP
-    // client aborted the request via the dashboard's Stop button - cancel the
-    // running dataflow so its workers stop instead of finishing a doomed query.
-    let guard = CancelOnDrop::new(handle.cancel_token());
-    let batches = tokio::task::spawn_blocking(move || handle.collect())
+        };
+        // A SET/RESET compiles to no dataflow; nothing to return.
+        if plan.as_set_variable().is_some() {
+            return Ok(Vec::new());
+        }
+        let plan = Arc::new(plan);
+        // Compile and launch the dataflow (with the CopyOut cap) on the blocking
+        // pool; `execute_copying` returns the running handle without collecting.
+        // The closure gets its own clone of the transaction Arc only because
+        // spawn_blocking moves its captures to another thread.
+        let handle = tokio::task::spawn_blocking({
+            let transaction = transaction.clone();
+            move || -> Result<DataFlowHandle<arrow_array::RecordBatch>, String> {
+                let spec = plan
+                    .compile(&dispatcher, transaction.as_ref())
+                    .map_err(|e| e.to_string())?;
+                Ok(spec.execute_copying())
+            }
+        })
         .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    guard.defuse();
-    Ok(batches)
+        .map_err(|e| e.to_string())??;
+
+        // If this future is dropped before collection finishes - e.g. the HTTP
+        // client aborted the request via the dashboard's Stop button - cancel the
+        // running dataflow so its workers stop instead of finishing a doomed query.
+        let guard = CancelOnDrop::new(handle.cancel_token());
+        let batches = tokio::task::spawn_blocking(move || handle.collect())
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        guard.defuse();
+        Ok(batches)
+    }
+    .await;
+    match &result {
+        Ok(_) => catalog.commit_transaction(transaction),
+        Err(_) => catalog.rollback_transaction(transaction),
+    }
+    result
 }
 
 #[derive(Debug, Error)]
@@ -211,11 +231,15 @@ pub struct PivotQueryHandler {
     dispatcher: dispatch::DataFlowDispatcher,
     /// Cache of planned (but not yet compiled) query plans, keyed by SQL text.
     /// Planning a statement (DuckDB optimize + bridge round-trip + plan
-    /// translation) is a fixed few-millisecond cost paid on every query — a
+    /// translation) is a fixed few-millisecond cost paid on every query, a
     /// large fraction of a small query's latency. Repeated SELECTs (the common
     /// case for dashboards/benchmarks) reuse the cached `Plan` and only re-run
     /// the cheap `compile` + execute. Shared across connections; only SELECTs
     /// are cached and any non-SELECT statement flushes it (see `run_query`).
+    ///
+    /// Plans carry no catalog state, so a cache hit compiled under the current
+    /// query's transaction reads that transaction's view. DDL flushes the
+    /// cache (it may change the schema cached plans were bound against).
     plan_cache: Arc<Mutex<HashMap<String, Arc<planner::Plan>>>>,
 }
 
@@ -234,135 +258,158 @@ impl PivotQueryHandler {
     /// Plan `query`, then either run it (timing each phase, tallying the
     /// dataflow's IO/CPU work when `collect_stats`) or — if it turned out to be a
     /// `SET`/`RESET` — return that for the caller to apply to the connection.
+    ///
+    /// The whole statement runs inside one catalog transaction: everything it
+    /// binds and compiles reads that snapshot, and the transaction is committed
+    /// on success and rolled back on failure (or cancellation).
     async fn run_query(
         &self,
         query: &str,
         collect_stats: bool,
         with_perf: bool,
     ) -> Result<Outcome> {
-        let dispatcher = self.dispatcher.clone();
-        let query = query.to_string();
+        let transaction = self.catalog.begin_transaction();
+        // The async block scopes the body's `?` early-returns so success and
+        // failure both land on the commit/rollback at the end.
+        let result: Result<Outcome> = async {
+            let dispatcher = self.dispatcher.clone();
+            let query = query.to_string();
 
-        // Reuse a cached plan if we've planned this exact SQL before. Only
-        // read-only SELECT plans are ever inserted, so a cache hit is always a
-        // SELECT regardless of what `query` is. Planning is a fixed few-ms cost;
-        // skipping it on repeated SELECTs shaves that off every query after the
-        // first — which the `plan` phase time below makes visible (near-zero on a
-        // hit, the full planner round-trip on a miss).
-        let started = Instant::now();
-        let cached = self.plan_cache.lock().unwrap().get(&query).cloned();
-        let plan = match cached {
-            Some(plan) => plan,
-            None => {
-                let catalog = self.catalog.clone();
-                let q = query.clone();
-                let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
-                    with_planner(&catalog, |planner| Ok(Arc::new(planner.plan(&q)?)))
-                })
-                .await
-                .map_err(Error::PlannerPanic)??;
-                // Cache SELECTs; treat anything else (DDL/DML/…) as a cache
-                // flush — it may invalidate the schema cached plans were built
-                // against — and don't cache it.
-                let mut cache = self.plan_cache.lock().unwrap();
-                if plan_is_cacheable(&plan) {
-                    cache.insert(query.clone(), plan.clone());
-                } else {
-                    cache.clear();
+            // Reuse a cached plan if we've planned this exact SQL before. Only
+            // read-only SELECT plans are ever inserted, so a cache hit is always a
+            // SELECT regardless of what `query` is. Plans carry no snapshot, so a
+            // hit still reads this transaction's view at compile. Planning is a
+            // fixed few-ms cost; skipping it on repeated SELECTs shaves that off
+            // every query after the first, which the `plan` phase time below makes
+            // visible (near-zero on a hit, the full planner round-trip on a miss).
+            let started = Instant::now();
+            let cached = self.plan_cache.lock().unwrap().get(&query).cloned();
+            let plan = match cached {
+                Some(plan) => plan,
+                None => {
+                    let catalog = self.catalog.clone();
+                    let q = query.clone();
+                    let planning_transaction = transaction.clone();
+                    let plan =
+                        tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
+                            with_planner(&catalog, |planner| {
+                                Ok(Arc::new(planner.plan(&q, planning_transaction)?))
+                            })
+                        })
+                        .await
+                        .map_err(Error::PlannerPanic)??;
+                    // Cache SELECTs; treat anything else (DDL/DML/…) as a cache
+                    // flush (it may invalidate the schema cached plans were built
+                    // against) and don't cache it.
+                    let mut cache = self.plan_cache.lock().unwrap();
+                    if plan_is_cacheable(&plan) {
+                        cache.insert(query.clone(), plan.clone());
+                    } else {
+                        cache.clear();
+                    }
+                    plan
                 }
-                plan
+            };
+            let plan_time = started.elapsed();
+
+            // A `SET`/`RESET` is a session command, not a query — DuckDB parsed and
+            // typed it for us, so there's no string-munging here. It compiles to no
+            // dataflow; hand it back for `do_query` to apply to the connection.
+            if let Some(set) = plan.as_set_variable() {
+                return Ok(Outcome::Set {
+                    name: set.name.clone(),
+                    value: set.value.clone(),
+                });
             }
-        };
-        let plan_time = started.elapsed();
 
-        // A `SET`/`RESET` is a session command, not a query — DuckDB parsed and
-        // typed it for us, so there's no string-munging here. It compiles to no
-        // dataflow; hand it back for `do_query` to apply to the connection.
-        if let Some(set) = plan.as_set_variable() {
-            return Ok(Outcome::Set {
-                name: set.name.clone(),
-                value: set.value.clone(),
-            });
-        }
-
-        // When the session ran `SET perf = 1`, start a `perf record` scoped to the
-        // worker threads and mark this query's dataflows profiled. Marking them
-        // makes the workers run *only* this dataflow for its duration (other
-        // queries / ingest on the pool pause), so the capture is just this
-        // dataflow, and exclusive mode lifts as the dataflows finish. `start`
-        // runs on a blocking thread (it sleeps waiting for perf to attach); the
-        // guard is stopped off the reactor after drain (its `child.wait()` blocks
-        // until the report flushes). On error/cancel the guard instead drops in
-        // this async frame, which is rare. Compiled out without the feature.
-        #[cfg(feature = "perf")]
-        let (dispatcher, mut perf_guard) = if with_perf {
-            let sql = query.clone();
-            let guard = tokio::task::spawn_blocking(move || crate::perf::start(&sql))
-                .await
-                .ok()
-                .flatten();
-            match guard {
-                Some(guard) => (dispatcher.with_profiling(true), Some(guard)),
-                None => (dispatcher, None),
-            }
-        } else {
-            (dispatcher, None)
-        };
-        #[cfg(not(feature = "perf"))]
-        let _ = with_perf;
-
-        // Compile the plan into a fresh dataflow and launch it. `compile` is pure
-        // pivot work (no DuckDB), so it runs on any blocking thread without the
-        // planner thread-local. `execute_with_stats` turns on the dataflow's
-        // IO/CPU tally only when the client asked for it.
-        let started = Instant::now();
-        let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-            let rows = plan.compile(&dispatcher)?.map(|| |b| PGRowBatch::from(b));
-            Ok(if collect_stats {
-                rows.execute_with_stats()
+            // When the session ran `SET perf = 1`, start a `perf record` scoped to the
+            // worker threads and mark this query's dataflows profiled. Marking them
+            // makes the workers run *only* this dataflow for its duration (other
+            // queries / ingest on the pool pause), so the capture is just this
+            // dataflow, and exclusive mode lifts as the dataflows finish. `start`
+            // runs on a blocking thread (it sleeps waiting for perf to attach); the
+            // guard is stopped off the reactor after drain (its `child.wait()` blocks
+            // until the report flushes). On error/cancel the guard instead drops in
+            // this async frame, which is rare. Compiled out without the feature.
+            #[cfg(feature = "perf")]
+            let (dispatcher, mut perf_guard) = if with_perf {
+                let sql = query.clone();
+                let guard = tokio::task::spawn_blocking(move || crate::perf::start(&sql))
+                    .await
+                    .ok()
+                    .flatten();
+                match guard {
+                    Some(guard) => (dispatcher.with_profiling(true), Some(guard)),
+                    None => (dispatcher, None),
+                }
             } else {
-                rows.execute()
+                (dispatcher, None)
+            };
+            #[cfg(not(feature = "perf"))]
+            let _ = with_perf;
+
+            // Compile the plan into a fresh dataflow and launch it. `compile` is pure
+            // pivot work (no DuckDB), so it runs on any blocking thread without the
+            // planner thread-local. `execute_with_stats` turns on the dataflow's
+            // IO/CPU tally only when the client asked for it.
+            let started = Instant::now();
+            let compile_transaction = transaction.clone();
+            let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
+                let rows = plan
+                    .compile(&dispatcher, compile_transaction.as_ref())?
+                    .map(|| |b| PGRowBatch::from(b));
+                Ok(if collect_stats {
+                    rows.execute_with_stats()
+                } else {
+                    rows.execute()
+                })
             })
-        })
-        .await
-        .map_err(Error::PlannerPanic)??;
-        let compile_time = started.elapsed();
-
-        // Cancel the dataflow if our future is dropped before drain finishes —
-        // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
-        // raw disconnects (whole connection task dropped).
-        let guard = CancelOnDrop::new(handle.cancel_token());
-        let started = Instant::now();
-        let (batches, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
             .await
-            .map_err(Error::WorkerPanic)??;
-        let exec_time = started.elapsed();
-        guard.defuse();
+            .map_err(Error::PlannerPanic)??;
+            let compile_time = started.elapsed();
 
-        // Stop perf off the reactor: `child.wait()` blocks until the report is
-        // flushed (seconds for a large capture), which would otherwise stall this
-        // tokio worker thread.
-        #[cfg(feature = "perf")]
-        if let Some(perf) = perf_guard.take() {
-            let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
+            // Cancel the dataflow if our future is dropped before drain finishes —
+            // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
+            // raw disconnects (whole connection task dropped).
+            let guard = CancelOnDrop::new(handle.cancel_token());
+            let started = Instant::now();
+            let (batches, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
+                .await
+                .map_err(Error::WorkerPanic)??;
+            let exec_time = started.elapsed();
+            guard.defuse();
+
+            // Stop perf off the reactor: `child.wait()` blocks until the report is
+            // flushed (seconds for a large capture), which would otherwise stall this
+            // tokio worker thread.
+            #[cfg(feature = "perf")]
+            if let Some(perf) = perf_guard.take() {
+                let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
+            }
+
+            let fields = batches
+                .first()
+                .map_or(Arc::new(vec![]), |b| b.fields.clone());
+            let response = Response::Query(QueryResponse::new(
+                fields,
+                stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
+            ));
+            Ok(Outcome::Query(
+                response,
+                QueryStats {
+                    plan: plan_time,
+                    compile: compile_time,
+                    exec: exec_time,
+                    flow,
+                },
+            ))
         }
-
-        let fields = batches
-            .first()
-            .map_or(Arc::new(vec![]), |b| b.fields.clone());
-        let response = Response::Query(QueryResponse::new(
-            fields,
-            stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
-        ));
-        Ok(Outcome::Query(
-            response,
-            QueryStats {
-                plan: plan_time,
-                compile: compile_time,
-                exec: exec_time,
-                flow,
-            },
-        ))
+        .await;
+        match &result {
+            Ok(_) => self.catalog.commit_transaction(transaction),
+            Err(_) => self.catalog.rollback_transaction(transaction),
+        }
+        result
     }
 }
 

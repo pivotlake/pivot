@@ -4,8 +4,8 @@
 //! It lives here, not in the planner, because row groups are a parquet/catalog
 //! concept the generic planner knows nothing about. The planner only exposes the
 //! generic [`TableFunction`] trait; this implements it, and
-//! `ParquetCatalog::table_function`
-//! hands it back so the planner's `TableFunctionScan` can run it.
+//! `ParquetTransaction::table_function` hands it back so the planner's
+//! `TableFunctionScan` can run it against the query's transaction.
 
 use std::sync::Arc;
 
@@ -13,13 +13,12 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use planner::ScalarValue;
-use planner::catalog::{Column, QueryContext};
+use planner::catalog::{CatalogTransaction, Column};
 use planner::compile::Error;
 use planner::types::Type;
 use planner::{TableFunction, TableFunctionSignature};
 
-use super::ParquetQueryContext;
-use crate::manifest::PartitionEqFilter;
+use super::ParquetTransaction;
 use crate::parquet::RowGroupMetadata;
 
 /// The output columns, in declared order. The single source of truth for both
@@ -59,7 +58,7 @@ impl TableFunction for MetadataTableFunction {
         &self,
         args: &[ScalarValue],
         dispatcher: &DataFlowDispatcher,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let table_name = match args {
             [ScalarValue::Utf8(name)] => name.as_str(),
@@ -76,19 +75,18 @@ impl TableFunction for MetadataTableFunction {
             }
         };
 
-        let parquet_ctx = ctx
-            .as_any()
-            .downcast_ref::<ParquetQueryContext>()
-            .ok_or_else(|| invalid("metadata() requires a parquet-backed catalog".to_string()))?;
-        // Warm the table (reload to latest + load every file's footer); metadata
-        // wants every file, so no partition filters are applied.
-        parquet_ctx
-            .parquet(table_name, std::iter::empty::<PartitionEqFilter>())
-            .map_err(|_| invalid(format!("table '{table_name}' does not exist")))?;
-
-        // Build straight from the catalog's per-file row groups, so each row
+        // Read the per-file row groups straight from the transaction's frozen
+        // snapshot (every footer is already materialized there), so each row
         // group's `file_name` is its real manifest path - no positional guessing.
-        let rows = row_group_rows(&parquet_ctx.file_row_groups(table_name));
+        let transaction = transaction
+            .as_any()
+            .downcast_ref::<ParquetTransaction>()
+            .ok_or_else(|| invalid("metadata() requires a parquet-backed catalog".to_string()))?;
+        let file_row_groups = transaction
+            .snapshot
+            .file_row_groups(table_name)
+            .ok_or_else(|| invalid(format!("table '{table_name}' does not exist")))?;
+        let rows = row_group_rows(&file_row_groups);
         let i64_column = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
         let columns: Vec<ArrayRef> = vec![
             i64_column(rows.iter().map(|r| r.file_index).collect()),

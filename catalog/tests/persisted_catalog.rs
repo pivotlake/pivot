@@ -103,7 +103,10 @@ fn create_table_with_path_scans_rows() {
     )
     .unwrap();
 
-    let table = catalog.binding("events").expect("table created");
+    let table = catalog
+        .begin_transaction()
+        .table("events")
+        .expect("table created");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&catalog, "events");
     let results = table_input(&dispatch, &parquet, Projection::all(2), false)
@@ -140,7 +143,8 @@ fn tables_persist_across_reopen() {
     // Reopening (as a restart would) reloads the table and its data.
     let reopened = ParquetCatalog::open(db_uri, &dispatch).unwrap();
     let table = reopened
-        .binding("events")
+        .begin_transaction()
+        .table("events")
         .expect("table reloaded from the manifest");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&reopened, "events");
@@ -162,13 +166,13 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 
         // A data-less table: registered, with no row groups (its data lives under
         // `<root>/t`, which fills in once a file is registered there).
-        assert!(catalog.binding("t").is_some());
+        assert!(catalog.begin_transaction().table("t").is_some());
         assert!(current_parquet(&catalog, "t").row_groups().is_empty());
     }
 
     // And it survives a reopen.
     let reopened = ParquetCatalog::open(db_uri, &dispatch).unwrap();
-    assert!(reopened.binding("t").is_some());
+    assert!(reopened.begin_transaction().table("t").is_some());
 }
 
 #[test]
@@ -213,7 +217,7 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     // The no-data case drives the same fan-in with nothing to fetch: every
     // worker's sink finishes empty and worker 0 still commits.
     create(&dispatch, &catalog, rooted_request("empty", columns())).unwrap();
-    assert!(catalog.binding("empty").is_some());
+    assert!(catalog.begin_transaction().table("empty").is_some());
     assert!(current_parquet(&catalog, "empty").row_groups().is_empty());
 }
 

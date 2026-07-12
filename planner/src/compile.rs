@@ -20,7 +20,7 @@
 //! submodules, not here.
 //!
 
-use crate::catalog::{Catalog, QueryContext};
+use crate::catalog::{Catalog, CatalogTransaction};
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
@@ -117,17 +117,17 @@ impl Plan {
     pub fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
+        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // A cached plan is re-run through here, so this is where it must pick up
-        // data committed since it was planned. The query context reloads each
-        // table a scan touches to its latest version the first time it compiles —
-        // lazily, and once per table, so a table feeding both a scan and a late
-        // materialize reloads a single time and both read one snapshot.
-        let ctx = self.catalog.query_context();
+        // Every table access resolves through `transaction`, so the whole
+        // query reads one frozen view of the catalog and no live catalog
+        // state is consulted here. The plan itself carries no snapshot: it can
+        // be cached and compiled again under a later transaction, reading that
+        // transaction's view.
         let mut slots = DynamicFilterSlots::new();
         let compiled = self
             .root
-            .compile(dispatcher, &self.catalog, ctx.as_ref(), &mut slots)?;
+            .compile(dispatcher, &self.catalog, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }
 }
@@ -195,7 +195,7 @@ impl PlanNode {
         &self,
         dispatcher: &DataFlowDispatcher,
         catalog: &Arc<dyn Catalog>,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
@@ -204,7 +204,7 @@ impl PlanNode {
         // succeeding means no scan happens at all. `try_compile_from_stats`
         // checks the rest of the shape (single bare-scan child, no predicates).
         if let crate::Operator::Aggregate(agg) = &self.operator
-            && let Some(spec) = agg.try_compile_from_stats(&self.inputs, dispatcher, ctx)?
+            && let Some(spec) = agg.try_compile_from_stats(&self.inputs, dispatcher, transaction)?
         {
             return Ok(spec);
         }
@@ -223,19 +223,19 @@ impl PlanNode {
 
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, ctx, slots)?);
+            inputs.push(input.compile(dispatcher, catalog, transaction, slots)?);
         }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher, ctx, slots),
-            crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, catalog.as_ref(), ctx),
+            crate::Operator::Input(o) => o.compile(dispatcher, transaction, slots),
+            crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, transaction),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
             crate::Operator::Limit(o) => o.compile(inputs.remove(0)),
-            crate::Operator::Materialize(o) => o.compile(inputs.remove(0), ctx),
+            crate::Operator::Materialize(o) => o.compile(inputs.remove(0), transaction),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);
