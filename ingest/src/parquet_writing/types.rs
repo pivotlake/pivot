@@ -14,7 +14,6 @@ use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use catalog::SortBounds;
 use dispatch::{Identifier, WorkerIdOutput};
-use serde_json::Value;
 use thriftparquet::footer::Statistics;
 
 /// Identifies a row group across the pipeline so its column chunks reassemble
@@ -36,7 +35,7 @@ pub(crate) struct PartitionTag {
     pub(crate) file_id: FileId,
     /// Total row groups in this file, so the assembler knows when it's complete.
     pub(crate) n_row_groups: usize,
-    pub(crate) partition: Option<Value>,
+    pub(crate) partition: Option<catalog::PartitionValues>,
     /// The file's sort-key bounds (min/max per sort column over the whole file),
     /// recorded in the manifest. `None` when the table has no sort key. The
     /// per-row-group, per-column statistics the footer carries are a separate
@@ -49,7 +48,7 @@ pub(crate) struct PartitionTag {
 /// unsorted write).
 pub(crate) struct EncodedFile {
     pub(crate) bytes: Vec<u8>,
-    pub(crate) partition: Option<Value>,
+    pub(crate) partition: Option<catalog::PartitionValues>,
     pub(crate) sort_bounds: Option<SortBounds>,
 }
 

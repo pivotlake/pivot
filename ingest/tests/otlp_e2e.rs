@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow_array::{Array, ArrayRef, Datum, Int64Array, Scalar, StringViewArray};
 use catalog::ParquetCatalog;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use ingest::{IngestConfig, Ingestor, OtelConfig, Signal};
@@ -21,6 +22,31 @@ use tonic::transport::{Channel, Endpoint};
 
 /// A 64 MiB file-cache ring, as the in-crate sink tests use.
 const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
+
+fn scalar_string(values: &HashMap<String, Scalar<ArrayRef>>, field: &str) -> String {
+    values
+        .get(field)
+        .expect("field exists")
+        .get()
+        .0
+        .as_any()
+        .downcast_ref::<StringViewArray>()
+        .expect("field is Utf8View")
+        .value(0)
+        .to_string()
+}
+
+fn scalar_i64(values: &HashMap<String, Scalar<ArrayRef>>, field: &str) -> i64 {
+    values
+        .get(field)
+        .expect("field exists")
+        .get()
+        .0
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("field is Int64")
+        .value(0)
+}
 
 // --- helpers ---------------------------------------------------------------
 
@@ -265,12 +291,7 @@ async fn partitioned_logs_land_one_file_per_service() {
     let mut services: Vec<String> = table
         .file_partitions()
         .into_iter()
-        .map(|(_, p)| {
-            p.expect("file has a partition tuple")["ServiceName"]
-                .as_str()
-                .expect("ServiceName string")
-                .to_string()
-        })
+        .map(|(_, p)| scalar_string(&p.expect("file has a partition tuple"), "ServiceName"))
         .collect();
     services.sort();
 
@@ -280,8 +301,8 @@ async fn partitioned_logs_land_one_file_per_service() {
     // Each file records its sort-key (Timestamp) bounds, min <= max.
     for (_, bounds) in table.file_sort_bounds() {
         let b = bounds.expect("file has sort bounds");
-        let min = b.min["Timestamp"].as_i64().expect("min Timestamp");
-        let max = b.max["Timestamp"].as_i64().expect("max Timestamp");
+        let min = scalar_i64(&b.min, "Timestamp");
+        let max = scalar_i64(&b.max, "Timestamp");
         assert!(min <= max, "sort bounds: {min} <= {max}");
     }
 
