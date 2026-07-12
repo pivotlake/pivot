@@ -178,16 +178,23 @@ fn create_table_without_a_path_makes_an_empty_table() {
 }
 
 #[test]
-fn create_table_over_a_missing_path_yields_an_empty_table() {
-    // A location with no files yields an empty table — the same as a relative or
-    // no-path location. The catalog does not stat the path (which only makes
-    // sense for a local store; on a bucket an absolute path is just a key).
+fn create_table_over_an_unwritable_path_fails() {
+    // CREATE TABLE commits Delta version 0 at the table's location, so a
+    // location that cannot be written is a clean error, not a silently empty
+    // table.
     let (_dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
-    create_table(&catalog, create_request("t", bogus, columns)).unwrap();
-    assert!(catalog.begin_transaction().table("t").is_some());
-    assert!(current_parquet(&catalog, "t").row_groups().is_empty());
+
+    let err = create_table(&catalog, create_request("t", bogus, columns))
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.to_lowercase().contains("permission denied"),
+        "expected the Delta commit's write failure, got: {err}"
+    );
+    assert!(catalog.begin_transaction().table("t").is_none());
 }
 
 #[test]
@@ -452,11 +459,8 @@ fn metadata_function_honors_column_projection() {
 fn metadata_function_on_empty_table() {
     let (_dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    create_table(
-        &catalog,
-        create_request("t", Path::new("/no/such/dir"), columns),
-    )
-    .unwrap();
+    let empty_dir = TempDir::new().unwrap();
+    create_table(&catalog, create_request("t", empty_dir.path(), columns)).unwrap();
 
     let results = run_sql(&catalog, "SELECT * FROM metadata('t')");
 
@@ -767,7 +771,7 @@ fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
         .append_data_file(
             ObjectPath::new("keep.parquet"),
             &std::fs::read(dir.path().join("keep.parquet")).unwrap(),
-            Some(serde_json::json!({ "name": "keep" })),
+            Some(string_values("name", "keep")),
             None,
         )
         .unwrap();
@@ -775,17 +779,24 @@ fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
         .append_data_file(
             ObjectPath::new("drop.parquet"),
             &std::fs::read(dir.path().join("drop.parquet")).unwrap(),
-            Some(serde_json::json!({ "name": "drop" })),
+            Some(string_values("name", "drop")),
             None,
         )
         .unwrap();
     (dir, catalog)
 }
 
+fn string_values(name: &str, value: &str) -> HashMap<String, Scalar<ArrayRef>> {
+    HashMap::from([(
+        name.to_string(),
+        Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
+    )])
+}
+
 fn name_eq(value: &str) -> PartitionEqFilter {
     PartitionEqFilter {
         column: "name".to_string(),
-        value: serde_json::json!(value),
+        value: Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
     }
 }
 

@@ -14,21 +14,18 @@ arrow-buffer = { workspace = true }
 # Filtering a decoded batch down to the rows a pushed-down equality keeps
 # (see the row-group decoder's view-equality test).
 arrow-select = { workspace = true }
-# Encode a pushed-down constant to the same JSON a partition tuple is stamped
-# with (ingest uses arrow-json too), so partition pruning compares like for like.
-arrow-json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
 snap = { workspace = true }
-# Catalog metadata is serialized as JSON: the `_pivot_manifest.json` database
-# manifest and the `_pivot_tables/<table>/<version>.json` table-manifest versions.
+# The database-level `_pivot_manifest.json` table index is serialized as JSON.
+# Per-table state is standard Delta Lake metadata under each table's `_delta_log`.
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Synchronous object-store access for the catalog control plane (LIST/GET/PUT/
-# conditional-PUT of the manifest and `_pivot_tables/` versions), so the engine
+# conditional-PUT of the manifest and initial Delta commit), so the engine
 # never spins up an async runtime.
 # `ureq` is blocking HTTP + rustls; `aws-sigv4::sign` is a pure sync function we
 # call to sign S3 requests (the tokio it transitively pulls is never driven).
@@ -45,6 +42,12 @@ ring = "0.17"
 base64 = "0.22"
 # Build/parse the concrete URLs handed to the io_uring HTTP reader.
 url = { workspace = true }
+# Delta Kernel owns per-table snapshot semantics.  The catalog index remains
+# Pivot's `_pivot_manifest.json`, while every indexed table is loaded from its
+# standard `_delta_log` through the reference Arrow/object-store engine.
+delta_kernel = { version = "0.25.0", features = ["arrow-conversion", "internal-api"] }
+delta_kernel_default_engine = { version = "0.25.0", features = ["rustls", "arrow-58"] }
+uuid = { version = "1", features = ["v4"] }
 # Optional, behind the `test-support` feature: the in-Docker object-store test
 # harness exposed as `catalog::test_support`. testcontainers brings up MinIO and
 # fake-gcs-server; tempfile backs the local() backend. (The harness's other
