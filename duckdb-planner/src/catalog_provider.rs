@@ -11,7 +11,7 @@ use crate::handle::Expr;
 /// Describes a table that the planner can reference during query planning.
 ///
 /// Implement this trait for tables in your schema and return instances
-/// from [`DuckDBBind::try_bind`]. The planner uses [`duckdb_typed_columns`](DuckDBTable::duckdb_typed_columns)
+/// from [`DuckDBTransaction::table`]. The planner uses [`duckdb_typed_columns`](DuckDBTable::duckdb_typed_columns)
 /// to resolve column names and types, and attaches the `Box<dyn DuckDBTable>` to the
 /// resulting scan operator so downstream consumers
 /// can identify which table is being scanned.
@@ -69,22 +69,30 @@ pub struct TableFunctionDef {
 pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
 
 pub trait DuckDBBind {
-    /// Given a table name, return a table/object that implements [`DuckDBTable`] with column definitions.
-    /// Returns `None` if the table doesn't exist.
-    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>>;
-
-    /// Given a function name, return its binding signature, or `None` if the
-    /// provider has no such table function. The bridge registers it on demand
-    /// during binding; functions the provider doesn't know (e.g. DuckDB built-ins
-    /// like `generate_series`) return `None` and resolve elsewhere. Default: none.
-    fn table_function(&self, _name: &str) -> Option<TableFunctionDef> {
+    /// Given a scalar function name (e.g. `drop_cache`), return its binding
+    /// signature. Names the provider doesn't define return `None` and resolve
+    /// against DuckDB's own built-ins. Default: none.
+    fn scalar_function(&self, _name: &str) -> Option<ScalarFunctionDef> {
         None
     }
+}
 
-    /// Like [`table_function`](Self::table_function), but for scalar functions
-    /// (e.g. `drop_cache`). Names the provider doesn't define return `None` and
-    /// resolve against DuckDB's own built-ins. Default: none.
-    fn scalar_function(&self, _name: &str) -> Option<ScalarFunctionDef> {
+/// One planning transaction's binder: resolves table and table-function names
+/// against the snapshot the transaction was opened on, so everything a single
+/// plan binds comes from one consistent view of the catalog. Only names that
+/// are static registry (scalar functions) still resolve through [`DuckDBBind`].
+pub trait DuckDBTransaction: Send + Sync {
+    /// Given a table name, return a table/object that implements [`DuckDBTable`]
+    /// with column definitions, resolved against this transaction's snapshot.
+    /// Returns `None` if the table doesn't exist.
+    fn table(&self, name: &str) -> Option<Box<dyn DuckDBTable>>;
+
+    /// Given a function name, return its binding signature, or `None` if this
+    /// transaction's catalog has no such table function. The bridge registers it
+    /// on demand during binding; functions it doesn't know (e.g. DuckDB
+    /// built-ins like `generate_series`) return `None` and resolve elsewhere.
+    /// Default: none.
+    fn table_function(&self, _name: &str) -> Option<TableFunctionDef> {
         None
     }
 }
@@ -107,8 +115,26 @@ impl CatalogContext {
     }
 }
 
-pub(crate) fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetTableResult {
-    match ctx.provider.try_bind(name) {
+/// Wraps an `Arc<dyn DuckDBTransaction>` for the C++ bridge, the same way
+/// [`CatalogContext`] wraps the provider. One is created per
+/// [`PlannerContext::plan`](crate::PlannerContext::plan) call; the C++ side
+/// publishes a pointer to it on the pivot storage info for the duration of
+/// that plan, and table lookups during binding come back through it.
+pub struct TransactionContext {
+    transaction: Arc<dyn DuckDBTransaction>,
+}
+
+impl TransactionContext {
+    pub(crate) fn new(transaction: Arc<dyn DuckDBTransaction>) -> Self {
+        TransactionContext { transaction }
+    }
+}
+
+pub(crate) fn catalog_get_table(
+    transaction: &TransactionContext,
+    name: &str,
+) -> CatalogGetTableResult {
+    match transaction.transaction.table(name) {
         Some(table) => {
             let columns = table.duckdb_typed_columns();
             CatalogGetTableResult {
@@ -126,10 +152,10 @@ pub(crate) fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetT
 }
 
 pub(crate) fn catalog_get_table_function(
-    ctx: &CatalogContext,
+    transaction: &TransactionContext,
     name: &str,
 ) -> CatalogGetTableFunctionResult {
-    match ctx.provider.table_function(name) {
+    match transaction.transaction.table_function(name) {
         Some(def) => CatalogGetTableFunctionResult {
             found: true,
             arg_type_ids: def.arg_type_ids,

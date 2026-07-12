@@ -22,10 +22,12 @@ fn boolean_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT flag FROM bools WHERE flag <> false")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -49,10 +51,12 @@ fn int8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT value FROM int8s WHERE value <> 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -76,10 +80,12 @@ fn int16_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT value FROM int16s WHERE value <> 20")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -95,10 +101,12 @@ fn int16_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
 fn int32_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     // example_table.c is the Int32 column; rows are 100, 200, 300, 400, 500.
     let results = testing_planner
-        .planner
         .plan("SELECT c FROM example_table WHERE c <> 200")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -124,10 +132,12 @@ fn int64_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT value FROM int64s WHERE value <> 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -143,10 +153,12 @@ fn int64_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
 fn utf8_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     // example_table.name is the Utf8 column; rows are alice/bob/charlie/dave/alice.
     let results = testing_planner
-        .planner
         .plan("SELECT name FROM example_table WHERE name <> 'bob'")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();

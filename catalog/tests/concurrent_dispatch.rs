@@ -90,10 +90,11 @@ fn make_catalog() -> (TempDir, Arc<ParquetCatalog>) {
 
 fn run_count(catalog: &Arc<ParquetCatalog>) -> usize {
     let mut planner = Planner::new(catalog.clone() as Arc<dyn PlannerCatalog>);
+    let transaction = catalog.begin_transaction();
     planner
-        .plan("SELECT id FROM t")
+        .plan("SELECT id FROM t", transaction.clone())
         .unwrap()
-        .compile(&dispatcher())
+        .compile(&dispatcher(), transaction.as_ref())
         .unwrap()
         .collect()
         .unwrap()

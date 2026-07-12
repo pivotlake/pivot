@@ -17,14 +17,15 @@
 //!   current file list.
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
-//! per-file row groups at one log version; the flattened scan view a query sees
-//! is derived from those files on demand, so there is no cached copy to drift.
-//! A change swaps `version` + `files` whole. Resolving a table for a query
-//! ([`Catalog::table`]) first **reloads**: one LIST of the table's log
-//! directory; if a newer version exists, only the *new* files' footers are
-//! fetched (over the dispatch pool) and the new file set is swapped in — so a
-//! file registered by ingest, a compaction's swap, or even another process's
-//! commit becomes visible to the very next query.
+//! per-file row groups at one log version. The in-memory set is kept current by
+//! **push, not pull**: a periodic [`refresh_catalog`](ParquetCatalog::refresh_catalog)
+//! sweep (the server runs one on an interval) reloads every table to its latest
+//! committed version and fetches any new files' footers, and an in-process
+//! writer (ingest, compaction) [`publish_table`](ParquetCatalog::publish_table)s
+//! its committed copy immediately. Queries never touch the store: a query opens
+//! a transaction ([`Catalog::begin_transaction`]) whose [`CatalogSnapshot`]
+//! freezes the table set as of that moment, and every binding, scan, and late
+//! materialize of that query reads the frozen snapshot with zero I/O.
 //!
 //! Each resolve hands back a fresh [`TableBinding`], so per-query filter
 //! pushdown accumulates on that binding alone.
@@ -38,7 +39,7 @@ pub use binding::TableBinding;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use crate::manifest::{
     self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
@@ -49,8 +50,8 @@ use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
 use planner::TableFunction;
 use planner::catalog::{
-    Catalog, CreateTableRequest, Error as CatalogError, QueryContext, Result as CatalogResult,
-    Table,
+    Catalog, CatalogTransaction, CreateTableRequest, Error as CatalogError,
+    Result as CatalogResult, Table,
 };
 pub use table::CatalogTable;
 pub use table::TableFile;
@@ -84,6 +85,10 @@ pub enum Error {
     Manifest(#[from] manifest::Error),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
+    #[error(
+        "table `{table}`: file `{file}` has no loaded row-group metadata; the copy was not synced to its manifest"
+    )]
+    FooterNotLoaded { table: String, file: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -126,7 +131,7 @@ pub struct ParquetCatalog {
     store: Arc<dyn ObjectStore>,
 
     /// The worker pool every footer fetch runs on. Held by the catalog because
-    /// reloads happen at query-bind time, where no dispatcher is passed in.
+    /// refreshes drive their own dataflows, with no dispatcher passed in.
     dispatcher: DataFlowDispatcher,
 }
 
@@ -206,12 +211,71 @@ impl ParquetCatalog {
         ))
     }
 
-    /// Resolve `name` to a fresh [`TableBinding`] (same semantics as
-    /// [`Catalog::table`] *minus the reload*, and typed). Useful for callers
-    /// (and tests) that need state the [`Table`] trait does not expose.
-    pub fn binding(&self, name: &str) -> Option<TableBinding> {
-        let columns = self.tables.read().unwrap().get(name)?.columns();
-        Some(TableBinding::new(name.to_string(), columns))
+    /// Open a transaction, typed: freeze the current table set into a
+    /// [`CatalogSnapshot`] and hand back the concrete [`ParquetTransaction`]
+    /// over it. Cheap: clones the map (the row-group metadata inside is
+    /// `Arc`-shared), no I/O. The [`Catalog::begin_transaction`] trait impl
+    /// delegates here.
+    pub fn begin_transaction(&self) -> Arc<ParquetTransaction> {
+        Arc::new(ParquetTransaction {
+            snapshot: Arc::new(CatalogSnapshot {
+                tables: self.tables.read().unwrap().clone(),
+            }),
+        })
+    }
+
+    /// Bring the in-memory table set up to date with the store: pick up tables
+    /// another process registered in the database index, and advance every
+    /// table to its latest committed manifest version, fetching the footers of
+    /// files it doesn't hold yet. This is the **only** place the read path
+    /// pays store I/O; the server drives it on a background interval, so
+    /// queries always bind against an already-materialized set. Returns whether
+    /// anything changed.
+    ///
+    /// Tables are never removed here: there is no `DROP TABLE`, and removing a
+    /// map entry on a manifest miss could race a concurrent in-process create.
+    pub fn refresh_catalog(&self) -> Result<bool> {
+        let mut changed = false;
+
+        let index = CatalogManifest::load(self.store.as_ref())?;
+        for entry in &index.tables {
+            if self.tables.read().unwrap().contains_key(&entry.name) {
+                continue;
+            }
+            let table = Self::load_table(&self.dispatcher, &self.store, entry)?;
+            let mut map = self.tables.write().unwrap();
+            // An in-process CREATE TABLE may have published it since the read.
+            if !map.contains_key(&entry.name) {
+                map.insert(entry.name.clone(), table);
+                changed = true;
+            }
+        }
+
+        // Refresh each table on a clone outside the lock (footer fetches are
+        // I/O), then publish the advanced copy back.
+        for mut table in self.tables() {
+            if table.refresh()? {
+                changed |= self.publish_table(table);
+            }
+        }
+
+        Ok(changed)
+    }
+
+    /// Publish a committed [`CatalogTable`] copy into the shared map, so its
+    /// new version is visible to the next transaction immediately (rather than
+    /// after the next background refresh). Ingest and compaction call this
+    /// right after their commit. A copy at or behind the map's current version
+    /// is dropped (`false`); a newer one replaces it.
+    pub fn publish_table(&self, table: CatalogTable) -> bool {
+        let mut map = self.tables.write().unwrap();
+        match map.get(table.name()) {
+            Some(existing) if existing.version() >= table.version() => false,
+            _ => {
+                map.insert(table.name().to_string(), table);
+                true
+            }
+        }
     }
 
     /// The worker pool this catalog fetches footers on — shared with callers
@@ -395,21 +459,14 @@ impl ParquetCatalog {
 }
 
 impl Catalog for ParquetCatalog {
-    /// Resolve `name` to a [`TableBinding`]: it carries the table's schema and
-    /// (after pushdown) this query's predicates, but no file set. The files are
-    /// read from the query's [`ParquetQueryContext`] when it compiles, so a
-    /// reused (cached) plan always scans the latest committed files. Resolving
-    /// here is pure in-memory and does no I/O. Each binding is its own value, so
-    /// per-query filter pushdown prunes its view without affecting other queries.
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        Some(Box::new(self.binding(name)?))
-    }
-
-    fn query_context(&self) -> Box<dyn QueryContext> {
-        Box::new(ParquetQueryContext {
-            tables: self.tables.clone(),
-            pinned: Mutex::new(HashMap::new()),
-        })
+    /// Open a transaction: freeze the table set as it stands right now. Every
+    /// table the transaction binds resolves from that frozen
+    /// [`CatalogSnapshot`] (pure in-memory, no I/O), so one query reads one
+    /// consistent version of every table regardless of concurrent refreshes or
+    /// commits. Dropping the returned transaction (the commit) releases the
+    /// snapshot.
+    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
+        ParquetCatalog::begin_transaction(self)
     }
 
     fn create_table(
@@ -419,106 +476,101 @@ impl Catalog for ParquetCatalog {
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         Ok(self.create(request, dispatcher)?)
     }
+}
 
-    fn table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
-        // `metadata('table')` reports a table's row-group footers; it is
-        // parquet-specific, so it lives here rather than in the generic planner.
-        match name {
-            "metadata" => Some(Box::new(MetadataTableFunction)),
-            _ => None,
-        }
+/// One transaction's frozen view of the catalog: every table at the version it
+/// held when the transaction began, with all row-group metadata already
+/// materialized (the background refresh keeps the master set fully fetched).
+/// Everything a query does against it (binding, scan-view construction, late
+/// materialize, `metadata()`) is pure in-memory.
+pub struct CatalogSnapshot {
+    tables: HashMap<String, CatalogTable>,
+}
+
+impl std::fmt::Debug for CatalogSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogSnapshot")
+            .field("tables", &self.tables.keys())
+            .finish_non_exhaustive()
     }
 }
 
-/// One pinned scan view per `(table name, partition filter)`. The filter
-/// half is each `(column, JSON constant)` sorted, the hashable form of the
-/// predicates.
-type PinnedScanViews = HashMap<(String, Vec<(String, String)>), Arc<ParquetTable>>;
+impl CatalogSnapshot {
+    /// Resolve `name` to a fresh [`TableBinding`] over this snapshot, or `None`
+    /// if the snapshot has no such table. Pure in-memory. The typed counterpart
+    /// of [`CatalogTransaction::table`].
+    pub fn table(&self, name: &str) -> Option<TableBinding> {
+        let columns = self.tables.get(name)?.columns();
+        Some(TableBinding::new(name.to_string(), columns))
+    }
 
-/// One query's [`QueryContext`]: the concrete context a [`TableBinding`]
-/// downcasts to. The first time a scan asks for a table it reloads the master to
-/// the latest committed version and pins the resulting row groups; later asks
-/// (the same table's late materialize, or a self-join) return that same pinned
-/// `Arc`. So each table reloads at most once per query and every scan of it sees
-/// one consistent snapshot.
-pub(super) struct ParquetQueryContext {
-    tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    /// One pinned scan view per `(table, its partition filter)`. The key groups
-    /// exactly the asks that must agree: a scan and its later materialize share a
-    /// `(name, filters)`, so they pin the same view and address the same row-group
-    /// indices. Different filters (a self-join's branches) get their own views,
-    /// which is correct — they never share an index space. The filter half is each
-    /// `(column, JSON constant)` sorted, the hashable form of the predicates.
-    pinned: Mutex<PinnedScanViews>,
-}
-
-impl ParquetQueryContext {
-    /// Table `name`'s committed row groups for the files that can match
-    /// `partition_filters` — the partition-pruned scan view, pinned on first ask
-    /// and returned from the pin thereafter. Footers are fetched lazily here, only
-    /// for the surviving partitions, so a one-partition query never reads every
-    /// other partition's footer. Errors if the table no longer exists (dropped
-    /// since planning) or the reload fails, rather than scanning a stale or empty
-    /// file set.
+    /// Table `name`'s row groups for the files that can match
+    /// `partition_filters` — the partition-pruned scan view. Built from the
+    /// snapshot's already materialized row groups: no manifest read, no footer
+    /// fetch. The snapshot is immutable, so two asks with the same filters (a
+    /// scan and its late materialize) always build identical views addressing
+    /// the same row-group indices. Errors if the table isn't in the snapshot
+    /// (it never was, or the binding outlived its transaction into a catalog
+    /// where it's gone) rather than scanning an empty file set.
     pub(super) fn parquet(
         &self,
         name: &str,
         partition_filters: impl Iterator<Item = PartitionEqFilter>,
     ) -> CatalogResult<Arc<ParquetTable>> {
         let filters: Vec<PartitionEqFilter> = partition_filters.collect();
-        let mut key_filters: Vec<(String, String)> = filters
-            .iter()
-            .map(|f| (f.column.clone(), f.value.to_string()))
-            .collect();
-        key_filters.sort(); // filter order doesn't change the view
-        let key = (name.to_string(), key_filters);
-        if let Some(parquet) = self.pinned.lock().unwrap().get(&key) {
-            return Ok(parquet.clone());
-        }
-
-        // Build the view: take the master copy, advance its manifest (no footer
-        // I/O), then fetch footers for just the surviving partitions.
-        let mut table = self
-            .tables
-            .read()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                CatalogError::Other(
-                    format!("table {name:?} no longer exists (dropped since planning?)").into(),
-                )
-            })?;
+        let table = self.tables.get(name).ok_or_else(|| {
+            CatalogError::Other(format!("table {name:?} is not in this snapshot").into())
+        })?;
         table
-            .reload_manifest_only()
-            .map_err(|e| CatalogError::Other(Box::new(e)))?;
-        let parquet = table
-            .parquet(&filters)
-            .map_err(|e| CatalogError::Other(Box::new(e)))?;
-        // Publish the warmed copy (advanced version + the footers just fetched) so
-        // a later query starts current and re-fetches nothing it already holds.
-        self.tables.write().unwrap().insert(name.to_string(), table);
-        self.pinned.lock().unwrap().insert(key, parquet.clone());
-        Ok(parquet)
+            .build_scan_view(&filters)
+            .map_err(|e| CatalogError::Other(Box::new(e)))
     }
 
     /// Per-file row groups (path + its row groups, manifest order) for the
-    /// `metadata()` table function. Call after [`parquet`](Self::parquet) has
-    /// warmed the table so its footers are loaded.
+    /// `metadata()` table function. Errors if the snapshot has no such table.
     pub(super) fn file_row_groups(
         &self,
         name: &str,
-    ) -> Vec<(String, Vec<Arc<crate::parquet::RowGroupMetadata>>)> {
-        self.tables
-            .read()
-            .unwrap()
-            .get(name)
-            .map(|table| table.file_row_groups())
-            .unwrap_or_default()
+    ) -> Option<Vec<(String, Vec<Arc<crate::parquet::RowGroupMetadata>>)>> {
+        Some(self.tables.get(name)?.file_row_groups())
     }
 }
 
-impl QueryContext for ParquetQueryContext {
+/// The [`CatalogTransaction`] a [`ParquetCatalog`] opens: one query's handle on
+/// its [`CatalogSnapshot`]. Dropped when the query finishes (the commit),
+/// releasing the snapshot.
+#[derive(Debug)]
+pub struct ParquetTransaction {
+    pub(super) snapshot: Arc<CatalogSnapshot>,
+}
+
+impl ParquetTransaction {
+    /// [`CatalogTransaction::table`], typed: the concrete [`TableBinding`]
+    /// instead of the trait object. This is the single resolution path; the
+    /// trait impl below only boxes its result (the planner needs a
+    /// `Box<dyn Table>`, while a concrete caller wants the `TableBinding`, and
+    /// one function cannot return both).
+    pub fn table(&self, name: &str) -> Option<TableBinding> {
+        self.snapshot.table(name)
+    }
+}
+
+impl CatalogTransaction for ParquetTransaction {
+    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+        Some(Box::new(ParquetTransaction::table(self, name)?))
+    }
+
+    fn table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
+        // `metadata('table')` reports a table's row-group footers; it is
+        // parquet-specific, so it lives here rather than in the generic
+        // planner. It reads the transaction handed to its compile, the same
+        // frozen view the rest of the query reads.
+        match name {
+            "metadata" => Some(Box::new(MetadataTableFunction)),
+            _ => None,
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

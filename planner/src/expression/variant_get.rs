@@ -266,9 +266,7 @@ mod tests {
     fn rejects_an_uncast_comparison(mut testing_planner: TestingPlanner) {
         docs_table(&mut testing_planner, vec![r#"{"age":30}"#]);
 
-        let result = testing_planner
-            .planner
-            .plan("SELECT d FROM docs WHERE d.age > 27");
+        let result = testing_planner.plan("SELECT d FROM docs WHERE d.age > 27");
 
         assert!(
             result.is_err(),
@@ -458,7 +456,6 @@ mod tests {
         );
 
         let err = testing_planner
-            .planner
             .plan("SELECT CAST(d->k AS BIGINT) FROM docs")
             .unwrap_err();
 

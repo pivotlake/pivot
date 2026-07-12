@@ -28,7 +28,7 @@ use rstest::fixture;
 use serde_json::Value;
 
 use crate::Planner;
-use crate::catalog::{Catalog, Column, DynamicScanPredicate, Table};
+use crate::catalog::{Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table};
 use crate::types::{Type, physical_arrow_type};
 use dispatch::{
     DataFlowDispatcher, Dispatch, Nullary, NullaryFactory, NullaryResult, Projection,
@@ -117,7 +117,7 @@ impl Table for TestTable {
         projection: Projection,
         _dynamic_filters: Vec<DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
-        _ctx: &dyn crate::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         let projected = self
             .batch
@@ -141,7 +141,7 @@ impl Table for TestTable {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
-        _ctx: &dyn crate::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("the in-memory test table is never late-materialized")
     }
@@ -152,7 +152,7 @@ impl Table for TestTable {
     fn column_min_max(
         &self,
         column: usize,
-        _ctx: &dyn crate::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         let arr = self.batch.column(column);
         match arr.data_type() {
@@ -220,14 +220,28 @@ impl TestCatalog {
     }
 }
 
-impl Catalog for TestCatalog {
+/// One test transaction: a frozen clone of the catalog's table map, so binding
+/// mirrors the production shape (snapshot per query) without any storage.
+#[derive(Debug)]
+struct TestTransaction {
+    tables: HashMap<String, TestTable>,
+}
+
+impl CatalogTransaction for TestTransaction {
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        self.tables
-            .lock()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .map(|t| Box::new(t) as _)
+        self.tables.get(name).cloned().map(|t| Box::new(t) as _)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Catalog for TestCatalog {
+    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
+        Arc::new(TestTransaction {
+            tables: self.tables.lock().unwrap().clone(),
+        })
     }
 
     fn create_table(
@@ -261,6 +275,17 @@ impl TestingPlanner {
     /// Register an ad-hoc table in the catalog.
     pub fn add_table(&self, name: &str, columns: &[(&str, Type, ArrayRef)]) {
         self.catalog.add_table(name, columns);
+    }
+
+    /// Plan `sql` inside a fresh transaction on this fixture's catalog.
+    pub fn plan(&mut self, sql: &str) -> Result<crate::Plan, crate::Error> {
+        let transaction = self.catalog.begin_transaction();
+        self.planner.plan(sql, transaction)
+    }
+
+    /// A fresh transaction on this fixture's catalog, for compiling plans.
+    pub fn transaction(&self) -> Arc<dyn CatalogTransaction> {
+        self.catalog.begin_transaction()
     }
 }
 
@@ -313,10 +338,12 @@ pub fn run(planner: &mut TestingPlanner, sql: &str) -> Vec<Value> {
 /// `Date32`) rather than only the JSON-rendered values.
 pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> {
     planner
-        .planner
         .plan(sql)
         .unwrap()
-        .compile(planner.dispatch.dispatcher())
+        .compile(
+            planner.dispatch.dispatcher(),
+            planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap()

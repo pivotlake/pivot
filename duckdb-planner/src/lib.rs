@@ -13,7 +13,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use duckdb_planner::{
-//!     DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId, PlannerContext,
+//!     DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
 //! };
 //! use duckdb_planner::duckdb_bridge::duckdb_types::LogicalOperatorType;
 //!
@@ -31,8 +31,14 @@
 //!
 //! struct MyCatalog;
 //!
-//! impl DuckDBBind for MyCatalog {
-//!     fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
+//! impl DuckDBBind for MyCatalog {}
+//!
+//! // Table names resolve through a per-plan transaction (a snapshot of the
+//! // catalog), not through the provider itself.
+//! struct MyTransaction;
+//!
+//! impl DuckDBTransaction for MyTransaction {
+//!     fn table(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
 //!         match name {
 //!             "users" => Some(Box::new(UsersTable)),
 //!             _ => None,
@@ -42,8 +48,8 @@
 //!
 //! let mut ctx = PlannerContext::new(Arc::new(MyCatalog));
 //!
-//! // Plan a query; walk the root handle.
-//! let plan = ctx.plan("SELECT name FROM users").unwrap();
+//! // Plan a query inside a transaction; walk the root handle.
+//! let plan = ctx.plan("SELECT name FROM users", Arc::new(MyTransaction)).unwrap();
 //! let root = plan.root();
 //! assert_eq!(root.op_type(), LogicalOperatorType::LOGICAL_PROJECTION);
 //! ```
@@ -60,7 +66,7 @@ use std::sync::Arc;
 use duckdb_bridge::ffi;
 use thiserror::Error;
 
-pub use catalog_provider::{DuckDBBind, DuckDBTable};
+pub use catalog_provider::{DuckDBBind, DuckDBTable, DuckDBTransaction};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use handle::{Expr, LogicalOp, Plan};
@@ -123,11 +129,20 @@ impl PlannerContext {
         }
     }
 
-    /// Plan a SQL query: sends the query to DuckDB and returns a [`Plan`] handle
-    /// owning the resolved logical plan. The caller walks it through
-    /// [`Plan::root`] and the [`LogicalOp`]/[`Expr`] accessors.
-    pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
-        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query);
+    /// Plan a SQL query inside `transaction`: sends the query to DuckDB and
+    /// returns a [`Plan`] handle owning the resolved logical plan. The caller
+    /// walks it through [`Plan::root`] and the [`LogicalOp`]/[`Expr`] accessors.
+    ///
+    /// Every table the query references is bound through `transaction`, so one
+    /// plan sees one consistent snapshot of the catalog. The transaction is
+    /// published to the bridge only for the duration of this call.
+    pub fn plan(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn DuckDBTransaction>,
+    ) -> Result<Plan, Error> {
+        let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
+        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, &transaction_ctx);
         if !result.error_kind.is_empty() {
             return Err(bridge_error(&result));
         }

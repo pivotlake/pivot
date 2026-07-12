@@ -9,7 +9,6 @@ use rstest::rstest;
 #[rstest]
 fn in_subquery_semijoin_is_unsupported_not_late_materialized(mut testing_planner: TestingPlanner) {
     let result = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a IN (SELECT b FROM example_table WHERE b > 20)");
     assert!(
         result.is_err(),
@@ -20,7 +19,6 @@ fn in_subquery_semijoin_is_unsupported_not_late_materialized(mut testing_planner
 #[rstest]
 fn simple_select(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a, b FROM example_table")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -32,7 +30,6 @@ fn simple_select(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn explain_wraps_the_explained_plan(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("EXPLAIN SELECT a, b FROM example_table")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -45,7 +42,6 @@ fn explain_wraps_the_explained_plan(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a <> b")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -59,7 +55,6 @@ fn filter(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -72,7 +67,6 @@ fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn order_by_without_limit_produces_order_by(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table ORDER BY a DESC")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -85,7 +79,6 @@ fn order_by_without_limit_produces_order_by(mut testing_planner: TestingPlanner)
 #[rstest]
 fn simple_aggregate(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT COUNT(*) FROM example_table WHERE a <> 0")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -99,7 +92,6 @@ fn simple_aggregate(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn aggregate_with_single_group(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -112,7 +104,6 @@ fn aggregate_with_single_group(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn aggregate_with_multiple_groups(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a, b, COUNT(*) FROM example_table GROUP BY a, b")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -125,7 +116,6 @@ fn aggregate_with_multiple_groups(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn input_references_correct_columns(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a, c FROM example_table")
         .unwrap();
     // `a` is column #0 and `c` is column #2 in the table; the Input scans
@@ -140,7 +130,6 @@ fn input_references_correct_columns(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn create_table_produces_create_table_operator(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("CREATE TABLE created_table (id INTEGER, name VARCHAR)")
         .unwrap();
     assert_snapshot!(
@@ -153,7 +142,6 @@ fn create_table_produces_create_table_operator(mut testing_planner: TestingPlann
 #[rstest]
 fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("CREATE TABLE created_table (id INTEGER) WITH (path='/asdf', format='parquet')")
         .unwrap();
     assert_snapshot!(
@@ -166,7 +154,6 @@ fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -180,10 +167,7 @@ fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn set_variable_is_parsed_by_duckdb(mut testing_planner: TestingPlanner) {
-    let plan = testing_planner
-        .planner
-        .plan("SET pivot_stats = true")
-        .unwrap();
+    let plan = testing_planner.plan("SET pivot_stats = true").unwrap();
 
     let set = plan
         .as_set_variable()
@@ -195,7 +179,7 @@ fn set_variable_is_parsed_by_duckdb(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn reset_variable_carries_no_value(mut testing_planner: TestingPlanner) {
-    let plan = testing_planner.planner.plan("RESET pivot_stats").unwrap();
+    let plan = testing_planner.plan("RESET pivot_stats").unwrap();
 
     let set = plan
         .as_set_variable()
