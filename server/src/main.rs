@@ -108,6 +108,15 @@ struct Args {
     /// disable.
     #[arg(long, value_name = "ADDR")]
     http_bind: Option<SocketAddr>,
+
+    /// How often (seconds) the background catalog refresh brings the in-memory
+    /// table set up to date with the store: new manifest versions, new files'
+    /// footers, and tables committed by other processes. Queries bind against
+    /// a snapshot of that in-memory set, so this bounds how stale a query's
+    /// view of *externally* committed data can be (this process's own ingest
+    /// and compaction publish their commits immediately).
+    #[arg(long, default_value_t = 30, value_name = "SECS")]
+    catalog_refresh_secs: u64,
 }
 
 impl Args {
@@ -300,6 +309,7 @@ fn main() -> Result<(), Error> {
             ingests,
             compact_bytes,
             args.compact_min_files,
+            Duration::from_secs(args.catalog_refresh_secs),
         );
         if let Some(addr) = args.http_bind {
             server = server.with_http_bind(addr);

@@ -18,10 +18,12 @@ use rstest::rstest;
 #[rstest]
 fn grouped_count_beside_string_min_is_int64(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT COUNT(*) AS n, MIN(name) AS mn FROM example_table GROUP BY a")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -40,10 +42,10 @@ fn grouped_count_beside_string_min_is_int64(mut testing_planner: TestingPlanner)
 #[rstest]
 fn grouped_count_having_on_count_does_not_crash(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
+
         .plan("SELECT MIN(name) AS mn, COUNT(*) AS n FROM example_table GROUP BY a HAVING COUNT(*) > 0")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(testing_planner.dispatcher(), testing_planner.transaction().as_ref())
         .unwrap()
         .collect()
         .unwrap();
@@ -55,10 +57,12 @@ fn grouped_count_having_on_count_does_not_crash(mut testing_planner: TestingPlan
 #[rstest]
 fn global_sum_of_narrow_int_is_decimal128(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT SUM(a) AS s FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -79,10 +83,12 @@ fn min_of_int_cast_to_text_compares_lexicographically(mut testing_planner: Testi
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT MIN(CAST(x AS VARCHAR)) AS mn FROM nums")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();

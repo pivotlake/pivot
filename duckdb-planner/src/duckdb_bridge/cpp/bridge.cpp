@@ -171,10 +171,28 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 	return plan;
 }
 
-ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query) {
+// Publishes the pivot transaction for the duration of one plan: every table
+// and table-function lookup during binding reads it off the storage info (see
+// `PivotSchemaCatalogEntry::LookupEntry`) and the destructor clears it, so the
+// pointer never outlives the `extract_plan` call that owns the referent.
+struct CurrentTransactionScope {
+	PivotStorageInfo &storage_info;
+
+	CurrentTransactionScope(PivotStorageInfo &storage_info, const TransactionContext &transaction)
+	    : storage_info(storage_info) {
+		storage_info.current_transaction = &transaction;
+	}
+	~CurrentTransactionScope() {
+		storage_info.current_transaction = nullptr;
+	}
+};
+
+ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
+                               const TransactionContext &transaction) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
 	std::optional<ExtractPlanResult> error;
+	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
 
 	try {
 		std::string query_str(query.data(), query.size());

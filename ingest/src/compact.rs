@@ -240,11 +240,14 @@ impl Compacter {
                         files = merged.len(),
                         "compacted batch"
                     );
-                    // Pull in the swap we just committed before scanning again.
+                    // Pull in the swap we just committed before scanning again,
+                    // and publish it so the next query's snapshot reads the
+                    // merged file instead of the swapped-out inputs.
                     if let Err(e) = table.refresh() {
                         warn!(table = table.name(), error = %e, "compaction: refresh after merge failed");
                         return;
                     }
+                    self.catalog.publish_table(table.clone());
                 }
                 Ok(Err(e)) => {
                     error!(table = table.name(), error = %e, "compaction merge failed");

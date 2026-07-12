@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 use planner::Planner;
-use planner::catalog::{Catalog, Column, DynamicScanPredicate, Table};
+use planner::catalog::{Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table};
 use planner::types::Type;
 
 #[derive(Clone, Debug)]
@@ -95,7 +95,7 @@ impl Table for TestTable {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-        _ctx: &dyn planner::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         Ok(table_input_with_filter(
             dispatcher,
@@ -118,7 +118,7 @@ impl Table for TestTable {
         &self,
         input: RecordBatchOperatorSpec,
         projection: Projection,
-        _ctx: &dyn planner::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         Ok(catalog::parquet::materialize(
             input,
@@ -170,14 +170,28 @@ impl TestCatalog {
     }
 }
 
-impl Catalog for TestCatalog {
+/// One test transaction: a frozen clone of the catalog's table map, mirroring
+/// the production shape (one snapshot per query).
+#[derive(Debug)]
+struct TestTransaction {
+    tables: HashMap<String, TestTable>,
+}
+
+impl CatalogTransaction for TestTransaction {
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        self.tables
-            .lock()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .map(|t| Box::new(t) as _)
+        self.tables.get(name).cloned().map(|t| Box::new(t) as _)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Catalog for TestCatalog {
+    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
+        Arc::new(TestTransaction {
+            tables: self.tables.lock().unwrap().clone(),
+        })
     }
 
     fn create_table(
@@ -251,6 +265,18 @@ impl TestingPlanner {
         self.catalog
             .add_table_files(&self.dispatch, name, columns, batches);
     }
+
+    /// Plan `sql` inside a fresh transaction on this fixture's catalog, the
+    /// one-liner tests use instead of wiring the transaction themselves.
+    pub fn plan(&mut self, sql: &str) -> Result<planner::Plan, planner::Error> {
+        let transaction = self.catalog.begin_transaction();
+        self.planner.plan(sql, transaction)
+    }
+
+    /// A fresh transaction on this fixture's catalog, for compiling plans.
+    pub fn transaction(&self) -> Arc<dyn CatalogTransaction> {
+        self.catalog.begin_transaction()
+    }
 }
 
 /// Shared planner backed by a catalog seeded with `example_table`:
@@ -307,11 +333,13 @@ pub fn run(planner: &mut TestingPlanner, sql: &str) -> Vec<Value> {
 /// inspect the output arrow schema rather than only the JSON-rendered values.
 #[allow(dead_code)]
 pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> {
+    // One transaction spans plan and compile, as a statement's does.
+    let transaction = planner.transaction();
     planner
         .planner
-        .plan(sql)
+        .plan(sql, transaction.clone())
         .unwrap()
-        .compile(planner.dispatcher())
+        .compile(planner.dispatcher(), transaction.as_ref())
         .unwrap()
         .collect()
         .unwrap()

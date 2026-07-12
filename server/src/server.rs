@@ -26,10 +26,16 @@ use pgwire::tokio::process_socket;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::{JoinError, JoinSet};
+use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
+
+/// Default cadence of the background catalog refresh (the
+/// `catalog_refresh_interval` argument of [`Server::new`]).
+pub const DEFAULT_CATALOG_REFRESH: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -73,6 +79,10 @@ pub struct Server {
     /// `None` (the default) leaves it off; set it with
     /// [`with_http_bind`](Self::with_http_bind).
     http_bind: Option<SocketAddr>,
+    /// How often the background sweep refreshes the in-memory catalog from the
+    /// store (manifest versions + new footers). Queries snapshot the in-memory
+    /// set, so this bounds staleness for externally committed data.
+    catalog_refresh_interval: Duration,
 }
 
 impl Server {
@@ -89,6 +99,7 @@ impl Server {
         ingests: Vec<IngestConfig>,
         compact_bytes: u64,
         compact_min_files: usize,
+        catalog_refresh_interval: Duration,
     ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
         // handler needs it to compile every plan, and the ingest sources need
@@ -110,6 +121,7 @@ impl Server {
             compact_bytes,
             compact_min_files,
             http_bind: None,
+            catalog_refresh_interval,
         }
     }
 
@@ -164,6 +176,36 @@ impl Server {
             })
         });
 
+        // Keep the in-memory catalog current: on an interval, reload every
+        // table to its latest committed manifest version and fetch any new
+        // files' footers. Queries bind against a snapshot of the in-memory set
+        // and never read the store themselves, so this sweep is what makes
+        // externally committed data (another process's ingest, a bucket
+        // writer) visible. The catalog was fully loaded at open, so the
+        // immediate first tick is skipped.
+        let refresh_task = {
+            let catalog = self.catalog.clone();
+            let mut tick = tokio::time::interval(self.catalog_refresh_interval);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            tokio::spawn(async move {
+                // A tokio interval fires its first tick immediately on
+                // creation; consume it so the first refresh runs one full
+                // interval from now (the catalog was just loaded at open).
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let catalog = catalog.clone();
+                    // The refresh drives footer-fetch dataflows and blocking
+                    // store reads, so it runs off the reactor.
+                    match tokio::task::spawn_blocking(move || catalog.refresh_catalog()).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => warn!(error = %e, "catalog refresh failed"),
+                        Err(e) => warn!(error = %e, "catalog refresh panicked"),
+                    }
+                }
+            })
+        };
+
         // `Option` so the two terminal arms below can each take ownership
         // without the borrow checker tripping over the loop.
         let mut ingestor = Some(ingestor);
@@ -175,6 +217,7 @@ impl Server {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signalled, draining ingest then workers");
+                    refresh_task.abort();
                     if let Some(task) = &http_task {
                         task.abort();
                     }
@@ -192,6 +235,7 @@ impl Server {
                 Some(joined) = self.worker_watchers.join_next() => {
                     // A worker died: flushing would hang on a dead worker, so
                     // stop the receivers without a final flush.
+                    refresh_task.abort();
                     if let Some(task) = &http_task {
                         task.abort();
                     }
@@ -275,6 +319,7 @@ mod tests {
             vec![],
             0,
             ingest::DEFAULT_MIN_FILES_TO_MERGE,
+            DEFAULT_CATALOG_REFRESH,
         );
 
         let join = tokio::spawn(server.serve(Box::pin(async move {

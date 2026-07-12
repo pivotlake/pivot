@@ -9,6 +9,11 @@
 
 struct PivotStorageInfo : public duckdb::StorageExtensionInfo {
 	const CatalogContext *catalog_ctx;
+	// The pivot transaction of the plan currently being extracted. Set by
+	// `extract_plan` for the duration of one call (planning is single-threaded
+	// per context) and stamped onto each `PivotTransaction` the transaction
+	// manager starts, so table binding resolves against that plan's snapshot.
+	const TransactionContext *current_transaction = nullptr;
 	std::vector<duckdb::unique_ptr<PivotTableCatalogEntry>> table_entries;
 	// Table- and scalar-function catalog entries synthesized on lookup; kept
 	// alive for the duration of one plan alongside the table entries.
