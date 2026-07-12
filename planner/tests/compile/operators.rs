@@ -28,10 +28,12 @@ fn int16_col(values: Vec<i16>) -> ArrayRef {
 #[rstest]
 fn explain_emits_plan_text_without_running_the_query(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("EXPLAIN SELECT a, b FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -53,10 +55,12 @@ fn explain_emits_plan_text_without_running_the_query(mut testing_planner: Testin
 #[rstest]
 fn select_column_subset(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a, b FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -82,10 +86,12 @@ fn select_column_subset(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn select_all_columns(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a, b, c FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -111,10 +117,12 @@ fn select_all_columns(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn select_single_column(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT c FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -148,10 +156,12 @@ fn filter_not_equal_columns(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT a, b FROM pairs_with_dup WHERE a <> b")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -184,10 +194,12 @@ fn filter_not_equal_no_matches(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM pairs_all_equal WHERE a <> b")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -199,10 +211,12 @@ fn filter_not_equal_no_matches(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_not_equal_all_pass(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a, b FROM example_table WHERE a <> b")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -228,10 +242,12 @@ fn filter_not_equal_all_pass(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_not_equal_constant(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a <> 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -256,10 +272,12 @@ fn filter_not_equal_constant(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_equal_constant(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a = 3")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -274,10 +292,12 @@ fn filter_equal_constant(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_equal_no_match(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a = 999")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -293,10 +313,12 @@ fn filter_equal_no_match(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn order_by_ascending(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a, b FROM example_table ORDER BY a ASC")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -320,10 +342,12 @@ fn order_by_ascending(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn order_by_descending(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a, b FROM example_table ORDER BY a DESC")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -347,10 +371,12 @@ fn order_by_descending(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn top_n_limit_1(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 1")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -363,10 +389,12 @@ fn top_n_limit_1(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn top_n_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table ORDER BY a LIMIT 100")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -378,10 +406,12 @@ fn top_n_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT b FROM example_table ORDER BY a ASC LIMIT 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -403,10 +433,12 @@ fn top_n_limit_2_ascending(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn plain_limit_keeps_limit_rows(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table LIMIT 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -419,10 +451,12 @@ fn plain_limit_keeps_limit_rows(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn plain_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table LIMIT 100")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -438,10 +472,12 @@ fn plain_limit_exceeds_row_count(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn plain_limit_with_offset(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table LIMIT 2 OFFSET 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -462,10 +498,12 @@ fn group_by_plain_limit(mut testing_planner: TestingPlanner) {
     add_events_table(&testing_planner);
 
     let results = testing_planner
-        .planner
         .plan("SELECT g, COUNT(*) FROM events GROUP BY g LIMIT 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -493,13 +531,15 @@ fn grouped_multikey_order_by_count_desc_limit(mut testing_planner: TestingPlanne
     );
 
     let results = testing_planner
-        .planner
         .plan(
             "SELECT UserID, SearchPhrase, COUNT(*) AS c FROM events \
              GROUP BY UserID, SearchPhrase ORDER BY c DESC, UserID, SearchPhrase LIMIT 10",
         )
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -546,10 +586,12 @@ fn grouped_multikey_order_by_breaks_count_ties_on_secondary_key(
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT g, COUNT(*) AS c FROM g_ties GROUP BY g ORDER BY c DESC, g LIMIT 3")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -569,10 +611,12 @@ fn grouped_multikey_order_by_breaks_count_ties_on_secondary_key(
 #[rstest]
 fn select_star_filtered_top_n_late_materializes(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT * FROM example_table WHERE name <> 'bob' ORDER BY a ASC LIMIT 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -611,13 +655,15 @@ fn grouped_avg_length_filtered_having_ordered(mut testing_planner: TestingPlanne
 
     let rows = batches_to_json(
         &testing_planner
-            .planner
             .plan(
                 "SELECT g, AVG(length(url)) AS l, COUNT(*) AS c FROM pages \
                  WHERE url <> '' GROUP BY g HAVING COUNT(*) > 1 ORDER BY l DESC LIMIT 25",
             )
             .unwrap()
-            .compile(testing_planner.dispatcher())
+            .compile(
+                testing_planner.dispatcher(),
+                testing_planner.transaction().as_ref(),
+            )
             .unwrap()
             .collect()
             .unwrap(),
@@ -637,10 +683,12 @@ fn grouped_avg_length_filtered_having_ordered(mut testing_planner: TestingPlanne
 #[rstest]
 fn group_by_int_column(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a, COUNT(*) FROM example_table GROUP BY a")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -658,10 +706,12 @@ fn group_by_int_column(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn group_by_string_column_with_duplicates(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT name, COUNT(*) FROM example_table GROUP BY name")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -696,10 +746,12 @@ fn group_by_int64_string_key(mut testing_planner: TestingPlanner) {
 
     let mut rows = batches_to_json(
         &testing_planner
-            .planner
             .plan("SELECT id, name, COUNT(*) FROM hits GROUP BY id, name LIMIT 10")
             .unwrap()
-            .compile(testing_planner.dispatcher())
+            .compile(
+                testing_planner.dispatcher(),
+                testing_planner.transaction().as_ref(),
+            )
             .unwrap()
             .collect()
             .unwrap(),
@@ -770,10 +822,12 @@ fn group_by_int64_and_date_columns(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT id, d, COUNT(*) FROM idd GROUP BY id, d")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -827,10 +881,12 @@ fn group_by_count_distinct(mut testing_planner: TestingPlanner) {
         ],
     );
     let results = testing_planner
-        .planner
         .plan("SELECT g, COUNT(DISTINCT x) FROM gx GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -859,10 +915,12 @@ fn group_by_count_distinct_string_key(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT name, COUNT(DISTINCT x) FROM nx GROUP BY name")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -903,10 +961,12 @@ fn group_by_count_distinct_multi_column_key(mut testing_planner: TestingPlanner)
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT g, name, COUNT(DISTINCT uid) FROM gnx GROUP BY g, name")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -952,10 +1012,12 @@ fn group_by_count_distinct_computed_key(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT k * 2 AS p, COUNT(DISTINCT x) FROM cg GROUP BY k * 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -974,10 +1036,12 @@ fn group_by_count_distinct_computed_key(mut testing_planner: TestingPlanner) {
 fn global_count_distinct_string(mut testing_planner: TestingPlanner) {
     // example_table.name = alice, bob, charlie, dave, alice -> 4 distinct.
     let results = testing_planner
-        .planner
         .plan("SELECT COUNT(DISTINCT name) FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -997,10 +1061,12 @@ fn global_count_distinct_int(mut testing_planner: TestingPlanner) {
         &[("v", Type::Int32, int_col(vec![7, 7, 7, 8, 9, 9, 0, 0]))],
     );
     let results = testing_planner
-        .planner
         .plan("SELECT COUNT(DISTINCT v) FROM ints")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1025,10 +1091,12 @@ fn group_by_mixed_distinct(mut testing_planner: TestingPlanner) {
         ],
     );
     let results = testing_planner
-        .planner
         .plan("SELECT g, SUM(v), COUNT(*), COUNT(DISTINCT x) FROM mixed GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1072,10 +1140,12 @@ fn group_by_two_counts_mixed_distinct(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT g, COUNT(*), COUNT(w), COUNT(DISTINCT x) FROM cc GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1117,10 +1187,12 @@ fn group_by_count_two_int16_sums_coalesce(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT g, COUNT(*), SUM(a), SUM(b), COUNT(c) FROM cs GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1153,12 +1225,14 @@ fn group_order_by_sum_with_coalesced_count_limit(mut testing_planner: TestingPla
     );
 
     let results = testing_planner
-        .planner
         .plan(
             "SELECT g, COUNT(*), COUNT(c), SUM(a) AS s FROM tk GROUP BY g ORDER BY s DESC LIMIT 2",
         )
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1182,10 +1256,12 @@ fn group_order_by_sum_with_coalesced_count_limit(mut testing_planner: TestingPla
 #[rstest]
 fn filter_then_order_by(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a, b FROM example_table WHERE a <> b ORDER BY a DESC")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1218,10 +1294,12 @@ fn filter_then_count(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT COUNT(*) FROM pairs_all_equal WHERE a <> b")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1239,10 +1317,12 @@ fn global_avg_is_lowered_to_sum_and_count(mut testing_planner: TestingPlanner) {
     // `UnsupportedAggregateExpression`) and produce the right average through
     // the sum + count slots. avg(a) over [1,2,3,4,5] = 3.0.
     let results = testing_planner
-        .planner
         .plan("SELECT AVG(a) FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1259,10 +1339,12 @@ fn global_sum_count_avg_together(mut testing_planner: TestingPlanner) {
     // Must compile and run end-to-end; count = 5 and avg(b) over
     // [10,20,30,40,50] = 30.0 (sum(a) is a Decimal128, skipped by the f64 scan).
     let results = testing_planner
-        .planner
         .plan("SELECT SUM(a), COUNT(*), AVG(b) FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1284,10 +1366,12 @@ fn global_min_max(mut testing_planner: TestingPlanner) {
     // MIN/MAX fold the extreme over the whole column (no GROUP BY): over
     // a=[1,2,3,4,5] and b=[10,20,30,40,50], min(a)=1 and max(b)=50.
     let results = testing_planner
-        .planner
         .plan("SELECT MIN(a), MAX(b) FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1311,10 +1395,12 @@ fn global_string_min_max(mut testing_planner: TestingPlanner) {
         )],
     );
     let results = testing_planner
-        .planner
         .plan("SELECT MIN(s), MAX(s) FROM gs_global")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1338,10 +1424,12 @@ fn grouped_min_max(mut testing_planner: TestingPlanner) {
         ],
     );
     let results = testing_planner
-        .planner
         .plan("SELECT g, MIN(v), MAX(v) FROM gv GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1379,10 +1467,9 @@ fn grouped_string_min_and_max(mut testing_planner: TestingPlanner) {
 
     let run = |p: &mut TestingPlanner, sql: &str| {
         let results = p
-            .planner
             .plan(sql)
             .unwrap()
-            .compile(p.dispatcher())
+            .compile(p.dispatcher(), p.transaction().as_ref())
             .unwrap()
             .collect()
             .unwrap();
@@ -1419,10 +1506,12 @@ fn grouped_string_max_order_by_limit(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT g, MAX(s) FROM gsl GROUP BY g ORDER BY MAX(s) DESC LIMIT 1")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1454,10 +1543,12 @@ fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
 
     // MIN(s) + MAX(s): a string mix of opposite directions in one value.
     let results = testing_planner
-        .planner
         .plan("SELECT g, MIN(s), MAX(s) FROM gs2 GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1470,10 +1561,12 @@ fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
 
     // MIN(s) (string) + MAX(v) (integer): a string extreme beside a numeric one.
     let mixed = testing_planner
-        .planner
         .plan("SELECT g, MIN(s), MAX(v) FROM gs2 GROUP BY g")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1488,10 +1581,12 @@ fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_then_top_n(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1522,13 +1617,15 @@ fn add_events_table(testing_planner: &TestingPlanner) {
 fn group_order_by_count_desc_with_offset(mut testing_planner: TestingPlanner) {
     add_events_table(&testing_planner);
     let results = testing_planner
-        .planner
         .plan(
             "SELECT g, COUNT(*) FROM events \
              GROUP BY g ORDER BY COUNT(*) DESC LIMIT 2 OFFSET 2",
         )
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1545,13 +1642,15 @@ fn group_order_by_count_desc_with_offset(mut testing_planner: TestingPlanner) {
 fn group_order_by_key_asc_with_offset(mut testing_planner: TestingPlanner) {
     add_events_table(&testing_planner);
     let results = testing_planner
-        .planner
         .plan(
             "SELECT g, COUNT(*) FROM events \
              GROUP BY g ORDER BY g ASC LIMIT 2 OFFSET 1",
         )
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1566,9 +1665,24 @@ struct RecordingCatalog {
     created_tables: Mutex<Vec<CreateTableRequest>>,
 }
 
-impl Catalog for RecordingCatalog {
+/// The CREATE TABLE statements planned here reference no tables, so the
+/// transaction resolves nothing.
+#[derive(Debug)]
+struct EmptyTransaction;
+
+impl planner::catalog::CatalogTransaction for EmptyTransaction {
     fn table(&self, _name: &str) -> Option<Box<dyn Table>> {
         None
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Catalog for RecordingCatalog {
+    fn begin_transaction(&self) -> Arc<dyn planner::catalog::CatalogTransaction> {
+        Arc::new(EmptyTransaction)
     }
 
     fn create_table(
@@ -1629,11 +1743,15 @@ fn create_table_calls_catalog_once() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
     let mut planner = Planner::new(catalog.clone());
+    let transaction = catalog.begin_transaction();
 
     let results = planner
-        .plan("CREATE TABLE created_table (id INTEGER, name VARCHAR)")
+        .plan(
+            "CREATE TABLE created_table (id INTEGER, name VARCHAR)",
+            transaction.clone(),
+        )
         .unwrap()
-        .compile(dispatch.dispatcher())
+        .compile(dispatch.dispatcher(), transaction.as_ref())
         .unwrap()
         .collect()
         .unwrap();
@@ -1657,11 +1775,15 @@ fn create_table_passes_with_options_to_catalog() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
     let mut planner = Planner::new(catalog.clone());
+    let transaction = catalog.begin_transaction();
 
     let results = planner
-        .plan("CREATE TABLE created_table (id INTEGER) WITH (existing_path='/asdf')")
+        .plan(
+            "CREATE TABLE created_table (id INTEGER) WITH (existing_path='/asdf')",
+            transaction.clone(),
+        )
         .unwrap()
-        .compile(dispatch.dispatcher())
+        .compile(dispatch.dispatcher(), transaction.as_ref())
         .unwrap()
         .collect()
         .unwrap();
@@ -1721,14 +1843,16 @@ fn group_by_string_min_mixed_distinct_filtered_ordered(mut testing_planner: Test
 
     let rows = batches_to_json(
         &testing_planner
-            .planner
             .plan(
                 "SELECT phrase, MIN(url), MIN(title), COUNT(*) AS c, COUNT(DISTINCT user) \
                  FROM hits WHERE title LIKE '%Goog%' AND url NOT LIKE '%.google.%' \
                  AND phrase <> '' GROUP BY phrase ORDER BY c DESC LIMIT 10",
             )
             .unwrap()
-            .compile(testing_planner.dispatcher())
+            .compile(
+                testing_planner.dispatcher(),
+                testing_planner.transaction().as_ref(),
+            )
             .unwrap()
             .collect()
             .unwrap(),
@@ -1770,10 +1894,12 @@ fn group_by_numeric_min_max_mixed_distinct(mut testing_planner: TestingPlanner) 
 
     let mut rows = batches_to_json(
         &testing_planner
-            .planner
             .plan("SELECT g, MIN(v), MAX(v), COUNT(DISTINCT user) FROM gv GROUP BY g")
             .unwrap()
-            .compile(testing_planner.dispatcher())
+            .compile(
+                testing_planner.dispatcher(),
+                testing_planner.transaction().as_ref(),
+            )
             .unwrap()
             .collect()
             .unwrap(),
@@ -1802,10 +1928,12 @@ fn group_by_numeric_min_max_mixed_distinct(mut testing_planner: TestingPlanner) 
 #[rstest]
 fn generate_series_emits_inclusive_range(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT * FROM generate_series(1, 5)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1831,10 +1959,12 @@ fn generate_series_emits_inclusive_range(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn range_excludes_upper_bound_and_honors_step(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT * FROM range(0, 10, 2)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1862,10 +1992,10 @@ fn generate_series_streams_across_chunk_boundaries(mut testing_planner: TestingP
     // 20000 rows span several SERIES_CHUNK_ROWS (8192) batches, so this exercises
     // the multi-poll streaming path, not a single in-memory batch.
     let results = testing_planner
-        .planner
+
         .plan("SELECT count(*), min(generate_series), max(generate_series) FROM generate_series(1, 20000)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(testing_planner.dispatcher(), testing_planner.transaction().as_ref())
         .unwrap()
         .collect()
         .unwrap();
@@ -1883,10 +2013,12 @@ fn generate_series_streams_across_chunk_boundaries(mut testing_planner: TestingP
 #[rstest]
 fn count_star_over_generate_series(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT count(*) FROM generate_series(1, 5)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1899,10 +2031,12 @@ fn count_star_over_generate_series(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn range_with_single_argument_starts_at_zero(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT * FROM range(5)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1929,10 +2063,12 @@ fn range_with_single_argument_starts_at_zero(mut testing_planner: TestingPlanner
 fn count_star_over_empty_series(mut testing_planner: TestingPlanner) {
     // start > stop with a positive step yields no rows; count(*) must still be 0.
     let results = testing_planner
-        .planner
         .plan("SELECT count(*) FROM generate_series(5, 1)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1945,10 +2081,12 @@ fn count_star_over_empty_series(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn generate_series_composes_with_aggregate(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT count(*), sum(generate_series) FROM generate_series(1, 4)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1965,9 +2103,7 @@ fn generate_series_composes_with_aggregate(mut testing_planner: TestingPlanner) 
 fn unsupported_aggregate_returns_error(mut testing_planner: TestingPlanner) {
     // `stddev` has no pivot lowering (unlike SUM/COUNT/MIN/MAX/AVG), so it must
     // surface as a plan-conversion error rather than silently mis-aggregating.
-    let result = testing_planner
-        .planner
-        .plan("SELECT STDDEV(b) FROM example_table");
+    let result = testing_planner.plan("SELECT STDDEV(b) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }
 
@@ -1980,10 +2116,12 @@ fn projection_of_constant_broadcasts_to_every_row(mut testing_planner: TestingPl
     // "all columns in a record batch must have the same length". This is the path the
     // duckdb RemoveDerivedGroups optimizer exposes for `GROUP BY <const>` (e.g. q34).
     let results = testing_planner
-        .planner
         .plan("SELECT 1, name FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -2031,10 +2169,12 @@ fn group_by_error_names_the_unsupported_key_not_the_first(mut testing_planner: T
     );
 
     let compiled = testing_planner
-        .planner
         .plan("SELECT k_int, k_float, COUNT(*) FROM mixed_keys GROUP BY k_int, k_float")
         .unwrap()
-        .compile(testing_planner.dispatcher());
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        );
     let err = match compiled {
         Ok(_) => panic!("grouping by a float key should fail to compile"),
         Err(err) => err.to_string(),

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
 use planner::Planner;
-use planner::catalog::{Catalog, Column, CreateTableRequest, Table};
+use planner::catalog::{Catalog, CatalogTransaction, Column, CreateTableRequest, Table};
 use planner::expression::TableFilter;
 use planner::types::Type;
 
@@ -40,7 +40,7 @@ impl Table for RecordingTable {
         _projection: Projection,
         _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
-        _ctx: &dyn planner::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("plan-only test should not reach compile")
     }
@@ -61,15 +61,29 @@ impl Table for RecordingTable {
 
 /// Minimal `Catalog` that resolves a single, known table name. Used instead
 /// of the shared `TestCatalog` because we need a hand-rolled `Table` impl.
+/// Its transaction snapshot is the catalog itself: the table never changes.
 #[derive(Debug)]
 struct SingleTableCatalog {
     name: String,
     table: RecordingTable,
 }
 
-impl Catalog for SingleTableCatalog {
+impl CatalogTransaction for SingleTableCatalog {
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
         (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn Table>)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Catalog for SingleTableCatalog {
+    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
+        Arc::new(SingleTableCatalog {
+            name: self.name.clone(),
+            table: self.table.clone(),
+        })
     }
 
     fn create_table(
@@ -94,12 +108,20 @@ fn two_int_cols() -> Vec<Column> {
     ]
 }
 
-fn build_planner(table: RecordingTable) -> Planner {
+fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {
     let catalog = Arc::new(SingleTableCatalog {
         name: "t".to_string(),
         table,
     });
-    Planner::new(catalog)
+    (Planner::new(catalog.clone()), catalog)
+}
+
+fn plan_sql(
+    planner: &mut Planner,
+    catalog: &Arc<SingleTableCatalog>,
+    sql: &str,
+) -> Result<planner::Plan, planner::Error> {
+    planner.plan(sql, catalog.begin_transaction())
 }
 
 /// `Catalog::table` is consulted by name; the looked-up `Table::columns` is
@@ -107,9 +129,9 @@ fn build_planner(table: RecordingTable) -> Planner {
 #[test]
 fn catalog_resolves_named_table() {
     let table = RecordingTable::new(two_int_cols(), false);
-    let mut planner = build_planner(table.clone());
+    let (mut planner, catalog) = build_planner(table.clone());
 
-    let plan = planner.plan("SELECT a, b FROM t").unwrap();
+    let plan = plan_sql(&mut planner, &catalog, "SELECT a, b FROM t").unwrap();
 
     assert_snapshot!(plan.to_string(), @"
     Projection(a:Int32, b:Int32)
@@ -121,9 +143,9 @@ fn catalog_resolves_named_table() {
 #[test]
 fn catalog_returns_error_for_unknown_table() {
     let table = RecordingTable::new(two_int_cols(), false);
-    let mut planner = build_planner(table.clone());
+    let (mut planner, catalog) = build_planner(table.clone());
 
-    let err = planner.plan("SELECT a FROM nonexistent").unwrap_err();
+    let err = plan_sql(&mut planner, &catalog, "SELECT a FROM nonexistent").unwrap_err();
     let msg = err.to_string();
     assert!(
         msg.contains("nonexistent") || msg.to_lowercase().contains("table"),
@@ -145,9 +167,9 @@ fn pushdown_snapshot(received: &[TableFilter]) -> String {
 #[test]
 fn pushdown_rejected_keeps_filter_operator() {
     let table = RecordingTable::new(two_int_cols(), false);
-    let mut planner = build_planner(table.clone());
+    let (mut planner, catalog) = build_planner(table.clone());
 
-    let plan = planner.plan("SELECT a FROM t WHERE a <> 0").unwrap();
+    let plan = plan_sql(&mut planner, &catalog, "SELECT a FROM t WHERE a <> 0").unwrap();
 
     let received = table.received.lock().unwrap();
     assert_snapshot!(pushdown_snapshot(&received), @"a:Int32 <> 0:Int32 -> Boolean");
@@ -166,9 +188,9 @@ fn pushdown_rejected_keeps_filter_operator() {
 #[test]
 fn pushdown_accepted_drops_filter_operator() {
     let table = RecordingTable::new(two_int_cols(), true);
-    let mut planner = build_planner(table.clone());
+    let (mut planner, catalog) = build_planner(table.clone());
 
-    let plan = planner.plan("SELECT a FROM t WHERE a <> 0").unwrap();
+    let plan = plan_sql(&mut planner, &catalog, "SELECT a FROM t WHERE a <> 0").unwrap();
 
     let received = table.received.lock().unwrap();
     assert_snapshot!(pushdown_snapshot(&received), @"a:Int32 <> 0:Int32 -> Boolean");
@@ -184,9 +206,9 @@ fn pushdown_accepted_drops_filter_operator() {
 #[test]
 fn no_where_clause_skips_pushdown() {
     let table = RecordingTable::new(two_int_cols(), true);
-    let mut planner = build_planner(table.clone());
+    let (mut planner, catalog) = build_planner(table.clone());
 
-    let _plan = planner.plan("SELECT a FROM t").unwrap();
+    let _plan = plan_sql(&mut planner, &catalog, "SELECT a FROM t").unwrap();
 
     assert!(table.received.lock().unwrap().is_empty());
 }

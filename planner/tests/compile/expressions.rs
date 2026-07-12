@@ -10,10 +10,12 @@ use rstest::rstest;
 #[rstest]
 fn filter_contains_substring(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT name, b FROM example_table WHERE contains(name, 'ali')")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -30,10 +32,12 @@ fn filter_contains_substring(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_contains_no_match(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT name FROM example_table WHERE contains(name, 'zzz')")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -54,10 +58,12 @@ fn filter_contains_matches_all(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT s FROM substrings WHERE contains(s, 'aa')")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -70,10 +76,12 @@ fn filter_contains_matches_all(mut testing_planner: TestingPlanner) {
 fn contains_then_group_by(mut testing_planner: TestingPlanner) {
     // Filter to names containing "a" (alice, charlie, dave), then group by name.
     let results = testing_planner
-        .planner
         .plan("SELECT name, COUNT(*) FROM example_table WHERE contains(name, 'a') GROUP BY name")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -103,10 +111,12 @@ fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT extract(minute FROM EventTime) AS m, COUNT(*) FROM events GROUP BY m")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -152,10 +162,12 @@ fn group_by_computed_key_sum(mut testing_planner: TestingPlanner) {
     minute_grouped_table(&mut testing_planner, "ev");
 
     let results = testing_planner
-        .planner
         .plan("SELECT extract(minute FROM EventTime) AS m, SUM(v) FROM ev GROUP BY m")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -183,10 +195,12 @@ fn group_by_computed_key_min_max(mut testing_planner: TestingPlanner) {
     minute_grouped_table(&mut testing_planner, "ev");
 
     let results = testing_planner
-        .planner
         .plan("SELECT extract(minute FROM EventTime) AS m, MIN(v), MAX(v) FROM ev GROUP BY m")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -214,10 +228,10 @@ fn group_by_computed_key_multi_agg(mut testing_planner: TestingPlanner) {
     minute_grouped_table(&mut testing_planner, "ev");
 
     let results = testing_planner
-        .planner
+
         .plan("SELECT extract(minute FROM EventTime) AS m, SUM(v), COUNT(*), MAX(v) FROM ev GROUP BY m")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(testing_planner.dispatcher(), testing_planner.transaction().as_ref())
         .unwrap()
         .collect()
         .unwrap();
@@ -252,12 +266,14 @@ fn group_by_computed_key_avg(mut testing_planner: TestingPlanner) {
     // AVG over a computed group key, lowered by DuckDB to sum+count over the
     // key column.
     let results = testing_planner
-        .planner
         .plan(
             "SELECT extract(minute FROM EventTime) AS m, AVG(v) AS a FROM ev GROUP BY m ORDER BY m",
         )
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -296,10 +312,10 @@ fn group_by_plain_and_computed_key(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
+
         .plan("SELECT uid, extract(minute FROM EventTime) AS m, SUM(v), COUNT(*) FROM t GROUP BY uid, m")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(testing_planner.dispatcher(), testing_planner.transaction().as_ref())
         .unwrap()
         .collect()
         .unwrap();
@@ -350,10 +366,12 @@ fn group_by_column_and_arithmetic_key(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT a, b - 1 AS d, COUNT(*) FROM t GROUP BY a, d")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -421,12 +439,14 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
 
     for (part, expected) in cases {
         let results = testing_planner
-            .planner
             .plan(&format!(
                 "SELECT extract({part} FROM EventTime) AS v, EventTime AS t FROM ts"
             ))
             .unwrap()
-            .compile(testing_planner.dispatcher())
+            .compile(
+                testing_planner.dispatcher(),
+                testing_planner.transaction().as_ref(),
+            )
             .unwrap()
             .collect()
             .unwrap();
@@ -453,10 +473,12 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
 fn filter_in_list_int(mut testing_planner: TestingPlanner) {
     // a IN (2, 4): rows with a=2 and a=4 survive.
     let results = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a IN (2, 4)")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -475,10 +497,12 @@ fn filter_in_list_int(mut testing_planner: TestingPlanner) {
 fn filter_in_list_string(mut testing_planner: TestingPlanner) {
     // name IN ('alice', 'charlie'): alice (×2) and charlie (×1) survive.
     let results = testing_planner
-        .planner
         .plan("SELECT name FROM example_table WHERE name IN ('alice', 'charlie')")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -534,10 +558,12 @@ fn in_list_compare_in_compiles_to_membership_mask() {
 fn case_expression_in_projection(mut testing_planner: TestingPlanner) {
     // a = [1,2,3,4,5]; a < 3 -> 'low' (a=1,2), else 'high' (a=3,4,5).
     let results = testing_planner
-        .planner
         .plan("SELECT CASE WHEN a < 3 THEN 'low' ELSE 'high' END AS c FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -557,13 +583,15 @@ fn case_expression_multi_arm_group_key(mut testing_planner: TestingPlanner) {
     //   a=2,3   -> "mid" (2 rows)
     //   a=4,5   -> "hi"  (2 rows)
     let results = testing_planner
-        .planner
         .plan(
             "SELECT CASE WHEN a < 2 THEN 'lo' WHEN a < 4 THEN 'mid' ELSE 'hi' END AS c, COUNT(*) \
              FROM example_table GROUP BY 1",
         )
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -595,10 +623,12 @@ fn arithmetic_in_projection(mut testing_planner: TestingPlanner) {
     // operand pair (Int32 column + BIGINT constant) that exercises the
     // Int64 coercion path.
     let results = testing_planner
-        .planner
         .plan("SELECT a + 1, b - 2, (a + b) * 2, a + 5000000000 FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -643,10 +673,12 @@ fn length_counts_bytes(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT i, length(s) FROM strs")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -688,10 +720,12 @@ fn arithmetic_does_not_truncate_floats(mut testing_planner: TestingPlanner) {
     // branch. Coercing both to Int64 there would truncate `f` (1.5 -> 1) before
     // adding; the result must keep the fractional input.
     let results = testing_planner
-        .planner
         .plan("SELECT f + n FROM mixed")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -717,10 +751,12 @@ fn arithmetic_does_not_truncate_floats(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn filter_not_contains(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT name FROM example_table WHERE NOT contains(name, 'a')")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -755,10 +791,12 @@ fn regexp_replace_extracts_group(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan(r"SELECT i, regexp_replace(url, '^https?://(?:www\.)?([^/]+)/.*$', '\1') FROM urls")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -794,10 +832,12 @@ fn regexp_replace_first_match_only(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan("SELECT regexp_replace(s, 'a', 'b') FROM rep")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -824,10 +864,12 @@ fn regexp_replace_dollar_is_literal(mut testing_planner: TestingPlanner) {
     // replacement dialect would read `$1` as a group reference, so it must be
     // escaped to `$$` — otherwise the `$1` would be consumed instead of kept.
     let results = testing_planner
-        .planner
         .plan(r"SELECT regexp_replace(s, 'x', 'a$1b') FROM rep")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -854,10 +896,12 @@ fn regexp_jit_replace_extracts_group(mut testing_planner: TestingPlanner) {
     );
 
     let results = testing_planner
-        .planner
         .plan(r"SELECT regexp_jit_replace(url, '^https?://(?:www\.)?([^/]+)/.*', '\1') FROM urls")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -873,9 +917,7 @@ fn regexp_jit_replace_extracts_group(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn unsupported_scalar_function_returns_error(mut testing_planner: TestingPlanner) {
-    let result = testing_planner
-        .planner
-        .plan("SELECT lower(name) FROM example_table");
+    let result = testing_planner.plan("SELECT lower(name) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
 }
 
@@ -885,10 +927,12 @@ fn unsupported_scalar_function_returns_error(mut testing_planner: TestingPlanner
 #[rstest]
 fn global_sum_over_product(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT SUM(a * b) AS s FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -904,10 +948,12 @@ fn global_sum_over_nested_product(mut testing_planner: TestingPlanner) {
     // A nested expression argument: the whole `(a * b) * c` is one computed
     // argument, compiled (recursively) into a single materialised column.
     let results = testing_planner
-        .planner
         .plan("SELECT SUM((a * b) * c) AS s FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -921,10 +967,12 @@ fn global_sum_over_nested_product(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn global_min_max_over_product(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT MIN(a * b) AS lo, MAX(a * b) AS hi FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -938,10 +986,12 @@ fn global_min_max_over_product(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn grouped_sum_over_product(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT name, SUM(a * b) AS s FROM example_table GROUP BY name")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -957,10 +1007,12 @@ fn grouped_sum_over_product(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn aggregate_argument_mixed_with_plain_aggregate(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT SUM(a * b) AS s, SUM(c) AS t, COUNT(*) AS n FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -975,10 +1027,12 @@ fn aggregate_argument_mixed_with_plain_aggregate(mut testing_planner: TestingPla
 #[rstest]
 fn count_distinct_over_product(mut testing_planner: TestingPlanner) {
     let results = testing_planner
-        .planner
         .plan("SELECT COUNT(DISTINCT a * b) AS d FROM example_table")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -992,10 +1046,12 @@ fn count_distinct_over_product(mut testing_planner: TestingPlanner) {
 fn grouped_count_distinct_over_product(mut testing_planner: TestingPlanner) {
     // alice's two rows give a*b of 10 and 250 (two distinct values).
     let results = testing_planner
-        .planner
         .plan("SELECT name, COUNT(DISTINCT a * b) AS d FROM example_table GROUP BY name")
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();
@@ -1013,13 +1069,15 @@ fn computed_group_key_with_computed_aggregate_argument(mut testing_planner: Test
     // Group by a computed key (a bucket) and aggregate a computed argument: both
     // are materialised into leading columns before the aggregate.
     let results = testing_planner
-        .planner
         .plan(
             "SELECT CASE WHEN a <= 3 THEN 1 ELSE 0 END AS bucket, SUM(a * b) AS s \
              FROM example_table GROUP BY CASE WHEN a <= 3 THEN 1 ELSE 0 END",
         )
         .unwrap()
-        .compile(testing_planner.dispatcher())
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
         .unwrap()
         .collect()
         .unwrap();

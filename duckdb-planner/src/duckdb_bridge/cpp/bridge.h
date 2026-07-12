@@ -7,6 +7,7 @@
 #include <vector>
 
 struct CatalogContext;
+struct TransactionContext;
 struct OptionalTableWrapper;
 struct ExtractPlanResult;
 
@@ -42,7 +43,8 @@ struct ExpressionList {
 };
 
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
-ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query);
+ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
+                               const TransactionContext &transaction);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();

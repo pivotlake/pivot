@@ -1,6 +1,6 @@
 //! [`Materialize`] — late-materialization fetch of extra columns.
 
-use crate::catalog::{QueryContext, Table};
+use crate::catalog::{CatalogTransaction, Table};
 use crate::compile::Error;
 use dispatch::{Projection as DispatchProjection, RecordBatchOperatorSpec};
 use std::fmt;
@@ -39,11 +39,11 @@ impl Materialize {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let projection = DispatchProjection::columns(self.columns.iter().copied());
         self.table
-            .materialize(input, projection, ctx)
+            .materialize(input, projection, transaction)
             .map_err(Error::TableScan)
     }
 }

@@ -175,7 +175,7 @@ fn table_rows(catalog: &ParquetCatalog) -> i64 {
     let mut table = catalog.table_handle("otel_logs").expect("table exists");
     table.refresh().expect("manifest reload");
     table
-        .parquet(&[])
+        .build_scan_view(&[])
         .expect("build scan view")
         .row_groups()
         .iter()

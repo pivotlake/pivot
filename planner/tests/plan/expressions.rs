@@ -5,10 +5,7 @@ use rstest::rstest;
 /// `Ref` — a bound column reference, displayed as `#idx:Type`.
 #[rstest]
 fn ref_column(mut testing_planner: TestingPlanner) {
-    let plan = testing_planner
-        .planner
-        .plan("SELECT a FROM example_table")
-        .unwrap();
+    let plan = testing_planner.plan("SELECT a FROM example_table").unwrap();
     assert_snapshot!(plan.to_string(), @"
     Projection(a:Int32)
       Input([a:Int32])
@@ -19,7 +16,6 @@ fn ref_column(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn compare_notequal_columns(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a <> b")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -34,7 +30,6 @@ fn compare_notequal_columns(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn compare_equal_columns(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a = b")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -49,7 +44,6 @@ fn compare_equal_columns(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn compare_equal_constant(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a = 5")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -63,7 +57,6 @@ fn compare_equal_constant(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn constant_integer(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT a FROM example_table WHERE a <> 5")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -78,7 +71,6 @@ fn constant_integer(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn constant_string(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT name FROM example_table WHERE name <> 'alice'")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -93,7 +85,6 @@ fn constant_string(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn aggregate_count_star(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT COUNT(*) FROM example_table WHERE a <> 0")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -109,7 +100,6 @@ fn aggregate_count_star(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn function_contains(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan("SELECT name FROM example_table WHERE contains(name, 'ali')")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -134,7 +124,6 @@ fn function_minute(mut testing_planner: TestingPlanner) {
         )],
     );
     let plan = testing_planner
-        .planner
         .plan("SELECT extract(minute FROM EventTime) AS m, COUNT(*) FROM events GROUP BY m")
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
@@ -148,7 +137,6 @@ fn function_minute(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn case_expression_group_key(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
-        .planner
         .plan(
             "SELECT CASE WHEN a < 3 THEN 'low' ELSE 'high' END AS c, COUNT(*) \
              FROM example_table GROUP BY 1",

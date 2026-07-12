@@ -9,8 +9,8 @@
 pub mod duckdb_types;
 
 use crate::catalog_provider::{
-    CatalogContext, OptionalTableWrapper, catalog_get_scalar_function, catalog_get_table,
-    catalog_get_table_function, pushdown_filter,
+    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_get_scalar_function,
+    catalog_get_table, catalog_get_table_function, pushdown_filter,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -83,10 +83,12 @@ pub mod ffi {
 
     extern "Rust" {
         type CatalogContext;
+        type TransactionContext;
         type OptionalTableWrapper;
-        fn catalog_get_table(ctx: &CatalogContext, name: &str) -> CatalogGetTableResult;
+        fn catalog_get_table(transaction: &TransactionContext, name: &str)
+        -> CatalogGetTableResult;
         fn catalog_get_table_function(
-            ctx: &CatalogContext,
+            transaction: &TransactionContext,
             name: &str,
         ) -> CatalogGetTableFunctionResult;
         fn catalog_get_scalar_function(
@@ -116,7 +118,16 @@ pub mod ffi {
         type Value;
 
         fn new_context(catalog: Box<CatalogContext>) -> UniquePtr<DuckPlannerContext>;
-        fn extract_plan(ctx: Pin<&mut DuckPlannerContext>, query: &str) -> ExtractPlanResult;
+        /// Plan `query` with `transaction` published for its duration: every
+        /// table and table-function lookup during binding resolves through it
+        /// (see `PivotSchemaCatalogEntry::LookupEntry`). The reference only
+        /// needs to outlive this call; the C++ side clears its pointer before
+        /// returning.
+        fn extract_plan(
+            ctx: Pin<&mut DuckPlannerContext>,
+            query: &str,
+            transaction: &TransactionContext,
+        ) -> ExtractPlanResult;
 
         fn plan_root(plan: &PlanHandle) -> &LogicalOperator;
 

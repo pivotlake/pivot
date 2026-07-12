@@ -138,30 +138,6 @@ impl CatalogTable {
         Ok(true)
     }
 
-    /// Reload to the latest version *without* fetching any footers: advance the
-    /// manifest and drop cached files no longer in it, but leave fetching the new
-    /// files' footers to [`parquet`](Self::parquet), which fetches only the
-    /// partitions a query actually scans. The read path uses this; a writer still
-    /// uses [`refresh`](Self::refresh) (it needs every file's row groups to pick
-    /// compaction candidates). Returns whether it
-    /// advanced.
-    pub fn reload_manifest_only(&mut self) -> crate::Result<bool> {
-        let Some(manifest) =
-            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
-        else {
-            return Ok(false);
-        };
-        self.manifest = manifest;
-        let kept: HashSet<&str> = self
-            .manifest
-            .entries
-            .iter()
-            .map(|e| e.file.path.as_str())
-            .collect();
-        self.files.retain(|f| kept.contains(f.file.path.as_str()));
-        Ok(true)
-    }
-
     /// Write `bytes` as a new data file at `path` (under the table's location)
     /// and commit it into the table — the ingest sink's append, one call for the
     /// write and the manifest commit. Idempotent on `path`.
@@ -413,47 +389,46 @@ impl CatalogTable {
         Ok(())
     }
 
+    /// The manifest version this copy is at. Monotonic per table; used to
+    /// decide whether a published copy is newer than the catalog's.
+    pub fn version(&self) -> u64 {
+        self.manifest.version
+    }
+
     /// A flat scan view of the files whose recorded partition tuple can still
     /// match `filters` — every surviving file's row groups concatenated in
     /// manifest order, where a row group's global index is simply its position.
-    /// Footers are fetched here, and only for the surviving files, so a query
-    /// touching one partition never pays the HTTP to read every other partition's
-    /// footer. Fetched footers are cached in `files`, so a second call in the same
-    /// query (the late materialize after the scan) re-fetches nothing. An empty
-    /// `filters`, or one naming no partition column, keeps every file.
+    /// An empty `filters`, or one naming no partition column, keeps every file.
+    ///
+    /// Read-only: it is built entirely from the row groups this copy already
+    /// holds, so it does **no** I/O. Every surviving file's footer must have
+    /// been fetched (the refresh path keeps `files` synced to the manifest); a
+    /// missing one is an error, never a silently narrower scan.
     ///
     /// The row group's global index is its position in this returned flat list, so
     /// a scan and its materialize must build it from the *same* `filters` (they
     /// do: both go through the binding's predicates) to address the same groups.
-    pub fn parquet(&mut self, filters: &[PartitionEqFilter]) -> crate::Result<Arc<ParquetTable>> {
-        let matching: Vec<ManifestEntry> = self
+    pub fn build_scan_view(
+        &self,
+        filters: &[PartitionEqFilter],
+    ) -> crate::Result<Arc<ParquetTable>> {
+        let by_path: HashMap<&ObjectPath, &TableFile> =
+            self.files.iter().map(|f| (&f.file.path, f)).collect();
+        let mut row_groups = Vec::new();
+        for entry in self
             .manifest
             .entries
             .iter()
             .filter(|e| e.maybe_matches_partition(&self.manifest.partition_by, filters))
-            .cloned()
-            .collect();
-
-        let to_fetch: Vec<DataFile> = matching
-            .iter()
-            .filter(|e| !self.files.iter().any(|f| f.file.path == e.file.path))
-            .map(|e| {
-                e.file
-                    .clone()
-                    .into_data_file(self.store.as_ref(), &self.location)
-            })
-            .collect::<store::Result<_>>()?;
-        let fetched =
-            crate::parquet::load_table_files(&self.dispatcher, &to_fetch, self.declared_columns())?;
-        self.files.extend(fetched);
-
-        let by_path: HashMap<&ObjectPath, &TableFile> =
-            self.files.iter().map(|f| (&f.file.path, f)).collect();
-        let row_groups = matching
-            .iter()
-            .filter_map(|e| by_path.get(&e.file.path))
-            .flat_map(|f| f.row_groups.iter().cloned())
-            .collect();
+        {
+            let file = by_path
+                .get(&entry.file.path)
+                .ok_or_else(|| Error::FooterNotLoaded {
+                    table: self.name.clone(),
+                    file: entry.file.path.as_str().to_string(),
+                })?;
+            row_groups.extend(file.row_groups.iter().cloned());
+        }
         Ok(Arc::new(ParquetTable::new(row_groups)))
     }
 
@@ -479,7 +454,8 @@ impl CatalogTable {
     /// Each committed file's manifest path paired with its loaded row groups, in
     /// manifest order - the source for the `metadata()` table function, where
     /// each row group reports the file it belongs to. Only files whose footers
-    /// are loaded contribute (a [`parquet`](Self::parquet) call warms them).
+    /// are loaded contribute (the refresh path keeps them synced to the
+    /// manifest).
     pub(super) fn file_row_groups(&self) -> Vec<(String, Vec<Arc<RowGroupMetadata>>)> {
         let by_path: HashMap<&ObjectPath, &TableFile> =
             self.files.iter().map(|f| (&f.file.path, f)).collect();

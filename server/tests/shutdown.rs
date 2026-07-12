@@ -39,7 +39,15 @@ fn shutdown_signal_drains_all_worker_threads() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(bind, dispatch, catalog, vec![], 0, 4);
+            let server = Server::new(
+                bind,
+                dispatch,
+                catalog,
+                vec![],
+                0,
+                4,
+                server::DEFAULT_CATALOG_REFRESH,
+            );
             server
                 .serve(Box::pin(async move {
                     let _ = shutdown_rx.await;
