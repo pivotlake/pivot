@@ -10,11 +10,11 @@
 //!
 //! Durable state lives in two places, both in the store:
 //!
-//! - the [`manifest`] — which tables exist (name, declared schema, location);
-//! - the per-table [`TableManifest`] — *which
-//!   Parquet files* each table consists of, as a sequence of versions committed
-//!   with the store's compare-and-swap. The highest version is the table's
-//!   current file list.
+//! - the [`manifest`], which tables exist (name, location);
+//! - each table's Delta Lake transaction log (see [`crate::delta`]): its
+//!   declared schema, partition/sort specs, and *which Parquet files* it
+//!   consists of, as a sequence of versions committed with an atomic
+//!   create-if-absent. The highest version is the table's current file list.
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version. The in-memory set is kept current by
@@ -41,9 +41,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::manifest::{
-    self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
-};
+pub use crate::manifest::TableFile;
+use crate::manifest::{self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter};
 use crate::parquet::{ParquetTable, ParquetTableError};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
@@ -54,7 +53,6 @@ use planner::catalog::{
     Result as CatalogResult, Table,
 };
 pub use table::CatalogTable;
-pub use table::TableFile;
 use thiserror::Error as ThisError;
 
 const PATH_OPTION: &str = "path";
@@ -83,6 +81,12 @@ pub enum Error {
     Store(#[from] store::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
+    #[error(transparent)]
+    Delta(#[from] crate::delta::Error),
+    #[error(
+        "writes to table `{0}` are disabled: ingest and compaction are not yet supported over the delta table format"
+    )]
+    WritesDisabled(String),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(
@@ -164,49 +168,46 @@ impl ParquetCatalog {
     /// manifest (schema + file list) and fetch its files' footers, building the
     /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
-        let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
-        let manifest = CatalogManifest::load(store.as_ref())?;
-
-        let mut tables = HashMap::new();
-        for entry in &manifest.tables {
-            let table = Self::load_table(dispatcher, &store, entry)?;
-            tables.insert(entry.name.clone(), table);
-        }
-
-        Ok(Self {
-            tables: Arc::new(RwLock::new(tables)),
-            store,
+        let catalog = Self {
+            tables: Arc::new(RwLock::new(HashMap::new())),
+            store: open_store(uri)?.into(),
             dispatcher: dispatcher.clone(),
-        })
+        };
+        let manifest = CatalogManifest::load(catalog.store.as_ref())?;
+        let mut tables = catalog.tables.write().unwrap();
+        for entry in &manifest.tables {
+            tables.insert(entry.name.clone(), catalog.load_table(entry)?);
+        }
+        drop(tables);
+        Ok(catalog)
     }
 
     /// Build the in-memory [`CatalogTable`] for one persisted table: read its
-    /// manifest (erroring if the catalog points at a table that has none), then
-    /// locate its committed files under the entry's location and fetch their
-    /// footers over the pool.
-    fn load_table(
-        dispatcher: &DataFlowDispatcher,
-        store: &Arc<dyn ObjectStore>,
-        entry: &CatalogManifestTableEntry,
-    ) -> Result<CatalogTable> {
-        let manifest = TableManifest::load(store.as_ref(), &entry.name)?;
-        let files = manifest
+    /// delta log (erroring if the catalog points at a table that has none),
+    /// then locate its committed files under the entry's location and fetch
+    /// their footers over the pool.
+    fn load_table(&self, entry: &CatalogManifestTableEntry) -> Result<CatalogTable> {
+        let (log, mut state) = crate::delta::DeltaLog::open(
+            &self.store.get_config()?,
+            self.store.get_absolute_url(&entry.location)?,
+        )?;
+        let files = state
             .entries
             .iter()
             .map(|f| {
                 f.file
                     .clone()
-                    .into_data_file(store.as_ref(), &entry.location)
+                    .into_data_file(self.store.as_ref(), &entry.location)
             })
             .collect::<store::Result<Vec<DataFile>>>()?;
-        let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
+        state.files = crate::parquet::load_table_files(&self.dispatcher, &files)?;
         Ok(CatalogTable::new(
             entry.name.clone(),
             entry.location.clone(),
-            manifest,
-            table_files,
-            store.clone(),
-            dispatcher.clone(),
+            Arc::new(log),
+            state,
+            self.store.clone(),
+            self.dispatcher.clone(),
         ))
     }
 
@@ -241,20 +242,39 @@ impl ParquetCatalog {
             if self.tables.read().unwrap().contains_key(&entry.name) {
                 continue;
             }
-            let table = Self::load_table(&self.dispatcher, &self.store, entry)?;
-            let mut map = self.tables.write().unwrap();
-            // An in-process CREATE TABLE may have published it since the read.
-            if !map.contains_key(&entry.name) {
-                map.insert(entry.name.clone(), table);
-                changed = true;
-            }
+            // One unloadable table (e.g. a delta table with an unsupported
+            // feature) must not stop the sweep from serving every other table;
+            // it is skipped with a warning and retried next tick.
+            let table = match self.load_table(entry) {
+                Ok(table) => table,
+                Err(e) => {
+                    tracing::warn!(table = %entry.name, error = %e, "skipping unloadable table in catalog refresh");
+                    continue;
+                }
+            };
+            // No re-check under the write lock: nothing else can have inserted
+            // this name meanwhile. An in-process CREATE TABLE of an
+            // index-listed table always fails its create CAS (the table's log
+            // already exists) before publishing, and writers only publish
+            // copies of tables already in the map.
+            self.tables
+                .write()
+                .unwrap()
+                .insert(entry.name.clone(), table);
+            changed = true;
         }
 
         // Refresh each table on a clone outside the lock (footer fetches are
-        // I/O), then publish the advanced copy back.
+        // I/O), then publish the advanced copy back. A table that fails to
+        // refresh keeps serving its current version and must not block the
+        // others from advancing.
         for mut table in self.tables() {
-            if table.refresh()? {
-                changed |= self.publish_table(table);
+            match table.refresh() {
+                Ok(true) => changed |= self.publish_table(table),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(table = %table.name(), error = %e, "skipping failed table refresh in catalog refresh");
+                }
             }
         }
 

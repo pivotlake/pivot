@@ -145,6 +145,20 @@ impl ObjectStore for LocalStore {
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
         Ok(DataFileSource::Local(self.path_for(key)))
     }
+
+    fn get_config(&self) -> Result<super::StoreConfig> {
+        let root = std::path::absolute(&self.root).map_err(|source| StoreError::Io {
+            key: self.root.display().to_string(),
+            source,
+        })?;
+        let url = url::Url::from_directory_path(&root).map_err(|()| {
+            StoreError::Config(format!("root `{}` is not a valid file url", root.display()))
+        })?;
+        Ok(super::StoreConfig {
+            url,
+            options: Default::default(),
+        })
+    }
 }
 
 #[cfg(test)]

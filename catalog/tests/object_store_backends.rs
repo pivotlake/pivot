@@ -22,9 +22,9 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+use catalog::ParquetCatalog;
 use catalog::parquet::table_input;
 use catalog::store::ObjectPath;
-use catalog::{FileRef, ParquetCatalog};
 use common::{
     DispatchGuard, collect_i64s, current_parquet, dispatch_with_buffers, strings_and_ints,
 };
@@ -100,10 +100,6 @@ fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
     values
 }
 
-fn row_groups(cat: &ParquetCatalog, name: &str) -> usize {
-    current_parquet(cat, name).row_groups().len()
-}
-
 // --- behaviours (run on every backend) -------------------------------------
 
 mod bodies {
@@ -136,45 +132,21 @@ mod bodies {
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }
 
-    /// Registering a new file (the ingest append) makes its rows visible to the
-    /// next bind, on top of the existing ones.
-    pub fn append_registers_new_file(b: &Backend) {
+    /// Every data-write mutator is disabled while the write paths are reworked
+    /// for the delta format: each errors explicitly and the table is unchanged.
+    pub fn data_writes_are_disabled(b: &Backend) {
         let d = dispatch_with_buffers(2, 32);
         let cat = create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]);
 
-        cat.table_handle("events")
-            .unwrap()
-            .append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]), None, None)
-            .unwrap();
+        let mut table = cat.table_handle("events").unwrap();
+        let append =
+            table.append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]), None, None);
+        let replace = table.replace_data_files(&[], &[]);
 
-        assert_eq!(scan(&d, &cat, "events"), vec![1, 2, 3, 4, 5, 6]);
-    }
-
-    /// Compaction swaps the small files for one merged file in a single version:
-    /// the rows are unchanged but now live in one row group.
-    pub fn compaction_replaces_files(b: &Backend) {
-        let d = dispatch_with_buffers(2, 32);
-        let cat = create_events(&d, b, &[("p1.parquet", &[1, 2, 3]), ("p2.parquet", &[4])]);
-        let merged = pq(&[1, 2, 3, 4]);
-        b.store
-            .put(&ObjectPath::new("events/merged.parquet"), &merged)
-            .unwrap();
-
-        let swapped = cat
-            .table_handle("events")
-            .unwrap()
-            .replace_data_files(
-                &[ObjectPath::new("p1.parquet"), ObjectPath::new("p2.parquet")],
-                &[catalog::ManifestEntry::new(FileRef {
-                    path: ObjectPath::new("merged.parquet"),
-                    size: merged.len() as u64,
-                })],
-            )
-            .unwrap();
-
-        assert!(swapped);
-        assert_eq!(scan(&d, &cat, "events"), vec![1, 2, 3, 4]);
-        assert_eq!(row_groups(&cat, "events"), 1);
+        for result in [append, replace.map(|_| ())] {
+            assert!(result.unwrap_err().to_string().contains("disabled"));
+        }
+        assert_eq!(scan(&d, &cat, "events"), vec![1, 2, 3]);
     }
 
     /// A stored object reads back through `source` — the read source the ring is
@@ -256,8 +228,7 @@ macro_rules! backend_tests {
 
 backend_tests!(create_and_scan);
 backend_tests!(survives_reopen);
-backend_tests!(append_registers_new_file);
-backend_tests!(compaction_replaces_files);
+backend_tests!(data_writes_are_disabled);
 backend_tests!(source_reads_object_back);
 backend_tests!(list_is_one_level);
 

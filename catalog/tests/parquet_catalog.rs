@@ -13,7 +13,7 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 use catalog::store::ObjectPath;
-use catalog::{ParquetCatalog, PartitionEqFilter, TableBinding};
+use catalog::{ParquetCatalog, TableBinding};
 use common::current_parquet;
 use planner::Planner;
 use planner::catalog::{
@@ -175,13 +175,13 @@ fn create_table_without_a_path_makes_an_empty_table() {
 
 #[test]
 fn create_table_over_a_missing_path_yields_an_empty_table() {
-    // A location with no files yields an empty table — the same as a relative or
-    // no-path location. The catalog does not stat the path (which only makes
-    // sense for a local store; on a bucket an absolute path is just a key).
-    let (_dir, columns) = three_row_table();
+    // A location with no files yields an empty table — the same as a relative
+    // or no-path location. The missing directory is created (the table's delta
+    // log lives under it), so the location must be creatable.
+    let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
-    create_table(&catalog, create_request("t", bogus, columns)).unwrap();
+    let missing = dir.path().join("not/yet/created");
+    create_table(&catalog, create_request("t", &missing, columns)).unwrap();
     assert!(catalog.begin_transaction().table("t").is_some());
     assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
@@ -351,20 +351,6 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
     path
 }
 
-/// Append the file at `path` to table `name` through a cloned-out handle — the
-/// table-level API a writer (ingest) uses: it writes the bytes into the table's
-/// location, CAS-commits the file, and publishes the committed copy back so the
-/// next transaction's snapshot sees it. Recorded by its location-relative name.
-fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
-    let bytes = std::fs::read(path).unwrap();
-    let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
-    let mut handle = catalog.table_handle(name).expect("table exists");
-    handle
-        .append_data_file(relative, &bytes, None, None)
-        .unwrap();
-    catalog.publish_table(handle);
-}
-
 /// Run `sql` through a planner over `catalog` (inside a fresh transaction,
 /// like the server does per query) and return the result batches.
 fn run_sql(catalog: &Arc<ParquetCatalog>, sql: &str) -> Vec<RecordBatch> {
@@ -446,11 +432,11 @@ fn metadata_function_honors_column_projection() {
 /// still carries the full schema (an empty batch, not no batch).
 #[test]
 fn metadata_function_on_empty_table() {
-    let (_dir, columns) = three_row_table();
+    let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(
         &catalog,
-        create_request("t", Path::new("/no/such/dir"), columns),
+        create_request("t", &dir.path().join("empty"), columns),
     )
     .unwrap();
 
@@ -461,57 +447,51 @@ fn metadata_function_on_empty_table() {
 }
 
 /// Each file gets its own `file_index`, so the metadata composes with normal SQL
-/// to count files and total rows across an appended file.
+/// to count files and total rows across a second file.
 #[test]
 fn metadata_function_numbers_files_distinctly() {
     let (dir, columns) = three_row_table();
+    write_ids(dir.path(), "later.parquet", &[40, 50]);
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
-    append(&catalog, "t", &new_file);
 
     let results = run_sql(&catalog, "SELECT * FROM metadata('t')");
 
-    assert_eq!(i64_column(&results, "file_index"), vec![0, 0, 0, 1]);
-    // row_group_index is per-file, so it resets to 0 for the appended file's
-    // single row group rather than continuing the global count.
-    assert_eq!(i64_column(&results, "row_group_index"), vec![0, 1, 2, 0]);
+    // Which file is index 0 follows the create-time listing order (not pinned
+    // here); what matters is that the two files are numbered distinctly and
+    // row_group_index restarts from 0 within each file.
+    let file_index = i64_column(&results, "file_index");
+    let row_group_index = i64_column(&results, "row_group_index");
+    let mut per_file: HashMap<i64, Vec<i64>> = HashMap::new();
+    for (file, group) in file_index.iter().zip(&row_group_index) {
+        per_file.entry(*file).or_default().push(*group);
+    }
+    let mut group_counts: Vec<usize> = per_file.values().map(Vec::len).collect();
+    group_counts.sort();
+    assert_eq!(group_counts, [1, 3], "two files, numbered distinctly");
+    for groups in per_file.values() {
+        assert_eq!(*groups, (0..groups.len() as i64).collect::<Vec<_>>());
+    }
     assert_eq!(i64_column(&results, "num_rows").iter().sum::<i64>(), 5);
 }
 
-/// A file appended after `CREATE TABLE` becomes visible to new binds, with
-/// global row-group indices kept sequential.
+/// Every data-write mutator is disabled while the write paths are reworked
+/// for the delta format: each errors explicitly and commits nothing.
 #[test]
-fn append_data_file_makes_new_file_visible_to_new_binds() {
+fn data_writes_are_disabled() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+
+    let mut table = catalog.table_handle("t").unwrap();
+    let append = table.append_data_file(ObjectPath::new("x.parquet"), b"bytes", None, None);
+    let replace = table.replace_data_files(&[], &[]);
+    let maintain = table.maintain();
+
+    for result in [append, replace.map(|_| ()), maintain] {
+        assert!(result.unwrap_err().to_string().contains("disabled"));
+    }
     assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 3);
-
-    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
-    append(&catalog, "t", &new_file);
-
-    let parquet = current_parquet(&catalog, "t");
-    let groups = parquet.row_groups();
-    assert_eq!(groups.len(), 4);
-    assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
-}
-
-/// Appending the same path twice (a replayed flush notification) must not
-/// double-count its rows. The second handle starts a version behind, so it CAS-
-/// conflicts, refreshes, and sees the file already present.
-#[test]
-fn append_data_file_is_idempotent_per_path() {
-    let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-
-    let new_file = write_ids(dir.path(), "later.parquet", &[40]);
-    append(&catalog, "t", &new_file);
-    // Appending the same file again is a no-op (it must not double-count).
-    append(&catalog, "t", &new_file);
-
-    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 4);
 }
 
 /// No table yet (ingest runs before `CREATE TABLE`): there is no handle to
@@ -522,149 +502,28 @@ fn table_handle_for_a_missing_table_is_none() {
     assert!(catalog.table_handle("missing").is_none());
 }
 
-/// Compaction's commit: the small files' row groups vanish, the merged file's
-/// appear, and indices are renumbered — one atomic version swap. And a *second*
-/// compacter that picked the same inputs must abort its swap (`Ok(false)`)
-/// rather than re-add its output on top, which would double-count the rows.
+/// Only committed files exist: the delta log, not the directory listing, is
+/// what a reopen reads, so a stray file dropped next to the data (a crashed
+/// writer's leftover) is invisible.
 #[test]
-fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
-    let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let extra = write_ids(dir.path(), "extra.parquet", &[40]);
-    append(&catalog, "t", &extra);
-    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 4);
-
-    let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
-    let merged_size = std::fs::metadata(&merged).unwrap().len();
-    let removed = vec![
-        ObjectPath::new("data.parquet"),
-        ObjectPath::new("extra.parquet"),
-    ];
-    let added = vec![catalog::ManifestEntry::new(catalog::FileRef {
-        path: ObjectPath::new("merged.parquet"),
-        size: merged_size,
-    })];
-    // A losing compacter clones the table out at the version where the inputs
-    // are present, before the winning swap lands.
-    let mut loser = catalog.table_handle("t").unwrap();
-    loser.refresh().unwrap();
-    let mut winner = catalog.table_handle("t").unwrap();
-    winner.refresh().unwrap();
-    assert!(
-        winner.replace_data_files(&removed, &added).unwrap(),
-        "first swap commits"
-    );
-    // The loser only discovers the inputs are gone after its CAS conflict +
-    // refresh, and aborts — no footer read for its output, no double-count.
-    let loser_added = vec![catalog::ManifestEntry::new(catalog::FileRef {
-        path: ObjectPath::new("merged-loser.parquet"),
-        size: merged_size,
-    })];
-    assert!(
-        !loser.replace_data_files(&removed, &loser_added).unwrap(),
-        "second swap aborts: its inputs were already swapped out"
-    );
-
-    let parquet = current_parquet(&catalog, "t");
-    let groups = parquet.row_groups();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].num_rows, 4);
-}
-
-/// A binding's pushed-down predicates are a pure filter over whatever file set
-/// they are applied to: the same binding prunes a wider, later file set just as
-/// well, so predicate state and file state stay independent.
-#[test]
-fn pushed_predicate_prunes_latest_files_after_refresh() {
-    let (dir, columns) = three_row_table();
-    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = catalog.begin_transaction().table("t").unwrap();
-    table
-        .pushdown_filter(col_eq_filter(0, int_constant(20)))
-        .unwrap();
-    assert_eq!(row_group_count(&catalog, "t", &table), 1);
-
-    let new_file = write_ids(dir.path(), "later.parquet", &[40, 50]);
-    append(&catalog, "t", &new_file);
-
-    // `id = 20` still prunes to the single matching row group, now over 4 files.
-    assert_eq!(row_group_count(&catalog, "t", &table), 1);
-}
-
-/// A second catalog over the same persisted root sees another instance's
-/// append at its next reload: reloading reads the committed manifest, so
-/// cross-process commits surface without any re-`CREATE`.
-#[test]
-fn other_catalog_instance_sees_append_at_next_bind() {
-    let (data_dir, columns) = three_row_table();
-    let db = TempDir::new().unwrap();
-    let writer =
-        Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
-    create_table(&writer, create_request("t", data_dir.path(), columns)).unwrap();
-
-    // The reader opens before the new file exists, at version 1.
-    let reader = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(current_parquet(&reader, "t").row_groups().len(), 3);
-
-    let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
-    append(&writer, "t", &new_file);
-
-    // The reader's next reload picks up version 2 from the committed manifest.
-    let rows = current_parquet(&reader, "t")
-        .row_groups()
-        .iter()
-        .map(|rg| rg.num_rows)
-        .sum::<i64>();
-    assert_eq!(rows, 5);
-}
-
-/// Restart reads the committed manifest, not the directory: files appended
-/// after the `CREATE` survive a reopen.
-#[test]
-fn reopened_database_restores_appended_files_from_manifest() {
+fn unlogged_stray_file_is_invisible_after_reopen() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
         let catalog =
             Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
         create_table(&catalog, create_request("t", data_dir.path(), columns)).unwrap();
-        let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
-        append(&catalog, "t", &new_file);
     }
-    let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
-}
-
-/// Only committed files exist: after a compaction swap, a leftover input
-/// (e.g. a crash before the unlink) is invisible to a reopen — no double-read.
-#[test]
-fn unlogged_leftover_file_is_invisible_after_swap() {
-    let (data_dir, columns) = three_row_table();
-    let db = TempDir::new().unwrap();
-    let catalog =
-        Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
-    create_table(&catalog, create_request("t", data_dir.path(), columns)).unwrap();
-
-    // "Compact" data.parquet into merged.parquet but crash before deleting the
-    // input: both files are on disk, only merged is in the manifest.
-    let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![catalog::ManifestEntry::new(catalog::FileRef {
-        path: ObjectPath::new("merged.parquet"),
-        size: std::fs::metadata(&merged).unwrap().len(),
-    })];
-    catalog
-        .table_handle("t")
-        .unwrap()
-        .replace_data_files(&[ObjectPath::new("data.parquet")], &added)
-        .unwrap();
+    write_ids(data_dir.path(), "stray.parquet", &[40, 50]);
 
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+
     let parquet = current_parquet(&reopened, "t");
-    let groups = parquet.row_groups();
-    assert_eq!(groups.len(), 1, "only the committed merged file is read");
-    assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 3);
+    assert_eq!(
+        parquet.row_groups().len(),
+        3,
+        "only committed files are read"
+    );
 }
 
 /// Write `file_name` into `dir` with one row group per value in `ids`, so a file
@@ -722,90 +581,4 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     // `id = 1` excludes the part-2 file's three row groups entirely; only the
     // part-1 file's three survive.
     assert_eq!(row_group_count(&catalog, "t", &table), 3);
-}
-
-/// A table partitioned by `name` with one committed file per partition: a
-/// one-row-group `keep` file and a three-row-group `drop` file, each tagged with
-/// its partition tuple. The distinct group counts let a build's group count name
-/// exactly which files it fetched. Files are written *after* `CREATE TABLE` (over
-/// an empty dir) so they arrive through the partition-recording append, not as
-/// untagged create-time discoveries.
-fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
-    let dir = TempDir::new().unwrap();
-    let request = CreateTableRequest {
-        name: "p".to_string(),
-        columns: vec![
-            Column {
-                name: "id".to_string(),
-                col_type: Type::Int32,
-            },
-            Column {
-                name: "name".to_string(),
-                col_type: Type::Utf8,
-            },
-        ],
-        options: HashMap::from([
-            (
-                "path".to_string(),
-                dir.path().to_string_lossy().into_owned(),
-            ),
-            ("partition_by".to_string(), "name".to_string()),
-        ]),
-        if_not_exists: false,
-    };
-    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    create_table(&catalog, request).unwrap();
-
-    write_ids_one_group_each(dir.path(), "keep.parquet", &[1]);
-    write_ids_one_group_each(dir.path(), "drop.parquet", &[2, 2, 2]);
-    let mut table = catalog.table_handle("p").unwrap();
-    table
-        .append_data_file(
-            ObjectPath::new("keep.parquet"),
-            &std::fs::read(dir.path().join("keep.parquet")).unwrap(),
-            Some(serde_json::json!({ "name": "keep" })),
-            None,
-        )
-        .unwrap();
-    table
-        .append_data_file(
-            ObjectPath::new("drop.parquet"),
-            &std::fs::read(dir.path().join("drop.parquet")).unwrap(),
-            Some(serde_json::json!({ "name": "drop" })),
-            None,
-        )
-        .unwrap();
-    (dir, catalog)
-}
-
-fn name_eq(value: &str) -> PartitionEqFilter {
-    PartitionEqFilter {
-        column: "name".to_string(),
-        value: serde_json::json!(value),
-    }
-}
-
-#[test]
-fn partition_filter_builds_only_the_matching_partitions_files() {
-    let (_dir, catalog) = table_partitioned_by_name();
-
-    let mut table = catalog.table_handle("p").unwrap();
-    table.refresh().unwrap();
-    let kept = table.build_scan_view(&[name_eq("keep")]).unwrap();
-
-    // Only the one-group `keep` file enters the scan view; the three-group
-    // `drop` file's partition tuple can't match.
-    assert_eq!(kept.row_groups().len(), 1);
-}
-
-#[test]
-fn no_partition_filter_builds_every_partitions_files() {
-    let (_dir, catalog) = table_partitioned_by_name();
-
-    let mut table = catalog.table_handle("p").unwrap();
-    table.refresh().unwrap();
-    let all = table.build_scan_view(&[]).unwrap();
-
-    // Without a filter both files are in view: keep's 1 group + drop's 3.
-    assert_eq!(all.row_groups().len(), 4);
 }

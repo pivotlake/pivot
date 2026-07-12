@@ -16,6 +16,7 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 mod catalog;
+mod delta;
 mod manifest;
 pub mod parquet;
 pub mod store;

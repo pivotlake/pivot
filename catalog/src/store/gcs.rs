@@ -16,7 +16,10 @@
 //! [`source`](GcsStore::source)), so a worker only ever *reads* a current token.
 //! RS256 signing uses `ring`; everything is synchronous, no async runtime.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key,
+    parse_root_url,
+};
 use base64::Engine;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -382,6 +385,26 @@ impl ObjectStore for GcsStore {
         Ok(DataFileSource::Remote {
             url,
             auth: Some(Arc::new(move || auth.current())),
+        })
+    }
+
+    fn get_config(&self) -> Result<super::StoreConfig> {
+        // Against the real service, an object_store client resolves
+        // credentials itself through the same application-default chain this
+        // store uses, so no options are passed. An emulator ignores auth:
+        // point the client at it and skip request signing, as this store's
+        // own requests do.
+        let mut options: Vec<(String, String)> = Vec::new();
+        if self.auth.emulated {
+            if self.endpoint.starts_with("http://") {
+                options.push(("google_allow_http".into(), "true".into()));
+            }
+            options.push(("google_base_url".into(), self.endpoint.clone()));
+            options.push(("google_skip_signature".into(), "true".into()));
+        }
+        Ok(super::StoreConfig {
+            url: parse_root_url(&format!("gs://{}/{}", self.bucket, self.prefix))?,
+            options: options.into_iter().collect(),
         })
     }
 }

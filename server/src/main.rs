@@ -278,6 +278,15 @@ fn main() -> Result<(), Error> {
     let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
 
     let ingests = args.ingests();
+    // Ingest and compaction are disabled while their write paths are being
+    // reworked for the Delta table format: refuse the flags outright rather
+    // than accept them and write through an unfinished path.
+    if !ingests.is_empty() || args.compact {
+        error!(
+            "ingest and compaction are disabled for now (unsupported over the Delta table format); remove the --otel*/--compact flags"
+        );
+        std::process::exit(1);
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -199,6 +199,7 @@ async fn await_rows(catalog: &ParquetCatalog, expected: i64, timeout: Duration) 
 
 /// Logs sent over gRPC are drained by `shutdown` and become queryable rows.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "catalog data writes are disabled while the delta write path lands"]
 async fn logs_sent_over_grpc_are_queryable_after_shutdown() {
     let port = free_port();
     let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
@@ -222,6 +223,7 @@ async fn logs_sent_over_grpc_are_queryable_after_shutdown() {
 /// The per-sink flush timer lands the rows on its own cadence — queryable
 /// without waiting for shutdown.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "catalog data writes are disabled while the delta write path lands"]
 async fn flush_timer_makes_logs_queryable_without_shutdown() {
     let port = free_port();
     let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
@@ -246,6 +248,7 @@ async fn flush_timer_makes_logs_queryable_without_shutdown() {
 /// A partitioned + sorted table: logs from two services flushed together land in
 /// one file per service, each tagged with its partition tuple in the manifest.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "catalog data writes are disabled while the delta write path lands"]
 async fn partitioned_logs_land_one_file_per_service() {
     let port = free_port();
     let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);

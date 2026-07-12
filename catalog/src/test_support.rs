@@ -145,9 +145,27 @@ fn start_gcs() -> Option<Container<GenericImage>> {
     // No log-message wait: `fake-gcs-server`'s banner has shifted across
     // versions, so we treat "container running" as the gate and poll the JSON
     // API for actual readiness via the bucket-create retry below.
-    let image = GenericImage::new("fsouza/fake-gcs-server", "1.52.2")
+    // The `tustvold` fork (what arrow-rs's own object_store CI runs against)
+    // implements the path-style XML API delta-rs's object_store speaks to the
+    // delta log; upstream fake-gcs-server rejects its object PUTs. The JSON
+    // API this store itself uses is unchanged.
+    //
+    // `-public-host localhost`: fake-gcs-server only routes the path-style XML
+    // API (`GET /{bucket}?list-type=2` etc.) when the request's host matches
+    // its public host; without it those requests 404 and only the JSON API
+    // works.
+    let image = GenericImage::new("tustvold/fake-gcs-server", "latest")
         .with_exposed_port(ContainerPort::Tcp(4443))
-        .with_cmd(["-scheme", "http", "-backend", "memory", "-port", "4443"]);
+        .with_cmd([
+            "-scheme",
+            "http",
+            "-backend",
+            "memory",
+            "-port",
+            "4443",
+            "-public-host",
+            "localhost",
+        ]);
     let container = match image.start() {
         Ok(c) => c,
         Err(e) => {

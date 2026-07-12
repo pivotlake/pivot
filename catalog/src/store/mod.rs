@@ -50,7 +50,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// location); the size lets a reader locate a Parquet footer without a separate
 /// HEAD/`stat`.
 ///
-/// [table manifest]: crate::manifest::TableManifest
+/// [table manifest]: crate::manifest::TableState
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileRef {
     pub path: ObjectPath,
@@ -195,6 +195,43 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn describe(&self) -> String {
         format!("{self:?}")
     }
+
+    /// This store's root and access configuration in generic, client-neutral
+    /// form: the database root as a URL (`file://`/`s3://`/`gs://`, trailing
+    /// slash) plus the [`object_store`-spelled] options (credentials,
+    /// endpoint) any client of that crate needs to reach it. A layer above
+    /// resolves its own keys against the root (the delta log layer hands both
+    /// to delta-kernel's default engine); this store itself never consumes it.
+    ///
+    /// [`object_store`-spelled]: https://docs.rs/object_store/latest/object_store/enum.ClientConfigKey.html
+    fn get_config(&self) -> Result<StoreConfig>;
+
+    /// The absolute URL of `key` within this store — the
+    /// [config](Self::get_config)'s root with the key joined under it. URL
+    /// joining shares [`ObjectPath`]'s resolution rules: a relative key lands
+    /// under the root, an absolute one escapes to the root of the storage
+    /// medium (the filesystem root, or the bucket root). Returned with a
+    /// trailing slash, naming a directory, so a client's own joins land under
+    /// it.
+    fn get_absolute_url(&self, key: &ObjectPath) -> Result<url::Url> {
+        let root = self.get_config()?.url;
+        let mut url = root.join(key.as_str()).map_err(|e| {
+            StoreError::Config(format!("key `{}` under `{root}`: {e}", key.as_str()))
+        })?;
+        if !url.path().ends_with('/') {
+            url.set_path(&format!("{}/", url.path()));
+        }
+        Ok(url)
+    }
+}
+
+/// A store's root URL and the generic `object_store` options to open it with.
+#[derive(Clone, Debug)]
+pub struct StoreConfig {
+    /// The database root, with a trailing slash so keys join under it.
+    pub url: url::Url,
+    /// Option names as the `object_store` crate reads them.
+    pub options: std::collections::HashMap<String, String>,
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
@@ -208,6 +245,17 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
         let path = uri.strip_prefix("file://").unwrap_or(uri);
         Ok(Box::new(LocalStore::new(path)))
     }
+}
+
+/// Parse a store root URI into the [`StoreConfig`] URL form (trailing slash,
+/// so keys join under it).
+pub(crate) fn parse_root_url(uri: &str) -> Result<url::Url> {
+    let uri = if uri.ends_with('/') {
+        uri.to_string()
+    } else {
+        format!("{uri}/")
+    };
+    url::Url::parse(&uri).map_err(|e| StoreError::Config(format!("store root `{uri}`: {e}")))
 }
 
 /// The final path segment of a raw object-store key string (a backend's listing

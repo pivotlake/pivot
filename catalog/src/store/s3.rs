@@ -6,7 +6,10 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key,
+    parse_root_url,
+};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -17,12 +20,15 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub struct S3Store {
+    bucket: String,
     /// In-bucket prefix under which this catalog's keys live.
     prefix: String,
     region: String,
     access_key: String,
     secret_key: String,
     session_token: Option<String>,
+    /// The custom endpoint requests go to (MinIO etc.), `None` on AWS itself.
+    endpoint: Option<String>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
     /// hosted) or `http://localhost:9000/bucket` (path-style endpoint override).
     base: String,
@@ -47,10 +53,12 @@ impl S3Store {
         let secret_key = env_req("AWS_SECRET_ACCESS_KEY")?;
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
 
-        let (base, host) = match std::env::var("AWS_ENDPOINT_URL").ok() {
+        let endpoint = std::env::var("AWS_ENDPOINT_URL")
+            .ok()
+            .map(|ep| ep.trim_end_matches('/').to_string());
+        let (base, host) = match endpoint.as_deref() {
             // Path-style against a custom endpoint (MinIO etc.).
             Some(ep) => {
-                let ep = ep.trim_end_matches('/');
                 let host = ep
                     .split("://")
                     .nth(1)
@@ -69,11 +77,13 @@ impl S3Store {
         };
 
         Ok(Self {
+            bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             region,
             access_key,
             secret_key,
             session_token,
+            endpoint,
             base,
             host,
             agent: ureq::AgentBuilder::new().build(),
@@ -248,6 +258,30 @@ impl ObjectStore for S3Store {
         Ok(DataFileSource::Remote {
             url: self.presign_get(key)?,
             auth: None,
+        })
+    }
+
+    fn get_config(&self) -> Result<super::StoreConfig> {
+        // The same credentials/region/endpoint this store resolved from the
+        // environment, in the option names object_store reads.
+        let mut options: Vec<(String, String)> = vec![
+            ("aws_access_key_id".into(), self.access_key.clone()),
+            ("aws_secret_access_key".into(), self.secret_key.clone()),
+            ("aws_region".into(), self.region.clone()),
+        ];
+        if let Some(token) = &self.session_token {
+            options.push(("aws_session_token".into(), token.clone()));
+        }
+        if let Some(endpoint) = &self.endpoint {
+            if endpoint.starts_with("http://") {
+                options.push(("aws_allow_http".into(), "true".into()));
+            }
+            options.push(("aws_endpoint".into(), endpoint.clone()));
+            options.push(("aws_virtual_hosted_style_request".into(), "false".into()));
+        }
+        Ok(super::StoreConfig {
+            url: parse_root_url(&format!("s3://{}/{}", self.bucket, self.prefix))?,
+            options: options.into_iter().collect(),
         })
     }
 }

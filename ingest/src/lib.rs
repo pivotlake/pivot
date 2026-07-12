@@ -531,6 +531,7 @@ mod tests {
     /// A written file decodes back to the original values through the engine's
     /// scan (proves the PLAIN int and byte-array encodings are correct).
     #[test]
+    #[ignore = "catalog data writes are disabled while the delta write path lands"]
     fn written_pages_decode_to_original_values() {
         let dispatch = Dispatch::spin_up(1, RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
@@ -569,6 +570,7 @@ mod tests {
     /// Page jobs encoded in parallel across the pool are stitched into one file
     /// with a single row group spanning all the flush's rows.
     #[test]
+    #[ignore = "catalog data writes are disabled while the delta write path lands"]
     fn parallel_pages_assemble_into_one_file() {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -595,6 +597,7 @@ mod tests {
     /// A flush that lands after `CREATE TABLE` is registered with the catalog,
     /// so its rows are visible to new binds without re-creating the table.
     #[test]
+    #[ignore = "catalog data writes are disabled while the delta write path lands"]
     fn flushed_file_is_registered_with_catalog_table() {
         let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
@@ -625,6 +628,7 @@ mod tests {
     /// to the merged file in one log commit, the inputs are deleted, and the
     /// merged file decodes back to all the original rows.
     #[test]
+    #[ignore = "catalog data writes are disabled while the delta write path lands"]
     fn compaction_merges_registered_files_and_swaps_catalog() {
         // 4× the usual test ring: the fused scan→encode dataflow keeps decode
         // and encode in flight together, so decompressed pages (a full ring
@@ -709,6 +713,7 @@ mod tests {
     /// partition and re-applies the table's spec, rather than dropping the
     /// metadata.
     #[test]
+    #[ignore = "catalog data writes are disabled while the delta write path lands"]
     fn compaction_preserves_partition_and_sort_metadata() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let dir = tempfile::tempdir().unwrap();
@@ -770,6 +775,7 @@ mod tests {
     /// `s3://` root takes) compacts through the exact same code, with writes
     /// and deletes going through the table's store handle.
     #[test]
+    #[ignore = "catalog data writes are disabled while the delta write path lands"]
     fn compaction_works_on_store_relative_tables() {
         use arrow_array::Int64Array;
         use arrow_schema::{DataType, Field, Schema};
@@ -859,6 +865,7 @@ mod tests {
     /// the compacter works through a second instance over the same database
     /// root — and the server sees the swap at its next bind.
     #[test]
+    #[ignore = "catalog data writes are disabled while the delta write path lands"]
     fn compacter_in_another_process_compacts_the_servers_flushes() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();

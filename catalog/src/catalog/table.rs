@@ -1,58 +1,40 @@
 //! The catalog's master record of one table: its definition plus its current
-//! content — the files at one manifest version.
+//! content, the files at one delta log version.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
-use crate::manifest::{FIRST_VERSION, ManifestEntry, PartitionEqFilter, SortBounds, TableManifest};
+use crate::delta::{self, DeltaLog};
+use crate::manifest::{ManifestEntry, PartitionEqFilter, SortBounds, TableFile, TableState};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use dispatch::DataFlowDispatcher;
 use planner::catalog::Column;
 
-/// One data file of a table: its identity ([`FileRef`]) paired with its
-/// materialized row groups (file-local order).
-#[derive(Clone)]
-pub struct TableFile {
-    pub(super) file: FileRef,
-    pub(super) row_groups: Vec<Arc<RowGroupMetadata>>,
-}
-
-impl TableFile {
-    /// Pair a file's identity with the row groups read from its footer. Built by
-    /// the metadata fetcher (one per file) and the catalog's table assembly.
-    pub(crate) fn new(file: FileRef, row_groups: Vec<Arc<RowGroupMetadata>>) -> Self {
-        Self { file, row_groups }
-    }
-
-    /// This file's row groups, in file-local order.
-    pub(crate) fn row_groups(&self) -> &[Arc<RowGroupMetadata>] {
-        &self.row_groups
-    }
-}
-
-/// The catalog's master record of one table: its [`TableManifest`] (declared
-/// columns + committed file list, at one version) and its current content — the
-/// per-file row groups (`files`). The version lives in the manifest, not
-/// alongside it.
+/// The catalog's master record of one table: its [`TableState`] (declared
+/// columns + committed file list, at one delta log version) and its current
+/// content, the per-file row groups (`files`). The version lives in the
+/// manifest, not alongside it.
 ///
-/// It is a plain **value** — `Clone`, no interior locks. A writer (ingest,
-/// compaction) clones one out of the catalog, mutates its own copy, and lets the
-/// durable manifest be the source of truth: every mutation
-/// ([`append_data_file`](Self::append_data_file),
-/// [`replace_data_files`](Self::replace_data_files)) commits a new manifest
-/// version by compare-and-swap, retrying past a concurrent writer. Copies drift
-/// freely; [`refresh`](Self::refresh) reconciles any copy to the latest version
-/// (re-reading only the footers it doesn't already hold). `store`, `name`, and
-/// `location` are kept so a copy can persist and reload itself.
+/// It is a plain **value** — `Clone`, no interior locks. The table's delta log
+/// is the source of truth; copies drift freely and [`refresh`](Self::refresh)
+/// reconciles any copy to the latest committed version (re-reading only the
+/// footers it doesn't already hold). The data-write mutators a writer (ingest,
+/// compaction) would evolve a copy through are currently **disabled** — they
+/// keep their signatures but always error (see
+/// [`append_data_file`](Self::append_data_file)); the one write the catalog
+/// performs is `CREATE TABLE`'s first commit. `store`, `name`, and `location`
+/// are kept so a copy can reload itself.
 #[derive(Clone)]
 pub struct CatalogTable {
     name: String,
     /// Where the table's Parquet data lives in the object store.
     location: ObjectPath,
-    pub(super) manifest: TableManifest,
-    pub(super) files: Vec<TableFile>,
+    /// The table's delta transaction log: a kernel-backed handle whose cached
+    /// snapshot advances incrementally, shared by every copy of this table.
+    log: Arc<DeltaLog>,
+    pub(super) state: TableState,
     store: Arc<dyn ObjectStore>,
     /// The pool a reload/commit fetches footers on, so the mutators need no
     /// dispatcher passed in.
@@ -60,32 +42,32 @@ pub struct CatalogTable {
 }
 
 impl CatalogTable {
-    /// Reassemble a persisted table from its loaded `manifest` and the per-file
+    /// Reassemble a persisted table from its loaded `state` and the per-file
     /// row groups (`files`) just fetched for it — the reopen path. Does not
-    /// persist anything; the manifest it was loaded from is already durable.
+    /// persist anything; the state it was loaded from is already durable.
     pub(super) fn new(
         name: String,
         location: ObjectPath,
-        manifest: TableManifest,
-        files: Vec<TableFile>,
+        log: Arc<DeltaLog>,
+        state: TableState,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
     ) -> Self {
         Self {
             name,
             location,
-            manifest,
-            files,
+            log,
+            state,
             store,
             dispatcher,
         }
     }
 
-    /// Create a brand-new table from freshly-read footers: build its
-    /// [`TableManifest`] (declared `columns` + the loaded files, at
-    /// [`FIRST_VERSION`]) and commit it. The compare-and-swap fails with
-    /// [`Error::TableExists`] if another writer already committed this table's
-    /// first version. The `CREATE TABLE` commit path.
+    /// Create a brand-new table from freshly-read footers: create its delta
+    /// table (declared `columns`, the partition/sort specs, and the loaded
+    /// files, as the log's first version). Fails with [`Error::TableExists`]
+    /// if a delta log already exists at the location (including a concurrent
+    /// creator winning the first commit). The `CREATE TABLE` commit path.
     #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn create_new(
         name: String,
@@ -104,211 +86,107 @@ impl CatalogTable {
             .iter()
             .map(|f| ManifestEntry::new(f.file.clone()))
             .collect();
-        let manifest = TableManifest {
-            version: FIRST_VERSION,
+        let (log, mut state) = DeltaLog::create(
+            &store.get_config()?,
+            store.get_absolute_url(&location)?,
             columns,
             partition_by,
             sort_by,
             entries,
-        };
-        if !manifest.commit(store.as_ref(), &name)? {
-            return Err(Error::TableExists(name));
-        }
+        )
+        .map_err(|e| match e {
+            delta::Error::TableExists => Error::TableExists(name.clone()),
+            other => Error::Delta(other),
+        })?;
+        state.files = files;
         Ok(Self {
             name,
             location,
-            manifest,
-            files,
+            log: Arc::new(log),
+            state,
             store,
             dispatcher,
         })
     }
 
-    /// Reload this copy to the latest committed version. Errors if the table has
-    /// no manifest at all (a corrupt catalog). Returns whether it advanced;
-    /// `Ok(false)` means this copy was already current.
+    /// Reload this copy to the latest committed delta log version. Errors if
+    /// the table has no log at all (a corrupt catalog). Returns whether it
+    /// advanced; `Ok(false)` means this copy was already current.
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let Some(manifest) =
-            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
-        else {
+        let Some(mut state) = self.log.load_after(self.state.version)? else {
             return Ok(false);
         };
-        self.manifest = manifest;
-        self.sync_files_to_manifest()?;
+        self.attach_files(&mut state)?;
+        self.state = state;
         Ok(true)
     }
 
-    /// Write `bytes` as a new data file at `path` (under the table's location)
-    /// and commit it into the table — the ingest sink's append, one call for the
-    /// write and the manifest commit. Idempotent on `path`.
+    /// The ingest sink's append: write `bytes` as a new data file and commit it
+    /// into the table. **Disabled** while the write paths are being reworked
+    /// for the delta format: always errors without writing anything, so a
+    /// misconfigured ingest fails loudly instead of committing through an
+    /// unfinished path. The signature is kept so ingest keeps compiling.
     pub fn append_data_file(
         &mut self,
-        path: ObjectPath,
-        bytes: &[u8],
-        partition: Option<serde_json::Value>,
-        sort_bounds: Option<SortBounds>,
+        _path: ObjectPath,
+        _bytes: &[u8],
+        _partition: Option<serde_json::Value>,
+        _sort_bounds: Option<SortBounds>,
     ) -> crate::Result<()> {
-        let file = self.write_data_file(path, bytes)?;
-        self.commit_added_file(file, partition, sort_bounds)
+        Err(Error::WritesDisabled(self.name.clone()))
     }
 
-    /// CAS-commit one already-written file into the manifest, retrying past a
-    /// concurrent writer (refresh + retry). A file the manifest already holds is
-    /// an idempotent no-op, so a replayed append can't double-count rows.
-    /// `partition`/`sort_bounds` are the file's partition tuple and sort-key range
-    /// (a partitioning/sorting sink's), each `None` when not recorded.
-    fn commit_added_file(
-        &mut self,
-        file: FileRef,
-        partition: Option<serde_json::Value>,
-        sort_bounds: Option<SortBounds>,
-    ) -> crate::Result<()> {
-        loop {
-            if self
-                .manifest
-                .entries
-                .iter()
-                .any(|e| e.file.path == file.path)
-            {
-                return Ok(());
-            }
-            let mut entries = self.manifest.entries.clone();
-            entries.push(ManifestEntry {
-                file: file.clone(),
-                partition: partition.clone(),
-                sort_bounds: sort_bounds.clone(),
-            });
-            if self.try_commit(entries)? {
-                return Ok(());
-            }
-            self.refresh()?;
-        }
-    }
-
-    /// Atomically swap a set of this table's files for another — the compaction
-    /// commit. Commits a new version whose file list is `latest − removed +
-    /// added`, retrying past concurrent commits, so no reader ever sees the rows
-    /// doubled or missing.
-    ///
-    /// Returns whether the swap was committed. It is **aborted** (`Ok(false)`,
-    /// nothing committed) if any of `removed` is no longer in the latest
-    /// version: that means another writer already swapped these inputs out, so
-    /// re-adding `added` (which holds their rows) would double-count. A
-    /// concurrent compacter that loses this race must discard its `added` files
-    /// as orphans and leave the inputs alone — they belong to the swap that won.
+    /// The compaction commit: atomically swap a set of this table's files for
+    /// another. **Disabled** while the write paths are being reworked for the
+    /// delta format: always errors without committing anything. The signature
+    /// is kept so the compacter keeps compiling.
     pub fn replace_data_files(
         &mut self,
-        removed: &[ObjectPath],
-        added: &[ManifestEntry],
+        _removed: &[ObjectPath],
+        _added: &[ManifestEntry],
     ) -> crate::Result<bool> {
-        loop {
-            if !removed
-                .iter()
-                .all(|p| self.manifest.entries.iter().any(|e| &e.file.path == p))
-            {
-                return Ok(false);
-            }
-            let mut entries: Vec<ManifestEntry> = self
-                .manifest
-                .entries
-                .iter()
-                .filter(|e| !removed.contains(&e.file.path))
-                .cloned()
-                .collect();
-            // The merged files keep the partition tuple / sort bounds the caller
-            // recorded for them (compaction merges within one partition).
-            entries.extend(added.iter().cloned());
-            if self.try_commit(entries)? {
-                return Ok(true);
-            }
-            self.refresh()?;
-        }
+        Err(Error::WritesDisabled(self.name.clone()))
     }
 
-    /// Try to commit `entries` as the next version via compare-and-swap. On
-    /// success, swaps in the new manifest + files (fetching only the new footers)
-    /// and returns `true`; on a CAS conflict returns `false` without touching
-    /// this copy.
-    fn try_commit(&mut self, entries: Vec<ManifestEntry>) -> crate::Result<bool> {
-        let manifest = TableManifest {
-            version: self.manifest.version + 1,
-            columns: self.manifest.columns.clone(),
-            partition_by: self.manifest.partition_by.clone(),
-            sort_by: self.manifest.sort_by.clone(),
-            entries,
-        };
-        if !manifest.commit(self.store.as_ref(), &self.name)? {
-            return Ok(false);
-        }
-        self.manifest = manifest;
-        self.sync_files_to_manifest()?;
-        Ok(true)
+    /// Background upkeep of this table's delta log (checkpoint, expired-log
+    /// cleanup, vacuum). **Disabled** while the write paths are being reworked
+    /// for the delta format: always errors without touching the log. The
+    /// signature is kept so the compacter keeps compiling.
+    pub fn maintain(&self) -> crate::Result<()> {
+        Err(Error::WritesDisabled(self.name.clone()))
     }
 
-    /// Garbage-collect this table's superseded manifest versions, keeping only a
-    /// recent tail (see [`TableManifest::prune_old_versions`]). Each commit
-    /// leaves a new version file behind; this reclaims the old ones so a busy
-    /// table's version directory stays small and the `list` every bind does
-    /// stays cheap. The compacter drives it — it's the background sweep that
-    /// already polls every table.
-    pub fn prune_old_versions(&self) -> crate::Result<()> {
-        TableManifest::prune_old_versions(self.store.as_ref(), &self.name, self.manifest.version)?;
-        Ok(())
-    }
-
-    /// Record the just-swapped-out `removed` inputs (paths as they appear in the
-    /// manifest) for *deferred* deletion at this table's current manifest version.
-    /// Their objects are deleted only when that version is pruned
-    /// ([`prune_old_versions`](Self::prune_old_versions)) — so a query still
-    /// reading the prior version never has a file deleted out from under it.
-    pub fn record_deletions(&self, removed: &[ObjectPath]) -> crate::Result<()> {
-        let resolved: Vec<ObjectPath> = removed.iter().map(|p| self.location.resolve(p)).collect();
-        TableManifest::record_deletions(
-            self.store.as_ref(),
-            &self.name,
-            self.manifest.version,
-            &resolved,
-        )?;
-        Ok(())
-    }
-
-    /// Reconcile `files` to the current `manifest`: drop the files no longer in
-    /// it, then fetch and append the ones not yet held.
-    fn sync_files_to_manifest(&mut self) -> crate::Result<()> {
-        let kept: HashSet<&str> = self
-            .manifest
-            .entries
+    /// Attach each of `state`'s entries' footers to it before it is installed:
+    /// carry over the footers this copy already holds and fetch only the ones
+    /// it doesn't, so a state and its footers always change together.
+    fn attach_files(&self, state: &mut TableState) -> crate::Result<()> {
+        let mut files: Vec<TableFile> = self
+            .state
+            .files
             .iter()
-            .map(|e| e.file.path.as_str())
+            .filter(|f| state.entries.iter().any(|e| e.file.path == f.file.path))
+            .cloned()
             .collect();
-        self.files.retain(|f| kept.contains(f.file.path.as_str()));
-        let missing = self.retrieve_missing_table_files()?;
-        self.files.extend(missing);
-        Ok(())
-    }
-
-    /// Fetch the [`TableFile`]s for this table's manifest entries that aren't
-    /// already held — the footers this copy is missing (disjoint from `files`).
-    fn retrieve_missing_table_files(&self) -> crate::Result<Vec<TableFile>> {
-        let to_fetch: Vec<DataFile> = self
-            .manifest
+        let to_fetch: Vec<DataFile> = state
             .entries
             .iter()
-            .filter(|e| !self.files.iter().any(|f| f.file.path == e.file.path))
+            .filter(|e| !files.iter().any(|f| f.file.path == e.file.path))
             .map(|e| {
                 e.file
                     .clone()
                     .into_data_file(self.store.as_ref(), &self.location)
             })
             .collect::<store::Result<_>>()?;
-        Ok(crate::parquet::load_table_files(
+        files.extend(crate::parquet::load_table_files(
             &self.dispatcher,
             &to_fetch,
-        )?)
+        )?);
+        state.files = files;
+        Ok(())
     }
 
     pub fn files(&self) -> &[TableFile] {
-        &self.files
+        &self.state.files
     }
 
     /// The table's name.
@@ -319,26 +197,26 @@ impl CatalogTable {
     /// The table's partition columns, in order (empty = unpartitioned). A
     /// partitioning writer routes each row to a file by these columns' values.
     pub fn partition_by(&self) -> &[String] {
-        &self.manifest.partition_by
+        &self.state.partition_by
     }
 
     /// The table's sort columns, in order (empty = unsorted). A writer sorts each
     /// file's rows by these before encoding.
     pub fn sort_by(&self) -> &[String] {
-        &self.manifest.sort_by
+        &self.state.sort_by
     }
 
     /// The table's current files as [`FileRef`]s — what a compacter scans to pick
     /// merge candidates, and names in a [`replace_data_files`](Self::replace_data_files) swap.
     pub fn file_refs(&self) -> Vec<FileRef> {
-        self.files.iter().map(|f| f.file.clone()).collect()
+        self.state.files.iter().map(|f| f.file.clone()).collect()
     }
 
     /// Each committed file paired with the partition tuple recorded for it (the
     /// one-row arrow-json object a partitioning writer stamped, or `None`). Reads
     /// the manifest, so it reflects the current committed version.
     pub fn file_partitions(&self) -> Vec<(ObjectPath, Option<serde_json::Value>)> {
-        self.manifest
+        self.state
             .entries
             .iter()
             .map(|e| (e.file.path.clone(), e.partition.clone()))
@@ -348,7 +226,7 @@ impl CatalogTable {
     /// Each committed file paired with its recorded sort-key bounds (the
     /// `sort_by` columns at the file's first/last row, or `None`).
     pub fn file_sort_bounds(&self) -> Vec<(ObjectPath, Option<SortBounds>)> {
-        self.manifest
+        self.state
             .entries
             .iter()
             .map(|e| (e.file.path.clone(), e.sort_bounds.clone()))
@@ -361,6 +239,7 @@ impl CatalogTable {
     pub fn parquet_table_for(&self, wanted: &[FileRef]) -> Arc<ParquetTable> {
         let want: HashSet<&ObjectPath> = wanted.iter().map(|f| &f.path).collect();
         let row_groups = self
+            .state
             .files
             .iter()
             .filter(|f| want.contains(&f.file.path))
@@ -369,29 +248,26 @@ impl CatalogTable {
         Arc::new(ParquetTable::new(row_groups))
     }
 
-    /// Write `bytes` as a new data file at `path` (resolved against the table's
-    /// location like any [`FileRef`] path), returning its [`FileRef`]. The
-    /// compaction writer's output, committed with
-    /// [`replace_data_files`](Self::replace_data_files).
-    pub fn write_data_file(&self, path: ObjectPath, bytes: &[u8]) -> crate::Result<FileRef> {
-        self.store.put(&self.location.resolve(&path), bytes)?;
-        Ok(FileRef {
-            path,
-            size: bytes.len() as u64,
-        })
+    /// The compaction writer's output write. **Disabled** while the write
+    /// paths are being reworked for the delta format: always errors before
+    /// putting any object, so the compacter can't litter a table's directory
+    /// with output whose commit would be refused anyway. The signature is kept
+    /// so the compacter keeps compiling.
+    pub fn write_data_file(&self, _path: ObjectPath, _bytes: &[u8]) -> crate::Result<FileRef> {
+        Err(Error::WritesDisabled(self.name.clone()))
     }
 
-    /// Delete a data file (a compaction input swapped out of the manifest).
-    /// `path` resolves against the table's location like any [`FileRef`] path.
-    pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
-        self.store.delete(&self.location.resolve(path))?;
-        Ok(())
+    /// Delete a data file (a compaction input swapped out of the table).
+    /// **Disabled** like every other write; the signature is kept so the
+    /// compacter keeps compiling.
+    pub fn delete_data_file(&self, _path: &ObjectPath) -> crate::Result<()> {
+        Err(Error::WritesDisabled(self.name.clone()))
     }
 
     /// The manifest version this copy is at. Monotonic per table; used to
     /// decide whether a published copy is newer than the catalog's.
     pub fn version(&self) -> u64 {
-        self.manifest.version
+        self.state.version
     }
 
     /// A flat scan view of the files whose recorded partition tuple can still
@@ -412,13 +288,13 @@ impl CatalogTable {
         filters: &[PartitionEqFilter],
     ) -> crate::Result<Arc<ParquetTable>> {
         let by_path: HashMap<&ObjectPath, &TableFile> =
-            self.files.iter().map(|f| (&f.file.path, f)).collect();
+            self.state.files.iter().map(|f| (&f.file.path, f)).collect();
         let mut row_groups = Vec::new();
         for entry in self
-            .manifest
+            .state
             .entries
             .iter()
-            .filter(|e| e.maybe_matches_partition(&self.manifest.partition_by, filters))
+            .filter(|e| e.maybe_matches_partition(&self.state.partition_by, filters))
         {
             let file = by_path
                 .get(&entry.file.path)
@@ -433,7 +309,7 @@ impl CatalogTable {
 
     /// The table's columns (schema), as the planner's [`Column`]s.
     pub fn columns(&self) -> Vec<Column> {
-        self.manifest.columns.clone()
+        self.state.columns.clone()
     }
 
     /// Where the table's data lives, relative to the database root (an absolute
@@ -451,8 +327,8 @@ impl CatalogTable {
     /// manifest).
     pub(super) fn file_row_groups(&self) -> Vec<(String, Vec<Arc<RowGroupMetadata>>)> {
         let by_path: HashMap<&ObjectPath, &TableFile> =
-            self.files.iter().map(|f| (&f.file.path, f)).collect();
-        self.manifest
+            self.state.files.iter().map(|f| (&f.file.path, f)).collect();
+        self.state
             .entries
             .iter()
             .filter_map(|e| {
