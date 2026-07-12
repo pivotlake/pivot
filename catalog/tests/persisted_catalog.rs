@@ -34,6 +34,18 @@ fn write_parquet(path: &Path, batch: &arrow_array::RecordBatch) {
     writer.close().unwrap();
 }
 
+fn write_delta_commit(table: &Path, version: u64, actions: &[serde_json::Value]) {
+    let log = table.join("_delta_log");
+    std::fs::create_dir_all(&log).unwrap();
+    let mut body = actions
+        .iter()
+        .map(|action| serde_json::to_string(action).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    body.push('\n');
+    std::fs::write(log.join(format!("{version:020}.json")), body).unwrap();
+}
+
 fn columns() -> Vec<Column> {
     vec![
         Column {
@@ -155,6 +167,58 @@ fn tables_persist_across_reopen() {
 }
 
 #[test]
+fn background_refresh_advances_to_latest_delta_snapshot() {
+    let dispatch = dispatch(1);
+    let db = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let first = data.path().join("a.parquet");
+    let second = data.path().join("b.parquet");
+    write_parquet(&first, &strings_and_ints(&["a"], &[1]));
+
+    let catalog = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    create(
+        &dispatch,
+        &catalog,
+        path_request("events", data.path(), columns()),
+    )
+    .unwrap();
+    assert_eq!(current_parquet(&catalog, "events").row_groups().len(), 1);
+
+    write_parquet(&second, &strings_and_ints(&["b"], &[2]));
+    let second_size = std::fs::metadata(&second).unwrap().len();
+    write_delta_commit(
+        data.path(),
+        1,
+        &[serde_json::json!({
+            "add": {
+                "path": "b.parquet",
+                "partitionValues": {},
+                "size": second_size,
+                "modificationTime": 0,
+                "dataChange": true
+            }
+        })],
+    );
+
+    assert!(catalog.refresh_catalog().unwrap());
+    assert_eq!(current_parquet(&catalog, "events").row_groups().len(), 2);
+
+    write_delta_commit(
+        data.path(),
+        2,
+        &[serde_json::json!({
+            "remove": {
+                "path": "a.parquet",
+                "deletionTimestamp": 0,
+                "dataChange": true
+            }
+        })],
+    );
+    assert!(catalog.refresh_catalog().unwrap());
+    assert_eq!(current_parquet(&catalog, "events").row_groups().len(), 1);
+}
+
+#[test]
 fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
@@ -168,6 +232,25 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
         // `<root>/t`, which fills in once a file is registered there).
         assert!(catalog.begin_transaction().table("t").is_some());
         assert!(current_parquet(&catalog, "t").row_groups().is_empty());
+
+        let commit =
+            std::fs::read_to_string(db.path().join("t/_delta_log/00000000000000000000.json"))
+                .unwrap();
+        let metadata = commit
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|action| action.get("metaData").is_some())
+            .unwrap();
+        let schema: serde_json::Value =
+            serde_json::from_str(metadata["metaData"]["schemaString"].as_str().unwrap()).unwrap();
+        let fields = schema["fields"].as_array().unwrap();
+        assert!(
+            fields
+                .iter()
+                .all(|field| field["nullable"].as_bool() == Some(false))
+        );
+        assert_eq!(fields[0]["type"], "string");
+        assert_eq!(fields[1]["type"], "long");
     }
 
     // And it survives a reopen.

@@ -7,13 +7,13 @@
 //! [`assembler`](super::assembler) lays the chunks out into a file. Each carries
 //! the row group's shared [`RowGroupHeader`] for routing and provenance.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use catalog::SortBounds;
 use dispatch::{Identifier, WorkerIdOutput};
-use serde_json::Value;
 
 /// Identifies a row group across the pipeline so its column chunks reassemble
 /// together.
@@ -52,7 +52,7 @@ pub(crate) struct PartitionTag {
     pub(crate) file_id: FileId,
     /// Total row groups in this file, so the assembler knows when it's complete.
     pub(crate) n_row_groups: usize,
-    pub(crate) partition: Option<Value>,
+    pub(crate) partition: Option<HashMap<String, Scalar<ArrayRef>>>,
     /// The file's sort-key bounds (min/max per sort column over the whole file),
     /// recorded in the manifest. File-level: the same on every row group of the
     /// file. `None` when the table has no sort key.
@@ -67,7 +67,7 @@ pub(crate) struct PartitionTag {
 /// unsorted write).
 pub(crate) struct EncodedFile {
     pub(crate) bytes: Vec<u8>,
-    pub(crate) partition: Option<Value>,
+    pub(crate) partition: Option<HashMap<String, Scalar<ArrayRef>>>,
     pub(crate) sort_bounds: Option<SortBounds>,
 }
 

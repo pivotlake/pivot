@@ -763,7 +763,7 @@ fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
         .append_data_file(
             ObjectPath::new("keep.parquet"),
             &std::fs::read(dir.path().join("keep.parquet")).unwrap(),
-            Some(serde_json::json!({ "name": "keep" })),
+            Some(string_values("name", "keep")),
             None,
         )
         .unwrap();
@@ -771,17 +771,24 @@ fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
         .append_data_file(
             ObjectPath::new("drop.parquet"),
             &std::fs::read(dir.path().join("drop.parquet")).unwrap(),
-            Some(serde_json::json!({ "name": "drop" })),
+            Some(string_values("name", "drop")),
             None,
         )
         .unwrap();
     (dir, catalog)
 }
 
+fn string_values(name: &str, value: &str) -> HashMap<String, Scalar<ArrayRef>> {
+    HashMap::from([(
+        name.to_string(),
+        Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
+    )])
+}
+
 fn name_eq(value: &str) -> PartitionEqFilter {
     PartitionEqFilter {
         column: "name".to_string(),
-        value: serde_json::json!(value),
+        value: Scalar::new(Arc::new(StringViewArray::from(vec![value])) as ArrayRef),
     }
 }
 

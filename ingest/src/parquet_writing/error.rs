@@ -10,12 +10,9 @@ use thriftparquet::parquet_thrift::ParquetError;
 #[derive(Debug, thiserror::Error)]
 pub(super) enum WriteError {
     /// An Arrow kernel or schema operation failed (sort, take, concat, min/max,
-    /// `index_of`, building a one-row batch, the arrow-json writer).
+    /// `index_of`, building a typed scalar map, or encoding a row key).
     #[error(transparent)]
     Arrow(#[from] ArrowError),
-    /// Reading the arrow-json writer's output back into a `serde_json::Value`.
-    #[error("serializing partition metadata as JSON: {0}")]
-    Json(#[from] serde_json::Error),
     /// Serializing a page header or the file footer.
     #[error("encoding Parquet thrift: {0}")]
     Thrift(#[from] ParquetError),

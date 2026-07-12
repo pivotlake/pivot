@@ -36,14 +36,15 @@
 //!
 //! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow_array::{ArrayRef, Scalar};
 use catalog::parquet::table_input;
 use catalog::store::ObjectPath;
-use catalog::{CatalogTable, FileRef, ManifestEntry, ParquetCatalog};
+use catalog::{CatalogTable, FileRef, ManifestEntry, ParquetCatalog, scalar_values_equal};
 use dispatch::{DataFlowDispatcher, DataFlowError, Projection};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
@@ -276,24 +277,26 @@ impl Compacter {
     fn next_batch(&self, table: &CatalogTable) -> Option<Vec<FileRef>> {
         // Compaction merges within a single partition: across partitions it
         // couldn't stamp the merged file with one tuple, and the write pipeline
-        // would just re-split it back out, making no progress. So group the small
-        // files by partition (keyed by the tuple's JSON, `""` for unpartitioned)
-        // and fill a batch from one group.
+        // would just re-split it back out, making no progress. Group by the
+        // typed partition tuple and fill a batch from one group.
         let partition_of: HashMap<ObjectPath, _> = table.file_partitions().into_iter().collect();
-        let mut by_partition: BTreeMap<String, Vec<FileRef>> = BTreeMap::new();
+        let mut by_partition: Vec<(Option<HashMap<String, Scalar<ArrayRef>>>, Vec<FileRef>)> =
+            Vec::new();
         for file in table.file_refs() {
             if file.size >= self.target_bytes {
                 continue;
             }
-            let key = partition_of
-                .get(&file.path)
-                .and_then(|p| p.as_ref())
-                .map(|tuple| tuple.to_string())
-                .unwrap_or_default();
-            by_partition.entry(key).or_default().push(file);
+            let key = partition_of.get(&file.path).cloned().unwrap_or(None);
+            match by_partition
+                .iter_mut()
+                .find(|(partition, _)| partition_values_equal(partition, &key))
+            {
+                Some((_, files)) => files.push(file),
+                None => by_partition.push((key, vec![file])),
+            }
         }
 
-        for mut files in by_partition.into_values() {
+        for (_, mut files) in by_partition {
             if files.len() < 2 {
                 continue;
             }
@@ -323,6 +326,17 @@ impl Compacter {
             }
         }
         None
+    }
+}
+
+fn partition_values_equal(
+    left: &Option<HashMap<String, Scalar<ArrayRef>>>,
+    right: &Option<HashMap<String, Scalar<ArrayRef>>>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => scalar_values_equal(left, right),
+        _ => false,
     }
 }
 

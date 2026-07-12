@@ -14,13 +14,13 @@ catalog = { path = "../catalog" }
 
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
-# Partitioned/sorted ingest: lexsort + partition (arrow-ord), concat + take
-# (arrow-select), and arrow-json to record each file's partition tuple in the
-# manifest. `uuid` names files so concurrent ingestors never collide.
+# Partitioned/sorted ingest: lexsort + partition (arrow-ord), comparable row
+# keys (arrow-row), and concat + take (arrow-select). `uuid` names files so
+# concurrent ingestors never collide.
 arrow-ord = { path = "../arrow-rs/arrow-ord" }
+arrow-row = { path = "../arrow-rs/arrow-row" }
 arrow-select = { path = "../arrow-rs/arrow-select" }
 arrow-arith = { path = "../arrow-rs/arrow-arith" }
-arrow-json = { path = "../arrow-rs/arrow-json" }
 # Dictionary encoding: cast a column to a dictionary array (intern + index).
 arrow-cast = { path = "../arrow-rs/arrow-cast" }
 uuid = { version = "1", features = ["v4"] }
