@@ -31,7 +31,9 @@
 //! use catalog::parquet::{ParquetTable, table_input};
 //! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
-//! use planner::catalog::{Catalog, Column, CreateTableRequest, DynamicScanPredicate, Table};
+//! use planner::catalog::{
+//!     Catalog, CatalogTransaction, Column, CreateTableRequest, DynamicScanPredicate, Table,
+//! };
 //! use planner::types::Type;
 //!
 //! #[derive(Debug)]
@@ -41,7 +43,7 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool) -> planner::catalog::Result<RecordBatchOperatorSpec> {
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool, _transaction: &dyn CatalogTransaction) -> planner::catalog::Result<RecordBatchOperatorSpec> {
 //!         Ok(table_input(dispatcher, &self.parquet, projection, false))
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
@@ -59,12 +61,26 @@
 //!     tables: HashMap<String, MyTableTemplate>,
 //! }
 //!
-//! impl Catalog for MyCatalog {
+//! // Tables resolve through a per-query transaction: a frozen snapshot of the
+//! // catalog.
+//! #[derive(Debug)]
+//! struct MyTransaction {
+//!     tables: HashMap<String, MyTableTemplate>,
+//! }
+//!
+//! impl CatalogTransaction for MyTransaction {
 //!     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
 //!         self.tables
 //!             .get(name)
 //!             .cloned()
 //!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn Table>)
+//!     }
+//!     fn as_any(&self) -> &dyn std::any::Any { self }
+//! }
+//!
+//! impl Catalog for MyCatalog {
+//!     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
+//!         Arc::new(MyTransaction { tables: self.tables.clone() })
 //!     }
 //!     fn create_table(&self, _req: CreateTableRequest, _dispatcher: &DataFlowDispatcher) -> planner::catalog::Result<RecordBatchOperatorSpec> {
 //!         unimplemented!("this catalog is read-only")
@@ -84,11 +100,12 @@
 //! tables.insert("hits".to_string(), template);
 //! let catalog: Arc<dyn Catalog> = Arc::new(MyCatalog { tables });
 //!
-//! let mut planner = Planner::new(catalog);
+//! let mut planner = Planner::new(catalog.clone());
 //!
-//! // SQL -> Pivot Plan -> dispatch operator spec -> execution.
-//! let plan = planner.plan("SELECT COUNT(*) FROM hits WHERE URL <> 'foo'").unwrap();
-//! let spec = plan.compile(dispatch.dispatcher()).unwrap();
+//! // One transaction per query: SQL -> Pivot Plan -> dispatch spec -> execution.
+//! let transaction = catalog.begin_transaction();
+//! let plan = planner.plan("SELECT COUNT(*) FROM hits WHERE URL <> 'foo'", transaction.clone()).unwrap();
+//! let spec = plan.compile(dispatch.dispatcher(), transaction.as_ref()).unwrap();
 //! let batches = spec.collect();
 //! ```
 //!
@@ -123,8 +140,10 @@ pub use operator::{Operator, SetVariable, TableFunction, TableFunctionSignature}
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;
 
-use crate::catalog::DuckDBCatalogAdapter;
-pub use duckdb_planner::{DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId, ScalarValue};
+use crate::catalog::{CatalogTransaction, DuckDBCatalogAdapter, DuckDBTransactionAdapter};
+pub use duckdb_planner::{
+    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
+};
 
 /// Errors surfaced by [`Planner::plan`].
 #[derive(Debug, Error)]
@@ -160,13 +179,20 @@ impl Planner {
         }
     }
 
-    /// Plan a SQL statement into a Pivot [`Plan`].
+    /// Plan a SQL statement into a Pivot [`Plan`], inside `transaction`.
     ///
-    /// The statement is first planned by DuckDB (which resolves references
-    /// through the catalog), then the resulting plan handles are walked into a
-    /// Pivot [`PlanNode`] tree (see the `build` module).
-    pub fn plan(&mut self, query: &str) -> Result<Plan, Error> {
-        let planned = self.planner_context.plan(query)?;
+    /// The statement is first planned by DuckDB, which resolves every table
+    /// reference through the transaction's catalog snapshot (carried across the
+    /// bridge on the DuckDB transaction the planner starts internally), then the
+    /// resulting plan handles are walked into a Pivot [`PlanNode`] tree (see the
+    /// `build` module).
+    pub fn plan(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> Result<Plan, Error> {
+        let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
+        let planned = self.planner_context.plan(query, adapter)?;
         let mut root = build::build_plan(planned.root())?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();

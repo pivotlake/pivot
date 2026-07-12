@@ -1,5 +1,7 @@
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalOperatorType;
-use duckdb_planner::{DuckDBBind, DuckDBColumn, DuckDBTable, LogicalTypeId, PlannerContext};
+use duckdb_planner::{
+    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
+};
 use std::sync::Arc;
 
 struct UsersTable;
@@ -29,8 +31,12 @@ impl DuckDBTable for UsersTable {
 
 struct TestCatalog;
 
-impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+impl DuckDBBind for TestCatalog {}
+
+struct TestTransaction;
+
+impl DuckDBTransaction for TestTransaction {
+    fn table(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
             "users" => Some(Box::new(UsersTable)),
             _ => None,
@@ -66,7 +72,10 @@ fn no_memory_leak_across_repeated_plans() {
 
                 for i in 0..per_thread {
                     let plan = ctx
-                        .plan("SELECT id, name FROM users WHERE age <> 0")
+                        .plan(
+                            "SELECT id, name FROM users WHERE age <> 0",
+                            Arc::new(TestTransaction),
+                        )
                         .unwrap();
                     assert_eq!(
                         plan.root().op_type(),

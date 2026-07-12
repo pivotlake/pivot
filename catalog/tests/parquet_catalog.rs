@@ -154,7 +154,7 @@ fn create_table_succeeds_with_valid_path() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    assert!(catalog.table("t").is_some());
+    assert!(catalog.begin_transaction().table("t").is_some());
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
     };
     // No path: the table lives under the (in-memory) database root with no data.
     create_table(&catalog, req).unwrap();
-    assert!(catalog.binding("t").is_some());
+    assert!(catalog.begin_transaction().table("t").is_some());
     assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
 
@@ -182,7 +182,7 @@ fn create_table_over_a_missing_path_yields_an_empty_table() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let bogus = Path::new("/definitely/not/a/real/path/for/catalog/tests");
     create_table(&catalog, create_request("t", bogus, columns)).unwrap();
-    assert!(catalog.binding("t").is_some());
+    assert!(catalog.begin_transaction().table("t").is_some());
     assert!(current_parquet(&catalog, "t").row_groups().is_empty());
 }
 
@@ -225,7 +225,7 @@ fn pushdown_filter_always_returns_false() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -238,7 +238,7 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     assert_eq!(row_group_count(&catalog, "t", &table), 3);
 
     table
@@ -257,14 +257,14 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut first = catalog.binding("t").unwrap();
+    let mut first = catalog.begin_transaction().table("t").unwrap();
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
     assert_eq!(row_group_count(&catalog, "t", &first), 2);
 
     // A fresh bind starts from the master entry's full row group set.
-    let second = catalog.binding("t").unwrap();
+    let second = catalog.begin_transaction().table("t").unwrap();
     assert_eq!(row_group_count(&catalog, "t", &second), 3);
 }
 
@@ -275,7 +275,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 999` lies outside every (min,max) → all three row groups drop.
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
@@ -289,7 +289,7 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 20` matches only the row group whose single value is 20.
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -301,7 +301,7 @@ fn pushdown_filter_eq_returns_false() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -314,7 +314,7 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
@@ -353,25 +353,28 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 
 /// Append the file at `path` to table `name` through a cloned-out handle — the
 /// table-level API a writer (ingest) uses: it writes the bytes into the table's
-/// location and CAS-commits the file. The catalog's own copy is not touched (a
-/// later `resolve` reconciles it). Recorded by its location-relative name.
+/// location, CAS-commits the file, and publishes the committed copy back so the
+/// next transaction's snapshot sees it. Recorded by its location-relative name.
 fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
     let bytes = std::fs::read(path).unwrap();
     let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
-    catalog
-        .table_handle(name)
-        .expect("table exists")
+    let mut handle = catalog.table_handle(name).expect("table exists");
+    handle
         .append_data_file(relative, &bytes, None, None)
-        .unwrap()
+        .unwrap();
+    catalog.publish_table(handle);
 }
 
-/// Run `sql` through a planner over `catalog` and return the result batches.
+/// Run `sql` through a planner over `catalog` (inside a fresh transaction,
+/// like the server does per query) and return the result batches.
 fn run_sql(catalog: &Arc<ParquetCatalog>, sql: &str) -> Vec<RecordBatch> {
-    let mut planner = Planner::new(catalog.clone() as Arc<dyn PlannerCatalog>);
+    let planner_catalog = catalog.clone() as Arc<dyn PlannerCatalog>;
+    let transaction = planner_catalog.begin_transaction();
+    let mut planner = Planner::new(planner_catalog);
     planner
-        .plan(sql)
+        .plan(sql, transaction.clone())
         .unwrap()
-        .compile(&dispatcher())
+        .compile(&dispatcher(), transaction.as_ref())
         .unwrap()
         .collect()
         .unwrap()
@@ -569,16 +572,15 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     assert_eq!(groups[0].num_rows, 4);
 }
 
-/// A pushed-down predicate prunes against the table's *current* files: a binding
-/// resolved before an append, after a refresh, prunes over the new file set —
-/// the compile path fetches the latest files from the query context, so a reused
-/// (cached) plan's predicates apply to data committed since it was planned.
+/// A binding's pushed-down predicates are a pure filter over whatever file set
+/// they are applied to: the same binding prunes a wider, later file set just as
+/// well, so predicate state and file state stay independent.
 #[test]
 fn pushed_predicate_prunes_latest_files_after_refresh() {
     let (dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -710,7 +712,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = catalog.binding("t").unwrap();
+    let mut table = catalog.begin_transaction().table("t").unwrap();
     assert_eq!(row_group_count(&catalog, "t", &table), 6);
 
     table
@@ -788,11 +790,11 @@ fn partition_filter_builds_only_the_matching_partitions_files() {
     let (_dir, catalog) = table_partitioned_by_name();
 
     let mut table = catalog.table_handle("p").unwrap();
-    table.reload_manifest_only().unwrap();
-    let kept = table.parquet(&[name_eq("keep")]).unwrap();
+    table.refresh().unwrap();
+    let kept = table.build_scan_view(&[name_eq("keep")]).unwrap();
 
-    // Only the one-group `keep` file is fetched; the three-group `drop` file is
-    // skipped before its footer is read.
+    // Only the one-group `keep` file enters the scan view; the three-group
+    // `drop` file's partition tuple can't match.
     assert_eq!(kept.row_groups().len(), 1);
 }
 
@@ -801,9 +803,9 @@ fn no_partition_filter_builds_every_partitions_files() {
     let (_dir, catalog) = table_partitioned_by_name();
 
     let mut table = catalog.table_handle("p").unwrap();
-    table.reload_manifest_only().unwrap();
-    let all = table.parquet(&[]).unwrap();
+    table.refresh().unwrap();
+    let all = table.build_scan_view(&[]).unwrap();
 
-    // Without a filter both files are fetched: keep's 1 group + drop's 3.
+    // Without a filter both files are in view: keep's 1 group + drop's 3.
     assert_eq!(all.row_groups().len(), 4);
 }

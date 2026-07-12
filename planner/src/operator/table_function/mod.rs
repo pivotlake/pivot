@@ -6,7 +6,7 @@
 //! column projection shared by all of them. The concrete functions live
 //! elsewhere: the generic ones ([`series`]) here, backend-specific ones (e.g.
 //! `metadata`, which only a catalog that has row groups can answer) in the
-//! catalog, contributed through [`Catalog::table_function`].
+//! catalog, contributed through [`CatalogTransaction::table_function`].
 //!
 //! A function produces its *full* output (every column it declares, in order)
 //! as a dataflow; the operator then projects that to the columns DuckDB asked
@@ -17,7 +17,7 @@
 
 mod series;
 
-use crate::catalog::{Catalog, Column, QueryContext};
+use crate::catalog::{CatalogTransaction, Column};
 use crate::compile::Error;
 use crate::expression::Expression;
 use crate::types::Type;
@@ -49,24 +49,28 @@ pub trait TableFunction: Send + Sync {
     /// function in DuckDB. Must match what [`compile`](Self::compile) emits.
     fn signature(&self) -> TableFunctionSignature;
 
-    /// Build the dataflow emitting this function's full output. `ctx` is the
-    /// per-query context a backend function (e.g. `metadata`) downcasts to reach
-    /// its storage; pure functions ignore it.
+    /// Build the dataflow emitting this function's full output. `transaction`
+    /// is the query's catalog transaction; a backend function that reads
+    /// catalog data (e.g. `metadata`) resolves it from there, exactly as a
+    /// [`Table`](crate::catalog::Table) does. Pure functions ignore it.
     fn compile(
         &self,
         args: &[ScalarValue],
         dispatcher: &DataFlowDispatcher,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error>;
 }
 
-/// Resolve a table function by name. The catalog is consulted first, then the
-/// generic built-ins, matching the bind-side order (the bridge resolves a
-/// function against the catalog before falling back to DuckDB's system catalog).
-/// Keeping the two layers in the same order means a catalog-provided function and
-/// a built-in of the same name can never disagree between bind and compile.
-fn find_table_function(name: &str, catalog: &dyn Catalog) -> Option<Box<dyn TableFunction>> {
-    catalog.table_function(name).or_else(|| builtin(name))
+/// Resolve a table function by name. The transaction is consulted first, then
+/// the generic built-ins, matching the bind-side order (the bridge resolves a
+/// function against the transaction before falling back to DuckDB's system
+/// catalog). Keeping the two layers in the same order means a backend function
+/// and a built-in of the same name can never disagree between bind and compile.
+fn find_table_function(
+    name: &str,
+    transaction: &dyn CatalogTransaction,
+) -> Option<Box<dyn TableFunction>> {
+    transaction.table_function(name).or_else(|| builtin(name))
 }
 
 /// The generic built-in table functions, keyed by name. These depend only on
@@ -120,12 +124,11 @@ impl TableFunctionScan {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        catalog: &dyn Catalog,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let function = find_table_function(&self.function_name, catalog)
+        let function = find_table_function(&self.function_name, transaction)
             .ok_or_else(|| Error::UnsupportedTableFunction(self.function_name.clone()))?;
-        let full = function.compile(&self.args, dispatcher, ctx)?;
+        let full = function.compile(&self.args, dispatcher, transaction)?;
         self.project(full)
     }
 

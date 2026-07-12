@@ -55,18 +55,34 @@ PivotSchemaCatalogEntry::PivotSchemaCatalogEntry(Catalog &catalog, CreateSchemaI
     : SchemaCatalogEntry(catalog, info) {
 }
 
+// The pivot transaction of the plan currently being extracted, published on
+// the storage info by `extract_plan` for the duration of that one call
+// (planning is single-threaded per context). Table and table-function lookups
+// resolve through it, so everything one plan binds comes from the same catalog
+// snapshot (never from the live catalog, which a background refresh may be
+// updating concurrently). A lookup without one is a bridge bug, never a
+// legitimate binder probe: the only statements run outside `extract_plan` are
+// the ATTACH/USE at context construction, which bind no pivot entries.
+static const ::TransactionContext &pivot_transaction_ctx(duckdb::Catalog &catalog) {
+	auto &storage_info = PivotStorageInfo::Get(catalog.GetAttached().GetDatabase());
+	if (!storage_info.current_transaction) {
+		throw InternalException("pivot catalog lookup with no pivot transaction published");
+	}
+	return *storage_info.current_transaction;
+}
+
 optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransaction transaction,
                                                          const EntryLookupInfo &lookup_info) {
 	auto &table_name = lookup_info.GetEntryName();
 	auto &pivot_catalog = ParentCatalog().Cast<PivotCatalog>();
 
 	// A table-function reference (e.g. `metadata('t')`): resolve it against the
-	// Rust provider's registry. Unknown names (DuckDB built-ins like
-	// generate_series) return nullptr, so the binder falls through to the system
-	// catalog. The function's schema comes entirely from Rust; nothing about it
-	// is declared in this bridge.
+	// transaction's snapshot, since such a function reads catalog data. Unknown
+	// names (DuckDB built-ins like generate_series) return nullptr, so the
+	// binder falls through to the system catalog. The function's schema comes
+	// entirely from Rust; nothing about it is declared in this bridge.
 	if (lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
-		auto function = catalog_get_table_function(*pivot_catalog.catalog_ctx, table_name);
+		auto function = catalog_get_table_function(pivot_transaction_ctx(ParentCatalog()), table_name);
 		if (!function.found) {
 			return nullptr;
 		}
@@ -121,7 +137,15 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		return PivotStorageInfo::Get(db_instance).AddScalarFunctionEntry(std::move(entry));
 	}
 
-	auto result = catalog_get_table(*pivot_catalog.catalog_ctx, table_name);
+	// Pivot holds only tables and the functions handled above; probes for any
+	// other entry type (types, sequences, macros, ...) can't resolve here, so
+	// fall through to the system catalog exactly as a not-found table does.
+	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+
+	// A base-table reference: resolve it through the transaction's snapshot.
+	auto result = catalog_get_table(pivot_transaction_ctx(ParentCatalog()), table_name);
 
 	if (!result.found) {
 		return nullptr;

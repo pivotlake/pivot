@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 use planner::Planner;
-use planner::catalog::{Catalog, Column, DynamicScanPredicate, Table};
+use planner::catalog::{Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table};
 use planner::types::Type;
 
 #[derive(Clone, Debug)]
@@ -74,7 +74,7 @@ impl Table for TestTable {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-        _ctx: &dyn planner::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         Ok(table_input_with_filter(
             dispatcher,
@@ -97,7 +97,7 @@ impl Table for TestTable {
         &self,
         input: RecordBatchOperatorSpec,
         projection: Projection,
-        _ctx: &dyn planner::catalog::QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         Ok(catalog::parquet::materialize(
             input,
@@ -134,14 +134,28 @@ impl TestCatalog {
     }
 }
 
-impl Catalog for TestCatalog {
+/// One test transaction: a frozen clone of the catalog's table map, mirroring
+/// the production shape (one snapshot per query).
+#[derive(Debug)]
+struct TestTransaction {
+    tables: HashMap<String, TestTable>,
+}
+
+impl CatalogTransaction for TestTransaction {
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        self.tables
-            .lock()
-            .unwrap()
-            .get(name)
-            .cloned()
-            .map(|t| Box::new(t) as _)
+        self.tables.get(name).cloned().map(|t| Box::new(t) as _)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl Catalog for TestCatalog {
+    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
+        Arc::new(TestTransaction {
+            tables: self.tables.lock().unwrap().clone(),
+        })
     }
 
     fn create_table(
@@ -194,6 +208,18 @@ impl TestingPlanner {
     /// `Dispatch` so the parquet write/open happens on a worker.
     pub fn add_table(&self, name: &str, columns: &[(&str, Type, ArrayRef)]) {
         self.catalog.add_table(&self.dispatch, name, columns);
+    }
+
+    /// Plan `sql` inside a fresh transaction on this fixture's catalog, the
+    /// one-liner tests use instead of wiring the transaction themselves.
+    pub fn plan(&mut self, sql: &str) -> Result<planner::Plan, planner::Error> {
+        let transaction = self.catalog.begin_transaction();
+        self.planner.plan(sql, transaction)
+    }
+
+    /// A fresh transaction on this fixture's catalog, for compiling plans.
+    pub fn transaction(&self) -> Arc<dyn CatalogTransaction> {
+        self.catalog.begin_transaction()
     }
 }
 
