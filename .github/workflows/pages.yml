@@ -21,6 +21,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Bypass the kache rustc wrapper (.cargo/config.toml): kache is only
+  # installed on dev machines.
+  RUSTC_WRAPPER: ""
 
 # Like ci.yml, the docs build defaults to the self-hosted `ci-runner2` GCP VM
 # (gcp-builder label). Pushes to main resume the VM and build there; a manual

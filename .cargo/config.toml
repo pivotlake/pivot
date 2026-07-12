@@ -3,10 +3,14 @@
 # of the compiler version, crate source, dependencies, and normalized flags, so
 # unchanged crates restore instantly instead of recompiling.
 #
-# It wraps rustc for every build here EXCEPT the release builds, which clear
-# RUSTC_WRAPPER (an empty value overrides this setting) so shipped and optimized
-# binaries are always compiled fresh, uncached:
-#   - the release-binary CI job (.github/workflows/deploy.yml)
-#   - the PGO recipes (pgo.just)
+# kache is only installed on dev machines, so it wraps rustc for local builds
+# ONLY. Everything else clears RUSTC_WRAPPER (an empty value overrides this
+# setting):
+#   - CI checks and docs (.github/workflows/ci.yml, pages.yml), which cache
+#     with rust-cache instead
+#   - the release builds, so shipped and optimized binaries are always compiled
+#     fresh, uncached: the release-binary CI job (.github/workflows/deploy.yml),
+#     the PGO recipes (pgo.just), and the Docker images (server/Dockerfile,
+#     benchmarks/Dockerfile)
 [build]
 rustc-wrapper = "kache"

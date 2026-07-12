@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
+# Bypass the kache rustc wrapper (.cargo/config.toml): kache is not installed
+# in the image, and release binaries are always compiled fresh, never cached.
+ENV RUSTC_WRAPPER=
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/benchmarks/target \
     cargo build --release --manifest-path benchmarks/Cargo.toml --bin pivot-bench \
