@@ -14,13 +14,13 @@ catalog = { workspace = true }
 
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-# Partitioned/sorted ingest: lexsort + partition (arrow-ord), concat + take
-# (arrow-select), and arrow-json to record each file's partition tuple in the
-# manifest. `uuid` names files so concurrent ingestors never collide.
+# Partitioned/sorted ingest: lexsort + partition (arrow-ord), comparable row
+# keys (arrow-row), and concat + take (arrow-select). `uuid` names files so
+# concurrent ingestors never collide.
 arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
 arrow-select = { workspace = true }
 arrow-arith = { workspace = true }
-arrow-json = { workspace = true }
 # Dictionary encoding: cast a column to a dictionary array (intern + index).
 arrow-cast = { workspace = true }
 # Variant (JSON) columns: `parquet-variant` supplies the value/path types the

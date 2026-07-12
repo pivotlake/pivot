@@ -287,13 +287,14 @@ fn spawn_flush_timer(
 mod tests {
     use super::*;
     use crate::sink::ParquetSink;
-    use arrow_array::{Array, Int32Array, RecordBatch, StringViewArray};
+    use arrow_array::{Array, ArrayRef, Datum, Int32Array, RecordBatch, Scalar, StringViewArray};
     use catalog::parquet::{ParquetTable, table_input};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, Projection};
     use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value::Value};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::collections::HashMap;
     use std::path::Path;
 
     const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
@@ -528,6 +529,19 @@ mod tests {
             .collect()
     }
 
+    fn scalar_string(values: &HashMap<String, Scalar<ArrayRef>>, field: &str) -> String {
+        values
+            .get(field)
+            .expect("field exists")
+            .get()
+            .0
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .expect("field is Utf8View")
+            .value(0)
+            .to_string()
+    }
+
     /// A written file decodes back to the original values through the engine's
     /// scan (proves the PLAIN int and byte-array encodings are correct).
     #[test]
@@ -751,10 +765,13 @@ mod tests {
         let partitions = table.file_partitions();
         assert_eq!(partitions.len(), 1);
         assert_eq!(
-            partitions[0]
-                .1
-                .as_ref()
-                .expect("merged file keeps a partition tuple")["ServiceName"],
+            scalar_string(
+                partitions[0]
+                    .1
+                    .as_ref()
+                    .expect("merged file keeps a partition tuple"),
+                "ServiceName",
+            ),
             "svc"
         );
         assert!(
