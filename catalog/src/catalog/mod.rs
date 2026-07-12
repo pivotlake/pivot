@@ -10,11 +10,9 @@
 //!
 //! Durable state lives in two places, both in the store:
 //!
-//! - the [`manifest`] — which tables exist (name, declared schema, location);
-//! - the per-table [`TableManifest`] — *which
-//!   Parquet files* each table consists of, as a sequence of versions committed
-//!   with the store's compare-and-swap. The highest version is the table's
-//!   current file list.
+//! - the [`manifest`] — which tables exist (name and location);
+//! - each table's standard Delta `_delta_log` — its schema, partitioning,
+//!   version, and active Parquet files, interpreted by Delta Kernel.
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version. The in-memory set is kept current by
@@ -77,12 +75,18 @@ pub enum Error {
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
     TableExists(String),
+    #[error(
+        "catalog writes are not converted to Delta Lake yet; ingest and compaction are disabled for table `{0}`"
+    )]
+    DeltaWritesUnsupported(String),
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
     Store(#[from] store::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
+    #[error(transparent)]
+    Delta(#[from] crate::delta::Error),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(
@@ -119,7 +123,7 @@ pub struct ParquetCatalog {
     /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
     /// lock-free value that callers clone out and evolve independently.
     tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
-    /// The database's object store — both the table manifests and the tables'
+    /// The database's object store — the table index, Delta logs, and tables'
     /// Parquet data. A local directory by default ([`new`], an ephemeral one
     /// under the temp dir), or the directory / S3 / GCS root a database is
     /// [`open`](Self::open)ed at. The catalog reads and writes a table's data
@@ -189,7 +193,15 @@ impl ParquetCatalog {
         store: &Arc<dyn ObjectStore>,
         entry: &CatalogManifestTableEntry,
     ) -> Result<CatalogTable> {
-        let manifest = TableManifest::load(store.as_ref(), &entry.name)?;
+        let delta_uri = crate::delta::table_uri(&store.describe(), &entry.location)?;
+        let state = crate::delta::load_table(&delta_uri)?;
+        let manifest = TableManifest {
+            version: state.version,
+            columns: state.columns,
+            partition_by: state.partition_by,
+            sort_by: Vec::new(),
+            entries: state.entries,
+        };
         let files = manifest
             .entries
             .iter()
@@ -208,6 +220,7 @@ impl ParquetCatalog {
             table_files,
             store.clone(),
             dispatcher.clone(),
+            delta_uri,
         ))
     }
 
@@ -226,7 +239,7 @@ impl ParquetCatalog {
 
     /// Bring the in-memory table set up to date with the store: pick up tables
     /// another process registered in the database index, and advance every
-    /// table to its latest committed manifest version, fetching the footers of
+    /// table to its latest committed Delta version, fetching the footers of
     /// files it doesn't hold yet. This is the **only** place the read path
     /// pays store I/O; the server drives it on a background interval, so
     /// queries always bind against an already-materialized set. Returns whether
@@ -505,19 +518,19 @@ impl CatalogSnapshot {
     }
 
     /// Table `name`'s row groups for the files that can match
-    /// `partition_filters` — the partition-pruned scan view. Built from the
-    /// snapshot's already materialized row groups: no manifest read, no footer
-    /// fetch. The snapshot is immutable, so two asks with the same filters (a
-    /// scan and its late materialize) always build identical views addressing
-    /// the same row-group indices. Errors if the table isn't in the snapshot
-    /// (it never was, or the binding outlived its transaction into a catalog
-    /// where it's gone) rather than scanning an empty file set.
+    /// `partition_filter_candidates` — the partition-pruned scan view. Built
+    /// from the snapshot's already materialized row groups: no manifest read,
+    /// no footer fetch. The snapshot is immutable, so two asks with the same
+    /// candidates (a scan and its late materialize) always build identical views
+    /// addressing the same row-group indices. Errors if the table isn't in the
+    /// snapshot (it never was, or the binding outlived its transaction into a
+    /// catalog where it's gone) rather than scanning an empty file set.
     pub(super) fn parquet(
         &self,
         name: &str,
-        partition_filters: impl Iterator<Item = PartitionEqFilter>,
+        partition_filter_candidates: impl Iterator<Item = PartitionEqFilter>,
     ) -> CatalogResult<Arc<ParquetTable>> {
-        let filters: Vec<PartitionEqFilter> = partition_filters.collect();
+        let filters: Vec<PartitionEqFilter> = partition_filter_candidates.collect();
         let table = self.tables.get(name).ok_or_else(|| {
             CatalogError::Other(format!("table {name:?} is not in this snapshot").into())
         })?;

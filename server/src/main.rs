@@ -110,7 +110,7 @@ struct Args {
     http_bind: Option<SocketAddr>,
 
     /// How often (seconds) the background catalog refresh brings the in-memory
-    /// table set up to date with the store: new manifest versions, new files'
+    /// table set up to date with the store: new Delta versions, new files'
     /// footers, and tables committed by other processes. Queries bind against
     /// a snapshot of that in-memory set, so this bounds how stale a query's
     /// view of *externally* committed data can be (this process's own ingest

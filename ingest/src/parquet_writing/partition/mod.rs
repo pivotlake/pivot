@@ -18,39 +18,62 @@
 //! leaves one tail file, not one per worker. With no `partition_by` the split is a
 //! no-op (one group, key `None`), so the same stage drives plain writes too.
 //!
-//! The partition tuple is a one-row arrow-json [`Value`] (`{"svc":"a"}`), used
-//! directly as the `HashMap` grouping key (`Value` is `Hash + Eq`) and recorded
-//! as-is in the manifest.
+//! The partition tuple is a hash map of column names to typed Arrow scalars. A
+//! matching Arrow row key is used for hash grouping without erasing those
+//! values through JSON; the scalar map itself is recorded with each file.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender as StdSender, TryRecvError};
 
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_ord::partition::partition;
-use arrow_ord::sort::{SortColumn, lexsort_to_indices};
-use arrow_schema::{Schema, SchemaRef};
-use arrow_select::concat::concat_batches;
-use arrow_select::take::take_record_batch;
-use catalog::SortBounds;
-use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult};
-use serde_json::Value;
-
-mod json;
-
-use json::row_object;
-
 use super::error::WriteResult;
 use super::shredding;
 use super::stats::column_min_max;
 use super::types::{ColumnChunkJob, PartitionTag, RowGroupHeader};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_ord::partition::partition;
+use arrow_ord::sort::{SortColumn, lexsort_to_indices};
+use arrow_row::{OwnedRow, RowConverter, SortField};
+use arrow_schema::SchemaRef;
+use arrow_select::concat::concat_batches;
+use arrow_select::take::take_record_batch;
+use catalog::{SortBounds, pivot_scalar, scalar_values_from_row};
+use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult};
 
-/// A partition tuple (a one-row arrow-json object), or `None` for an
-/// unpartitioned write — used directly as the grouping key (`Value` is `Hash +
-/// Eq`) and recorded in the manifest.
-type PartitionKey = Option<Value>;
+/// Hashable identity plus the typed values recorded with an output file. Arrow's
+/// row encoding supplies equality/hash semantics across every supported scalar
+/// type while the scalar map retains field names and physical types.
+#[derive(Clone)]
+struct PartitionKey {
+    row: Option<OwnedRow>,
+    values: Option<catalog::PartitionValues>,
+}
+
+impl PartitionKey {
+    fn unpartitioned() -> Self {
+        Self {
+            row: None,
+            values: None,
+        }
+    }
+}
+
+impl PartialEq for PartitionKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.row == other.row
+    }
+}
+
+impl Eq for PartitionKey {}
+
+impl Hash for PartitionKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.row.hash(state);
+    }
+}
 
 /// A leftover partition's rows, shipped to worker 0 at finish.
 type Leftover = (PartitionKey, Vec<RecordBatch>);
@@ -135,7 +158,7 @@ impl Partitioner {
     /// contiguous, then the `partition` kernel cuts the runs.
     fn split(&self, batch: RecordBatch) -> WriteResult<Vec<(PartitionKey, RecordBatch)>> {
         if self.partition_by.is_empty() {
-            return Ok(vec![(None, batch)]);
+            return Ok(vec![(PartitionKey::unpartitioned(), batch)]);
         }
         let column = |name: &str| -> WriteResult<ArrayRef> {
             Ok(batch.column(batch.schema().index_of(name)?).clone())
@@ -159,13 +182,26 @@ impl Partitioner {
             .iter()
             .map(|n| Ok(batch.column(batch.schema().index_of(n)?).clone()))
             .collect::<WriteResult<Vec<ArrayRef>>>()?;
+        let converter = RowConverter::new(
+            part_cols
+                .iter()
+                .map(|column| SortField::new(column.data_type().clone()))
+                .collect(),
+        )?;
+        let rows = converter.convert_columns(&part_cols)?;
         partition(&part_cols)?
             .ranges()
             .into_iter()
             .map(|r| {
                 let slice = batch.slice(r.start, r.end - r.start);
-                let tuple = row_object(&slice, &self.partition_by, 0)?;
-                Ok((Some(tuple), slice))
+                let values = scalar_values_from_row(&batch, &self.partition_by, r.start)?;
+                Ok((
+                    PartitionKey {
+                        row: Some(rows.row(r.start).owned()),
+                        values: Some(values),
+                    },
+                    slice,
+                ))
             })
             .collect()
     }
@@ -294,7 +330,7 @@ impl RowGroupBuilder {
             let tag = Arc::new(PartitionTag {
                 file_id,
                 n_row_groups,
-                partition: partition.clone(),
+                partition: partition.values.clone(),
                 sort_bounds: sort_bounds.clone(),
             });
             // Every column chunk of this row group shares one header.
@@ -315,9 +351,8 @@ impl RowGroupBuilder {
         Ok(())
     }
 
-    /// The file's sort-key bounds: each sort column's min/max over the whole file,
-    /// as `{col: min}` / `{col: max}` arrow-json objects. `None` if there's no
-    /// sort key or no sort column has stats.
+    /// The file's sort-key bounds: each sort column's typed min/max over the
+    /// whole file. `None` if there's no sort key or no sort column has stats.
     fn file_sort_bounds(
         &self,
         batch: &RecordBatch,
@@ -326,7 +361,6 @@ impl RowGroupBuilder {
         if self.sort_by.is_empty() {
             return Ok(None);
         }
-        let mut fields = Vec::new();
         let mut mins = Vec::new();
         let mut maxs = Vec::new();
         let mut included = Vec::new();
@@ -335,7 +369,6 @@ impl RowGroupBuilder {
             let Some((min, max)) = column_min_max(batch.column(i)) else {
                 continue;
             };
-            fields.push(schema.field(i).as_ref().clone());
             mins.push(min);
             maxs.push(max);
             included.push(name.clone());
@@ -343,12 +376,16 @@ impl RowGroupBuilder {
         if included.is_empty() {
             return Ok(None);
         }
-        let bound_schema = Arc::new(Schema::new(fields));
-        let min_batch = RecordBatch::try_new(bound_schema.clone(), mins)?;
-        let max_batch = RecordBatch::try_new(bound_schema, maxs)?;
         Ok(Some(SortBounds {
-            min: row_object(&min_batch, &included, 0)?,
-            max: row_object(&max_batch, &included, 0)?,
+            min: included
+                .iter()
+                .cloned()
+                .zip(mins.iter().map(|value| pivot_scalar(value, 0)))
+                .collect(),
+            max: included
+                .into_iter()
+                .zip(maxs.iter().map(|value| pivot_scalar(value, 0)))
+                .collect(),
         }))
     }
 }
@@ -356,7 +393,7 @@ impl RowGroupBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{Datum, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
     /// A partitioner with just a partition spec, for testing [`Partitioner::split`].
@@ -396,14 +433,40 @@ mod tests {
     /// Rows split into one group per partition value, grouped by that value.
     #[test]
     fn splits_by_partition_value() {
+        use arrow_array::{Datum, StringViewArray};
+
         let parts = partitioner(&["service"])
             .split(batch(&["b", "a", "b", "a"], &[4, 1, 3, 2]))
             .unwrap();
 
         assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].0.as_ref().unwrap()["service"], "a");
+        let first = parts[0]
+            .0
+            .values
+            .as_ref()
+            .unwrap()
+            .get("service")
+            .unwrap()
+            .get()
+            .0
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(first.value(0), "a");
         assert_eq!(parts[0].1.num_rows(), 2);
-        assert_eq!(parts[1].0.as_ref().unwrap()["service"], "b");
+        let second = parts[1]
+            .0
+            .values
+            .as_ref()
+            .unwrap()
+            .get("service")
+            .unwrap()
+            .get()
+            .0
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(second.value(0), "b");
         assert_eq!(parts[1].1.num_rows(), 2);
     }
 
@@ -413,7 +476,42 @@ mod tests {
         let parts = partitioner(&[]).split(batch(&["b", "a"], &[2, 1])).unwrap();
 
         assert_eq!(parts.len(), 1);
-        assert!(parts[0].0.is_none());
+        assert!(parts[0].0.values.is_none());
         assert_eq!(parts[0].1.num_rows(), 2);
+    }
+
+    #[test]
+    fn sort_bounds_are_typed_scalar_maps() {
+        let mut partitioner = partitioner(&[]);
+        partitioner.builder.sort_by = Arc::from(["ts".to_string()]);
+        let batch = batch(&["b", "a", "c"], &[4, 1, 3]);
+        let bounds = partitioner
+            .builder
+            .file_sort_bounds(&batch, &batch.schema())
+            .unwrap()
+            .unwrap();
+
+        let min = bounds
+            .min
+            .get("ts")
+            .unwrap()
+            .get()
+            .0
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        let max = bounds
+            .max
+            .get("ts")
+            .unwrap()
+            .get()
+            .0
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+
+        assert_eq!((min, max), (1, 4));
     }
 }
