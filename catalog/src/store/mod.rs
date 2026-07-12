@@ -195,6 +195,21 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn describe(&self) -> String {
         format!("{self:?}")
     }
+
+    /// How delta-rs should address a table rooted at `location` within this
+    /// store: the table's full URI plus the storage options its object store
+    /// needs to reach it (credentials, endpoint). The delta transaction log is
+    /// read through this target; the data-plane reads of the same files keep
+    /// going through this store's own methods.
+    fn delta_table_target(&self, location: &ObjectPath) -> Result<DeltaTableTarget>;
+}
+
+/// Where a table's delta log lives: a `file://`/`s3://`/`gs://` table URI and
+/// the storage options to open it with (option names as delta-rs reads them).
+#[derive(Clone, Debug)]
+pub struct DeltaTableTarget {
+    pub uri: String,
+    pub storage_options: std::collections::HashMap<String, String>,
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,

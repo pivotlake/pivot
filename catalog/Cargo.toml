@@ -42,6 +42,18 @@ ring = "0.17"
 base64 = "0.22"
 # Build/parse the concrete URLs handed to the io_uring HTTP reader.
 url = "2"
+# Read each table's Delta Lake transaction log: the background catalog sync
+# loads a table's schema, partition/sort specs, and committed file list from
+# the `_delta_log/` under its data location. `deltalake-aws` and
+# `deltalake-gcp` are delta-rs's S3 and GCS log stores, registered explicitly
+# at runtime: the `deltalake` meta crate would do it in a pre-main constructor,
+# which allocates before jemalloc (the global allocator) is initialized and
+# aborts. delta-rs is async, so the catalog owns one small tokio runtime
+# dedicated to its log reads.
+deltalake-core = { version = "0.32", features = ["rustls"] }
+deltalake-aws = { version = "0.15", features = ["rustls"] }
+deltalake-gcp = "0.16"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 # Optional, behind the `test-support` feature: the in-Docker object-store test
 # harness exposed as `catalog::test_support`. testcontainers brings up MinIO and
 # fake-gcs-server; tempfile backs the local() backend. (The harness's other

@@ -17,12 +17,15 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub struct S3Store {
+    bucket: String,
     /// In-bucket prefix under which this catalog's keys live.
     prefix: String,
     region: String,
     access_key: String,
     secret_key: String,
     session_token: Option<String>,
+    /// The custom endpoint requests go to (MinIO etc.), `None` on AWS itself.
+    endpoint: Option<String>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
     /// hosted) or `http://localhost:9000/bucket` (path-style endpoint override).
     base: String,
@@ -47,10 +50,12 @@ impl S3Store {
         let secret_key = env_req("AWS_SECRET_ACCESS_KEY")?;
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
 
-        let (base, host) = match std::env::var("AWS_ENDPOINT_URL").ok() {
+        let endpoint = std::env::var("AWS_ENDPOINT_URL")
+            .ok()
+            .map(|ep| ep.trim_end_matches('/').to_string());
+        let (base, host) = match endpoint.as_deref() {
             // Path-style against a custom endpoint (MinIO etc.).
             Some(ep) => {
-                let ep = ep.trim_end_matches('/');
                 let host = ep
                     .split("://")
                     .nth(1)
@@ -69,11 +74,13 @@ impl S3Store {
         };
 
         Ok(Self {
+            bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             region,
             access_key,
             secret_key,
             session_token,
+            endpoint,
             base,
             host,
             agent: ureq::AgentBuilder::new().build(),
@@ -248,6 +255,35 @@ impl ObjectStore for S3Store {
         Ok(DataFileSource::Remote {
             url: self.presign_get(key)?,
             auth: None,
+        })
+    }
+
+    fn delta_table_target(&self, location: &ObjectPath) -> Result<super::DeltaTableTarget> {
+        let uri = format!(
+            "s3://{}/{}",
+            self.bucket,
+            object_key(&self.prefix, location)
+        );
+        // The same credentials/region/endpoint this store resolved from the
+        // environment, in the option names delta-rs's S3 backend reads.
+        let mut storage_options: Vec<(String, String)> = vec![
+            ("AWS_ACCESS_KEY_ID".into(), self.access_key.clone()),
+            ("AWS_SECRET_ACCESS_KEY".into(), self.secret_key.clone()),
+            ("AWS_REGION".into(), self.region.clone()),
+        ];
+        if let Some(token) = &self.session_token {
+            storage_options.push(("AWS_SESSION_TOKEN".into(), token.clone()));
+        }
+        if let Some(endpoint) = &self.endpoint {
+            storage_options.push(("AWS_ENDPOINT_URL".into(), endpoint.clone()));
+            storage_options.push(("AWS_FORCE_PATH_STYLE".into(), "true".into()));
+            if endpoint.starts_with("http://") {
+                storage_options.push(("AWS_ALLOW_HTTP".into(), "true".into()));
+            }
+        }
+        Ok(super::DeltaTableTarget {
+            uri,
+            storage_options: storage_options.into_iter().collect(),
         })
     }
 }

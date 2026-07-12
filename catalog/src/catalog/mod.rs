@@ -10,11 +10,11 @@
 //!
 //! Durable state lives in two places, both in the store:
 //!
-//! - the [`manifest`] — which tables exist (name, declared schema, location);
-//! - the per-table [`TableManifest`] — *which
-//!   Parquet files* each table consists of, as a sequence of versions committed
-//!   with the store's compare-and-swap. The highest version is the table's
-//!   current file list.
+//! - the [`manifest`], which tables exist (name, location);
+//! - each table's Delta Lake transaction log (see [`crate::delta`]): its
+//!   declared schema, partition/sort specs, and *which Parquet files* it
+//!   consists of, as a sequence of versions committed with an atomic
+//!   create-if-absent. The highest version is the table's current file list.
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version. The in-memory set is kept current by
@@ -41,9 +41,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::manifest::{
-    self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
-};
+use crate::manifest::{self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter};
 use crate::parquet::{ParquetTable, ParquetTableError};
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
@@ -83,6 +81,10 @@ pub enum Error {
     Store(#[from] store::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
+    #[error(transparent)]
+    Delta(#[from] crate::delta::Error),
+    #[error("catalog writes are not supported while Delta Lake integration is read-only")]
+    DeltaWritesUnsupported,
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(
@@ -189,7 +191,8 @@ impl ParquetCatalog {
         store: &Arc<dyn ObjectStore>,
         entry: &CatalogManifestTableEntry,
     ) -> Result<CatalogTable> {
-        let manifest = TableManifest::load(store.as_ref(), &entry.name)?;
+        let target = store.delta_table_target(&entry.location)?;
+        let manifest = crate::delta::load_manifest(&target, &entry.name)?;
         let files = manifest
             .entries
             .iter()
@@ -203,6 +206,7 @@ impl ParquetCatalog {
         Ok(CatalogTable::new(
             entry.name.clone(),
             entry.location.clone(),
+            target,
             manifest,
             table_files,
             store.clone(),
@@ -241,7 +245,16 @@ impl ParquetCatalog {
             if self.tables.read().unwrap().contains_key(&entry.name) {
                 continue;
             }
-            let table = Self::load_table(&self.dispatcher, &self.store, entry)?;
+            // One unloadable table (e.g. a delta table with an unsupported
+            // feature) must not stop the sweep from serving every other table;
+            // it is skipped with a warning and retried next tick.
+            let table = match Self::load_table(&self.dispatcher, &self.store, entry) {
+                Ok(table) => table,
+                Err(e) => {
+                    tracing::warn!(table = %entry.name, error = %e, "skipping unloadable table in catalog refresh");
+                    continue;
+                }
+            };
             let mut map = self.tables.write().unwrap();
             // An in-process CREATE TABLE may have published it since the read.
             if !map.contains_key(&entry.name) {
@@ -251,10 +264,16 @@ impl ParquetCatalog {
         }
 
         // Refresh each table on a clone outside the lock (footer fetches are
-        // I/O), then publish the advanced copy back.
+        // I/O), then publish the advanced copy back. A table that fails to
+        // refresh keeps serving its current version and must not block the
+        // others from advancing.
         for mut table in self.tables() {
-            if table.refresh()? {
-                changed |= self.publish_table(table);
+            match table.refresh() {
+                Ok(true) => changed |= self.publish_table(table),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(table = %table.name(), error = %e, "skipping failed table refresh in catalog refresh");
+                }
             }
         }
 

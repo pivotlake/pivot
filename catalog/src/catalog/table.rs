@@ -1,13 +1,14 @@
 //! The catalog's master record of one table: its definition plus its current
-//! content — the files at one manifest version.
+//! content, the files at one Delta Lake log version.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Error;
-use crate::manifest::{FIRST_VERSION, ManifestEntry, PartitionEqFilter, SortBounds, TableManifest};
+use crate::delta;
+use crate::manifest::{ManifestEntry, PartitionEqFilter, SortBounds, TableManifest};
 use crate::parquet::{ParquetTable, RowGroupMetadata};
-use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
+use crate::store::{self, DataFile, DeltaTableTarget, FileRef, ObjectPath, ObjectStore};
 use dispatch::DataFlowDispatcher;
 use planner::catalog::Column;
 
@@ -32,25 +33,20 @@ impl TableFile {
     }
 }
 
-/// The catalog's master record of one table: its [`TableManifest`] (declared
-/// columns + committed file list, at one version) and its current content — the
-/// per-file row groups (`files`). The version lives in the manifest, not
-/// alongside it.
+/// The catalog's in-memory record of one table: its [`TableManifest`] extracted
+/// from Delta Lake and the loaded row groups for its active files.
 ///
-/// It is a plain **value** — `Clone`, no interior locks. A writer (ingest,
-/// compaction) clones one out of the catalog, mutates its own copy, and lets the
-/// durable manifest be the source of truth: every mutation
-/// ([`append_data_file`](Self::append_data_file),
-/// [`replace_data_files`](Self::replace_data_files)) commits a new manifest
-/// version by compare-and-swap, retrying past a concurrent writer. Copies drift
-/// freely; [`refresh`](Self::refresh) reconciles any copy to the latest version
-/// (re-reading only the footers it doesn't already hold). `store`, `name`, and
-/// `location` are kept so a copy can persist and reload itself.
+/// It is a plain value with no interior locks. [`refresh`](Self::refresh)
+/// reconciles a copy to the latest Delta log version and reads only missing
+/// Parquet footers. Catalog writes are intentionally unsupported while the
+/// Delta integration is read-only.
 #[derive(Clone)]
 pub struct CatalogTable {
     name: String,
     /// Where the table's Parquet data lives in the object store.
     location: ObjectPath,
+    /// How delta-rs addresses the transaction log at this table's location.
+    target: DeltaTableTarget,
     pub(super) manifest: TableManifest,
     pub(super) files: Vec<TableFile>,
     store: Arc<dyn ObjectStore>,
@@ -66,6 +62,7 @@ impl CatalogTable {
     pub(super) fn new(
         name: String,
         location: ObjectPath,
+        target: DeltaTableTarget,
         manifest: TableManifest,
         files: Vec<TableFile>,
         store: Arc<dyn ObjectStore>,
@@ -74,6 +71,7 @@ impl CatalogTable {
         Self {
             name,
             location,
+            target,
             manifest,
             files,
             store,
@@ -81,11 +79,7 @@ impl CatalogTable {
         }
     }
 
-    /// Create a brand-new table from freshly-read footers: build its
-    /// [`TableManifest`] (declared `columns` + the loaded files, at
-    /// [`FIRST_VERSION`]) and commit it. The compare-and-swap fails with
-    /// [`Error::TableExists`] if another writer already committed this table's
-    /// first version. The `CREATE TABLE` commit path.
+    /// Reject `CREATE TABLE` until the catalog has a Delta writer path.
     #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn create_new(
         name: String,
@@ -97,39 +91,22 @@ impl CatalogTable {
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
     ) -> crate::Result<Self> {
-        // Files discovered at CREATE TABLE carry no partition metadata (opaque
-        // paths, footers not parsed for it); the partitioning sink records it on
-        // the files it appends later.
-        let entries = files
-            .iter()
-            .map(|f| ManifestEntry::new(f.file.clone()))
-            .collect();
-        let manifest = TableManifest {
-            version: FIRST_VERSION,
+        let _ = (
+            name,
+            location,
+            files,
             columns,
             partition_by,
             sort_by,
-            entries,
-        };
-        if !manifest.commit(store.as_ref(), &name)? {
-            return Err(Error::TableExists(name));
-        }
-        Ok(Self {
-            name,
-            location,
-            manifest,
-            files,
             store,
             dispatcher,
-        })
+        );
+        Err(Error::DeltaWritesUnsupported)
     }
 
-    /// Reload this copy to the latest committed version. Errors if the table has
-    /// no manifest at all (a corrupt catalog). Returns whether it advanced;
-    /// `Ok(false)` means this copy was already current.
+    /// Reload this copy to the latest committed Delta version.
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let Some(manifest) =
-            TableManifest::load_after(self.store.as_ref(), &self.name, self.manifest.version)?
+        let Some(manifest) = delta::load_manifest_after(&self.target, self.manifest.version)?
         else {
             return Ok(false);
         };
@@ -138,9 +115,7 @@ impl CatalogTable {
         Ok(true)
     }
 
-    /// Write `bytes` as a new data file at `path` (under the table's location)
-    /// and commit it into the table — the ingest sink's append, one call for the
-    /// write and the manifest commit. Idempotent on `path`.
+    /// Reject ingest writes until they can commit a matching Delta transaction.
     pub fn append_data_file(
         &mut self,
         path: ObjectPath,
@@ -148,128 +123,29 @@ impl CatalogTable {
         partition: Option<serde_json::Value>,
         sort_bounds: Option<SortBounds>,
     ) -> crate::Result<()> {
-        let file = self.write_data_file(path, bytes)?;
-        self.commit_added_file(file, partition, sort_bounds)
+        let _ = (path, bytes, partition, sort_bounds);
+        Err(Error::DeltaWritesUnsupported)
     }
 
-    /// CAS-commit one already-written file into the manifest, retrying past a
-    /// concurrent writer (refresh + retry). A file the manifest already holds is
-    /// an idempotent no-op, so a replayed append can't double-count rows.
-    /// `partition`/`sort_bounds` are the file's partition tuple and sort-key range
-    /// (a partitioning/sorting sink's), each `None` when not recorded.
-    fn commit_added_file(
-        &mut self,
-        file: FileRef,
-        partition: Option<serde_json::Value>,
-        sort_bounds: Option<SortBounds>,
-    ) -> crate::Result<()> {
-        loop {
-            if self
-                .manifest
-                .entries
-                .iter()
-                .any(|e| e.file.path == file.path)
-            {
-                return Ok(());
-            }
-            let mut entries = self.manifest.entries.clone();
-            entries.push(ManifestEntry {
-                file: file.clone(),
-                partition: partition.clone(),
-                sort_bounds: sort_bounds.clone(),
-            });
-            if self.try_commit(entries)? {
-                return Ok(());
-            }
-            self.refresh()?;
-        }
-    }
-
-    /// Atomically swap a set of this table's files for another — the compaction
-    /// commit. Commits a new version whose file list is `latest − removed +
-    /// added`, retrying past concurrent commits, so no reader ever sees the rows
-    /// doubled or missing.
-    ///
-    /// Returns whether the swap was committed. It is **aborted** (`Ok(false)`,
-    /// nothing committed) if any of `removed` is no longer in the latest
-    /// version: that means another writer already swapped these inputs out, so
-    /// re-adding `added` (which holds their rows) would double-count. A
-    /// concurrent compacter that loses this race must discard its `added` files
-    /// as orphans and leave the inputs alone — they belong to the swap that won.
+    /// Reject compaction swaps until they can commit a matching Delta transaction.
     pub fn replace_data_files(
         &mut self,
         removed: &[ObjectPath],
         added: &[ManifestEntry],
     ) -> crate::Result<bool> {
-        loop {
-            if !removed
-                .iter()
-                .all(|p| self.manifest.entries.iter().any(|e| &e.file.path == p))
-            {
-                return Ok(false);
-            }
-            let mut entries: Vec<ManifestEntry> = self
-                .manifest
-                .entries
-                .iter()
-                .filter(|e| !removed.contains(&e.file.path))
-                .cloned()
-                .collect();
-            // The merged files keep the partition tuple / sort bounds the caller
-            // recorded for them (compaction merges within one partition).
-            entries.extend(added.iter().cloned());
-            if self.try_commit(entries)? {
-                return Ok(true);
-            }
-            self.refresh()?;
-        }
+        let _ = (removed, added);
+        Err(Error::DeltaWritesUnsupported)
     }
 
-    /// Try to commit `entries` as the next version via compare-and-swap. On
-    /// success, swaps in the new manifest + files (fetching only the new footers)
-    /// and returns `true`; on a CAS conflict returns `false` without touching
-    /// this copy.
-    fn try_commit(&mut self, entries: Vec<ManifestEntry>) -> crate::Result<bool> {
-        let manifest = TableManifest {
-            version: self.manifest.version + 1,
-            columns: self.manifest.columns.clone(),
-            partition_by: self.manifest.partition_by.clone(),
-            sort_by: self.manifest.sort_by.clone(),
-            entries,
-        };
-        if !manifest.commit(self.store.as_ref(), &self.name)? {
-            return Ok(false);
-        }
-        self.manifest = manifest;
-        self.sync_files_to_manifest()?;
-        Ok(true)
-    }
-
-    /// Garbage-collect this table's superseded manifest versions, keeping only a
-    /// recent tail (see [`TableManifest::prune_old_versions`]). Each commit
-    /// leaves a new version file behind; this reclaims the old ones so a busy
-    /// table's version directory stays small and the `list` every bind does
-    /// stays cheap. The compacter drives it — it's the background sweep that
-    /// already polls every table.
+    /// Reject legacy manifest pruning for Delta-backed tables.
     pub fn prune_old_versions(&self) -> crate::Result<()> {
-        TableManifest::prune_old_versions(self.store.as_ref(), &self.name, self.manifest.version)?;
-        Ok(())
+        Err(Error::DeltaWritesUnsupported)
     }
 
-    /// Record the just-swapped-out `removed` inputs (paths as they appear in the
-    /// manifest) for *deferred* deletion at this table's current manifest version.
-    /// Their objects are deleted only when that version is pruned
-    /// ([`prune_old_versions`](Self::prune_old_versions)) — so a query still
-    /// reading the prior version never has a file deleted out from under it.
+    /// Reject legacy deferred-deletion records for Delta-backed tables.
     pub fn record_deletions(&self, removed: &[ObjectPath]) -> crate::Result<()> {
-        let resolved: Vec<ObjectPath> = removed.iter().map(|p| self.location.resolve(p)).collect();
-        TableManifest::record_deletions(
-            self.store.as_ref(),
-            &self.name,
-            self.manifest.version,
-            &resolved,
-        )?;
-        Ok(())
+        let _ = removed;
+        Err(Error::DeltaWritesUnsupported)
     }
 
     /// Reconcile `files` to the current `manifest`: drop the files no longer in

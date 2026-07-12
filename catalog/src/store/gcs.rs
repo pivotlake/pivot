@@ -384,6 +384,30 @@ impl ObjectStore for GcsStore {
             auth: Some(Arc::new(move || auth.current())),
         })
     }
+
+    fn delta_table_target(&self, location: &ObjectPath) -> Result<super::DeltaTableTarget> {
+        let uri = format!(
+            "gs://{}/{}",
+            self.bucket,
+            object_key(&self.prefix, location)
+        );
+        // Against the real service, delta-rs resolves credentials itself
+        // through the same application-default chain this store uses, so no
+        // options are passed. An emulator ignores auth: point delta-rs at it
+        // and skip request signing, as this store's own requests do.
+        let mut storage_options: Vec<(String, String)> = Vec::new();
+        if self.auth.emulated {
+            storage_options.push(("google_base_url".into(), self.endpoint.clone()));
+            storage_options.push(("google_skip_signature".into(), "true".into()));
+            if self.endpoint.starts_with("http://") {
+                storage_options.push(("google_allow_http".into(), "true".into()));
+            }
+        }
+        Ok(super::DeltaTableTarget {
+            uri,
+            storage_options: storage_options.into_iter().collect(),
+        })
+    }
 }
 
 impl GcsStore {
