@@ -80,7 +80,7 @@ pub struct Server {
     /// [`with_http_bind`](Self::with_http_bind).
     http_bind: Option<SocketAddr>,
     /// How often the background sweep refreshes the in-memory catalog from the
-    /// store (manifest versions + new footers). Queries snapshot the in-memory
+    /// store (Delta versions + new footers). Queries snapshot the in-memory
     /// set, so this bounds staleness for externally committed data.
     catalog_refresh_interval: Duration,
 }
@@ -177,7 +177,7 @@ impl Server {
         });
 
         // Keep the in-memory catalog current: on an interval, reload every
-        // table to its latest committed manifest version and fetch any new
+        // table to its latest committed Delta version and fetch any new
         // files' footers. Queries bind against a snapshot of the in-memory set
         // and never read the store themselves, so this sweep is what makes
         // externally committed data (another process's ingest, a bucket

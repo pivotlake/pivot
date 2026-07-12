@@ -1,8 +1,7 @@
 //! catalog: pivotdb's table layer over Parquet.
 //!
-//! - [`catalog`](ParquetCatalog) — the tables: durable definitions and per-table
-//!   file lists in the [`manifest`], live row-group state in memory, reloaded up
-//!   to the latest manifest version at every query bind.
+//! - [`catalog`](ParquetCatalog) — the tables: a durable Pivot table index,
+//!   per-table Delta Lake snapshots, and live row-group state in memory.
 //! - [`parquet`] — the engines: the per-query scan pipeline and the
 //!   metadata-fetch (table load) pipeline, both dataflows over the dispatch
 //!   worker pool.
@@ -16,6 +15,7 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 mod catalog;
+mod delta;
 mod manifest;
 pub mod parquet;
 pub mod store;
@@ -28,5 +28,8 @@ pub mod test_support;
 pub use catalog::{
     CatalogSnapshot, CatalogTable, Error, ParquetCatalog, ParquetTransaction, Result, TableBinding,
 };
-pub use manifest::{ManifestEntry, PartitionEqFilter, SortBounds};
+pub use manifest::{
+    ManifestEntry, PartitionEqFilter, PartitionValues, SortBounds, pivot_scalar,
+    scalar_values_equal, scalar_values_from_row,
+};
 pub use store::FileRef;
