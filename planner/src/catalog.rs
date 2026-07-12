@@ -23,7 +23,7 @@ use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOpe
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::Expr;
 use duckdb_planner::catalog_provider::{
-    DuckDBBind, DuckDBTable, ScalarFunctionDef, TableFunctionDef,
+    DuckDBBind, DuckDBTable, DuckDBTransaction, ScalarFunctionDef, TableFunctionDef,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -70,27 +70,35 @@ pub struct CreateTableRequest {
     pub if_not_exists: bool,
 }
 
-/// An opaque per-query context, created once per [`Plan::compile`](crate::Plan::compile)
-/// (via [`Catalog::query_context`]) and threaded to every [`Table::compile`]. The
-/// planner treats it as a black box; a backend's [`Table`] downcasts it to its
-/// own concrete context and reads whatever it needs. The catalog, for instance,
-/// uses it to reload + pin each table's files once per query — so a reused
-/// (cached) plan sees data committed since it was planned, and a scan and its
-/// late materialize share one snapshot.
-pub trait QueryContext {
-    /// Downcast hook. The trait carries no behaviour of its own — a backend
-    /// recovers its concrete context from this and reads whatever it needs.
-    fn as_any(&self) -> &dyn Any;
-}
+/// One query's transaction: a consistent **snapshot** of the catalog, opened by
+/// [`Catalog::begin_transaction`] before the query is planned and dropped when
+/// the query finishes (the commit). Every table the query binds resolves
+/// through this snapshot (never through the live catalog, which a background
+/// refresh may be updating concurrently), so a plan's scans, its late
+/// materialize, and its metadata peepholes all see one frozen view.
+pub trait CatalogTransaction: Debug + Send + Sync {
+    /// Resolve a table name to a fresh, independently-mutable [`Table`] bound
+    /// to this transaction's snapshot, or `None` if no such table exists in the
+    /// snapshot. Each call returns a unique `Box`, so per-query filter pushdown
+    /// can mutate the table without affecting concurrent queries.
+    fn table(&self, name: &str) -> Option<Box<dyn Table>>;
 
-/// The default [`QueryContext`]: carries nothing, for backends whose tables are
-/// always current (e.g. in-memory test stubs) and never downcast it.
-pub struct NoQueryContext;
-
-impl QueryContext for NoQueryContext {
-    fn as_any(&self) -> &dyn Any {
-        self
+    /// A backend-specific table-valued function by `name`, or `None`. This is
+    /// how a backend contributes functions only it can answer (e.g. `metadata`,
+    /// which needs the backend's row-group metadata). It lives on the
+    /// transaction rather than the catalog because such a function reads data,
+    /// and must read it from the transaction handed to its compile. The
+    /// generic functions (`generate_series`, `range`) are resolved by the
+    /// planner itself and never reach here. Default: none.
+    fn table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
+        None
     }
+
+    /// Downcast hook: a backend's [`Table`] recovers its concrete transaction
+    /// from the `&dyn CatalogTransaction` handed to the compile-time methods
+    /// ([`Table::compile`], [`Table::row_count`], ...), so a binding carries no
+    /// snapshot state of its own.
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// A table that the planner can read from.
@@ -113,17 +121,18 @@ pub trait Table: Debug + Send + Sync {
     /// row-group ID and per-row index). Backends that don't materialize can
     /// ignore it; the bridge only sets it on a late-materialized query's narrow
     /// scan.
-    /// `ctx` is the per-query [`QueryContext`]; a backend reading mutable storage
-    /// downcasts it to reload itself to the latest committed version before
-    /// scanning, so a reused (cached) plan sees data committed since it was
-    /// planned. Backends with no such notion ignore it.
+    ///
+    /// `transaction` is the query's catalog transaction, the same one this
+    /// table was bound from; the backend resolves the table's file set from its
+    /// snapshot (downcasting via [`CatalogTransaction::as_any`]), so the
+    /// binding itself carries no snapshot state.
     fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec>;
 
     /// Return the table's schema.
@@ -147,7 +156,7 @@ pub trait Table: Debug + Send + Sync {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
-        _ctx: &dyn QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec> {
         unreachable!("materialize called on a table that does not support late materialization")
     }
@@ -164,13 +173,12 @@ pub trait Table: Debug + Send + Sync {
     /// can be answered without scanning any rows (e.g. Parquet row-group
     /// statistics covering every row group, with no predicates pushed into this
     /// binding). The scalars carry the column's physical storage type. `None`
-    /// means "unknown, scan instead" and is always a safe answer. `ctx` is the
-    /// per-query context a mutable-storage backend downcasts to resolve its
-    /// current files, exactly as [`compile`](Table::compile) does.
+    /// means "unknown, scan instead" and is always a safe answer. Answered from
+    /// `transaction`'s snapshot, as in [`compile`](Table::compile).
     fn column_min_max(
         &self,
         _column: usize,
-        _ctx: &dyn QueryContext,
+        _transaction: &dyn CatalogTransaction,
     ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         None
     }
@@ -178,9 +186,9 @@ pub trait Table: Debug + Send + Sync {
     /// The table's total row count derived purely from metadata, if it can be
     /// answered without scanning any rows (e.g. summing Parquet row-group row
     /// counts, with no predicates pushed into this binding). `None` means
-    /// "unknown, scan instead" and is always a safe answer. `ctx` resolves the
-    /// binding's current files, as in [`column_min_max`](Table::column_min_max).
-    fn row_count(&self, _ctx: &dyn QueryContext) -> Option<i64> {
+    /// "unknown, scan instead" and is always a safe answer. Answered from
+    /// `transaction`'s snapshot, as in [`compile`](Table::compile).
+    fn row_count(&self, _transaction: &dyn CatalogTransaction) -> Option<i64> {
         None
     }
 }
@@ -242,17 +250,12 @@ impl DuckDBTable for DuckDBTableAdapter {
 /// table) on the coordinator and returns the dataflow plan that *writes* the
 /// result into the catalog when executed.
 pub trait Catalog: Debug + Send + Sync {
-    /// Resolve a table name to a fresh, independently-mutable [`Table`], or
-    /// `None` if no such table exists. Each call returns a unique `Box`, so
-    /// per-query filter pushdown can mutate the table without affecting
-    /// concurrent queries.
-    fn table(&self, name: &str) -> Option<Box<dyn Table>>;
-
-    /// A fresh [`QueryContext`] for one [`Plan::compile`](crate::Plan::compile).
-    /// Default: an empty context, for always-current backends.
-    fn query_context(&self) -> Box<dyn QueryContext> {
-        Box::new(NoQueryContext)
-    }
+    /// Open a transaction: snapshot the catalog as it stands right now. All
+    /// binding for one query resolves through the returned snapshot, so the
+    /// query reads a single consistent view regardless of concurrent refreshes
+    /// or commits. The caller holds the transaction for the query's lifetime and
+    /// drops it at commit (when the query finishes).
+    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction>;
 
     /// Compile a `CREATE TABLE` statement into the dataflow that writes the new
     /// table into the catalog.
@@ -268,33 +271,43 @@ pub trait Catalog: Debug + Send + Sync {
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec>;
 
-    /// A backend-specific table-valued function by `name`, or `None`. This is how
-    /// a catalog contributes functions only it can answer (e.g. `metadata`, which
-    /// needs the backend's row-group metadata) without the generic planner
-    /// knowing about them. The generic functions (`generate_series`, `range`) are
-    /// resolved by the planner itself and never reach here. Default: none.
-    fn table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
-        None
-    }
+    /// Commit `transaction`: the query it served finished successfully. The
+    /// default does nothing; the snapshot is simply released when the caller's
+    /// last reference drops. A backend with real transactional state hooks its
+    /// finalization here.
+    fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) {}
+
+    /// Roll back `transaction`: the query it served failed or was cancelled.
+    /// Default: nothing, as with [`commit_transaction`](Self::commit_transaction).
+    fn rollback_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) {}
 }
 
-/// Adapts a Pivot [`Catalog`] to DuckDB's [`DuckDBBind`] trait so DuckDB can
-/// resolve table names during SQL binding. Looks up the table on the wrapped
-/// catalog and wraps it in a [`DuckDBTableAdapter`].
+/// Adapts a Pivot [`Catalog`] to DuckDB's [`DuckDBBind`] trait, resolving the
+/// static (transaction-independent) names during SQL binding: today only the
+/// planner's built-in scalar functions. Tables and table functions resolve
+/// through a per-query [`DuckDBTransactionAdapter`] instead, since both are
+/// answered from the transaction's snapshot.
 pub struct DuckDBCatalogAdapter {
     pub catalog: Arc<dyn Catalog>,
 }
 
-impl DuckDBBind for DuckDBCatalogAdapter {
-    fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
-        let table = self.catalog.table(name)?;
+/// Adapts a Pivot [`CatalogTransaction`] to DuckDB's [`DuckDBTransaction`]
+/// trait: table and table-function lookups during one plan's binding resolve
+/// against this transaction's snapshot.
+pub struct DuckDBTransactionAdapter {
+    pub transaction: Arc<dyn CatalogTransaction>,
+}
+
+impl DuckDBTransaction for DuckDBTransactionAdapter {
+    fn table(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
+        let table = self.transaction.table(name)?;
         Some(Box::new(DuckDBTableAdapter { table }))
     }
 
     fn table_function(&self, name: &str) -> Option<TableFunctionDef> {
         // The function's own signature is the single source of truth; convert its
         // Pivot types to DuckDB logical type ids for the binder.
-        let signature = self.catalog.table_function(name)?.signature();
+        let signature = self.transaction.table_function(name)?.signature();
         Some(TableFunctionDef {
             arg_type_ids: signature
                 .arguments
@@ -304,7 +317,9 @@ impl DuckDBBind for DuckDBCatalogAdapter {
             columns: duckdb_columns(&signature.columns),
         })
     }
+}
 
+impl DuckDBBind for DuckDBCatalogAdapter {
     fn scalar_function(&self, name: &str) -> Option<ScalarFunctionDef> {
         // Pivot's own scalar functions (e.g. drop_cache) are generic, not
         // catalog-specific, so their signatures live in the planner rather than

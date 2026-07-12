@@ -1,7 +1,6 @@
 //! The per-query **binding**: the independently-mutable [`TableBinding`] every
-//! [`Catalog::table`](planner::catalog::Catalog::table) resolve derives from
-//! the master entry, so a query's filter pushdown prunes its own view without
-//! affecting anyone else.
+//! transaction resolve derives from its snapshot, so a query's filter pushdown
+//! prunes its own view without affecting anyone else.
 
 use std::sync::Arc;
 
@@ -16,10 +15,12 @@ use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
 use arrow_schema::{Field, Schema};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
-    Column, DynamicScanPredicate, Error as CatalogError, QueryContext, Result as CatalogResult,
-    Table,
+    CatalogTransaction, Column, DynamicScanPredicate, Error as CatalogError,
+    Result as CatalogResult, Table,
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
+
+use super::ParquetTransaction;
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
 /// DuckDB during binding. Recorded as-is; applied at [`compile`](Table::compile)
@@ -79,15 +80,16 @@ fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPa
     }
 }
 
-/// A catalog table, resolved as a **live handle**: it carries the table's name,
-/// schema, and this query's pushed-down predicates, but *not* a file set. It
-/// pulls the current row groups from the query's [`QueryContext`] every time it
-/// compiles, so a reused (cached) plan always scans the latest committed files.
-/// Cloned per-binding so each query accumulates its own predicates.
+/// A catalog table resolved by name from one transaction: it carries the
+/// table's name, schema, and this query's pushed-down predicates, but no
+/// catalog state. The file set is read from the transaction handed to the
+/// compile-time methods, so the binding is a plain value and the transaction
+/// stays the single owner of the frozen view. Cloned per-binding so each query
+/// accumulates its own predicates.
 #[derive(Clone, Debug)]
 pub struct TableBinding {
-    /// The catalog name resolved, used to fetch this table's data from the
-    /// query cache at compile time.
+    /// The catalog name resolved, used to fetch this table's row groups from
+    /// the transaction's snapshot at compile time.
     name: String,
     pub columns: Vec<Column>,
     /// Single-column predicates pushed down for this binding (recorded here
@@ -106,20 +108,24 @@ impl TableBinding {
         }
     }
 
-    /// This table's current committed row groups, from the query context (which
-    /// reloads to the latest version and pins). The context is always our own
-    /// [`ParquetQueryContext`](super::ParquetQueryContext) — a `ParquetCatalog`
-    /// only ever compiles its own bindings — so the downcast is an invariant;
-    /// failing it, or the table having been dropped since planning, is an error,
-    /// never a silent empty scan.
-    fn resolve_files(&self, ctx: &dyn QueryContext) -> CatalogResult<Arc<ParquetTable>> {
-        let ctx = ctx
+    /// This table's row groups in `transaction`'s snapshot, partition-pruned by
+    /// the pushed equality predicates. Pure in-memory; the snapshot is
+    /// immutable, so a scan and its late materialize (same filters) build
+    /// identical views addressing the same global row-group indices. The
+    /// transaction is always our own [`ParquetTransaction`] (a `ParquetCatalog`
+    /// only ever compiles its own bindings), so the downcast is an invariant;
+    /// failing it is an error, never a silent empty scan.
+    fn resolve_files(
+        &self,
+        transaction: &dyn CatalogTransaction,
+    ) -> CatalogResult<Arc<ParquetTable>> {
+        let transaction = transaction
             .as_any()
-            .downcast_ref::<super::ParquetQueryContext>()
-            .ok_or_else(|| {
-                CatalogError::Other("query context is not a ParquetQueryContext".into())
-            })?;
-        ctx.parquet(&self.name, self.partition_filters())
+            .downcast_ref::<ParquetTransaction>()
+            .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
+        transaction
+            .snapshot
+            .parquet(&self.name, self.partition_filters())
     }
 
     /// This binding's pushed equality predicates as partition filters: the column
@@ -174,12 +180,12 @@ impl Table for TableBinding {
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        // The query context hands back this table's latest committed files (it
-        // reloads once and pins), so a reused cached plan scans data committed
-        // since it was planned.
-        let current = self.resolve_files(ctx)?;
+        // The transaction's snapshot hands back the file set this query was
+        // bound against, partition-pruned. All in-memory: the background
+        // refresh already materialized every footer.
+        let current = self.resolve_files(transaction)?;
 
         // Dictionary pruning currently supports plain columns only. Shredded
         // leaves have file-specific positions and still use min/max pruning.
@@ -221,13 +227,17 @@ impl Table for TableBinding {
         &self,
         input: RecordBatchOperatorSpec,
         projection: Projection,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        // Same `ctx` as the scan, so this reads the *same* pinned snapshot —
-        // their global row-group indices must line up. Late materialization
-        // re-reads rows by that global index, so it uses the full table, not the
-        // pruned scan view.
-        Ok(materialize(input, self.resolve_files(ctx)?, projection))
+        // Same transaction as the scan and its snapshot is immutable, so this
+        // reads an identical view and their global row-group indices line up.
+        // Late materialization re-reads rows by that global index, so it uses
+        // the full table, not the pruned scan view.
+        Ok(materialize(
+            input,
+            self.resolve_files(transaction)?,
+            projection,
+        ))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
@@ -264,16 +274,16 @@ impl Table for TableBinding {
     fn column_min_max(
         &self,
         column: usize,
-        ctx: &dyn QueryContext,
+        transaction: &dyn CatalogTransaction,
     ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
         if !self.predicates.is_empty() {
             return None;
         }
-        // Read this binding's current committed files, the same snapshot a scan
-        // would see; an unresolvable context (e.g. table dropped) means "scan".
-        let parquet = self.resolve_files(ctx).ok()?;
+        // Read the transaction's snapshot files, the same view a scan would
+        // see; an unresolvable snapshot means "scan".
+        let parquet = self.resolve_files(transaction).ok()?;
         let row_groups = parquet.row_groups();
         if row_groups.is_empty() {
             return None;
@@ -297,7 +307,7 @@ impl Table for TableBinding {
         Some((min?, max?))
     }
 
-    fn row_count(&self, ctx: &dyn QueryContext) -> Option<i64> {
+    fn row_count(&self, transaction: &dyn CatalogTransaction) -> Option<i64> {
         // Only sound for the whole, unfiltered table: a pushed-down predicate
         // means the scan this binding stands for excludes rows.
         if !self.predicates.is_empty() {
@@ -305,7 +315,7 @@ impl Table for TableBinding {
         }
         // The parquet footer carries each row group's exact row count, so the
         // table's count is their sum, with no data pages read.
-        let parquet = self.resolve_files(ctx).ok()?;
+        let parquet = self.resolve_files(transaction).ok()?;
         Some(parquet.row_groups().iter().map(|rg| rg.num_rows).sum())
     }
 }

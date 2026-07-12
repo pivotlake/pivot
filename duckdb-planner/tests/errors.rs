@@ -1,4 +1,6 @@
-use duckdb_planner::{DuckDBBind, DuckDBColumn, DuckDBTable, Error, LogicalTypeId, PlannerContext};
+use duckdb_planner::{
+    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext,
+};
 use std::sync::Arc;
 
 struct TTable;
@@ -24,8 +26,12 @@ impl DuckDBTable for TTable {
 
 struct TestCatalog;
 
-impl DuckDBBind for TestCatalog {
-    fn try_bind(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+impl DuckDBBind for TestCatalog {}
+
+struct TestTransaction;
+
+impl DuckDBTransaction for TestTransaction {
+    fn table(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
             "t" => Some(Box::new(TTable)),
             _ => None,
@@ -37,10 +43,14 @@ fn create_simple_context() -> PlannerContext {
     PlannerContext::new(Arc::new(TestCatalog))
 }
 
+fn plan(p: &mut PlannerContext, query: &str) -> Result<duckdb_planner::Plan, Error> {
+    p.plan(query, Arc::new(TestTransaction))
+}
+
 #[test]
 fn invalid_syntax() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECTTT * FROM t");
+    let result = plan(&mut p, "SELECTTT * FROM t");
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => {
@@ -53,7 +63,7 @@ fn invalid_syntax() {
 #[test]
 fn nonexistent_column() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT nonexistent_column FROM t");
+    let result = plan(&mut p, "SELECT nonexistent_column FROM t");
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => {
@@ -66,7 +76,7 @@ fn nonexistent_column() {
 #[test]
 fn nonexistent_table() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT * FROM nonexistent_table");
+    let result = plan(&mut p, "SELECT * FROM nonexistent_table");
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => assert!(e.exception_message.contains("nonexistent_table")),
@@ -77,7 +87,7 @@ fn nonexistent_table() {
 #[test]
 fn exception_location() {
     let mut p = create_simple_context();
-    let result = p.plan("SELECT * FROM nonexistent_table");
+    let result = plan(&mut p, "SELECT * FROM nonexistent_table");
     match result {
         Ok(_) => panic!("Expected error"),
         Err(Error::DuckDBPlanning(e)) => assert_eq!(e.position.unwrap(), "14"),
