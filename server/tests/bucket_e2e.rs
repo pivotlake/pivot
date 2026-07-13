@@ -10,8 +10,10 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -24,7 +26,31 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use server::Server;
+use testcontainers::core::{CmdWaitFor, ExecCommand, Mount};
+use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 use tokio_postgres::{Client, SimpleQueryMessage};
+
+const DELTA_DOCKER_TAG: &str = "4.1.0";
+const DELTA_TABLE_PATH: &str = "/data/events";
+const DELTA_WRITE_SCRIPT: &str = r#"
+import json
+import sys
+
+import pyarrow as pa
+from deltalake import WriterProperties, write_deltalake
+
+rows = json.loads(sys.argv[2])
+write_deltalake(
+    sys.argv[1],
+    pa.table({
+        "name": pa.array([row[0] for row in rows], type=pa.string()),
+        "value": pa.array([row[1] for row in rows], type=pa.int64()),
+    }),
+    mode=sys.argv[3],
+    writer_properties=WriterProperties(compression="SNAPPY"),
+)
+"#;
 
 // --- helpers ---------------------------------------------------------------
 
@@ -51,6 +77,10 @@ fn pq(values: &[i64]) -> Vec<u8> {
 /// Start a server whose catalog is opened on `root` (a bucket URI or local
 /// path), on a dedicated thread, and return the port once it is listening.
 fn start_server_on(root: &str) -> u16 {
+    start_server_on_with_refresh(root, server::DEFAULT_CATALOG_REFRESH)
+}
+
+fn start_server_on_with_refresh(root: &str, catalog_refresh_interval: Duration) -> u16 {
     let port = pick_free_port();
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
@@ -70,13 +100,73 @@ fn start_server_on(root: &str) -> u16 {
                 vec![],
                 0,
                 4,
-                server::DEFAULT_CATALOG_REFRESH,
+                catalog_refresh_interval,
             );
             let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
         });
     });
     wait_until_listening(bind);
     port
+}
+
+fn start_delta_writer(root: &Path) -> Option<Container<GenericImage>> {
+    let image = GenericImage::new("deltaio/delta-docker", DELTA_DOCKER_TAG)
+        .with_entrypoint("sleep")
+        .with_cmd(["infinity"])
+        .with_user("root")
+        .with_mount(Mount::bind_mount(
+            root.to_string_lossy().into_owned(),
+            "/data",
+        ));
+    match image.start() {
+        Ok(container) => Some(container),
+        Err(error) => {
+            eprintln!("skipping Delta Lake e2e test because Docker is unavailable: {error}");
+            None
+        }
+    }
+}
+
+fn write_delta_rows(container: &Container<GenericImage>, rows: &str, mode: &str) {
+    let mut result = container
+        .exec(
+            ExecCommand::new([
+                "python3",
+                "-c",
+                DELTA_WRITE_SCRIPT,
+                DELTA_TABLE_PATH,
+                rows,
+                mode,
+            ])
+            .with_cmd_ready_condition(CmdWaitFor::exit()),
+        )
+        .expect("run Delta Lake writer");
+    let exit_code = result.exit_code().expect("read writer exit code");
+    let stdout = String::from_utf8_lossy(
+        &result
+            .stdout_to_vec()
+            .expect("read Delta Lake writer stdout"),
+    )
+    .into_owned();
+    let stderr = String::from_utf8_lossy(
+        &result
+            .stderr_to_vec()
+            .expect("read Delta Lake writer stderr"),
+    )
+    .into_owned();
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "Delta Lake writer failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn register_delta_table(root: &Path) {
+    std::fs::write(
+        root.join("_pivot_manifest.json"),
+        r#"{"version":1,"tables":[{"name":"events","location":"events"}]}"#,
+    )
+    .unwrap();
 }
 
 /// Run `sql` and return the first row's first column as an `i64`.
@@ -92,6 +182,21 @@ async fn select_one_i64(client: &Client, sql: &str) -> i64 {
         }
     }
     panic!("no data row from `{sql}`");
+}
+
+async fn await_one_i64(client: &Client, sql: &str, expected: i64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let actual = select_one_i64(client, sql).await;
+        if actual == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`{sql}` stayed at {actual}, expected {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Upload a two-file `events` table (5 rows: 1,2,3 + 4,5) into the backing
@@ -185,6 +290,46 @@ macro_rules! bucket_tests {
 
 bucket_tests!(create_table_and_count);
 bucket_tests!(count_with_filter);
+
+#[test]
+fn externally_written_delta_table_refreshes_to_latest_commit() {
+    let database = tempfile::TempDir::new().unwrap();
+    let Some(delta_writer) = start_delta_writer(database.path()) else {
+        return;
+    };
+    write_delta_rows(
+        &delta_writer,
+        r#"[["alpha",11],["beta",22],["gamma",33]]"#,
+        "error",
+    );
+    register_delta_table(database.path());
+    let root = database.path().to_str().unwrap();
+    let port = start_server_on_with_refresh(root, Duration::from_millis(100));
+
+    block_on(async {
+        let client = connect_client(port).await;
+
+        assert_eq!(
+            select_one_i64(&client, "SELECT SUM(value) FROM events").await,
+            66
+        );
+        assert_eq!(
+            select_one_i64(&client, "SELECT value FROM events WHERE name = 'beta'").await,
+            22
+        );
+    });
+
+    write_delta_rows(&delta_writer, r#"[["delta",44],["epsilon",55]]"#, "append");
+
+    block_on(async {
+        let client = connect_client(port).await;
+        await_one_i64(&client, "SELECT COUNT(value) FROM events", 5).await;
+        assert_eq!(
+            select_one_i64(&client, "SELECT SUM(value) FROM events").await,
+            165
+        );
+    });
+}
 
 /// KNOWN BUG (`#[ignore]`d until fixed): `SELECT COUNT(*)` with no predicate
 /// returns 0 instead of the row count. DuckDB scans `COUNT(*)` with a
