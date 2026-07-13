@@ -4618,6 +4618,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
+ "testcontainers",
  "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
