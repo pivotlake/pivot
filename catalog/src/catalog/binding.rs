@@ -3,21 +3,24 @@
 //! prunes its own view without affecting anyone else.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::manifest::PartitionEqFilter;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
-use arrow_array::{Array, ArrayRef, Scalar};
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use crate::parquet_writing::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, encode_spec};
+use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, Sender};
 use planner::catalog::{
     CatalogTransaction, Column, DynamicScanPredicate, Error as CatalogError,
     Result as CatalogResult, Table,
 };
 use planner::expression::{CompareType, Expression, TableFilter};
 
-use super::ParquetTransaction;
+use super::{CatalogTable, ParquetTransaction};
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
 /// DuckDB during binding. Recorded as-is; applied at [`compile`](Table::compile)
@@ -165,6 +168,64 @@ impl Table for TableBinding {
         ))
     }
 
+    /// Build the transactional Parquet write pipeline for this table.
+    ///
+    /// Dispatch workers conform and encode batches, then fan completed files
+    /// into [`TransactionWriter::submit`](super::transaction::TransactionWriter::submit).
+    /// Submission is an in-memory channel send; a dedicated transaction thread
+    /// performs object-store writes and retains their paths until commit adds
+    /// them to Delta or rollback deletes them. The pipeline's only output is the
+    /// inserted row count used for PostgreSQL's command-completion tag.
+    fn insert(
+        &self,
+        source: RecordBatchOperatorSpec,
+        transaction: &dyn CatalogTransaction,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        let transaction = transaction
+            .as_any()
+            .downcast_ref::<ParquetTransaction>()
+            .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
+        let table = transaction
+            .snapshot
+            .tables
+            .get(&self.name)
+            .cloned()
+            .ok_or_else(|| {
+                CatalogError::Other(format!("table {:?} is not in this snapshot", self.name).into())
+            })?;
+
+        let rows_written = Arc::new(AtomicU64::new(0));
+        let source = self.conform_batches(source, &table, rows_written.clone());
+        let encoded = encode_spec(
+            source,
+            Arc::from(table.partition_by()),
+            Arc::from(table.sort_by()),
+            ROW_GROUP_ROWS,
+            ROW_GROUPS_PER_FILE,
+        );
+        let writer = transaction.insert_writer();
+        let table_name = self.name.clone();
+        let staged = encoded.fan_in(
+            (writer, table_name),
+            |state, encoded, _sender: &mut dyn Sender<RecordBatch>| {
+                state
+                    .0
+                    .submit(state.1.clone(), encoded)
+                    .map_err(|error| dispatch::UnaryError::Operator(Box::new(error)))
+            },
+            move |_state, sender: &mut dyn Sender<RecordBatch>| {
+                let count = UInt64Array::from(vec![rows_written.load(Ordering::Relaxed)]);
+                let schema = Schema::new(vec![Field::new("count", DataType::UInt64, false)]);
+                sender.send(RecordBatch::try_new(
+                    Arc::new(schema),
+                    vec![Arc::new(count)],
+                )?)?;
+                Ok(())
+            },
+        );
+        Ok(RecordBatchOperatorSpec::from_spec(staged))
+    }
+
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
         let TableFilter::Expression(expr) = filter else {
             return Ok(false);
@@ -252,6 +313,42 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 }
 
 impl TableBinding {
+    /// Put source batches into the target table's physical Parquet shape.
+    ///
+    /// DuckDB has already bound each VALUES column to a compatible logical
+    /// type, and [`Insert::compile`](planner::operator::Insert::compile) has
+    /// reordered explicit column lists into table order. This projection casts
+    /// those arrays to Pivot's exact physical Arrow types, replaces the source
+    /// schema with the table schema, and counts rows for PostgreSQL's
+    /// `INSERT 0 n` completion tag. It performs CPU-only Arrow work; Parquet
+    /// encoding and object-store I/O happen in later stages.
+    fn conform_batches(
+        &self,
+        source: RecordBatchOperatorSpec,
+        table: &CatalogTable,
+        rows_written: Arc<AtomicU64>,
+    ) -> RecordBatchOperatorSpec {
+        let schema = table.physical_arrow_schema();
+        source.project(move || {
+            let rows_written = rows_written.clone();
+            let schema = schema.clone();
+            move |batch: RecordBatch| {
+                rows_written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .zip(schema.fields())
+                    .map(|(column, field)| {
+                        arrow_cast::cast(column, field.data_type())
+                            .expect("a bound INSERT value must cast to its table column")
+                    })
+                    .collect();
+                RecordBatch::try_new(schema.clone(), columns)
+                    .expect("conformed INSERT columns must match the table schema")
+            }
+        })
+    }
+
     /// Clone `parquet`'s row groups and keep only those that survive this
     /// binding's pushed-down predicates — i.e. what [`Table::compile`] actually
     /// scans over the table's current files. A min/max stat that proves no row in

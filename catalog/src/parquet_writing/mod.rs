@@ -44,7 +44,7 @@ mod error;
 mod partition;
 mod types;
 
-pub(crate) use types::EncodedFile;
+pub use types::EncodedFile;
 
 use std::sync::Arc;
 
@@ -56,6 +56,11 @@ use dispatch::{
 };
 
 use types::{ColumnChunkJob, EncodedColumnChunk};
+
+/// Rows per Parquet row group for SQL INSERT output.
+pub const ROW_GROUP_ROWS: usize = 128 * 1024;
+/// Row groups per Parquet file for SQL INSERT output.
+pub const ROW_GROUPS_PER_FILE: usize = 8;
 
 /// A buffered ingest item that flattens itself into one Arrow `RecordBatch`.
 /// Conversion runs inside the pipeline (stage 1) on a worker, so the receive
@@ -87,7 +92,7 @@ pub fn encode_items<T: ToRecordBatch>(
         stealable::<T>(workers).into_iter().collect(),
         convert::factories::<T>(workers),
     );
-    encode_stages(
+    build_encode_stages(
         batches,
         workers,
         partition_by,
@@ -95,6 +100,7 @@ pub fn encode_items<T: ToRecordBatch>(
         target_rows,
         target_row_groups,
     )
+    .execute()
 }
 
 /// Encode an existing `RecordBatch` dataflow into Parquet files (the batches are
@@ -109,6 +115,19 @@ pub fn encode_record_batches(
     target_rows: usize,
     target_row_groups: usize,
 ) -> DataFlowHandle<EncodedFile> {
+    encode_spec(spec, partition_by, sort_by, target_rows, target_row_groups).execute()
+}
+
+/// Chain the Parquet encoder onto a record-batch dataflow without launching it.
+/// Callers can attach a terminal stage before execution, which INSERT uses to
+/// enqueue file writes without performing I/O on dispatch workers.
+pub fn encode_spec(
+    spec: RecordBatchOperatorSpec,
+    partition_by: Arc<[String]>,
+    sort_by: Arc<[String]>,
+    target_rows: usize,
+    target_row_groups: usize,
+) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + Send + 'static> {
     let (dispatcher, heads) = spec.into_parts();
     let workers = heads.len();
     let batches = OperatorSpec::new(
@@ -118,7 +137,7 @@ pub fn encode_record_batches(
             .map(RecordBatchFactoryBridge::new)
             .collect::<Vec<_>>(),
     );
-    encode_stages(
+    build_encode_stages(
         batches,
         workers,
         partition_by,
@@ -128,16 +147,15 @@ pub fn encode_record_batches(
     )
 }
 
-/// Chain the encode stages (partition onward) onto a `RecordBatch` dataflow and
-/// run it, yielding finished [`EncodedFile`]s as they complete.
-fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
+/// Chain the encode stages (partition onward) onto a `RecordBatch` dataflow.
+fn build_encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
     batches: OperatorSpec<RecordBatch, OF>,
     workers: usize,
     partition_by: Arc<[String]>,
     sort_by: Arc<[String]>,
     target_rows: usize,
     target_row_groups: usize,
-) -> DataFlowHandle<EncodedFile> {
+) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + Send + 'static> {
     // One file's worth of rows; a partition flushes a file once it reaches this.
     let file_rows = target_rows.saturating_mul(target_row_groups).max(1);
     batches
@@ -155,5 +173,4 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
                 .collect(),
             assembler::factories(workers),
         )
-        .execute()
 }

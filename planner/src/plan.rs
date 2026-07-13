@@ -231,6 +231,13 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn as_insert(&self) -> Option<&crate::operator::Insert> {
+        match &self.root.operator {
+            Operator::Insert(insert) => Some(insert),
+            _ => None,
+        }
+    }
+
     /// If this plan is a bare `SET`/`RESET`, return it. Such a statement is a
     /// session command, not a query — it compiles to nothing — so the server
     /// checks this first and acts on the variables it recognises instead of

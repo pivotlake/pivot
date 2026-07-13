@@ -79,6 +79,9 @@ pub use filter::FilterFactory;
 mod map;
 pub use map::MapFactory;
 
+mod fan_in;
+pub use fan_in::FanInFactory;
+
 mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 

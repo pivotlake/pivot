@@ -31,6 +31,7 @@
 mod binding;
 mod metadata_function;
 mod table;
+mod transaction;
 
 pub use binding::TableBinding;
 
@@ -95,6 +96,14 @@ pub enum Error {
     FooterNotLoaded { table: String, file: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("INSERT target table `{0}` is not present in the transaction snapshot")]
+    InsertTableMissing(String),
+    #[error("the transaction's INSERT writer is no longer available")]
+    InsertWriterUnavailable,
+    #[error("the transaction's INSERT writer stopped before accepting a file")]
+    InsertWriterStopped,
+    #[error("the transaction's INSERT writer panicked")]
+    InsertWriterPanicked,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -229,10 +238,12 @@ impl ParquetCatalog {
     /// `Arc`-shared), no I/O. The [`Catalog::begin_transaction`] trait impl
     /// delegates here.
     pub fn begin_transaction(&self) -> Arc<ParquetTransaction> {
+        let snapshot = Arc::new(CatalogSnapshot {
+            tables: self.tables.read().unwrap().clone(),
+        });
         Arc::new(ParquetTransaction {
-            snapshot: Arc::new(CatalogSnapshot {
-                tables: self.tables.read().unwrap().clone(),
-            }),
+            writer: Arc::new(transaction::TransactionWriter::new(snapshot.clone())),
+            snapshot,
         })
     }
 
@@ -486,6 +497,26 @@ impl Catalog for ParquetCatalog {
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         Ok(self.create(request, dispatcher)?)
     }
+
+    fn commit_transaction(&self, transaction: Arc<dyn CatalogTransaction>) -> CatalogResult<()> {
+        let transaction = transaction
+            .as_any()
+            .downcast_ref::<ParquetTransaction>()
+            .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
+        for table in transaction.writer.commit()? {
+            self.publish_table(table);
+        }
+        Ok(())
+    }
+
+    fn rollback_transaction(&self, transaction: Arc<dyn CatalogTransaction>) -> CatalogResult<()> {
+        let transaction = transaction
+            .as_any()
+            .downcast_ref::<ParquetTransaction>()
+            .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
+        transaction.writer.rollback()?;
+        Ok(())
+    }
 }
 
 /// One transaction's frozen view of the catalog: every table at the version it
@@ -552,6 +583,7 @@ impl CatalogSnapshot {
 #[derive(Debug)]
 pub struct ParquetTransaction {
     pub(super) snapshot: Arc<CatalogSnapshot>,
+    pub(in crate::catalog) writer: Arc<transaction::TransactionWriter>,
 }
 
 impl ParquetTransaction {
@@ -562,6 +594,10 @@ impl ParquetTransaction {
     /// one function cannot return both).
     pub fn table(&self, name: &str) -> Option<TableBinding> {
         self.snapshot.table(name)
+    }
+
+    pub(in crate::catalog) fn insert_writer(&self) -> Arc<transaction::TransactionWriter> {
+        self.writer.clone()
     }
 }
 

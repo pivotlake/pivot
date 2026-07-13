@@ -11,6 +11,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Datum, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampSecondArray,
 };
+use arrow_cast::display::array_value_to_string;
 use delta_kernel::Snapshot;
 use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::object_store::DynObjectStore;
@@ -46,6 +47,10 @@ pub enum Error {
     UnsupportedType { column: String, data_type: String },
     #[error("Delta file `{path}` has an invalid negative size {size}")]
     InvalidFileSize { path: String, size: i64 },
+    #[error("Delta table version {0} cannot be incremented")]
+    VersionOverflow(u64),
+    #[error(transparent)]
+    Arrow(#[from] arrow_schema::ArrowError),
     #[error(
         "Delta file `{0}` uses a deletion vector; Pivot's Parquet reader cannot apply deletion vectors yet"
     )]
@@ -123,6 +128,65 @@ pub(crate) fn initialize_table(
         )));
     }
     Ok(uri)
+}
+
+/// Append files in the version immediately after `expected_version`.
+///
+/// Delta's numbered commit file is the compare-and-swap: exactly one writer
+/// can create it. A loser returns `false`, refreshes, and retries against the
+/// next snapshot. The Parquet data files must already exist before this call.
+pub(crate) fn commit_added_files(
+    store: &dyn ObjectStore,
+    location: &ObjectPath,
+    expected_version: u64,
+    files: &[ManifestEntry],
+) -> Result<bool, Error> {
+    let next_version = expected_version
+        .checked_add(1)
+        .ok_or(Error::VersionOverflow(expected_version))?;
+    let actions = files
+        .iter()
+        .map(|entry| {
+            let partition_values = entry
+                .partition
+                .as_ref()
+                .map(|values| {
+                    values
+                        .iter()
+                        .map(|(name, value)| {
+                            let array = value.get().0;
+                            let value = if array.is_null(0) {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::Value::String(array_value_to_string(array, 0)?)
+                            };
+                            Ok((name.clone(), value))
+                        })
+                        .collect::<Result<serde_json::Map<_, _>, Error>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(serde_json::json!({
+                "add": {
+                    "path": entry.file.path.as_str(),
+                    "partitionValues": partition_values,
+                    "size": entry.file.size,
+                    "modificationTime": 0,
+                    "dataChange": true,
+                }
+            }))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let mut commit = actions
+        .into_iter()
+        .map(|action| serde_json::to_string(&action).expect("JSON value is serializable"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    commit.push('\n');
+    let key = location
+        .join("_delta_log")
+        .join(&format!("{next_version:020}.json"));
+    Ok(store.put_if_absent(&key, commit.as_bytes())?)
 }
 
 /// Resolve a catalog-relative table location into the URI Delta Kernel reads.

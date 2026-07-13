@@ -28,6 +28,23 @@ fn simple_select(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn values_is_a_nullary_source(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .unwrap();
+    let rendered = plan.to_string();
+
+    assert!(
+        rendered.contains("Values("),
+        "the plan must contain a Values source:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("DummyScan"),
+        "the DuckDB logical DummyScan must not enter Pivot's physical plan:\n{rendered}"
+    );
+}
+
+#[rstest]
 fn explain_wraps_the_explained_plan(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("EXPLAIN SELECT a, b FROM example_table")

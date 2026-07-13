@@ -53,6 +53,40 @@ fn explain_emits_plan_text_without_running_the_query(mut testing_planner: Testin
 }
 
 #[rstest]
+fn values_source_emits_all_rows_in_one_batch(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .plan("VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    let batch = &results[0];
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap(),
+        &Int32Array::from(vec![1, 2, 3])
+    );
+    assert_eq!(
+        batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap(),
+        &StringViewArray::from(vec!["one", "two", "three"])
+    );
+}
+
+#[rstest]
 fn select_column_subset(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .plan("SELECT a, b FROM example_table")

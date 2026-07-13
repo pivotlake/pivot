@@ -27,8 +27,9 @@ use crate::catalog::Table;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
-    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Limit,
-    Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
+    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
+    Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
+    Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::type_from_logical;
@@ -88,7 +89,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         return build_late_materialization(op, join, ctx);
     }
 
-    let inputs = op
+    let mut inputs = op
         .children()
         .map(|child| build_node(child, ctx))
         .collect::<Result<Vec<_>, _>>()?;
@@ -128,6 +129,8 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             Operator::TableFunctionScan(TableFunctionScan::from_handle(view)?)
         }
         DuckOperator::CreateTable(c) => Operator::CreateTable(CreateTable::from_handle(c)?),
+        DuckOperator::Insert(i) => Operator::Insert(Insert::from_handle(i)?),
+        DuckOperator::ExpressionGet(e) => Operator::Values(Values::from_handle(e)?),
         DuckOperator::Set(s) => Operator::SetVariable(SetVariable::from_set(s)),
         DuckOperator::Reset(r) => Operator::SetVariable(SetVariable::from_reset(r)),
         // No view to construct from: these carry no kind-specific payload.
@@ -140,6 +143,25 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             )));
         }
     };
+
+    // DuckDB's logical VALUES shape is ExpressionGet -> DummyScan. Its own
+    // physical planner evaluates foldable VALUES expressions eagerly and turns
+    // them into a COLUMN_DATA_SCAN. Pivot owns physical execution, so lower the
+    // same logical shape to a nullary Values source and discard the trigger-only
+    // dummy child. Keep any non-dummy child intact so compilation reports the
+    // unsupported shape instead of silently discarding meaningful input.
+    if matches!(operator, Operator::Values(_))
+        && matches!(
+            inputs.as_slice(),
+            [PlanNode {
+                operator: Operator::DummyScan(_),
+                inputs: dummy_inputs,
+                ..
+            }] if dummy_inputs.is_empty()
+        )
+    {
+        inputs.clear();
+    }
 
     let node = PlanNode {
         name: op.name(),

@@ -228,6 +228,18 @@ pub mod ffi {
         fn lo_create_has_query(op: &LogicalOperator) -> bool;
         fn lo_create_constraint_count(op: &LogicalOperator) -> usize;
 
+        // ---- Insert ----
+        fn lo_insert_table_name(op: &LogicalOperator) -> String;
+        fn lo_insert_column_map_count(op: &LogicalOperator) -> usize;
+        fn lo_insert_column_map_entry(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_insert_has_on_conflict(op: &LogicalOperator) -> bool;
+        fn lo_insert_return_chunk(op: &LogicalOperator) -> bool;
+
+        // ---- ExpressionGet ----
+        fn lo_expression_get_row_count(op: &LogicalOperator) -> usize;
+        fn lo_expression_get_column_count(op: &LogicalOperator) -> usize;
+        fn lo_expression_get_expr(op: &LogicalOperator, row: usize, column: usize) -> &Expression;
+
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> String;
         fn lo_set_value(op: &LogicalOperator) -> String;
@@ -276,6 +288,7 @@ pub mod ffi {
         // ---- Value: typed accessors (shared by constants and table-function
         // arguments). Read `value_type` first, then the matching accessor.
         fn value_type(v: &Value) -> u8;
+        fn value_is_null(v: &Value) -> bool;
         fn value_bool(v: &Value) -> bool;
         fn value_i8(v: &Value) -> i8;
         fn value_i16(v: &Value) -> i16;

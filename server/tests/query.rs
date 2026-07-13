@@ -314,3 +314,86 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
         "expected a structured pgwire error, got: {err}",
     );
 }
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_values_writes_rows_and_reports_count(#[future] conn: Conn) {
+    let directory = TempDir::new().unwrap();
+    create_people_table(&conn, "people_insert_values", directory.path()).await;
+
+    let messages = conn
+        .simple_query(
+            "INSERT INTO people_insert_values VALUES \
+             (10, 'delta'), (20, 'echo'), (30, 'foxtrot')",
+        )
+        .await
+        .unwrap();
+    let reordered = conn
+        .simple_query("INSERT INTO people_insert_values (name, id) VALUES ('golf', 40)")
+        .await
+        .unwrap();
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name FROM people_insert_values ORDER BY id",
+    )
+    .await;
+
+    assert!(
+        messages
+            .iter()
+            .any(|message| matches!(message, SimpleQueryMessage::CommandComplete(3)))
+    );
+    assert!(
+        reordered
+            .iter()
+            .any(|message| matches!(message, SimpleQueryMessage::CommandComplete(1)))
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("10".into()), Some("delta".into())],
+            vec![Some("20".into()), Some("echo".into())],
+            vec![Some("30".into()), Some("foxtrot".into())],
+            vec![Some("40".into()), Some("golf".into())],
+        ]
+    );
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+            .count(),
+        2
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_insert_leaves_no_parquet_files(#[future] conn: Conn) {
+    let directory = TempDir::new().unwrap();
+    create_people_table(&conn, "people_failed_insert", directory.path()).await;
+
+    let error = conn
+        .simple_query("INSERT INTO people_failed_insert VALUES (NULL, 'missing')")
+        .await
+        .unwrap_err();
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM people_failed_insert").await;
+
+    assert!(
+        error
+            .as_db_error()
+            .is_some_and(|db_error| db_error.message().to_lowercase().contains("null")),
+        "expected a null-related write error, got {error}"
+    );
+    assert_eq!(rows, vec![vec![Some("0".into())]]);
+    assert_eq!(
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+            .count(),
+        0
+    );
+}

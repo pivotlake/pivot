@@ -14,7 +14,7 @@ mod pages;
 mod plain;
 mod rle;
 
-use arrow_array::ArrayRef;
+use arrow_array::{Array, ArrayRef};
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
 use super::error::WriteResult;
@@ -53,6 +53,11 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
 pub(in crate::parquet_writing) fn encode_column_chunk(
     values: &ArrayRef,
 ) -> WriteResult<(Option<EncodedPage>, Vec<EncodedPage>)> {
+    if values.null_count() > 0 {
+        return Err(super::error::WriteError::NullsInRequiredColumn {
+            nulls: values.null_count(),
+        });
+    }
     match dictionary::try_encode(values)? {
         Some((dictionary_page, index_page)) => Ok((Some(dictionary_page), vec![index_page])),
         None => Ok((None, plain::encode_chunk(values)?)),

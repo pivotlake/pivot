@@ -33,6 +33,7 @@ pub enum ScalarValue {
         days: i32,
         micros: i64,
     },
+    Null(LogicalTypeId),
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
 }
@@ -59,6 +60,7 @@ impl fmt::Display for ScalarValue {
                 days,
                 micros,
             } => write!(f, "{months} {days} {micros}"),
+            ScalarValue::Null(data_type) => write!(f, "NULL ({data_type:?})"),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),
         }
     }

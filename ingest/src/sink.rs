@@ -30,7 +30,7 @@ use dispatch::{DataFlowDispatcher, DataFlowError};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::parquet_writing::{self, EncodedFile, ToRecordBatch};
+use catalog::parquet_writing::{self, EncodedFile, ToRecordBatch};
 
 /// Cumulative, lock-free counters for one sink's flush activity - read by the
 /// introspection API to show live ingest throughput per table.

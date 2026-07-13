@@ -96,10 +96,16 @@ pub enum Error {
     UnsupportedCreateTableConstraints(usize),
     #[error("CREATE TABLE nodes should not have input operators")]
     UnexpectedCreateTableInputs,
+    #[error("VALUES nodes should not have input operators")]
+    UnexpectedValuesInputs,
     #[error("compiling table scan: {0}")]
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("inserting: {0}")]
+    Insert(#[source] crate::catalog::Error),
+    #[error("INSERT target table `{0}` does not exist")]
+    InsertTableMissing(String),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
     #[error("Unsupported table function: {0}")]
@@ -242,6 +248,13 @@ impl PlanNode {
                 }
                 o.compile(dispatcher, catalog)
             }
+            crate::Operator::Values(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedValuesInputs);
+                }
+                o.compile(dispatcher)
+            }
+            crate::Operator::Insert(o) => o.compile(inputs.remove(0), transaction),
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
             crate::Operator::Explain(_) => unreachable!("Explain is compiled before its inputs"),

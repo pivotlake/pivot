@@ -45,8 +45,8 @@ use tonic::transport::Server;
 use tonic::transport::server::Router;
 use tonic::{Request, Response, Status};
 
-use crate::parquet_writing::ToRecordBatch;
 use crate::sink::{Flushable, ParquetSink};
+use catalog::parquet_writing::ToRecordBatch;
 use convert::CompiledMapping;
 use mapping::{LogsItem, MetricsItem, TracesItem};
 

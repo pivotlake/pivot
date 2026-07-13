@@ -16,6 +16,7 @@
 use arrow_array::{
     ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, Scalar, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    new_null_array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use duckdb_planner::ScalarValue;
@@ -179,6 +180,10 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Float32(v) => Arc::new(Float32Array::new_scalar(v).into_inner()),
         ScalarValue::Float64(v) => Arc::new(Float64Array::new_scalar(v).into_inner()),
         ScalarValue::Utf8(v) => Arc::new(StringViewArray::new_scalar(v).into_inner()),
+        ScalarValue::Null(logical_type) => {
+            let pivot_type = type_from_logical(logical_type)?;
+            new_null_array(&physical_arrow_type(&pivot_type), 1)
+        }
         // DuckDB's DATE is days since the epoch, the same as arrow `Date32`.
         // Comparisons coerce both sides to a common numeric type, so this lines up
         // with the integer day-count the parquet stores for a `DATE` column.

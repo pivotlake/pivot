@@ -160,11 +160,34 @@ pub(crate) async fn execute_sql(
         Ok(batches)
     }
     .await;
-    match &result {
-        Ok(_) => catalog.commit_transaction(transaction),
-        Err(_) => catalog.rollback_transaction(transaction),
+    match result {
+        Ok(batches) => {
+            let commit_catalog = catalog.clone();
+            let commit_transaction = transaction.clone();
+            let commit = tokio::task::spawn_blocking(move || {
+                commit_catalog.commit_transaction(commit_transaction)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            if let Err(error) = commit {
+                let rollback_catalog = catalog.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    rollback_catalog.rollback_transaction(transaction)
+                })
+                .await;
+                return Err(error.to_string());
+            }
+            Ok(batches)
+        }
+        Err(error) => {
+            let rollback_catalog = catalog.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                rollback_catalog.rollback_transaction(transaction)
+            })
+            .await;
+            Err(error)
+        }
     }
-    result
 }
 
 #[derive(Debug, Error)]
@@ -179,6 +202,10 @@ enum Error {
     WorkerPanic(JoinError),
     #[error("waiter thread panicked: {0}")]
     PlannerPanic(JoinError),
+    #[error("finalizing catalog transaction: {0}")]
+    Transaction(#[source] planner::catalog::Error),
+    #[error("INSERT finished without a row count")]
+    InsertCountMissing,
 }
 
 impl Error {
@@ -353,9 +380,11 @@ impl PivotQueryHandler {
             // planner thread-local. `execute_with_stats` turns on the dataflow's
             // IO/CPU tally only when the client asked for it.
             let started = Instant::now();
+            let is_insert = plan.as_insert().is_some();
+            let compiled_plan = plan.clone();
             let compile_transaction = transaction.clone();
             let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-                let rows = plan
+                let rows = compiled_plan
                     .compile(&dispatcher, compile_transaction.as_ref())?
                     .map(|| |b| PGRowBatch::from(b));
                 Ok(if collect_stats {
@@ -387,6 +416,26 @@ impl PivotQueryHandler {
                 let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
             }
 
+            let stats = QueryStats {
+                plan: plan_time,
+                compile: compile_time,
+                exec: exec_time,
+                flow,
+            };
+            if is_insert {
+                let row = batches
+                    .iter()
+                    .find_map(|batch| batch.rows.first())
+                    .ok_or(Error::InsertCountMissing)?;
+                let (length, digits) = row.data.split_at(4);
+                let length = i32::from_be_bytes(length.try_into().unwrap()) as usize;
+                let rows = std::str::from_utf8(&digits[..length])
+                    .expect("the INSERT count is text")
+                    .parse()
+                    .expect("the INSERT count is an integer");
+                return Ok(Outcome::Insert { rows, stats });
+            }
+
             let fields = batches
                 .first()
                 .map_or(Arc::new(vec![]), |b| b.fields.clone());
@@ -394,22 +443,36 @@ impl PivotQueryHandler {
                 fields,
                 stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
             ));
-            Ok(Outcome::Query(
-                response,
-                QueryStats {
-                    plan: plan_time,
-                    compile: compile_time,
-                    exec: exec_time,
-                    flow,
-                },
-            ))
+            Ok(Outcome::Query(response, stats))
         }
         .await;
-        match &result {
-            Ok(_) => self.catalog.commit_transaction(transaction),
-            Err(_) => self.catalog.rollback_transaction(transaction),
+        match result {
+            Ok(outcome) => {
+                let catalog = self.catalog.clone();
+                let commit_transaction = transaction.clone();
+                let commit = tokio::task::spawn_blocking(move || {
+                    catalog.commit_transaction(commit_transaction)
+                })
+                .await
+                .map_err(Error::PlannerPanic)?;
+                if let Err(error) = commit {
+                    let catalog = self.catalog.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        catalog.rollback_transaction(transaction)
+                    })
+                    .await;
+                    return Err(Error::Transaction(error));
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                let catalog = self.catalog.clone();
+                let _ =
+                    tokio::task::spawn_blocking(move || catalog.rollback_transaction(transaction))
+                        .await;
+                Err(error)
+            }
         }
-        result
     }
 }
 
@@ -419,7 +482,14 @@ enum Outcome {
     Query(Response, QueryStats),
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
     /// for `RESET`; the server decides which names actually mean anything.
-    Set { name: String, value: Option<String> },
+    Set {
+        name: String,
+        value: Option<String>,
+    },
+    Insert {
+        rows: u64,
+        stats: QueryStats,
+    },
 }
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
@@ -530,23 +600,25 @@ impl SimpleQueryHandler for PivotQueryHandler {
                 e.into_pgwire()
             })?;
 
-        let res = match outcome {
-            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
-            Outcome::Query(res, stats) => {
-                // Send the breakdown as an INFO notice before the rows.
-                if with_stats {
-                    let notice = NoticeResponse::from(ErrorInfo::new(
-                        "INFO".to_string(),
-                        "00000".to_string(),
-                        stats.summary(),
-                    ));
-                    client
-                        .send(PgWireBackendMessage::NoticeResponse(notice))
-                        .await?;
-                }
-                res
-            }
+        let (res, stats) = match outcome {
+            Outcome::Set { name, value } => (apply_set(client, &name, value.as_deref()), None),
+            Outcome::Insert { rows, stats } => (
+                Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows as usize)),
+                Some(stats),
+            ),
+            Outcome::Query(res, stats) => (res, Some(stats)),
         };
+
+        if with_stats && let Some(stats) = stats {
+            let notice = NoticeResponse::from(ErrorInfo::new(
+                "INFO".to_string(),
+                "00000".to_string(),
+                stats.summary(),
+            ));
+            client
+                .send(PgWireBackendMessage::NoticeResponse(notice))
+                .await?;
+        }
 
         info!(sql = %query, "query succeeded");
         Ok(vec![res])

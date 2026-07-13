@@ -18,6 +18,7 @@ mod catalog;
 mod delta;
 mod manifest;
 pub mod parquet;
+pub mod parquet_writing;
 pub mod store;
 /// A Docker-backed object-store test harness (MinIO / fake-gcs-server). Gated
 /// behind the `test-support` feature so it — and its heavy testcontainers deps —

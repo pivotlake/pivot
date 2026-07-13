@@ -6,7 +6,6 @@ description = "Receivers that ingest external telemetry (OTLP today) and sink it
 
 [dependencies]
 dispatch = { path = "../dispatch" }
-thriftparquet = { path = "../thriftparquet" }
 # The catalog: each flushed Parquet file is registered with its table so new
 # rows are queryable immediately, and the compacter reads files back / swaps
 # them through it.
@@ -14,19 +13,8 @@ catalog = { path = "../catalog" }
 
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
-# Partitioned/sorted ingest: lexsort + partition (arrow-ord), comparable row
-# keys (arrow-row), and concat + take (arrow-select). `uuid` names files so
-# concurrent ingestors never collide.
-arrow-ord = { path = "../arrow-rs/arrow-ord" }
-arrow-row = { path = "../arrow-rs/arrow-row" }
-arrow-select = { path = "../arrow-rs/arrow-select" }
-arrow-arith = { path = "../arrow-rs/arrow-arith" }
-# Dictionary encoding: cast a column to a dictionary array (intern + index).
-arrow-cast = { path = "../arrow-rs/arrow-cast" }
+# `uuid` names files so concurrent ingestors never collide.
 uuid = { version = "1", features = ["v4"] }
-# In-house Parquet encoding (no upstream `parquet` crate): the shared
-# `thriftparquet` metadata/codec layer plus the same snappy lib the reader uses.
-snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "b896aa24d6c85fa1b40f8746c3cc2185ca4084b9" }
 
 # OTLP over gRPC. tonic 0.14 split prost codegen into `tonic-prost`; the
 # generated service code lives in `opentelemetry-proto` (gen-tonic), so we only

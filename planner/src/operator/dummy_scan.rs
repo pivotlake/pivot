@@ -4,6 +4,10 @@
 //! `SELECT drop_cache()`) compiles to the [`Nullary`] source below, which emits
 //! exactly one empty (zero-column) row on a single worker so the projection
 //! above it evaluates its expressions once and produces one output row.
+//!
+//! DuckDB also places a logical dummy scan below `LogicalExpressionGet` for a
+//! `VALUES` clause. Pivot removes that child while building its plan because
+//! [`Values`](crate::operator::Values) is compiled directly as a nullary source.
 
 use crate::compile::Error;
 use arrow_array::{RecordBatch, RecordBatchOptions};

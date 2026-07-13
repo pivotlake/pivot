@@ -161,6 +161,16 @@ pub trait Table: Debug + Send + Sync {
         unreachable!("materialize called on a table that does not support late materialization")
     }
 
+    /// Compile an INSERT source into a dataflow that stages its durable writes
+    /// in `transaction` and emits one row containing the inserted-row count.
+    fn insert(
+        &self,
+        _source: RecordBatchOperatorSpec,
+        _transaction: &dyn CatalogTransaction,
+    ) -> Result<RecordBatchOperatorSpec> {
+        Err(Error::Other("table does not support INSERT".into()))
+    }
+
     /// Try to push a filter into the table. Returns `Ok(true)` if it was
     /// *FULLY* consumed (no upstream `Filter` operator required), `Ok(false)`
     /// if it was kept above. Errors propagate to the FFI boundary as C++
@@ -275,11 +285,15 @@ pub trait Catalog: Debug + Send + Sync {
     /// default does nothing; the snapshot is simply released when the caller's
     /// last reference drops. A backend with real transactional state hooks its
     /// finalization here.
-    fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) {}
+    fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) -> Result<()> {
+        Ok(())
+    }
 
     /// Roll back `transaction`: the query it served failed or was cancelled.
     /// Default: nothing, as with [`commit_transaction`](Self::commit_transaction).
-    fn rollback_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) {}
+    fn rollback_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Adapts a Pivot [`Catalog`] to DuckDB's [`DuckDBBind`] trait, resolving the

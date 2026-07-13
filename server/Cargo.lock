@@ -1154,10 +1154,14 @@ name = "catalog"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
+ "arrow-arith 58.0.0",
  "arrow-array 58.0.0",
  "arrow-buffer 58.0.0",
+ "arrow-cast 58.0.0",
  "arrow-ord 58.0.0",
+ "arrow-row 58.0.0",
  "arrow-schema 58.0.0",
+ "arrow-select 58.0.0",
  "aws-credential-types",
  "aws-sigv4",
  "base64",
@@ -2627,22 +2631,15 @@ checksum = "bfa799dd5ed20a7e349f3b4639aa80d74549c81716d9ec4f994c9b5815598306"
 name = "ingest"
 version = "0.1.0"
 dependencies = [
- "arrow-arith 58.0.0",
  "arrow-array 58.0.0",
- "arrow-cast 58.0.0",
- "arrow-ord 58.0.0",
- "arrow-row 58.0.0",
  "arrow-schema 58.0.0",
- "arrow-select 58.0.0",
  "catalog",
  "dispatch",
  "opentelemetry-proto",
  "prost",
  "serde",
  "serde_json",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=b896aa24d6c85fa1b40f8746c3cc2185ca4084b9)",
  "thiserror 2.0.18",
- "thriftparquet",
  "tokio",
  "toml",
  "tonic",

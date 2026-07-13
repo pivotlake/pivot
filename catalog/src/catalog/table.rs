@@ -158,12 +158,64 @@ impl CatalogTable {
     /// write and the manifest commit. Idempotent on `path`.
     pub fn append_data_file(
         &mut self,
-        _path: ObjectPath,
-        _bytes: &[u8],
-        _partition: Option<HashMap<String, Scalar<ArrayRef>>>,
-        _sort_bounds: Option<SortBounds>,
+        path: ObjectPath,
+        bytes: &[u8],
+        partition: Option<HashMap<String, Scalar<ArrayRef>>>,
+        sort_bounds: Option<SortBounds>,
     ) -> crate::Result<()> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
+        let file = self.write_data_file(path, bytes)?;
+        self.commit_added_files(vec![ManifestEntry {
+            file,
+            partition,
+            sort_bounds,
+        }])
+    }
+
+    /// Commit all files from one INSERT in a single Delta version.
+    pub fn commit_added_files(&mut self, added: Vec<ManifestEntry>) -> crate::Result<()> {
+        loop {
+            let fresh = added
+                .iter()
+                .filter(|candidate| {
+                    !self
+                        .manifest
+                        .entries
+                        .iter()
+                        .any(|held| held.file.path == candidate.file.path)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if fresh.is_empty() {
+                return Ok(());
+            }
+
+            // Materialize every footer before making the Delta commit visible.
+            // Once the compare-and-swap succeeds, publishing this table copy is
+            // an in-memory operation and cannot fail after the durable commit.
+            let data_files = fresh
+                .iter()
+                .map(|entry| {
+                    entry
+                        .file
+                        .clone()
+                        .into_data_file(self.store.as_ref(), &self.location)
+                })
+                .collect::<store::Result<Vec<_>>>()?;
+            let loaded = crate::parquet::load_table_files(&self.dispatcher, &data_files)?;
+
+            if crate::delta::commit_added_files(
+                self.store.as_ref(),
+                &self.location,
+                self.manifest.version,
+                &fresh,
+            )? {
+                self.manifest.version += 1;
+                self.manifest.entries.extend(fresh);
+                self.files.extend(loaded);
+                return Ok(());
+            }
+            self.refresh()?;
+        }
     }
 
     /// Atomically swap a set of this table's files for another — the compaction
@@ -305,14 +357,19 @@ impl CatalogTable {
     /// location like any [`FileRef`] path), returning its [`FileRef`]. The
     /// compaction writer's output, committed with
     /// [`replace_data_files`](Self::replace_data_files).
-    pub fn write_data_file(&self, _path: ObjectPath, _bytes: &[u8]) -> crate::Result<FileRef> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
+    pub fn write_data_file(&self, path: ObjectPath, bytes: &[u8]) -> crate::Result<FileRef> {
+        self.store.put(&self.location.resolve(&path), bytes)?;
+        Ok(FileRef {
+            path,
+            size: bytes.len() as u64,
+        })
     }
 
     /// Delete a data file (a compaction input swapped out of the manifest).
     /// `path` resolves against the table's location like any [`FileRef`] path.
-    pub fn delete_data_file(&self, _path: &ObjectPath) -> crate::Result<()> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
+    pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
+        self.store.delete(&self.location.resolve(path))?;
+        Ok(())
     }
 
     /// The manifest version this copy is at. Monotonic per table; used to
@@ -361,6 +418,23 @@ impl CatalogTable {
     /// The table's columns (schema), as the planner's [`Column`]s.
     pub fn columns(&self) -> Vec<Column> {
         self.manifest.columns.clone()
+    }
+
+    /// Arrow schema used by Pivot-written Parquet files.
+    pub fn physical_arrow_schema(&self) -> arrow_schema::SchemaRef {
+        let fields = self
+            .manifest
+            .columns
+            .iter()
+            .map(|column| {
+                arrow_schema::Field::new(
+                    column.name.clone(),
+                    planner::types::physical_arrow_type(&column.col_type),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        Arc::new(arrow_schema::Schema::new(fields))
     }
 
     /// Where the table's data lives, relative to the database root (an absolute

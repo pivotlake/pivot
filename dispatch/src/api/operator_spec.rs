@@ -1,9 +1,10 @@
 use crate::operations::channels::{
-    ChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
+    ChannelFactory, FanInChannelFactory, Sender, StealableChannelFactory, fan_in, mpsc_channel,
+    stealable,
 };
 use crate::operations::{
-    DefaultUnaryFactory, Forward, InjectorSourceFactory, MapFactory, RootUnaryOperatorFactory,
-    UnaryFactory, UnaryOperatorFactory,
+    DefaultUnaryFactory, FanInFactory, Forward, InjectorSourceFactory, MapFactory,
+    RootUnaryOperatorFactory, UnaryFactory, UnaryOperatorFactory,
 };
 use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
 use arrow_array::RecordBatch;
@@ -168,6 +169,43 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let channels: Vec<_> = stealable::<O>(worker_count).into_iter().collect();
         let unaries: Vec<_> = (0..worker_count).map(|_| MapFactory(f.clone())).collect();
         self.chain(channels, unaries)
+    }
+
+    /// Gather all workers' output on one worker and fold it into a final value.
+    ///
+    /// `consume` runs once per gathered item with exclusive access to `state`;
+    /// `finish` consumes that state after every upstream worker closes. Only
+    /// the receiving worker owns or invokes these closures. The remaining
+    /// workers contain empty operators and only feed the fan-in channel.
+    #[allow(clippy::type_complexity)]
+    pub fn fan_in<O2, State, Consume, Finish>(
+        self,
+        state: State,
+        consume: Consume,
+        finish: Finish,
+    ) -> OperatorSpec<
+        O2,
+        UnaryOperatorFactory<
+            O,
+            O2,
+            FanInFactory<State, Consume, Finish>,
+            FanInChannelFactory<O>,
+            OF,
+        >,
+    >
+    where
+        O2: Send + 'static,
+        State: Send + 'static,
+        Consume:
+            FnMut(&mut State, O, &mut dyn Sender<O2>) -> crate::UnaryResult<()> + Send + 'static,
+        Finish: FnOnce(State, &mut dyn Sender<O2>) -> crate::UnaryResult<()> + Send + 'static,
+    {
+        let worker_count = self.factories.len();
+        let mut receiver = Some(FanInFactory::new(state, consume, finish));
+        let unaries = (0..worker_count)
+            .map(|_| receiver.take().unwrap_or_else(FanInFactory::empty))
+            .collect();
+        self.chain(fan_in::<O>(worker_count), unaries)
     }
 }
 

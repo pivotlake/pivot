@@ -336,7 +336,7 @@ fn write_column_chunk(
     Ok(ColumnChunk {
         file_offset: chunk_start,
         meta_data: Some(ColumnMetaData {
-            physical_type: catalog::parquet::arrow_to_parquet_physical(field.data_type())?,
+            physical_type: crate::parquet::arrow_to_parquet_physical(field.data_type())?,
             encodings,
             path_in_schema: vec![field.name().clone()],
             codec: SNAPPY_CODEC,
@@ -365,7 +365,7 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
     });
     for field in schema.fields() {
         elements.push(SchemaElement {
-            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(
+            physical_type: Some(crate::parquet::arrow_to_parquet_physical(
                 field.data_type(),
             )?),
             repetition_type: Some(REPETITION_REQUIRED),
