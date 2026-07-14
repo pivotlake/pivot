@@ -102,6 +102,11 @@ impl TableFunctionScan {
             columns,
         }
     }
+
+    /// The type of each output column, in order.
+    pub(crate) fn output_types(&self) -> Result<Vec<Type>, Error> {
+        self.columns.iter().map(Expression::result_type).collect()
+    }
 }
 
 impl fmt::Display for TableFunctionScan {

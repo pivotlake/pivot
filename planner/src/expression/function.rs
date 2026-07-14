@@ -107,6 +107,30 @@ impl Display for Function {
 }
 
 impl Function {
+    /// The type a call to this function yields.
+    pub fn result_type(&self) -> Type {
+        match self {
+            // The string matchers yield booleans.
+            Function::Contains(_) | Function::Prefix(_) => Type::Boolean,
+            // Arithmetic and the extractors carry DuckDB's bound result type.
+            Function::Arithmetic(a) => a.return_type.clone(),
+            Function::Length(l) => l.return_type.clone(),
+            Function::DatePart(d) => d.return_type.clone(),
+            // The regex replacers rewrite strings.
+            Function::RegexpReplace(_) | Function::RegexpJitReplace(_) => Type::Utf8,
+            // `/` always computes a float quotient.
+            Function::Divide(_) => Type::Float64,
+            // `date_trunc` and `now()` yield a timestamp.
+            Function::DateTrunc(_) | Function::Now => Type::Timestamp,
+            // `date`/`timestamp` ± interval keeps the temporal operand's type,
+            // and `make_date`/`make_timestamp` produce the type they convert to.
+            Function::IntervalArithmetic(i) => i.result.clone(),
+            Function::TemporalConvert(c) => c.result.clone(),
+            // `drop_cache()` returns the evicted-entry count.
+            Function::DropCache => Type::Int64,
+        }
+    }
+
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         match self {
             Function::Contains(c) => c.compile(),
