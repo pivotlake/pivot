@@ -127,9 +127,10 @@ impl<V: ByteViewType> ArrayBuilder for ViewsBuilder<V> {
         let nulls = null_buffer
             .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
             .filter(|n| n.null_count() != 0);
-        // Safety: every view was built with `make_view` over an in-bounds slice
-        // of its block. For the string flavour, the bytes come from a
-        // UTF8-annotated parquet column and are trusted to be valid UTF-8.
+        // Safety: every view was built with `make_view` over an in-bounds
+        // slice of its block, or is the zeroed view (a valid empty inline
+        // string) written under null slots. For the string flavour, the bytes
+        // come from a column the resolved schema types as UTF-8 text.
         unsafe {
             Arc::new(GenericByteViewArray::<V>::new_unchecked(
                 scalar_buffer,

@@ -22,7 +22,10 @@ use crate::memory::{SlabAllocator, SlabBuffer};
 
 /// Accumulates values into engine memory and produces a finished Arrow array.
 pub trait ArrayBuilder {
-    type Element: Copy;
+    /// `Default` is the element written under null slots: the slab is not
+    /// zeroed on allocation, and downstream kernels (and unsafe array
+    /// constructors) may touch masked slots, so they must hold a valid value.
+    type Element: Copy + Default;
 
     /// Creates a builder pre-allocated for `capacity` elements.
     fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self;
