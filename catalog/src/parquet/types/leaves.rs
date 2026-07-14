@@ -1,14 +1,4 @@
-//! Flattening a nested Arrow schema into leaf columns, and folding decoded leaf
-//! arrays back into it.
-//!
-//! Parquet stores (and pivot decodes) one column chunk per *leaf* of the
-//! schema tree, depth-first; a flat schema is the degenerate case where every
-//! top-level field is its own leaf. [`leaf_fields`] is the per-leaf primitive
-//! field list in chunk order, shared by the footer reader (per-leaf statistics)
-//! and the row-group decoder (per-leaf decoder types).
-//! [`nest_leaves_into_columns`] is the inverse: it folds a decoded depth-first
-//! stream of leaf arrays back under their struct parents to match the nested
-//! output schema.
+//! Conversion between nested Arrow columns and Parquet's depth-first leaves.
 
 use std::sync::Arc;
 
@@ -61,12 +51,9 @@ pub(crate) fn projected_leaves(fields: &Fields, columns: &[usize]) -> Vec<usize>
     leaves
 }
 
-/// The column-chunk index of the typed leaf that `path` is shredded into under
-/// the variant column `column`, resolved in THIS file's schema; `None` when the
-/// file doesn't shred that path. Used to prune row groups by a shredded path's
-/// statistics, and `None` (no pruning) is always sound.
+/// Finds the typed leaf for a shredded variant path in this file.
 ///
-/// Shredding nests one level per path segment: the leaf for `user.id` is
+/// For example, `user.id` maps to
 /// `column.typed_value.user.typed_value.id.typed_value`.
 pub(crate) fn variant_typed_leaf(fields: &Fields, column: usize, path: &[String]) -> Option<usize> {
     let mut names = Vec::with_capacity(path.len() * 2 + 1);
@@ -103,21 +90,10 @@ fn field_leaf_offset(field: &FieldRef, names: &[&str]) -> Option<usize> {
     None
 }
 
-/// Turn decoded leaf arrays back into the schema's columns.
+/// Rebuilds top-level columns from decoded leaf arrays.
 ///
-/// The decoder hands us one flat array per leaf, in the same depth-first
-/// order the file stores its column chunks. The output batch wants one array
-/// per top-level field, where a struct field is a [`StructArray`] holding its
-/// children. So we walk the schema's fields in order: a primitive field
-/// simply takes the next decoded array, and a struct field first collects an
-/// array for each of its children (its own structs collect theirs, and so
-/// on), then wraps them in a `StructArray`. For a flat schema this is a plain
-/// pass-through. The inverse of [`leaf_fields`].
-///
-/// The struct wrappers get no null buffer of their own: when a row's struct
-/// value is null, the file's definition levels already made every leaf of
-/// that row null, and readers of a struct column take a row's nullness from
-/// the leaves.
+/// Input arrays must follow the order returned by [`leaf_fields`]. Definition
+/// levels already carry nulls, so the new [`StructArray`]s need no null buffer.
 pub(crate) fn nest_leaves_into_columns(
     fields: &Fields,
     leaf_arrays: &mut impl Iterator<Item = ArrayRef>,
@@ -144,10 +120,7 @@ pub(crate) fn nest_leaves_into_columns(
         }
     }
 
-    // `open` is the chain of structs we are currently inside, outermost (the
-    // top level) first. Iterating with this explicit chain instead of
-    // recursing means a deeply nested document schema can't overflow the call
-    // stack.
+    // Keep the open structs in a stack to support deeply nested schemas.
     let mut open = vec![PartialStruct::start(fields)];
     loop {
         let innermost = open.last().expect("the top level only closes by returning");

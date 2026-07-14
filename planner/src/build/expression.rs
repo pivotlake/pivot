@@ -155,12 +155,8 @@ impl Cast {
         let target = type_from_logical(view.return_type())?;
         let source = Expression::from_handle(view.child())?;
 
-        // A cast over a variant is a typed path read: fold it, and the chain
-        // of `->` extractions beneath it, into one typed VariantGet, so the
-        // kernel reads a shredded leaf of the target type directly instead of
-        // materializing intermediate sub-variants. A target outside pivot's
-        // type set already failed `type_from_logical` above; of the rest, only
-        // a cast to VARIANT itself is not a read.
+        // Fold a cast and its `->` chain into one typed read. This lets the
+        // kernel read a shredded leaf without building intermediate variants.
         if matches!(source.result_type(), Ok(Type::Variant)) {
             if !VariantGet::supports_cast_to(&target) {
                 return Err(Error::UnsupportedScalarFunction(format!(

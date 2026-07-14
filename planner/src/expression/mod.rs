@@ -118,10 +118,7 @@ impl Expression {
     /// extractor when grouping on it (e.g. `GROUP BY CASE …`) and to derive
     /// each operator's output types (see `PlanNode::output_types`).
     ///
-    /// Covers every expression kind; the one remaining error is a constant of
-    /// an arrow type outside pivot's set, which nothing currently builds. That
-    /// error rejects an unclassified group key rather than silently mistyping
-    /// it.
+    /// Constants with unsupported Arrow types return an error.
     pub fn result_type(&self) -> Result<Type, compile::Error> {
         match self {
             Expression::Ref(r) => Ok(r.return_type.clone()),

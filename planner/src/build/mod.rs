@@ -77,17 +77,10 @@ pub(crate) fn build_plan(root: LogicalOp<'_>) -> Result<PlanNode, plan::Error> {
     Ok(render_variant_outputs(plan)?)
 }
 
-/// Render the query's variant-typed output columns as JSON text.
+/// Wraps variant outputs in a projection that renders them as JSON text.
 ///
-/// A variant's physical layout can differ per file (each file shreds by its own
-/// data), so handing the raw struct to the client would mean result batches of
-/// varying shape, and an unreadable binary value even when they don't vary.
-/// When the plan's output contains a variant column, wrap the whole plan in one
-/// more projection that renders those columns and passes the rest through, so
-/// the client always sees uniform JSON text. Asking the plan for its
-/// [`output_types`](PlanNode::output_types) makes this work for any root
-/// operator; below the added projection, everything still operates on the raw
-/// variant.
+/// This gives the client one stable type even when files use different
+/// shredded layouts. Operators below the projection still use raw variants.
 fn render_variant_outputs(plan: PlanNode) -> Result<PlanNode, crate::compile::Error> {
     let types = plan.output_types()?;
     if !types.contains(&Type::Variant) {

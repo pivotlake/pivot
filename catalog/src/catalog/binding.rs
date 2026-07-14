@@ -40,10 +40,7 @@ struct PushedPredicate {
 }
 
 impl PushedPredicate {
-    /// The column-chunk index this predicate's statistics live on in `rg`: the
-    /// column's own leaf for a plain predicate, or the shredded typed leaf for
-    /// a variant path. `None` when the path isn't shredded in this file, so it
-    /// simply can't prune (always sound).
+    /// Finds the leaf whose statistics apply to this predicate.
     fn get_leaf_for_row_group(&self, rg: &RowGroupMetadata) -> Option<usize> {
         let fields = rg.schema.fields();
         if self.path.is_empty() {
@@ -54,20 +51,10 @@ impl PushedPredicate {
     }
 }
 
-/// If `expr` is a read that row-group statistics can prune by, return which
-/// top-level column it reads and the JSON path inside that column (empty for
-/// a plain column). `None` means the expression can't drive pruning.
+/// Returns the column and optional variant path that can use row-group stats.
 ///
-/// Two shapes qualify:
-/// - a plain column reference, e.g. the left side of `url = 'x'`;
-/// - a typed JSON read, e.g. the left side of `CAST(d->'age' AS BIGINT) = 30`
-///   (plan build fuses the cast and the extraction chain into one
-///   `VariantGet`). Its statistics live on the file's shredded leaf for that
-///   path.
-///
-/// The `VariantGet` arm doesn't need to consider bare, uncast extractions:
-/// the planner rejects comparisons on untyped variants, so by the time a
-/// comparison reaches pushdown its `as_type` is always set.
+/// Plain columns use an empty path. Typed variant reads use the corresponding
+/// shredded leaf. Untyped variant reads cannot be compared and are ignored.
 fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPath)> {
     match expr {
         Expression::Ref(r) => Some((r.column_idx, Vec::new())),
@@ -183,16 +170,8 @@ impl Table for TableBinding {
         // since it was planned.
         let current = self.resolve_files(ctx)?;
 
-        // Equality predicates additionally let the decoder skip row groups
-        // whose dictionary for that column excludes the constant. Only
-        // plain-column predicates take this path for now. JSON-path predicates
-        // could too, and soundly: the shredding spec requires a value matching
-        // the shredded type to be stored in the typed leaf, so that leaf's
-        // dictionary is just as conclusive as a plain column's. What's missing
-        // is plumbing: the constant is installed on a decoder by top-level
-        // column position, and installing it on a shredded leaf (whose
-        // position differs per file) isn't built yet. Until then JSON-path
-        // predicates still get the min/max pruning below.
+        // Dictionary pruning currently supports plain columns only. Shredded
+        // leaves have file-specific positions and still use min/max pruning.
         let eq_predicates: Vec<ScanEqualityPredicate> = self
             .predicates
             .iter()

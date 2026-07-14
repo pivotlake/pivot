@@ -1,13 +1,7 @@
-//! [`VariantGet`]: reading a path out of a variant (JSON) column.
+//! Reads paths from variant columns.
 //!
-//! The SQL surface is the `->` operator plus explicit casts:
-//!   - `doc->'user'->'id'` extracts a field per `->`, yielding the sub-variant
-//!     (still `VARIANT`).
-//!   - `CAST(doc->'user'->'id' AS BIGINT)` types the extraction. Plan build
-//!     fuses the cast and the whole `->` chain into one typed [`VariantGet`],
-//!     so arrow's kernel reads a shredded leaf of that type directly (and
-//!     decodes the value blob only for rows the shredding didn't cover)
-//!     instead of materializing intermediate sub-variants.
+//! A bare `->` returns a sub-variant. A cast turns the full path into one typed
+//! [`VariantGet`], which can read a shredded leaf directly.
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
@@ -26,10 +20,7 @@ use std::sync::Arc;
 /// document.
 pub type JsonPath = Vec<String>;
 
-/// A variant path read: `path` holds one field name per `->`; `as_type` is
-/// `None` for a bare extraction (the result is the sub-variant) and the target
-/// type for one fused with a cast (the result is a real typed column, null
-/// where the path is missing or its value doesn't match).
+/// A variant path read, optionally converted to a concrete type.
 #[derive(Debug, Clone)]
 pub struct VariantGet {
     pub input: Box<Expression>,
@@ -44,11 +35,7 @@ impl VariantGet {
         self.as_type.clone().unwrap_or(Type::Variant)
     }
 
-    /// Whether `CAST(variant AS t)` is a supported typed read. Arrow's
-    /// extraction kernel produces every physical column type pivot has
-    /// (numerics, `Utf8View`, `Date32`, second timestamps, `Decimal128`), so
-    /// the only rejected target is VARIANT itself: that's not a read, and
-    /// DuckDB never plans a same-type cast.
+    /// Returns whether a variant can be read as `t`.
     pub(crate) fn supports_cast_to(t: &Type) -> bool {
         !matches!(t, Type::Variant)
     }
@@ -100,10 +87,7 @@ impl Display for VariantGet {
     }
 }
 
-/// Render a variant value as JSON text (`Utf8`). Wrapped around a query's
-/// variant-typed output columns, so the client receives readable JSON of one
-/// uniform type instead of a raw binary struct whose physical layout can
-/// differ per file (see `render_variant_outputs` in plan build).
+/// Converts variant output to JSON text.
 #[derive(Debug, Clone)]
 pub struct VariantToJson {
     pub input: Box<Expression>,

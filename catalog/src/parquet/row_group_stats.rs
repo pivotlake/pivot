@@ -33,16 +33,8 @@ pub fn row_group_filter_from(predicates: Vec<DynamicScanPredicate>) -> Option<Ro
             else {
                 continue;
             };
-            // A dynamic predicate's `column_idx` is always a top-level column:
-            // it is a Top-N order key, which the planner only pushes down for a
-            // plain column reference. (Predicates on a path *inside* a variant
-            // column take the static `PushedPredicate` route, which resolves
-            // the path to its shredded typed leaf itself.) Statistics, though,
-            // are stored per leaf chunk, and a column's chunk position shifts
-            // per file once any column before it spans several leaves, so map
-            // column to chunk in this row group's own schema. If the column
-            // itself spans several leaves, its first leaf (a variant's binary
-            // `metadata`) carries no stats, and no stats means no pruning.
+            // Dynamic predicates use top-level column indices, while statistics
+            // use file-specific leaf indices.
             let leaf = crate::parquet::types::leaves::first_leaf(
                 row_group.schema.fields(),
                 pred.column_idx,
@@ -95,13 +87,10 @@ pub fn scan_order_from(predicates: &[DynamicScanPredicate]) -> Option<ScanOrder>
     })
 }
 
-/// Returns `Ok(true)` when min/max statistics prove no row in `row_group` can
-/// satisfy `<leaf's values> <compare_type> constant`, so the row group can be
-/// skipped. `leaf` is a raw column-chunk index, already resolved against this
-/// row group's schema (a column's own leaf, or a shredded variant path's typed
-/// leaf). Returns `Ok(false)` when the group must still be scanned, including
-/// when stats are missing (absence of a bound is not proof of absence) or when
-/// the stats and constant are different Arrow types (no safe comparison).
+/// Returns whether min/max statistics prove that the row group cannot match.
+///
+/// `leaf` is a column-chunk index in this row group's schema. Missing or
+/// incompatible statistics cannot eliminate the row group.
 pub fn row_group_eliminated(
     row_group: &RowGroupMetadata,
     leaf: usize,
