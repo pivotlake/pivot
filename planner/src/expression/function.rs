@@ -3,7 +3,7 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Prefix,
-    RegexpJitReplace, RegexpReplace, TemporalConvert,
+    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::Type;
@@ -52,6 +52,20 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Utf8,
             volatile: false,
         }),
+        // `doc->'key'`: extract one field from a variant (JSON) column,
+        // yielding the sub-variant. DuckDB's binder rewrites the `->` operator
+        // to a `json_extract` call, which resolves here (the json extension
+        // isn't loaded; text-JSON functions don't exist in pivot). The `d.age`
+        // syntax needs no entry: it binds to DuckDB's native `variant_extract`,
+        // and pivot intercepts both names at plan build. Typing is by cast,
+        // e.g. `CAST(doc->'a'->'b' AS BIGINT)`, fused into one typed
+        // extraction (see `VariantGet`). VOLATILE because the stub's body is a
+        // no-op: DuckDB must never fold the call itself.
+        "json_extract" => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Variant, Type::Utf8],
+            return_type: Type::Variant,
+            volatile: true,
+        }),
         _ => None,
     }
 }
@@ -84,6 +98,12 @@ pub enum Function {
     /// compiles, so every row of the statement sees the same instant. Result is
     /// a `TIMESTAMP` (epoch seconds).
     Now,
+    /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
+    /// fused `CAST`.
+    VariantGet(VariantGet),
+    /// A variant value rendered as JSON text, wrapped around variant-typed
+    /// output columns by plan build.
+    VariantToJson(VariantToJson),
 }
 
 impl Display for Function {
@@ -102,6 +122,8 @@ impl Display for Function {
             Function::TemporalConvert(c) => write!(f, "{c}"),
             Function::DropCache => write!(f, "drop_cache()"),
             Function::Now => write!(f, "now()"),
+            Function::VariantGet(v) => write!(f, "{v}"),
+            Function::VariantToJson(v) => write!(f, "{v}"),
         }
     }
 }
@@ -126,6 +148,10 @@ impl Function {
             // and `make_date`/`make_timestamp` produce the type they convert to.
             Function::IntervalArithmetic(i) => i.result.clone(),
             Function::TemporalConvert(c) => c.result.clone(),
+            // A variant path read yields its cast's type (the sub-variant when
+            // bare); a JSON-text render always yields a string.
+            Function::VariantGet(v) => v.result_type(),
+            Function::VariantToJson(_) => Type::Utf8,
             // `drop_cache()` returns the evicted-entry count.
             Function::DropCache => Type::Int64,
         }
@@ -144,6 +170,8 @@ impl Function {
             Function::DatePart(d) => d.compile(),
             Function::IntervalArithmetic(i) => i.compile(),
             Function::TemporalConvert(c) => c.compile(),
+            Function::VariantGet(v) => v.compile(),
+            Function::VariantToJson(v) => v.compile(),
             // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single

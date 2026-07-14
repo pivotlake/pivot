@@ -66,15 +66,7 @@ pub struct TableFunctionDef {
     pub columns: Vec<DuckDBColumn>,
 }
 
-/// A scalar function the provider defines, described for DuckDB's binder: its
-/// argument types and return type (DuckDB logical type id discriminants), plus
-/// whether it must be marked `VOLATILE` so the optimizer can't fold the call
-/// away before pivot re-plans it.
-pub struct ScalarFunctionDef {
-    pub arg_type_ids: Vec<u8>,
-    pub return_type_id: u8,
-    pub is_volatile: bool,
-}
+pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
 
 pub trait DuckDBBind {
     /// Given a table name, return a table/object that implements [`DuckDBTable`] with column definitions.
@@ -156,17 +148,17 @@ pub(crate) fn catalog_get_scalar_function(
     name: &str,
 ) -> CatalogGetScalarFunctionResult {
     match ctx.provider.scalar_function(name) {
-        Some(def) => CatalogGetScalarFunctionResult {
+        Some(function) => CatalogGetScalarFunctionResult {
             found: true,
-            arg_type_ids: def.arg_type_ids,
-            return_type_id: def.return_type_id,
-            is_volatile: def.is_volatile,
+            function,
         },
         None => CatalogGetScalarFunctionResult {
             found: false,
-            arg_type_ids: Vec::new(),
-            return_type_id: 0,
-            is_volatile: false,
+            function: ScalarFunctionDef {
+                arg_type_ids: Vec::new(),
+                return_type_id: 0,
+                is_volatile: false,
+            },
         },
     }
 }
