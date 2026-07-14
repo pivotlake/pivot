@@ -24,7 +24,7 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert,
+    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -47,7 +47,7 @@ impl Expression {
             DuckExpression::Conjunction(c) => Expression::Conjunction(Conjunction::from_handle(c)?),
             DuckExpression::Case(c) => Expression::Case(Case::from_handle(c)?),
             DuckExpression::Not(n) => Expression::Not(Not::from_handle(n)?),
-            DuckExpression::Cast(c) => Expression::Cast(Cast::from_handle(c)?),
+            DuckExpression::Cast(c) => Cast::from_handle(c)?,
             DuckExpression::Unsupported(t) => return Err(Error::UnsupportedExpressionType(t)),
         })
     }
@@ -150,14 +150,50 @@ impl Case {
 }
 
 impl Cast {
-    pub(crate) fn from_handle(view: CastHandle<'_>) -> Result<Cast, Error> {
+    pub(crate) fn from_handle(view: CastHandle<'_>) -> Result<Expression, Error> {
         // A `BoundCastExpression`'s target is its own result type.
         let target = type_from_logical(view.return_type())?;
-        Ok(Cast {
+        let source = Expression::from_handle(view.child())?;
+
+        // A cast over a variant is a typed path read: fold it, and the chain
+        // of `->` extractions beneath it, into one typed VariantGet, so the
+        // kernel reads a shredded leaf of the target type directly instead of
+        // materializing intermediate sub-variants. A target outside pivot's
+        // type set already failed `type_from_logical` above; of the rest, only
+        // a cast to VARIANT itself is not a read.
+        if matches!(source.result_type(), Ok(Type::Variant)) {
+            if !VariantGet::supports_cast_to(&target) {
+                return Err(Error::UnsupportedScalarFunction(format!(
+                    "cannot cast a VARIANT to {target}"
+                )));
+            }
+            let (input, path) = collapse_extractions(source);
+            return Ok(Expression::Function(Function::VariantGet(VariantGet {
+                input: Box::new(input),
+                path,
+                as_type: Some(target),
+            })));
+        }
+
+        Ok(Expression::Cast(Cast {
             target_arrow: physical_arrow_type(&target),
             target,
-            source: Box::new(Expression::from_handle(view.child())?),
-        })
+            source: Box::new(source),
+        }))
+    }
+}
+
+/// Peel a chain of bare `->` extractions, returning the base expression and the
+/// concatenated path (empty when `e` isn't an extraction, e.g. a cast directly
+/// over a variant column).
+fn collapse_extractions(e: Expression) -> (Expression, Vec<String>) {
+    match e {
+        Expression::Function(Function::VariantGet(extraction)) if extraction.as_type.is_none() => {
+            let (input, mut path) = collapse_extractions(*extraction.input);
+            path.extend(extraction.path);
+            (input, path)
+        }
+        other => (other, Vec::new()),
     }
 }
 
@@ -267,6 +303,13 @@ impl Function {
             "make_timestamp" => Ok(Function::TemporalConvert(TemporalConvert::make_timestamp(
                 func,
             )?)),
+            // Variant field access: DuckDB's binder rewrites `d.age` to
+            // `variant_extract` (its native VARIANT function) and `d->'age'` to
+            // `json_extract` (which resolves against pivot's registry). Both are
+            // one extracted field.
+            "variant_extract" | "json_extract" => {
+                Ok(Function::VariantGet(VariantGet::from_handle(func)?))
+            }
             "drop_cache" => {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
@@ -282,6 +325,20 @@ impl Function {
                 None => Err(Error::UnsupportedScalarFunction(name)),
             },
         }
+    }
+}
+
+impl VariantGet {
+    /// A bare `doc->'key'`: one extracted field, yielding the sub-variant. A
+    /// cast above it types the read ([`Cast::from_handle`] fuses the chain).
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<VariantGet, Error> {
+        let params = function_args(func, 2)?;
+        let field = constant_string(Expression::from_handle(params[1])?, "->: field name")?;
+        Ok(VariantGet {
+            input: Box::new(Expression::from_handle(params[0])?),
+            path: vec![field],
+            as_type: None,
+        })
     }
 }
 

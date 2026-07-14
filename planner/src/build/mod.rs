@@ -25,13 +25,13 @@ use duckdb_planner::handle::{
 
 use crate::catalog::Table;
 use crate::dynamic_filter::DynamicFilter;
-use crate::expression::{Error as ExpressionError, Expression, Ref};
+use crate::expression::{Error as ExpressionError, Expression, Function, Ref, VariantToJson};
 use crate::operator::{
     Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Limit,
     Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
 };
 use crate::plan::{self, PlanNode};
-use crate::types::type_from_logical;
+use crate::types::{Type, type_from_logical};
 
 mod expression;
 mod operator;
@@ -73,7 +73,49 @@ pub(crate) fn build_plan(root: LogicalOp<'_>) -> Result<PlanNode, plan::Error> {
     let mut ctx = BuildCtx {
         dynamic_filter_slots: HashMap::new(),
     };
-    Ok(build_node(root, &mut ctx)?)
+    let plan = build_node(root, &mut ctx)?;
+    Ok(render_variant_outputs(plan)?)
+}
+
+/// Render the query's variant-typed output columns as JSON text.
+///
+/// A variant's physical layout can differ per file (each file shreds by its own
+/// data), so handing the raw struct to the client would mean result batches of
+/// varying shape, and an unreadable binary value even when they don't vary.
+/// When the plan's output contains a variant column, wrap the whole plan in one
+/// more projection that renders those columns and passes the rest through, so
+/// the client always sees uniform JSON text. Asking the plan for its
+/// [`output_types`](PlanNode::output_types) makes this work for any root
+/// operator; below the added projection, everything still operates on the raw
+/// variant.
+fn render_variant_outputs(plan: PlanNode) -> Result<PlanNode, crate::compile::Error> {
+    let types = plan.output_types()?;
+    if !types.contains(&Type::Variant) {
+        return Ok(plan);
+    }
+
+    let projections = types
+        .iter()
+        .enumerate()
+        .map(|(column_idx, column_type)| {
+            let column = Expression::Ref(Ref {
+                column_idx,
+                return_type: column_type.clone(),
+                name: None,
+            });
+            match column_type {
+                Type::Variant => Expression::Function(Function::VariantToJson(VariantToJson {
+                    input: Box::new(column),
+                })),
+                _ => column,
+            }
+        })
+        .collect();
+    Ok(PlanNode {
+        name: "render variant outputs".to_string(),
+        inputs: vec![plan],
+        operator: Operator::Projection(Projection { projections }),
+    })
 }
 
 fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, OperatorError> {
@@ -294,4 +336,67 @@ fn prepare_narrow_scan(node: &mut PlanNode) -> Option<Box<dyn Table>> {
         return Some(input.table.clone_box());
     }
     prepare_narrow_scan(node.inputs.first_mut()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operator::Aggregate;
+
+    fn variant_ref(column_idx: usize) -> Expression {
+        Expression::Ref(Ref {
+            column_idx,
+            return_type: Type::Variant,
+            name: None,
+        })
+    }
+
+    /// A variant output is rendered even when the root isn't a projection:
+    /// `output_types` sees through any operator, and the render wraps the
+    /// whole plan rather than rewriting inside it.
+    #[test]
+    fn renders_a_variant_output_under_an_aggregate_root() {
+        let plan = PlanNode {
+            name: "aggregate".to_string(),
+            inputs: Vec::new(),
+            operator: Operator::Aggregate(Aggregate {
+                groups: vec![variant_ref(0)],
+                expressions: Vec::new(),
+                output_limit: None,
+            }),
+        };
+
+        let rendered = render_variant_outputs(plan).unwrap();
+
+        assert_eq!(rendered.output_types().unwrap(), vec![Type::Utf8]);
+        let Operator::Projection(projection) = &rendered.operator else {
+            panic!("expected a render projection above the aggregate root");
+        };
+        assert!(matches!(
+            &projection.projections[0],
+            Expression::Function(Function::VariantToJson(_))
+        ));
+    }
+
+    /// A plan without variant outputs is returned untouched, with no extra
+    /// projection.
+    #[test]
+    fn leaves_variant_free_outputs_alone() {
+        let plan = PlanNode {
+            name: "projection".to_string(),
+            inputs: Vec::new(),
+            operator: Operator::Projection(Projection {
+                projections: vec![Expression::Ref(Ref {
+                    column_idx: 0,
+                    return_type: Type::Int64,
+                    name: None,
+                })],
+            }),
+        };
+
+        let rendered = render_variant_outputs(plan).unwrap();
+
+        assert_eq!(rendered.output_types().unwrap(), vec![Type::Int64]);
+        assert!(rendered.inputs.is_empty(), "no wrapper was added");
+    }
 }

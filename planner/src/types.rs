@@ -61,6 +61,10 @@ pub enum Type {
     /// `date_trunc`. The source parquet stores it as packed epoch *seconds* in
     /// an `Int64` column, so the executor treats it as `Int64` seconds.
     Timestamp,
+    /// A Parquet `variant` (semi-structured / JSON) column, presented to DuckDB
+    /// as its native `VARIANT` type: `d.age`, `d->'age'`, and casts all bind
+    /// natively. The executor sees the Arrow struct of leaves the file stores.
+    Variant,
 }
 
 impl fmt::Display for Type {
@@ -82,6 +86,7 @@ impl fmt::Display for Type {
             Type::Utf8 => "Utf8",
             Type::Date => "Date",
             Type::Timestamp => "Timestamp",
+            Type::Variant => "Variant",
         };
         f.write_str(name)
     }
@@ -172,6 +177,19 @@ type_conversions! {
     (Type::Utf8,      LogicalTypeId::VARCHAR,   DataType::Utf8View),
     (Type::Date,      LogicalTypeId::DATE,      DataType::Date32),
     (Type::Timestamp, LogicalTypeId::TIMESTAMP, DataType::Timestamp(TimeUnit::Second, None)),
+    (Type::Variant,   LogicalTypeId::VARIANT,   variant_struct_type()),
+}
+
+/// The nominal arrow shape of an unshredded variant column: the spec's two
+/// binary leaves. A file may carry additional shredded `typed_value` leaves, so
+/// a scanned batch's actual struct can be wider; everything that touches a
+/// variant (the `->` extraction) reads any layout, and this shape only serves
+/// as the column's pre-scan placeholder type.
+fn variant_struct_type() -> DataType {
+    DataType::Struct(arrow_schema::Fields::from(vec![
+        arrow_schema::Field::new("metadata", DataType::BinaryView, false),
+        arrow_schema::Field::new("value", DataType::BinaryView, true),
+    ]))
 }
 
 /// Convert a typed DuckDB [`ScalarValue`] into an arrow [`Scalar<ArrayRef>`]

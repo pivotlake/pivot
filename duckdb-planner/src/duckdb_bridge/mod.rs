@@ -22,7 +22,7 @@ use crate::catalog_provider::{
 /// reads fields straight off the C++ objects.
 #[cxx::bridge]
 pub mod ffi {
-    /// Column definition for FFI — carries the type as a `u8` discriminant
+    /// Column definition for FFI, carrying the type as a `u8` discriminant
     /// because CXX cannot pass Rust enums across the bridge.
     struct DuckDBColumn {
         pub name: String,
@@ -46,15 +46,21 @@ pub mod ffi {
         pub columns: Vec<DuckDBColumn>,
     }
 
-    /// Result of a catalog scalar-function lookup: the function's argument and
-    /// return types (DuckDB logical type id discriminants) and whether it must be
-    /// registered `VOLATILE`, or `found = false` if the provider has no such
-    /// function.
-    struct CatalogGetScalarFunctionResult {
-        pub found: bool,
+    /// A scalar function the provider defines, described for DuckDB's binder:
+    /// its argument and return types (DuckDB logical type id discriminants),
+    /// plus whether it must be marked `VOLATILE` so the optimizer can't fold
+    /// the call away before pivot re-plans it.
+    struct ScalarFunctionDef {
         pub arg_type_ids: Vec<u8>,
         pub return_type_id: u8,
         pub is_volatile: bool,
+    }
+
+    /// Result of a catalog scalar-function lookup, or `found = false` if the
+    /// provider has no such function.
+    struct CatalogGetScalarFunctionResult {
+        pub found: bool,
+        pub function: ScalarFunctionDef,
     }
 
     /// Outcome of `extract_plan`.

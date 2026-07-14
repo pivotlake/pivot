@@ -28,7 +28,16 @@ impl TestTable {
     fn new(dispatch: &Dispatch, columns: &[(&str, Type, ArrayRef)]) -> Self {
         let fields: Vec<Field> = columns
             .iter()
-            .map(|(name, _, array)| Field::new(*name, array.data_type().clone(), false))
+            .map(|(name, col_type, array)| {
+                let field = Field::new(*name, array.data_type().clone(), false);
+                // A variant column keeps its extension tag: the parquet writer
+                // stamps the VARIANT logical type from it, which the reader in
+                // turn needs to hand the binary leaves back as binary.
+                match col_type {
+                    Type::Variant => field.with_metadata(variant_extension_metadata()),
+                    _ => field,
+                }
+            })
             .collect();
         let schema = Arc::new(Schema::new(fields));
         let arrays: Vec<ArrayRef> = columns.iter().map(|(_, _, array)| array.clone()).collect();
@@ -45,8 +54,9 @@ impl TestTable {
     }
 
     /// A table whose data spans one parquet file per batch. The batches may
-    /// differ physically per file, as real ingested files do; each batch's
-    /// own schema is written as-is.
+    /// differ physically (e.g. a variant column shredded differently, or not
+    /// at all, per file), as real ingested files do; each batch's own schema
+    /// is written as-is.
     fn from_batches(dispatch: &Dispatch, columns: Vec<Column>, batches: &[RecordBatch]) -> Self {
         let dir = TempDir::new().unwrap();
         let props = WriterProperties::builder()
@@ -145,7 +155,7 @@ impl TestCatalog {
     }
 
     /// Register a table whose data spans one parquet file per batch (the files
-    /// may differ physically per file).
+    /// may differ physically, e.g. a variant column shredded per file).
     pub fn add_table_files(
         &self,
         dispatch: &Dispatch,
@@ -177,6 +187,19 @@ impl Catalog for TestCatalog {
     ) -> ::planner::catalog::Result<::dispatch::RecordBatchOperatorSpec> {
         unreachable!("test helper catalog does not support CREATE TABLE")
     }
+}
+
+/// The Arrow field metadata that marks a struct column as a Parquet variant.
+fn variant_extension_metadata() -> HashMap<String, String> {
+    use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
+    [
+        (
+            EXTENSION_TYPE_NAME_KEY.to_owned(),
+            "arrow.parquet.variant".to_owned(),
+        ),
+        (EXTENSION_TYPE_METADATA_KEY.to_owned(), String::new()),
+    ]
+    .into()
 }
 
 fn int_col(values: Vec<i32>) -> ArrayRef {
