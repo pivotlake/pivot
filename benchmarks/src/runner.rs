@@ -340,6 +340,11 @@ pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<Su
         if opts.drop_caches {
             cold_clear(&client).await?;
         }
+        if let Some(ms) = opts.sleep_ms
+            && !runs.is_empty()
+        {
+            sleep(Duration::from_millis(ms));
+        }
         let (run, last_output) = run_query(&client, query, opts).await?;
         if !opts.skip_check {
             check_or_update_expected(query, &last_output, opts.update_results)?;
