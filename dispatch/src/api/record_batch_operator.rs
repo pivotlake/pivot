@@ -312,7 +312,7 @@ impl RecordBatchOperatorSpec {
         unary_factories: impl IntoIterator<Item = UF>,
     ) -> Self {
         let siblings_left = Arc::new(AtomicUsize::new(self.worker_count()));
-        let factories = stealable::<RecordBatch>(self.worker_count())
+        let factories = stealable::<RecordBatch>(self.dispatcher.topology())
             .into_iter()
             .zip(unary_factories)
             .zip(self.factories)
@@ -419,7 +419,7 @@ impl RecordBatchOperatorSpec {
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
-        let factories: Vec<_> = stealable::<RecordBatch>(worker_count)
+        let factories: Vec<_> = stealable::<RecordBatch>(self.dispatcher.topology())
             .into_iter()
             .zip((0..worker_count).map(|_| MapFactory(builder())))
             .zip(self.factories)
@@ -531,7 +531,7 @@ impl RecordBatchOperatorSpec {
         self,
         key_cols: Vec<usize>,
     ) -> Self {
-        let worker_count = self.worker_count();
+        let topology = self.dispatcher.topology();
         let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K, Distinct>::create_for_workers(
             key_cols,
@@ -539,7 +539,7 @@ impl RecordBatchOperatorSpec {
             K::Config::default(),
             None,
             true,
-            worker_count,
+            topology,
             buffers,
         ))
     }
@@ -556,7 +556,7 @@ impl RecordBatchOperatorSpec {
         output_limit: Option<GroupLimit>,
         key_config: K::Config,
     ) -> Self {
-        let worker_count = self.worker_count();
+        let topology = self.dispatcher.topology();
         let buffers = self.dispatcher.buffers;
         self.unary(GroupFactory::<K, V>::create_for_workers(
             key_cols,
@@ -564,7 +564,7 @@ impl RecordBatchOperatorSpec {
             key_config,
             output_limit,
             false,
-            worker_count,
+            topology,
             buffers,
         ))
     }

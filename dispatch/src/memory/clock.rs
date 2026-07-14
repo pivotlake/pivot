@@ -3,9 +3,9 @@
 //! [`DecompressedCache`](super::decompressed_cache::DecompressedCache), indexed
 //! by ring slot.
 //!
-//! ## Two hands, one target share
+//! ## Two hands per region, one target share
 //!
-//! Each tier has its own hand sweeping the same slot array. A hand only acts on
+//! Each tier has its own hand sweeping the slot array. A hand only acts on
 //! slots of its own tier - anything else (free, or the other tier) is stepped
 //! over without touching its counter - so a tier's blocks age only while that
 //! tier is being evicted from. Which hand moves is the evictor's choice
@@ -13,6 +13,12 @@
 //! share of all cached slots against a target percentage), making the
 //! compressed/decompressed balance an explicit knob instead of an emergent
 //! property of per-tier lifetimes.
+//!
+//! Slot state (`owner`, `refs`) is global: any worker's hit may `touch` any
+//! slot. The sweep, however, is per NUMA node: each node has its own pair of
+//! hands covering only that node's slot region, so eviction only ever frees
+//! slots the evicting worker may acquire (node-local memory placement, see
+//! [`RingLayout`](super::RingLayout)).
 //!
 //! Within a tier, CLOCK rules apply: each slot has a small "lives" counter,
 //! the hand decrements it on each pass, and a slot at zero is the victim. A
@@ -86,30 +92,45 @@ struct Slot {
     bump: AtomicU8,
 }
 
-/// One CLOCK over every ring slot, swept by two per-tier hands.
+/// One CLOCK over every ring slot, swept by two per-tier hands per node
+/// region.
 pub struct Clock {
     slots: Box<[Slot]>,
-    compressed_hand: AtomicUsize,
-    decompressed_hand: AtomicUsize,
+    /// One compressed-tier sweep hand per node region; region `r` covers
+    /// `r * slots_per_region..(r + 1) * slots_per_region`.
+    compressed_hands: Box<[AtomicUsize]>,
+    /// The decompressed tier's counterpart of `compressed_hands`.
+    decompressed_hands: Box<[AtomicUsize]>,
+    slots_per_region: usize,
     /// Slots currently bound [`Owner::Compressed`] / [`Owner::Decompressed`],
     /// maintained by [`bind`](Self::bind)/[`release`](Self::release) - the two
-    /// functions every ownership transition goes through.
+    /// functions every ownership transition goes through. Global across
+    /// regions: the compressed/decompressed balance is a property of the whole
+    /// ring, not of any one node's share of it.
     compressed_count: AtomicUsize,
     decompressed_count: AtomicUsize,
 }
 
 impl Clock {
+    /// A single-region clock over `len` slots (single-node machines, tests).
     pub fn new(len: usize) -> Self {
+        Self::with_regions(1, len)
+    }
+
+    /// A clock over `region_count * slots_per_region` slots with one sweep
+    /// hand per tier per region.
+    pub fn with_regions(region_count: usize, slots_per_region: usize) -> Self {
         Self {
-            slots: (0..len)
+            slots: (0..region_count * slots_per_region)
                 .map(|_| Slot {
                     owner: AtomicU8::new(FREE),
                     refs: AtomicU8::new(0),
                     bump: AtomicU8::new(1),
                 })
                 .collect(),
-            compressed_hand: AtomicUsize::new(0),
-            decompressed_hand: AtomicUsize::new(0),
+            compressed_hands: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
+            decompressed_hands: (0..region_count).map(|_| AtomicUsize::new(0)).collect(),
+            slots_per_region,
             compressed_count: AtomicUsize::new(0),
             decompressed_count: AtomicUsize::new(0),
         }
@@ -210,16 +231,18 @@ impl Clock {
         *REINFORCE_BUMP
     }
 
-    /// Advance `tier`'s hand one slot and age it. Returns the slot if it is an
-    /// eviction candidate this pass (owned by `tier`, counter at zero); `None`
-    /// when the slot belongs to anything else (stepped over, untouched) or
-    /// still had a life to spend.
-    pub fn advance(&self, tier: Owner) -> Option<usize> {
-        let hand = match tier {
-            Owner::Compressed => &self.compressed_hand,
-            Owner::Decompressed => &self.decompressed_hand,
+    /// Advance `tier`'s hand for `region` one slot and age it. Returns the
+    /// slot if it is an eviction candidate this pass (owned by `tier`, counter
+    /// at zero); `None` when the slot belongs to anything else (stepped over,
+    /// untouched) or still had a life to spend. Only sweeps `region`'s slots,
+    /// so the caller can never be handed another node's memory.
+    pub fn advance(&self, tier: Owner, region: usize) -> Option<usize> {
+        let hands = match tier {
+            Owner::Compressed => &self.compressed_hands,
+            Owner::Decompressed => &self.decompressed_hands,
         };
-        let slot = hand.fetch_add(1, Relaxed) % self.slots.len();
+        let offset = hands[region].fetch_add(1, Relaxed) % self.slots_per_region;
+        let slot = region * self.slots_per_region + offset;
         if self.owner(slot) != Some(tier) {
             return None;
         }
@@ -236,10 +259,11 @@ impl Clock {
 mod tests {
     use super::*;
 
-    /// Sweep `tier`'s hand until it reports a victim, returning that slot.
+    /// Sweep `tier`'s region-0 hand until it reports a victim, returning that
+    /// slot.
     fn evict(clock: &Clock, tier: Owner) -> usize {
         loop {
-            if let Some(slot) = clock.advance(tier) {
+            if let Some(slot) = clock.advance(tier, 0) {
                 return slot;
             }
         }
@@ -249,8 +273,8 @@ mod tests {
     fn a_free_slot_is_never_a_victim() {
         let clock = Clock::new(1);
 
-        assert_eq!(clock.advance(Owner::Compressed), None);
-        assert_eq!(clock.advance(Owner::Decompressed), None);
+        assert_eq!(clock.advance(Owner::Compressed, 0), None);
+        assert_eq!(clock.advance(Owner::Decompressed, 0), None);
     }
 
     #[test]
@@ -270,7 +294,7 @@ mod tests {
         clock.bind(1, Owner::Decompressed);
 
         for _ in 0..10 {
-            clock.advance(Owner::Decompressed);
+            clock.advance(Owner::Decompressed, 0);
         }
 
         assert_eq!(clock.refs(0), 1, "aged by the other tier's hand");
@@ -304,14 +328,14 @@ mod tests {
     fn reinforce_grants_extra_sweeps_immediately() {
         let clock = Clock::new(1);
         clock.bind(0, Owner::Decompressed);
-        clock.advance(Owner::Decompressed); // its one insert-time life, spent
+        clock.advance(Owner::Decompressed, 0); // its one insert-time life, spent
 
         clock.reinforce(0); // one immediate REINFORCE_BUMP worth of lives
 
         for _ in 0..clock.reinforce_bump() {
-            assert_eq!(clock.advance(Owner::Decompressed), None);
+            assert_eq!(clock.advance(Owner::Decompressed, 0), None);
         }
-        assert_eq!(clock.advance(Owner::Decompressed), Some(0)); // now the victim
+        assert_eq!(clock.advance(Owner::Decompressed, 0), Some(0)); // now the victim
     }
 
     #[test]
@@ -337,8 +361,8 @@ mod tests {
         for _ in 0..4 {
             clock.touch(0);
             clock.touch(1);
-            clock.advance(Owner::Decompressed);
-            clock.advance(Owner::Decompressed);
+            clock.advance(Owner::Decompressed, 0);
+            clock.advance(Owner::Decompressed, 0);
         }
 
         assert!(clock.refs(0) > 8, "last copy should climb");
@@ -404,6 +428,22 @@ mod tests {
         clock.bind(0, Owner::Decompressed);
         clock.release(0);
 
-        assert_eq!(clock.advance(Owner::Decompressed), None);
+        assert_eq!(clock.advance(Owner::Decompressed, 0), None);
+    }
+
+    #[test]
+    fn a_regions_sweep_never_touches_another_regions_slots() {
+        let clock = Clock::with_regions(2, 2);
+        clock.bind(0, Owner::Decompressed);
+        clock.bind(3, Owner::Decompressed);
+
+        // Sweeping region 1 repeatedly evicts only its own slot; region 0's
+        // victim stays for region 0's own sweep.
+        for _ in 0..8 {
+            if let Some(slot) = clock.advance(Owner::Decompressed, 1) {
+                assert!(slot >= 2);
+            }
+        }
+        assert_eq!(evict(&clock, Owner::Decompressed), 0);
     }
 }

@@ -29,7 +29,7 @@ use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use core_affinity::CoreId;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -51,18 +51,31 @@ use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
 thread_local! {
+    /// This worker's global index, dense across all NUMA node groups
+    /// (`0..NUM_WORKERS`, node 0's workers first).
     pub static WORKER_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// Total workers across all node groups.
     pub static NUM_WORKERS: Cell<usize> = const { Cell::new(usize::MAX) };
-    /// Worker-thread-only handle to the shared [`WorkerWaker`].
+    /// The NUMA node group this worker belongs to.
+    static NODE_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+    /// Worker-thread-only handle to this node group's [`WorkerWaker`].
     ///
     /// Set once by [`Worker::create`] before the event loop starts, so that
     /// worker-side code (channel sends, the worker's own park path) can call
     /// [`worker_waker`] without threading an extra parameter through every
-    /// call site. Non-worker threads — the embedding server, cancellation
-    /// handles created off-worker — must instead reach the same instance
-    /// through their owned `Arc<WorkerWaker>` (e.g.
-    /// [`crate::DataFlowDispatcher::waker`]).
+    /// call site. Non-worker threads (the embedding server, cancellation
+    /// handles created off-worker) must instead reach the wakers through an
+    /// owned [`WakerSet`] (e.g. the one a dispatched dataflow's handle holds).
     static WORKER_WAKER: Cell<*const WorkerWaker> = const { Cell::new(std::ptr::null()) };
+    /// Worker-thread-only handle to the full [`WakerSet`], for the (rare)
+    /// notifies that must reach beyond this worker's own node.
+    static WAKER_SET_OWNER: RefCell<Option<Box<WakerSet>>> = const { RefCell::new(None) };
+    static WAKER_SET: Cell<*const WakerSet> = const { Cell::new(std::ptr::null()) };
+}
+
+/// The node group of the current worker thread.
+pub fn current_node() -> usize {
+    NODE_IDX.get()
 }
 
 /// Wake mechanism shared by all workers. Holds a monotonic `wake_count` and a
@@ -148,15 +161,74 @@ impl WorkerWaker {
     }
 }
 
-/// Install this thread's view of the shared [`WorkerWaker`].
+/// One [`WorkerWaker`] per NUMA node group, with routing from a worker index
+/// to its node's waker.
+///
+/// Wakers are per node so the hot paths stay node-local: a channel send wakes
+/// only same-node siblings (the only ones that can steal the item), and each
+/// waker's `wake_count` cacheline is written and spin-polled by one node's
+/// workers only. Events that can unblock workers on *other* nodes (a new
+/// dataflow, cancellation, a sibling counter reaching zero, a collector
+/// publishing work) must use [`notify_all`](Self::notify_all) or
+/// [`notify_worker`](Self::notify_worker) instead of the local
+/// [`worker_waker`].
+#[derive(Clone)]
+pub struct WakerSet {
+    node_wakers: Arc<[Arc<WorkerWaker>]>,
+    workers_per_node: usize,
+}
+
+impl WakerSet {
+    pub fn new(node_wakers: impl Into<Arc<[Arc<WorkerWaker>]>>, workers_per_node: usize) -> Self {
+        Self {
+            node_wakers: node_wakers.into(),
+            workers_per_node,
+        }
+    }
+
+    /// Wake the node group that `worker` (a global worker index) belongs to.
+    /// Used by channels that target a specific worker, so a cross-node send
+    /// wakes the receiver's node rather than the sender's.
+    pub fn notify_worker(&self, worker: usize) {
+        self.node_wakers[worker / self.workers_per_node].notify();
+    }
+
+    /// Wake every node group. For events whose consumers may be parked on any
+    /// node; cheap when nobody is parked (one atomic bump per node).
+    pub fn notify_all(&self) {
+        for waker in self.node_wakers.iter() {
+            waker.notify();
+        }
+    }
+}
+
+/// Install this thread's view of its node group's [`WorkerWaker`].
 ///
 /// Called by [`Worker::create`] before the event loop starts (and by
 /// `install_test_worker_waker` from test setup). The `Arc` is kept alive
-/// by the [`Worker`] itself / by [`crate::DataFlowDispatcher`] / by the
-/// (leaked) test waker, so the raw pointer cached here is valid for the
-/// lifetime of the thread.
+/// by the [`Worker`] itself / by the [`WakerSet`] installed alongside it /
+/// by the (leaked) test waker, so the raw pointer cached here is valid for
+/// the lifetime of the thread.
 pub fn init_worker_waker(waker: &Arc<WorkerWaker>) {
     WORKER_WAKER.set(Arc::as_ptr(waker));
+}
+
+/// Install this thread's [`WakerSet`], the cross-node counterpart of
+/// [`init_worker_waker`]. The set is boxed into a thread-local owner so the
+/// cached raw pointer stays valid for the lifetime of the thread.
+pub fn init_waker_set(set: WakerSet) {
+    WAKER_SET_OWNER.with_borrow_mut(|slot| {
+        let boxed = Box::new(set);
+        WAKER_SET.set(&*boxed as *const WakerSet);
+        *slot = Some(boxed);
+    });
+}
+
+/// The full [`WakerSet`] for code running on a worker thread. Mirrors
+/// [`worker_waker`]: trusted to be installed (workers do it in
+/// [`Worker::create`], tests via `install_test_worker_waker`).
+pub fn waker_set() -> &'static WakerSet {
+    unsafe { &*WAKER_SET.get() }
 }
 
 /// Return the shared [`WorkerWaker`] for code running on a worker thread.
@@ -180,6 +252,8 @@ pub fn worker_waker() -> &'static WorkerWaker {
 pub(crate) fn install_test_worker_waker() {
     let waker = Arc::new(WorkerWaker::new());
     init_worker_waker(&waker);
+    NODE_IDX.set(0);
+    init_waker_set(WakerSet::new(vec![waker.clone()], NUM_WORKERS.get().max(1)));
     std::mem::forget(waker);
 }
 
@@ -197,8 +271,10 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 /// thread with affinity to a CPU which continuously requests work from the dispatcher and does it.
 ///
 /// The main idea of a Worker is to keep everything possible "local" to it, to prevent
-/// context-switching/CPU cache-invalidation and in the future allow NUMA optimizations etc. We try
-/// to make our physical CPU cores first class citizens.
+/// context-switching/CPU cache-invalidation. Workers are grouped by NUMA node (see
+/// [`Dispatch::spin_up`](crate::Dispatch::spin_up)); every dataflow runs on all workers,
+/// but each worker allocates only node-local ring memory and steals work only from
+/// same-node siblings. We try to make our physical CPU cores first class citizens.
 ///
 /// The Worker receives dataflows from the Dispatcher and runs them- the logic is outlined is as
 /// follows:
@@ -254,6 +330,7 @@ impl Worker {
     pub fn create(
         idx: usize,
         num_workers: usize,
+        node: usize,
         core: CoreId,
         should_exit: Arc<AtomicBool>,
         memory_context_factory: MemoryContextFactory,
@@ -261,6 +338,7 @@ impl Worker {
         receiver: Receiver<DataFlowBuilder>,
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
+        waker_set: WakerSet,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
             // Worker startup (io_uring + memory-context setup) can fail. Every worker
@@ -270,6 +348,14 @@ impl Worker {
             let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 WORKER_IDX.set(idx);
                 NUM_WORKERS.set(num_workers);
+                NODE_IDX.set(node);
+                // Pin to this worker's core BEFORE touching any memory, so everything
+                // this worker first-faults - its node-local ring (via `prefault_buffers`),
+                // free pools, and io_uring buffers - lands on this core's NUMA node. Pages
+                // are placed where first written under the default policy, so prefaulting
+                // before pinning would scatter the ring across nodes and defeat the
+                // per-node split.
+                core_affinity::set_for_current(core);
                 // Register this worker's OS tid so the server can scope a
                 // `perf record -t` to the worker pool.
                 #[cfg(feature = "perf")]
@@ -277,6 +363,7 @@ impl Worker {
                 let last_seen_wake_count = waker.wake_count();
                 debug!("Initializing worker waker {:?}", idx);
                 init_worker_waker(&waker);
+                init_waker_set(waker_set);
                 // Give this worker thread a handle to the shared disk cache so
                 // `drop_cache()` can clear it; the requester takes ownership.
                 crate::io::disk_cache::install_worker_disk_cache(disk_cache.clone());
@@ -294,7 +381,6 @@ impl Worker {
                 init_memory_context(memory_context_factory.create_memory_ctx());
                 debug!("Pre-faulting for worker {:?}", idx);
                 memory_ctx().prefault_buffers();
-                core_affinity::set_for_current(core);
                 worker
             }));
             debug!("Waiting for barrier for worker {:?}", idx);

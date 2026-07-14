@@ -49,7 +49,7 @@
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
-use crate::worker::worker_waker;
+use crate::worker::waker_set;
 use arrow::compute::kernels::cmp;
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
 use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
@@ -387,8 +387,9 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
         // and would otherwise drop its sender silently — if that drop is the
         // one that disconnects the channel and the receiver is parked, it sleeps
         // forever. Dropping first means the wake reflects the post-drop state.
+        // The receiver may be parked on another node, so wake every node.
         drop(sender);
-        worker_waker().notify();
+        waker_set().notify_all();
 
         Ok(receiver.map(|rx| OrderByLimitOutputter {
             rx,
@@ -632,10 +633,11 @@ mod tests {
     /// can sleep through the final disconnect and the query hangs forever.
     #[test]
     fn into_outputter_notifies_even_with_no_local_top_k() {
-        use crate::worker::{WorkerWaker, init_worker_waker};
+        use crate::worker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
 
         let waker = Arc::new(WorkerWaker::new());
         init_worker_waker(&waker);
+        init_waker_set(WakerSet::new(vec![waker.clone()], 1));
 
         let (tx, rx) = mpsc::channel::<RecordBatch>();
         // Freshly built, nothing consumed -> `running_top_k` is None.

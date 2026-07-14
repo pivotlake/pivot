@@ -4,8 +4,8 @@ use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
-use crate::memory::{BUFFER_SIZE, Ring, WriteBuffer};
-use crate::worker::{NUM_WORKERS, WORKER_IDX};
+use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
+use crate::worker::WORKER_IDX;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::sync::{Arc, LazyLock};
 
@@ -45,32 +45,55 @@ pub struct MemoryContextFactory {
     clock: Arc<Clock>,
     dirty_pool_factory: PoolFactory,
     zeroed_pool_factory: PoolFactory,
+    layout: RingLayout,
+    node: usize,
 }
 
 impl MemoryContextFactory {
-    pub fn create_many(count: usize, buffers: usize) -> Vec<Self> {
+    /// Build one factory per worker (global worker order) over a single shared
+    /// ring, both caches, and the clock, partitioned per `layout`: each worker
+    /// prefaults, acquires, and evicts only its own node's slot region, so its
+    /// memory placement stays node-local, while all cached data remains
+    /// readable (and releasable) from every worker.
+    pub fn create_for_layout(layout: RingLayout) -> Vec<Self> {
         assert!(
             MEMORY_CTX_PTR.get().is_null(),
             "another memory context is already active!"
         );
 
+        let buffers = layout.total_slots();
+        let topology = layout.topology();
         let ring = Arc::new(Ring::new(buffers).unwrap());
         let compressed_cache = Arc::new(CompressedCache::new(buffers));
         let decompressed_cache = Arc::new(DecompressedCache::new(buffers));
-        let clock = Arc::new(Clock::new(buffers));
-        let mut zeroed_pool_factories = PoolFactory::create_many(count);
-        let mut dirty_pool_factories = PoolFactory::create_many(count);
+        let clock = Arc::new(Clock::with_regions(
+            topology.node_count,
+            buffers / topology.node_count,
+        ));
+        let zeroed_pool_factories = PoolFactory::create_for_layout(layout);
+        let dirty_pool_factories = PoolFactory::create_for_layout(layout);
 
-        (0..count)
-            .map(|_| Self {
+        zeroed_pool_factories
+            .into_iter()
+            .zip(dirty_pool_factories)
+            .enumerate()
+            .map(|(worker, (zeroed_pool_factory, dirty_pool_factory))| Self {
                 ring: ring.clone(),
                 compressed_cache: compressed_cache.clone(),
                 decompressed_cache: decompressed_cache.clone(),
                 clock: clock.clone(),
-                dirty_pool_factory: dirty_pool_factories.pop().unwrap(),
-                zeroed_pool_factory: zeroed_pool_factories.pop().unwrap(),
+                dirty_pool_factory,
+                zeroed_pool_factory,
+                layout,
+                node: topology.node_of_worker(worker),
             })
             .collect()
+    }
+
+    /// Single-node convenience over [`create_for_layout`](Self::create_for_layout):
+    /// `count` workers sharing a `buffers`-slot ring with no NUMA split.
+    pub fn create_many(count: usize, buffers: usize) -> Vec<Self> {
+        Self::create_for_layout(RingLayout::single_node(count, buffers))
     }
 
     pub fn create_memory_ctx(self) -> MemoryContext {
@@ -83,6 +106,8 @@ impl MemoryContextFactory {
             zeroed_pool: self.zeroed_pool_factory.create_pool(),
             compressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
             decompressed_fill_cursor: UnsafeCell::new(FillCursor::empty()),
+            layout: self.layout,
+            node: self.node,
         }
     }
 }
@@ -102,14 +127,25 @@ pub struct MemoryContext {
     /// discipline the caches use for their per-slot metadata.
     compressed_fill_cursor: UnsafeCell<FillCursor>,
     decompressed_fill_cursor: UnsafeCell<FillCursor>,
+    /// How ring slots map to nodes and home workers (shared by all contexts).
+    layout: RingLayout,
+    /// This worker's NUMA node, i.e. the ring region it allocates and evicts from.
+    node: usize,
 }
 
 impl MemoryContext {
     pub fn prefault_buffers(&self) {
-        // Pre-fault buffers (strided by NUM_WORKERS) so each worker faults different pages.
+        // Fault in the slots this worker is home to, so under first-touch their
+        // pages land on this worker's (already pinned) core's NUMA node. Homes
+        // partition each node's region across that node's workers, so every
+        // slot is faulted exactly once, by a worker on its own node.
         // We forget the WriteBuffer to avoid the Drop impl pushing to the dirty pool,
         // then manually release the slot and push to the zeroed pool.
-        for i in (WORKER_IDX.get()..self.ring.len()).step_by(NUM_WORKERS.get()) {
+        let worker = WORKER_IDX.get();
+        for i in self.layout.node_slots(self.node) {
+            if self.layout.home_worker(i) != worker {
+                continue;
+            }
             let mut write = memory_ctx().ring().try_write(i).unwrap();
             for j in (0..BUFFER_SIZE).step_by(4096) {
                 write.as_mut()[j] = 1u8;
@@ -259,8 +295,9 @@ impl MemoryContext {
         // reaches zero in at most that many), so more than both hands' worth
         // combined is abnormal: warn and sleep to let peer workers / ingest
         // release slots; if it still finds nothing, the cache is genuinely
-        // exhausted, so panic to abort the offending query.
-        let ring_len = self.ring.len() as u64;
+        // exhausted, so panic to abort the offending query. The sweep covers
+        // only this worker's node region, so every bound is region-sized.
+        let ring_len = self.layout.node_slots(self.node).len() as u64;
         let max_lives = self.clock.max_lives() as u64;
         let warn_at = (2 * max_lives + 2) * ring_len;
         let mut iterations: u64 = 0;
@@ -299,10 +336,13 @@ impl MemoryContext {
                 }
             }
 
-            let reclaimed = self.clock.advance(tier).and_then(|slot| match tier {
-                Owner::Compressed => self.compressed_cache.reclaim(slot),
-                Owner::Decompressed => self.decompressed_cache.reclaim(slot),
-            });
+            let reclaimed = self
+                .clock
+                .advance(tier, self.node)
+                .and_then(|slot| match tier {
+                    Owner::Compressed => self.compressed_cache.reclaim(slot),
+                    Owner::Decompressed => self.decompressed_cache.reclaim(slot),
+                });
             match reclaimed {
                 Some(write_buffer) => return write_buffer,
                 None => ticks_without_success += 1,
@@ -320,7 +360,7 @@ impl MemoryContext {
 #[cfg(any(test, feature = "test-util"))]
 pub fn init_test_free_pool(dirty_count: usize) {
     WORKER_IDX.set(0);
-    NUM_WORKERS.set(1);
+    crate::worker::NUM_WORKERS.set(1);
     crate::worker::install_test_worker_waker();
     let factory = MemoryContextFactory::create_many(1, 128).pop().unwrap();
     init_memory_context(factory.create_memory_ctx());

@@ -65,7 +65,7 @@ use thiserror::Error;
 
 use super::channels::{Receiver, Sender};
 use super::{FinishStatus, Operator};
-use crate::worker::worker_waker;
+use crate::worker::{waker_set, worker_waker};
 
 mod pipeline_breaker;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
@@ -270,9 +270,9 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
             let was_last = self.siblings_left.fetch_sub(1, Ordering::Relaxed) == 1;
             if was_last {
                 // Sibling counter just hit 0: every worker's `try_finish` for this
-                // operator can now run. Wake any peers parked on the waker so they
-                // advance to their `finish` instead of sleeping out the timeout.
-                worker_waker().notify();
+                // operator can now run. Wake peers parked on any node's waker so
+                // they advance to their `finish` instead of sleeping out the park.
+                waker_set().notify_all();
             }
             was_last
         };

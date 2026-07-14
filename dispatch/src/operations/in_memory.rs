@@ -70,6 +70,11 @@ impl<T: Send> Receiver<T> for InjectorSource<T> {
         // path: when downstream of this source does per-item IO, deferring to the
         // idle path serialises it (one item in flight at a time). A single
         // non-spinning attempt keeps the hot loop from spinning on `Steal::Retry`.
+        // The `is_empty` pre-check keeps the drained-source case (every pass for
+        // the rest of the query) to a plain load instead of an epoch-pinning steal.
+        if self.items.is_empty() {
+            return None;
+        }
         match self.items.steal() {
             Steal::Success(item) => Some(item),
             Steal::Empty | Steal::Retry => None,
@@ -77,13 +82,14 @@ impl<T: Send> Receiver<T> for InjectorSource<T> {
     }
 
     fn steal(&self) -> Option<T> {
-        loop {
-            return match self.items.steal() {
-                Steal::Empty => None,
-                Steal::Success(item) => Some(item),
+        while !self.items.is_empty() {
+            match self.items.steal() {
+                Steal::Empty => return None,
+                Steal::Success(item) => return Some(item),
                 Steal::Retry => continue,
-            };
+            }
         }
+        None
     }
 }
 

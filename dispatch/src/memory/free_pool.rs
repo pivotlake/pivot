@@ -6,55 +6,77 @@
 //!
 //! 1. local LIFO deque (no contention, hot in cache),
 //! 2. per-worker injector (picks up indices returned by *other* workers), and
-//! 3. work-stealing from sibling workers' deques.
+//! 3. work-stealing from same-node sibling workers' deques.
 //!
-//! Pools belonging to the same `MemoryContextFactory` share their injectors and
-//! stealers, so a buffer pushed by one worker is reachable by every other
-//! worker in the same group.
+//! Pools belonging to the same `MemoryContextFactory` batch share one global
+//! injector array (so a buffer released *anywhere* can be routed back), but a
+//! worker's stealer list covers only its own NUMA node's siblings: acquiring a
+//! slot is what places memory, so it must stay node-local (see
+//! [`RingLayout`](super::RingLayout)).
 //!
-//! On push, the index is routed to its *home worker* (`idx % NUM_WORKERS`).
-//! Pushing from the home worker hits the local deque; pushing from any other
-//! worker hits the home worker's injector.
+//! On push, the index is routed to its *home worker*
+//! ([`RingLayout::home_worker`](super::RingLayout::home_worker), always a
+//! worker on the slot's own node). Pushing from the home worker hits the local
+//! deque; pushing from any other worker (any node) hits the home worker's
+//! injector.
 
+use crate::memory::RingLayout;
 use crate::worker::WORKER_IDX;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 /// Builds a coordinated set of [`FreePool`]s — one per worker — that share
-/// injectors and stealer lists.
+/// a global injector array and per-node stealer lists.
 ///
 /// Each factory holds Arc clones of the shared state; calling
 /// [`create_pool`](Self::create_pool) on the calling worker thread registers
-/// that worker's stealer and waits on a barrier so every pool sees the final
-/// stealer list.
-#[derive(Clone)]
+/// that worker's stealer and waits on its node's barrier so every same-node
+/// pool sees the final stealer list.
 pub struct PoolFactory {
+    /// This worker's node's stealer registry (same-node siblings only).
     registry: Arc<Mutex<Vec<Stealer<usize>>>>,
+    /// One injector per worker across all nodes, indexed by global worker index.
     injectors: Arc<Vec<Injector<usize>>>,
+    /// Registration barrier for this worker's node.
     barrier: Arc<Barrier>,
+    layout: RingLayout,
 }
 
 impl PoolFactory {
-    /// Returns `count` factories, all sharing the same injectors, stealer
-    /// registry, and registration barrier. Pass one factory to each worker.
-    pub fn create_many(count: usize) -> Vec<PoolFactory> {
-        let registry = Arc::new(Mutex::new(Vec::new()));
-        let injectors: Arc<Vec<_>> = Arc::new((0..count).map(|_| Injector::new()).collect());
-        let barrier = Arc::new(Barrier::new(count));
-        (0..count)
-            .map(|_| Self {
-                registry: registry.clone(),
-                injectors: injectors.clone(),
-                barrier: barrier.clone(),
+    /// Returns one factory per worker (global worker order), sharing a global
+    /// injector array, with stealer registries and registration barriers per
+    /// node. Pass one factory to each worker.
+    pub fn create_for_layout(layout: RingLayout) -> Vec<PoolFactory> {
+        let topology = layout.topology();
+        let injectors: Arc<Vec<_>> = Arc::new(
+            (0..topology.total_workers())
+                .map(|_| Injector::new())
+                .collect(),
+        );
+        let node_registries: Vec<_> = (0..topology.node_count)
+            .map(|_| Arc::new(Mutex::new(Vec::new())))
+            .collect();
+        let node_barriers: Vec<_> = (0..topology.node_count)
+            .map(|_| Arc::new(Barrier::new(topology.workers_per_node)))
+            .collect();
+        (0..topology.total_workers())
+            .map(|worker| {
+                let node = topology.node_of_worker(worker);
+                Self {
+                    registry: node_registries[node].clone(),
+                    injectors: injectors.clone(),
+                    barrier: node_barriers[node].clone(),
+                    layout,
+                }
             })
             .collect()
     }
 
     /// Register this worker's local deque and return its [`FreePool`].
     ///
-    /// Blocks on the shared barrier until every sibling factory has also
-    /// called `create_pool`, so the snapshot of stealers is complete.
+    /// Blocks on the node's barrier until every same-node sibling factory has
+    /// also called `create_pool`, so the snapshot of stealers is complete.
     pub fn create_pool(&self) -> FreePool {
         let local = Worker::new_lifo();
         self.registry.lock().unwrap().push(local.stealer());
@@ -65,17 +87,19 @@ impl PoolFactory {
             stealers,
             injectors: self.injectors.clone(),
             last_stealer_idx: AtomicUsize::new(0),
+            layout: self.layout,
         }
     }
 }
 
-/// A single worker's view of the free pool: a private LIFO deque, peer
-/// stealer handles, and a shared per-worker injector array.
+/// One worker's view of the free pool. It holds a private LIFO deque,
+/// same-node peer stealer handles, and the shared per-worker injector array.
 pub struct FreePool {
     worker: Worker<usize>,
     stealers: Vec<Stealer<usize>>,
     injectors: Arc<Vec<Injector<usize>>>,
     last_stealer_idx: AtomicUsize,
+    layout: RingLayout,
 }
 
 impl FreePool {
@@ -95,8 +119,13 @@ impl FreePool {
             return Some(idx);
         }
 
-        loop {
-            match self.injectors[WORKER_IDX.get()].steal() {
+        // The `is_empty` pre-checks below (injector and stealers) keep the
+        // all-empty scan to plain loads: `steal()` pins a crossbeam epoch and
+        // CASes even when it finds nothing, which idle workers would otherwise
+        // pay on every wakeup.
+        let own_injector = &self.injectors[WORKER_IDX.get()];
+        while !own_injector.is_empty() {
+            match own_injector.steal() {
                 Steal::Success(idx) => return Some(idx),
                 Steal::Retry => continue,
                 Steal::Empty => break,
@@ -109,7 +138,11 @@ impl FreePool {
 
         let start = self.last_stealer_idx.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.stealers.len() {
-            if let Steal::Success(idx) = self.stealers[(start + i) % self.stealers.len()].steal() {
+            let stealer = &self.stealers[(start + i) % self.stealers.len()];
+            if stealer.is_empty() {
+                continue;
+            }
+            if let Steal::Success(idx) = stealer.steal() {
                 return Some(idx);
             }
         }
@@ -119,9 +152,12 @@ impl FreePool {
 
     /// Return a buffer index. If this worker is `idx`'s home worker, the index
     /// lands in the local deque; otherwise it lands in the home worker's
-    /// injector, where the home worker can pick it up on its next `pop`.
+    /// injector, where the home worker can pick it up on its next `pop`. The
+    /// home worker is always on the slot's own node, so a buffer released on
+    /// another node finds its way back without the releaser ever *acquiring*
+    /// remote memory.
     pub(crate) fn push(&self, idx: usize) {
-        let home_worker = idx % self.injectors.len();
+        let home_worker = self.layout.home_worker(idx);
         if WORKER_IDX.get() == home_worker {
             self.worker.push(idx)
         } else {
@@ -157,6 +193,7 @@ mod tests {
                 stealers: stealers.clone(),
                 injectors: injectors.clone(),
                 last_stealer_idx: AtomicUsize::new(0),
+                layout: RingLayout::single_node(count, 128),
             })
             .collect()
     }
@@ -244,12 +281,54 @@ mod tests {
         assert_eq!(popped, Some(1));
     }
 
+    /// One pool per worker of a 2-node topology with 1 worker per node and 2
+    /// slots per node (built via the factory so stealer lists are per node).
+    fn build_two_node_pools() -> Vec<FreePool> {
+        let layout = RingLayout::new(
+            crate::numa::Topology {
+                workers_per_node: 1,
+                node_count: 2,
+            },
+            2,
+        );
+        PoolFactory::create_for_layout(layout)
+            .into_iter()
+            .map(|factory| factory.create_pool())
+            .collect()
+    }
+
+    #[test]
+    fn a_slot_released_on_another_node_routes_back_to_its_home_worker() {
+        let pools = build_two_node_pools();
+
+        // Slot 2 lives in node 1's region; released from node 0's worker it
+        // must land with node 1's worker, not the releaser.
+        act_as_worker(0, 2);
+        pools[0].push(2);
+
+        act_as_worker(1, 2);
+        assert_eq!(pools[1].pop(false), Some(2));
+    }
+
+    #[test]
+    fn a_worker_never_steals_a_free_slot_from_another_node() {
+        let pools = build_two_node_pools();
+        act_as_worker(1, 2);
+        pools[1].push(3);
+
+        act_as_worker(0, 2);
+
+        assert_eq!(pools[0].pop(true), None);
+    }
+
     #[test]
     fn create_pool_via_factory_for_single_worker() {
         // Setup: exercise the factory's barrier path (1-worker barrier returns
         // immediately, so we can do this on a single thread).
         act_as_worker(0, 1);
-        let factory = PoolFactory::create_many(1).pop().unwrap();
+        let factory = PoolFactory::create_for_layout(RingLayout::single_node(1, 128))
+            .pop()
+            .unwrap();
         let pool = factory.create_pool();
 
         // Execute
