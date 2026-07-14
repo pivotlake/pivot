@@ -15,38 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`ViewsBuilder`] — an [`ArrayBuilder`] that produces Arrow
-//! `StringViewArray`s.
+//! [`ViewsBuilder`]: an [`ArrayBuilder`] that produces Arrow byte-view
+//! arrays (`StringViewArray` or `BinaryViewArray`, per the `V` type parameter).
 //!
-//! Each string value is stored as a 128-bit *view*. Short strings (≤ 12 bytes)
-//! are inlined; longer strings reference a `(block_id, offset)` into the
+//! Each value is stored as a 128-bit *view*. Short values (≤ 12 bytes)
+//! are inlined; longer values reference a `(block_id, offset)` into the
 //! `buffers` list. The builder accumulates views in a slab-allocated buffer
-//! and converts to a `StringViewArray` with zero copies on
-//! [`into_array`](ArrayBuilder::into_array).
+//! and converts to the finished array with zero copies on
+//! [`into_array`](ArrayBuilder::into_array). The two flavours share this one
+//! physical layout; `V` only decides the array type the leaf's schema declares.
 
 use crate::parquet::reading::decoding::column_decoders::ArrayBuilder;
-use arrow_array::{ArrayRef, StringViewArray, builder::make_view};
+use arrow_array::types::ByteViewType;
+use arrow_array::{ArrayRef, GenericByteViewArray, builder::make_view};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use dispatch::memory::SlabAllocator;
 use dispatch::memory::SlabBuffer;
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-/// Accumulates 128-bit string views and their backing data blocks, then
-/// finalises into a `StringViewArray`.
+/// Accumulates 128-bit views and their backing data blocks, then finalises
+/// into a `GenericByteViewArray<V>`.
 ///
 /// Does not reuse `GenericByteViewBuilder` because it needs slab-allocated
 /// storage and direct control over the view buffer.
-pub struct ViewsBuilder {
+pub struct ViewsBuilder<V: ByteViewType> {
     /// Slab-allocated buffer of 128-bit views (one per value).
     pub views: SlabBuffer<u128>,
     /// Number of views pushed so far.
     len: usize,
     /// Data blocks referenced by non-inline views.
     pub buffers: Vec<Buffer>,
+    phantom: PhantomData<V>,
 }
 
-impl ViewsBuilder {
+impl<V: ByteViewType> ViewsBuilder<V> {
     /// Registers a data block and returns its block ID (used in non-inline
     /// views to reference string data).
     pub fn append_block(&mut self, block: Buffer) -> u32 {
@@ -82,7 +86,7 @@ impl ViewsBuilder {
     }
 }
 
-impl ArrayBuilder for ViewsBuilder {
+impl<V: ByteViewType> ArrayBuilder for ViewsBuilder<V> {
     type Element = u128;
 
     fn with_capacity(allocator: &mut SlabAllocator, capacity: usize) -> Self {
@@ -90,6 +94,7 @@ impl ArrayBuilder for ViewsBuilder {
             views: allocator.create_slab_buffer(capacity, false),
             len: 0,
             buffers: vec![],
+            phantom: PhantomData,
         }
     }
 
@@ -122,9 +127,11 @@ impl ArrayBuilder for ViewsBuilder {
         let nulls = null_buffer
             .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
             .filter(|n| n.null_count() != 0);
-        // Safety: views were created correctly, and checked that the data is utf8 when building the buffer
+        // Safety: every view was built with `make_view` over an in-bounds slice
+        // of its block. For the string flavour, the bytes come from a
+        // UTF8-annotated parquet column and are trusted to be valid UTF-8.
         unsafe {
-            Arc::new(StringViewArray::new_unchecked(
+            Arc::new(GenericByteViewArray::<V>::new_unchecked(
                 scalar_buffer,
                 self.buffers,
                 nulls,

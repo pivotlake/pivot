@@ -19,9 +19,10 @@
 //!   Int64             INT64              -                       read+write
 //!   Float32           FLOAT              -                       read+write
 //!   Float64           DOUBLE             -                       read+write
-//!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8          read+write
+//!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
 //!   Date32            INT32              Date                    read only
 //!   Timestamp(Second) INT64              Timestamp{..}           read only
+//!   BinaryView        BYTE_ARRAY         unannotated             read only
 //! ```
 //!
 //! The "read only" rows resolve files written elsewhere; pivot's own writer only
@@ -45,6 +46,7 @@ const BYTE_ARRAY: i32 = Type::BYTE_ARRAY as i32;
 
 // Parquet `ConvertedType` ids: the legacy width/temporal annotation, read
 // alongside the modern `LogicalType`.
+const CONVERTED_UTF8: i32 = 0;
 const CONVERTED_UINT_8: i32 = 11;
 const CONVERTED_UINT_16: i32 = 12;
 const CONVERTED_UINT_32: i32 = 13;
@@ -58,6 +60,13 @@ const CONVERTED_TIMESTAMP_MICROS: i32 = 10;
 
 /// Read path: a Parquet leaf's physical type (plus optional logical/converted
 /// annotations) -> the arrow [`DataType`] the executor decodes it into.
+///
+/// A BYTE_ARRAY is a string only when the file says so (a UTF8/String
+/// annotation); an unannotated one is binary, exactly as the spec defines it.
+/// Files in the wild do store text without the annotation, but that fact isn't
+/// in the file: it comes from the table's declared schema, and
+/// `apply_declared_types` (in `table.rs`) retypes such columns to string when
+/// the table declares them VARCHAR.
 pub fn parquet_to_arrow(
     physical_type: Option<i32>,
     converted_type: Option<i32>,
@@ -73,7 +82,15 @@ pub fn parquet_to_arrow(
         INT64 => int64_arrow(converted_type, logical_type),
         FLOAT => Ok(DataType::Float32),
         DOUBLE => Ok(DataType::Float64),
-        BYTE_ARRAY => Ok(DataType::Utf8View),
+        BYTE_ARRAY => {
+            let is_string = converted_type == Some(CONVERTED_UTF8)
+                || matches!(logical_type, Some(LogicalType::String));
+            if is_string {
+                Ok(DataType::Utf8View)
+            } else {
+                Ok(DataType::BinaryView)
+            }
+        }
         _ => Err(Error::UnsupportedType(format!(
             "Parquet physical type {pt}"
         ))),

@@ -26,31 +26,14 @@ struct TestTable {
 
 impl TestTable {
     fn new(dispatch: &Dispatch, columns: &[(&str, Type, ArrayRef)]) -> Self {
-        let dir = TempDir::new().unwrap();
-
         let fields: Vec<Field> = columns
             .iter()
             .map(|(name, _, array)| Field::new(*name, array.data_type().clone(), false))
             .collect();
         let schema = Arc::new(Schema::new(fields));
         let arrays: Vec<ArrayRef> = columns.iter().map(|(_, _, array)| array.clone()).collect();
-        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let batch = RecordBatch::try_new(schema, arrays).unwrap();
 
-        let file_path = dir.path().join("data.parquet");
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let file = std::fs::File::create(&file_path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-
-        // Read the footers once, over the dispatch worker pool. This drives a
-        // dataflow, so it runs on the coordinator (here), not via run_on_worker.
-        let parquet_table = Arc::new(
-            ParquetTable::from_directory(dispatch.dispatcher(), dir.path())
-                .expect("ParquetTable::from_directory failed"),
-        );
         let cols = columns
             .iter()
             .map(|(name, col_type, _)| Column {
@@ -58,11 +41,39 @@ impl TestTable {
                 col_type: col_type.clone(),
             })
             .collect();
+        Self::from_batches(dispatch, cols, &[batch])
+    }
+
+    /// A table whose data spans one parquet file per batch. The batches may
+    /// differ physically per file, as real ingested files do; each batch's
+    /// own schema is written as-is.
+    fn from_batches(dispatch: &Dispatch, columns: Vec<Column>, batches: &[RecordBatch]) -> Self {
+        let dir = TempDir::new().unwrap();
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        for (i, batch) in batches.iter().enumerate() {
+            let file_path = dir.path().join(format!("part{i}.parquet"));
+            let file = std::fs::File::create(&file_path).unwrap();
+            let mut writer =
+                ArrowWriter::try_new(file, batch.schema(), Some(props.clone())).unwrap();
+            writer.write(batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        // Read the footers once, over the dispatch worker pool. This drives a
+        // dataflow, so it runs on the coordinator (here), not via run_on_worker.
+        // The declared columns travel with the load, as a catalog table's do,
+        // so files storing text as unannotated binary read as text.
+        let parquet_table = Arc::new(
+            ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &columns)
+                .expect("ParquetTable::from_directory failed"),
+        );
 
         TestTable {
             _dir: Arc::new(dir),
             parquet_table,
-            columns: cols,
+            columns,
         }
     }
 }
@@ -132,6 +143,21 @@ impl TestCatalog {
             .unwrap()
             .insert(name.to_string(), TestTable::new(dispatch, columns));
     }
+
+    /// Register a table whose data spans one parquet file per batch (the files
+    /// may differ physically per file).
+    pub fn add_table_files(
+        &self,
+        dispatch: &Dispatch,
+        name: &str,
+        columns: Vec<Column>,
+        batches: &[RecordBatch],
+    ) {
+        self.tables.lock().unwrap().insert(
+            name.to_string(),
+            TestTable::from_batches(dispatch, columns, batches),
+        );
+    }
 }
 
 impl Catalog for TestCatalog {
@@ -195,6 +221,13 @@ impl TestingPlanner {
     pub fn add_table(&self, name: &str, columns: &[(&str, Type, ArrayRef)]) {
         self.catalog.add_table(&self.dispatch, name, columns);
     }
+
+    /// Register a table whose data spans one parquet file per batch.
+    #[allow(dead_code)] // not all test binaries call every helper
+    pub fn add_table_files(&self, name: &str, columns: Vec<Column>, batches: &[RecordBatch]) {
+        self.catalog
+            .add_table_files(&self.dispatch, name, columns, batches);
+    }
 }
 
 /// Shared planner backed by a catalog seeded with `example_table`:
@@ -239,6 +272,26 @@ pub fn testing_planner() -> TestingPlanner {
         catalog,
         dispatch,
     }
+}
+
+/// Plan, compile, and run `sql`, returning the result rows as JSON.
+#[allow(dead_code)] // not all test binaries call every helper
+pub fn run(planner: &mut TestingPlanner, sql: &str) -> Vec<Value> {
+    batches_to_json(&run_batches(planner, sql))
+}
+
+/// Plan, compile, and run `sql`, returning the raw result batches. Lets a test
+/// inspect the output arrow schema rather than only the JSON-rendered values.
+#[allow(dead_code)]
+pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> {
+    planner
+        .planner
+        .plan(sql)
+        .unwrap()
+        .compile(planner.dispatcher())
+        .unwrap()
+        .collect()
+        .unwrap()
 }
 
 /// The value of a row's single column, by position rather than name. For tests

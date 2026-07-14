@@ -9,9 +9,11 @@
 use crate::parquet::reading::decoding::column_decoders::Dict;
 use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
+use arrow_array::types::ByteViewType;
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
+use std::marker::PhantomData;
 
 /// Internal signal for cross-buffer boundary conditions during dictionary
 /// parsing.
@@ -87,7 +89,7 @@ impl DictFactory {
 
     /// Consumes the factory, parsing all dictionary entries and returning the
     /// finished [`ViewDict`].
-    pub fn create_dict(mut self) -> ViewDict {
+    pub fn create_dict<V: ByteViewType>(mut self) -> ViewDict<V> {
         while self.position.buffer_index < self.data.len() {
             match self.decode_entries_for_current_buffer() {
                 Ok(_) => {
@@ -110,22 +112,25 @@ impl DictFactory {
         ViewDict {
             data: self.buffers,
             views: self.views,
+            phantom: PhantomData,
         }
     }
 }
 
-/// Pre-parsed string dictionary for O(1) view lookups by RLE index.
+/// Pre-parsed byte-array dictionary for O(1) view lookups by RLE index.
 ///
 /// `views[i]` is the 128-bit Arrow view for dictionary entry `i`. `data`
-/// holds the backing blocks referenced by non-inline views.
-pub struct ViewDict {
+/// holds the backing blocks referenced by non-inline views. `V` names the
+/// flavour of [`ViewsBuilder`] the entries feed into (string or binary).
+pub struct ViewDict<V: ByteViewType> {
     /// Backing data blocks (original page buffers + any cross-boundary copies).
     data: Vec<Buffer>,
     /// One 128-bit view per dictionary entry.
     views: Vec<u128>,
+    phantom: PhantomData<V>,
 }
 
-impl ViewDict {
+impl<V: ByteViewType> ViewDict<V> {
     #[inline(always)]
     pub fn view(&self, idx: usize) -> u128 {
         self.views[idx]
@@ -147,8 +152,8 @@ impl ViewDict {
     }
 }
 
-impl Dict for ViewDict {
-    type Builder = ViewsBuilder;
+impl<V: ByteViewType> Dict for ViewDict<V> {
+    type Builder = ViewsBuilder<V>;
     type Item = u128;
 
     fn new(data: Vec<Bytes>, size: usize, _allocator: &mut SlabAllocator) -> Self {
@@ -172,6 +177,7 @@ impl Dict for ViewDict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::types::StringViewType;
     use bytes::Bytes;
 
     fn encode_plain(strings: &[&str]) -> Vec<u8> {
@@ -183,7 +189,7 @@ mod tests {
         data
     }
 
-    fn decode_entries(data: Vec<Bytes>, num_entries: usize) -> ViewDict {
+    fn decode_entries(data: Vec<Bytes>, num_entries: usize) -> ViewDict<StringViewType> {
         DictFactory::new(data, num_entries).create_dict()
     }
 

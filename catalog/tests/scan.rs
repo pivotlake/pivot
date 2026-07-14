@@ -302,7 +302,7 @@ fn materialize_rejects_corrupt_footer_without_panicking() {
     bytes.extend_from_slice(b"PAR1");
     std::fs::write(&path, &bytes).unwrap();
 
-    let result = ParquetTable::from_files(&dispatch, &[&path]);
+    let result = ParquetTable::from_files(&dispatch, &[&path], &[]);
     assert!(
         result.is_err(),
         "a footer longer than the file must error, not panic"

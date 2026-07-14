@@ -15,6 +15,7 @@ use crate::store::{DataFile, DataFileSource, FileRef};
 use dispatch::io::{FileLocation, FsRequest, HttpRequest, RemoteFile, open_direct_read};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
+use planner::catalog::Column;
 use std::sync::Arc;
 
 const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
@@ -38,12 +39,22 @@ fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
 /// Reads files' footers and emits one [`TableFile`] per file, keeping many reads
 /// in flight (bounded by `MAX_DISK_IN_FLIGHT`/`MAX_HTTP_IN_FLIGHT` via the
 /// shared [`RequestTracker`]).
-#[derive(Default)]
 pub(super) struct TableFileMetadataFetcher {
     tracker: RequestTracker<FooterRead>,
+    /// The table's declared schema, reconciled with each parsed footer's
+    /// schema (see `apply_declared_types`); empty when the table declares
+    /// none.
+    declared_columns: Arc<[Column]>,
 }
 
 impl TableFileMetadataFetcher {
+    pub(super) fn new(declared_columns: Arc<[Column]>) -> Self {
+        Self {
+            tracker: RequestTracker::default(),
+            declared_columns,
+        }
+    }
+
     /// Advance the read in `slot` as far as it can without blocking on IO: while
     /// its current region is fully present, parse it and either emit the file's
     /// [`TableFile`] (done) or issue the next region's read (the exact-footer
@@ -62,7 +73,7 @@ impl TableFileMetadataFetcher {
                 .tracker
                 .request_for_slot(slot)
                 .unwrap()
-                .parse_region()
+                .parse_region(&self.declared_columns)
                 .map_err(crate::parquet::op_err)?;
             match parsed {
                 // The footer overflowed the probe; an exact read was queued. Stage
@@ -269,7 +280,10 @@ impl FooterRead {
     /// Parse the just-completed region. Returns the file's row groups, or `None`
     /// if the footer overflowed the probe window and an exact re-read was issued
     /// (its completion will call back here).
-    fn parse_region(&mut self) -> Result<Option<Vec<RowGroupMetadata>>> {
+    fn parse_region(
+        &mut self,
+        declared_columns: &[Column],
+    ) -> Result<Option<Vec<RowGroupMetadata>>> {
         let bytes = self.region_bytes();
 
         let footer: &[u8] = if self.reading_exact {
@@ -296,6 +310,10 @@ impl FooterRead {
             &bytes[start..bytes.len() - 8]
         };
 
-        Ok(Some(row_groups_from_footer(footer, self.location.clone())?))
+        Ok(Some(row_groups_from_footer(
+            footer,
+            self.location.clone(),
+            declared_columns,
+        )?))
     }
 }
