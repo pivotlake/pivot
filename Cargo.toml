@@ -1,0 +1,72 @@
+[workspace]
+resolver = "3"
+members = [
+    "benchmarks",
+    "catalog",
+    "dispatch",
+    "duckdb-planner",
+    "ingest",
+    "planner",
+    "server",
+    "thriftparquet",
+]
+# arrow-rs (vendored submodule) and perfy are workspaces of their own; they
+# resolve and lock independently.
+exclude = ["arrow-rs", "perfy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+# Sibling crates.
+catalog = { path = "catalog" }
+dispatch = { path = "dispatch" }
+duckdb-planner = { path = "duckdb-planner" }
+ingest = { path = "ingest" }
+planner = { path = "planner" }
+server = { path = "server" }
+thriftparquet = { path = "thriftparquet" }
+
+# The vendored arrow-rs fork (git submodule). `parquet` is the strict,
+# spec-compliant reader used only as a test oracle by crates with their own
+# Parquet paths.
+arrow = { path = "arrow-rs/arrow" }
+arrow-arith = { path = "arrow-rs/arrow-arith" }
+arrow-array = { path = "arrow-rs/arrow-array" }
+arrow-buffer = { path = "arrow-rs/arrow-buffer" }
+arrow-cast = { path = "arrow-rs/arrow-cast" }
+arrow-json = { path = "arrow-rs/arrow-json" }
+arrow-ord = { path = "arrow-rs/arrow-ord" }
+arrow-schema = { path = "arrow-rs/arrow-schema" }
+arrow-select = { path = "arrow-rs/arrow-select" }
+parquet = { path = "arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+
+ahash = "0.8.12"
+bytes = "1.11.0"
+clap = { version = "4", features = ["derive"] }
+core_affinity = "0.8.3"
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+crossbeam-deque = "0.8.6"
+insta = "1"
+libc = "0.2.184"
+rstest = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "b896aa24d6c85fa1b40f8746c3cc2185ca4084b9" }
+sysinfo = "0.38.0"
+tempfile = "3"
+thiserror = "2.0.18"
+tokio = "1.40"
+tokio-postgres = "0.7"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+ureq = "2"
+url = "2.5"
+
+# Optimized like release but with debuginfo, so `perf` can resolve inlined
+# frames and line numbers. Build for profiling with
+# `cargo build --profile profiling`; plain `--release` stays lean.
+[profile.profiling]
+inherits = "release"
+debug = true

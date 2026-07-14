@@ -60,7 +60,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: dispatch
+          workspaces: .
 
       - name: Build documentation
         working-directory: dispatch
@@ -74,11 +74,11 @@ jobs:
           cargo doc --no-deps
 
       - name: Add redirect to dispatch crate
-        run: echo '<meta http-equiv="refresh" content="0;url=dispatch/index.html">' > dispatch/target/doc/index.html
+        run: echo '<meta http-equiv="refresh" content="0;url=dispatch/index.html">' > target/doc/index.html
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: dispatch/target/doc
+          path: target/doc
 
       - name: Deploy to GitHub Pages
         id: deployment

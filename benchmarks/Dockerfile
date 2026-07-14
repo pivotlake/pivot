@@ -18,9 +18,9 @@ COPY . .
 ENV RUSTC_WRAPPER=
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/benchmarks/target \
-    cargo build --release --manifest-path benchmarks/Cargo.toml --bin pivot-bench \
- && cp benchmarks/target/release/pivot-bench /usr/local/bin/pivot-bench
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p benchmarks --bin pivot-bench \
+ && cp target/release/pivot-bench /usr/local/bin/pivot-bench
 
 FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:slim
 

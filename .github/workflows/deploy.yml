@@ -126,7 +126,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: server
+          workspaces: .
 
       - name: Build release binary (${{ matrix.arch }})
         working-directory: server
@@ -162,7 +162,7 @@ jobs:
           fi
           # Strip any trailing slash so we control the joins below.
           BUCKET="${BUCKET%/}"
-          BIN=server/target/release/pivotdb-server
+          BIN=target/release/pivotdb-server
 
           # Upload an immutable, SHA-pinned copy plus a moving `latest` pointer.
           gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-$ARCH-$SHA"
