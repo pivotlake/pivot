@@ -33,8 +33,8 @@ pub fn row_group_filter_from(predicates: Vec<DynamicScanPredicate>) -> Option<Ro
             else {
                 continue;
             };
-            // Dynamic predicates use top-level column indices, while statistics
-            // use file-specific leaf indices.
+            // Dynamic predicates only target top-level columns. DuckDB does
+            // not push them down for JSON paths.
             let leaf = crate::parquet::types::leaves::first_leaf(
                 row_group.schema.fields(),
                 pred.column_idx,
