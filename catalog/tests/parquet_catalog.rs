@@ -918,3 +918,81 @@ fn variant_pushdown_keeps_all_groups_for_an_unshredded_path() {
 
     assert_eq!(row_group_count(&catalog, "docs", &table), 3);
 }
+
+/// Soundness: a row may store the path's value in the binary `value` fallback
+/// instead of the typed leaf (the spec allows it for values of another
+/// variant type), where the typed leaf's stats can't see it. A row group with
+/// any non-null fallback must not be pruned.
+#[test]
+fn variant_pushdown_keeps_groups_whose_value_fallback_holds_data() {
+    use arrow_array::{BinaryViewArray, StructArray};
+    use arrow_schema::Fields;
+
+    // Hand-built shredded shape, two rows per group: group 0 has one typed
+    // age (10) and one row with `age` in the fallback `value`; group 1 is
+    // fully shredded (20, 30) with an all-null fallback.
+    let age_group = Fields::from(vec![
+        Field::new("value", DataType::BinaryView, true),
+        Field::new("typed_value", DataType::Int64, true),
+    ]);
+    let typed_group = Fields::from(vec![Field::new(
+        "age",
+        DataType::Struct(age_group.clone()),
+        true,
+    )]);
+    let doc_fields = Fields::from(vec![
+        Field::new("metadata", DataType::BinaryView, false),
+        Field::new("value", DataType::BinaryView, true),
+        Field::new("typed_value", DataType::Struct(typed_group.clone()), true),
+    ]);
+    let age = StructArray::new(
+        age_group,
+        vec![
+            Arc::new(BinaryViewArray::from(vec![
+                None,
+                Some(b"unshredded".as_ref()),
+                None,
+                None,
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(10), None, Some(20), Some(30)])) as ArrayRef,
+        ],
+        None,
+    );
+    let typed_value = StructArray::new(typed_group, vec![Arc::new(age) as ArrayRef], None);
+    let doc = StructArray::new(
+        doc_fields.clone(),
+        vec![
+            Arc::new(BinaryViewArray::from(vec![b"m".as_ref(); 4])) as ArrayRef,
+            Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 4])) as ArrayRef,
+            Arc::new(typed_value) as ArrayRef,
+        ],
+        None,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "doc",
+            DataType::Struct(doc_fields),
+            true,
+        )])),
+        vec![Arc::new(doc) as ArrayRef],
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(Some(2))
+        .build();
+    let file = File::create(dir.path().join("docs.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let (catalog, mut table) = shredded_docs_catalog(dir.path());
+
+    table
+        .pushdown_filter(variant_filter("age", CompareType::Equal, 20))
+        .unwrap();
+
+    // Group 0's typed stats ([10, 10]) exclude 20, but its fallback row could
+    // still hold a matching age, so it survives alongside group 1.
+    assert_eq!(row_group_count(&catalog, "docs", &table), 2);
+}

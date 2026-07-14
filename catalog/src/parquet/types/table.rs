@@ -226,6 +226,15 @@ fn build_row_groups(
         .into_iter()
         .enumerate()
         .map(|(i, rg)| {
+            // Chunks are per leaf; a row group with a different count is a
+            // malformed footer and would index out of bounds below.
+            if rg.columns.len() != leaves.len() {
+                return Err(Error::InvalidFooter(format!(
+                    "row group {i} has {} column chunks but the schema has {} leaves",
+                    rg.columns.len(),
+                    leaves.len()
+                )));
+            }
             let num_rows = rg.num_rows;
             let columns = rg
                 .columns
@@ -248,16 +257,16 @@ fn build_row_groups(
                     }
                 })
                 .collect();
-            RowGroupMetadata {
+            Ok(RowGroupMetadata {
                 location: location.clone(),
                 schema: schema.clone(),
                 columns,
                 num_rows,
                 file_row_group_idx: i,
                 live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     Ok(row_groups)
 }
@@ -398,12 +407,19 @@ fn schema_elements_to_arrow(
     let mut cursor = 1; // element 0 is the root group
     let mut fields = Vec::new();
     for _ in 0..elements[0].num_children.unwrap_or(0) {
-        let (field, next) = parse_schema_element(elements, cursor, 0, &mut def_levels)?;
+        let (field, next) = parse_schema_element(elements, cursor, 0, 0, &mut def_levels)?;
         fields.push(field);
         cursor = next;
     }
     Ok((Schema::new(fields), def_levels))
 }
+
+/// Deepest schema nesting accepted. Real schemas stay far below this (a
+/// shredded variant adds two levels per path segment); the cap only exists so
+/// a malformed or hostile footer can't overflow the stack through
+/// [`parse_schema_element`]'s per-level recursion, which would abort the
+/// process rather than fail the load.
+const MAX_SCHEMA_DEPTH: usize = 128;
 
 /// Reconcile a file's parsed schema with the table's declared column types,
 /// matched by column name: a file may carry more columns than the table
@@ -423,15 +439,18 @@ fn schema_elements_to_arrow(
 /// a contradiction fails the load with the offending column's name rather
 /// than mis-decoding data.
 fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<Schema> {
-    let declared_by_name: std::collections::HashMap<&str, &Type> = declared_columns
+    // Keyed case-insensitively: DuckDB resolves identifiers that way, so a
+    // file written by another tool may spell a declared column differently
+    // and must still reconcile with it.
+    let declared_by_name: std::collections::HashMap<String, &Type> = declared_columns
         .iter()
-        .map(|c| (c.name.as_str(), &c.col_type))
+        .map(|c| (c.name.to_lowercase(), &c.col_type))
         .collect();
     let fields = schema
         .fields()
         .iter()
         .map(|field| {
-            let Some(declared) = declared_by_name.get(field.name().as_str()) else {
+            let Some(declared) = declared_by_name.get(&field.name().to_lowercase()) else {
                 return Ok(field.clone());
             };
             let file_type = field.data_type();
@@ -440,17 +459,24 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
                     field.as_ref().clone().with_data_type(DataType::Utf8View),
                 ));
             }
-            let matches_declared = match declared {
-                Type::Variant => matches!(file_type, DataType::Struct(_)),
-                // Pivot's timestamp convention (see `Type::Timestamp`): files
-                // store packed epoch seconds in a plain INT64 column, which
-                // the executor reads as-is. A file with a real timestamp
-                // annotation parses to `Timestamp(Second)` and matches the
-                // declared type's storage exactly below.
-                Type::Timestamp => matches!(
+            // Pivot's timestamp convention (see `Type::Timestamp`): scans
+            // hand the executor epoch seconds as plain `Int64`, and
+            // pivot-written files store exactly that. An annotated file
+            // parses to `Timestamp(Second)`, the same 8-byte integers;
+            // retype it to the canonical `Int64` so every file of the table
+            // decodes to the same column type as the executor expects.
+            if **declared == Type::Timestamp
+                && matches!(
                     file_type,
                     DataType::Int64 | DataType::Timestamp(TimeUnit::Second, None)
-                ),
+                )
+            {
+                return Ok(Arc::new(
+                    field.as_ref().clone().with_data_type(DataType::Int64),
+                ));
+            }
+            let matches_declared = match declared {
+                Type::Variant => matches!(file_type, DataType::Struct(_)),
                 _ => *file_type == planner::types::physical_arrow_type(declared),
             };
             if matches_declared {
@@ -475,21 +501,51 @@ fn parse_schema_element(
     elements: &[crate::parquet::types::thrift::footer::SchemaElement],
     idx: usize,
     parent_def: i16,
+    depth: usize,
     def_levels: &mut Vec<i16>,
 ) -> Result<(Field, usize)> {
     use crate::parquet::types::thrift::footer::LogicalType;
-    let elem = &elements[idx];
+    // The cursor is driven by each group's *claimed* child count, so a
+    // malformed footer can point past the element list; fail the load
+    // instead of panicking mid-fetch.
+    let Some(elem) = elements.get(idx) else {
+        return Err(Error::InvalidFooter(
+            "schema group claims more children than the footer holds".into(),
+        ));
+    };
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Err(Error::InvalidFooter(format!(
+            "schema nesting exceeds {MAX_SCHEMA_DEPTH} levels"
+        )));
+    }
     // repetition_type: 0=REQUIRED, 1=OPTIONAL, 2=REPEATED.
+    // REPEATED elements (the LIST/MAP encodings) need repetition-level
+    // decoding, which the page decoder doesn't do; accepting them here would
+    // silently misdecode their pages.
+    if elem.repetition_type == Some(2) {
+        return Err(Error::UnsupportedType(format!(
+            "repeated field '{}' (LIST/MAP columns are not supported)",
+            elem.name
+        )));
+    }
     let nullable = elem.repetition_type == Some(1);
     let def_level = parent_def + nullable as i16;
 
     match elem.num_children {
         Some(n) if n > 0 => {
+            // Children can't outnumber the elements after this one; a bigger
+            // claim is malformed (and would size the Vec from hostile input).
+            if n as usize > elements.len() - idx - 1 {
+                return Err(Error::InvalidFooter(
+                    "schema group claims more children than the footer holds".into(),
+                ));
+            }
             let is_variant = elem.logical_type == Some(LogicalType::Variant);
             let mut children = Vec::with_capacity(n as usize);
             let mut cursor = idx + 1;
             for _ in 0..n {
-                let (child, next) = parse_schema_element(elements, cursor, def_level, def_levels)?;
+                let (child, next) =
+                    parse_schema_element(elements, cursor, def_level, depth + 1, def_levels)?;
                 children.push(child);
                 cursor = next;
             }
@@ -664,6 +720,104 @@ mod tests {
                 && message.contains("Utf8View"),
             "unhelpful mismatch error: {message}"
         );
+    }
+
+    /// Both timestamp storage flavors (pivot's plain INT64 epoch seconds and
+    /// an annotated `Timestamp(Second)`) retype to the one canonical arrow
+    /// type the executor reads, so a table mixing such files emits
+    /// uniformly-typed batches.
+    #[test]
+    fn declared_timestamp_canonicalizes_both_storage_flavors() {
+        let schema = Schema::new(vec![
+            Field::new("ts_plain", DataType::Int64, false),
+            Field::new(
+                "ts_annotated",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+        ]);
+        let declared = [
+            column("ts_plain", Type::Timestamp),
+            column("ts_annotated", Type::Timestamp),
+        ];
+
+        let reconciled = apply_declared_types(schema, &declared).unwrap();
+
+        assert_eq!(*reconciled.field(0).data_type(), DataType::Int64);
+        assert_eq!(*reconciled.field(1).data_type(), DataType::Int64);
+    }
+
+    /// DuckDB resolves identifiers case-insensitively, so a declared column
+    /// must reconcile with a file column spelled in another case.
+    #[test]
+    fn declared_columns_match_file_columns_case_insensitively() {
+        let schema = Schema::new(vec![Field::new("URL", DataType::BinaryView, false)]);
+
+        let reconciled = apply_declared_types(schema, &[column("url", Type::Utf8)]).unwrap();
+
+        assert_eq!(*reconciled.field(0).data_type(), DataType::Utf8View);
+    }
+
+    fn schema_element(
+        name: &str,
+        repetition_type: Option<i32>,
+        num_children: Option<i32>,
+        physical_type: Option<i32>,
+    ) -> crate::parquet::types::thrift::footer::SchemaElement {
+        crate::parquet::types::thrift::footer::SchemaElement {
+            physical_type,
+            repetition_type,
+            name: name.to_string(),
+            num_children,
+            converted_type: None,
+            logical_type: None,
+        }
+    }
+
+    /// A REPEATED element (the LIST/MAP encoding) fails the load cleanly:
+    /// the page decoder has no repetition-level support, so accepting it
+    /// would silently misdecode.
+    #[test]
+    fn repeated_schema_elements_fail_the_load() {
+        let elements = vec![
+            schema_element("root", None, Some(1), None),
+            schema_element("tags", Some(1), Some(1), None),
+            schema_element("list", Some(2), Some(1), None),
+            schema_element("element", Some(1), None, Some(2)),
+        ];
+
+        let err = schema_elements_to_arrow(&elements).unwrap_err();
+
+        assert!(err.to_string().contains("not supported"), "{err}");
+    }
+
+    /// A group claiming more children than the footer holds is malformed and
+    /// fails the load instead of indexing out of bounds.
+    #[test]
+    fn overclaimed_child_counts_fail_the_load() {
+        let elements = vec![
+            schema_element("root", None, Some(3), None),
+            schema_element("a", Some(1), None, Some(2)),
+        ];
+
+        let err = schema_elements_to_arrow(&elements).unwrap_err();
+
+        assert!(err.to_string().contains("more children"), "{err}");
+    }
+
+    /// Nesting past the cap fails the load instead of overflowing the stack
+    /// (which would abort the process, not unwind).
+    #[test]
+    fn absurdly_deep_nesting_fails_the_load() {
+        let mut elements = vec![schema_element("root", None, Some(1), None)];
+        for i in 0..=MAX_SCHEMA_DEPTH {
+            elements.push(schema_element(&format!("g{i}"), Some(1), Some(1), None));
+        }
+        elements.push(schema_element("leaf", Some(1), None, Some(2)));
+
+        let err = schema_elements_to_arrow(&elements).unwrap_err();
+
+        assert!(err.to_string().contains("nesting"), "{err}");
     }
 
     /// Pruning away every row group keeps the table's schema, so a scan that

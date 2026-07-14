@@ -336,6 +336,73 @@ fn scan_shredded_variant_with_a_leading_null() {
 }
 
 #[test]
+fn scan_variant_with_a_null_document_row() {
+    use arrow_array::Array;
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{GetOptions, json_to_variant, variant_get};
+
+    let dispatch = dispatch(1);
+    // The second document is SQL NULL: its required `metadata` leaf decodes
+    // with a null there, which only a struct-level null mask may carry.
+    let json: ArrayRef = Arc::new(StringArray::from(vec![Some(r#"{"age":30}"#), None]));
+    let variant = json_to_variant(&json).unwrap();
+    let field = variant.field("doc");
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![field])),
+        vec![Arc::new(variant.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    let doc = results[0].column(0);
+    assert!(doc.is_null(1));
+    let ages = variant_get(
+        doc,
+        GetOptions::new_with_path(VariantPath::try_from("age").unwrap())
+            .with_as_type(Some(Arc::new(Field::new("age", DataType::Int64, true)))),
+    )
+    .unwrap();
+    assert_eq!(
+        ages.as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![Some(30), None])
+    );
+}
+
+#[test]
+fn scan_nullable_strings_produce_valid_views() {
+    use arrow_array::Array;
+
+    // Null rows still occupy view slots, and kernels may touch masked slots
+    // before applying validity, so every slot must hold a valid view.
+    for dictionary in [false, true] {
+        let dispatch = dispatch(1);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)])),
+            vec![Arc::new(StringViewArray::from(vec![
+                Some("a string too long to inline in a view"),
+                None,
+                Some("b"),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let (_dir, table) = parquet_table(&dispatch, &[batch], dictionary);
+
+        let results = table_input(&dispatch, &table, Projection::all(1), false)
+            .collect()
+            .unwrap();
+
+        let strings = results[0].column(0);
+        strings.to_data().validate_full().unwrap();
+        assert_eq!(strings.null_count(), 2);
+    }
+}
+
+#[test]
 fn scan_dictionary_encoded_variant() {
     use parquet_variant::VariantPath;
     use parquet_variant_compute::{
@@ -590,6 +657,39 @@ fn scan_multiple_parquet_files() {
         .unwrap();
 
     assert_eq!(extract_count(&results), 5);
+}
+
+#[test]
+fn list_columns_are_rejected_at_load() {
+    use arrow_array::Array;
+    use arrow_array::builder::{Int64Builder, ListBuilder};
+
+    // The decoder has no repetition-level support, so a LIST column must fail
+    // the load cleanly rather than misdecode its pages.
+    let dispatch = dispatch(1);
+    let mut tags = ListBuilder::new(Int64Builder::new());
+    tags.append_value([Some(1), Some(2)]);
+    tags.append_value([Some(3)]);
+    let tags = tags.finish();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            tags.data_type().clone(),
+            true,
+        )])),
+        vec![Arc::new(tags) as _],
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let file = std::fs::File::create(dir.path().join("lists.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let result = ParquetTable::from_directory(&dispatch, dir.path(), &[]);
+
+    let err = result.err().expect("LIST columns must not load");
+    assert!(err.to_string().contains("not supported"), "{err}");
 }
 
 #[test]
