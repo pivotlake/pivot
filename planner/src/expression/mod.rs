@@ -112,50 +112,33 @@ pub enum Expression {
 }
 
 impl Expression {
-    /// Static result type of a computed expression, used to pick a group-key
-    /// extractor when grouping on it (e.g. `GROUP BY CASE …`). Errors when the
-    /// type can't be determined statically, so an unclassified key is rejected
-    /// rather than silently mistyped.
+    /// Static result type of a computed expression. Used to pick a group-key
+    /// extractor when grouping on it (e.g. `GROUP BY CASE …`) and to derive
+    /// each operator's output types (see `PlanNode::output_types`).
+    ///
+    /// Covers every expression kind; the one remaining error is a constant of
+    /// an arrow type outside pivot's set, which nothing currently builds. That
+    /// error rejects an unclassified group key rather than silently mistyping
+    /// it.
     pub fn result_type(&self) -> Result<Type, compile::Error> {
         match self {
             Expression::Ref(r) => Ok(r.return_type.clone()),
-            Expression::Constant(s) => match s.get().0.data_type() {
-                arrow_schema::DataType::Utf8
-                | arrow_schema::DataType::LargeUtf8
-                | arrow_schema::DataType::Utf8View => Ok(Type::Utf8),
-                arrow_schema::DataType::Int8 => Ok(Type::Int8),
-                arrow_schema::DataType::Int16 => Ok(Type::Int16),
-                arrow_schema::DataType::Int32 => Ok(Type::Int32),
-                arrow_schema::DataType::Int64 => Ok(Type::Int64),
-                arrow_schema::DataType::Float32 => Ok(Type::Float32),
-                arrow_schema::DataType::Float64 => Ok(Type::Float64),
-                _ => Err(compile::Error::IndeterminateResultType(self.clone())),
-            },
+            Expression::Constant(s) => types::type_from_physical(s.get().0.data_type())
+                .ok_or_else(|| compile::Error::IndeterminateResultType(self.clone())),
+            // Comparisons and the boolean combinators all yield booleans.
+            Expression::Compare(_)
+            | Expression::Between(_)
+            | Expression::InList(_)
+            | Expression::Conjunction(_)
+            | Expression::Not(_) => Ok(Type::Boolean),
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
             // A cast yields its target type.
             Expression::Cast(c) => Ok(c.target.clone()),
-            // `date_trunc` and `now()` yield a timestamp; the regex replacers a string.
-            Expression::Function(Function::DateTrunc(_) | Function::Now) => Ok(Type::Timestamp),
-            // `date`/`timestamp` ± interval keeps the temporal operand's type.
-            Expression::Function(Function::IntervalArithmetic(i)) => Ok(i.result.clone()),
-            // `make_date`/`make_timestamp` produce the temporal type they convert to.
-            Expression::Function(Function::TemporalConvert(c)) => Ok(c.result.clone()),
-            Expression::Function(Function::RegexpReplace(_) | Function::RegexpJitReplace(_)) => {
-                Ok(Type::Utf8)
-            }
-            // A date part (`extract(minute …)`) and a byte length each carry the
-            // type they evaluate to.
-            Expression::Function(Function::DatePart(d)) => Ok(d.return_type.clone()),
-            Expression::Function(Function::Length(l)) => Ok(l.return_type.clone()),
-            // Arithmetic carries DuckDB's bound result type, so a float/decimal
-            // operand surfaces as `DOUBLE`/`DECIMAL` here (which the grouping and
-            // aggregation paths then reject).
-            Expression::Function(Function::Arithmetic(a)) => Ok(a.return_type.clone()),
-            // Everything else (comparisons, `contains`, `Divide`'s Float64
-            // quotient, …) has no type we use for grouping.
-            _ => Err(compile::Error::IndeterminateResultType(self.clone())),
+            // An aggregate carries DuckDB's bound result type.
+            Expression::AggregateFunc(a) => Ok(a.return_type().clone()),
+            Expression::Function(f) => Ok(f.result_type()),
         }
     }
 
