@@ -6,7 +6,7 @@
 //!
 //! The [`Plan`] carries the [`Catalog`] it was bound against (operators like
 //! `CREATE TABLE` need it at execution time). The dispatcher, on the other
-//! hand, is passed in at [`compile`](crate::compile) time — it represents
+//! hand, is passed in at [`compile`] time — it represents
 //! "what worker pool runs this plan" and isn't a property of the plan itself.
 
 use crate::catalog::Catalog;
