@@ -27,7 +27,4 @@ void PivotExtension::Load(ExtensionLoader &loader) {
 	ext->attach = pivot_catalog_attach;
 	ext->create_transaction_manager = create_pivot_transaction_manager;
 	StorageExtension::Register(DBConfig::GetConfig(db), "pivotdb", ext);
-
-	// DuckDB provides VARIANT casts and field access. Pivot functions are loaded
-	// on demand from the Rust registry through LookupEntry.
 }
