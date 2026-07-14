@@ -53,6 +53,7 @@
 // a published API — so allow public docs to reference private items.
 #![allow(rustdoc::private_intra_doc_links)]
 
+use core_affinity::CoreId;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier};
@@ -72,6 +73,7 @@ pub mod worker;
 mod api;
 mod data_flow;
 mod functions;
+mod numa;
 mod operations;
 #[cfg(feature = "perf")]
 mod profiler;
@@ -79,7 +81,7 @@ mod scan;
 mod stats;
 
 use crate::operations::nullary::OneShotNullaryFactory;
-use crate::worker::{Worker, WorkerWaker};
+use crate::worker::{WakerSet, Worker, WorkerWaker};
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
@@ -87,6 +89,7 @@ pub use io::{FsRequest, HttpRequest};
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
+pub use numa::Topology;
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 #[cfg(feature = "perf")]
@@ -132,28 +135,40 @@ pub type Identifier = usize;
 /// their next iteration.
 pub struct Shutdown {
     flag: Arc<AtomicBool>,
-    waker: Arc<WorkerWaker>,
+    /// One waker per NUMA node group; shutdown wakes every group.
+    wakers: Vec<Arc<WorkerWaker>>,
 }
 
 impl Shutdown {
     pub fn shutdown(&self) {
         self.flag.store(true, Ordering::Relaxed);
-        // Workers parked on the waker won't observe `exit_flag` until someone
-        // wakes them. Notify so every parked worker returns from
-        // `wait_if_unchanged` and sees the flag on its next loop iteration.
-        self.waker.notify();
+        // Workers parked on a waker won't observe `exit_flag` until someone
+        // wakes them. Notify every group's waker so every parked worker returns
+        // from `wait_if_unchanged` and sees the flag on its next loop iteration.
+        for waker in &self.wakers {
+            waker.notify();
+        }
     }
+}
+
+/// What a successful dispatch hands back: the wakers of every node the dataflow
+/// runs on, so cancellation (which may fire from a non-worker thread) can wake
+/// parked workers on any node.
+pub struct Dispatched {
+    pub(crate) wakers: WakerSet,
 }
 
 #[derive(Clone)]
 pub struct DataFlowDispatcher {
+    /// One channel per worker, in global worker order (node 0's workers first).
     senders: Vec<StdSender<DataFlowBuilder>>,
+    /// The worker/node shape, mirrored by every per-worker structure a
+    /// dataflow builds (channels, sibling counters).
+    topology: numa::Topology,
+    /// One waker per node group, for dispatch-time and cancellation wakes.
+    waker_set: WakerSet,
+    /// Total ring slots across all nodes, used to size group-by working memory.
     buffers: usize,
-    /// Shared [`WorkerWaker`] handed to every worker on startup. Non-worker
-    /// threads (e.g. the embedding server) can call `waker().notify()` to
-    /// kick idle workers out of their park; worker threads access the same
-    /// instance through their thread-local [`crate::worker::worker_waker`].
-    waker: Arc<WorkerWaker>,
     /// Whether every dataflow launched through this handle is marked profiled.
     /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling))
     /// so profiling (and the exclusive execution it triggers) is scoped to one
@@ -180,26 +195,38 @@ impl DataFlowDispatcher {
 }
 
 impl DataFlowDispatcher {
-    /// Send each worker their pre-built `DataFlow` bundle. Each worker
-    /// receives exactly one builder with their specific resources.
-    pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) {
-        for (sender, builder) in self.senders.iter().zip(builders) {
-            sender.send(builder).unwrap();
+    /// Dispatch one pre-built `DataFlow` bundle across the node groups.
+    /// Builder `i` goes to global worker `i` (node `i / workers_per_node`). A
+    /// full bundle has one builder per worker; a shorter one (e.g.
+    /// [`run_on_worker`](Self::run_on_worker)'s single builder) reaches only
+    /// the first workers, which is consistent with the dense `0..builder_count`
+    /// worker indexing its channels are built for.
+    pub fn push_data_flow(
+        &self,
+        builders: impl IntoIterator<Item = DataFlowBuilder>,
+    ) -> Dispatched {
+        for (worker, builder) in builders.into_iter().enumerate() {
+            self.senders[worker].send(builder).unwrap();
         }
-        // Wake idle workers so they pick up the new dataflow without
-        // waiting out their park.
-        self.waker.notify();
+        // Wake idle workers on every node so they pick up the new dataflow
+        // without waiting out their park.
+        self.waker_set.notify_all();
+        Dispatched {
+            wakers: self.waker_set.clone(),
+        }
     }
 
-    /// Borrow the shared waker so callers outside a worker thread (e.g.
-    /// cancellation handles, the embedding server's shutdown path) can wake
-    /// parked workers without going through the worker-thread TLS.
-    pub fn waker(&self) -> &Arc<WorkerWaker> {
-        &self.waker
-    }
-
+    /// The total worker count across all node groups. Every dataflow's
+    /// operator chain is built at this size, since a dataflow runs on every
+    /// worker.
     pub fn worker_count(&self) -> usize {
-        self.senders.len()
+        self.topology.total_workers()
+    }
+
+    /// The worker/node shape of the pool, for code that partitions per-worker
+    /// state by node (e.g. work-stealing channels, scan queues).
+    pub fn topology(&self) -> numa::Topology {
+        self.topology
     }
 
     /// Ship a `FnOnce() -> T` to worker 0 and return its result.
@@ -261,43 +288,86 @@ pub struct Dispatch {
 }
 
 impl Dispatch {
-    /// Spawn `worker_count` worker threads (capped by available cores) and return a
-    /// `Dispatch` that owns them. `buffers` sets the size of the shared ring (in 2MB
-    /// slots) used for all worker memory contexts. `disk_cache` is the optional
-    /// disk cache for remote reads, shared by every worker's requester (`None`
-    /// disables it). Blocks until every worker has finished pre-faulting and is
-    /// ready for work.
+    /// Spawn up to `worker_count` worker threads and return a `Dispatch` that owns them.
+    ///
+    /// Cores are grouped by NUMA node; `worker_count` is split evenly across nodes (each
+    /// group is the same size, leftover cores dropped). All workers share one memory ring
+    /// of `buffers` 2MB slots and one set of caches, but the ring is regioned per node:
+    /// each node's workers first-touch, acquire, and evict only their own region, so
+    /// every allocation is node-local while cached data stays visible pool-wide (see
+    /// [`memory::RingLayout`]). Every dataflow runs on all workers. `disk_cache` is the
+    /// optional disk cache for remote reads, shared by every worker's requester (`None`
+    /// disables it). Blocks until every worker has finished pre-faulting.
     pub fn spin_up(
         worker_count: usize,
         buffers: usize,
         disk_cache: Option<Arc<crate::io::DiskCache>>,
     ) -> Self {
         let cores = core_affinity::get_core_ids().unwrap();
-        info!("Setting up io...");
+        let groups = numa::balance_worker_groups(numa::group_cores_by_node(cores), worker_count);
+        Self::spin_up_groups(groups, buffers, disk_cache)
+    }
 
-        let cores: Vec<_> = cores.into_iter().take(worker_count).collect();
-        let mut threads = vec![];
-        info!("Creating memory context ({})...", cores.len());
-        let barrier = Arc::new(Barrier::new(cores.len() + 1));
-        let mut senders = vec![];
-        let mut memory_context_factories = MemoryContextFactory::create_many(cores.len(), buffers);
+    /// Spawn one worker group per entry in `core_groups` (every group must be the
+    /// same length). The total ring budget `buffers` is divided evenly across the
+    /// groups' regions. Shared by [`spin_up`](Self::spin_up) and tests that inject
+    /// a synthetic multi-node topology on a single-node machine.
+    fn spin_up_groups(
+        core_groups: Vec<Vec<CoreId>>,
+        buffers: usize,
+        disk_cache: Option<Arc<crate::io::DiskCache>>,
+    ) -> Self {
+        // Empty groups would size the ready barrier for one phantom worker and then
+        // spawn none, deadlocking the barrier wait below. Fail loudly instead.
+        assert!(
+            !core_groups.is_empty(),
+            "no cores available to spin up workers"
+        );
+        let topology = numa::Topology {
+            workers_per_node: core_groups[0].len(),
+            node_count: core_groups.len(),
+        };
+        debug_assert!(
+            core_groups
+                .iter()
+                .all(|group| group.len() == topology.workers_per_node),
+            "node groups must be equal-sized"
+        );
+        let total_workers = topology.total_workers();
+        let layout = memory::RingLayout::new(topology, (buffers / topology.node_count).max(1));
+        info!(
+            "Starting {total_workers} workers across {} node group(s)...",
+            topology.node_count
+        );
+
+        let barrier = Arc::new(Barrier::new(total_workers + 1));
         let should_exit = Arc::new(AtomicBool::new(false));
-        let waker = Arc::new(WorkerWaker::new());
-        info!("Starting workers...");
-        for (i, core) in cores.into_iter().enumerate() {
-            let (tx, rx) = channel();
-            senders.push(tx);
-            threads.push(Worker::create(
-                i,
-                worker_count,
-                core,
-                should_exit.clone(),
-                memory_context_factories.pop().unwrap(),
-                disk_cache.clone(),
-                rx,
-                barrier.clone(),
-                waker.clone(),
-            ));
+        let mut memory_factories = MemoryContextFactory::create_for_layout(layout).into_iter();
+        let node_wakers: Vec<Arc<WorkerWaker>> = (0..topology.node_count)
+            .map(|_| Arc::new(WorkerWaker::new()))
+            .collect();
+        let waker_set = WakerSet::new(node_wakers.clone(), topology.workers_per_node);
+
+        let mut threads = vec![];
+        let mut senders = vec![];
+        for (node, group) in core_groups.into_iter().enumerate() {
+            for (node_local_idx, core) in group.into_iter().enumerate() {
+                let (tx, rx) = channel();
+                senders.push(tx);
+                threads.push(Worker::create(
+                    node * topology.workers_per_node + node_local_idx,
+                    total_workers,
+                    node,
+                    core,
+                    should_exit.clone(),
+                    memory_factories.next().unwrap(),
+                    disk_cache.clone(),
+                    rx,
+                    barrier.clone(),
+                    node_wakers[node].clone(),
+                    waker_set.clone(),
+                ));
+            }
         }
         barrier.wait();
         info!("All workers have begun...");
@@ -305,20 +375,21 @@ impl Dispatch {
         Dispatch {
             dataflow_dispatcher: DataFlowDispatcher {
                 senders,
-                buffers,
-                waker: waker.clone(),
+                topology,
+                waker_set,
+                buffers: layout.total_slots(),
                 #[cfg(feature = "perf")]
                 profiled: false,
             },
             handles: threads,
             shutdown: Shutdown {
                 flag: should_exit,
-                waker,
+                wakers: node_wakers,
             },
         }
     }
 
-    /// Number of active worker threads (one per core).
+    /// Total number of active worker threads across all node groups.
     pub fn workers(&self) -> usize {
         self.handles.len()
     }
@@ -341,5 +412,150 @@ impl Dispatch {
 
     pub fn into_parts(self) -> (Vec<JoinHandle<()>>, Shutdown) {
         (self.handles, self.shutdown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! These tests cover node-group dispatch: a dataflow spans every group,
+    //! workers carry global indices and node identities, and all groups share
+    //! one ring. A synthetic two-group topology makes this testable on a
+    //! single-node machine.
+
+    use super::*;
+    use crate::operations::nullary::OneShotNullaryFactory;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    /// Build `node_count` groups of `workers_per_node` workers from real core ids,
+    /// duplicating the first core so the test runs on any machine.
+    fn synthetic_groups(node_count: usize, workers_per_node: usize) -> Vec<Vec<CoreId>> {
+        let core = core_affinity::get_core_ids().unwrap()[0];
+        (0..node_count)
+            .map(|_| vec![core; workers_per_node])
+            .collect()
+    }
+
+    /// Run a one-shot-per-worker dataflow collecting `f()` from every worker.
+    fn collect_from_each_worker<T: Send + 'static>(
+        dispatcher: &DataFlowDispatcher,
+        f: impl Fn() -> T + Clone + Send + 'static,
+    ) -> Vec<T> {
+        let factories = (0..dispatcher.worker_count())
+            .map(|_| NullaryOperatorFactory::new(OneShotNullaryFactory::new(f.clone())));
+        OperatorSpec::new(dispatcher.clone(), factories)
+            .collect()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_dataflow_spans_every_node_group() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+
+        let nodes = collect_from_each_worker(dispatch.dispatcher(), crate::worker::current_node);
+
+        assert_eq!(nodes.len(), 4, "ran on every worker of every group");
+        assert_eq!(
+            nodes.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([0, 1]),
+            "workers of both node groups took part"
+        );
+        dispatch.exit();
+    }
+
+    #[test]
+    fn all_node_groups_share_one_ring() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+
+        let rings = collect_from_each_worker(dispatch.dispatcher(), || {
+            memory_ctx().ring() as *const _ as usize
+        });
+
+        assert_eq!(rings.into_iter().collect::<HashSet<_>>().len(), 1);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn workers_carry_dense_global_indices() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+
+        let mut indices =
+            collect_from_each_worker(dispatch.dispatcher(), || crate::worker::WORKER_IDX.get());
+
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn group_by_merges_correctly_across_node_groups() {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::{Int32Type, Int64Type};
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        // Enough ring slots per node region for the group-by's arenas, slab
+        // tables, and merge fragments.
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 256, None);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        // Every key appears once per batch, so each of the 8 batches contributes
+        // to every group and the per-node merge fragments must combine across
+        // nodes to produce the right counts.
+        let batches: Vec<RecordBatch> = (0..8)
+            .map(|_| {
+                let keys: ArrayRef = Arc::new(Int32Array::from((0..100).collect::<Vec<_>>()));
+                RecordBatch::try_new(schema.clone(), vec![keys]).unwrap()
+            })
+            .collect();
+
+        let results = values_input(dispatch.dispatcher(), batches)
+            .record_batches()
+            .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,)>>(
+                vec![0],
+                vec![AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    arrow_schema::DataType::Int64,
+                )],
+                None,
+                (),
+            )
+            .collect()
+            .unwrap();
+
+        let mut counts: Vec<(i32, i64)> = results
+            .iter()
+            .flat_map(|batch| {
+                let keys = batch.column(0).as_primitive::<Int32Type>();
+                let values = batch.column(1).as_primitive::<Int64Type>();
+                (0..batch.num_rows())
+                    .map(|i| (keys.value(i), values.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        counts.sort();
+        assert_eq!(counts.len(), 100, "one row per group");
+        assert!(
+            counts.iter().all(|&(_, c)| c == 8),
+            "every key seen 8 times"
+        );
+        dispatch.exit();
+    }
+
+    #[test]
+    fn run_on_workers_reaches_every_worker() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let seen = Arc::new(Mutex::new(HashSet::new()));
+
+        let collector = seen.clone();
+        dispatch.dispatcher().run_on_workers(move || {
+            collector
+                .lock()
+                .unwrap()
+                .insert(crate::worker::WORKER_IDX.get());
+        });
+
+        assert_eq!(seen.lock().unwrap().len(), 4, "touched every worker");
+        dispatch.exit();
     }
 }

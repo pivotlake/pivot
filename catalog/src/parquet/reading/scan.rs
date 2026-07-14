@@ -37,13 +37,14 @@ where
     OF: OperatorFactory<RowGroupBuffer> + Send + 'static,
 {
     let n = input.dispatcher().worker_count();
+    let topology = input.dispatcher().topology();
     let decoded = input
         .chain(
-            stealable::<RowGroupBuffer>(n).into_iter().collect(),
+            stealable::<RowGroupBuffer>(topology).into_iter().collect(),
             (0..n).map(|_| IndexerFactory::new()).collect(),
         )
         .chain(
-            stealable::<CompressedPage>(n).into_iter().collect(),
+            stealable::<CompressedPage>(topology).into_iter().collect(),
             (0..n).map(|_| DecompressorFactory::new()).collect(),
         )
         .chain(
@@ -122,7 +123,13 @@ pub fn table_input_with_filter_and_eq_predicates(
     if projection.indices().is_empty() {
         return empty_projection_scan(dispatcher, table, filter, add_row_group_metadata);
     }
-    let injector = RowGroupInjectorFactory::new(table, projection.clone(), filter, scan_order);
+    let injector = RowGroupInjectorFactory::new(
+        table,
+        projection.clone(),
+        filter,
+        scan_order,
+        dispatcher.topology().node_count,
+    );
     let siblings = Arc::new(AtomicUsize::new(n));
     // One fetcher handles disk and HTTP row groups, bounding each medium's
     // in-flight count separately.
@@ -159,9 +166,9 @@ pub fn materialize(
     let siblings_materializer = Arc::new(AtomicUsize::new(n));
     let siblings_fetcher = Arc::new(AtomicUsize::new(n));
 
-    let factories: Vec<_> = stealable::<RecordBatch>(n)
+    let factories: Vec<_> = stealable::<RecordBatch>(dispatcher.topology())
         .into_iter()
-        .zip(stealable::<RowGroupRequest>(n))
+        .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
         .map(|(rb_ch, rq_ch)| {
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(

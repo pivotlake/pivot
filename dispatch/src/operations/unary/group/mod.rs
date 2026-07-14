@@ -116,15 +116,15 @@ use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
     PartitionBuffers, RadixConfig,
 };
-use crate::worker::worker_waker;
+use crate::worker::{current_node, waker_set};
 use ahash::RandomState;
 use arena::SharedArena;
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 use crossbeam_deque::{Injector, Steal};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use thiserror::Error;
 use unary::pipeline_breaker::{Consumer, Outputter};
 
@@ -163,9 +163,19 @@ impl GroupLimit {
     }
 }
 
-/// Number of hash partitions for the output merge phase.
-/// Each partition is merged independently, enabling parallel output.
+/// Minimum number of hash partitions for the output merge phase. Each
+/// partition is merged independently, enabling parallel output; the actual
+/// count is raised to the worker count (see [`merge_partition_floor`]) so a
+/// large pool doesn't idle behind too few jobs.
 const PARTITIONS: usize = 64;
+
+/// Compute the merge-phase partition floor. The merge uses at least
+/// [`PARTITIONS`] partitions and at least one job per contributing worker
+/// (rounded up to a power of two, which the hash-top-bits partitioning
+/// requires), so every core has merge work.
+fn merge_partition_floor(contributing_workers: usize) -> usize {
+    PARTITIONS.max(contributing_workers.next_power_of_two())
+}
 
 /// Number of radix partitions for the scatter + merge of high-cardinality
 /// (switched) workers. Larger than [`PARTITIONS`] so each radix target stays
@@ -188,9 +198,13 @@ pub struct Group<K: KeyExtractor, V: AggregationValue> {
     key_config: K::Config,
 
     aggregated_table: AggregatedTable<K, V>,
-    sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
+    sender: mpsc::Sender<NodeOutput<K, V>>,
     outputter: GroupOutputter<K, V>,
 }
+
+/// One worker's flushed consume-phase output, tagged with the NUMA node that
+/// produced it so the merge can group sources per node.
+type NodeOutput<K, V> = (usize, AggregatedTableOutput<K, V>);
 
 impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
     #[allow(clippy::too_many_arguments)]
@@ -198,14 +212,14 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         key_arena: Arc<SharedArena>,
         value_arena: Arc<SharedArena>,
         state: RandomState,
-        injector: Arc<Injector<PartitionJob<K, V>>>,
+        injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
         key_config: K::Config,
         output_limit: Option<GroupLimit>,
         count_only: bool,
-        sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
-        receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
+        sender: mpsc::Sender<NodeOutput<K, V>>,
+        receiver: Option<mpsc::Receiver<NodeOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
@@ -232,7 +246,8 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
             key_config: key_config.clone(),
             outputter: GroupOutputter {
                 key_arena,
-                injector,
+                node: current_node(),
+                injectors,
                 receiver,
                 partition_jobs_injected,
                 key_config,
@@ -269,7 +284,7 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
 
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
         let tables = self.aggregated_table.flush();
-        self.sender.send(tables).unwrap();
+        self.sender.send((current_node(), tables)).unwrap();
         Ok(Some(self.outputter))
     }
 }
@@ -284,8 +299,14 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
 pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     /// String *key* storage; backs the leading key column(s) at output.
     key_arena: Arc<SharedArena>,
-    injector: Arc<Injector<PartitionJob<K, V>>>,
-    receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
+    /// One job queue per NUMA node. A node-level merge job reads that node's
+    /// tables, so it is queued on (and preferentially run by) that node's
+    /// workers; a worker falls back to other nodes' queues only when its own
+    /// is empty, trading locality for tail balance.
+    injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
+    /// This worker's node, i.e. which of `injectors` is local to it.
+    node: usize,
+    receiver: Option<mpsc::Receiver<NodeOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     key_config: K::Config,
     /// The value's shared context, threaded into each [`PartitionJob`] so the merge
@@ -318,19 +339,37 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     output_accumulator: Option<output::OutputAccumulator<K, V>>,
 }
 
-/// A single partition's merge work unit.
+/// One (NUMA node, partition) merge work unit.
 ///
-/// Created by the [`GroupOutputter`] that holds the receiver and pushed to a
-/// shared [`Injector`] for work-stealing execution. Each job merges all
-/// source tables for partition `index` into one result table and sends the
-/// output as a [`RecordBatch`].
+/// Created by the [`GroupOutputter`] that holds the receiver and pushed to the
+/// node's [`Injector`] for work-stealing execution. Each job merges one node's
+/// source tables for partition `index` into one result table. On a single-node
+/// pool (`finale` is `None`) that result is the partition's final table and its
+/// rows are emitted directly. With multiple nodes, each node's job folds only
+/// node-local memory and stashes its fragment in the shared [`PartitionFinale`];
+/// whichever job finishes last folds the (already per-node aggregated, so much
+/// smaller) fragments together and emits the rows. That final fold is the only
+/// step that reads another node's memory.
 pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
-    /// Switched workers' scatter buffers (empty Vec in the all-in-place case).
+    /// This node's switched workers' scatter buffers (empty Vec when none switched).
     buffers: Arc<Vec<PartitionBuffers<K, V>>>,
-    /// Every worker's in-place stack: switched workers' pre-switch tables and
-    /// non-switched workers' full stacks. Slot-range-merged at `num_partitions`.
+    /// Holds the in-place stacks of this node's workers: switched workers'
+    /// pre-switch tables and non-switched workers' full stacks. Jobs merge
+    /// them by slot range at `num_partitions` granularity.
     tables: Arc<Vec<MultiSlabTable<K, V>>>,
     index: usize,
+    /// Cross-node completion state for partition `index`; `None` when this job's
+    /// merge result is already final (single-node pool).
+    finale: Option<Arc<PartitionFinale<K, V>>>,
+    /// Starting capacity of this job's merge target. Hierarchical jobs use the
+    /// full `partition_capacity`, not a per-node share: the hierarchical path
+    /// is chosen exactly when keys repeat across workers, and row groups are
+    /// hash-assigned to nodes, so a repeating key reaches every node and each
+    /// node's fragment converges toward the partition's full distinct count.
+    /// A per-node share would guarantee a mid-merge resize the sizing exists
+    /// to avoid; the full size only costs transient memory the following
+    /// cross-node fold frees.
+    fragment_capacity: usize,
     key_arena: Arc<SharedArena>,
     /// The arena's ring buffers wrapped as Arrow `Buffer`s, built once for the
     /// whole output phase and shared by every partition job. String-key output
@@ -351,6 +390,28 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
 
 unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionJob<K, V> {}
 
+/// Where one partition's per-node merge jobs meet: each job deposits its
+/// node's merged fragment, and the last one to arrive folds them into the
+/// partition's final table (see [`merge::merge_fragments`]).
+struct PartitionFinale<K: KeyExtractor, V: AggregationValue> {
+    /// Node jobs still to deposit; the job that decrements this to zero runs
+    /// the final fold.
+    remaining: AtomicUsize,
+    fragments: Mutex<Vec<MultiSlabTable<K, V>>>,
+}
+
+unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionFinale<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue> Sync for PartitionFinale<K, V> {}
+
+impl<K: KeyExtractor, V: AggregationValue> PartitionFinale<K, V> {
+    fn new(node_count: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(node_count),
+            fragments: Mutex::new(Vec::with_capacity(node_count)),
+        }
+    }
+}
+
 impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
     /// Merge this partition's scatter buffers and in-place stacks into one result
     /// table, then feed its rows into the worker's shared `acc` (building columns
@@ -367,11 +428,30 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
             self.index,
             &self.buffers,
             &self.tables,
-            self.partition_capacity,
+            self.fragment_capacity,
             self.num_partitions,
             &self.key_arena,
             &self.shared_context,
         );
+        let result_map = match &self.finale {
+            None => result_map,
+            Some(finale) => {
+                finale.fragments.lock().unwrap().push(result_map);
+                if finale.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+                    // Another node's job for this partition is still running;
+                    // it will fold the fragments and emit.
+                    return Ok(());
+                }
+                let fragments = std::mem::take(&mut *finale.fragments.lock().unwrap());
+                merge::merge_fragments::<K, V>(
+                    fragments,
+                    self.partition_capacity,
+                    self.num_partitions.trailing_zeros(),
+                    &self.key_arena,
+                    &self.shared_context,
+                )
+            }
+        };
         if result_map.len() == 0 {
             return Ok(());
         }
@@ -402,11 +482,14 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
     /// row). Run exactly once, by whichever worker holds the receiver.
     fn create_partition_jobs<S: Sender<RecordBatch>>(
         &self,
-        rx: mpsc::Receiver<AggregatedTableOutput<K, V>>,
+        rx: mpsc::Receiver<NodeOutput<K, V>>,
         sender: &mut S,
     ) -> unary::Result<()> {
-        let mut all_tables = Vec::new();
-        let mut all_buffers = Vec::new();
+        let node_count = self.injectors.len();
+        let mut tables_by_node: Vec<Vec<MultiSlabTable<K, V>>> =
+            (0..node_count).map(|_| Vec::new()).collect();
+        let mut buffers_by_node: Vec<Vec<PartitionBuffers<K, V>>> =
+            (0..node_count).map(|_| Vec::new()).collect();
         let mut hll = Hll::new();
         let mut zero_hash_seen = false;
         // A worker only folds its keys into the sketch once it switches to
@@ -417,17 +500,32 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         // switched worker also holds over-counts, which only over-sizes the
         // merge targets (safe); under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
-        for out in rx.into_iter() {
+        let mut contributing_workers = 0usize;
+        for (node, out) in rx.into_iter() {
+            contributing_workers += 1;
             if out.buffers.is_none() {
                 non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
             }
-            all_tables.extend(out.tables);
+            tables_by_node[node].extend(out.tables);
             if let Some(b) = out.buffers {
-                all_buffers.push(b);
+                buffers_by_node[node].push(b);
             }
             hll.merge(&out.hll);
             zero_hash_seen |= out.zero_hash_seen;
         }
+        let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
+        let partition_floor = merge_partition_floor(contributing_workers);
+        let total_in_place: usize = tables_by_node.iter().flatten().map(|t| t.len()).sum();
+        let scatter_rows: usize = buffers_by_node
+            .iter()
+            .flatten()
+            .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
+            .sum();
+        // Estimate the global distinct count: the HLL covers switched
+        // workers, and a non-switched worker's exact per-table count stands
+        // in for its keys (over-counting keys a switched worker also holds,
+        // which is safe).
+        let estimate = hll.estimate() + non_switched_groups;
 
         // Decide how many independent merge jobs to run (`num_partitions`) and how
         // large each job's result table starts (`partition_capacity`). Every job
@@ -442,14 +540,13 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         let target_groups_per_partition = (TARGET_MERGE_PARTITION_BYTES
             / std::mem::size_of::<(u64, K::Persisted, V)>().max(1))
         .max(1);
-        let (num_partitions, partition_capacity) = if all_buffers.is_empty() {
+        let (num_partitions, partition_capacity) = if !any_switched {
             // No worker switched to radix, so every group still sits in an in-place
-            // table. Run a plain PARTITIONS-way merge, each job sized to its share of
+            // table. Run a partition_floor-way merge, each job sized to its share of
             // the total group count.
-            let total: usize = all_tables.iter().map(|t| t.len()).sum();
             (
-                PARTITIONS,
-                (total / PARTITIONS)
+                partition_floor,
+                (total_in_place / partition_floor)
                     .next_power_of_two()
                     .max(DEFAULT_CAPACITY),
             )
@@ -462,9 +559,14 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
             // so every core has work, and never more than the bucket count, since the
             // merge can't be finer than the scatter (each job folds a contiguous range
             // of buckets, reaching one-bucket-per-job only at very high cardinality).
-            let scatter_buckets = all_buffers[0].0.len();
-            let estimate = hll.estimate() + non_switched_groups;
-            let floor = PARTITIONS.min(scatter_buckets);
+            let scatter_buckets = buffers_by_node
+                .iter()
+                .flatten()
+                .next()
+                .expect("a worker switched, so some node has scatter buffers")
+                .0
+                .len();
+            let floor = partition_floor.min(scatter_buckets);
             let merge_partitions = (estimate / target_groups_per_partition)
                 .next_power_of_two()
                 .clamp(floor, scatter_buckets);
@@ -477,8 +579,22 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
             (merge_partitions, capacity)
         };
 
-        let buffers = Arc::new(all_buffers);
-        let tables = Arc::new(all_tables);
+        // Node-hierarchical or direct merge? Hierarchical (one job per node and
+        // partition, then a fold of the per-node fragments) keeps each job's
+        // reads node-local, but pays an extra materialization of the fragments.
+        // That trade only wins when keys repeat across the input enough that
+        // per-node aggregation shrinks what the cross-node fold must touch.
+        // With near-unique keys (input close to the distinct estimate) the
+        // fragments would be as large as the input, so merge every node's
+        // sources directly and pay the remote reads once. An all-in-place merge
+        // is always direct: its tables are per-worker aggregated already and
+        // their estimate equals their total, so the test is never met.
+        let hierarchical = node_count > 1 && total_in_place + scatter_rows > 2 * estimate;
+        let fragment_capacity = if hierarchical {
+            (partition_capacity / node_count).max(1)
+        } else {
+            partition_capacity
+        };
         // Wrap the arena's ring buffers once for the whole output phase (consume
         // is done, so `next_idx` is final). Every partition job shares this one
         // `Arc<[Buffer]>` for zero-copy string output, so a batch attaches it with
@@ -486,11 +602,19 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         // Held by the jobs (and the batches they emit), never by the arena, so
         // there is no `arena -> Buffer -> arena` cycle.
         let output_buffers: Arc<[Buffer]> = self.key_arena.to_arrow_buffers();
-        for i in 0..num_partitions {
-            self.injector.push(PartitionJob {
-                buffers: buffers.clone(),
-                tables: tables.clone(),
-                index: i,
+        // All jobs are pushed before the injected flag flips, so a drained
+        // queue means a finished phase.
+        let mut push_job = |injector: &Injector<PartitionJob<K, V>>,
+                            index: usize,
+                            finale: Option<Arc<PartitionFinale<K, V>>>,
+                            buffers: Arc<Vec<PartitionBuffers<K, V>>>,
+                            tables: Arc<Vec<MultiSlabTable<K, V>>>| {
+            injector.push(PartitionJob {
+                buffers,
+                tables,
+                index,
+                finale,
+                fragment_capacity,
                 key_arena: self.key_arena.clone(),
                 output_buffers: output_buffers.clone(),
                 partition_capacity,
@@ -501,9 +625,45 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
                 output_limit: self.output_limit,
                 count_only: self.count_only,
             });
+        };
+        if hierarchical {
+            // One job per (node, partition), queued on the owning node so the
+            // bulk of every merge reads node-local memory.
+            let buffers_by_node: Vec<_> = buffers_by_node.into_iter().map(Arc::new).collect();
+            let tables_by_node: Vec<_> = tables_by_node.into_iter().map(Arc::new).collect();
+            for i in 0..num_partitions {
+                let finale = Arc::new(PartitionFinale::new(node_count));
+                for (node, injector) in self.injectors.iter().enumerate() {
+                    push_job(
+                        injector,
+                        i,
+                        Some(finale.clone()),
+                        buffers_by_node[node].clone(),
+                        tables_by_node[node].clone(),
+                    );
+                }
+            }
+        } else {
+            // One job per partition over every node's sources, spread across
+            // the node queues so all workers share the load.
+            let buffers = Arc::new(buffers_by_node.into_iter().flatten().collect::<Vec<_>>());
+            let tables = Arc::new(tables_by_node.into_iter().flatten().collect::<Vec<_>>());
+            for i in 0..num_partitions {
+                push_job(
+                    &self.injectors[i % node_count],
+                    i,
+                    None,
+                    buffers.clone(),
+                    tables.clone(),
+                );
+            }
         }
 
-        self.partition_jobs_injected.store(true, Ordering::Relaxed);
+        // Release pairs with the Acquire load in `output`: a worker that sees
+        // the flag also sees every job pushed above it. With relaxed ordering
+        // another core may observe the flag before the pushes and conclude
+        // from a still-empty queue that the merge phase is over.
+        self.partition_jobs_injected.store(true, Ordering::Release);
 
         // Exact COUNT(DISTINCT): the keys-only consume excluded the single
         // key whose bijective hash is 0 (it collides with the empty sentinel)
@@ -522,8 +682,8 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
                 .map_err(|e| unary::Error::from(Error::from(e)))?;
         }
 
-        // Wake up all workers so that they can start working on partitions
-        worker_waker().notify();
+        // Wake up all workers (on every node) so they can start working on partitions
+        waker_set().notify_all();
         Ok(())
     }
 }
@@ -534,7 +694,27 @@ impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutpu
             self.create_partition_jobs(rx, sender)?;
         }
 
-        let steal = self.injector.steal();
+        // Claim a job, trying the own node's queue first (its sources are
+        // node-local), then other nodes' queues so a node that finished its
+        // share helps with the tail instead of idling. The plain-load
+        // `is_empty` pre-checks keep the drained-queue polls (every pass
+        // until the dataflow finishes) from pinning a crossbeam epoch each
+        // time.
+        let queue_count = self.injectors.len();
+        let mut steal = Steal::Empty;
+        for offset in 0..queue_count {
+            let queue = &self.injectors[(self.node + offset) % queue_count];
+            if queue.is_empty() {
+                continue;
+            }
+            match queue.steal() {
+                Steal::Empty => {}
+                s => {
+                    steal = s;
+                    break;
+                }
+            }
+        }
         match steal {
             Steal::Success(job) => {
                 let allocator = self
@@ -544,7 +724,7 @@ impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutpu
                     .map_err(unary::Error::from)?;
             }
             Steal::Empty => {
-                if self.partition_jobs_injected.load(Ordering::Relaxed) {
+                if self.partition_jobs_injected.load(Ordering::Acquire) {
                     // Queue drained: emit this worker's last partial batch.
                     if let (Some(acc), Some(allocator)) = (
                         self.output_accumulator.as_mut(),
@@ -668,7 +848,7 @@ mod tests {
         let key_arena = SharedArena::new(64);
         let value_arena = SharedArena::new(64);
         let state = RandomState::new();
-        let injector = Arc::new(Injector::new());
+        let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
@@ -1004,7 +1184,7 @@ mod tests {
         let key_arena = SharedArena::new(64);
         let value_arena = SharedArena::new(64);
         let state = RandomState::new();
-        let injector = Arc::new(Injector::new());
+        let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);

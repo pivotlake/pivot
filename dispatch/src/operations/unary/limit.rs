@@ -29,7 +29,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
-use crate::worker::worker_waker;
+use crate::worker::waker_set;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -119,8 +119,8 @@ impl Consumer<RecordBatch, RecordBatch> for Limit {
             // upstream stage that will now be abandoned rather than finished)
             // won't otherwise notice `reached`, so it would never abandon its own
             // upstream nor flush its buffer, and the receiver worker would wait
-            // forever.
-            worker_waker().notify();
+            // forever. Peers may be parked on any node, so wake them all.
+            waker_set().notify_all();
         }
         Ok(())
     }
@@ -158,8 +158,9 @@ impl Consumer<RecordBatch, RecordBatch> for Limit {
         // receiver worker collects with a non-blocking `try_recv` while parked,
         // so a worker that buffered nothing must still wake it, or the final
         // disconnect could be slept through. (Same hazard as `order_by_limit`.)
+        // The receiver may be parked on another node, so wake every node.
         drop(sender);
-        worker_waker().notify();
+        waker_set().notify_all();
 
         Ok(receiver.map(|rx| LimitOutputter {
             rx,

@@ -30,15 +30,16 @@ pub(crate) fn profiling_active() -> bool {
 static WORKER_TIDS: LazyLock<Mutex<HashMap<usize, i32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Record the calling worker thread's OS tid under its worker index. Called once
-/// per worker at startup. `gettid` is Linux-only (where `perf` runs); elsewhere
-/// the feature still compiles but the tid is a placeholder.
-pub(crate) fn register_worker_tid(worker_idx: usize) {
+/// Record the calling worker thread's OS tid. Called once per worker at startup.
+/// Keyed by the tid itself (globally unique) rather than the worker index, which is
+/// node-relative and so repeats across NUMA node groups. `gettid` is Linux-only (where
+/// `perf` runs); elsewhere the feature still compiles but the tid is a placeholder.
+pub(crate) fn register_worker_tid(_worker_idx: usize) {
     #[cfg(target_os = "linux")]
     let tid = nix::unistd::gettid().as_raw();
     #[cfg(not(target_os = "linux"))]
     let tid = 0i32;
-    WORKER_TIDS.lock().unwrap().insert(worker_idx, tid);
+    WORKER_TIDS.lock().unwrap().insert(tid as usize, tid);
 }
 
 /// OS tids of all started worker threads. An out-of-crate profiler scopes

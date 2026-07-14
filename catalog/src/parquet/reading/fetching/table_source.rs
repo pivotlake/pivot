@@ -1,22 +1,45 @@
 //! Work-stealing source that feeds row groups into the fetching pipeline.
 //!
 //! [`RowGroupInjectorFactory`] pre-loads every row group from a
-//! [`ParquetTable`] into a shared [`Injector`] queue. Each worker gets its own
-//! [`RowGroupInjector`] (via [`RootChannelFactory`]) that steals row groups on
-//! demand, wrapping them in a [`RowGroupRequest`] with the target projection.
+//! [`ParquetTable`] into one shared [`Injector`] queue per NUMA node. Each
+//! worker gets its own [`RowGroupInjector`] (via [`RootChannelFactory`]) that
+//! claims row groups from its node's queue on demand, wrapping them in a
+//! [`RowGroupRequest`] with the target projection.
+//!
+//! Row groups are assigned to nodes by a stable hash of their identity (file +
+//! index within the file), so the *same* row group lands on the *same* node
+//! query after query. Everything a claim produces (the read into the
+//! compressed cache, decompression, decode) happens on the claiming worker,
+//! so sticky assignment keeps a row group's cached bytes on one node and its
+//! next scan node-local. A worker whose node's queue runs dry claims from
+//! other nodes' queues rather than idle (the stolen row group is still read
+//! and decoded entirely on the claiming node; only its cached bytes end up
+//! remote for a later query).
 
 use crate::parquet::RowGroupRequest;
-use crate::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::parquet::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::parquet::{RowGroupFilter, ScanOrder};
+
+/// The NUMA node a row group is assigned to, by a hash of its stable identity
+/// (its file and its index within that file). Deterministic across queries so
+/// assignment is sticky for as long as the file stays open, and uniform enough
+/// to split any table's row groups evenly across nodes.
+fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    row_group.location.hash(&mut hasher);
+    row_group.file_row_group_idx.hash(&mut hasher);
+    (hasher.finish() % node_count as u64) as usize
+}
 
 /// Whether scalar `a` orders strictly before `b` (`a < b`). Used to build a
 /// total order over per-row-group stat bounds; a null or type-mismatched
@@ -92,39 +115,44 @@ fn cache_first_order(table: &ParquetTable) -> Vec<usize> {
     order
 }
 
-/// Factory that populates a shared [`Injector`] with every row group in a
-/// table and produces [`RowGroupInjector`] receivers for each worker.
+/// Factory that populates one [`Injector`] per NUMA node with the table's row
+/// groups (split by [`affinity_node`]) and produces [`RowGroupInjector`]
+/// receivers for each worker.
 #[derive(Clone)]
 pub struct RowGroupInjectorFactory {
-    row_groups: Arc<Injector<QueryRowGroupMetadata>>,
+    node_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
     projection: Projection,
     filter: Option<RowGroupFilter>,
 }
 
 impl RowGroupInjectorFactory {
-    /// Creates a new factory, pushing all row groups from `table` into the
-    /// shared work-stealing queue. When `filter` is set, each row group is
-    /// offered to it on steal and skipped if it returns `false`. When
-    /// `scan_order` is set (a Top-N boundary on one key), row groups are pushed
-    /// in that key's order so the most-promising are stolen first and the
-    /// boundary prunes the rest; otherwise decompressed-cache-covered row groups
-    /// go first (see [`cache_first_order`]), falling back to file order.
+    /// Creates a new factory, pushing each of `table`'s row groups into its
+    /// affinity node's queue (`node_count` queues in total). When `filter` is
+    /// set, each row group is offered to it on claim and skipped if it returns
+    /// `false`. When `scan_order` is set (a Top-N boundary on one key), row
+    /// groups are pushed in that key's order so the most-promising are claimed
+    /// first and the boundary prunes the rest; otherwise decompressed-cache-covered
+    /// row groups go first (see [`cache_first_order`]), falling back to file
+    /// order.
     pub fn new(
         table: &Arc<ParquetTable>,
         projection: Projection,
         filter: Option<RowGroupFilter>,
         scan_order: Option<ScanOrder>,
+        node_count: usize,
     ) -> Self {
-        let injector = Arc::new(Injector::new());
+        let node_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>> =
+            Arc::new((0..node_count).map(|_| Injector::new()).collect());
         let order = match scan_order {
             Some(order) => steal_order(table, order),
             None => cache_first_order(table),
         };
         for row_group_idx in order {
-            injector.push(QueryRowGroupMetadata::new(table, row_group_idx, None));
+            let node = affinity_node(&table.row_groups[row_group_idx], node_count);
+            node_queues[node].push(QueryRowGroupMetadata::new(table, row_group_idx, None));
         }
         Self {
-            row_groups: injector,
+            node_queues,
             projection,
             filter,
         }
@@ -134,58 +162,78 @@ impl RowGroupInjectorFactory {
 impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
     type Receiver = RowGroupInjector;
 
+    /// Runs on the worker thread, so the receiver can snapshot which node's
+    /// queue is local to it.
     fn build(self) -> Self::Receiver {
         RowGroupInjector {
-            row_groups: self.row_groups,
+            node: dispatch::worker::current_node(),
+            node_queues: self.node_queues,
             projection: self.projection,
             filter: self.filter,
         }
     }
 }
 
-/// A [`Receiver`] that steals row groups from the shared [`Injector`] queue.
-///
-/// Work is only consumed through [`steal`](Self::steal); `try_recv` always
-/// returns `None`.
+/// A [`Receiver`] that claims row groups from the per-node [`Injector`]
+/// queues: its own node's queue on the hot path, other nodes' queues only
+/// when its own runs dry.
 pub struct RowGroupInjector {
-    row_groups: Arc<Injector<QueryRowGroupMetadata>>,
+    node_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>>,
+    /// Index of this worker's node's queue in `node_queues`.
+    node: usize,
     projection: Projection,
     filter: Option<RowGroupFilter>,
 }
 
 impl Receiver<RowGroupRequest> for RowGroupInjector {
     fn is_empty(&self) -> bool {
-        self.row_groups.is_empty()
+        self.node_queues.iter().all(|queue| queue.is_empty())
     }
 
-    /// Eager-path pull. The injector is the *only* source of row groups, so it
-    /// must be reachable from `run_cpu_work` (which calls `try_recv`) — otherwise
-    /// row groups are stolen only in the worker's idle branch, one at a time,
-    /// and a high-latency remote scan never builds read-ahead (in-flight reads
-    /// peak at 1 per worker). A single non-spinning attempt keeps the hot loop
-    /// from spinning on `Steal::Retry`; the next iteration retries. A pruned row
-    /// group also returns `None` (it has been removed; the next call advances).
+    /// Pull eagerly from this node's own queue. The injector is the *only*
+    /// source of row groups, so it must be reachable from `run_cpu_work` (which
+    /// calls `try_recv`), otherwise row groups are claimed only in the worker's
+    /// idle branch, one at a time, and a high-latency remote scan never builds
+    /// read-ahead (in-flight reads peak at 1 per worker). A single non-spinning
+    /// attempt keeps the hot loop from spinning on `Steal::Retry`; the next
+    /// iteration retries. A pruned row group also returns `None` (it has been
+    /// removed; the next call advances).
     fn try_recv(&self) -> Option<RowGroupRequest> {
-        match self.row_groups.steal() {
+        // This pre-check is a plain load; once the queue drains (every pass
+        // for the rest of the query) it avoids an epoch-pinning steal per
+        // call.
+        let queue = &self.node_queues[self.node];
+        if queue.is_empty() {
+            return None;
+        }
+        match queue.steal() {
             Steal::Success(s) => self.admit(s),
             Steal::Empty | Steal::Retry => None,
         }
     }
 
+    /// Pull on the idle path: drain this node's queue first, then fall back
+    /// to other nodes' queues so a node that finished its share keeps its
+    /// CPUs busy instead of waiting out the tail.
     fn steal(&self) -> Option<RowGroupRequest> {
-        loop {
-            match self.row_groups.steal() {
-                Steal::Empty => return None,
-                Steal::Retry => continue,
-                // Skip row groups the filter prunes; keep stealing rather than
-                // handing the worker a no-op.
-                Steal::Success(s) => {
-                    if let Some(req) = self.admit(s) {
-                        return Some(req);
+        let queue_count = self.node_queues.len();
+        for offset in 0..queue_count {
+            let queue = &self.node_queues[(self.node + offset) % queue_count];
+            while !queue.is_empty() {
+                match queue.steal() {
+                    Steal::Empty => break,
+                    Steal::Retry => continue,
+                    // Skip row groups the filter prunes; keep claiming rather
+                    // than handing the worker a no-op.
+                    Steal::Success(s) => {
+                        if let Some(req) = self.admit(s) {
+                            return Some(req);
+                        }
                     }
                 }
             }
         }
+        None
     }
 }
 

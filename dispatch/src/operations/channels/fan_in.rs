@@ -10,7 +10,7 @@
 //! nothing.
 
 use crate::operations::channels::ChannelFactory;
-use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel};
+use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel, mpsc_channel_to};
 
 /// One worker's endpoint of a fan-in channel: a clone of the shared sender (all
 /// pointing at worker 0's queue) and this worker's receiver — the real one for
@@ -33,7 +33,7 @@ impl<T: Send + 'static> ChannelFactory<T> for FanInChannelFactory<T> {
 /// single real receiver handed to worker 0; workers `1..count` get a private,
 /// always-empty receiver.
 pub fn fan_in<T: Send + 'static>(count: usize) -> Vec<FanInChannelFactory<T>> {
-    let (sender, receiver) = mpsc_channel::<T>();
+    let (sender, receiver) = mpsc_channel_to::<T>(0);
     let mut factories = Vec::with_capacity(count);
     factories.push(FanInChannelFactory {
         sender: sender.clone(),

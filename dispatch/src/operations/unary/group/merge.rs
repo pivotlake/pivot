@@ -34,8 +34,8 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable, PersistedKey, Table,
-    TableStorage,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MAX_LOAD_FACTOR, MultiSlabTable,
+    PersistedKey, Table, TableStorage,
 };
 
 /// Collision-to-entry ratio at which we double the target table.
@@ -317,6 +317,55 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     }
     target
 }
+/// Fold one partition's per-node merge fragments into a single result table.
+///
+/// Each fragment is one NUMA node's [`merge_combined`] result for the same
+/// partition, so it is already fully aggregated within its node and every
+/// entry belongs to this partition. Only the keys shared *across* nodes
+/// remain to be combined, which is why this final, partly-remote pass is so
+/// much cheaper than merging every worker's raw tables across nodes would be.
+///
+/// When the largest fragment can hold every entry at the table's load factor
+/// (typical when nodes saw mostly the same keys), it becomes the target and
+/// only the other fragments are folded in. Otherwise (mostly node-disjoint
+/// keys) a fresh table sized for the whole partition (`partition_capacity`,
+/// derived from the global estimate) is filled from all fragments, so the
+/// fold doesn't resize mid-way.
+pub(super) fn merge_fragments<K: KeyExtractor, V: AggregationValue>(
+    mut fragments: Vec<MultiSlabTable<K, V>>,
+    partition_capacity: usize,
+    partition_bits: u32,
+    key_arena: &SharedArena,
+    cfg: &V::SharedContext,
+) -> MultiSlabTable<K, V> {
+    let mut allocator = SlabAllocator::new(true);
+    let total: usize = fragments.iter().map(|f| f.len()).sum();
+    let largest = fragments
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, f)| f.len())
+        .map(|(i, _)| i)
+        .expect("a partition always has at least one fragment");
+    let mut target = if total as f64 <= fragments[largest].capacity() as f64 * MAX_LOAD_FACTOR {
+        fragments.swap_remove(largest)
+    } else {
+        let cap = partition_capacity.max(DEFAULT_CAPACITY);
+        <MultiSlabTable<K, V>>::multi_slab(&mut allocator, cap, partition_bits)
+    };
+    for fragment in &fragments {
+        for entry in fragment.iter(0) {
+            target.merge::<true, _>(
+                entry.hash(),
+                K::resolve_persisted(key_arena, *entry.key()),
+                *entry.value(),
+                cfg,
+            );
+            resize_if_needed::<K, V>(&mut allocator, &mut target);
+        }
+    }
+    target
+}
+
 /// Grow a merge target by 4x if it has crossed its load threshold. A safety net:
 /// `partition_capacity` is sized (from the HLL estimate) to hold the partition's
 /// groups, so with a sound estimate this never fires.
@@ -551,6 +600,55 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], (5, 5));
+    }
+
+    /// Node-hierarchical merges fold per-node fragments (each a `merge_combined`
+    /// result for the same partition) into one final table; keys shared across
+    /// nodes must combine, node-disjoint keys must all survive.
+    #[test]
+    fn fragments_fold_across_nodes() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let node_a = make_worker_tables(&state, &arena, &[1, 2, 3]);
+        let node_b = make_worker_tables(&state, &arena, &[2, 3, 4]);
+
+        let mut entries = vec![];
+        for p in 0..PARTITIONS {
+            let fragments = vec![
+                merge_combined::<IntExtractor, CountValue>(
+                    p,
+                    &[],
+                    &node_a,
+                    4,
+                    PARTITIONS,
+                    &arena,
+                    &COUNT_CFG,
+                ),
+                merge_combined::<IntExtractor, CountValue>(
+                    p,
+                    &[],
+                    &node_b,
+                    4,
+                    PARTITIONS,
+                    &arena,
+                    &COUNT_CFG,
+                ),
+            ];
+            let folded = merge_fragments::<IntExtractor, CountValue>(
+                fragments,
+                DEFAULT_CAPACITY,
+                PARTITIONS.trailing_zeros(),
+                &arena,
+                &COUNT_CFG,
+            );
+            for entry in folded.iter(0) {
+                entries.push((*entry.key(), entry.value().sort_key(0) as usize));
+            }
+        }
+
+        entries.sort();
+        assert_eq!(entries, vec![(1, 1), (2, 2), (3, 2), (4, 1)]);
     }
 
     /// Feed `values` through a worker in batch-sized chunks and hand back its

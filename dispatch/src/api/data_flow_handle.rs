@@ -1,5 +1,6 @@
+use crate::Dispatched;
 use crate::stats::DataFlowStats;
-use crate::worker::WorkerWaker;
+use crate::worker::WakerSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -17,9 +18,9 @@ pub struct DataFlowHandle<T> {
     stats_rx: mpsc::Receiver<DataFlowStats>,
     /// Process-wide cancel flag, checked by every worker on each iteration.
     cancelled: Arc<AtomicBool>,
-    /// Shared with the [`DataFlowDispatcher`](crate::DataFlowDispatcher) so that cancel callers (which
-    /// may not be on a worker thread) can still wake any parked worker.
-    waker: Arc<WorkerWaker>,
+    /// Wakers of every node the dataflow runs on, so that cancel callers (which
+    /// may not be on a worker thread) can wake all parked workers.
+    wakers: WakerSet,
 }
 
 impl<T> DataFlowHandle<T> {
@@ -28,14 +29,14 @@ impl<T> DataFlowHandle<T> {
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
         stats_rx: mpsc::Receiver<DataFlowStats>,
         cancelled: Arc<AtomicBool>,
-        waker: Arc<WorkerWaker>,
+        dispatched: Dispatched,
     ) -> Self {
         Self {
             rx,
             err_rx,
             stats_rx,
             cancelled,
-            waker,
+            wakers: dispatched.wakers,
         }
     }
 
@@ -43,7 +44,7 @@ impl<T> DataFlowHandle<T> {
     /// iteration of their event loop.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        self.waker.notify();
+        self.wakers.notify_all();
     }
 
     /// A cheap, `Clone + Send + Sync` handle that can fire cancellation from
@@ -51,7 +52,7 @@ impl<T> DataFlowHandle<T> {
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             cancelled: self.cancelled.clone(),
-            waker: self.waker.clone(),
+            wakers: self.wakers.clone(),
         }
     }
 
@@ -125,13 +126,13 @@ impl<T> Iterator for DataFlowHandle<T> {
 #[derive(Clone)]
 pub struct CancelToken {
     cancelled: Arc<AtomicBool>,
-    waker: Arc<WorkerWaker>,
+    wakers: WakerSet,
 }
 
 impl CancelToken {
     /// Signal cancellation. Idempotent.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        self.waker.notify();
+        self.wakers.notify_all();
     }
 }

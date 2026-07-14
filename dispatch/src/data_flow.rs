@@ -24,7 +24,7 @@ use crate::Identifier;
 use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
 use crate::operations::{AbandonedOperator, FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
-use crate::worker::worker_waker;
+use crate::worker::waker_set;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;
@@ -230,8 +230,9 @@ impl Drop for DataFlow {
         if self.profiled && crate::profiler::PROFILED_FLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
             // Exclusive mode just lifted. A worker that parked while holding only
             // non-profiled (paused) dataflows got no channel send to wake it, so
-            // notify unconditionally or it sleeps until the next unrelated wake.
-            worker_waker().notify();
+            // notify every node unconditionally or it sleeps until the next
+            // unrelated wake.
+            waker_set().notify_all();
         }
     }
 }
@@ -310,8 +311,9 @@ impl DataFlow {
         if self.err_tx.send(err).is_err() {
             warn!("Unable to send error...");
         }
+        // Cancellation must reach workers parked on any node.
         self.cancelled.store(true, Ordering::Relaxed);
-        worker_waker().notify();
+        waker_set().notify_all();
     }
 
     /// Try running a function within the dataflow- this will gracefully catch any errors/panics and
