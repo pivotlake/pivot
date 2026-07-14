@@ -1,27 +1,27 @@
 [package]
 name = "dispatch"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 
-arrow-array = { path = "../arrow-rs/arrow-array" }
-arrow-schema = { path = "../arrow-rs/arrow-schema" }
-arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
-arrow-buffer = { path = "../arrow-rs/arrow-buffer"}
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
+arrow-buffer = { workspace = true }
 
-crossbeam-deque = "0.8.6"
-core_affinity = "0.8.3"
-thiserror = "2.0.18"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+crossbeam-deque = { workspace = true }
+core_affinity = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 memchr = "2.7"
-ahash = "0.8.12"
+ahash = { workspace = true }
 
 tikv-jemallocator = "0.6.0"
 
-bytes = "1.11.0"
-libc = "0.2.178"
+bytes = { workspace = true }
+libc = { workspace = true }
 
 # Cryptographic hash for the disk cache's content-addressed filenames: a stable
 # spec (identical across versions/platforms) whose collisions can't be crafted,
@@ -38,7 +38,7 @@ webpki-roots = "0.26"
 # Byte-level HTTP/1.1 head parsing for the sans-IO range-read helpers
 # (io::http::http1), driven from our own io_uring transport.
 httparse = "1.9"
-url = "2.5"
+url = { workspace = true }
 
 [features]
 # Exposes `test_utils` and the test-only worker-waker / free-pool helpers so
@@ -64,14 +64,14 @@ nix = { version = "0.31.2", features = ["fs", "uio"] }
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 # Generate a self-signed cert so tests can stand up a loopback HTTPS server the
 # client trusts via an injected root store.
 rcgen = "0.13"
 # Operator microbenchmarks (`benches/operators.rs`). `harness = false` below: we
 # drive Criterion from our own `main` so a single `Dispatch` (worker pool) is
 # spun up once and reused across every scenario, instead of per bench group.
-criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+criterion = { workspace = true }
 
 [[bench]]
 name = "operators"
@@ -84,7 +84,3 @@ harness = false
 name = "http_range"
 harness = false
 required-features = ["test-util"]
-
-[profile.profiling]
-inherits = "release"
-debug = true

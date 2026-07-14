@@ -86,9 +86,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # All crates share the root workspace's Cargo.lock and target/, so every
+      # matrix cell caches the same workspace root.
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ matrix.crate }}
+          workspaces: .
 
       # The catalog/server object-store tests bring up MinIO + fake-gcs-server
       # via testcontainers. Cache the image tarballs (keyed on the pinned tags)
@@ -113,6 +115,16 @@ jobs:
               echo "pull $image"; docker pull "$image" && docker save "$image" -o "$tar"
             fi
           done
+
+      # ci-runner2 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
+      # (GCC bug 95189). Build the C/C++ deps with clang there, like the
+      # deploy and pages workflows do; GitHub-hosted runners have a newer,
+      # unaffected gcc, so leave them on the default.
+      - name: Use clang on the self-hosted runner
+        if: runner.environment == 'self-hosted'
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
 
       - run: ./ci.sh ${{ matrix.check }} ${{ matrix.crate }}
 

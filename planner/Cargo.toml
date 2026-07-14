@@ -1,32 +1,32 @@
 [package]
 name = "planner"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-arrow-array = { path = "../arrow-rs/arrow-array" }
-arrow-schema = { path = "../arrow-rs/arrow-schema" }
-arrow-ord = { path = "../arrow-rs/arrow-ord" }
-arrow-arith = { path = "../arrow-rs/arrow-arith" }
-arrow = { path = "../arrow-rs/arrow" }
-duckdb-planner = { path = "../duckdb-planner" }
-dispatch = { path = "../dispatch" }
-ahash = "0.8"
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-arith = { workspace = true }
+arrow = { workspace = true }
+duckdb-planner = { workspace = true }
+dispatch = { workspace = true }
+ahash = { workspace = true }
 regex = "1"
 pcre2 = "0.2"
-thiserror = "2.0.18"
+thiserror = { workspace = true }
 # Column/Type derive serde so catalog can persist a table's declared schema in its
 # manifest.
-serde = { version = "1.0", features = ["derive"] }
+serde = { workspace = true }
 
 [dev-dependencies]
 # The Parquet reader, for integration tests that plan over a real on-disk table.
 # A dev-dependency cycle (catalog depends on planner) — allowed by Cargo.
-catalog = { path = "../catalog" }
-parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
-arrow-json = { path = "../arrow-rs/arrow-json" }
-serde_json = "1.0"
-tempfile = "3"
-core_affinity = "0.8.3"
-insta = "1"
-rstest = "0.26"
+catalog = { workspace = true }
+parquet = { workspace = true }
+arrow-json = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+core_affinity = { workspace = true }
+insta = { workspace = true }
+rstest = { workspace = true }

@@ -1,24 +1,21 @@
 [package]
 name = "duckdb-planner"
-version = "0.1.0"
-edition = "2024"
-
-[profile.release]
-debug = true
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 cxx = "1"
 autocxx = "0.30.0"
-thiserror = "2"
+thiserror = { workspace = true }
 arrow = "58.0.0"
-dispatch = { path = "../dispatch" }
+dispatch = { workspace = true }
 
 [dev-dependencies]
-libc = "0.2.184"
+libc = { workspace = true }
 parquet = { version = "58.0.0", features = ["arrow"] }
-tempfile = "3"
-rstest = "0.23"
-insta = "1"
+tempfile = { workspace = true }
+rstest = { workspace = true }
+insta = { workspace = true }
 
 [build-dependencies]
 cxx-build = { version = "1.0", features = ["parallel"] }
