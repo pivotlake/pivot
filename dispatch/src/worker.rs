@@ -909,7 +909,14 @@ impl Worker {
     }
 
     fn try_receiving_new_dataflow(&mut self) {
-        if let Ok(builder) = self.data_flow_queue.try_recv() {
+        // Drain everything queued. Taking one builder per pass loses dataflows:
+        // two dispatches can land while this worker is parked, their notifies
+        // coalescing into one wake-count advance. The woken pass would take only
+        // the first builder, finish it without setting `did_work`, and re-park
+        // with the count already current, stranding the second dataflow's
+        // builder in the queue forever (its query hangs; sibling workers spin
+        // or park waiting for this worker's operator to ever exist).
+        while let Ok(builder) = self.data_flow_queue.try_recv() {
             debug!("Received data flow...");
             match builder.build() {
                 Ok(data_flow) => {
