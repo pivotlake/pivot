@@ -159,11 +159,15 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
             while run_left > 0 {
                 let (present, n) = def.next_run(run_left);
                 match (keep, present) {
-                    // A kept value decodes; a kept null leaves a slot that
-                    // `validity` masks off.
+                    // A kept value decodes; a kept null gets a zeroed slot
+                    // that `validity` masks off. The slot must hold a valid
+                    // element (zero is an empty inline view / zero primitive):
+                    // branchless kernels read masked slots before applying
+                    // validity, and byte-view arrays require every view to be
+                    // safe to interpret.
                     (true, true) => decode_run(&mut self.decoder, builder, dict, n),
                     (true, false) => {
-                        builder.spare_mut(n);
+                        builder.spare_mut(n).fill(B::Element::default());
                     }
                     // Skipped present rows still consume their values; skipped
                     // nulls have no value in the stream.

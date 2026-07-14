@@ -12,7 +12,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, StructArray};
+use arrow_array::{Array, ArrayRef, StructArray};
+use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, FieldRef, Fields};
 
 /// The depth-first leaf fields of `fields` (struct fields expanded to their
@@ -61,42 +62,71 @@ pub(crate) fn projected_leaves(fields: &Fields, columns: &[usize]) -> Vec<usize>
     leaves
 }
 
-/// The column-chunk index of the typed leaf that `path` is shredded into under
-/// the variant column `column`, resolved in THIS file's schema; `None` when the
-/// file doesn't shred that path. Used to prune row groups by a shredded path's
-/// statistics, and `None` (no pruning) is always sound.
+/// The column-chunk indices that decide whether a shredded variant path can
+/// be pruned by statistics.
+pub(crate) struct ShreddedPathLeaves {
+    /// The typed leaf holding the path's shredded values, whose min/max
+    /// statistics a predicate compares against.
+    pub typed_value: usize,
+    /// The binary `value` leaves along the path. A row's value for the path
+    /// may live in any of them instead of the typed leaf (an unshredded row,
+    /// or a value of another variant type), invisible to the typed leaf's
+    /// statistics; pruning is sound only when each is all-null in the row
+    /// group.
+    pub value_fallbacks: Vec<usize>,
+}
+
+/// Resolve `path`, shredded under the variant column `column`, to its leaves
+/// in THIS file's schema; `None` when the file doesn't shred that path (no
+/// pruning, always sound).
 ///
 /// Shredding nests one level per path segment: the leaf for `user.id` is
 /// `column.typed_value.user.typed_value.id.typed_value`.
-pub(crate) fn variant_typed_leaf(fields: &Fields, column: usize, path: &[String]) -> Option<usize> {
-    let mut names = Vec::with_capacity(path.len() * 2 + 1);
+pub(crate) fn variant_shredded_leaves(
+    fields: &Fields,
+    column: usize,
+    path: &[String],
+) -> Option<ShreddedPathLeaves> {
+    let mut offset = first_leaf(fields, column);
+    let mut field = &fields[column];
+    let mut value_fallbacks = Vec::new();
+    // Each shredding level holds a binary `value` fallback next to the
+    // `typed_value` we descend. A level without a `value` child has no
+    // fallback to guard against.
     for segment in path {
-        names.push("typed_value");
-        names.push(segment.as_str());
+        if let Some((value_offset, _)) = child_leaf_offset(field, "value") {
+            value_fallbacks.push(offset + value_offset);
+        }
+        let (typed_offset, typed) = child_leaf_offset(field, "typed_value")?;
+        let (segment_offset, segment_field) = child_leaf_offset(typed, segment)?;
+        offset += typed_offset + segment_offset;
+        field = segment_field;
     }
-    names.push("typed_value");
-    let offset = field_leaf_offset(&fields[column], &names)?;
-    Some(first_leaf(fields, column) + offset)
+    if let Some((value_offset, _)) = child_leaf_offset(field, "value") {
+        value_fallbacks.push(offset + value_offset);
+    }
+    let (typed_offset, typed) = child_leaf_offset(field, "typed_value")?;
+    if matches!(typed.data_type(), DataType::Struct(_)) {
+        // The path names an object shredded further, not a typed leaf.
+        return None;
+    }
+    Some(ShreddedPathLeaves {
+        typed_value: offset + typed_offset,
+        value_fallbacks,
+    })
 }
 
-/// Depth-first leaf offset, within `field`, of the descendant reached by the
-/// `names` path (each a child field name), or `None` if the path doesn't lead
-/// to a leaf. Counts the leaves of earlier siblings skipped along the way.
-fn field_leaf_offset(field: &FieldRef, names: &[&str]) -> Option<usize> {
-    let Some((head, tail)) = names.split_first() else {
-        // Path fully consumed: the target is reached iff it's a leaf.
-        return match field.data_type() {
-            DataType::Struct(_) => None,
-            _ => Some(0),
-        };
-    };
+/// The leaf offset (within `field`) and field of `field`'s direct child named
+/// `name`, counting the leaves of earlier siblings; `None` when `field` isn't
+/// a struct or has no such child.
+fn child_leaf_offset<'a>(field: &'a FieldRef, name: &str) -> Option<(usize, &'a FieldRef)> {
     let DataType::Struct(children) = field.data_type() else {
-        return None; // the path continues, but we're already at a leaf
+        return None;
     };
     let mut offset = 0;
     for child in children {
-        if child.name() == head {
-            return field_leaf_offset(child, tail).map(|inner| offset + inner);
+        if child.name() == name {
+            return Some((offset, child));
         }
         offset += leaf_count(child);
     }
@@ -114,10 +144,12 @@ fn field_leaf_offset(field: &FieldRef, names: &[&str]) -> Option<usize> {
 /// on), then wraps them in a `StructArray`. For a flat schema this is a plain
 /// pass-through. The inverse of [`leaf_fields`].
 ///
-/// The struct wrappers get no null buffer of their own: when a row's struct
-/// value is null, the file's definition levels already made every leaf of
-/// that row null, and readers of a struct column take a row's nullness from
-/// the leaves.
+/// A struct wrapper's null buffer is derived from its non-nullable children:
+/// a null in such a child can only mean the struct (or an ancestor) is null
+/// at that row, since the child itself never is. Without this mask,
+/// `StructArray::new` rejects the child's nulls as unmasked. Structs whose
+/// children are all nullable get no mask; their null rows decode as
+/// all-null children, which readers treat the same way.
 pub(crate) fn nest_leaves_into_columns(
     fields: &Fields,
     leaf_arrays: &mut impl Iterator<Item = ArrayRef>,
@@ -140,7 +172,15 @@ pub(crate) fn nest_leaves_into_columns(
             self.fields.get(self.arrays.len())
         }
         fn into_struct_array(self) -> ArrayRef {
-            Arc::new(StructArray::new(self.fields, self.arrays, None))
+            // Null wherever any non-nullable child is null: the child itself
+            // can't be, so the null came from this struct or an ancestor.
+            let mut nulls: Option<NullBuffer> = None;
+            for (field, array) in self.fields.iter().zip(&self.arrays) {
+                if !field.is_nullable() {
+                    nulls = NullBuffer::union(nulls.as_ref(), array.nulls());
+                }
+            }
+            Arc::new(StructArray::new(self.fields, self.arrays, nulls))
         }
     }
 
@@ -213,17 +253,22 @@ mod tests {
             ("name", DataType::Utf8),
         ])]);
 
+        let age = variant_shredded_leaves(&fields, 0, &path(&["age"])).unwrap();
+        let name = variant_shredded_leaves(&fields, 0, &path(&["name"])).unwrap();
+
         // metadata=0 value=1 | age.value=2 age.typed_value=3
         //                    | name.value=4 name.typed_value=5
-        assert_eq!(variant_typed_leaf(&fields, 0, &path(&["age"])), Some(3));
-        assert_eq!(variant_typed_leaf(&fields, 0, &path(&["name"])), Some(5));
+        assert_eq!(age.typed_value, 3);
+        assert_eq!(age.value_fallbacks, vec![1, 2]);
+        assert_eq!(name.typed_value, 5);
+        assert_eq!(name.value_fallbacks, vec![1, 4]);
     }
 
     #[test]
     fn variant_typed_leaf_is_none_for_an_unshredded_path() {
         let fields = Fields::from(vec![variant(&[("age", DataType::Int64)])]);
 
-        assert_eq!(variant_typed_leaf(&fields, 0, &path(&["missing"])), None);
+        assert!(variant_shredded_leaves(&fields, 0, &path(&["missing"])).is_none());
     }
 
     #[test]
@@ -233,8 +278,11 @@ mod tests {
             variant(&[("age", DataType::Int64)]),
         ]);
 
+        let age = variant_shredded_leaves(&fields, 1, &path(&["age"])).unwrap();
+
         // id=0 | metadata=1 value=2 age.value=3 age.typed_value=4
-        assert_eq!(variant_typed_leaf(&fields, 1, &path(&["age"])), Some(4));
+        assert_eq!(age.typed_value, 4);
+        assert_eq!(age.value_fallbacks, vec![2, 3]);
     }
 
     #[test]
@@ -276,10 +324,10 @@ mod tests {
         );
         let fields = Fields::from(vec![doc]);
 
+        let leaves = variant_shredded_leaves(&fields, 0, &path(&["user", "id"])).unwrap();
+
         // metadata=0 value=1 user.value=2 user.id.value=3 user.id.typed_value=4
-        assert_eq!(
-            variant_typed_leaf(&fields, 0, &path(&["user", "id"])),
-            Some(4)
-        );
+        assert_eq!(leaves.typed_value, 4);
+        assert_eq!(leaves.value_fallbacks, vec![1, 2, 3]);
     }
 }

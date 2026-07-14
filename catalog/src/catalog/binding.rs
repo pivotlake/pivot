@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::manifest::PartitionEqFilter;
-use crate::parquet::types::leaves::{first_leaf, variant_typed_leaf};
+use crate::parquet::types::leaves::{first_leaf, variant_shredded_leaves};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
@@ -42,15 +42,23 @@ struct PushedPredicate {
 impl PushedPredicate {
     /// The column-chunk index this predicate's statistics live on in `rg`: the
     /// column's own leaf for a plain predicate, or the shredded typed leaf for
-    /// a variant path. `None` when the path isn't shredded in this file, so it
-    /// simply can't prune (always sound).
+    /// a variant path. `None` means pruning isn't sound for this row group
+    /// (always safe): the path isn't shredded in this file, or some rows may
+    /// hold the path's value in a binary `value` fallback along the path,
+    /// where the typed leaf's statistics can't see them. The spec only allows
+    /// stats-based skipping when every such fallback is all-null.
     fn get_leaf_for_row_group(&self, rg: &RowGroupMetadata) -> Option<usize> {
         let fields = rg.schema.fields();
         if self.path.is_empty() {
-            Some(first_leaf(fields, self.column_idx))
-        } else {
-            variant_typed_leaf(fields, self.column_idx, &self.path)
+            return Some(first_leaf(fields, self.column_idx));
         }
+        let leaves = variant_shredded_leaves(fields, self.column_idx, &self.path)?;
+        let all_fallbacks_null = leaves.value_fallbacks.iter().all(|&leaf| {
+            rg.leaf_statistics(leaf)
+                .and_then(|stats| stats.null_count)
+                .is_some_and(|null_count| null_count == rg.num_rows)
+        });
+        all_fallbacks_null.then_some(leaves.typed_value)
     }
 }
 
@@ -186,13 +194,14 @@ impl Table for TableBinding {
         // Equality predicates additionally let the decoder skip row groups
         // whose dictionary for that column excludes the constant. Only
         // plain-column predicates take this path for now. JSON-path predicates
-        // could too, and soundly: the shredding spec requires a value matching
-        // the shredded type to be stored in the typed leaf, so that leaf's
-        // dictionary is just as conclusive as a plain column's. What's missing
-        // is plumbing: the constant is installed on a decoder by top-level
-        // column position, and installing it on a shredded leaf (whose
-        // position differs per file) isn't built yet. Until then JSON-path
-        // predicates still get the min/max pruning below.
+        // could too, when every binary `value` fallback along the path is
+        // all-null in the row group (the same condition min/max pruning
+        // checks): only then does the typed leaf hold every row's value for
+        // the path, making its dictionary as conclusive as a plain column's.
+        // What's missing is plumbing: the constant is installed on a decoder
+        // by top-level column position, and installing it on a shredded leaf
+        // (whose position differs per file) isn't built yet. Until then
+        // JSON-path predicates still get the min/max pruning below.
         let eq_predicates: Vec<ScanEqualityPredicate> = self
             .predicates
             .iter()
