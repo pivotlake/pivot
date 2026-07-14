@@ -52,8 +52,8 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Utf8,
             volatile: false,
         }),
-        // DuckDB binds `doc->'key'` as `json_extract`. Mark the stub volatile
-        // because Pivot, not DuckDB, evaluates it during plan execution.
+        // DuckDB binds `doc->'key'` as `json_extract`. The stub is a no-op, so
+        // mark it volatile to prevent DuckDB from evaluating or folding it.
         "json_extract" => Some(ScalarFunctionSignature {
             arguments: vec![Type::Variant, Type::Utf8],
             return_type: Type::Variant,
