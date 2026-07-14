@@ -86,10 +86,14 @@ pub struct RowGroupMetadata {
 }
 
 impl RowGroupMetadata {
-    /// Decoded min/max (and counts) for column `idx`, if the writer recorded
-    /// statistics for it.
-    pub fn column_statistics(&self, idx: usize) -> Option<&ColumnStatistics> {
-        self.columns.get(idx).and_then(|c| c.statistics.as_ref())
+    /// Decoded min/max (and counts) for the top-level column `column`, if the
+    /// writer recorded statistics for it. Chunks are per leaf, so the column is
+    /// resolved to its first leaf: for a flat column that is the column's own
+    /// chunk, and for a struct (variant) column it is a binary leaf without
+    /// usable stats, so callers simply get `None` and don't prune.
+    pub fn column_statistics(&self, column: usize) -> Option<&ColumnStatistics> {
+        let leaf = super::leaves::first_leaf(self.schema.fields(), column);
+        self.columns.get(leaf).and_then(|c| c.statistics.as_ref())
     }
 }
 
