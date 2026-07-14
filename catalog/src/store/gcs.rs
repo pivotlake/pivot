@@ -1,6 +1,6 @@
-//! Google Cloud Storage backend: blocking HTTP via [`ureq`] over the GCS JSON
-//! API, authenticated with an OAuth2 bearer token — for both the control-plane
-//! metadata ops here *and* the io_uring range reads, which carry a fresh
+//! Google Cloud Storage backend: blocking control calls via [`ureq`] and async
+//! Parquet uploads via reqwest over the GCS JSON API, authenticated with an
+//! OAuth2 bearer token. The io_uring range reads carry a fresh
 //! `Authorization: Bearer` header rather than a presigned URL (presigned URLs
 //! expire after an hour, stranding files cached across queries).
 //!
@@ -14,7 +14,7 @@
 //! **authorized_user** file (refresh-token grant). Minting is a blocking `ureq` call kept off the
 //! ring: it happens on the control thread (every query primes the token via
 //! [`source`](GcsStore::source)), so a worker only ever *reads* a current token.
-//! RS256 signing uses `ring`; everything is synchronous, no async runtime.
+//! RS256 signing uses `ring`.
 
 use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use base64::Engine;
@@ -42,6 +42,7 @@ pub struct GcsStore {
     /// JSON API origin (scheme + `host[:port]`, no trailing slash). The real
     /// service by default; an emulator when `STORAGE_EMULATOR_HOST` is set.
     endpoint: String,
+    async_client: reqwest::Client,
     /// Shared token state. An `Arc` so [`source`](Self::source) can hand workers
     /// a closure that reads the same cell this store re-mints.
     auth: Arc<GcsAuth>,
@@ -94,6 +95,9 @@ impl GcsStore {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
             endpoint,
+            async_client: reqwest::Client::builder()
+                .build()
+                .map_err(|error| StoreError::Http(format!("building GCS client: {error}")))?,
             auth: Arc::new(GcsAuth {
                 agent: ureq::AgentBuilder::new().build(),
                 token: RwLock::new(None),
@@ -302,6 +306,42 @@ impl ObjectStore for GcsStore {
             Ok(_) => Ok(()),
             Err(e) => Err(StoreError::Http(format!("GCS PUT {key}: {e}"))),
         }
+    }
+
+    fn put_async(&self, key: ObjectPath, data: Vec<u8>) -> super::StoreFuture<'_, ()> {
+        let url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            self.endpoint,
+            self.bucket,
+            self.object_path(&key)
+        );
+        let auth = self.auth.clone();
+        let client = self.async_client.clone();
+        Box::pin(async move {
+            // Token minting can read credentials and perform its own HTTP
+            // exchange, so keep that rare refresh off the async reactor.
+            let header = tokio::task::spawn_blocking(move || auth.header())
+                .await
+                .map_err(|error| {
+                    StoreError::Http(format!("GCS credential task failed: {error}"))
+                })??;
+            let response = client
+                .post(url)
+                .header("Authorization", header.as_ref())
+                .header("Content-Type", "application/octet-stream")
+                .body(data)
+                .send()
+                .await
+                .map_err(|error| StoreError::Http(format!("GCS PUT {key}: {error}")))?;
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(StoreError::Http(format!(
+                    "GCS PUT {key}: HTTP {}",
+                    response.status()
+                )))
+            }
+        })
     }
 
     fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {

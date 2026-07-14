@@ -40,6 +40,10 @@ webpki-roots = "0.26"
 httparse = "1.9"
 url = "2.5"
 
+# Generic async stages run futures on a dispatch-owned runtime and wake the
+# pinned worker when a completion is ready to re-enter the dataflow.
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
 [features]
 # Exposes `test_utils` and the test-only worker-waker / free-pool helpers so
 # out-of-crate test suites (e.g. catalog's Parquet reader tests) can drive

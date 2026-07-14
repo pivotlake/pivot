@@ -3,12 +3,13 @@ use crate::operations::channels::{
     stealable,
 };
 use crate::operations::{
-    DefaultUnaryFactory, FanInFactory, Forward, InjectorSourceFactory, MapFactory,
+    AsyncMapFactory, DefaultUnaryFactory, FanInFactory, Forward, InjectorSourceFactory, MapFactory,
     RootUnaryOperatorFactory, SinkFactory, UnaryFactory, UnaryOperatorFactory,
 };
 use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
 use arrow_array::RecordBatch;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -168,6 +169,39 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let worker_count = self.factories.len();
         let channels: Vec<_> = stealable::<O>(worker_count).into_iter().collect();
         let unaries: Vec<_> = (0..worker_count).map(|_| MapFactory(f.clone())).collect();
+        self.chain(channels, unaries)
+    }
+
+    /// Append a bounded parallel async map stage.
+    ///
+    /// `f` is invoked on the dispatch worker that receives an item, but the
+    /// returned future runs on dispatch's async runtime. Completions wake and
+    /// re-enter the owning worker before being forwarded downstream. At most
+    /// `max_in_flight_per_worker` futures run for each worker, so a slow service
+    /// backpressures the upstream pipeline instead of accumulating output.
+    /// Started futures drain before a cancelled dataflow releases its outputs.
+    #[allow(clippy::type_complexity)]
+    pub fn map_each_async<O2, F, Fut>(
+        self,
+        max_in_flight_per_worker: usize,
+        f: F,
+    ) -> OperatorSpec<
+        O2,
+        UnaryOperatorFactory<O, O2, AsyncMapFactory<F>, StealableChannelFactory<O>, OF>,
+    >
+    where
+        O2: Send + 'static,
+        F: FnMut(O) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = crate::UnaryResult<O2>> + Send + 'static,
+    {
+        let worker_count = self.factories.len();
+        let channels: Vec<_> = stealable::<O>(worker_count).into_iter().collect();
+        let waker = self.dispatcher.waker().clone();
+        let unaries = (0..worker_count)
+            .map(|_| {
+                AsyncMapFactory::new(f.clone(), max_in_flight_per_worker.max(1), waker.clone())
+            })
+            .collect();
         self.chain(channels, unaries)
     }
 

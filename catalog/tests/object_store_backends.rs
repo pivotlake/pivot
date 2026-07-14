@@ -17,6 +17,7 @@ mod common;
 use catalog::test_support as harness;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -92,7 +93,22 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Pa
 /// Scan the table's `value` column, sorted.
 fn scan(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
     let parquet = current_parquet(cat, name);
-    let out = table_input(d, &parquet, Projection::all(2), false)
+    scan_parquet(d, &parquet)
+}
+
+/// Scan the table copy already published in this process, without asking Delta
+/// Kernel to reopen an emulator-specific remote endpoint.
+fn scan_published(d: &DispatchGuard, cat: &ParquetCatalog, name: &str) -> Vec<i64> {
+    let parquet = cat
+        .table_handle(name)
+        .unwrap()
+        .build_scan_view(&[])
+        .unwrap();
+    scan_parquet(d, &parquet)
+}
+
+fn scan_parquet(d: &DispatchGuard, parquet: &Arc<catalog::parquet::ParquetTable>) -> Vec<i64> {
+    let out = table_input(d, parquet, Projection::all(2), false)
         .collect()
         .unwrap();
     let mut values = collect_i64s(&out, 1);
@@ -148,6 +164,34 @@ mod bodies {
             .unwrap();
 
         assert_eq!(scan(&d, &cat, "events"), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    /// SQL INSERT asynchronously persists its Parquet output through dispatch,
+    /// then commits the file so the published table can scan the rows.
+    pub fn insert_writes_and_commits(b: &Backend) {
+        let d = dispatch_with_buffers(2, 32);
+        let cat = Arc::new(create_events(&d, b, &[("p1.parquet", &[1])]));
+        let transaction = cat.begin_transaction();
+        let mut planner = planner::Planner::new(cat.clone());
+        let plan = planner
+            .plan(
+                "INSERT INTO events VALUES ('two', 2), ('three', 3)",
+                transaction.clone(),
+            )
+            .unwrap();
+
+        let counts = plan
+            .compile(&d, transaction.as_ref())
+            .unwrap()
+            .collect()
+            .unwrap();
+        cat.commit_transaction(transaction).unwrap();
+
+        assert_eq!(
+            counts.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            1
+        );
+        assert_eq!(scan_published(&d, &cat, "events"), vec![1, 2, 3]);
     }
 
     /// Compaction swaps the small files for one merged file in a single version:
@@ -257,6 +301,7 @@ macro_rules! backend_tests {
 backend_tests!(create_and_scan);
 backend_tests!(survives_reopen);
 backend_tests!(append_registers_new_file);
+backend_tests!(insert_writes_and_commits);
 backend_tests!(compaction_replaces_files);
 backend_tests!(source_reads_object_back);
 backend_tests!(list_is_one_level);

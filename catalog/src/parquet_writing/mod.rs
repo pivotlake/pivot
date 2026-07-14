@@ -120,7 +120,7 @@ pub fn encode_record_batches(
 
 /// Chain the Parquet encoder onto a record-batch dataflow without launching it.
 /// Callers can attach a terminal stage before execution, which INSERT uses to
-/// enqueue file writes without performing I/O on dispatch workers.
+/// persist files asynchronously without blocking dispatch workers.
 pub fn encode_spec(
     spec: RecordBatchOperatorSpec,
     partition_by: Arc<[String]>,

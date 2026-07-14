@@ -1,5 +1,5 @@
-//! S3 (and S3-compatible) backend: blocking HTTP via [`ureq`], requests signed
-//! with SigV4 via `aws_sigv4::http_request::sign` (a pure function — no runtime).
+//! S3 (and S3-compatible) backend: blocking control calls via [`ureq`] and
+//! asynchronous Parquet uploads via reqwest. Requests are signed with SigV4.
 //!
 //! Credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
 //! `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`); region from
@@ -29,6 +29,7 @@ pub struct S3Store {
     /// `Host` header value for signing.
     host: String,
     agent: ureq::Agent,
+    async_client: reqwest::Client,
 }
 
 impl S3Store {
@@ -77,6 +78,9 @@ impl S3Store {
             base,
             host,
             agent: ureq::AgentBuilder::new().build(),
+            async_client: reqwest::Client::builder()
+                .build()
+                .map_err(|error| StoreError::Http(format!("building S3 client: {error}")))?,
         })
     }
 
@@ -180,6 +184,36 @@ impl ObjectStore for S3Store {
             Ok(_) => Ok(()),
             Err(e) => Err(StoreError::Http(format!("PUT {object}: {e}"))),
         }
+    }
+
+    fn put_async(&self, key: ObjectPath, data: Vec<u8>) -> super::StoreFuture<'_, ()> {
+        let request = (|| {
+            let object = object_key(&self.prefix, &key);
+            let url = self.url_for(&object);
+            let signed = self.sign("PUT", &url, &[], &data)?;
+            Ok((object, url, signed))
+        })();
+        let client = self.async_client.clone();
+        Box::pin(async move {
+            let (object, url, signed) = request?;
+            let mut builder = client.put(url);
+            for (name, value) in signed {
+                builder = builder.header(name, value);
+            }
+            let response = builder
+                .body(data)
+                .send()
+                .await
+                .map_err(|error| StoreError::Http(format!("PUT {object}: {error}")))?;
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(StoreError::Http(format!(
+                    "PUT {object}: HTTP {}",
+                    response.status()
+                )))
+            }
+        })
     }
 
     fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {

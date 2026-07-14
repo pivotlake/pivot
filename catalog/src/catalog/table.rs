@@ -365,6 +365,22 @@ impl CatalogTable {
         })
     }
 
+    /// Asynchronously write owned Parquet bytes at `path`.
+    ///
+    /// SQL INSERT chains this future into its dispatch dataflow, so remote
+    /// uploads and local file writes do not block a pinned worker.
+    pub async fn write_data_file_async(
+        &self,
+        path: ObjectPath,
+        bytes: Vec<u8>,
+    ) -> crate::Result<FileRef> {
+        let size = bytes.len() as u64;
+        self.store
+            .put_async(self.location.resolve(&path), bytes)
+            .await?;
+        Ok(FileRef { path, size })
+    }
+
     /// Delete a data file (a compaction input swapped out of the manifest).
     /// `path` resolves against the table's location like any [`FileRef`] path.
     pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {

@@ -79,6 +79,9 @@ pub use filter::FilterFactory;
 mod map;
 pub use map::MapFactory;
 
+mod async_map;
+pub use async_map::AsyncMapFactory;
+
 mod fan_in;
 pub use fan_in::FanInFactory;
 
@@ -138,6 +141,15 @@ pub trait Unary<I, O> {
     /// Whether this unary is ready to accept another input. Returns `false` when
     /// backpressured (e.g. waiting for IO to complete before consuming more).
     fn ready_for_more_work(&mut self) -> bool {
+        true
+    }
+
+    /// Whether this unary may enter finalization after its input has drained.
+    ///
+    /// An operator with independently-running work can return `false` until all
+    /// completions have been re-entered through [`run`](Self::run). The worker
+    /// may park while it waits; the completion source must wake it.
+    fn ready_to_finish(&self) -> bool {
         true
     }
 
@@ -228,7 +240,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
 {
     fn run_cpu_work(&mut self) -> super::Result<WorkStatus> {
         if !self.unary.ready_for_more_work() {
-            return Ok(WorkStatus::Pending);
+            return Ok(self.unary.run(&mut self.sender)?);
         }
 
         let item = match self.receiver.try_recv() {
@@ -266,6 +278,13 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         // tail belongs to a scan that's being abandoned anyway.
         let done_consuming = || self.receiver.is_empty() || self.unary.finished_consuming();
         if !done_consuming() {
+            return Ok(FinishStatus::Pending);
+        }
+
+        // The input may be empty while independently-running work is still in
+        // flight. Do not notify the sibling barrier until every completion has
+        // re-entered the operator and been forwarded downstream.
+        if !self.unary.ready_to_finish() {
             return Ok(FinishStatus::Pending);
         }
 

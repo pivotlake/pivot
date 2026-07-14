@@ -4,17 +4,18 @@
 //! and turn a key into a ring-readable [`DataFile`]; the table manifest,
 //! table log, and catalog build on it one layer up.
 //!
-//! Everything here is **synchronous** and pulls in no async runtime: local
-//! access is plain `std::fs`; S3/GCS go over [`ureq`] (blocking HTTP + rustls).
-//! S3 requests are signed with `aws_sigv4::http_request::sign` — a pure function
-//! we call inline (the tokio it transitively links is never driven). Credentials
-//! come from the environment. This runs off the io_uring ring on purpose: a
-//! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
-//! per query) next to the hot column-chunk reads, which stay on the ring.
+//! Catalog control operations are synchronous: local access is plain `std::fs`,
+//! while S3/GCS use [`ureq`] (blocking HTTP + rustls). Parquet data writes use
+//! [`ObjectStore::put_async`] from a dispatch async stage, backed by Tokio file
+//! IO or reqwest uploads. Credentials come from the environment. Control calls
+//! stay off the io_uring ring on purpose: a LIST is not a range GET the ring can
+//! serve, and it is rare and tiny next to hot column-chunk reads.
 
 use dispatch::io::AuthHeader;
 use std::fmt::Debug;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 
 mod gcs;
 mod local;
@@ -42,6 +43,7 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 /// A table's data file: its [`ObjectPath`] in the store and its size in bytes.
 /// The single durable file identity — the [table manifest] records a
@@ -151,6 +153,12 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// write. (Concurrent writers are last-writer-wins — fine for the database
     /// index, which a single server writes on the occasional `CREATE TABLE`.)
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
+
+    /// Replace `key` with owned `data` asynchronously.
+    ///
+    /// Parquet data uploads use this path from a dispatch async stage. Small
+    /// catalog control objects continue through [`put`](Self::put).
+    fn put_async(&self, key: ObjectPath, data: Vec<u8>) -> StoreFuture<'_, ()>;
 
     /// Create `key` with `data` only if it does not already exist — the
     /// compare-and-swap the versioned [table manifest](crate::manifest) builds

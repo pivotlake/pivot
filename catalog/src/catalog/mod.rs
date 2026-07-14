@@ -98,10 +98,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("INSERT target table `{0}` is not present in the transaction snapshot")]
     InsertTableMissing(String),
-    #[error("the transaction's INSERT writer is no longer available")]
+    #[error("the transaction's INSERT staging state is no longer available")]
     InsertWriterUnavailable,
-    #[error("the transaction's INSERT writer panicked")]
-    InsertWriterPanicked,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -594,8 +592,11 @@ impl ParquetTransaction {
         self.snapshot.table(name)
     }
 
-    pub(in crate::catalog) fn insert_writer(&self) -> Result<transaction::WriteSender> {
-        self.writer.write_sender()
+    pub(in crate::catalog) fn insert_writer(
+        &self,
+        table: String,
+    ) -> Result<transaction::WriteSender> {
+        self.writer.write_sender(table)
     }
 }
 

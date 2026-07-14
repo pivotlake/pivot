@@ -5,12 +5,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::manifest::PartitionEqFilter;
+use crate::manifest::{ManifestEntry, PartitionEqFilter};
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use crate::parquet_writing::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, encode_spec};
+use crate::store::{FileRef, ObjectPath};
 use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, Sender};
@@ -170,12 +171,12 @@ impl Table for TableBinding {
 
     /// Build the transactional Parquet write pipeline for this table.
     ///
-    /// Dispatch workers conform and encode batches, then enqueue completed files
-    /// directly through worker-local transaction writer producers. Submission
-    /// does not acquire the transaction lifecycle mutex. A dedicated thread
-    /// performs object-store writes and retains their paths until commit adds
-    /// them to Delta or rollback deletes them. The pipeline's only output is the
-    /// inserted row count used for PostgreSQL's command-completion tag.
+    /// Dispatch workers conform and encode batches, then asynchronously persist
+    /// completed files without blocking a pinned worker. Each path is registered
+    /// with the transaction before its upload starts, so commit can publish the
+    /// drained pipeline and rollback can remove every attempted file. The
+    /// pipeline's only output is the inserted row count used for PostgreSQL's
+    /// command-completion tag.
     fn insert(
         &self,
         source: RecordBatchOperatorSpec,
@@ -203,14 +204,32 @@ impl Table for TableBinding {
             ROW_GROUP_ROWS,
             ROW_GROUPS_PER_FILE,
         );
-        let writer = transaction.insert_writer()?;
-        let table_name = self.name.clone();
-        let count_emitted = Arc::new(AtomicBool::new(false));
-        let staged = encoded.sink_each(
-            move |encoded| {
-                writer.submit(table_name.clone(), encoded);
+        let writer = transaction.insert_writer(self.name.clone())?;
+        let upload_table = table.clone();
+        let uploaded = encoded.map_each_async(2, move |encoded| {
+            let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
+            let file = FileRef {
+                path: path.clone(),
+                size: encoded.bytes.len() as u64,
+            };
+            let staged = writer.submit(ManifestEntry {
+                file,
+                partition: encoded.partition,
+                sort_bounds: encoded.sort_bounds,
+            });
+            let table = upload_table.clone();
+            async move {
+                staged.map_err(|error| dispatch::UnaryError::Operator(Box::new(error)))?;
+                table
+                    .write_data_file_async(path, encoded.bytes)
+                    .await
+                    .map_err(|error| dispatch::UnaryError::Operator(Box::new(error)))?;
                 Ok(())
-            },
+            }
+        });
+        let count_emitted = Arc::new(AtomicBool::new(false));
+        let staged = uploaded.sink_each(
+            move |()| Ok(()),
             move |sender: &mut dyn Sender<RecordBatch>| {
                 if count_emitted.swap(true, Ordering::Relaxed) {
                     return Ok(());

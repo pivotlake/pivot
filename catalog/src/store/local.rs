@@ -65,6 +65,26 @@ impl ObjectStore for LocalStore {
         })
     }
 
+    fn put_async(&self, key: ObjectPath, data: Vec<u8>) -> super::StoreFuture<'_, ()> {
+        let path = self.path_for(&key);
+        Box::pin(async move {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|source| StoreError::Io {
+                        key: key.to_string(),
+                        source,
+                    })?;
+            }
+            tokio::fs::write(&path, data)
+                .await
+                .map_err(|source| StoreError::Io {
+                    key: key.to_string(),
+                    source,
+                })
+        })
+    }
+
     fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {

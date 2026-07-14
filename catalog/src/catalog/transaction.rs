@@ -1,68 +1,25 @@
-//! Transaction-owned Parquet writes for INSERT.
+//! Transaction-owned metadata for Parquet files staged by INSERT.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{JoinHandle, Thread};
 
 use crate::manifest::ManifestEntry;
-use crate::parquet_writing::EncodedFile;
-use crate::store::ObjectPath;
-use crossbeam_deque::{Injector, Steal};
 
 use super::{CatalogSnapshot, CatalogTable, Error, Result};
 
-struct WriteCommand {
-    table: String,
-    encoded: EncodedFile,
-}
-
-struct WriteQueue {
-    commands: Injector<WriteCommand>,
-    producers: AtomicUsize,
-}
-
-impl WriteQueue {
-    fn new() -> Self {
-        Self {
-            commands: Injector::new(),
-            producers: AtomicUsize::new(1),
-        }
-    }
-}
-
-/// A worker-local producer for the transaction's Parquet writer queue.
-///
-/// Submitting a file does not acquire the transaction lifecycle mutex. The
-/// final producer to drop wakes the writer so it can drain and exit.
+/// A worker-local handle that registers one table's files before their async
+/// uploads start.
+#[derive(Clone)]
 pub(in crate::catalog) struct WriteSender {
-    queue: Arc<WriteQueue>,
-    writer: Thread,
-}
-
-impl Clone for WriteSender {
-    fn clone(&self) -> Self {
-        self.queue.producers.fetch_add(1, Ordering::Relaxed);
-        Self {
-            queue: self.queue.clone(),
-            writer: self.writer.clone(),
-        }
-    }
+    writer: Arc<TransactionWriter>,
+    table: String,
 }
 
 impl WriteSender {
-    /// Enqueue an encoded file and wake the blocking writer thread.
-    pub(in crate::catalog) fn submit(&self, table: String, encoded: EncodedFile) {
-        self.queue.commands.push(WriteCommand { table, encoded });
-        self.writer.unpark();
-    }
-}
-
-impl Drop for WriteSender {
-    fn drop(&mut self) {
-        if self.queue.producers.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.writer.unpark();
-        }
+    /// Retain a file's final identity so commit can publish it and rollback can
+    /// delete it, including when its upload later fails or is cancelled.
+    pub(in crate::catalog) fn submit(&self, entry: ManifestEntry) -> Result<()> {
+        self.writer.stage(&self.table, entry)
     }
 }
 
@@ -74,32 +31,21 @@ struct PendingTable {
 #[derive(Default)]
 struct WriterResult {
     tables: HashMap<String, PendingTable>,
-    error: Option<Error>,
-}
-
-struct WriterThread {
-    sender: WriteSender,
-    join: JoinHandle<WriterResult>,
 }
 
 enum WriterState {
-    Idle,
-    Running(WriterThread),
-    Finishing,
-    Completed(WriterResult),
+    Open(WriterResult),
     Finalized,
 }
 
 /// Shared transaction state captured by INSERT operators.
 ///
-/// INSERT setup obtains a [`WriteSender`] while holding the lifecycle mutex.
-/// Dispatch workers then clone that producer and submit directly to a shared
-/// lock-free queue. The dedicated writer performs all blocking object-store
-/// calls. Commit and rollback join it from the server's blocking pool after the
-/// dataflow has drained.
+/// Dispatch performs every Parquet upload. This state only records each path
+/// before launch, then commits the successfully drained dataflow's entries in
+/// one Delta version or removes them on rollback.
 pub(super) struct TransactionWriter {
     snapshot: Arc<CatalogSnapshot>,
-    state: Mutex<Option<WriterState>>,
+    state: Mutex<WriterState>,
 }
 
 impl std::fmt::Debug for TransactionWriter {
@@ -111,108 +57,56 @@ impl std::fmt::Debug for TransactionWriter {
 }
 
 impl TransactionWriter {
-    /// Create a lazy writer. No thread is started until the first encoded file
-    /// is submitted, so read-only transactions pay no thread cost.
     pub(super) fn new(snapshot: Arc<CatalogSnapshot>) -> Self {
         Self {
             snapshot,
-            state: Mutex::new(Some(WriterState::Idle)),
+            state: Mutex::new(WriterState::Open(WriterResult::default())),
         }
     }
 
-    /// Obtain a producer for an INSERT pipeline.
-    ///
-    /// This is the only lifecycle-mutex acquisition needed by that pipeline.
-    /// Its dispatch workers clone the returned producer and enqueue files
-    /// without returning to the transaction state.
-    pub(super) fn write_sender(&self) -> Result<WriteSender> {
-        let mut locked = self.state.lock().unwrap();
-        let state = locked.take().ok_or(Error::InsertWriterUnavailable)?;
-        let writer = match state {
-            WriterState::Idle => match self.start_writer() {
-                Ok(writer) => writer,
-                Err(error) => {
-                    *locked = Some(WriterState::Idle);
-                    return Err(error);
-                }
-            },
-            WriterState::Running(writer) => writer,
-            other => {
-                *locked = Some(other);
-                return Err(Error::InsertWriterUnavailable);
-            }
-        };
-        let sender = writer.sender.clone();
-        *locked = Some(WriterState::Running(writer));
-        Ok(sender)
+    /// Obtain a table-scoped registration handle for an INSERT pipeline.
+    pub(super) fn write_sender(self: &Arc<Self>, table: String) -> Result<WriteSender> {
+        if !self.snapshot.tables.contains_key(&table) {
+            return Err(Error::InsertTableMissing(table));
+        }
+        if !matches!(*self.state.lock().unwrap(), WriterState::Open(_)) {
+            return Err(Error::InsertWriterUnavailable);
+        }
+        Ok(WriteSender {
+            writer: self.clone(),
+            table,
+        })
     }
 
-    /// Start the transaction's single blocking-I/O thread and shared queue.
-    fn start_writer(&self) -> Result<WriterThread> {
-        let queue = Arc::new(WriteQueue::new());
-        let snapshot = self.snapshot.clone();
-        let writer_queue = queue.clone();
-        let join = std::thread::Builder::new()
-            .name("pivot-insert-writer".to_string())
-            .spawn(move || write_files(snapshot, writer_queue))?;
-        let sender = WriteSender {
-            queue,
-            writer: join.thread().clone(),
+    fn stage(&self, table: &str, entry: ManifestEntry) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let WriterState::Open(result) = &mut *state else {
+            return Err(Error::InsertWriterUnavailable);
         };
-        Ok(WriterThread { sender, join })
-    }
-
-    /// Close the command channel and join the writer exactly once.
-    ///
-    /// The server calls commit and rollback from Tokio's blocking pool, so this
-    /// join never occupies a dispatch worker or an async reactor thread.
-    fn finish_writer(&self) -> Result<()> {
-        let running = {
-            let mut locked = self.state.lock().unwrap();
-            match locked.take().ok_or(Error::InsertWriterUnavailable)? {
-                WriterState::Idle => {
-                    *locked = Some(WriterState::Completed(WriterResult::default()));
-                    return Ok(());
-                }
-                WriterState::Running(writer) => {
-                    *locked = Some(WriterState::Finishing);
-                    writer
-                }
-                WriterState::Completed(result) => {
-                    *locked = Some(WriterState::Completed(result));
-                    return Ok(());
-                }
-                other => {
-                    *locked = Some(other);
-                    return Err(Error::InsertWriterUnavailable);
-                }
-            }
-        };
-
-        drop(running.sender);
-        let result = running
-            .join
-            .join()
-            .map_err(|_| Error::InsertWriterPanicked)?;
-        self.state
-            .lock()
-            .unwrap()
-            .replace(WriterState::Completed(result));
+        let snapshot_table = self
+            .snapshot
+            .tables
+            .get(table)
+            .ok_or_else(|| Error::InsertTableMissing(table.to_string()))?;
+        result
+            .tables
+            .entry(table.to_string())
+            .or_insert_with(|| PendingTable {
+                table: snapshot_table.clone(),
+                entries: Vec::new(),
+            })
+            .entries
+            .push(entry);
         Ok(())
     }
 
-    /// Drain writes, commit each table's staged files in one Delta version, and
-    /// return the updated table copies for immediate catalog publication.
+    /// Commit each table's staged files in one Delta version and return the
+    /// updated copies for immediate catalog publication.
     pub(super) fn commit(&self) -> Result<Vec<CatalogTable>> {
-        self.finish_writer()?;
-        let mut locked = self.state.lock().unwrap();
-        let state = locked.as_mut().ok_or(Error::InsertWriterUnavailable)?;
-        let WriterState::Completed(result) = state else {
+        let mut state = self.state.lock().unwrap();
+        let WriterState::Open(result) = &mut *state else {
             return Err(Error::InsertWriterUnavailable);
         };
-        if let Some(error) = result.error.take() {
-            return Err(error);
-        }
 
         let mut committed = Vec::with_capacity(result.tables.len());
         for pending in result.tables.values_mut() {
@@ -224,103 +118,30 @@ impl TransactionWriter {
         Ok(committed)
     }
 
-    /// Drain writes and delete every uncommitted Parquet file successfully
-    /// created by this transaction.
+    /// Delete every Parquet path registered by this transaction.
     pub(super) fn rollback(&self) -> Result<()> {
-        self.finish_writer()?;
-        let mut locked = self.state.lock().unwrap();
-        let state = locked.take().ok_or(Error::InsertWriterUnavailable)?;
-        let WriterState::Completed(result) = state else {
-            *locked = Some(state);
-            return Err(Error::InsertWriterUnavailable);
+        let result = {
+            let mut state = self.state.lock().unwrap();
+            match std::mem::replace(&mut *state, WriterState::Finalized) {
+                WriterState::Open(result) => result,
+                WriterState::Finalized => return Err(Error::InsertWriterUnavailable),
+            }
         };
-        let cleanup = delete_pending_files(result);
-        *locked = Some(WriterState::Finalized);
-        cleanup
+        delete_pending_files(result)
     }
 }
 
 impl Drop for TransactionWriter {
     fn drop(&mut self) {
-        let state = self.state.get_mut().unwrap().take();
-        let Some(state) = state else {
+        let state = std::mem::replace(self.state.get_mut().unwrap(), WriterState::Finalized);
+        let WriterState::Open(result) = state else {
             return;
         };
-        match state {
-            WriterState::Idle | WriterState::Finalized => {}
-            WriterState::Completed(result) => {
-                let _ = std::thread::Builder::new()
-                    .name("pivot-insert-cleanup".to_string())
-                    .spawn(move || {
-                        let _ = delete_pending_files(result);
-                    });
-            }
-            WriterState::Running(writer) => {
-                let _ = std::thread::Builder::new()
-                    .name("pivot-insert-cleanup".to_string())
-                    .spawn(move || {
-                        drop(writer.sender);
-                        if let Ok(result) = writer.join.join() {
-                            let _ = delete_pending_files(result);
-                        }
-                    });
-            }
-            WriterState::Finishing => {}
-        }
-    }
-}
-
-/// Run on `pivot-insert-writer`: persist encoded bytes and retain the exact
-/// file entries that commit will publish or rollback will delete.
-fn write_files(snapshot: Arc<CatalogSnapshot>, queue: Arc<WriteQueue>) -> WriterResult {
-    let mut result = WriterResult::default();
-    while let Some(command) = next_write(&queue) {
-        if result.error.is_some() {
-            continue;
-        }
-        let Some(snapshot_table) = snapshot.tables.get(&command.table) else {
-            result.error = Some(Error::InsertTableMissing(command.table));
-            continue;
-        };
-        let pending = result
-            .tables
-            .entry(command.table)
-            .or_insert_with(|| PendingTable {
-                table: snapshot_table.clone(),
-                entries: Vec::new(),
+        let _ = std::thread::Builder::new()
+            .name("pivot-insert-cleanup".to_string())
+            .spawn(move || {
+                let _ = delete_pending_files(result);
             });
-        let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
-        match pending.table.write_data_file(path, &command.encoded.bytes) {
-            Ok(file) => pending.entries.push(ManifestEntry {
-                file,
-                partition: command.encoded.partition,
-                sort_bounds: command.encoded.sort_bounds,
-            }),
-            Err(error) => result.error = Some(error),
-        }
-    }
-    result
-}
-
-/// Wait for the next queued file, or finish after the final producer drops and
-/// all previously submitted files have been drained.
-fn next_write(queue: &WriteQueue) -> Option<WriteCommand> {
-    loop {
-        match queue.commands.steal() {
-            Steal::Success(command) => return Some(command),
-            Steal::Retry => continue,
-            Steal::Empty if queue.producers.load(Ordering::Acquire) == 0 => {
-                // A final producer may have pushed between the first steal and
-                // our producer-count load. With no producers left, a second
-                // empty result is stable and means the queue is fully drained.
-                match queue.commands.steal() {
-                    Steal::Success(command) => return Some(command),
-                    Steal::Retry => continue,
-                    Steal::Empty => return None,
-                }
-            }
-            Steal::Empty => std::thread::park(),
-        }
     }
 }
 
