@@ -82,6 +82,14 @@ mod tests {
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
     ) -> JoinResult {
+        build_and_probe_with_probe_array(build_worker_batches, probe_batches, true)
+    }
+
+    fn build_and_probe_with_probe_array(
+        build_worker_batches: Vec<Vec<RecordBatch>>,
+        probe_batches: Vec<RecordBatch>,
+        use_probe_array: bool,
+    ) -> JoinResult {
         init_test_free_pool(16);
         let workers = build_worker_batches.len();
         let (builds, probes, gate) = factory::create_for_workers(0, 0, workers);
@@ -115,7 +123,12 @@ mod tests {
             }
         }
 
-        let mut probe = probes.into_iter().next().unwrap().build_unary();
+        let mut probe = probes
+            .into_iter()
+            .next()
+            .unwrap()
+            .with_probe_array(use_probe_array)
+            .build_unary();
         let mut sender = CollectSender::new();
         for batch in probe_batches {
             probe.consume(batch, &mut sender).unwrap();
@@ -272,6 +285,18 @@ mod tests {
         let mut keys = collect_i64_column(&r.batches, 1);
         keys.sort();
         assert_eq!(keys, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn scalar_probe_handles_matches_duplicates_and_misses() {
+        let build_batches = vec![vec![int64_batch(&[10, 10, 20, 30, 40])]];
+        let probe_batches = vec![int64_batch(&[99, 10, 30, 99, 10])];
+
+        let scalar_result = build_and_probe_with_probe_array(build_batches, probe_batches, false);
+
+        let mut scalar_keys = collect_i64_column(&scalar_result.batches, 1);
+        scalar_keys.sort();
+        assert_eq!(scalar_keys, vec![10, 10, 10, 10, 30]);
     }
 
     #[test]

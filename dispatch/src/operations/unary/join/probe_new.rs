@@ -38,6 +38,8 @@ pub struct Probe {
     table: JoinTable,
     hash_state: RandomState,
     key_column: usize,
+    use_probe_array: bool,
+    batch_hashes: Box<[u64; RECORD_BATCH_SIZE]>,
     ptrs: Box<[*const u64; RECORD_BATCH_SIZE]>,
     entries: Box<[u64; RECORD_BATCH_SIZE]>,
 
@@ -52,12 +54,19 @@ pub struct Probe {
 }
 
 impl Probe {
-    pub fn new(table: JoinTable, hash_state: RandomState, key_column: usize) -> Self {
+    pub fn new(
+        table: JoinTable,
+        hash_state: RandomState,
+        key_column: usize,
+        use_probe_array: bool,
+    ) -> Self {
         let mut allocator = SlabAllocator::new(false);
         Self {
             table,
             hash_state,
             key_column,
+            use_probe_array,
+            batch_hashes: Box::new([0; RECORD_BATCH_SIZE]),
             hashes: Box::new([0; RING_SIZE]),
 
             matched_slots: Box::new([(0, 0); RING_SIZE]),
@@ -74,6 +83,106 @@ impl Probe {
             ),
             order_keys: JoinPrimitiveBuilder::<Int64Type>::new(&mut allocator, RECORD_BATCH_SIZE),
         }
+    }
+
+    #[inline(never)]
+    fn probe_old<
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+        S: Sender<RecordBatch>,
+    >(
+        &mut self,
+        directory: &Directory<B>,
+        col: &Int64Array,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        debug_assert!(col.len() <= RECORD_BATCH_SIZE);
+        for row_idx in 0..col.len() {
+            let value = unsafe { col.value_unchecked(row_idx) };
+            self.batch_hashes[row_idx] = self.hash_state.hash_one(value);
+        }
+
+        let arena = unsafe { &*self.table.arena.get() };
+        let mut lineitem_builder =
+            JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut order_builder =
+            JoinPrimitiveBuilder::<Int64Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut output_idx = 0;
+
+        for row_idx in 0..col.len() {
+            const DIRECTORY_PREFETCH_DISTANCE: usize = 16;
+            const ARENA_PREFETCH_DISTANCE: usize = 8;
+
+            if row_idx + DIRECTORY_PREFETCH_DISTANCE < col.len() {
+                directory.prefetch_l2(self.batch_hashes[row_idx + DIRECTORY_PREFETCH_DISTANCE]);
+            }
+
+            if row_idx + ARENA_PREFETCH_DISTANCE < col.len() {
+                let future_hash = self.batch_hashes[row_idx + ARENA_PREFETCH_DISTANCE];
+                let future_slot = directory.slot_for(future_hash);
+                let future_start = directory.end_ptr(future_slot as isize);
+                prefetch_ptr_l2(arena.ptr_at_index(future_start) as *const u8);
+            }
+
+            let hash = self.batch_hashes[row_idx];
+            if !directory.matches_bloom(hash) {
+                continue;
+            }
+
+            let slot = directory.slot_for(hash);
+            let start = directory.end_ptr(slot as isize);
+            let end = directory.end_ptr((slot + 1) as isize);
+            let probe_key = unsafe { col.value_unchecked(row_idx) } as Value;
+
+            for arena_idx in start..end {
+                let entry = arena[arena_idx];
+                if entry != probe_key {
+                    continue;
+                }
+
+                lineitem_builder.write(output_idx, entry as i64);
+                order_builder.write(output_idx, entry as i64);
+                output_idx += 1;
+
+                if output_idx == RECORD_BATCH_SIZE {
+                    let lineitem = mem::replace(
+                        &mut lineitem_builder,
+                        JoinPrimitiveBuilder::<Int64Type>::new(
+                            &mut self.allocator,
+                            RECORD_BATCH_SIZE,
+                        ),
+                    );
+                    let order = mem::replace(
+                        &mut order_builder,
+                        JoinPrimitiveBuilder::<Int64Type>::new(
+                            &mut self.allocator,
+                            RECORD_BATCH_SIZE,
+                        ),
+                    );
+                    let batch = RecordBatch::try_new(
+                        PROBE_SCHEMA.clone(),
+                        vec![
+                            lineitem.into_array(output_idx),
+                            order.into_array(output_idx),
+                        ],
+                    )?;
+                    sender.send(batch)?;
+                    output_idx = 0;
+                }
+            }
+        }
+
+        if output_idx != 0 {
+            let batch = RecordBatch::try_new(
+                PROBE_SCHEMA.clone(),
+                vec![
+                    lineitem_builder.into_array(output_idx),
+                    order_builder.into_array(output_idx),
+                ],
+            )?;
+            sender.send(batch)?;
+        }
+
+        Ok(())
     }
 
     pub fn run<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(
@@ -248,6 +357,13 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         let arena = unsafe { &*self.table.arena.get() };
 
         let join_dir = unsafe { &*self.table.directory.get() };
+        if !self.use_probe_array {
+            return match join_dir {
+                JoinDirectory::Contiguous(dir) => self.probe_old(dir, col, sender),
+                JoinDirectory::NonContiguous(dir) => self.probe_old(dir, col, sender),
+            };
+        }
+
         match join_dir {
             JoinDirectory::Contiguous(dir) => {
                 let lineitem_keys =
