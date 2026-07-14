@@ -194,7 +194,8 @@ impl ParquetCatalog {
                     .into_data_file(store.as_ref(), &entry.location)
             })
             .collect::<store::Result<Vec<DataFile>>>()?;
-        let table_files = crate::parquet::load_table_files(dispatcher, &files)?;
+        let declared_columns: Arc<[planner::catalog::Column]> = manifest.columns.clone().into();
+        let table_files = crate::parquet::load_table_files(dispatcher, &files, declared_columns)?;
         Ok(CatalogTable::new(
             entry.name.clone(),
             entry.location.clone(),
@@ -304,9 +305,11 @@ impl ParquetCatalog {
         let tables = self.tables.clone();
         let store = self.store.clone();
         let pool = dispatcher.clone();
+        let declared_columns: Arc<[planner::catalog::Column]> = request.columns.clone().into();
         Ok(crate::parquet::create_load_and_commit_spec(
             dispatcher,
             &files,
+            declared_columns,
             move |loaded: Vec<TableFile>| {
                 let mut map = tables.write().unwrap();
                 if map.contains_key(&request.name) {

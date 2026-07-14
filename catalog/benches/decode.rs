@@ -250,7 +250,7 @@ fn main() {
     let dir = TempDir::new().unwrap();
     write_parquet(&dir, rows);
     let table = Arc::new(
-        ParquetTable::from_directory(dispatch.dispatcher(), dir.path())
+        ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &[])
             .expect("ParquetTable::from_directory failed"),
     );
 

@@ -1,7 +1,7 @@
 //! Column decoder for variable-length string and binary types, producing
-//! Arrow `StringViewArray`s.
+//! Arrow byte-view arrays (`StringViewArray` / `BinaryViewArray`).
 //!
-//! Arrow's *view* layout stores each value as a 128-bit view: short strings
+//! Arrow's *view* layout stores each value as a 128-bit view: short values
 //! (≤ 12 bytes) are inlined, while longer ones reference a `(block_id,
 //! offset)` into an external buffer list. This module provides the three
 //! components needed by [`TypedColumnDecoder`]:
@@ -13,7 +13,11 @@
 //! - [`ViewDict`] — the [`Dict`](super::Dict) that pre-parses dictionary
 //!   entries into views for O(1) lookup.
 //!
-//! [`BytesViewDecoder`] ties them together as a ready-to-use type alias.
+//! [`BytesViewDecoder`] ties them together as a ready-to-use type alias. All
+//! three are generic over [`ByteViewType`](arrow_array::types::ByteViewType):
+//! the decode machinery is byte-for-byte identical for the two flavours, and
+//! the parameter only picks the array type the finished column is built as,
+//! matching the leaf's declared schema type (`Utf8View` or `BinaryView`).
 
 use crate::parquet::reading::decoding::column_decoders::TypedColumnDecoder;
 use crate::parquet::reading::decoding::column_decoders::bytes_view::dict::ViewDict;
@@ -24,8 +28,11 @@ pub(crate) mod views_builder;
 pub(crate) mod dict;
 mod plain_page_decoder;
 
-/// Ready-to-use column decoder for variable-length string/binary types.
-pub type BytesViewDecoder = TypedColumnDecoder<ViewDict, ViewsBuilder, PlainPageDecoder>;
+/// Ready-to-use column decoder for variable-length string/binary types; `V`
+/// (a [`ByteViewType`](arrow_array::types::ByteViewType)) picks whether it
+/// finalises as a `StringViewArray` or a `BinaryViewArray`.
+pub type BytesViewDecoder<V> =
+    TypedColumnDecoder<ViewDict<V>, ViewsBuilder<V>, PlainPageDecoder<V>>;
 
 #[cfg(test)]
 mod tests {
@@ -35,7 +42,8 @@ mod tests {
     use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
     use crate::parquet::types::thrift::general::Encoding;
     use crate::parquet::types::thrift::headers::PageHeader;
-    use arrow_array::{Array, ArrayRef, StringViewArray};
+    use arrow_array::types::{BinaryViewType, StringViewType};
+    use arrow_array::{Array, ArrayRef, BinaryViewArray, StringViewArray};
     use bytes::Bytes;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
@@ -99,11 +107,34 @@ mod tests {
         );
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(0);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(0);
         dec.insert_page(page, &mut allocator);
 
         let result = dec.read(&mut allocator, 3).unwrap();
         assert_eq!(extract_strings(&result), vec!["hi", "bye", "ok"]);
+    }
+
+    /// The binary flavour finalises as a `BinaryViewArray`, with no UTF-8
+    /// requirement on the bytes.
+    #[test]
+    fn binary_flavour_builds_a_binary_view_array() {
+        init_test_free_pool(4);
+        let mut data = Vec::new();
+        let values: [&[u8]; 2] = [&[0x00, 0xFF, 0xC3], b"plain"];
+        for v in values {
+            data.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            data.extend_from_slice(v);
+        }
+        let page = make_data_page(data, 2, Encoding::PLAIN, 0);
+
+        let mut allocator = SlabAllocator::new(true);
+        let mut dec = BytesViewDecoder::<BinaryViewType>::new(0);
+        dec.insert_page(page, &mut allocator);
+        let result = dec.read(&mut allocator, 2).unwrap();
+
+        let bv = result.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+        assert_eq!(bv.value(0), values[0]);
+        assert_eq!(bv.value(1), values[1]);
     }
 
     #[test]
@@ -114,7 +145,7 @@ mod tests {
         let page = make_data_page(encode_plain_strings(&[long1, long2]), 2, Encoding::PLAIN, 0);
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(0);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(0);
         dec.insert_page(page, &mut allocator);
 
         let result = dec.read(&mut allocator, 2).unwrap();
@@ -133,7 +164,7 @@ mod tests {
         let data_page = make_data_page(rle_data, 4, Encoding::RLE_DICTIONARY, 0);
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(0);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(0);
         dec.insert_page(dict_page, &mut allocator);
         dec.insert_page(data_page, &mut allocator);
 
@@ -148,7 +179,7 @@ mod tests {
         let page1 = make_data_page(encode_plain_strings(&["c", "d"]), 2, Encoding::PLAIN, 1);
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(0);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(0);
         dec.insert_page(page0, &mut allocator);
         dec.insert_page(page1, &mut allocator);
         let result = dec.read(&mut allocator, 4).unwrap();
@@ -167,7 +198,7 @@ mod tests {
         );
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(0);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(0);
         dec.insert_page(page, &mut allocator);
 
         let r1 = dec.read(&mut allocator, 2).unwrap();
@@ -197,7 +228,7 @@ mod tests {
         let page = make_data_page(page_data, 3, Encoding::PLAIN, 0);
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(1); // max_def_level = 1
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1); // max_def_level = 1
         dec.insert_page(page, &mut allocator);
         let result = dec.read(&mut allocator, 3).unwrap();
         assert_eq!(extract_strings(&result), vec!["hi", "bye", "ok"]);
@@ -243,7 +274,7 @@ mod tests {
         let page = make_plain_page_with_def_levels(&[true, true, true], &["aa", "bb", "cc"]);
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(1);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
         dec.insert_page(page, &mut allocator);
 
         let result = dec.read(&mut allocator, 3).unwrap();
@@ -268,7 +299,7 @@ mod tests {
         );
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(1);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
         dec.insert_page(page, &mut allocator);
 
         let result = dec.read(&mut allocator, 4).unwrap();
@@ -294,7 +325,7 @@ mod tests {
         );
 
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = BytesViewDecoder::new(1);
+        let mut dec = BytesViewDecoder::<StringViewType>::new(1);
         dec.insert_page(page, &mut allocator);
 
         let result = dec.read(&mut allocator, 3).unwrap();

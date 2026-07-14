@@ -74,11 +74,9 @@
 //! // Wire one parquet directory into the catalog under the name "hits". The
 //! // footers are read once here, over the dispatch worker pool.
 //! let dispatch = Dispatch::spin_up(1, 10, None);
-//! let parquet = Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), Path::new("/tmp/hits")).unwrap());
-//! let template = MyTableTemplate {
-//!     parquet,
-//!     columns: vec![Column { name: "URL".into(), col_type: Type::Utf8 }],
-//! };
+//! let columns = vec![Column { name: "URL".into(), col_type: Type::Utf8 }];
+//! let parquet = Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), Path::new("/tmp/hits"), &columns).unwrap());
+//! let template = MyTableTemplate { parquet, columns };
 //!
 //! let mut tables = HashMap::new();
 //! tables.insert("hits".to_string(), template);
