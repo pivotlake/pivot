@@ -369,6 +369,7 @@ mod tests {
         DictFactory, ViewDict,
     };
     use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+    use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;
     use dispatch::memory::SlabAllocator;
@@ -383,7 +384,7 @@ mod tests {
         data
     }
 
-    fn make_dict(entries: &[&str]) -> ViewDict {
+    fn make_dict(entries: &[&str]) -> ViewDict<StringViewType> {
         let data = vec![Bytes::from(encode_plain_strings(entries))];
         DictFactory::new(data, entries.len()).create_dict()
     }
@@ -396,7 +397,7 @@ mod tests {
         buffers.into_iter().map(Bytes::from).collect()
     }
 
-    fn extract_strings(builder: ViewsBuilder) -> Vec<String> {
+    fn extract_strings(builder: ViewsBuilder<StringViewType>) -> Vec<String> {
         let array = builder.into_array(None);
         let sv = array.as_any().downcast_ref::<StringViewArray>().unwrap();
         (0..sv.len()).map(|i| sv.value(i).to_string()).collect()
@@ -409,7 +410,7 @@ mod tests {
     fn push_all(
         allocator: &mut SlabAllocator,
         decoder: &mut RleDecoder,
-        dict: &ViewDict,
+        dict: &ViewDict<StringViewType>,
         size: usize,
     ) -> Vec<String> {
         let mut buf = ViewsBuilder::with_capacity(allocator, size);

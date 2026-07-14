@@ -491,7 +491,7 @@ mod tests {
     /// metadata-fetch dataflow from this (coordinator) thread; the footer
     /// reads themselves land on the workers.
     fn read_table(dispatch: &Dispatch, dir: &Path) -> Arc<ParquetTable> {
-        Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir).unwrap())
+        Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir, &[]).unwrap())
     }
 
     fn parquet_file_count(dir: &Path) -> usize {

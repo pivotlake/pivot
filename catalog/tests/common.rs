@@ -121,7 +121,8 @@ pub fn parquet_table_from_dir(
     dir: &std::path::Path,
 ) -> Arc<ParquetTable> {
     Arc::new(
-        ParquetTable::from_directory(dispatch, dir).expect("ParquetTable::from_directory failed"),
+        ParquetTable::from_directory(dispatch, dir, &[])
+            .expect("ParquetTable::from_directory failed"),
     )
 }
 

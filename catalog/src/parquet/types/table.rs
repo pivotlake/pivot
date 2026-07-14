@@ -17,6 +17,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
+use planner::catalog::Column;
+use planner::types::Type;
 use std::fmt::{Debug, Formatter};
 use std::path::Path;
 use std::sync::atomic::AtomicUsize;
@@ -41,6 +43,13 @@ pub enum Error {
     /// the writer can't emit, or a Parquet leaf the reader can't decode).
     #[error("unsupported type: {0}")]
     UnsupportedType(String),
+    /// A file's stored column type contradicts the table's declared schema.
+    #[error("column '{column}' is declared {declared} but the file stores {file_type}")]
+    DeclaredTypeMismatch {
+        column: String,
+        declared: Type,
+        file_type: DataType,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -96,7 +105,15 @@ impl ParquetTable {
     /// Drives the metadata-fetch dataflow, so it must run on the **coordinator**
     /// (the thread holding `dispatcher`), not inside a `run_on_worker` closure —
     /// a nested dataflow would deadlock the worker pool.
-    pub fn from_directory(dispatcher: &DataFlowDispatcher, path: &Path) -> Result<Self> {
+    ///
+    /// `declared_columns` is the table's declared schema, reconciled with
+    /// each file's own schema (see [`apply_declared_types`]); pass `&[]` when
+    /// nothing was declared.
+    pub fn from_directory(
+        dispatcher: &DataFlowDispatcher,
+        path: &Path,
+        declared_columns: &[Column],
+    ) -> Result<Self> {
         let mut paths = Vec::new();
         for entry in fs::read_dir(path)? {
             let entry = entry?;
@@ -106,7 +123,7 @@ impl ParquetTable {
                 paths.push(path);
             }
         }
-        Self::from_files(dispatcher, &paths)
+        Self::from_files(dispatcher, &paths, declared_columns)
     }
 
     /// Build a table from an explicit, ordered list of local files. Same
@@ -114,6 +131,7 @@ impl ParquetTable {
     pub fn from_files<P: AsRef<Path>>(
         dispatcher: &DataFlowDispatcher,
         paths: &[P],
+        declared_columns: &[Column],
     ) -> Result<Self> {
         let files = paths
             .iter()
@@ -123,7 +141,7 @@ impl ParquetTable {
                 Ok(DataFile::local(path.to_path_buf(), size))
             })
             .collect::<io::Result<Vec<_>>>()?;
-        Self::from_locations(dispatcher, files)
+        Self::from_locations(dispatcher, files, declared_columns)
     }
 
     /// Build a table from remote files: concrete fetchable URLs paired with
@@ -132,21 +150,27 @@ impl ParquetTable {
     pub fn from_remote_files(
         dispatcher: &DataFlowDispatcher,
         files: &[(Url, u64)],
+        declared_columns: &[Column],
     ) -> Result<Self> {
         let files = files
             .iter()
             .map(|(url, size)| DataFile::remote(url.clone(), *size))
             .collect();
-        Self::from_locations(dispatcher, files)
+        Self::from_locations(dispatcher, files, declared_columns)
     }
 
     /// Read every file's footer in parallel (the metadata-fetch dataflow) and
     /// assemble the row groups. The locations may freely mix local and remote
     /// files. Same coordinator requirement as
     /// [`from_directory`](Self::from_directory).
-    pub fn from_locations(dispatcher: &DataFlowDispatcher, files: Vec<DataFile>) -> Result<Self> {
-        let table_files = crate::parquet::metadata::load_table_files(dispatcher, &files)
-            .map_err(|e| Error::Materialize(e.to_string()))?;
+    pub fn from_locations(
+        dispatcher: &DataFlowDispatcher,
+        files: Vec<DataFile>,
+        declared_columns: &[Column],
+    ) -> Result<Self> {
+        let table_files =
+            crate::parquet::metadata::load_table_files(dispatcher, &files, declared_columns.into())
+                .map_err(|e| Error::Materialize(e.to_string()))?;
         let row_groups = table_files
             .iter()
             .flat_map(|f| f.row_groups().iter().cloned())
@@ -168,12 +192,15 @@ pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 
 /// Parse raw thrift footer bytes into this file's row groups (file-local
 /// indices), tying each to `location` for the column-chunk reads that follow.
+/// `declared_columns` is the table's declared schema (empty when the table has
+/// none), reconciled with the file's own schema by [`apply_declared_types`].
 pub(crate) fn row_groups_from_footer(
     footer: &[u8],
     location: dispatch::io::FileLocation,
+    declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    build_row_groups(file_meta, location)
+    build_row_groups(file_meta, location, declared_columns)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
@@ -183,9 +210,13 @@ pub(crate) fn row_groups_from_footer(
 fn build_row_groups(
     file_meta: FileMetaData,
     location: dispatch::io::FileLocation,
+    declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
-    let schema = Arc::new(schema);
+    // Reconcile with the declared table schema before anything reads the
+    // types: the statistics right below decode by leaf type, and the scan's
+    // decoders and output schema follow this schema too.
+    let schema = Arc::new(apply_declared_types(schema, declared_columns)?);
     // Column chunks are per leaf (depth-first), so statistics are decoded against
     // the leaf's type, not the j-th top-level field's (they differ under nesting).
     let leaves = super::leaves::leaf_fields(schema.fields());
@@ -374,10 +405,68 @@ fn schema_elements_to_arrow(
     Ok((Schema::new(fields), def_levels))
 }
 
+/// Reconcile a file's parsed schema with the table's declared column types,
+/// matched by column name: a file may carry more columns than the table
+/// declares (an ingest mapping can write a superset), and those pass through
+/// untouched.
+///
+/// Two pairings reconcile instead of matching exactly:
+/// - declared VARCHAR, file binary: the file stores text as *unannotated*
+///   BYTE_ARRAY (binary is all the file claims, and files written that way
+///   are common in the wild); the declaration is what says those bytes are
+///   text, so the column is retyped to `Utf8View` and decodes and compares
+///   as text.
+/// Every other pairing must equal the declared type's storage type exactly;
+/// a contradiction fails the load with the offending column's name rather
+/// than mis-decoding data.
+fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<Schema> {
+    let declared_by_name: std::collections::HashMap<&str, &Type> = declared_columns
+        .iter()
+        .map(|c| (c.name.as_str(), &c.col_type))
+        .collect();
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let Some(declared) = declared_by_name.get(field.name().as_str()) else {
+                return Ok(field.clone());
+            };
+            let file_type = field.data_type();
+            if **declared == Type::Utf8 && *file_type == DataType::BinaryView {
+                return Ok(Arc::new(
+                    field.as_ref().clone().with_data_type(DataType::Utf8View),
+                ));
+            }
+            let matches_declared = match declared {
+                // Pivot's timestamp convention (see `Type::Timestamp`): files
+                // store packed epoch seconds in a plain INT64 column, which
+                // the executor reads as-is. A file with a real timestamp
+                // annotation parses to `Timestamp(Second)` and matches the
+                // declared type's storage exactly below.
+                Type::Timestamp => matches!(
+                    file_type,
+                    DataType::Int64 | DataType::Timestamp(TimeUnit::Second, None)
+                ),
+                _ => *file_type == planner::types::physical_arrow_type(declared),
+            };
+            if matches_declared {
+                Ok(field.clone())
+            } else {
+                Err(Error::DeclaredTypeMismatch {
+                    column: field.name().clone(),
+                    declared: (*declared).clone(),
+                    file_type: file_type.clone(),
+                })
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Schema::new(fields))
+}
+
 /// Parse the subtree rooted at `elements[idx]`. `parent_def` is the definition
-/// level contributed by ancestors (each optional ancestor adds one). Returns the
-/// Arrow field and the index just past this subtree, appending one entry per
-/// leaf to `def_levels` in depth-first (column-chunk) order.
+/// level contributed by ancestors (each optional ancestor adds one). Returns
+/// the Arrow field and the index just past this subtree, appending one entry
+/// per leaf to `def_levels` in depth-first (column-chunk) order.
 fn parse_schema_element(
     elements: &[crate::parquet::types::thrift::footer::SchemaElement],
     idx: usize,
@@ -398,8 +487,10 @@ fn parse_schema_element(
                 children.push(child);
                 cursor = next;
             }
-            let data_type = DataType::Struct(children.into());
-            Ok((Field::new(&elem.name, data_type, nullable), cursor))
+            Ok((
+                Field::new(&elem.name, DataType::Struct(children.into()), nullable),
+                cursor,
+            ))
         }
         _ => {
             def_levels.push(def_level);
@@ -447,7 +538,7 @@ mod tests {
                 .unwrap();
         writer.write(batch).unwrap();
         writer.close().unwrap();
-        let table = ParquetTable::from_directory(test_dispatcher(), dir.path()).unwrap();
+        let table = ParquetTable::from_directory(test_dispatcher(), dir.path(), &[]).unwrap();
         (dir, table)
     }
 
@@ -464,6 +555,68 @@ mod tests {
             encoding,
             count,
         }
+    }
+
+    fn column(name: &str, col_type: Type) -> Column {
+        Column {
+            name: name.to_string(),
+            col_type,
+        }
+    }
+
+    /// A column the table declares VARCHAR whose file leaf is unannotated
+    /// binary is retyped to text; every other pairing is left alone.
+    #[test]
+    fn declared_varchar_retypes_an_unannotated_binary_column() {
+        let schema = Schema::new(vec![
+            Field::new("url", DataType::BinaryView, false),
+            Field::new("id", DataType::Int64, false),
+        ]);
+
+        let declared = [column("url", Type::Utf8), column("id", Type::Int64)];
+        let reconciled = apply_declared_types(schema, &declared).unwrap();
+
+        assert_eq!(*reconciled.field(0).data_type(), DataType::Utf8View);
+        assert_eq!(*reconciled.field(1).data_type(), DataType::Int64);
+    }
+
+    /// Matching is by column name: file columns the table doesn't declare
+    /// pass through untouched (an ingest mapping can write a superset, in any
+    /// order), and an empty declaration changes nothing.
+    #[test]
+    fn undeclared_file_columns_pass_through_untouched() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::BinaryView, false),
+            Field::new("b", DataType::BinaryView, false),
+        ]);
+
+        let reconciled = apply_declared_types(schema.clone(), &[column("b", Type::Utf8)]).unwrap();
+        let untouched = apply_declared_types(schema, &[]).unwrap();
+
+        assert_eq!(*reconciled.field(0).data_type(), DataType::BinaryView);
+        assert_eq!(*reconciled.field(1).data_type(), DataType::Utf8View);
+        assert_eq!(*untouched.field(0).data_type(), DataType::BinaryView);
+    }
+
+    /// A file whose stored type contradicts the declaration fails the load,
+    /// naming the offending column and both types.
+    #[test]
+    fn declared_type_mismatch_fails_naming_the_column() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("price", DataType::Utf8View, false),
+        ]);
+
+        let declared = [column("id", Type::Int64), column("price", Type::Float64)];
+        let err = apply_declared_types(schema, &declared).unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("'price'")
+                && message.contains("Float64")
+                && message.contains("Utf8View"),
+            "unhelpful mismatch error: {message}"
+        );
     }
 
     /// Pruning away every row group keeps the table's schema, so a scan that

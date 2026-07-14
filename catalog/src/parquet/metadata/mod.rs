@@ -25,14 +25,29 @@ mod writer;
 use crate::catalog::TableFile;
 use crate::store::DataFile;
 use dispatch::{
-    DataFlowDispatcher, DefaultUnaryFactory, OperatorSpec, RecordBatchOperatorSpec,
-    RootUnaryOperatorFactory, fan_in,
+    DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
+    UnaryFactory, fan_in,
 };
 use fetcher::TableFileMetadataFetcher;
 use injector::FileInjectorFactory;
+use planner::catalog::Column;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use writer::TableBuildSinkFactory;
+
+/// Builds each worker's [`TableFileMetadataFetcher`], carrying the table's
+/// declared column types so every parsed footer is reconciled with them.
+struct MetadataFetcherFactory {
+    declared_columns: Arc<[Column]>,
+}
+
+impl UnaryFactory<DataFile, TableFile> for MetadataFetcherFactory {
+    type Unary = TableFileMetadataFetcher;
+
+    fn build_unary(self) -> Self::Unary {
+        TableFileMetadataFetcher::new(self.declared_columns)
+    }
+}
 
 /// The per-worker source→fetch factories: each worker steals files from a shared
 /// injector and reads their footers, emitting one [`TableFile`] per file (the
@@ -41,20 +56,17 @@ use writer::TableBuildSinkFactory;
 fn fetch_table_file_factories(
     files: &[DataFile],
     workers: usize,
-) -> Vec<
-    RootUnaryOperatorFactory<
-        DataFile,
-        TableFile,
-        DefaultUnaryFactory<TableFileMetadataFetcher>,
-        FileInjectorFactory,
-    >,
-> {
+    declared_columns: Arc<[Column]>,
+) -> Vec<RootUnaryOperatorFactory<DataFile, TableFile, MetadataFetcherFactory, FileInjectorFactory>>
+{
     let injector = FileInjectorFactory::new(files);
     let siblings = Arc::new(AtomicUsize::new(workers));
     (0..workers)
         .map(|_| {
             RootUnaryOperatorFactory::new(
-                DefaultUnaryFactory::<TableFileMetadataFetcher>::new(),
+                MetadataFetcherFactory {
+                    declared_columns: declared_columns.clone(),
+                },
                 injector.clone(),
                 siblings.clone(),
             )
@@ -71,10 +83,11 @@ fn fetch_table_file_factories(
 pub(crate) fn load_table_files(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
+    declared_columns: Arc<[Column]>,
 ) -> Result<Vec<TableFile>, dispatch::DataFlowError> {
     OperatorSpec::new(
         dispatcher.clone(),
-        fetch_table_file_factories(files, dispatcher.worker_count()),
+        fetch_table_file_factories(files, dispatcher.worker_count(), declared_columns),
     )
     .collect()
 }
@@ -88,6 +101,7 @@ pub(crate) fn load_table_files(
 pub fn create_load_and_commit_spec<C>(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
+    declared_columns: Arc<[Column]>,
     commit: C,
 ) -> RecordBatchOperatorSpec
 where
@@ -97,7 +111,7 @@ where
 {
     let fetch = OperatorSpec::new(
         dispatcher.clone(),
-        fetch_table_file_factories(files, dispatcher.worker_count()),
+        fetch_table_file_factories(files, dispatcher.worker_count(), declared_columns),
     );
 
     // `fan_in` funnels every worker's row groups to worker 0; only worker 0 gets

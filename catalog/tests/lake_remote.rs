@@ -226,7 +226,8 @@ fn materializes_a_remote_footer_over_the_ring() {
     // window is fetched through the compressed cache exactly like a column chunk. No
     // HEAD, no suffix probe.
     let table = Arc::new(
-        ParquetTable::from_remote_files(&dispatch, &[(url, size)]).expect("materialize footers"),
+        ParquetTable::from_remote_files(&dispatch, &[(url, size)], &[])
+            .expect("materialize footers"),
     );
     // Four rows, one row group each (writer set to one row per group).
     assert_eq!(table.row_groups().len(), 4, "all row-group footers parsed");
@@ -261,8 +262,9 @@ fn materializes_many_remote_footers_concurrently() {
         expected.push(i * 2 + 1);
     }
 
-    let table =
-        Arc::new(ParquetTable::from_remote_files(&dispatch, &files).expect("materialize footers"));
+    let table = Arc::new(
+        ParquetTable::from_remote_files(&dispatch, &files, &[]).expect("materialize footers"),
+    );
     assert_eq!(table.row_groups().len(), 16, "8 files x 2 row groups each");
 
     let results = table_input(&dispatch, &table, Projection::all(2), false)
@@ -294,7 +296,7 @@ fn footer_load_keeps_many_reads_in_flight() {
         })
         .collect();
 
-    ParquetTable::from_remote_files(&dispatch, &files).unwrap();
+    ParquetTable::from_remote_files(&dispatch, &files, &[]).unwrap();
 
     assert!(peak.load(Ordering::SeqCst) >= 4, "footer loads serialised");
 }
@@ -319,7 +321,7 @@ fn row_group_scan_keeps_many_reads_in_flight() {
             )
         })
         .collect();
-    let table = Arc::new(ParquetTable::from_remote_files(&dispatch, &files).unwrap());
+    let table = Arc::new(ParquetTable::from_remote_files(&dispatch, &files, &[]).unwrap());
     peak.store(0, Ordering::SeqCst);
 
     table_input(&dispatch, &table, Projection::all(2), false)
@@ -341,7 +343,7 @@ fn remote_scan_reports_io_and_cpu_stats() {
     let bytes = wide_parquet_bytes();
     let size = bytes.len() as u64;
     let url = serve_with_ranges(bytes);
-    let table = Arc::new(ParquetTable::from_remote_files(&dispatch, &[(url, size)]).unwrap());
+    let table = Arc::new(ParquetTable::from_remote_files(&dispatch, &[(url, size)], &[]).unwrap());
 
     let (batches, stats) = table_input(&dispatch, &table, Projection::all(2), false)
         .collect_with_stats()

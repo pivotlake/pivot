@@ -328,6 +328,7 @@ impl CatalogTable {
         Ok(crate::parquet::load_table_files(
             &self.dispatcher,
             &to_fetch,
+            self.declared_columns(),
         )?)
     }
 
@@ -442,7 +443,8 @@ impl CatalogTable {
                     .into_data_file(self.store.as_ref(), &self.location)
             })
             .collect::<store::Result<_>>()?;
-        let fetched = crate::parquet::load_table_files(&self.dispatcher, &to_fetch)?;
+        let fetched =
+            crate::parquet::load_table_files(&self.dispatcher, &to_fetch, self.declared_columns())?;
         self.files.extend(fetched);
 
         let by_path: HashMap<&ObjectPath, &TableFile> =
@@ -458,6 +460,12 @@ impl CatalogTable {
     /// The table's columns (schema), as the planner's [`Column`]s.
     pub fn columns(&self) -> Vec<Column> {
         self.manifest.columns.clone()
+    }
+
+    /// The declared schema as one shareable slice: what a footer load
+    /// reconciles each file's parsed schema against.
+    fn declared_columns(&self) -> Arc<[Column]> {
+        self.manifest.columns.clone().into()
     }
 
     /// Where the table's data lives, relative to the database root (an absolute

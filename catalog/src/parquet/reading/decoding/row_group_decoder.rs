@@ -18,8 +18,8 @@ use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    TimestampSecondType, UInt16Type,
+    ArrowPrimitiveType, BinaryViewType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type,
+    Int64Type, StringViewType, TimestampSecondType, UInt16Type,
 };
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
@@ -77,12 +77,14 @@ fn column_decoder_for_type(
         DataType::Timestamp(TimeUnit::Second, None) => Ok(primitive!(TimestampSecondType)),
         DataType::Float32 => Ok(primitive!(Float32Type)),
         DataType::Float64 => Ok(primitive!(Float64Type)),
-        DataType::Utf8View
-        | DataType::BinaryView
-        | DataType::Utf8
-        | DataType::Binary
-        | DataType::LargeUtf8
-        | DataType::LargeBinary => Ok(Box::new(BytesViewDecoder::new(max_def_level))),
+        // The byte-view decoder's flavour matches the leaf's declared type, so
+        // the finished column is a string or binary array directly.
+        DataType::Utf8View | DataType::Utf8 | DataType::LargeUtf8 => Ok(Box::new(
+            BytesViewDecoder::<StringViewType>::new(max_def_level),
+        )),
+        DataType::BinaryView | DataType::Binary | DataType::LargeBinary => Ok(Box::new(
+            BytesViewDecoder::<BinaryViewType>::new(max_def_level),
+        )),
         other => Err(Error::UnsupportedColumnType(other.clone())),
     }
 }

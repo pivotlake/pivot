@@ -10,10 +10,12 @@ use super::super::ArrayBuilder;
 use crate::parquet::reading::decoding::column_decoders::DecodePlain;
 use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
+use arrow_array::types::ByteViewType;
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use dispatch::env::MAX_INLINE_STRING_VIEW;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use std::marker::PhantomData;
 use thiserror::Error;
 
 /// Internal error signalling that the current buffer was exhausted mid-value.
@@ -30,25 +32,26 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Reads plain-encoded (length-prefixed) byte arrays from scattered buffers,
-/// producing string views.
+/// producing views for a string or binary [`ViewsBuilder`] (per `V`).
 ///
 /// Holds both the raw `Bytes` buffers (for cross-boundary reads via
 /// [`MultiBufferReader`]) and Arrow `Buffer` copies (for zero-copy view
 /// block registration).
-pub struct PlainPageDecoder {
+pub struct PlainPageDecoder<V: ByteViewType> {
     data: Vec<Bytes>,
     /// Arrow `Buffer` wrappers over `data`, registered as view blocks.
     buffers: Vec<Buffer>,
     position: ReaderPosition,
+    phantom: PhantomData<V>,
 }
 
-impl PlainPageDecoder {
+impl<V: ByteViewType> PlainPageDecoder<V> {
     /// Reads a string of `len` bytes that spans a buffer boundary, creates a
     /// new data block for it, and appends the view.
     #[inline(always)]
     fn append_view_across_boundaries(
         &mut self,
-        output: &mut ViewsBuilder,
+        output: &mut ViewsBuilder<V>,
         len: u32,
     ) -> Result<(), Error> {
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
@@ -70,7 +73,7 @@ impl PlainPageDecoder {
     /// or `Err(Error::ReadStr(len))` if the string body is split.
     fn read_from_current_buffer(
         &mut self,
-        output: &mut ViewsBuilder,
+        output: &mut ViewsBuilder<V>,
         size: usize,
     ) -> Result<(), Error> {
         let bytes = &self.data[self.position.buffer_index];
@@ -144,14 +147,15 @@ impl PlainPageDecoder {
     }
 }
 
-impl DecodePlain for PlainPageDecoder {
-    type Builder = ViewsBuilder;
+impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
+    type Builder = ViewsBuilder<V>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {
             buffers: data.iter().map(|b| Buffer::from(b.clone())).collect(),
             data,
             position,
+            phantom: PhantomData,
         }
     }
 
@@ -208,6 +212,7 @@ mod tests {
     use super::*;
     use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
     use crate::parquet::reading::decoding::column_decoders::{ArrayBuilder, DecodePlain};
+    use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;
     use dispatch::memory::SlabAllocator;
@@ -226,7 +231,7 @@ mod tests {
         buffers.into_iter().map(Bytes::from).collect()
     }
 
-    fn extract(buf: ViewsBuilder) -> Vec<String> {
+    fn extract(buf: ViewsBuilder<StringViewType>) -> Vec<String> {
         let arr = buf.into_array(None);
         let sv = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
         (0..sv.len()).map(|i| sv.value(i).to_string()).collect()
