@@ -175,7 +175,7 @@ impl Decoder {
         &mut self,
         sender: &mut S,
     ) -> dispatch::UnaryResult<bool> {
-        let mut indexes_to_remove = HashSet::default();
+        let mut exhausted_row_group = None;
         let mut produced = false;
 
         let allocator = &mut self.allocator;
@@ -186,19 +186,17 @@ impl Decoder {
             {
                 sender.send(batch)?;
                 if decoder.exhausted() {
-                    indexes_to_remove.insert(decoder.row_group_idx());
+                    exhausted_row_group = Some(decoder.row_group_idx());
                 }
                 produced = true;
                 break;
             }
         }
 
-        if !indexes_to_remove.is_empty() {
-            for _ in 0..indexes_to_remove.len() {
-                self.release_claim();
-            }
+        if let Some(row_group_idx) = exhausted_row_group {
+            self.release_claim();
             self.row_group_decoders
-                .retain(|d| !indexes_to_remove.contains(&d.row_group_idx()));
+                .retain(|d| d.row_group_idx() != row_group_idx);
         }
         Ok(produced)
     }

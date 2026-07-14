@@ -138,8 +138,8 @@ pub type Identifier = usize;
 /// their next iteration.
 pub struct Shutdown {
     flag: Arc<AtomicBool>,
-    /// One waker per NUMA node group; shutdown wakes every group.
-    wakers: Vec<Arc<WorkerWaker>>,
+    /// Every node group's waker; shutdown wakes them all.
+    wakers: WakerSet,
 }
 
 impl Shutdown {
@@ -148,17 +148,8 @@ impl Shutdown {
         // Workers parked on a waker won't observe `exit_flag` until someone
         // wakes them. Notify every group's waker so every parked worker returns
         // from `wait_if_unchanged` and sees the flag on its next loop iteration.
-        for waker in &self.wakers {
-            waker.notify();
-        }
+        self.wakers.notify_all();
     }
-}
-
-/// What a successful dispatch hands back: the wakers of every node the dataflow
-/// runs on, so cancellation (which may fire from a non-worker thread) can wake
-/// parked workers on any node.
-pub struct Dispatched {
-    pub(crate) wakers: WakerSet,
 }
 
 #[derive(Clone)]
@@ -203,20 +194,17 @@ impl DataFlowDispatcher {
     /// full bundle has one builder per worker; a shorter one (e.g.
     /// [`run_on_worker`](Self::run_on_worker)'s single builder) reaches only
     /// the first workers, which is consistent with the dense `0..builder_count`
-    /// worker indexing its channels are built for.
-    pub fn push_data_flow(
-        &self,
-        builders: impl IntoIterator<Item = DataFlowBuilder>,
-    ) -> Dispatched {
+    /// worker indexing its channels are built for. Returns the wakers of every
+    /// node, so cancellation (which may fire from a non-worker thread) can
+    /// wake parked workers on any node.
+    pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) -> WakerSet {
         for (worker, builder) in builders.into_iter().enumerate() {
             self.senders[worker].send(builder).unwrap();
         }
         // Wake idle workers on every node so they pick up the new dataflow
         // without waiting out their park.
         self.waker_set.notify_all_delegated();
-        Dispatched {
-            wakers: self.waker_set.clone(),
-        }
+        self.waker_set.clone()
     }
 
     /// The total worker count across all node groups. Every dataflow's
@@ -259,9 +247,10 @@ impl DataFlowDispatcher {
     /// per worker (each gets its own clone of `f`), so `f` executes on a thread
     /// that has a live `MemoryContext` — e.g. to touch per-worker ring/free-pool
     /// state such as `memory_ctx().zero_dirty_buffers()`.
-    pub fn run_on_workers<F>(&self, f: F)
+    pub fn run_on_workers<T, F>(&self, f: F) -> Vec<T>
     where
-        F: Fn() + Clone + Send + 'static,
+        T: Send + 'static,
+        F: Fn() -> T + Clone + Send + 'static,
     {
         let factories = (0..self.worker_count()).map(|_| {
             let f = f.clone();
@@ -269,7 +258,7 @@ impl DataFlowDispatcher {
         });
         OperatorSpec::new(self.clone(), factories)
             .collect()
-            .expect("run_on_workers dataflow failed");
+            .expect("run_on_workers dataflow failed")
     }
 }
 
@@ -379,7 +368,7 @@ impl Dispatch {
             dataflow_dispatcher: DataFlowDispatcher {
                 senders,
                 topology,
-                waker_set,
+                waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),
                 #[cfg(feature = "perf")]
                 profiled: false,
@@ -387,7 +376,7 @@ impl Dispatch {
             handles: threads,
             shutdown: Shutdown {
                 flag: should_exit,
-                wakers: node_wakers,
+                wakers: waker_set,
             },
         }
     }
@@ -426,7 +415,6 @@ mod tests {
     //! single-node machine.
 
     use super::*;
-    use crate::operations::nullary::OneShotNullaryFactory;
     use std::collections::HashSet;
     use std::sync::Mutex;
 
@@ -439,23 +427,13 @@ mod tests {
             .collect()
     }
 
-    /// Run a one-shot-per-worker dataflow collecting `f()` from every worker.
-    fn collect_from_each_worker<T: Send + 'static>(
-        dispatcher: &DataFlowDispatcher,
-        f: impl Fn() -> T + Clone + Send + 'static,
-    ) -> Vec<T> {
-        let factories = (0..dispatcher.worker_count())
-            .map(|_| NullaryOperatorFactory::new(OneShotNullaryFactory::new(f.clone())));
-        OperatorSpec::new(dispatcher.clone(), factories)
-            .collect()
-            .unwrap()
-    }
-
     #[test]
     fn a_dataflow_spans_every_node_group() {
         let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
 
-        let nodes = collect_from_each_worker(dispatch.dispatcher(), crate::worker::current_node);
+        let nodes = dispatch
+            .dispatcher()
+            .run_on_workers(crate::worker::current_node);
 
         assert_eq!(nodes.len(), 4, "ran on every worker of every group");
         assert_eq!(
@@ -470,9 +448,9 @@ mod tests {
     fn all_node_groups_share_one_ring() {
         let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
 
-        let rings = collect_from_each_worker(dispatch.dispatcher(), || {
-            memory_ctx().ring() as *const _ as usize
-        });
+        let rings = dispatch
+            .dispatcher()
+            .run_on_workers(|| memory_ctx().ring() as *const _ as usize);
 
         assert_eq!(rings.into_iter().collect::<HashSet<_>>().len(), 1);
         dispatch.exit();
@@ -482,8 +460,9 @@ mod tests {
     fn workers_carry_dense_global_indices() {
         let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
 
-        let mut indices =
-            collect_from_each_worker(dispatch.dispatcher(), || crate::worker::WORKER_IDX.get());
+        let mut indices = dispatch
+            .dispatcher()
+            .run_on_workers(|| crate::worker::WORKER_IDX.get());
 
         indices.sort();
         assert_eq!(indices, vec![0, 1, 2, 3]);

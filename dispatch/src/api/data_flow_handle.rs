@@ -1,4 +1,3 @@
-use crate::Dispatched;
 use crate::stats::DataFlowStats;
 use crate::worker::WakerSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,14 +28,14 @@ impl<T> DataFlowHandle<T> {
         err_rx: mpsc::Receiver<crate::data_flow::Error>,
         stats_rx: mpsc::Receiver<DataFlowStats>,
         cancelled: Arc<AtomicBool>,
-        dispatched: Dispatched,
+        wakers: WakerSet,
     ) -> Self {
         Self {
             rx,
             err_rx,
             stats_rx,
             cancelled,
-            wakers: dispatched.wakers,
+            wakers,
         }
     }
 

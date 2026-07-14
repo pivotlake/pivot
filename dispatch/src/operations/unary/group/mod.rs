@@ -217,12 +217,8 @@ const TARGET_SCATTER_STREAMS: usize = 1 << 19;
 /// buckets than workers would leave cores idle.
 fn get_scatter_bucket_count_for_worker(total_workers: usize) -> usize {
     let budget = (TARGET_SCATTER_STREAMS / total_workers.max(1)).max(1);
-    let buckets = if budget.is_power_of_two() {
-        budget
-    } else {
-        budget.next_power_of_two() / 2
-    };
-    buckets
+    // The largest power of two at or below the budget.
+    (1usize << budget.ilog2())
         .max(total_workers.next_power_of_two())
         .min(RADIX_PARTITIONS)
 }
@@ -561,11 +557,6 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
         let partition_floor = merge_partition_floor(contributing_workers);
         let total_in_place: usize = tables_by_node.iter().flatten().map(|t| t.len()).sum();
-        let scatter_rows: usize = buffers_by_node
-            .iter()
-            .flatten()
-            .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
-            .sum();
         // Estimate the global distinct count: the HLL covers switched
         // workers, and a non-switched worker's exact per-table count stands
         // in for its keys (over-counting keys a switched worker also holds,
@@ -643,12 +634,19 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         // sources directly and pay the remote reads once. An all-in-place merge
         // is always direct: its tables are per-worker aggregated already and
         // their estimate equals their total, so the test is never met.
-        let hierarchical = node_count > 1 && total_in_place + scatter_rows > 2 * estimate;
-        let fragment_capacity = if hierarchical {
-            (partition_capacity / node_count).max(1)
-        } else {
-            partition_capacity
+        // Counting the scattered rows walks every switched worker's every
+        // bucket, so only pay for it when a second node exists at all.
+        let hierarchical = node_count > 1 && {
+            let scatter_rows: usize = buffers_by_node
+                .iter()
+                .flatten()
+                .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
+                .sum();
+            total_in_place + scatter_rows > 2 * estimate
         };
+        // Full partition size even for per-node fragments; see
+        // `PartitionJob::fragment_capacity`.
+        let fragment_capacity = partition_capacity;
         // Wrap the arena's ring buffers once for the whole output phase (consume
         // is done, so `next_idx` is final). Every partition job shares this one
         // `Arc<[Buffer]>` for zero-copy string output, so a batch attaches it with

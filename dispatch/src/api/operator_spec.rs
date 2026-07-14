@@ -81,7 +81,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
-        let dispatched = self
+        let wakers = self
             .dispatcher
             .push_data_flow(self.factories.into_iter().map(|f| {
                 let tx = tx.clone();
@@ -103,7 +103,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         drop(stats_tx);
 
         let (rx, _) = rx.into_parts();
-        DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, dispatched)
+        DataFlowHandle::new(rx, err_rx, stats_rx, cancelled, wakers)
     }
 
     /// Run the dataflow and drain every produced item into a `Vec`. Shortcut

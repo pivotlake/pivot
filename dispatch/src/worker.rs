@@ -196,6 +196,11 @@ impl WorkerWaker {
     /// reaching zero, a collector publishing merge jobs.
     pub fn notify(&self) {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
+        self.wake_all_parked();
+    }
+
+    /// Unpark every currently parked worker (no wake-count bump).
+    fn wake_all_parked(&self) {
         if self.parked_workers.load(Ordering::SeqCst) == 0 {
             return;
         }
@@ -248,12 +253,7 @@ impl WorkerWaker {
         let epoch = self.broadcast_epoch.load(Ordering::SeqCst);
         if epoch != *last_seen {
             *last_seen = epoch;
-            if self.parked_workers.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            for slot in &self.slots {
-                self.wake_slot(slot);
-            }
+            self.wake_all_parked();
         }
     }
 
@@ -621,7 +621,7 @@ impl Worker {
                 // Register this worker's OS tid so the server can scope a
                 // `perf record -t` to the worker pool.
                 #[cfg(feature = "perf")]
-                crate::profiler::register_worker_tid(idx);
+                crate::profiler::register_worker_tid();
                 let node_local_idx = idx % waker_set.workers_per_node;
                 waker.register(node_local_idx);
                 let last_seen_wake_count = waker.wake_count();
