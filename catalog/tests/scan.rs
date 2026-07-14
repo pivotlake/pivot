@@ -117,8 +117,8 @@ fn scan_nested_struct_column() {
     .unwrap();
     let (_dir, table) = parquet_table(&dispatch, &[batch], false);
 
-    // Three leaves (`user.id`, `user.name`, `ts`) reassemble into two columns.
-    let results = table_input(&dispatch, &table, Projection::all(3), false)
+    // Two top-level columns (`user{id, name}` and `ts`) over three leaf chunks.
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
         .collect()
         .unwrap();
 
@@ -231,8 +231,8 @@ fn scan_variant_column() {
         RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(doc) as _]).unwrap();
     let (_dir, table) = parquet_table(&dispatch, &[batch], false);
 
-    // Two leaves: `doc.metadata`, `doc.value`.
-    let results = table_input(&dispatch, &table, Projection::all(2), false)
+    // One top-level column `doc` (its metadata/value leaves reassemble).
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
         .collect()
         .unwrap();
 
@@ -278,9 +278,8 @@ fn scan_shredded_variant() {
     .unwrap();
     let (_dir, table) = parquet_table(&dispatch, &[batch], false);
 
-    // Four leaves: `metadata`, `value`, `typed_value.age.value`,
-    // `typed_value.age.typed_value`.
-    let results = table_input(&dispatch, &table, Projection::all(4), false)
+    // One top-level column `doc`, spanning this file's four shredded leaves.
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
         .collect()
         .unwrap();
 
@@ -320,7 +319,7 @@ fn scan_shredded_variant_with_a_leading_null() {
     .unwrap();
     let (_dir, table) = parquet_table(&dispatch, &[batch], false);
 
-    let results = table_input(&dispatch, &table, Projection::all(4), false)
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
         .collect()
         .unwrap();
 
@@ -361,7 +360,7 @@ fn scan_dictionary_encoded_variant() {
     .unwrap();
     let (_dir, table) = parquet_table(&dispatch, &[batch], true); // dictionary ENABLED
 
-    let results = table_input(&dispatch, &table, Projection::all(4), false)
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
         .collect()
         .unwrap();
 
@@ -413,7 +412,7 @@ fn scan_struct_between_scalars_keeps_leaf_order() {
     let dispatch = dispatch(1);
     let (_dir, table) = parquet_table(&dispatch, &[struct_between_scalars_batch()], false);
 
-    let results = table_input(&dispatch, &table, Projection::all(4), false)
+    let results = table_input(&dispatch, &table, Projection::all(3), false)
         .collect()
         .unwrap();
 
@@ -446,9 +445,9 @@ fn scan_scalar_after_struct() {
     let dispatch = dispatch(1);
     let (_dir, table) = parquet_table(&dispatch, &[struct_between_scalars_batch()], false);
 
-    // `b` is top-level field 2 but leaf 3; projecting its leaf must decode
-    // that chunk, not the struct's second leaf.
-    let results = table_input(&dispatch, &table, Projection::columns([3]), false)
+    // Column `b` sits after the struct, so its leaf chunk is at index 3, not 2;
+    // projecting the column must fetch and decode that chunk.
+    let results = table_input(&dispatch, &table, Projection::columns([2]), false)
         .collect()
         .unwrap();
 
@@ -463,8 +462,8 @@ fn scan_struct_only() {
     let dispatch = dispatch(1);
     let (_dir, table) = parquet_table(&dispatch, &[struct_between_scalars_batch()], false);
 
-    // The struct's two leaves project as one nested column.
-    let results = table_input(&dispatch, &table, Projection::columns([1, 2]), false)
+    // Projecting the struct column reads both its leaves and reassembles them.
+    let results = table_input(&dispatch, &table, Projection::columns([1]), false)
         .collect()
         .unwrap();
 
@@ -482,6 +481,78 @@ fn scan_struct_only() {
             .unwrap(),
         &StringViewArray::from(vec!["p", "q"])
     );
+}
+
+#[test]
+fn scan_variant_shredded_differently_per_file() {
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{
+        GetOptions, ShreddedSchemaBuilder, json_to_variant, shred_variant, variant_get,
+    };
+
+    let dispatch = dispatch(1);
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    // Two files, same top-level `doc` column, DIFFERENT physical layouts:
+    // file 0 shreds `age` (Int64), file 1 shreds `name` (Utf8). The projection
+    // must resolve to each file's own leaves; a single fixed leaf list would
+    // silently mis-decode one of the files.
+    let files = [
+        (
+            vec![r#"{"age":30}"#, r#"{"age":25}"#],
+            "age",
+            DataType::Int64,
+        ),
+        (
+            vec![r#"{"name":"x"}"#, r#"{"name":"y"}"#],
+            "name",
+            DataType::Utf8,
+        ),
+    ];
+    for (i, (rows, path, ty)) in files.iter().enumerate() {
+        let json: ArrayRef = Arc::new(StringArray::from(rows.clone()));
+        let shred = ShreddedSchemaBuilder::new()
+            .with_path(*path, ty)
+            .unwrap()
+            .build();
+        let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![shredded.field("doc")])),
+            vec![Arc::new(shredded.into_inner()) as _],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.path().join(format!("part{i}.parquet"))).unwrap();
+        let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props.clone())).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    // `age` is present (typed) in file 0 and absent (null) in file 1.
+    let mut ages: Vec<Option<i64>> = results
+        .iter()
+        .flat_map(|b| {
+            let a = variant_get(
+                b.column(0),
+                GetOptions::new_with_path(VariantPath::try_from("age").unwrap())
+                    .with_as_type(Some(Arc::new(Field::new("age", DataType::Int64, true)))),
+            )
+            .unwrap();
+            a.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ages.sort();
+    assert_eq!(ages, vec![None, None, Some(25), Some(30)]);
 }
 
 #[test]

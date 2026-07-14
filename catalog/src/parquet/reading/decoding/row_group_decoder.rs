@@ -12,7 +12,9 @@ use crate::parquet::reading::decoding::column_decoders::{
     BytesViewDecoder, ColumnDecoder, PrimitiveColumnDecoder,
 };
 use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
-use crate::parquet::types::leaves::{leaf_fields, nest_leaves_into_columns};
+use crate::parquet::types::leaves::{
+    first_leaf, leaf_count, leaf_fields, nest_leaves_into_columns,
+};
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
@@ -22,7 +24,7 @@ use arrow_array::types::{
     Int64Type, StringViewType, TimestampSecondType, UInt16Type,
 };
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
-use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Fields, Schema, SchemaRef, TimeUnit};
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
 use std::sync::Arc;
@@ -130,7 +132,6 @@ pub struct RowGroupDecoder {
 impl RowGroupDecoder {
     pub fn new(
         row_group_metadata: QueryRowGroupMetadata,
-        schema: SchemaRef,
         projection: &Projection,
         batch_size: usize,
         add_row_group_metadata: bool,
@@ -138,22 +139,32 @@ impl RowGroupDecoder {
     ) -> Result<Self> {
         let pruned = row_group_metadata.pruned_flag();
         let columns = row_group_metadata.columns();
-        // Decoders are per leaf (column chunk), so their type comes from the
-        // file's leaf fields; `schema` here is the (possibly nested) output the
-        // decoded leaves reassemble into.
-        let leaves = leaf_fields(row_group_metadata.get_metadata().schema.fields());
+        // The projection names top-level columns. Each is decoded as its run of
+        // leaf chunks in THIS file's layout (a variant column can shred into a
+        // different run per file) and reassembled; the output schema comes from
+        // this file too. A flat column is one leaf, so for a flat schema all of
+        // this is the identity. The fetcher resolves leaves the same way, so a
+        // page's position lines up with its decoder.
+        let fields = row_group_metadata.get_metadata().schema.fields();
+        let leaves = leaf_fields(fields);
+
+        let mut column_decoders = Vec::new();
         let mut prunable_columns = Vec::new();
-        let column_decoders = projection
-            .column_indices
-            .iter()
-            .enumerate()
-            .map(|(schema_idx, &col_idx)| {
-                let predicate = eq_predicates.iter().find(|p| p.column_idx == col_idx);
+        let mut output_fields = Vec::with_capacity(projection.column_indices.len());
+        for &column in &projection.column_indices {
+            output_fields.push(fields[column].clone());
+            let start = first_leaf(fields, column);
+            let count = leaf_count(&fields[column]);
+            // Equality pushdown applies to a scalar (single-leaf) column only.
+            let predicate = (count == 1)
+                .then(|| eq_predicates.iter().find(|p| p.column_idx == column))
+                .flatten();
+            for leaf in start..start + count {
                 // Only a column chunk whose data pages are all dictionary
                 // encoded can be soundly pruned by dictionary contents.
-                let prunable = predicate.is_some() && columns[col_idx].data_pages_all_dictionary;
+                let prunable = predicate.is_some() && columns[leaf].data_pages_all_dictionary;
                 if prunable {
-                    prunable_columns.push(schema_idx);
+                    prunable_columns.push(column_decoders.len());
                 }
                 // Install the equality constant only when the column is prunable.
                 // The decoder uses it to skip building a dictionary that excludes
@@ -166,18 +177,18 @@ impl RowGroupDecoder {
                 } else {
                     None
                 };
-                column_decoder_for_type(
-                    leaves[col_idx].data_type(),
-                    columns[col_idx].max_def_level,
+                column_decoders.push(column_decoder_for_type(
+                    leaves[leaf].data_type(),
+                    columns[leaf].max_def_level,
                     eq_value,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+                )?);
+            }
+        }
 
         Ok(Self {
             row_group_idx: row_group_metadata.index(),
             column_decoders,
-            schema,
+            schema: Arc::new(Schema::new(Fields::from(output_fields))),
             batch_size,
             total: row_group_metadata
                 .filtered_indices()
