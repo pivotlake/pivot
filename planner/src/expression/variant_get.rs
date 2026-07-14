@@ -16,7 +16,7 @@ use arrow_array::RecordBatch;
 use arrow_array::builder::StringViewBuilder;
 use arrow_schema::{Field, FieldRef};
 use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{GetOptions, VariantArray, variant_get};
+use parquet_variant_compute::{GetOptions, VariantArray, unshred_variant, variant_get};
 use parquet_variant_json::VariantToJson as ToJson;
 use std::fmt::{self, Display};
 use std::sync::Arc;
@@ -129,6 +129,12 @@ impl VariantToJson {
                 // so batches from differently-shredded files render the same.
                 let variant =
                     VariantArray::try_new(arr).expect("a variant-typed input is a variant struct");
+                // Row-wise rendering can't reassemble a shredded OBJECT from
+                // its typed leaves (`value()` only handles typed scalars), so
+                // fold the typed leaves back into the binary value column
+                // first. A no-op for unshredded input.
+                let variant = unshred_variant(&variant)
+                    .expect("shredded variant folds back to its binary form");
 
                 let mut json = StringViewBuilder::with_capacity(variant.len());
                 // One text buffer reused across rows, instead of a fresh
