@@ -22,9 +22,9 @@ COPY . .
 ENV RUSTC_WRAPPER=
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/server/target \
-    cargo build --release --manifest-path server/Cargo.toml --bin pivotdb-server \
- && cp server/target/release/pivotdb-server /usr/local/bin/pivotdb-server
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p server --bin pivotdb-server \
+ && cp target/release/pivotdb-server /usr/local/bin/pivotdb-server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \

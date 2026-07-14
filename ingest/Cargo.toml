@@ -1,20 +1,20 @@
 [package]
 name = "ingest"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Receivers that ingest external telemetry (OTLP today) and sink it into Parquet files, offloading the CPU-heavy encode onto dispatch workers."
 
 [dependencies]
-dispatch = { path = "../dispatch" }
+dispatch = { workspace = true }
 # The catalog: each flushed Parquet file is registered with its table so new
 # rows are queryable immediately, and the compacter reads files back / swaps
 # them through it.
-catalog = { path = "../catalog" }
+catalog = { workspace = true }
 
-arrow-array = { path = "../arrow-rs/arrow-array" }
-arrow-schema = { path = "../arrow-rs/arrow-schema" }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 # `uuid` names files so concurrent ingestors never collide.
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }
 
 # OTLP over gRPC. tonic 0.14 split prost codegen into `tonic-prost`; the
 # generated service code lives in `opentelemetry-proto` (gen-tonic), so we only
@@ -28,29 +28,29 @@ opentelemetry-proto = { version = "0.31", default-features = false, features = [
     "metrics",
 ] }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 # OTLP column mappings are configured via TOML (see `otel::config`).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }
 toml = "0.8"
-thiserror = "2"
-tracing = "0.1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 # `CreateTableRequest` etc., to set up catalog tables in the register/compact
 # integration tests.
-planner = { path = "../planner" }
+planner = { workspace = true }
 # Strict, spec-compliant reader used only as a test oracle: if arrow-rs's
 # reader accepts our hand-rolled files, other engines (DuckDB, etc.) will too.
-parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+parquet = { workspace = true }
 # The OTLP-over-gRPC end-to-end test drives a running `Ingestor` from outside:
 # `dispatch`/`catalog` to set up the engine + table and read rows back, and a
 # `tonic` OTLP client (built from `opentelemetry-proto`'s gen-tonic code) to
 # send telemetry over the wire. (All already resolved as normal dependencies.)
-dispatch = { path = "../dispatch" }
-catalog = { path = "../catalog" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+dispatch = { workspace = true }
+catalog = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net"] }
 tonic = { version = "0.14", features = ["transport"] }
 opentelemetry-proto = { version = "0.31", default-features = false, features = [
     "gen-tonic",

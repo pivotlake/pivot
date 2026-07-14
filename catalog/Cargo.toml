@@ -1,30 +1,33 @@
 [package]
 name = "catalog"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-planner = { path = "../planner" }
-dispatch = { path = "../dispatch" }
-thriftparquet = { path = "../thriftparquet" }
-arrow-array = { path = "../arrow-rs/arrow-array" }
-arrow-ord = { path = "../arrow-rs/arrow-ord" }
-arrow-arith = { path = "../arrow-rs/arrow-arith" }
-arrow-schema = { path = "../arrow-rs/arrow-schema" }
-arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
-arrow-row = { path = "../arrow-rs/arrow-row" }
-arrow-select = { path = "../arrow-rs/arrow-select" }
-arrow-cast = { path = "../arrow-rs/arrow-cast" }
-thiserror = "2.0.18"
-tracing = "0.1"
-bytes = "1.11.0"
-crossbeam-deque = "0.8.6"
-ahash = "0.8.12"
-snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "b896aa24d6c85fa1b40f8746c3cc2185ca4084b9" }
-# The database-level `_pivot_manifest.json` table index is serialized as JSON.
-# Per-table state is standard Delta Lake metadata under each table's `_delta_log`.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+planner = { workspace = true }
+dispatch = { workspace = true }
+thriftparquet = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-row = { workspace = true }
+arrow-select = { workspace = true }
+arrow-cast = { workspace = true }
+# Encode a pushed-down constant to the same JSON a partition tuple is stamped
+# with (ingest uses arrow-json too), so partition pruning compares like for like.
+arrow-json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crossbeam-deque = { workspace = true }
+ahash = { workspace = true }
+snap = { workspace = true }
+# Catalog metadata is serialized as JSON: the `_pivot_manifest.json` database
+# manifest and the `_pivot_tables/<table>/<version>.json` table-manifest versions.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # Synchronous object-store access for the catalog control plane (LIST/GET/PUT/
 # conditional-PUT of the manifest and initial Delta commit), so the engine
 # never spins up an async runtime.
@@ -32,7 +35,7 @@ serde_json = "1"
 # call to sign S3 requests (the tokio it transitively pulls is never driven).
 # Credentials are read from the environment ourselves. GCS uses an OAuth bearer
 # over the JSON API. The hot data path uses none of this — it's on the ring.
-ureq = { version = "2", features = ["json"] }
+ureq = { workspace = true, features = ["json"] }
 aws-sigv4 = "1"
 aws-credential-types = "1"
 # Parse S3 ListObjectsV2 XML; GCS listing is JSON via serde_json.
@@ -42,20 +45,20 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 ring = "0.17"
 base64 = "0.22"
 # Build/parse the concrete URLs handed to the io_uring HTTP reader.
-url = "2"
+url = { workspace = true }
 # Delta Kernel owns per-table snapshot semantics.  The catalog index remains
 # Pivot's `_pivot_manifest.json`, while every indexed table is loaded from its
 # standard `_delta_log` through the reference Arrow/object-store engine.
-delta_kernel = { version = "0.25.0", features = ["arrow-conversion", "internal-api"] }
-delta_kernel_default_engine = { version = "0.25.0", features = ["rustls", "arrow-58"] }
-uuid = { version = "1", features = ["v4"] }
+delta_kernel = { workspace = true, features = ["arrow-conversion", "internal-api"] }
+delta_kernel_default_engine = { workspace = true, features = ["rustls", "arrow-58"] }
+uuid = { workspace = true }
 # Optional, behind the `test-support` feature: the in-Docker object-store test
 # harness exposed as `catalog::test_support`. testcontainers brings up MinIO and
 # fake-gcs-server; tempfile backs the local() backend. (The harness's other
 # needs — ureq, aws-sigv4, aws-credential-types, url — are already deps above.)
 testcontainers = { version = "0.24", features = ["blocking"], optional = true }
 testcontainers-modules = { version = "0.12", features = ["minio"], optional = true }
-tempfile = { version = "3", optional = true }
+tempfile = { workspace = true, optional = true }
 
 [features]
 # Exposes `catalog::test_support`, a MinIO/fake-gcs object-store harness used by
@@ -69,17 +72,17 @@ test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfil
 catalog = { path = ".", features = ["test-support"] }
 # `test-util` exposes dispatch's single-operator test harness for the moved
 # Parquet reader unit/integration tests.
-dispatch = { path = "../dispatch", features = ["test-util"] }
-parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
-arrow-schema = { path = "../arrow-rs/arrow-schema" }
-arrow = { path = "../arrow-rs/arrow", features = ["prettyprint"] }
-tempfile = "3"
-core_affinity = "0.8.3"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+dispatch = { workspace = true, features = ["test-util"] }
+parquet = { workspace = true }
+arrow-schema = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
+tempfile = { workspace = true }
+core_affinity = { workspace = true }
+tracing-subscriber = { workspace = true }
 # Parquet decompression/decoding microbenchmarks (`benches/decode.rs`).
 # `harness = false`: we drive Criterion from our own `main` so one `Dispatch`
 # (worker pool) + one synthetic parquet are built once and reused.
-criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+criterion = { workspace = true }
 
 [[bench]]
 name = "decode"
