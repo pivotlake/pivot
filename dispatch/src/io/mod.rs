@@ -38,7 +38,7 @@ use std::time::Duration;
 use url::Url;
 
 mod requester;
-pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
+pub use requester::{Error as IORequesterError, IORequester, RING_SIZE, disk_blocks_in_flight};
 
 mod cached_http;
 

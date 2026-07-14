@@ -25,12 +25,12 @@
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
-use crate::io::{Completion, DiskCache, IORequester};
+use crate::io::{Completion, DataFlowRequest, DiskCache, FsRequest, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use core_affinity::CoreId;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Spin budget while a **dataflow is in flight** but this worker momentarily has
@@ -240,6 +240,10 @@ pub struct Worker {
     /// refresh it — any `notify` they missed will simply make the next park
     /// observe a mismatch and return immediately, so no wake is lost.
     last_seen_wake_count: u64,
+    /// Disk reads pulled from a fetcher but not yet submitted to the ring, held
+    /// back by the submission throttle so the device queue is released steadily
+    /// near the target depth instead of in bursts. Empty when the throttle is off.
+    pending_fs: VecDeque<DataFlowRequest<FsRequest>>,
 }
 
 impl Worker {
@@ -289,6 +293,7 @@ impl Worker {
                     should_exit,
                     waker,
                     last_seen_wake_count,
+                    pending_fs: VecDeque::new(),
                 };
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
@@ -320,6 +325,103 @@ impl Worker {
     /// Submit disk reads from dataflows until the disk queue is busy or no more
     /// requests remain.
     fn saturate_io(&mut self) -> Result<()> {
+        static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        // 0 = unbounded (original per-worker behavior). >0 = hold the aggregate
+        // device queue at `target`: submit one read at a time up to the target and
+        // buffer the rest, so a fast synchronized consumer releases the queue
+        // steadily instead of flooding the device past its efficient depth.
+        let target =
+            *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_DISK_INFLIGHT", 0));
+
+        static PER_WORKER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let per_worker = *PER_WORKER
+            .get_or_init(|| crate::env::get_env_var_with_default("PIVOT_DISK_PER_WORKER", 0));
+        if per_worker > 0 {
+            let global_cap = if target == 0 { usize::MAX } else { target };
+            return self.saturate_io_per_worker(per_worker, global_cap);
+        }
+
+        if target == 0 {
+            return self.saturate_io_unbounded();
+        }
+
+        // Submit reads held from an earlier pass first, up to the target.
+        while crate::io::disk_blocks_in_flight() < target {
+            match self.pending_fs.pop_front() {
+                Some(r) => self.io.request(r)?,
+                None => break,
+            }
+        }
+        // If the buffer is drained and we're still under target, pull fresh reads
+        // from the fetchers; submit per read up to the target and buffer the rest
+        // (per read, so a big fetcher batch can't overshoot the target).
+        if self.pending_fs.is_empty() {
+            for flow in self.data_flows.values_mut() {
+                #[cfg(feature = "perf")]
+                if Self::paused_for_profiling(flow) {
+                    continue;
+                }
+                while self.pending_fs.is_empty() && crate::io::disk_blocks_in_flight() < target {
+                    let Some(mut requests) = flow.get_next_fs_request() else {
+                        break;
+                    };
+                    flow.stats().record_issued_disk(&mut requests);
+                    for r in requests {
+                        if crate::io::disk_blocks_in_flight() < target {
+                            self.io.request(r)?;
+                        } else {
+                            self.pending_fs.push_back(r);
+                        }
+                    }
+                }
+                if !self.pending_fs.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-worker submission throttle: hold this worker at `target` disk reads
+    /// in flight on its own ring, while `global_cap` bounds the aggregate device
+    /// queue across all workers. Per-worker spreading keeps the read window narrow
+    /// and evenly distributed (rather than concentrated among the fastest few,
+    /// as a single shared counter alone would allow); the aggregate cap fills the
+    /// last of the device-busy time without letting the window widen.
+    ///
+    /// A worker blocked by the aggregate cap keeps its next read buffered in
+    /// `pending_fs` so the run loop spins rather than parks (the freed slot comes
+    /// from another worker's completion, which does not wake this one).
+    fn saturate_io_per_worker(&mut self, target: usize, global_cap: usize) -> Result<()> {
+        while self.io.disk_in_flight() < target {
+            if self.pending_fs.is_empty() {
+                for flow in self.data_flows.values_mut() {
+                    #[cfg(feature = "perf")]
+                    if Self::paused_for_profiling(flow) {
+                        continue;
+                    }
+                    if let Some(mut requests) = flow.get_next_fs_request() {
+                        flow.stats().record_issued_disk(&mut requests);
+                        self.pending_fs.extend(requests);
+                        break;
+                    }
+                }
+                if self.pending_fs.is_empty() {
+                    break;
+                }
+            }
+            if crate::io::disk_blocks_in_flight() >= global_cap {
+                break;
+            }
+            let request = self.pending_fs.pop_front().expect("buffer is non-empty");
+            self.io.request(request)?;
+        }
+        Ok(())
+    }
+
+    /// Original unbounded submission: fill the ring until a disk read is pending,
+    /// then move on. Used when `PIVOT_DISK_INFLIGHT` is unset.
+    fn saturate_io_unbounded(&mut self) -> Result<()> {
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
@@ -604,6 +706,13 @@ impl Worker {
                 self.try_steal_work();
 
                 if !self.did_work_last_iteration {
+                    // Reads held by the in-flight gate must be retried (not parked
+                    // on): the slot they wait for frees on another worker's
+                    // completion, which won't wake this worker.
+                    if !self.pending_fs.is_empty() {
+                        std::hint::spin_loop();
+                        continue;
+                    }
                     self.clear_dirty_buffer_or_park();
                 }
             }

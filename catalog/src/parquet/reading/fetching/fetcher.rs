@@ -20,11 +20,6 @@ use dispatch::Sender;
 use dispatch::Unary;
 use dispatch::io::{FsRequest, HttpRequest};
 
-/// Disk-backed read blocks outstanding per worker before admitting another row
-/// group. One keeps disk reads serial — io_uring gives a single read ample
-/// depth.
-const MAX_DISK_IN_FLIGHT: usize = 1;
-
 #[derive(Default)]
 pub struct RowGroupFetcher {
     tracker: RequestTracker<RowGroupRequest>,
@@ -89,7 +84,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
     }
 
     fn ready_for_more_work(&mut self) -> bool {
-        self.tracker.disk_in_flight() < MAX_DISK_IN_FLIGHT
+        self.tracker.disk_in_flight() < crate::parquet::disk_readahead()
             && self.tracker.http_in_flight() < crate::parquet::http_readahead()
     }
 

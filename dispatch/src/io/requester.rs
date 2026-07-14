@@ -6,6 +6,7 @@ use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest,
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -27,6 +28,19 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// queue is twice this (the io_uring default), which bounds how many reads may be
 /// outstanding before completions overflow it - see callers that batch submissions.
 pub const RING_SIZE: u32 = 64;
+
+/// Process-wide count of operator disk-read blocks submitted to the device but not
+/// yet completed, summed across all workers. Workers hold reads back (leaving them
+/// buffered at the fetcher) once this reaches `PIVOT_DISK_INFLIGHT`, so the device
+/// queue is held steady near a target depth instead of spiking when a fast,
+/// synchronized consumer floods it in bursts (a burst past the NVMe's QD~16-32
+/// sweet spot lowers its throughput).
+static DISK_BLOCKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Current aggregate count of operator disk reads outstanding at the device.
+pub fn disk_blocks_in_flight() -> usize {
+    DISK_BLOCKS_IN_FLIGHT.load(Ordering::Relaxed)
+}
 
 /// Bridges dataflow operators and the I/O backend, holding state on outstanding
 /// requests and returning responses together with the original requested context.
@@ -103,6 +117,7 @@ impl IORequester {
         self.pending_io_requests.insert(self.next_id, request);
         self.next_id += 1;
         self.backend.submit()?;
+        DISK_BLOCKS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -127,6 +142,13 @@ impl IORequester {
     /// the engine's cache-file reads / write-backs (all on the shared backend).
     pub fn has_file_pending(&self) -> bool {
         !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
+    }
+
+    /// Number of disk reads currently in flight on this worker's ring. Used by
+    /// the per-worker submission throttle to hold each worker at a fixed depth,
+    /// spreading the aggregate device queue evenly across all workers.
+    pub fn disk_in_flight(&self) -> usize {
+        self.pending_io_requests.len()
     }
 
     /// Returns `true` if any HTTP read is in flight.
@@ -175,6 +197,7 @@ impl IORequester {
                 continue; // HTTP socket op, already routed above
             }
             if let Some(request) = self.pending_io_requests.remove(&ud) {
+                DISK_BLOCKS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
                 if result < 0 {
                     out.push(Err(FailedRead {
                         data_flow_id: request.data_flow_id,
@@ -223,6 +246,15 @@ impl IORequester {
         select.recv(self.http.completion_receiver());
         select.ready();
         Ok(())
+    }
+}
+
+impl Drop for IORequester {
+    /// Release this worker's still-outstanding reads from the global count on
+    /// teardown (their completions bypass `completions`, which is where the
+    /// decrement normally happens), so the count can't leak and wedge the gate.
+    fn drop(&mut self) {
+        DISK_BLOCKS_IN_FLIGHT.fetch_sub(self.pending_io_requests.len(), Ordering::Relaxed);
     }
 }
 

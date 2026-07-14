@@ -27,6 +27,15 @@ pub(crate) fn http_readahead() -> usize {
     *VALUE.get_or_init(|| dispatch::env::get_env_var_with_default("PIVOT_HTTP_READAHEAD", 64))
 }
 
+/// Disk read-ahead depth: blocks a fetcher keeps outstanding before admitting the
+/// next row group. Kept at 1 by default so a fast, synchronized consumer does not
+/// prefetch many row groups ahead and fan its outstanding reads across a wide LBA
+/// range, which lowers device throughput. Tunable via `PIVOT_DISK_READAHEAD`.
+pub(crate) fn disk_readahead() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| dispatch::env::get_env_var_with_default("PIVOT_DISK_READAHEAD", 1))
+}
+
 mod request_tracker;
 
 mod reading;
