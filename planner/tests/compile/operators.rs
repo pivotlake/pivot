@@ -87,6 +87,30 @@ fn values_source_emits_all_rows_in_one_batch(mut testing_planner: TestingPlanner
 }
 
 #[rstest]
+fn values_source_uses_duckdb_bound_column_type(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .plan("VALUES (1), (5000000000), (NULL)")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap(),
+        &Int64Array::from(vec![Some(1), Some(5_000_000_000), None])
+    );
+}
+
+#[rstest]
 fn select_column_subset(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .plan("SELECT a, b FROM example_table")

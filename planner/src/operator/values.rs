@@ -15,8 +15,8 @@
 
 use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::Expression;
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow_schema::{Field, Schema};
+use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_schema::Schema;
 use dispatch::{
     DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RecordBatchOperatorSpec, Sender,
     WorkStatus,
@@ -52,22 +52,21 @@ impl fmt::Display for Values {
 impl Values {
     /// Compile the complete `VALUES` matrix into a source that emits one batch.
     ///
-    /// Every worker receives a source factory and private expression evaluators,
-    /// but a shared atomic claim ensures that exactly one worker evaluates and
-    /// emits the matrix. Cells are concatenated by column, with DuckDB's bound
-    /// type for the first cell used to normalize compatible literals such as
-    /// mixed-width integers.
+    /// Builders are arranged by output column so evaluation can concatenate
+    /// each column without transposing the row-major logical representation.
+    /// Every worker receives the shared builders, but only the worker that
+    /// claims the source constructs evaluators and emits the matrix.
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let column_count = self.rows.first().map_or(0, Vec::len);
         let builders: Arc<Vec<Vec<ExprFn>>> = Arc::new(
-            self.rows
-                .iter()
-                .map(|row| {
-                    row.iter()
-                        .map(Expression::compile)
+            (0..column_count)
+                .map(|column_index| {
+                    self.rows
+                        .iter()
+                        .map(|row| row[column_index].compile())
                         .collect::<Result<_, _>>()
                 })
                 .collect::<Result<_, _>>()?,
@@ -79,32 +78,24 @@ impl Values {
             (0..dispatcher.worker_count()).map(|_| ValuesSourceFactory {
                 builders: builders.clone(),
                 claimed: claimed.clone(),
-                column_count,
             }),
         ))
     }
 }
 
-/// Builds one worker's source and its private expression evaluators.
+/// Builds one worker's source over the shared expression builders.
 struct ValuesSourceFactory {
     builders: Arc<Vec<Vec<ExprFn>>>,
     claimed: Arc<AtomicBool>,
-    column_count: usize,
 }
 
 impl NullaryFactory<RecordBatch> for ValuesSourceFactory {
     type Nullary = ValuesSource;
 
     fn build_nullary(self) -> Self::Nullary {
-        let evaluators = self
-            .builders
-            .iter()
-            .map(|row| row.iter().map(|builder| builder()).collect())
-            .collect();
         ValuesSource {
-            evaluators,
+            builders: self.builders,
             claimed: self.claimed,
-            column_count: self.column_count,
             ran: false,
         }
     }
@@ -112,9 +103,8 @@ impl NullaryFactory<RecordBatch> for ValuesSourceFactory {
 
 /// One worker's source. Only the worker that claims `claimed` emits a batch.
 struct ValuesSource {
-    evaluators: Vec<Vec<ExprEvalFn>>,
+    builders: Arc<Vec<Vec<ExprFn>>>,
     claimed: Arc<AtomicBool>,
-    column_count: usize,
     ran: bool,
 }
 
@@ -125,8 +115,17 @@ impl Nullary<RecordBatch> for ValuesSource {
         }
         self.ran = true;
 
-        if !self.claimed.swap(true, Ordering::SeqCst) {
-            sender.send(evaluate_values(&mut self.evaluators, self.column_count))?;
+        if self
+            .claimed
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            let mut evaluators = self
+                .builders
+                .iter()
+                .map(|column| column.iter().map(|builder| builder()).collect())
+                .collect::<Vec<_>>();
+            sender.send(evaluate_values(&mut evaluators))?;
         }
         Ok(WorkStatus::Ran)
     }
@@ -139,38 +138,26 @@ impl Nullary<RecordBatch> for ValuesSource {
 /// Evaluate one complete expression matrix into columns and concatenate its
 /// cells down the rows. The private single-row context satisfies the shared
 /// expression API without introducing a `DummyScan` into the dataflow.
-fn evaluate_values(evaluators: &mut [Vec<ExprEvalFn>], column_count: usize) -> RecordBatch {
+fn evaluate_values(evaluators: &mut [Vec<ExprEvalFn>]) -> RecordBatch {
     let context = RecordBatch::try_new_with_options(
         Arc::new(Schema::empty()),
         vec![],
         &RecordBatchOptions::new().with_row_count(Some(1)),
     )
     .expect("empty single-row VALUES context is always well-formed");
-    let columns: Vec<ArrayRef> = (0..column_count)
-        .map(|column_index| {
-            let cells = evaluators
-                .iter_mut()
-                .map(|row| row[column_index](&context).into_array(1))
-                .collect::<Vec<_>>();
-            let target = cells[0].data_type().clone();
-            let cast_cells = cells
-                .iter()
-                .map(|cell| {
-                    arrow::compute::cast(cell, &target)
-                        .expect("VALUES cells in one column share a bound type")
-                })
-                .collect::<Vec<_>>();
-            let arrays = cast_cells
-                .iter()
-                .map(|array| array.as_ref())
-                .collect::<Vec<_>>();
-            arrow::compute::concat(&arrays).expect("VALUES cells have one type")
-        })
-        .collect();
-    let fields = columns
-        .iter()
+    let columns = evaluators
+        .iter_mut()
         .enumerate()
-        .map(|(index, column)| Field::new(format!("col{index}"), column.data_type().clone(), true))
-        .collect::<Vec<_>>();
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        .map(|(column_index, column)| {
+            let cells = column
+                .iter_mut()
+                .map(|evaluate| evaluate(&context).into_array(1))
+                .collect::<Vec<_>>();
+            let arrays = cells.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
+            let column = arrow::compute::concat(&arrays)
+                .expect("DuckDB-bound VALUES cells in one column have one type");
+            (format!("col{column_index}"), column, true)
+        });
+    RecordBatch::try_from_iter_with_nullable(columns)
+        .expect("VALUES columns must have equal lengths")
 }
