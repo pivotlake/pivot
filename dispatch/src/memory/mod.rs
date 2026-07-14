@@ -16,9 +16,17 @@
 //!
 //! [`WriteBuffer`]s can also be used for many miscellaneous things, such as Vectors and HashTables. It
 //! is generally preferred to use [`WriteBuffer`]s as the memory is easily accounted for. See [`SlabAllocator`].
+//!
+//! On a multi-NUMA-node machine the one ring is split into a contiguous region per node
+//! (see [`RingLayout`]): a worker faults, acquires, and evicts only its own node's slots,
+//! so every allocation is node-local memory, while data cached anywhere in the ring stays
+//! readable by every worker (a remote read beats re-reading from disk).
 
 mod ring;
 pub use ring::{BUFFER_SIZE, Ring};
+
+mod layout;
+pub use layout::RingLayout;
 
 pub mod compressed_cache;
 pub use compressed_cache::CacheLookup;

@@ -90,7 +90,7 @@ fn pipeline_breaker_flush_does_not_hang_the_pool() {
         let d = (*dispatch).clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let channels: Vec<_> = stealable::<i64>(WORKERS).into_iter().collect();
+            let channels: Vec<_> = stealable::<i64>(d.topology()).into_iter().collect();
             let factories: Vec<_> = (0..WORKERS).map(|_| SilentBreakerFactory).collect();
             // Tiny source: just enough to drive the breaker, with minimal
             // consume-phase notify traffic so the workers stay caught up.

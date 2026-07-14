@@ -10,7 +10,7 @@
 
 use crate::Identifier;
 use crate::operations::channels;
-use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel};
+use crate::operations::channels::mpsc::{MpscReceiver, MpscSender, mpsc_channel_to};
 use crate::operations::channels::{ChannelFactory, Sender};
 
 /// Factory for building a return-to-worker channel.
@@ -63,7 +63,9 @@ impl<O: WorkerIdOutput> Sender<O> for WorkerAwareSender<O> {
 pub fn return_to_worker_mpsc<T: 'static + Send + WorkerIdOutput>(
     count: usize,
 ) -> impl IntoIterator<Item = ReturnToWorkerMpscFactory<T>> {
-    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count).map(|_| mpsc_channel::<T>()).unzip();
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..count)
+        .map(|worker| mpsc_channel_to::<T>(worker))
+        .unzip();
 
     receivers.into_iter().map(move |rx| {
         let txs: Vec<_> = senders.to_vec();

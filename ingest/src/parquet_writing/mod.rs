@@ -90,7 +90,7 @@ pub fn encode_items<T: ToRecordBatch>(
 ) -> DataFlowHandle<EncodedFile> {
     let workers = dispatcher.worker_count();
     let batches = values_input(dispatcher, items).chain(
-        stealable::<T>(workers).into_iter().collect(),
+        stealable::<T>(dispatcher.topology()).into_iter().collect(),
         convert::factories::<T>(workers),
     );
     encode_stages(
@@ -149,13 +149,14 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
 ) -> DataFlowHandle<EncodedFile> {
     // One file's worth of rows; a partition flushes a file once it reaches this.
     let file_rows = target_rows.saturating_mul(target_row_groups).max(1);
+    let topology = batches.dispatcher().topology();
     batches
         .chain(
-            stealable::<RecordBatch>(workers).into_iter().collect(),
+            stealable::<RecordBatch>(topology).into_iter().collect(),
             partition::factories(partition_by, sort_by, file_rows, target_rows, workers),
         )
         .chain(
-            stealable::<ColumnChunkJob>(workers).into_iter().collect(),
+            stealable::<ColumnChunkJob>(topology).into_iter().collect(),
             encoder::factories(workers),
         )
         .chain(

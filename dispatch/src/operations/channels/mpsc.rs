@@ -3,11 +3,12 @@
 //! Wraps `std::sync::mpsc` with an [`AtomicUsize`] counter so the receiver can
 //! check [`is_empty`](Receiver::is_empty) without blocking. Used for the final
 //! output channel in [`collect`](crate::api::RecordBatchOperatorSpec::collect)
-//! and internally by the [`return_to_worker`](super::return_to_worker) channel.
+//! and internally by the [`return_to_worker`](super::return_to_worker) and
+//! [`fan_in`](super::fan_in) channels.
 
 use crate::operations::channels;
 use crate::operations::channels::{Receiver, Sender};
-use crate::worker::worker_waker;
+use crate::worker::waker_set;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -17,6 +18,12 @@ use std::sync::mpsc::channel;
 pub struct MpscSender<T> {
     inner: mpsc::Sender<T>,
     count: Arc<AtomicUsize>,
+    /// The global index of the worker that reads this channel, when the reader
+    /// is a worker: each send wakes that worker's node so a parked receiver
+    /// (possibly on another NUMA node than the sender) picks the item up.
+    /// `None` when the receiver is not a worker (the final output channel,
+    /// whose consumer blocks on the inner mpsc directly).
+    receiving_worker: Option<usize>,
 }
 
 impl<T> Clone for MpscSender<T> {
@@ -24,6 +31,7 @@ impl<T> Clone for MpscSender<T> {
         Self {
             inner: self.inner.clone(),
             count: self.count.clone(),
+            receiving_worker: self.receiving_worker,
         }
     }
 }
@@ -43,7 +51,9 @@ impl<T> Sender<T> for MpscSender<T> {
         // freshly-sent item. `return_to_worker` routes cross-worker messages
         // through this channel, so without a notify the target worker can sit
         // parked while its mpsc has work waiting.
-        worker_waker().notify();
+        if let Some(worker) = self.receiving_worker {
+            waker_set().notify_worker(worker);
+        }
         Ok(())
     }
 }
@@ -94,13 +104,26 @@ impl<O> Receiver<O> for MpscReceiver<O> {
     }
 }
 
+/// An mpsc channel whose receiver is not a worker (e.g. the final output
+/// channel drained by the query's caller): sends bump the count but wake nobody.
 pub fn mpsc_channel<T>() -> (MpscSender<T>, MpscReceiver<T>) {
+    build_channel(None)
+}
+
+/// Build an mpsc channel read by the worker with global index
+/// `receiving_worker`; every send wakes that worker's node.
+pub fn mpsc_channel_to<T>(receiving_worker: usize) -> (MpscSender<T>, MpscReceiver<T>) {
+    build_channel(Some(receiving_worker))
+}
+
+fn build_channel<T>(receiving_worker: Option<usize>) -> (MpscSender<T>, MpscReceiver<T>) {
     let (tx, rx) = channel();
     let count = Arc::new(AtomicUsize::default());
     (
         MpscSender {
             inner: tx,
             count: count.clone(),
+            receiving_worker,
         },
         MpscReceiver { inner: rx, count },
     )

@@ -29,7 +29,7 @@ use crate::operations::unary::group::{
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
-use crate::worker::worker_waker;
+use crate::worker::waker_set;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
@@ -470,10 +470,11 @@ impl<A: IntCell + F64Cell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
         // a contribution per worker) and wakes the collector. Notifying
         // unconditionally after the send avoids the lost-wakeup that bites when
         // a finishing worker drops its sender while the collector is parked.
+        // The collector may be parked on another node, so wake every node.
         self.sender
             .send(self.local)
             .expect("aggregate collector dropped");
-        worker_waker().notify();
+        waker_set().notify_all();
 
         let totals = self.specs.iter().map(Slot::build).collect();
         Ok(self.receiver.map(|rx| AggregateOutputter {
