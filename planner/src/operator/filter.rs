@@ -42,10 +42,7 @@ impl Filter {
 
         // Conditions apply progressively: each one's survivors are what the
         // next condition evaluates, so a selective early condition spares the
-        // later ones most of the rows. Gathering the surviving rows costs a
-        // pass over every column, though, so the batch only shrinks while the
-        // remaining conditions are expensive enough to repay it; the tail of
-        // cheap conditions just ANDs masks and gathers once at the end.
+        // later ones most of the rows (see the shrink decision below).
         let remaining_kernels: Vec<usize> = {
             let per_condition: Vec<usize> = self
                 .conditions
@@ -56,7 +53,10 @@ impl Filter {
                 .map(|i| per_condition[i + 1..].iter().sum())
                 .collect()
         };
-        const SHRINK_KERNEL_THRESHOLD: usize = 4;
+        // Cycles one gathered element-copy costs, measured in kernel-pass
+        // units: a copy is an L1 load + store plus gather bookkeeping (~4
+        // cycles), while a vectorized kernel touches an element in ~1.
+        const SHRINK_COST_RATIO: f64 = 4.0;
 
         Ok(input.filter(move || {
             let mut eval_fns: Vec<ExprEvalFn> = filters.iter().map(|f| f()).collect();
@@ -75,7 +75,38 @@ impl Filter {
                         Some(previous) => and(&previous, mask).unwrap(),
                         None => mask.clone(),
                     };
-                    if remaining >= SHRINK_KERNEL_THRESHOLD {
+                    let kept = mask.true_count();
+                    if kept == 0 {
+                        // Nothing survives; skip the remaining conditions.
+                        return current.slice(0, 0);
+                    }
+                    // Shrink or carry the mask? Arrow kernels cannot skip rows,
+                    // so rows that already failed a condition ("dead", the
+                    // `1.0 - alive` fraction) are still computed over by every
+                    // remaining condition unless the batch is physically
+                    // compacted first. Compacting is not free either: a gather
+                    // copies every SURVIVING row (the `alive` fraction; dead
+                    // rows are simply not written) once per column, including
+                    // columns no remaining condition reads.
+                    //
+                    // Compare the two options in expected per-row cost (the
+                    // batch's row count multiplies both sides, so it cancels):
+                    //
+                    //   wasted ops/row if we keep the dead rows around:
+                    //       remaining kernel passes x fraction dead
+                    //   copy ops/row if we compact now:
+                    //       SHRINK_COST_RATIO x columns x fraction alive
+                    //
+                    // Copy when the copy is cheaper than the waste it removes.
+                    // A selective condition with lots of work left shrinks
+                    // (e.g. 86% dead with an OR tree ahead: 17 x 0.86 wasted
+                    // vs 4 x 8 x 0.14 copied); a barely-selective one, or one
+                    // with only a cheap tail remaining, carries the mask and
+                    // gathers once at the end.
+                    let alive = kept as f64 / current.num_rows() as f64;
+                    if remaining as f64 * (1.0 - alive)
+                        > SHRINK_COST_RATIO * current.num_columns() as f64 * alive
+                    {
                         current = filter_record_batch(&current, &mask)
                             .expect("mask length matches the batch");
                     } else {
