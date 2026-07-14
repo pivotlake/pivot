@@ -117,24 +117,27 @@ impl<O> Receiver<O> for MpscReceiver<O> {
 /// An mpsc channel whose receiver is not a worker (e.g. the final output
 /// channel drained by the query's caller): sends bump the count but wake nobody.
 pub fn mpsc_channel<T>() -> (MpscSender<T>, MpscReceiver<T>) {
-    build_channel(None)
-}
-
-/// Build an mpsc channel read by the worker with global index
-/// `receiving_worker`; every send wakes that worker's node.
-pub fn mpsc_channel_to<T>(receiving_worker: usize) -> (MpscSender<T>, MpscReceiver<T>) {
-    build_channel(Some(receiving_worker))
-}
-
-fn build_channel<T>(receiving_worker: Option<usize>) -> (MpscSender<T>, MpscReceiver<T>) {
     let (tx, rx) = channel();
     let count = Arc::new(AtomicUsize::default());
     (
         MpscSender {
             inner: tx,
             count: count.clone(),
-            receiving_worker,
+            receiving_worker: None,
         },
         MpscReceiver { inner: rx, count },
+    )
+}
+
+/// Build an mpsc channel read by the worker with global index
+/// `receiving_worker`; every send wakes that worker's node.
+pub fn mpsc_channel_to<T>(receiving_worker: usize) -> (MpscSender<T>, MpscReceiver<T>) {
+    let (tx, rx) = mpsc_channel();
+    (
+        MpscSender {
+            receiving_worker: Some(receiving_worker),
+            ..tx
+        },
+        rx,
     )
 }

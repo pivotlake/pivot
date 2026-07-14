@@ -121,24 +121,30 @@ impl DynamicFilterSlot {
     }
 
     /// Offer one batch's surviving rows' leading sort keys to the arming
-    /// window. `keys` must be sorted best-first in the sort's direction and
-    /// contain no nulls, and every source row may be offered at most once — a
-    /// row counted twice would fake a fuller window and over-tighten the
-    /// boundary (wrong results, not just weaker pruning). Once `fetch` keys
-    /// have pooled, the worst of them is published as the boundary; each later
-    /// offer that improves the window tightens it.
-    fn offer(&self, keys: ArrayRef, fetch: usize, descending: bool) -> Result<()> {
-        if fetch == 0 || keys.is_empty() {
-            return Ok(());
-        }
+    /// window. `keys` must be non-empty, sorted best-first in the sort's
+    /// direction, and contain no nulls, and every source row may be offered at
+    /// most once - a row counted twice would fake a fuller window and
+    /// over-tighten the boundary (wrong results, not just weaker pruning).
+    /// `boundary` is the caller's already-read [`Self::boundary`] (a stale
+    /// read only weakens the prefix filter below, never the window). Once
+    /// `fetch` keys have pooled, the worst of them is published as the
+    /// boundary; each later offer that improves the window tightens it.
+    fn offer(
+        &self,
+        keys: ArrayRef,
+        fetch: usize,
+        descending: bool,
+        boundary: Option<&Scalar<ArrayRef>>,
+    ) -> Result<()> {
+        debug_assert!(fetch > 0 && !keys.is_empty());
         // Only keys beating the current boundary can change a full window, and
         // being best-first they are a prefix of the offer. This keeps the
         // common armed-and-nothing-to-add case off the window mutex entirely.
-        let keys = match self.boundary() {
+        let keys = match boundary {
             None => keys,
             Some(current) => {
                 let kernel = if descending { cmp::gt } else { cmp::lt };
-                let better = kernel(&keys as &dyn Datum, &current as &dyn Datum)?;
+                let better = kernel(&keys as &dyn Datum, current as &dyn Datum)?;
                 match better.true_count() {
                     0 => return Ok(()),
                     n => keys.slice(0, n),
@@ -297,32 +303,24 @@ pub struct OrderByLimit {
     order_by: Vec<OrderBy>,
     sender: mpsc::Sender<RecordBatch>,
     receiver: Option<Receiver<RecordBatch>>,
-    /// When set, this worker is a dynamic-filter producer: it publishes into
-    /// the shared slot so sibling scans can prune row groups that can't reach
-    /// the global top-N — through the slot's pooled arming window when
-    /// `shared_window` is set, or directly from its own full window otherwise.
-    dynamic_filter: Option<Arc<DynamicFilterSlot>>,
-    /// Whether this operator pools per-batch keys into the slot's shared
-    /// arming window (see [`DynamicFilterSlot`]): a slot is wired, the leading
-    /// key orders nulls last, and the fetch is small enough for window merges
-    /// to stay cheap.
-    shared_window: bool,
+    /// When set, this worker is a dynamic-filter producer that pools each
+    /// batch's keys into the slot's shared arming window (see
+    /// [`DynamicFilterSlot`]): the leading key orders nulls last and the fetch
+    /// is small enough for window merges to stay cheap. Mutually exclusive
+    /// with `publish_slot`.
+    pooled_slot: Option<Arc<DynamicFilterSlot>>,
+    /// When set, this worker is a dynamic-filter producer whose fetch is too
+    /// large for the shared window (or whose leading key orders nulls first):
+    /// it publishes directly from its own full window instead (see
+    /// [`Self::publish_boundary`]).
+    publish_slot: Option<Arc<DynamicFilterSlot>>,
     /// The worker's running top-k: every batch is merged into this single
     /// `limit + offset`-row batch, so the worker holds one top-k at a time.
     running_top_k: Option<RecordBatch>,
-    /// Whether to reject whole batches up front against a full-window boundary
-    /// (see the module docs). Requires nulls-last ordering on the leading key,
-    /// since a null can't beat a full window.
-    boundary_reject: bool,
-    /// Whether rows *tied* with the boundary on the leading key are rejected
-    /// too. Sound only for a single sort key (the leading key is the whole
-    /// key, so equal-key rows are interchangeable under a tie-ambiguous
-    /// LIMIT); with more keys a tied row can still win on a later key.
-    reject_ties: bool,
     /// Cached fetch-th-best leading key from this worker's own window. Rebuilt
     /// only after a merge actually changes the running top-k, so the common
     /// rejected batch reads it by reference with no per-batch slice. Used only
-    /// without a `shared_window`, whose global boundary is always at least as
+    /// without a `pooled_slot`, whose global boundary is always at least as
     /// tight.
     reject_boundary: Option<Scalar<ArrayRef>>,
 }
@@ -337,51 +335,54 @@ impl OrderByLimit {
         dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> Self {
         let nulls_last_leading = order_by.first().is_some_and(|leading| !leading.nulls_first);
-        let shared_window = dynamic_filter.is_some()
-            && nulls_last_leading
-            && (1..=SHARED_WINDOW_MAX_FETCH).contains(&(limit + offset));
+        let pool = nulls_last_leading && (1..=SHARED_WINDOW_MAX_FETCH).contains(&(limit + offset));
+        let (pooled_slot, publish_slot) = match dynamic_filter {
+            Some(slot) if pool => (Some(slot), None),
+            other => (None, other),
+        };
         Self {
             limit,
             offset,
             sender,
             receiver,
-            dynamic_filter,
-            shared_window,
+            pooled_slot,
+            publish_slot,
             running_top_k: None,
-            boundary_reject: nulls_last_leading,
-            reject_ties: order_by.len() == 1,
             reject_boundary: None,
             order_by,
         }
     }
 
+    /// Whether whole batches may be rejected up front against a full-window
+    /// boundary (see the module docs). Requires nulls-last ordering on the
+    /// leading key, since a null can't beat a full window.
+    fn rejects_by_boundary(&self) -> bool {
+        self.order_by
+            .first()
+            .is_some_and(|leading| !leading.nulls_first)
+    }
+
+    /// Whether rows *tied* with the boundary on the leading key are rejected
+    /// too. Sound only for a single sort key (the leading key is the whole
+    /// key, so equal-key rows are interchangeable under a tie-ambiguous
+    /// LIMIT); with more keys a tied row can still win on a later key.
+    fn rejects_ties(&self) -> bool {
+        self.order_by.len() == 1
+    }
+
     /// Reduce an incoming batch to the rows worth merging into the running
     /// top-k: at most `fetch` already-sorted rows, or `None` if the whole batch
-    /// is provably outside the running top-k (see the module docs).
+    /// is provably outside the running top-k (see the module docs). `boundary`
+    /// is the full-window boundary to reject against, or `None` while no full
+    /// window has been witnessed (or on a nulls-first sort that never rejects).
     fn reduce_batch(
         &self,
         batch: &RecordBatch,
         fetch: usize,
+        boundary: Option<&Scalar<ArrayRef>>,
     ) -> unary::Result<Option<RecordBatch>> {
-        // Reject against the pooled global boundary when the shared window is
-        // in play (it is always at least as tight as this worker's own — see
-        // `reject_boundary`); otherwise against the locally maintained one.
-        let global_boundary;
-        let boundary = if self.shared_window {
-            global_boundary = self
-                .dynamic_filter
-                .as_ref()
-                .expect("shared window without a slot")
-                .boundary();
-            global_boundary.as_ref()
-        } else if self.boundary_reject {
-            self.reject_boundary.as_ref()
-        } else {
-            None
-        };
         let Some(boundary) = boundary else {
-            // No boundary yet (no full window witnessed, or a nulls-first sort
-            // that never rejects): nothing to reject against, take the top-k.
+            // Nothing to reject against, take the batch's top-k.
             return Ok(Some(get_top_k_from_single(
                 batch,
                 &self.order_by,
@@ -391,8 +392,8 @@ impl OrderByLimit {
         };
         let ordering = &self.order_by[0];
         // Strict comparison rejects boundary ties; multi-key sorts must keep
-        // them (see `reject_ties`).
-        let kernel = match (ordering.descending, self.reject_ties) {
+        // them (see `rejects_ties`).
+        let kernel = match (ordering.descending, self.rejects_ties()) {
             (true, true) => cmp::gt,
             (true, false) => cmp::gt_eq,
             (false, true) => cmp::lt,
@@ -418,18 +419,18 @@ impl OrderByLimit {
     }
 
     /// Publish this worker's running-window Nth-best leading key directly into
-    /// the shared slot, once the window is full. This is the non-pooling path
-    /// (no `shared_window`: a fetch too large for cheap window merges, or a
-    /// nulls-first leading key); small fetches pool per-batch keys through the
-    /// slot's arming window in `consume` instead.
+    /// the `publish_slot`, once the window is full. This is the non-pooling
+    /// path (a fetch too large for cheap window merges, or a nulls-first
+    /// leading key); small fetches pool per-batch keys through the slot's
+    /// arming window in `consume` instead.
     ///
     /// The window keeps `limit + offset` rows, so the last (worst) of them is a
     /// valid bound on the *global* boundary: this worker alone already witnesses
     /// that many rows at least as good as it. We prune on the leading key only,
     /// so multi-key sorts publish `order_by[0]`'s value (ties on it are resolved
-    /// by keeping the row group — see the consumer's comparison).
+    /// by keeping the row group - see the consumer's comparison).
     fn publish_boundary(&self, batch_top_k: &RecordBatch) {
-        let Some(slot) = &self.dynamic_filter else {
+        let Some(slot) = &self.publish_slot else {
             return;
         };
         let window = self.limit + self.offset;
@@ -484,27 +485,41 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
             return Ok(());
         }
 
+        // Pick the boundary to reject against: the pooled global one when a
+        // pooled slot is wired (always at least as tight as this worker's
+        // own, read once per batch and reused by the offer below), otherwise
+        // the locally maintained one.
+        let pooled_boundary = self.pooled_slot.as_ref().and_then(|slot| slot.boundary());
+        let boundary = if self.pooled_slot.is_some() {
+            pooled_boundary.as_ref()
+        } else if self.rejects_by_boundary() {
+            self.reject_boundary.as_ref()
+        } else {
+            None
+        };
+
         // Reduce the batch to its contribution (or drop it entirely if it can't
         // reach the running top-k); see `reduce_batch` / the module docs.
-        let Some(candidates) = self.reduce_batch(&batch, fetch)? else {
+        let Some(candidates) = self.reduce_batch(&batch, fetch, boundary)? else {
             return Ok(());
         };
 
         // Pool this batch's keys into the shared arming window. Only the fresh
-        // `candidates` are offered — never the running top-k, whose rows were
+        // `candidates` are offered - never the running top-k, whose rows were
         // already offered once and would be double-counted (see
         // [`DynamicFilterSlot::offer`]).
-        if self.shared_window {
-            let slot = self
-                .dynamic_filter
-                .as_ref()
-                .expect("shared window without a slot");
+        if let Some(slot) = &self.pooled_slot {
             let leading = candidates.column(self.order_by[0].column_idx);
-            // The leading key orders nulls last here (a `shared_window`
+            // The leading key orders nulls last here (a `pooled_slot`
             // precondition), so the non-null keys are a best-first prefix.
             let valid = leading.len() - leading.null_count();
             if valid > 0 {
-                slot.offer(leading.slice(0, valid), fetch, self.order_by[0].descending)?;
+                slot.offer(
+                    leading.slice(0, valid),
+                    fetch,
+                    self.order_by[0].descending,
+                    pooled_boundary.as_ref(),
+                )?;
             }
         }
 
@@ -516,13 +531,13 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
             Some(prev) => get_top_k_from_top_ks(vec![prev, candidates], &self.order_by, fetch, 0)?,
         };
 
-        if !self.shared_window {
+        if self.pooled_slot.is_none() {
             // Without a pooled slot, publish this worker's full-window boundary.
             self.publish_boundary(&merged);
             // Refresh the cached local reject boundary now the top-k has
-            // changed (a `shared_window` reads the tighter global boundary per
+            // changed (a pooled slot reads the tighter global boundary per
             // batch instead). Only surviving batches pay this.
-            if self.boundary_reject && merged.num_rows() >= fetch {
+            if self.rejects_by_boundary() && merged.num_rows() >= fetch {
                 let last = merged
                     .column(self.order_by[0].column_idx)
                     .slice(merged.num_rows() - 1, 1);

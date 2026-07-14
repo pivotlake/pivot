@@ -68,13 +68,15 @@ impl<T: Copy> SlabVec<T> {
     }
 
     /// Number of elements pushed. Every chunk before the last is full, so the
-    /// count follows from the chunk count and the last chunk's fill.
+    /// count is the full chunks' capacities plus the last chunk's fill.
     pub fn len(&self) -> usize {
-        match self.chunks.len() {
-            0 => 0,
-            1 => self.last_len,
-            n => Self::INITIAL_CAP + (n - 2) * Self::CHUNK_CAP + self.last_len,
+        if self.chunks.is_empty() {
+            return 0;
         }
+        (0..self.chunks.len() - 1)
+            .map(Self::chunk_cap)
+            .sum::<usize>()
+            + self.last_len
     }
 
     pub fn is_empty(&self) -> bool {

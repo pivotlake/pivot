@@ -12,7 +12,6 @@
 //! short, and it is the only way a single process-wide `perf record` can be sure
 //! it sampled just the dataflow we asked for.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
@@ -27,23 +26,21 @@ pub(crate) fn profiling_active() -> bool {
     PROFILED_FLOWS.load(Ordering::Relaxed) > 0
 }
 
-static WORKER_TIDS: LazyLock<Mutex<HashMap<usize, i32>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WORKER_TIDS: LazyLock<Mutex<Vec<i32>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Record the calling worker thread's OS tid. Called once per worker at startup.
-/// Keyed by the tid itself (globally unique) rather than the worker index, which is
-/// node-relative and so repeats across NUMA node groups. `gettid` is Linux-only (where
-/// `perf` runs); elsewhere the feature still compiles but the tid is a placeholder.
-pub(crate) fn register_worker_tid(_worker_idx: usize) {
+/// Record the calling worker thread's OS tid. Called once per worker at
+/// startup. `gettid` is Linux-only (where `perf` runs); elsewhere the feature
+/// still compiles but the tid is a placeholder.
+pub(crate) fn register_worker_tid() {
     #[cfg(target_os = "linux")]
     let tid = nix::unistd::gettid().as_raw();
     #[cfg(not(target_os = "linux"))]
     let tid = 0i32;
-    WORKER_TIDS.lock().unwrap().insert(tid as usize, tid);
+    WORKER_TIDS.lock().unwrap().push(tid);
 }
 
 /// OS tids of all started worker threads. An out-of-crate profiler scopes
 /// `perf record -t <tids>` to the worker pool with these.
 pub fn worker_tids() -> Vec<i32> {
-    WORKER_TIDS.lock().unwrap().values().copied().collect()
+    WORKER_TIDS.lock().unwrap().clone()
 }
