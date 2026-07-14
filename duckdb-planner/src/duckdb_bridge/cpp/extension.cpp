@@ -27,11 +27,4 @@ void PivotExtension::Load(ExtensionLoader &loader) {
 	ext->attach = pivot_catalog_attach;
 	ext->create_transaction_manager = create_pivot_transaction_manager;
 	StorageExtension::Register(DBConfig::GetConfig(db), "pivotdb", ext);
-
-	// No functions or casts are registered here. Variant columns use DuckDB's
-	// native VARIANT type, whose casts and `variant_extract` (the `d.age`
-	// syntax) are built in. Pivot's own scalar and table functions (drop_cache,
-	// `->`, metadata, ...) resolve on demand through the catalog's LookupEntry,
-	// which builds their entry from the Rust provider's registry, so adding one
-	// needs no change in this bridge.
 }

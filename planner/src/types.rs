@@ -147,12 +147,9 @@ macro_rules! type_conversions {
             }
         }
 
-        /// The pivot `Type` whose column carries `data_type`, or `None` for an
-        /// arrow type outside pivot's set. The mapping is many-to-one, so the
-        /// FIRST matching row wins (`Float64` over `Decimal`); that's the right
-        /// resolution for typing a *constant*, whose array was itself built
-        /// from this table. Columns don't need this: the planner carries their
-        /// `Type` explicitly.
+        /// Maps an Arrow type back to a Pivot type for constants.
+        ///
+        /// When several Pivot types share an Arrow type, the first match wins.
         pub fn type_from_physical(data_type: &DataType) -> Option<Type> {
             $( if *data_type == $arrow { return Some($pivot); } )+
             None

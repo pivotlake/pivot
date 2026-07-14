@@ -52,15 +52,8 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Utf8,
             volatile: false,
         }),
-        // `doc->'key'`: extract one field from a variant (JSON) column,
-        // yielding the sub-variant. DuckDB's binder rewrites the `->` operator
-        // to a `json_extract` call, which resolves here (the json extension
-        // isn't loaded; text-JSON functions don't exist in pivot). The `d.age`
-        // syntax needs no entry: it binds to DuckDB's native `variant_extract`,
-        // and pivot intercepts both names at plan build. Typing is by cast,
-        // e.g. `CAST(doc->'a'->'b' AS BIGINT)`, fused into one typed
-        // extraction (see `VariantGet`). VOLATILE because the stub's body is a
-        // no-op: DuckDB must never fold the call itself.
+        // DuckDB binds `doc->'key'` as `json_extract`. The stub is a no-op, so
+        // mark it volatile to prevent DuckDB from evaluating or folding it.
         "json_extract" => Some(ScalarFunctionSignature {
             arguments: vec![Type::Variant, Type::Utf8],
             return_type: Type::Variant,
