@@ -477,6 +477,10 @@ dependencies = [
 [[package]]
 name = "arrow-schema"
 version = "58.0.0"
+dependencies = [
+ "serde_core",
+ "serde_json",
+]
 
 [[package]]
 name = "arrow-schema"
@@ -3033,6 +3037,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-variant"
+version = "58.0.0"
+dependencies = [
+ "arrow-schema 58.0.0",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "simdutf8",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-compute"
+version = "58.0.0"
+dependencies = [
+ "arrow 58.0.0",
+ "arrow-schema 58.0.0",
+ "chrono",
+ "half",
+ "indexmap 2.14.0",
+ "parquet-variant",
+ "parquet-variant-json",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "parquet-variant-json"
+version = "58.0.0"
+dependencies = [
+ "arrow-schema 58.0.0",
+ "base64",
+ "chrono",
+ "parquet-variant",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "parse-display"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3214,6 +3257,9 @@ dependencies = [
  "arrow-schema 58.0.0",
  "dispatch",
  "duckdb-planner",
+ "parquet-variant",
+ "parquet-variant-compute",
+ "parquet-variant-json",
  "pcre2",
  "regex",
  "serde",

@@ -9,6 +9,12 @@ arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow-ord = { path = "../arrow-rs/arrow-ord" }
 arrow-arith = { path = "../arrow-rs/arrow-arith" }
 arrow = { path = "../arrow-rs/arrow" }
+# `variant_get` runs arrow's variant path-extraction kernel over the scanned
+# variant (JSON) struct column; `parquet-variant` supplies the path type and
+# `parquet-variant-json` renders variant output columns as JSON text.
+parquet-variant = { path = "../arrow-rs/parquet-variant" }
+parquet-variant-compute = { path = "../arrow-rs/parquet-variant-compute" }
+parquet-variant-json = { path = "../arrow-rs/parquet-variant-json" }
 duckdb-planner = { path = "../duckdb-planner" }
 dispatch = { path = "../dispatch" }
 ahash = "0.8"
@@ -23,7 +29,9 @@ serde = { version = "1.0", features = ["derive"] }
 # The Parquet reader, for integration tests that plan over a real on-disk table.
 # A dev-dependency cycle (catalog depends on planner) — allowed by Cargo.
 catalog = { path = "../catalog" }
-parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
+# `variant_experimental` so `ArrowWriter` stamps the VARIANT logical type on an
+# extension-tagged variant field (the variant tests read it back through pivot).
+parquet = { path = "../arrow-rs/parquet", default-features = false, features = ["arrow", "snap", "variant_experimental"] }
 arrow-json = { path = "../arrow-rs/arrow-json" }
 serde_json = "1.0"
 tempfile = "3"

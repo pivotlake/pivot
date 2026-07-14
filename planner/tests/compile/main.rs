@@ -4,3 +4,4 @@ mod common;
 mod declared_types;
 mod expressions;
 mod operators;
+mod variant;

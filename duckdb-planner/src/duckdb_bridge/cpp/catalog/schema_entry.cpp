@@ -21,6 +21,17 @@ using namespace duckdb;
 
 namespace {
 
+// Materialize the type behind a LogicalTypeId the Rust provider described.
+// Most ids are complete types on their own; VARIANT carries internal type
+// structure, so it must be built through its factory.
+LogicalType logical_type_from(uint8_t type_id) {
+	auto id = static_cast<LogicalTypeId>(type_id);
+	if (id == LogicalTypeId::VARIANT) {
+		return LogicalType::VARIANT();
+	}
+	return LogicalType(id);
+}
+
 // Carries a table function's output schema from the lookup (where Rust supplied
 // it) through to its bind. pivot only plans, never executes, so the bind just
 // republishes that schema and the bind data is a trivial placeholder.
@@ -74,12 +85,11 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		auto info = make_shared_ptr<PivotTableFunctionInfo>();
 		vector<LogicalType> arguments;
 		for (auto type_id : function.arg_type_ids) {
-			arguments.emplace_back(static_cast<LogicalTypeId>(type_id));
+			arguments.emplace_back(logical_type_from(type_id));
 		}
 		for (const auto &col : function.columns) {
 			info->names.emplace_back(std::string(col.name));
-			info->return_types.emplace_back(
-			    static_cast<LogicalTypeId>(col.duckdb_logical_type_id));
+			info->return_types.emplace_back(logical_type_from(col.duckdb_logical_type_id));
 		}
 
 		TableFunction func(std::string(table_name), std::move(arguments), nullptr,
@@ -103,14 +113,14 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		}
 
 		vector<LogicalType> arguments;
-		for (auto type_id : function.arg_type_ids) {
-			arguments.emplace_back(static_cast<LogicalTypeId>(type_id));
+		for (auto type_id : function.function.arg_type_ids) {
+			arguments.emplace_back(logical_type_from(type_id));
 		}
-		LogicalType return_type(static_cast<LogicalTypeId>(function.return_type_id));
+		LogicalType return_type = logical_type_from(function.function.return_type_id);
 
 		ScalarFunction func(std::string(table_name), std::move(arguments), return_type,
 		                    pivot_scalar_function_stub);
-		if (function.is_volatile) {
+		if (function.function.is_volatile) {
 			func.SetStability(FunctionStability::VOLATILE);
 		}
 
@@ -130,8 +140,8 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	CreateTableInfo table_info(*this, table_name);
 	for (const auto &col : result.columns) {
 		auto col_name = std::string(col.name);
-		auto type_id = static_cast<duckdb::LogicalTypeId>(col.duckdb_logical_type_id);
-		table_info.columns.AddColumn(ColumnDefinition(col_name, LogicalType(type_id)));
+		table_info.columns.AddColumn(
+		    ColumnDefinition(col_name, logical_type_from(col.duckdb_logical_type_id)));
 	}
 
 	auto &db_instance = ParentCatalog().GetAttached().GetDatabase();

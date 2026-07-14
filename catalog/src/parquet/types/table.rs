@@ -416,6 +416,9 @@ fn schema_elements_to_arrow(
 ///   are common in the wild); the declaration is what says those bytes are
 ///   text, so the column is retyped to `Utf8View` and decodes and compares
 ///   as text.
+/// - declared VARIANT: shredding legitimately widens the stored struct with
+///   per-path typed leaves, so any struct shape is accepted.
+///
 /// Every other pairing must equal the declared type's storage type exactly;
 /// a contradiction fails the load with the offending column's name rather
 /// than mis-decoding data.
@@ -438,6 +441,7 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
                 ));
             }
             let matches_declared = match declared {
+                Type::Variant => matches!(file_type, DataType::Struct(_)),
                 // Pivot's timestamp convention (see `Type::Timestamp`): files
                 // store packed epoch seconds in a plain INT64 column, which
                 // the executor reads as-is. A file with a real timestamp
@@ -616,6 +620,29 @@ mod tests {
         assert_eq!(*reconciled.field(0).data_type(), DataType::BinaryView);
         assert_eq!(*reconciled.field(1).data_type(), DataType::Utf8View);
         assert_eq!(*untouched.field(0).data_type(), DataType::BinaryView);
+    }
+
+    /// A declared VARIANT column accepts any struct shape (shredding widens
+    /// the stored struct per file).
+    #[test]
+    fn declared_variant_accepts_any_struct_shape() {
+        let doc = Field::new(
+            "d",
+            DataType::Struct(
+                vec![
+                    Field::new("metadata", DataType::BinaryView, false),
+                    Field::new("value", DataType::BinaryView, true),
+                    Field::new("age", DataType::Int64, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let schema = Schema::new(vec![doc.clone()]);
+
+        let reconciled = apply_declared_types(schema, &[column("d", Type::Variant)]).unwrap();
+
+        assert_eq!(reconciled.field(0), &doc);
     }
 
     /// A file whose stored type contradicts the declaration fails the load,
