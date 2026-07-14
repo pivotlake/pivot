@@ -194,6 +194,14 @@ impl Decoder {
         }
 
         if let Some(row_group_idx) = exhausted_row_group {
+            // Mark the removed row group closed, exactly like the consume path:
+            // a masked row group reaches its total while trailing all-false
+            // pages are still in flight, and a late page for an unclosed row
+            // group would resurrect a fresh decoder that waits forever for
+            // rows that were already emitted (and whose eventual removal would
+            // release the row group's claim a second time, wrapping the claim
+            // counters and wedging the scan).
+            self.closed_row_groups.insert(row_group_idx);
             self.release_claim();
             self.row_group_decoders
                 .retain(|d| d.row_group_idx() != row_group_idx);
@@ -276,7 +284,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;
     use dispatch::memory::init_test_free_pool;
-    use dispatch::test_utils::{run_unary, run_unary_to_completion};
+    use dispatch::test_utils::{CollectSender, run_unary, run_unary_to_completion};
     use std::sync::Arc;
 
     fn make_test_table(schema: SchemaRef, num_rows: i64) -> Arc<ParquetTable> {
@@ -648,6 +656,33 @@ mod tests {
         assert_eq!(out[0].schema().field(0).name(), "x");
         assert_eq!(out[0].schema().field(1).name(), "y");
         assert_eq!(*out[0].schema().field(0).data_type(), DataType::Int32);
+    }
+
+    /// A masked row group reaches its total while a trailing all-false page is
+    /// still in flight, and the exhaustion is detected on the drain path (not
+    /// while consuming the row group's own page). The late skipped page must be
+    /// dropped, not resurrect a fresh decoder that waits forever.
+    #[test]
+    fn test_late_skipped_page_after_drain_exhaustion_is_dropped() {
+        init_test_free_pool(4);
+        let schema = i32_schema(&["a"]);
+        let table = make_test_table(schema, 5);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, Some(vec![0, 1, 2]));
+        let mut decoder = new_decoder(&table, 2);
+        let mut sink = CollectSender::<RecordBatch>::default();
+
+        // The first page holds every kept row; consuming it emits one bounded
+        // batch (2 of 3) and leaves the decoder one row short of its total.
+        let kept = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
+        dispatch::Unary::consume(&mut decoder, kept, &mut sink).unwrap();
+        // The drain pass emits the last row, exhausting the row group while
+        // its trailing skipped page has not arrived yet.
+        dispatch::Unary::run(&mut decoder, &mut sink).unwrap();
+        let late_skipped = make_skipped_page(metadata, 0, 2, 1);
+        dispatch::Unary::consume(&mut decoder, late_skipped, &mut sink).unwrap();
+
+        assert_eq!(sink.items.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        assert!(dispatch::Unary::finish(&mut decoder, &mut sink).unwrap());
     }
 
     /// finish() drains remaining batches when batch_size < total rows.
