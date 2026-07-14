@@ -55,13 +55,7 @@ impl VariantGet {
 
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         let input_builder = self.input.compile()?;
-        // Build the parsed path once; the per-batch evaluation only clones the
-        // elements. Owned segments make the path `'static`.
-        let vpath: VariantPath<'static> = self
-            .path
-            .iter()
-            .map(|segment| VariantPathElement::field(segment.clone()))
-            .collect();
+        let segments: Arc<[String]> = self.path.clone().into();
         // A typed read asks the kernel directly for the pivot type's physical
         // arrow column.
         let as_field: Option<FieldRef> = self
@@ -70,16 +64,30 @@ impl VariantGet {
             .map(|ty| Arc::new(Field::new("item", physical_arrow_type(ty), true)));
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
-            let vpath = vpath.clone();
+            let segments = segments.clone();
             let as_field = as_field.clone();
             Box::new(move |batch: &RecordBatch| {
                 let input = input_expr(batch);
-                let (arr, _) = input.as_datum().get();
-                let variant = arr.slice(0, arr.len());
+                let variant = match &input {
+                    ExprResult::Array(array) => array.clone(),
+                    scalar => {
+                        let (arr, _) = scalar.as_datum().get();
+                        arr.slice(0, arr.len())
+                    }
+                };
 
-                let options =
-                    GetOptions::new_with_path(vpath.clone()).with_as_type(as_field.clone());
-                let array = variant_get(&variant, options).expect("variant path extraction");
+                // The path borrows the closure's segments, so building it per
+                // batch allocates only the element list, not the strings.
+                let vpath: VariantPath<'_> = segments
+                    .iter()
+                    .map(|segment| VariantPathElement::field(segment.as_str()))
+                    .collect();
+                let options = GetOptions::new_with_path(vpath).with_as_type(as_field.clone());
+                // Compiled expressions have no error channel; the dataflow
+                // catches the panic and fails the query with this message.
+                let array = variant_get(&variant, options).unwrap_or_else(|e| {
+                    panic!("variant path extraction failed (corrupt variant data?): {e}")
+                });
                 ExprResult::Array(array)
             }) as ExprEvalFn
         }))
@@ -123,16 +131,25 @@ impl VariantToJson {
                     VariantArray::try_new(arr).expect("a variant-typed input is a variant struct");
 
                 let mut json = StringViewBuilder::with_capacity(variant.len());
+                // One text buffer reused across rows, instead of a fresh
+                // `String` per rendered value.
+                let mut text = Vec::new();
                 for row in 0..variant.len() {
                     if variant.is_null(row) {
                         json.append_null();
-                    } else {
-                        let text = variant
-                            .value(row)
-                            .to_json_string()
-                            .expect("a variant value renders as JSON");
-                        json.append_value(text);
+                        continue;
                     }
+                    // Both failures are data-dependent (a corrupt metadata or
+                    // value blob); compiled expressions have no error channel,
+                    // so the dataflow catches the panic and fails the query.
+                    let value = variant
+                        .try_value(row)
+                        .unwrap_or_else(|e| panic!("corrupt variant value at row {row}: {e}"));
+                    text.clear();
+                    value
+                        .to_json(&mut text)
+                        .unwrap_or_else(|e| panic!("variant value failed to render as JSON: {e}"));
+                    json.append_value(std::str::from_utf8(&text).expect("JSON output is UTF-8"));
                 }
                 ExprResult::Array(Arc::new(json.finish()))
             }) as ExprEvalFn
