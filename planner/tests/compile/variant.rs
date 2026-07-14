@@ -70,20 +70,21 @@ fn casts_a_shredded_path_from_parquet(mut testing_planner: TestingPlanner) {
     assert_eq!(got, vec![None, Some(30)]);
 }
 
-/// A single-column `docs(d)` batch holding `rows`, with `shred_age` deciding
-/// whether the file gets a typed `age` leaf or stays unshredded.
-fn docs_batch(rows: Vec<&str>, shred_age: bool) -> RecordBatch {
+/// A single-column `docs(d)` batch holding `rows`, shredding `path` into a
+/// typed leaf when given.
+fn docs_batch_shredded_as(rows: Vec<&str>, shred: Option<(&str, &DataType)>) -> RecordBatch {
     let json: ArrayRef = Arc::new(StringArray::from(rows));
     let variant = json_to_variant(&json).unwrap();
-    let (field, array) = if shred_age {
-        let shred = ShreddedSchemaBuilder::new()
-            .with_path("age", &DataType::Int64)
-            .unwrap()
-            .build();
-        let shredded = shred_variant(&variant, &shred).unwrap();
-        (shredded.field("d"), shredded.into_inner())
-    } else {
-        (variant.field("d"), variant.into_inner())
+    let (field, array) = match shred {
+        Some((path, ty)) => {
+            let shred = ShreddedSchemaBuilder::new()
+                .with_path(path, ty)
+                .unwrap()
+                .build();
+            let shredded = shred_variant(&variant, &shred).unwrap();
+            (shredded.field("d"), shredded.into_inner())
+        }
+        None => (variant.field("d"), variant.into_inner()),
     };
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![field])),
@@ -92,20 +93,31 @@ fn docs_batch(rows: Vec<&str>, shred_age: bool) -> RecordBatch {
     .unwrap()
 }
 
+/// A single-column `docs(d)` batch holding `rows`, with `shred_age` deciding
+/// whether the file gets a typed `age` leaf or stays unshredded.
+fn docs_batch(rows: Vec<&str>, shred_age: bool) -> RecordBatch {
+    docs_batch_shredded_as(rows, shred_age.then_some(("age", &DataType::Int64)))
+}
+
+/// Register `docs(d VARIANT)` over several parquet files, one per batch.
+fn docs_table_files(planner: &mut TestingPlanner, batches: &[RecordBatch]) {
+    planner.add_table_files(
+        "docs",
+        vec![Column {
+            name: "d".to_string(),
+            col_type: Type::Variant,
+        }],
+        batches,
+    );
+}
+
 /// `SELECT d.age` across two files where only one shreds `age`: each file's
 /// leaves resolve on their own, and both render as the same JSON text.
 #[rstest]
 fn dot_access_across_mixed_shredding(mut testing_planner: TestingPlanner) {
     let shredded = docs_batch(vec![r#"{"age":30}"#, r#"{"age":25}"#], true);
     let unshredded = docs_batch(vec![r#"{"age":40}"#, r#"{"name":"bob"}"#], false);
-    testing_planner.add_table_files(
-        "docs",
-        vec![Column {
-            name: "d".to_string(),
-            col_type: Type::Variant,
-        }],
-        &[shredded, unshredded],
-    );
+    docs_table_files(&mut testing_planner, &[shredded, unshredded]);
 
     let rows = run(&mut testing_planner, "SELECT d.age AS a FROM docs");
 
@@ -184,4 +196,237 @@ fn filters_on_a_cast_path_from_parquet(mut testing_planner: TestingPlanner) {
         .map(|r| only_column(r).as_i64().unwrap())
         .collect();
     assert_eq!(got, vec![30]);
+}
+
+/// A typed cast across shredded and unshredded files: one file reads its
+/// typed leaf, the other decodes binary blobs, and the outputs unify.
+#[rstest]
+fn casts_a_path_across_mixed_shredding(mut testing_planner: TestingPlanner) {
+    let shredded = docs_batch(vec![r#"{"age":30}"#, r#"{"age":25}"#], true);
+    let unshredded = docs_batch(vec![r#"{"age":40}"#, r#"{"name":"bob"}"#], false);
+    docs_table_files(&mut testing_planner, &[shredded, unshredded]);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS BIGINT) AS a FROM docs",
+    );
+
+    let mut got: Vec<Option<i64>> = rows.iter().map(|r| r["a"].as_i64()).collect();
+    got.sort();
+    assert_eq!(got, vec![None, Some(25), Some(30), Some(40)]);
+}
+
+/// The same path shredded as a DIFFERENT type per file: each file's typed
+/// leaf is read as its own type, and a cast that doesn't match a leaf's
+/// values yields null for those rows rather than an error.
+#[rstest]
+fn casts_a_path_shredded_as_different_types_per_file(mut testing_planner: TestingPlanner) {
+    let ints = docs_batch_shredded_as(
+        vec![r#"{"age":30}"#, r#"{"age":25}"#],
+        Some(("age", &DataType::Int64)),
+    );
+    let texts = docs_batch_shredded_as(vec![r#"{"age":"forty"}"#], Some(("age", &DataType::Utf8)));
+    docs_table_files(&mut testing_planner, &[ints, texts]);
+
+    let ints = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS BIGINT) AS a FROM docs",
+    );
+    let texts = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS VARCHAR) AS a FROM docs",
+    );
+
+    let mut got: Vec<Option<i64>> = ints.iter().map(|r| r["a"].as_i64()).collect();
+    got.sort();
+    assert_eq!(got, vec![None, Some(25), Some(30)]);
+    let mut got: Vec<Option<&str>> = texts.iter().map(|r| r["a"].as_str()).collect();
+    got.sort();
+    assert_eq!(got, vec![None, None, Some("forty")]);
+}
+
+/// A nested path (`user.id`) shredded two levels deep reads its typed leaf.
+#[rstest]
+fn casts_a_nested_shredded_path(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![
+            r#"{"user":{"id":7}}"#,
+            r#"{"user":{"name":"b"}}"#,
+            r#"{"name":"x"}"#,
+        ],
+        "user.id",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'user'->'id' AS BIGINT) AS a FROM docs",
+    );
+
+    let mut got: Vec<Option<i64>> = rows.iter().map(|r| r["a"].as_i64()).collect();
+    got.sort();
+    assert_eq!(got, vec![None, None, Some(7)]);
+}
+
+#[rstest]
+fn filters_on_a_nested_shredded_path(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"user":{"id":7}}"#, r#"{"user":{"id":8}}"#],
+        "user.id",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'user'->'id' AS BIGINT) AS a FROM docs \
+         WHERE CAST(d->'user'->'id' AS BIGINT) = 7",
+    );
+
+    let got: Vec<Option<i64>> = rows.iter().map(|r| r["a"].as_i64()).collect();
+    assert_eq!(got, vec![Some(7)]);
+}
+
+/// A path that is NOT shredded but lives inside a shredded object: `user.id`
+/// has a typed leaf, `user.name` falls back to the object's value blob.
+#[rstest]
+fn reads_an_unshredded_path_inside_a_shredded_object(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"user":{"id":7,"name":"ann"}}"#, r#"{"user":{"id":8}}"#],
+        "user.id",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'user'->'name' AS VARCHAR) AS n FROM docs",
+    );
+
+    let mut got: Vec<Option<&str>> = rows.iter().map(|r| r["n"].as_str()).collect();
+    got.sort();
+    assert_eq!(got, vec![None, Some("ann")]);
+}
+
+/// The three shapes of "no value" behave distinctly: an explicit JSON null
+/// renders as `null` text, an absent path and a NULL document yield SQL NULL.
+#[rstest]
+fn distinguishes_json_null_absent_path_and_null_document(mut testing_planner: TestingPlanner) {
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        Some(r#"{"age":null}"#),
+        Some("{}"),
+        None,
+        Some(r#"{"age":30}"#),
+    ]));
+    let variant = json_to_variant(&json).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![variant.field("d")])),
+        vec![Arc::new(variant.into_inner()) as _],
+    )
+    .unwrap();
+    docs_table_files(&mut testing_planner, &[batch]);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS BIGINT) AS a, d.age AS j FROM docs",
+    );
+
+    let mut got: Vec<(Option<i64>, Option<String>)> = rows
+        .iter()
+        .map(|r| (r["a"].as_i64(), r["j"].as_str().map(str::to_string)))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (None, None),                     // {} : absent path
+            (None, None),                     // NULL document
+            (None, Some("null".to_string())), // {"age":null}
+            (Some(30), Some("30".to_string())),
+        ]
+    );
+}
+
+/// `SELECT d` (the whole document) renders the same JSON text whether the
+/// file shredded the column or not.
+#[rstest]
+fn selects_the_whole_document_across_mixed_shredding(mut testing_planner: TestingPlanner) {
+    let shredded = docs_batch(vec![r#"{"age":30}"#], true);
+    let unshredded = docs_batch(vec![r#"{"age":30}"#], false);
+    docs_table_files(&mut testing_planner, &[shredded, unshredded]);
+
+    let rows = run(&mut testing_planner, "SELECT d FROM docs");
+
+    let got: Vec<Option<&str>> = rows.iter().map(|r| only_column(r).as_str()).collect();
+    assert_eq!(got, vec![Some(r#"{"age":30}"#); 2]);
+}
+
+/// Global aggregates over a typed path read.
+#[rstest]
+fn aggregates_a_cast_path(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"age":30}"#, r#"{"age":30}"#, r#"{"age":25}"#],
+        "age",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT SUM(CAST(d->'age' AS BIGINT)) AS s, \
+                MIN(CAST(d->'age' AS BIGINT)) AS lo, \
+                MAX(CAST(d->'age' AS BIGINT)) AS hi FROM docs",
+    );
+
+    assert_eq!(rows[0]["s"].as_i64(), Some(85));
+    assert_eq!(rows[0]["lo"].as_i64(), Some(25));
+    assert_eq!(rows[0]["hi"].as_i64(), Some(30));
+}
+
+/// Two paths read out of the same document in one query.
+#[rstest]
+fn reads_two_paths_from_one_document(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"age":30,"name":"ann"}"#, r#"{"age":25,"name":"bob"}"#],
+        "age",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS BIGINT) AS a, CAST(d->'name' AS VARCHAR) AS n \
+         FROM docs ORDER BY a",
+    );
+
+    let got: Vec<(Option<i64>, Option<&str>)> = rows
+        .iter()
+        .map(|r| (r["a"].as_i64(), r["n"].as_str()))
+        .collect();
+    assert_eq!(got, vec![(Some(25), Some("bob")), (Some(30), Some("ann"))]);
+}
+
+/// Top-N over a typed path read.
+#[rstest]
+fn orders_and_limits_by_a_cast_path(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![
+            r#"{"age":30}"#,
+            r#"{"age":25}"#,
+            r#"{"age":40}"#,
+            r#"{"age":10}"#,
+        ],
+        "age",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS BIGINT) AS a FROM docs ORDER BY a LIMIT 2",
+    );
+
+    let got: Vec<Option<i64>> = rows.iter().map(|r| r["a"].as_i64()).collect();
+    assert_eq!(got, vec![Some(10), Some(25)]);
 }

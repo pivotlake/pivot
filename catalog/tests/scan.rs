@@ -373,6 +373,112 @@ fn scan_variant_with_a_null_document_row() {
 }
 
 #[test]
+fn scan_shredded_variant_with_a_null_document_row() {
+    use arrow_array::Array;
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{
+        GetOptions, ShreddedSchemaBuilder, json_to_variant, shred_variant, variant_get,
+    };
+
+    let dispatch = dispatch(1);
+    // A NULL document in a SHREDDED file: the null must survive through the
+    // deeper struct nesting (typed_value groups) as a struct-level mask.
+    let json: ArrayRef = Arc::new(StringArray::from(vec![Some(r#"{"age":30}"#), None]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    let doc = results[0].column(0);
+    assert!(doc.is_null(1));
+    let ages = variant_get(
+        doc,
+        GetOptions::new_with_path(VariantPath::try_from("age").unwrap())
+            .with_as_type(Some(Arc::new(Field::new("age", DataType::Int64, true)))),
+    )
+    .unwrap();
+    assert_eq!(
+        ages.as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![Some(30), None])
+    );
+}
+
+#[test]
+fn scan_variant_same_path_shredded_as_different_types() {
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{
+        GetOptions, ShreddedSchemaBuilder, json_to_variant, shred_variant, variant_get,
+    };
+
+    let dispatch = dispatch(1);
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    // Both files shred the SAME path, one as Int64 and one as Utf8, so their
+    // typed leaves carry different arrow types.
+    for (i, (json_rows, ty)) in [
+        (vec![r#"{"age":30}"#], DataType::Int64),
+        (vec![r#"{"age":"forty"}"#], DataType::Utf8),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let json: ArrayRef = Arc::new(StringArray::from(json_rows));
+        let shred = ShreddedSchemaBuilder::new()
+            .with_path("age", &ty)
+            .unwrap()
+            .build();
+        let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![shredded.field("doc")])),
+            vec![Arc::new(shredded.into_inner()) as _],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.path().join(format!("part{i}.parquet"))).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props.clone())).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    // Reading as BIGINT hits file 0's typed leaf and nulls file 1's string.
+    let mut ages: Vec<Option<i64>> = results
+        .iter()
+        .flat_map(|b| {
+            let a = variant_get(
+                b.column(0),
+                GetOptions::new_with_path(VariantPath::try_from("age").unwrap())
+                    .with_as_type(Some(Arc::new(Field::new("age", DataType::Int64, true)))),
+            )
+            .unwrap();
+            a.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ages.sort();
+    assert_eq!(ages, vec![None, Some(30)]);
+}
+
+#[test]
 fn scan_nullable_strings_produce_valid_views() {
     use arrow_array::Array;
 
