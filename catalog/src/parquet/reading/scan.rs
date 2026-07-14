@@ -28,7 +28,6 @@ use crate::parquet::{
 /// [`RowGroupBuffer`]s, producing decoded `RecordBatch`es.
 pub(crate) fn read_parquet<OF>(
     input: OperatorSpec<RowGroupBuffer, OF>,
-    table: &Arc<ParquetTable>,
     projection: Projection,
     batch_size: usize,
     add_row_group_metadata: bool,
@@ -54,7 +53,6 @@ where
             (0..n)
                 .map(|_| DecoderFactory {
                     batch_size,
-                    table: table.clone(),
                     projection: projection.clone(),
                     add_row_group_metadata,
                     eq_predicates: eq_predicates.clone(),
@@ -140,7 +138,6 @@ pub fn table_input_with_filter_and_eq_predicates(
     let input = OperatorSpec::new(dispatcher.clone(), factories);
     read_parquet(
         input,
-        table,
         projection,
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
@@ -182,7 +179,6 @@ pub fn materialize(
     let input = OperatorSpec::new(dispatcher, factories);
     read_parquet(
         input,
-        &table,
         projection,
         RECORD_BATCH_SIZE,
         false,

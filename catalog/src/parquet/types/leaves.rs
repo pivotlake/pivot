@@ -41,6 +41,26 @@ pub(crate) fn leaf_count(field: &FieldRef) -> usize {
     }
 }
 
+/// The index of `column`'s first leaf: the leaves of every field before it.
+pub(crate) fn first_leaf(fields: &Fields, column: usize) -> usize {
+    fields.iter().take(column).map(leaf_count).sum()
+}
+
+/// The leaf (column-chunk) indices a projection of top-level `columns` reads,
+/// resolved against this file's `fields`: each column expands to its run of
+/// leaves. A flat column is one leaf, so for a flat schema this is the
+/// identity. The fetcher and the decoder both iterate this list, so a fetched
+/// chunk's position always lines up with its decoder, even when another file
+/// shreds a variant column into a different number of leaves.
+pub(crate) fn projected_leaves(fields: &Fields, columns: &[usize]) -> Vec<usize> {
+    let mut leaves = Vec::with_capacity(columns.len());
+    for &column in columns {
+        let start = first_leaf(fields, column);
+        leaves.extend(start..start + leaf_count(&fields[column]));
+    }
+    leaves
+}
+
 /// Turn decoded leaf arrays back into the schema's columns.
 ///
 /// The decoder hands us one flat array per leaf, in the same depth-first

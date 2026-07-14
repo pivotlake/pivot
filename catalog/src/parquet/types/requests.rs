@@ -1,4 +1,5 @@
 use crate::parquet::request_tracker::PendingRequest;
+use crate::parquet::types::leaves::projected_leaves;
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::thrift::headers::PageHeader;
@@ -181,15 +182,19 @@ impl RowGroupRequest {
     pub fn from(metadata_handle: QueryRowGroupMetadata, projection: &Projection) -> Self {
         let location = metadata_handle.get_metadata().location.clone();
         let columns = metadata_handle.columns();
+        // The projection names top-level columns; fetch each one's run of leaf
+        // chunks in this file's layout. The decoder resolves leaves the same
+        // way, so a fetched chunk's position lines up with its decoder.
+        let fields = metadata_handle.get_metadata().schema.fields();
+        let leaves = projected_leaves(fields, projection.indices());
 
         let mut pending_fs = vec![];
         let mut pending_http = vec![];
-        let column_requests = projection
-            .indices()
+        let column_requests = leaves
             .iter()
-            .map(|&col_idx| {
+            .map(|&leaf| {
                 ColumnRequest::from(
-                    &columns[col_idx],
+                    &columns[leaf],
                     &location,
                     &mut pending_fs,
                     &mut pending_http,

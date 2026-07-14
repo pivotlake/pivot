@@ -12,13 +12,10 @@
 //! row group that has enough data. Exhausted row groups are removed immediately.
 
 use crate::parquet::DecompressedPage;
-use crate::parquet::types::leaves::leaf_count;
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::projection::Projection;
-use crate::parquet::types::table::ParquetTable;
 use ahash::HashSet;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
-use arrow_schema::{Schema, SchemaRef};
 use dispatch::Sender;
 use dispatch::WorkStatus;
 use dispatch::memory::SlabAllocator;
@@ -45,8 +42,6 @@ pub struct ScanEqualityPredicate {
 pub struct DecoderFactory {
     /// Maximum number of rows per output [`RecordBatch`].
     pub batch_size: usize,
-    /// Shared table metadata (schema + row group info).
-    pub table: Arc<ParquetTable>,
     /// Which columns to decode.
     pub projection: Projection,
     /// Whether to append row-group-id and row-index metadata columns to each
@@ -62,7 +57,6 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
     fn build_unary(self) -> Self::Unary {
         Decoder::new(
             self.batch_size,
-            self.table,
             self.projection,
             self.add_row_group_metadata,
             self.eq_predicates,
@@ -70,45 +64,17 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
     }
 }
 
-/// Builds the projected output [`Schema`]. The projection lists leaf
-/// (column-chunk) indices; this folds them back to the top-level fields that own
-/// them, emitting each owning field once in the order its first leaf appears, so
-/// a struct (variant) column's leaves project as the single nested field they
-/// belong to, and a flat schema is the identity. Whole top-level fields are
-/// expected to be projected together (the only granularity scans build).
-fn project_schema(schema: &Schema, projection: &Projection) -> Schema {
-    let owner = field_owner_per_leaf(schema);
-    let mut fields = Vec::new();
-    let mut last: Option<usize> = None;
-    for &leaf in projection.indices() {
-        let field = owner[leaf];
-        if last != Some(field) {
-            fields.push(schema.field(field).clone());
-            last = Some(field);
-        }
-    }
-    Schema::new(fields)
-}
-
-/// Maps each leaf (column-chunk) index to the top-level field that owns it: a
-/// primitive field owns one leaf, a struct field its whole leaf run.
-fn field_owner_per_leaf(schema: &Schema) -> Vec<usize> {
-    let mut owner = Vec::new();
-    for (i, field) in schema.fields().iter().enumerate() {
-        owner.extend(std::iter::repeat_n(i, leaf_count(field)));
-    }
-    owner
-}
-
 /// Accumulates [`DecompressedPage`]s and emits Arrow [`RecordBatch`]es.
 ///
 /// Maintains one [`RowGroupDecoder`] per in-flight row group. Pages arriving for a
 /// row group that has already been fully emitted are silently dropped.
+///
+/// There is no table-wide output schema here: each [`RowGroupDecoder`] derives
+/// its own from its file, because a variant column's physical layout (its
+/// shredded leaves) can differ file to file.
 pub struct Decoder {
     batch_size: usize,
     projection: Projection,
-    /// Projected output schema (only the columns the query needs).
-    schema: SchemaRef,
     /// Slab allocator for decoded Arrow buffers.
     allocator: SlabAllocator,
     /// One decoder per in-flight row group.
@@ -124,16 +90,13 @@ pub struct Decoder {
 impl Decoder {
     pub fn new(
         batch_size: usize,
-        table: Arc<ParquetTable>,
         projection: Projection,
         add_row_group_metadata: bool,
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
     ) -> Self {
-        let schema = Arc::new(project_schema(table.schema(), &projection));
         Self {
             batch_size,
             projection,
-            schema,
             allocator: SlabAllocator::new(true),
             row_group_decoders: Vec::new(),
             closed_row_groups: Default::default(),
@@ -158,7 +121,6 @@ impl Decoder {
         self.row_group_decoders.push(
             RowGroupDecoder::new(
                 row_group_metadata.clone(),
-                self.schema.clone(),
                 &self.projection,
                 self.batch_size,
                 self.add_row_group_metadata,
@@ -363,7 +325,6 @@ mod tests {
     fn new_decoder(table: &Arc<ParquetTable>, batch_size: usize) -> Decoder {
         Decoder::new(
             batch_size,
-            table.clone(),
             Projection::all_from_schema(table.schema()),
             false,
             Arc::new(Vec::new()),
