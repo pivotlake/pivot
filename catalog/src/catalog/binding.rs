@@ -3,7 +3,7 @@
 //! prunes its own view without affecting anyone else.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::manifest::PartitionEqFilter;
 use crate::parquet::{
@@ -170,9 +170,9 @@ impl Table for TableBinding {
 
     /// Build the transactional Parquet write pipeline for this table.
     ///
-    /// Dispatch workers conform and encode batches, then fan completed files
-    /// into [`TransactionWriter::submit`](super::transaction::TransactionWriter::submit).
-    /// Submission is an in-memory channel send; a dedicated transaction thread
+    /// Dispatch workers conform and encode batches, then enqueue completed files
+    /// directly through worker-local transaction writer producers. Submission
+    /// does not acquire the transaction lifecycle mutex. A dedicated thread
     /// performs object-store writes and retains their paths until commit adds
     /// them to Delta or rollback deletes them. The pipeline's only output is the
     /// inserted row count used for PostgreSQL's command-completion tag.
@@ -203,17 +203,18 @@ impl Table for TableBinding {
             ROW_GROUP_ROWS,
             ROW_GROUPS_PER_FILE,
         );
-        let writer = transaction.insert_writer();
+        let writer = transaction.insert_writer()?;
         let table_name = self.name.clone();
-        let staged = encoded.fan_in(
-            (writer, table_name),
-            |state, encoded, _sender: &mut dyn Sender<RecordBatch>| {
-                state
-                    .0
-                    .submit(state.1.clone(), encoded)
-                    .map_err(|error| dispatch::UnaryError::Operator(Box::new(error)))
+        let count_emitted = Arc::new(AtomicBool::new(false));
+        let staged = encoded.sink_each(
+            move |encoded| {
+                writer.submit(table_name.clone(), encoded);
+                Ok(())
             },
-            move |_state, sender: &mut dyn Sender<RecordBatch>| {
+            move |sender: &mut dyn Sender<RecordBatch>| {
+                if count_emitted.swap(true, Ordering::Relaxed) {
+                    return Ok(());
+                }
                 let count = UInt64Array::from(vec![rows_written.load(Ordering::Relaxed)]);
                 let schema = Schema::new(vec![Field::new("count", DataType::UInt64, false)]);
                 sender.send(RecordBatch::try_new(

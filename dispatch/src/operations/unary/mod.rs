@@ -82,6 +82,9 @@ pub use map::MapFactory;
 mod fan_in;
 pub use fan_in::FanInFactory;
 
+mod sink;
+pub use sink::SinkFactory;
+
 mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 

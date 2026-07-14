@@ -100,8 +100,6 @@ pub enum Error {
     InsertTableMissing(String),
     #[error("the transaction's INSERT writer is no longer available")]
     InsertWriterUnavailable,
-    #[error("the transaction's INSERT writer stopped before accepting a file")]
-    InsertWriterStopped,
     #[error("the transaction's INSERT writer panicked")]
     InsertWriterPanicked,
 }
@@ -596,8 +594,8 @@ impl ParquetTransaction {
         self.snapshot.table(name)
     }
 
-    pub(in crate::catalog) fn insert_writer(&self) -> Arc<transaction::TransactionWriter> {
-        self.writer.clone()
+    pub(in crate::catalog) fn insert_writer(&self) -> Result<transaction::WriteSender> {
+        self.writer.write_sender()
     }
 }
 

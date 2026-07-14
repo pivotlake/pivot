@@ -112,7 +112,8 @@ pub use operations::{
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
-    RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    RootUnaryOperatorFactory, SinkFactory, Unary, UnaryFactory, UnaryOperator,
+    UnaryOperatorFactory,
 };
 
 #[unsafe(export_name = "_rjem_malloc_conf")]

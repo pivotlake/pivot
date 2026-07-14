@@ -1,18 +1,69 @@
 //! Transaction-owned Parquet writes for INSERT.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{JoinHandle, Thread};
 
 use crate::manifest::ManifestEntry;
 use crate::parquet_writing::EncodedFile;
 use crate::store::ObjectPath;
+use crossbeam_deque::{Injector, Steal};
 
 use super::{CatalogSnapshot, CatalogTable, Error, Result};
 
 struct WriteCommand {
     table: String,
     encoded: EncodedFile,
+}
+
+struct WriteQueue {
+    commands: Injector<WriteCommand>,
+    producers: AtomicUsize,
+}
+
+impl WriteQueue {
+    fn new() -> Self {
+        Self {
+            commands: Injector::new(),
+            producers: AtomicUsize::new(1),
+        }
+    }
+}
+
+/// A worker-local producer for the transaction's Parquet writer queue.
+///
+/// Submitting a file does not acquire the transaction lifecycle mutex. The
+/// final producer to drop wakes the writer so it can drain and exit.
+pub(in crate::catalog) struct WriteSender {
+    queue: Arc<WriteQueue>,
+    writer: Thread,
+}
+
+impl Clone for WriteSender {
+    fn clone(&self) -> Self {
+        self.queue.producers.fetch_add(1, Ordering::Relaxed);
+        Self {
+            queue: self.queue.clone(),
+            writer: self.writer.clone(),
+        }
+    }
+}
+
+impl WriteSender {
+    /// Enqueue an encoded file and wake the blocking writer thread.
+    pub(in crate::catalog) fn submit(&self, table: String, encoded: EncodedFile) {
+        self.queue.commands.push(WriteCommand { table, encoded });
+        self.writer.unpark();
+    }
+}
+
+impl Drop for WriteSender {
+    fn drop(&mut self) {
+        if self.queue.producers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.writer.unpark();
+        }
+    }
 }
 
 struct PendingTable {
@@ -27,7 +78,7 @@ struct WriterResult {
 }
 
 struct WriterThread {
-    sender: mpsc::Sender<WriteCommand>,
+    sender: WriteSender,
     join: JoinHandle<WriterResult>,
 }
 
@@ -41,10 +92,11 @@ enum WriterState {
 
 /// Shared transaction state captured by INSERT operators.
 ///
-/// Dispatch workers only call [`submit`](Self::submit), which sends into an
-/// unbounded in-memory channel. The dedicated writer performs all blocking
-/// object-store calls. Commit and rollback join it from the server's blocking
-/// pool after the dataflow has drained.
+/// INSERT setup obtains a [`WriteSender`] while holding the lifecycle mutex.
+/// Dispatch workers then clone that producer and submit directly to a shared
+/// lock-free queue. The dedicated writer performs all blocking object-store
+/// calls. Commit and rollback join it from the server's blocking pool after the
+/// dataflow has drained.
 pub(super) struct TransactionWriter {
     snapshot: Arc<CatalogSnapshot>,
     state: Mutex<Option<WriterState>>,
@@ -68,31 +120,45 @@ impl TransactionWriter {
         }
     }
 
-    /// Queue one encoded file. This never waits for file or network I/O.
-    pub(super) fn submit(&self, table: String, encoded: EncodedFile) -> Result<()> {
+    /// Obtain a producer for an INSERT pipeline.
+    ///
+    /// This is the only lifecycle-mutex acquisition needed by that pipeline.
+    /// Its dispatch workers clone the returned producer and enqueue files
+    /// without returning to the transaction state.
+    pub(super) fn write_sender(&self) -> Result<WriteSender> {
         let mut locked = self.state.lock().unwrap();
         let state = locked.take().ok_or(Error::InsertWriterUnavailable)?;
         let writer = match state {
-            WriterState::Idle => self.start_writer()?,
+            WriterState::Idle => match self.start_writer() {
+                Ok(writer) => writer,
+                Err(error) => {
+                    *locked = Some(WriterState::Idle);
+                    return Err(error);
+                }
+            },
             WriterState::Running(writer) => writer,
             other => {
                 *locked = Some(other);
                 return Err(Error::InsertWriterUnavailable);
             }
         };
-        let send_result = writer.sender.send(WriteCommand { table, encoded });
+        let sender = writer.sender.clone();
         *locked = Some(WriterState::Running(writer));
-        send_result.map_err(|_| Error::InsertWriterStopped)
+        Ok(sender)
     }
 
-    /// Start the transaction's single blocking-I/O thread and its unbounded
-    /// in-memory command channel.
+    /// Start the transaction's single blocking-I/O thread and shared queue.
     fn start_writer(&self) -> Result<WriterThread> {
-        let (sender, receiver) = mpsc::channel();
+        let queue = Arc::new(WriteQueue::new());
         let snapshot = self.snapshot.clone();
+        let writer_queue = queue.clone();
         let join = std::thread::Builder::new()
             .name("pivot-insert-writer".to_string())
-            .spawn(move || write_files(snapshot, receiver))?;
+            .spawn(move || write_files(snapshot, writer_queue))?;
+        let sender = WriteSender {
+            queue,
+            writer: join.thread().clone(),
+        };
         Ok(WriterThread { sender, join })
     }
 
@@ -206,12 +272,9 @@ impl Drop for TransactionWriter {
 
 /// Run on `pivot-insert-writer`: persist encoded bytes and retain the exact
 /// file entries that commit will publish or rollback will delete.
-fn write_files(
-    snapshot: Arc<CatalogSnapshot>,
-    receiver: mpsc::Receiver<WriteCommand>,
-) -> WriterResult {
+fn write_files(snapshot: Arc<CatalogSnapshot>, queue: Arc<WriteQueue>) -> WriterResult {
     let mut result = WriterResult::default();
-    for command in receiver {
+    while let Some(command) = next_write(&queue) {
         if result.error.is_some() {
             continue;
         }
@@ -237,6 +300,28 @@ fn write_files(
         }
     }
     result
+}
+
+/// Wait for the next queued file, or finish after the final producer drops and
+/// all previously submitted files have been drained.
+fn next_write(queue: &WriteQueue) -> Option<WriteCommand> {
+    loop {
+        match queue.commands.steal() {
+            Steal::Success(command) => return Some(command),
+            Steal::Retry => continue,
+            Steal::Empty if queue.producers.load(Ordering::Acquire) == 0 => {
+                // A final producer may have pushed between the first steal and
+                // our producer-count load. With no producers left, a second
+                // empty result is stable and means the queue is fully drained.
+                match queue.commands.steal() {
+                    Steal::Success(command) => return Some(command),
+                    Steal::Retry => continue,
+                    Steal::Empty => return None,
+                }
+            }
+            Steal::Empty => std::thread::park(),
+        }
+    }
 }
 
 /// Best-effort cleanup that attempts every deletion and returns the first

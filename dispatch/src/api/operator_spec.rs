@@ -4,7 +4,7 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     DefaultUnaryFactory, FanInFactory, Forward, InjectorSourceFactory, MapFactory,
-    RootUnaryOperatorFactory, UnaryFactory, UnaryOperatorFactory,
+    RootUnaryOperatorFactory, SinkFactory, UnaryFactory, UnaryOperatorFactory,
 };
 use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
 use arrow_array::RecordBatch;
@@ -168,6 +168,34 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
         let worker_count = self.factories.len();
         let channels: Vec<_> = stealable::<O>(worker_count).into_iter().collect();
         let unaries: Vec<_> = (0..worker_count).map(|_| MapFactory(f.clone())).collect();
+        self.chain(channels, unaries)
+    }
+
+    /// Append a parallel sink stage with one consumer per worker.
+    ///
+    /// Every worker invokes its own clone of `consume`, so items stay parallel
+    /// through the end of the pipeline. Once every sibling has drained its
+    /// input, each worker invokes its own `finish` clone. Callers that need a
+    /// single final output can coordinate that through shared atomic state.
+    #[allow(clippy::type_complexity)]
+    pub fn sink_each<O2, Consume, Finish>(
+        self,
+        consume: Consume,
+        finish: Finish,
+    ) -> OperatorSpec<
+        O2,
+        UnaryOperatorFactory<O, O2, SinkFactory<Consume, Finish>, StealableChannelFactory<O>, OF>,
+    >
+    where
+        O2: Send + 'static,
+        Consume: FnMut(O) -> crate::UnaryResult<()> + Clone + Send + 'static,
+        Finish: FnMut(&mut dyn Sender<O2>) -> crate::UnaryResult<()> + Clone + Send + 'static,
+    {
+        let worker_count = self.factories.len();
+        let channels: Vec<_> = stealable::<O>(worker_count).into_iter().collect();
+        let unaries = (0..worker_count)
+            .map(|_| SinkFactory::new(consume.clone(), finish.clone()))
+            .collect();
         self.chain(channels, unaries)
     }
 
