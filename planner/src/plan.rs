@@ -10,8 +10,10 @@
 //! "what worker pool runs this plan" and isn't a property of the plan itself.
 
 use crate::catalog::Catalog;
+use crate::compile;
 use crate::expression::Expression;
 use crate::operator::{self, Operator, OrderByDirection, SetVariable};
+use crate::types::Type;
 use dispatch::GroupLimit;
 use std::fmt;
 use std::sync::Arc;
@@ -21,6 +23,8 @@ use thiserror::Error;
 pub enum Error {
     #[error("{0}")]
     Operator(#[from] operator::Error),
+    #[error("{0}")]
+    OutputType(#[from] compile::Error),
 }
 
 /// One node in a [`Plan`] tree: an [`Operator`] plus its child nodes. `name`
@@ -33,6 +37,19 @@ pub struct PlanNode {
 }
 
 impl PlanNode {
+    /// The pivot [`Type`] of each column this node emits, in output order,
+    /// derived from the operators themselves (a projection from its
+    /// expressions, a scan from its table, pass-through operators from their
+    /// input). Lets a pass over the plan ask what any subtree produces.
+    pub fn output_types(&self) -> Result<Vec<Type>, compile::Error> {
+        let inputs = self
+            .inputs
+            .iter()
+            .map(PlanNode::output_types)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.operator.output_types(&inputs)
+    }
+
     fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
         let prefix = "  ".repeat(indent);
         writeln!(f, "{prefix}{}", self.operator)?;
@@ -129,7 +146,6 @@ impl PlanNode {
                         // would keep the wrong rows; leave it to the full `TopN` sort
                         // above (only the pushdown is skipped).
                         use crate::expression::AggregateFunc;
-                        use crate::types::Type;
                         let unordered_sort_key = match a.expressions.get(slot) {
                             Some(Expression::AggregateFunc(
                                 AggregateFunc::Min(x) | AggregateFunc::Max(x),

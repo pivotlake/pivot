@@ -41,8 +41,9 @@ pub use set_variable::SetVariable;
 pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub use top_n::TopN;
 
-use crate::compile::DynamicFilterSlots;
-use crate::expression::{self};
+use crate::compile::{self, DynamicFilterSlots};
+use crate::expression::{self, Expression};
+use crate::types::Type;
 use dispatch::DynamicFilterSlot;
 use std::fmt;
 use std::sync::{Arc, RwLock};
@@ -93,6 +94,56 @@ pub enum Operator {
     Materialize(Materialize),
     /// `EXPLAIN <query>`: renders its child plan as text (see [`Explain`]).
     Explain(Explain),
+}
+
+impl Operator {
+    /// The pivot [`Type`] of each column this operator emits, in output order,
+    /// given its inputs' column types (one `Vec` per child, in child order).
+    /// This is what lets a pass over the plan ask what any subtree produces
+    /// (e.g. rendering variant output columns as JSON text) without knowing
+    /// operator shapes.
+    pub fn output_types(&self, inputs: &[Vec<Type>]) -> Result<Vec<Type>, compile::Error> {
+        match self {
+            // Sources: a scan's outputs are its column expressions. (The extra
+            // row-group metadata columns an `emit_row_group_metadata` scan
+            // appends are plumbing between that scan and its Materialize, not
+            // part of the logical schema.)
+            Operator::Input(input) => expression_types(&input.columns),
+            Operator::TableFunctionScan(scan) => scan.output_types(),
+            // A materialize re-fetches table columns by storage index.
+            Operator::Materialize(materialize) => {
+                let columns = materialize.table.columns();
+                Ok(materialize
+                    .columns
+                    .iter()
+                    .map(|&i| columns[i].col_type.clone())
+                    .collect())
+            }
+            // A projection reshapes its input into its expressions.
+            Operator::Projection(projection) => expression_types(&projection.projections),
+            // An aggregate emits its group keys, then one column per aggregate.
+            Operator::Aggregate(aggregate) => {
+                let mut types = expression_types(&aggregate.groups)?;
+                types.extend(expression_types(&aggregate.expressions)?);
+                Ok(types)
+            }
+            // These only reorder or trim rows; the columns pass through.
+            Operator::Filter(_) | Operator::OrderBy(_) | Operator::TopN(_) | Operator::Limit(_) => {
+                Ok(inputs[0].clone())
+            }
+            // A FROM-less SELECT's one-row source has no columns of its own.
+            Operator::DummyScan(_) => Ok(Vec::new()),
+            // EXPLAIN renders its child plan as text, one line per row.
+            Operator::Explain(_) => Ok(vec![Type::Utf8]),
+            // Statements, not queries: no result columns.
+            Operator::CreateTable(_) | Operator::SetVariable(_) => Ok(Vec::new()),
+        }
+    }
+}
+
+/// The result type of each expression, in order.
+fn expression_types(expressions: &[Expression]) -> Result<Vec<Type>, compile::Error> {
+    expressions.iter().map(Expression::result_type).collect()
 }
 
 impl fmt::Display for Operator {
