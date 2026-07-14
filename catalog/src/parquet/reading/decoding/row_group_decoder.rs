@@ -139,12 +139,8 @@ impl RowGroupDecoder {
     ) -> Result<Self> {
         let pruned = row_group_metadata.pruned_flag();
         let columns = row_group_metadata.columns();
-        // The projection names top-level columns. Each is decoded as its run of
-        // leaf chunks in THIS file's layout (a variant column can shred into a
-        // different run per file) and reassembled; the output schema comes from
-        // this file too. A flat column is one leaf, so for a flat schema all of
-        // this is the identity. The fetcher resolves leaves the same way, so a
-        // page's position lines up with its decoder.
+        // Expand projected columns into this file's leaves. Variant layouts can
+        // differ between files, so each row group resolves them independently.
         let fields = row_group_metadata.get_metadata().schema.fields();
         let leaves = leaf_fields(fields);
 

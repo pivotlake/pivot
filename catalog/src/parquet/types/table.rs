@@ -213,12 +213,9 @@ fn build_row_groups(
     declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
-    // Reconcile with the declared table schema before anything reads the
-    // types: the statistics right below decode by leaf type, and the scan's
-    // decoders and output schema follow this schema too.
+    // Use reconciled types for statistics, decoders, and output fields.
     let schema = Arc::new(apply_declared_types(schema, declared_columns)?);
-    // Column chunks are per leaf (depth-first), so statistics are decoded against
-    // the leaf's type, not the j-th top-level field's (they differ under nesting).
+    // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 
     let row_groups = file_meta
@@ -389,11 +386,8 @@ fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
         .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
 }
 
-/// Convert the footer's flat depth-first `SchemaElement` list (a tree, each
-/// group carrying its `num_children`) into the nested Arrow [`Schema`] plus the
-/// per-leaf maximum definition levels (in column-chunk order). A group element
-/// becomes a `Struct` field; a primitive element a leaf. The root (element 0) is
-/// the enclosing group.
+/// Converts footer schema elements into an Arrow schema and per-leaf
+/// definition levels.
 fn schema_elements_to_arrow(
     elements: &[crate::parquet::types::thrift::footer::SchemaElement],
 ) -> Result<(Schema, Vec<i16>)> {
@@ -426,18 +420,11 @@ const MAX_SCHEMA_DEPTH: usize = 128;
 /// declares (an ingest mapping can write a superset), and those pass through
 /// untouched.
 ///
-/// Two pairings reconcile instead of matching exactly:
-/// - declared VARCHAR, file binary: the file stores text as *unannotated*
-///   BYTE_ARRAY (binary is all the file claims, and files written that way
-///   are common in the wild); the declaration is what says those bytes are
-///   text, so the column is retyped to `Utf8View` and decodes and compares
-///   as text.
-/// - declared VARIANT: shredding legitimately widens the stored struct with
-///   per-path typed leaves, so any struct shape is accepted.
+/// A declared VARCHAR may retype unannotated binary data as text. A declared
+/// VARIANT accepts any struct shape because shredding adds fields per file.
 ///
-/// Every other pairing must equal the declared type's storage type exactly;
-/// a contradiction fails the load with the offending column's name rather
-/// than mis-decoding data.
+/// Other declared types must match the file's storage type. Undeclared file
+/// fields are unchanged.
 fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<Schema> {
     // Keyed case-insensitively: DuckDB resolves identifiers that way, so a
     // file written by another tool may spell a declared column differently
