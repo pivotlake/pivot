@@ -27,8 +27,8 @@ use crate::catalog::Table;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
-    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Limit,
-    Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
+    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, FakeInsert, Filter, Input,
+    Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::type_from_logical;
@@ -88,6 +88,45 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         return build_late_materialization(op, join, ctx);
     }
 
+    // The real INSERT/VALUES executor is developed independently. For this
+    // compatibility branch, keep DuckDB's binding and type checking but lower
+    // a VALUES insert directly to a no-write command operator. Skipping the
+    // child walk is intentional: ExpressionGet is only needed for its row
+    // count here and is not an executable Pivot source on this branch.
+    if let DuckOperator::Insert(insert) = kind {
+        if insert.returns_rows() {
+            return Err(OperatorError::Unsupported(
+                "INSERT ... RETURNING is not supported by the fake insert operator".to_string(),
+            ));
+        }
+        if insert.has_on_conflict() {
+            return Err(OperatorError::Unsupported(
+                "INSERT ... ON CONFLICT is not supported by the fake insert operator".to_string(),
+            ));
+        }
+        let affected_rows = match op.children().collect::<Vec<_>>().as_slice() {
+            [child] => fake_insert_row_count(*child).ok_or_else(|| {
+                OperatorError::Unsupported(format!(
+                    "fake INSERT only supports VALUES input, got {}",
+                    child.name()
+                ))
+            })?,
+            _ => {
+                return Err(OperatorError::Unsupported(
+                    "fake INSERT expects one VALUES input".to_string(),
+                ));
+            }
+        };
+        return Ok(PlanNode {
+            name: op.name(),
+            inputs: vec![],
+            operator: Operator::FakeInsert(FakeInsert {
+                table: insert.table_name(),
+                affected_rows,
+            }),
+        });
+    }
+
     let inputs = op
         .children()
         .map(|child| build_node(child, ctx))
@@ -133,7 +172,10 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         // No view to construct from: these carry no kind-specific payload.
         DuckOperator::DummyScan => Operator::DummyScan(DummyScan),
         DuckOperator::Explain => Operator::Explain(Explain),
-        DuckOperator::ComparisonJoin(_) | DuckOperator::Unsupported => {
+        DuckOperator::Insert(_)
+        | DuckOperator::ExpressionGet(_)
+        | DuckOperator::ComparisonJoin(_)
+        | DuckOperator::Unsupported => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported operator type: {}",
                 op.name()
@@ -176,6 +218,23 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     }
 
     Ok(node)
+}
+
+/// DuckDB adds a projection above VALUES when casts are needed (including the
+/// typed NULLs used by the pgwire fake binder). Peel only that harmless wrapper
+/// and read the cardinality from the underlying ExpressionGet.
+fn fake_insert_row_count(op: LogicalOp<'_>) -> Option<usize> {
+    match op.operator() {
+        DuckOperator::ExpressionGet(values) => Some(values.row_count()),
+        DuckOperator::Projection(_) => {
+            let children = op.children().collect::<Vec<_>>();
+            match children.as_slice() {
+                [child] => fake_insert_row_count(*child),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// A scan's projected output columns (and a filter's `projection_map`), each a

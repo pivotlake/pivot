@@ -228,6 +228,12 @@ pub mod ffi {
         fn lo_create_has_query(op: &LogicalOperator) -> bool;
         fn lo_create_constraint_count(op: &LogicalOperator) -> usize;
 
+        // ---- Fake Insert ----
+        fn lo_insert_table_name(op: &LogicalOperator) -> String;
+        fn lo_insert_has_on_conflict(op: &LogicalOperator) -> bool;
+        fn lo_insert_return_chunk(op: &LogicalOperator) -> bool;
+        fn lo_expression_get_row_count(op: &LogicalOperator) -> usize;
+
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> String;
         fn lo_set_value(op: &LogicalOperator) -> String;

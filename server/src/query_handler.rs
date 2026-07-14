@@ -20,9 +20,11 @@
 //! In either case the [`CancelOnDrop`] guard fires
 //! [`dispatch::CancelToken::cancel`] on the running dataflow.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,16 +35,20 @@ use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{QueryResponse, Response, Tag};
+use pgwire::api::portal::Portal;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{
+    DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, Tag,
+};
+use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers,
+    ClientInfo, ClientPortalStore, ConnectionManager, METADATA_DATABASE, PgWireServerHandlers, Type,
 };
 use pgwire::error::PgWireResult;
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::response::NoticeResponse;
+use pgwire::messages::response::{NoticeResponse, TransactionStatus};
 use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::{info, warn};
@@ -224,6 +230,86 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// One connection's explicit SQL transaction. pgjdbc turns auto-commit off and
+/// sends `BEGIN` before its first metadata/write statement; all following
+/// prepared INSERT executions must therefore share one catalog transaction
+/// until `COMMIT` or `ROLLBACK`.
+struct SessionTransaction {
+    catalog: Arc<dyn planner::catalog::Catalog>,
+    transaction: Mutex<Option<Arc<dyn planner::catalog::CatalogTransaction>>>,
+    failed: AtomicBool,
+}
+
+impl SessionTransaction {
+    fn new(catalog: Arc<dyn planner::catalog::Catalog>) -> Self {
+        Self {
+            catalog,
+            transaction: Mutex::new(None),
+            failed: AtomicBool::new(false),
+        }
+    }
+
+    fn begin(&self) {
+        let mut transaction = self.transaction.lock().unwrap();
+        if transaction.is_none() {
+            *transaction = Some(self.catalog.begin_transaction());
+            self.failed.store(false, Ordering::Release);
+        }
+    }
+
+    fn current(&self) -> Option<Arc<dyn planner::catalog::CatalogTransaction>> {
+        self.transaction.lock().unwrap().clone()
+    }
+
+    fn commit(&self) {
+        if let Some(transaction) = self.transaction.lock().unwrap().take() {
+            self.catalog.commit_transaction(transaction);
+        }
+        self.failed.store(false, Ordering::Release);
+    }
+
+    fn rollback(&self) {
+        if let Some(transaction) = self.transaction.lock().unwrap().take() {
+            self.catalog.rollback_transaction(transaction);
+        }
+        self.failed.store(false, Ordering::Release);
+    }
+
+    fn mark_failed(&self) {
+        if self.transaction.lock().unwrap().is_some() {
+            self.failed.store(true, Ordering::Release);
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// CREATE TABLE is currently committed by the catalog operator itself.
+    /// Refresh the session snapshot afterwards so the INSERT prepared next in
+    /// the same JDBC transaction can bind the newly-created table.
+    fn refresh_after_ddl(&self) {
+        let mut transaction = self.transaction.lock().unwrap();
+        if let Some(previous) = transaction.take() {
+            self.catalog.rollback_transaction(previous);
+            *transaction = Some(self.catalog.begin_transaction());
+        }
+    }
+}
+
+impl Drop for SessionTransaction {
+    fn drop(&mut self) {
+        // SessionExtensions owns this object. If the socket disappears before
+        // COMMIT/ROLLBACK, dropping the connection rolls back the open catalog
+        // transaction instead of silently committing a partial Kafka batch.
+        if let Ok(transaction) = self.transaction.get_mut()
+            && let Some(transaction) = transaction.take()
+        {
+            self.catalog.rollback_transaction(transaction);
+        }
+    }
+}
+
 /// pgwire `SimpleQueryHandler`: plans, compiles, and runs each query on the
 /// blocking pool, surfacing errors and supporting cancellation.
 pub struct PivotQueryHandler {
@@ -267,8 +353,9 @@ impl PivotQueryHandler {
         query: &str,
         collect_stats: bool,
         with_perf: bool,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+        autocommit: bool,
     ) -> Result<Outcome> {
-        let transaction = self.catalog.begin_transaction();
         // The async block scopes the body's `?` early-returns so success and
         // failure both land on the commit/rollback at the end.
         let result: Result<Outcome> = async {
@@ -321,6 +408,14 @@ impl PivotQueryHandler {
                     value: set.value.clone(),
                 });
             }
+
+            let command = if let Some(insert) = plan.as_fake_insert() {
+                Some(Command::Insert(insert.affected_rows))
+            } else if plan.is_create_table() {
+                Some(Command::CreateTable)
+            } else {
+                None
+            };
 
             // When the session ran `SET perf = 1`, start a `perf record` scoped to the
             // worker threads and mark this query's dataflows profiled. Marking them
@@ -387,6 +482,16 @@ impl PivotQueryHandler {
                 let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
             }
 
+            let stats = QueryStats {
+                plan: plan_time,
+                compile: compile_time,
+                exec: exec_time,
+                flow,
+            };
+            if let Some(command) = command {
+                return Ok(Outcome::Command(command, stats));
+            }
+
             let fields = batches
                 .first()
                 .map_or(Arc::new(vec![]), |b| b.fields.clone());
@@ -394,20 +499,14 @@ impl PivotQueryHandler {
                 fields,
                 stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
             ));
-            Ok(Outcome::Query(
-                response,
-                QueryStats {
-                    plan: plan_time,
-                    compile: compile_time,
-                    exec: exec_time,
-                    flow,
-                },
-            ))
+            Ok(Outcome::Query(response, stats))
         }
         .await;
-        match &result {
-            Ok(_) => self.catalog.commit_transaction(transaction),
-            Err(_) => self.catalog.rollback_transaction(transaction),
+        if autocommit {
+            match &result {
+                Ok(_) => self.catalog.commit_transaction(transaction),
+                Err(_) => self.catalog.rollback_transaction(transaction),
+            }
         }
         result
     }
@@ -417,9 +516,17 @@ impl PivotQueryHandler {
 enum Outcome {
     /// A normal query: its rows plus where its time went.
     Query(Response, QueryStats),
+    /// DDL/DML command and its execution statistics.
+    Command(Command, QueryStats),
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
     /// for `RESET`; the server decides which names actually mean anything.
     Set { name: String, value: Option<String> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    Insert(usize),
+    CreateTable,
 }
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
@@ -506,6 +613,349 @@ fn perf_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(PERF_FLAG).is_some_and(|v| v == "on")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransactionCommand {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+fn transaction_command(query: &str) -> Option<TransactionCommand> {
+    let normalized = query
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_ascii_uppercase();
+    if normalized == "BEGIN"
+        || normalized.starts_with("BEGIN ")
+        || normalized == "START TRANSACTION"
+        || normalized.starts_with("START TRANSACTION ")
+    {
+        Some(TransactionCommand::Begin)
+    } else if normalized == "COMMIT"
+        || normalized.starts_with("COMMIT ")
+        || normalized == "END"
+        || normalized.starts_with("END ")
+    {
+        Some(TransactionCommand::Commit)
+    } else if normalized == "ROLLBACK" || normalized.starts_with("ROLLBACK WORK") {
+        Some(TransactionCommand::Rollback)
+    } else {
+        None
+    }
+}
+
+fn failed_transaction_error() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "25P02".to_string(),
+        "current transaction is aborted, commands ignored until end of transaction block"
+            .to_string(),
+    )))
+}
+
+/// DuckDB does not accept PostgreSQL's `database.schema.table` spelling for
+/// CREATE/INSERT targets. pgjdbc exposes both catalog and schema, so the JDBC
+/// sink emits that fully-qualified form even though both identify the current
+/// Pivot connection. Remove only those leading current-database/public
+/// qualifiers, leaving every other statement and identifier untouched.
+fn strip_sink_target_qualification<'a>(query: &'a str, database: &str) -> Cow<'a, str> {
+    let trimmed = query.trim_start();
+    let keyword_len = if trimmed
+        .get(.."CREATE TABLE".len())
+        .is_some_and(|value| value.eq_ignore_ascii_case("CREATE TABLE"))
+    {
+        "CREATE TABLE".len()
+    } else if trimmed
+        .get(.."INSERT INTO".len())
+        .is_some_and(|value| value.eq_ignore_ascii_case("INSERT INTO"))
+    {
+        "INSERT INTO".len()
+    } else {
+        return Cow::Borrowed(query);
+    };
+
+    let target_start = keyword_len
+        + trimmed[keyword_len..]
+            .len()
+            .saturating_sub(trimmed[keyword_len..].trim_start().len());
+    let bytes = trimmed.as_bytes();
+    let mut target_end = target_start;
+    let mut quoted = false;
+    while target_end < bytes.len() {
+        match bytes[target_end] {
+            b'"' => quoted = !quoted,
+            b'(' | b' ' | b'\t' | b'\r' | b'\n' if !quoted => break,
+            _ => {}
+        }
+        target_end += 1;
+    }
+    let target = &trimmed[target_start..target_end];
+    let components = target.split('.').collect::<Vec<_>>();
+    let identifier_eq =
+        |value: &str, expected: &str| value.trim_matches('"').eq_ignore_ascii_case(expected);
+    let replacement = match components.as_slice() {
+        [catalog, schema, table]
+            if identifier_eq(catalog, database) && identifier_eq(schema, "public") =>
+        {
+            *table
+        }
+        [schema, table] if identifier_eq(schema, "public") => *table,
+        _ => return Cow::Borrowed(query),
+    };
+
+    let leading = query.len() - trimmed.len();
+    let absolute_start = leading + target_start;
+    let absolute_end = leading + target_end;
+    let mut normalized = String::with_capacity(query.len());
+    normalized.push_str(&query[..absolute_start]);
+    normalized.push_str(replacement);
+    normalized.push_str(&query[absolute_end..]);
+    Cow::Owned(normalized)
+}
+
+fn parameter_texts(portal: &Portal<String>) -> Vec<Option<String>> {
+    portal
+        .parameters
+        .iter()
+        .map(|value| {
+            value
+                .as_ref()
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+        })
+        .collect()
+}
+
+fn parameter_type_name(data_type: &Type) -> Option<&'static str> {
+    if *data_type == Type::BOOL {
+        Some("BOOLEAN")
+    } else if *data_type == Type::INT2 {
+        Some("SMALLINT")
+    } else if *data_type == Type::INT4 {
+        Some("INTEGER")
+    } else if *data_type == Type::INT8 {
+        Some("BIGINT")
+    } else if *data_type == Type::FLOAT4 {
+        Some("REAL")
+    } else if *data_type == Type::FLOAT8 {
+        Some("DOUBLE")
+    } else if *data_type == Type::NUMERIC {
+        Some("DECIMAL")
+    } else if *data_type == Type::DATE {
+        Some("DATE")
+    } else if *data_type == Type::TIMESTAMP || *data_type == Type::TIMESTAMPTZ {
+        Some("TIMESTAMP")
+    } else if *data_type == Type::TIME || *data_type == Type::TIMETZ {
+        Some("TIME")
+    } else if *data_type == Type::BYTEA {
+        Some("BLOB")
+    } else if *data_type == Type::TEXT
+        || *data_type == Type::VARCHAR
+        || *data_type == Type::BPCHAR
+        || *data_type == Type::UUID
+        || *data_type == Type::JSON
+        || *data_type == Type::JSONB
+    {
+        Some("VARCHAR")
+    } else {
+        None
+    }
+}
+
+/// Replace extended-protocol placeholders with typed NULL expressions. The
+/// fake INSERT still goes through DuckDB's normal binder, so wrong table or
+/// column names fail exactly as they will with the real insert operator, while
+/// Kafka record bytes are intentionally never interpolated into SQL.
+fn bind_fake_parameters(statement: &StoredStatement<String>) -> String {
+    let sql = statement.statement.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut index = 0;
+    let mut quote = None;
+
+    while index < sql.len() {
+        let byte = sql[index];
+        if !byte.is_ascii() {
+            let character = std::str::from_utf8(&sql[index..])
+                .expect("stored SQL is valid UTF-8")
+                .chars()
+                .next()
+                .unwrap();
+            output.push(character);
+            index += character.len_utf8();
+            continue;
+        }
+
+        if let Some(delimiter) = quote {
+            output.push(byte as char);
+            if byte == delimiter {
+                if sql.get(index + 1) == Some(&delimiter) {
+                    output.push(delimiter as char);
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            output.push(byte as char);
+            index += 1;
+            continue;
+        }
+
+        if byte == b'$' && sql.get(index + 1).is_some_and(u8::is_ascii_digit) {
+            let start = index;
+            index += 1;
+            let number_start = index;
+            while sql.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            let number = std::str::from_utf8(&sql[number_start..index])
+                .ok()
+                .and_then(|number| number.parse::<usize>().ok());
+            if let Some(parameter_index) = number.and_then(|number| number.checked_sub(1))
+                && let Some(data_type) = statement
+                    .parameter_types
+                    .get(parameter_index)
+                    .and_then(Option::as_ref)
+                && let Some(data_type) = parameter_type_name(data_type)
+            {
+                output.push_str("CAST(NULL AS ");
+                output.push_str(data_type);
+                output.push(')');
+            } else if number.is_some() {
+                output.push_str("NULL");
+            } else {
+                output.push_str(std::str::from_utf8(&sql[start..index]).unwrap_or("$"));
+            }
+            continue;
+        }
+
+        output.push(byte as char);
+        index += 1;
+    }
+
+    output
+}
+
+impl PivotQueryHandler {
+    async fn execute_statement<C>(
+        &self,
+        client: &mut C,
+        query: &str,
+        parameters: &[Option<String>],
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let session = client
+            .session_extensions()
+            .get_or_insert_with(|| SessionTransaction::new(self.catalog.clone()));
+
+        if let Some(command) = transaction_command(query) {
+            return Ok(match command {
+                TransactionCommand::Begin => {
+                    session.begin();
+                    Response::TransactionStart(Tag::new("BEGIN"))
+                }
+                TransactionCommand::Commit
+                    if session.is_failed()
+                        || client.transaction_status() == TransactionStatus::Error =>
+                {
+                    session.rollback();
+                    Response::TransactionEnd(Tag::new("ROLLBACK"))
+                }
+                TransactionCommand::Commit => {
+                    session.commit();
+                    Response::TransactionEnd(Tag::new("COMMIT"))
+                }
+                TransactionCommand::Rollback => {
+                    session.rollback();
+                    Response::TransactionEnd(Tag::new("ROLLBACK"))
+                }
+            });
+        }
+
+        if session.is_failed() || client.transaction_status() == TransactionStatus::Error {
+            return Err(failed_transaction_error());
+        }
+
+        let database = client
+            .metadata()
+            .get(METADATA_DATABASE)
+            .map(String::as_str)
+            .unwrap_or("pivot");
+        let query = strip_sink_target_qualification(query, database);
+        let query = query.as_ref();
+        if let Some(response) =
+            crate::postgres_metadata::execute(&self.catalog, database, query, parameters)
+        {
+            return Ok(response);
+        }
+
+        let with_stats = stats_on(client);
+        #[cfg(feature = "perf")]
+        let with_perf = perf_on(client);
+        #[cfg(not(feature = "perf"))]
+        let with_perf = false;
+
+        info!(sql = %query, "query received");
+        let current = session.current();
+        let autocommit = current.is_none();
+        let transaction = current.unwrap_or_else(|| self.catalog.begin_transaction());
+        let outcome = match self
+            .run_query(query, with_stats, with_perf, transaction, autocommit)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(error = %error, sql = %query, "query failed");
+                if !autocommit {
+                    session.mark_failed();
+                    client.set_transaction_status(TransactionStatus::Error);
+                }
+                return Err(error.into_pgwire());
+            }
+        };
+
+        let (response, stats) = match outcome {
+            Outcome::Set { name, value } => (apply_set(client, &name, value.as_deref()), None),
+            Outcome::Query(response, stats) => (response, Some(stats)),
+            Outcome::Command(command, stats) => {
+                if command == Command::CreateTable && !autocommit {
+                    session.refresh_after_ddl();
+                }
+                let response = match command {
+                    Command::Insert(rows) => {
+                        Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows))
+                    }
+                    Command::CreateTable => Response::Execution(Tag::new("CREATE TABLE")),
+                };
+                (response, Some(stats))
+            }
+        };
+
+        if with_stats && let Some(stats) = stats {
+            let notice = NoticeResponse::from(ErrorInfo::new(
+                "INFO".to_string(),
+                "00000".to_string(),
+                stats.summary(),
+            ));
+            client
+                .send(PgWireBackendMessage::NoticeResponse(notice))
+                .await?;
+        }
+
+        info!(sql = %query, "query succeeded");
+        Ok(response)
+    }
+}
+
 #[async_trait]
 impl SimpleQueryHandler for PivotQueryHandler {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -515,41 +965,75 @@ impl SimpleQueryHandler for PivotQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let with_stats = stats_on(client);
-        #[cfg(feature = "perf")]
-        let with_perf = perf_on(client);
-        #[cfg(not(feature = "perf"))]
-        let with_perf = false;
+        Ok(vec![self.execute_statement(client, query, &[]).await?])
+    }
+}
 
-        info!(sql = %query, "query received");
-        let outcome = self
-            .run_query(query, with_stats, with_perf)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, sql = %query, "query failed");
-                e.into_pgwire()
-            })?;
+#[async_trait]
+impl ExtendedQueryHandler for PivotQueryHandler {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
 
-        let res = match outcome {
-            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
-            Outcome::Query(res, stats) => {
-                // Send the breakdown as an INFO notice before the rows.
-                if with_stats {
-                    let notice = NoticeResponse::from(ErrorInfo::new(
-                        "INFO".to_string(),
-                        "00000".to_string(),
-                        stats.summary(),
-                    ));
-                    client
-                        .send(PgWireBackendMessage::NoticeResponse(notice))
-                        .await?;
-                }
-                res
-            }
-        };
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(NoopQueryParser)
+    }
 
-        info!(sql = %query, "query succeeded");
-        Ok(vec![res])
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let parameters = target
+            .parameter_types
+            .iter()
+            .map(|data_type| data_type.clone().unwrap_or(Type::UNKNOWN))
+            .collect();
+        let fields = crate::postgres_metadata::describe(&target.statement).unwrap_or_default();
+        Ok(DescribeStatementResponse::new(parameters, fields))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let fields =
+            crate::postgres_metadata::describe(&target.statement.statement).unwrap_or_default();
+        Ok(DescribePortalResponse::new(fields))
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let parameters = parameter_texts(portal);
+        let statement = &portal.statement.statement;
+        if crate::postgres_metadata::describe(statement).is_some() {
+            self.execute_statement(client, statement, &parameters).await
+        } else {
+            let query = bind_fake_parameters(&portal.statement);
+            self.execute_statement(client, &query, &parameters).await
+        }
     }
 }
 
@@ -614,11 +1098,54 @@ impl PgWireServerHandlers for PivotHandlers {
         self.cancel_handler.clone()
     }
 
-    fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.query_handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(pgwire::api::NoopHandler)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_current_postgres_catalog_and_schema_from_sink_targets() {
+        assert_eq!(
+            strip_sink_target_qualification(
+                "CREATE TABLE pivot.public.events (id BIGINT NULL)",
+                "pivot"
+            ),
+            "CREATE TABLE events (id BIGINT NULL)"
+        );
+        assert_eq!(
+            strip_sink_target_qualification(
+                "INSERT INTO \"pivot\".\"public\".\"events\" (\"id\") VALUES ($1)",
+                "pivot"
+            ),
+            "INSERT INTO \"events\" (\"id\") VALUES ($1)"
+        );
+    }
+
+    #[test]
+    fn preserves_unrelated_qualified_targets() {
+        let query = "INSERT INTO another.private.events VALUES ($1)";
+        assert_eq!(strip_sink_target_qualification(query, "pivot"), query);
+    }
+
+    #[test]
+    fn fake_binding_uses_types_without_touching_quoted_text() {
+        let statement = StoredStatement::new(
+            "insert".to_string(),
+            "INSERT INTO \"événements$1\" (id, note) VALUES ($1, '$2')".to_string(),
+            vec![Some(Type::INT4)],
+        );
+
+        assert_eq!(
+            bind_fake_parameters(&statement),
+            "INSERT INTO \"événements$1\" (id, note) VALUES (CAST(NULL AS INTEGER), '$2')"
+        );
     }
 }

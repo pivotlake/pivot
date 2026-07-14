@@ -53,6 +53,22 @@ fn explain_emits_plan_text_without_running_the_query(mut testing_planner: Testin
 }
 
 #[rstest]
+fn fake_insert_binds_but_persists_no_rows(mut testing_planner: TestingPlanner) {
+    let results = testing_planner
+        .plan("INSERT INTO example_table (a, b, c) VALUES (6, 60, 600)")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert!(results.is_empty());
+}
+
+#[rstest]
 fn select_column_subset(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .plan("SELECT a, b FROM example_table")

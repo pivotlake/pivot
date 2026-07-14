@@ -126,6 +126,12 @@ bool lo_create_temporary(const LogicalOperator &op);
 bool lo_create_has_query(const LogicalOperator &op);
 size_t lo_create_constraint_count(const LogicalOperator &op);
 
+// ---- Fake Insert ----
+rust::String lo_insert_table_name(const LogicalOperator &op);
+bool lo_insert_has_on_conflict(const LogicalOperator &op);
+bool lo_insert_return_chunk(const LogicalOperator &op);
+size_t lo_expression_get_row_count(const LogicalOperator &op);
+
 // ---- Set / Reset ----
 rust::String lo_set_name(const LogicalOperator &op);
 rust::String lo_set_value(const LogicalOperator &op);

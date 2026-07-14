@@ -96,6 +96,8 @@ pub enum Error {
     UnsupportedCreateTableConstraints(usize),
     #[error("CREATE TABLE nodes should not have input operators")]
     UnexpectedCreateTableInputs,
+    #[error("fake INSERT nodes should not have input operators")]
+    UnexpectedFakeInsertInputs,
     #[error("compiling table scan: {0}")]
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
@@ -241,6 +243,12 @@ impl PlanNode {
                     return Err(Error::UnexpectedCreateTableInputs);
                 }
                 o.compile(dispatcher, catalog)
+            }
+            crate::Operator::FakeInsert(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedFakeInsertInputs);
+                }
+                o.compile(dispatcher)
             }
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.

@@ -147,6 +147,8 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_GET => Operator::TableFunctionScan(TableFunctionScan { raw: self.raw }),
             L::LOGICAL_CREATE_TABLE => Operator::CreateTable(CreateTable { raw: self.raw }),
+            L::LOGICAL_INSERT => Operator::Insert(Insert { raw: self.raw }),
+            L::LOGICAL_EXPRESSION_GET => Operator::ExpressionGet(ExpressionGet { raw: self.raw }),
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
@@ -176,6 +178,11 @@ pub enum Operator<'plan> {
     /// A scan over a table-valued function (`LOGICAL_GET` with no base table).
     TableFunctionScan(TableFunctionScan<'plan>),
     CreateTable(CreateTable<'plan>),
+    /// An INSERT. Pivot exposes only the metadata needed by its temporary
+    /// compatibility operator; the real writer lives on a separate branch.
+    Insert(Insert<'plan>),
+    /// DuckDB's logical representation of a VALUES matrix.
+    ExpressionGet(ExpressionGet<'plan>),
     /// `SET name = value`.
     Set(Set<'plan>),
     /// `RESET name`.
@@ -225,6 +232,10 @@ define_handles! { ffi::LogicalOperator;
     TableFunctionScan,
     /// A `LogicalCreateTable` with an explicit column list.
     CreateTable,
+    /// A `LogicalInsert` into a base table.
+    Insert,
+    /// A `LogicalExpressionGet` (normally the VALUES child of an INSERT).
+    ExpressionGet,
     /// A `LogicalSet`: `SET name = value`.
     Set,
     /// A `LogicalReset`: `RESET name`.
@@ -444,6 +455,26 @@ impl<'plan> CreateTable<'plan> {
 
     pub fn constraint_count(self) -> usize {
         ffi::lo_create_constraint_count(self.raw)
+    }
+}
+
+impl<'plan> Insert<'plan> {
+    pub fn table_name(self) -> String {
+        ffi::lo_insert_table_name(self.raw)
+    }
+
+    pub fn has_on_conflict(self) -> bool {
+        ffi::lo_insert_has_on_conflict(self.raw)
+    }
+
+    pub fn returns_rows(self) -> bool {
+        ffi::lo_insert_return_chunk(self.raw)
+    }
+}
+
+impl<'plan> ExpressionGet<'plan> {
+    pub fn row_count(self) -> usize {
+        ffi::lo_expression_get_row_count(self.raw)
     }
 }
 

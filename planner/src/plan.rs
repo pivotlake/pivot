@@ -11,7 +11,7 @@
 
 use crate::catalog::Catalog;
 use crate::expression::Expression;
-use crate::operator::{self, Operator, OrderByDirection, SetVariable};
+use crate::operator::{self, FakeInsert, Operator, OrderByDirection, SetVariable};
 use dispatch::GroupLimit;
 use std::fmt;
 use std::sync::Arc;
@@ -246,6 +246,19 @@ impl Plan {
             Operator::SetVariable(set) if self.root.inputs.is_empty() => Some(set),
             _ => None,
         }
+    }
+
+    /// Return the temporary no-write INSERT when it is the statement root.
+    pub fn as_fake_insert(&self) -> Option<&FakeInsert> {
+        match &self.root.operator {
+            Operator::FakeInsert(insert) if self.root.inputs.is_empty() => Some(insert),
+            _ => None,
+        }
+    }
+
+    /// Whether this statement is a root CREATE TABLE command.
+    pub fn is_create_table(&self) -> bool {
+        matches!(self.root.operator, Operator::CreateTable(_)) && self.root.inputs.is_empty()
     }
 }
 

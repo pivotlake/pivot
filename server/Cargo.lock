@@ -4602,6 +4602,7 @@ dependencies = [
  "arrow-schema 58.0.0",
  "async-trait",
  "axum",
+ "bytes",
  "catalog",
  "clap",
  "core_affinity",

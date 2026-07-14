@@ -11,6 +11,8 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
@@ -619,6 +621,24 @@ bool lo_create_has_query(const LogicalOperator &op) {
 
 size_t lo_create_constraint_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalCreateTable>(op).info->constraints.size();
+}
+
+// ---- Fake Insert ----
+
+rust::String lo_insert_table_name(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalInsert>(op).table.name);
+}
+
+bool lo_insert_has_on_conflict(const LogicalOperator &op) {
+	return as<duckdb::LogicalInsert>(op).on_conflict_info.action_type != duckdb::OnConflictAction::THROW;
+}
+
+bool lo_insert_return_chunk(const LogicalOperator &op) {
+	return as<duckdb::LogicalInsert>(op).return_chunk;
+}
+
+size_t lo_expression_get_row_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalExpressionGet>(op).expressions.size();
 }
 
 // ---- Set / Reset ----

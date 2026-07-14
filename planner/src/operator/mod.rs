@@ -17,6 +17,7 @@ mod aggregate;
 mod create_table;
 mod dummy_scan;
 mod explain;
+mod fake_insert;
 mod filter;
 mod input;
 mod limit;
@@ -31,6 +32,7 @@ pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
+pub use fake_insert::FakeInsert;
 pub use filter::Filter;
 pub use input::Input;
 pub use limit::Limit;
@@ -86,6 +88,8 @@ pub enum Operator {
     TopN(TopN),
     Limit(Limit),
     CreateTable(CreateTable),
+    /// Temporary no-write INSERT used to exercise sink protocol integration.
+    FakeInsert(FakeInsert),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -107,6 +111,7 @@ impl fmt::Display for Operator {
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::Limit(l) => write!(f, "{l}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
+            Operator::FakeInsert(i) => write!(f, "{i}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),

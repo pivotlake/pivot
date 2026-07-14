@@ -140,6 +140,16 @@ fn create_table_produces_create_table_operator(mut testing_planner: TestingPlann
 }
 
 #[rstest]
+fn insert_values_produces_fake_insert_operator(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("INSERT INTO example_table (a, b, c) VALUES (1, 2, 3), (4, 5, 6)")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"FakeInsert(example_table, rows: 2)");
+    assert_eq!(plan.as_fake_insert().unwrap().affected_rows, 2);
+}
+
+#[rstest]
 fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("CREATE TABLE created_table (id INTEGER) WITH (path='/asdf', format='parquet')")
