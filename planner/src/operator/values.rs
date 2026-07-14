@@ -13,7 +13,7 @@
 //! evaluation context. That batch is an implementation detail, not an input
 //! operator and not a dispatched batch.
 
-use crate::compile::{Error, ExprEvalFn, ExprFn};
+use crate::compile::{Error, ExprEvalFn, ExprFn, ExprResult};
 use crate::expression::Expression;
 use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
@@ -151,7 +151,10 @@ fn evaluate_values(evaluators: &mut [Vec<ExprEvalFn>]) -> RecordBatch {
         .map(|(column_index, column)| {
             let cells = column
                 .iter_mut()
-                .map(|evaluate| evaluate(&context).into_array(1))
+                .map(|evaluate| match evaluate(&context) {
+                    ExprResult::Array(array) => array,
+                    ExprResult::Scalar(scalar) => scalar.into_inner(),
+                })
                 .collect::<Vec<_>>();
             let arrays = cells.iter().map(|array| array.as_ref()).collect::<Vec<_>>();
             let column = arrow::compute::concat(&arrays)
