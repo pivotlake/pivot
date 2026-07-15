@@ -1,19 +1,31 @@
+//! Parallel hash join: a radix-partitioned build phase populating a shared
+//! directory + arena, and a prefetch-pipelined probe phase emitting the joined
+//! rows.
+//!
+//! The two phases run as separate dataflows sequenced by
+//! [`RecordBatchOperatorSpec::join`](crate::RecordBatchOperatorSpec::join):
+//! the build dataflow runs to completion (its last partition job opens the
+//! `gate`), then the probe stage runs against the populated [`JoinTable`].
+//!
+//! Output layout: every probe-side column (in probe schema order) followed by
+//! every build-side column (in build schema order). An inner equi-join on a
+//! single `Int64` key is the supported shape.
+
 mod build;
 mod directory;
 mod factory;
-#[allow(dead_code)]
-mod pipeline;
 mod primitive_builder;
-mod probe_new;
+mod probe;
+
+use std::cell::UnsafeCell;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use arrow_array::RecordBatch;
 
 use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
-use std::cell::UnsafeCell;
-use std::sync::Arc;
-
-// pub(crate) type Value = (u64, u64);
-pub(crate) type Value = u32;
 
 /// Interior-mutable storage shared by partitioned build workers.
 pub(crate) struct JoinCell<T>(UnsafeCell<T>);
@@ -33,17 +45,26 @@ impl<T> JoinCell<T> {
 unsafe impl<T: Send> Send for JoinCell<T> {}
 unsafe impl<T: Send> Sync for JoinCell<T> {}
 
-/// Shared hash-table state handed from the build factories to the probe factories.
+/// Shared hash-table state handed from the build factories to the probe
+/// factories. `keys` and `rows` are parallel arenas indexed by the directory's
+/// slot cursors: the full-width join key, and the row's index into
+/// `build_rows` (the concatenated build-side payload batch). All fields are
+/// populated by the build phase and must only be read after `gate` is true.
 pub(crate) struct JoinTable {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
-    pub(crate) arena: Arc<JoinCell<MultiSlabBuffer<Value>>>,
+    pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
+    pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    pub(crate) build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+    /// Set by the last build partition job; probes must wait on it, since the
+    /// build dataflow's collect can return while a stolen job is still running.
+    pub(crate) gate: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use std::sync::atomic::Ordering;
@@ -60,6 +81,20 @@ mod tests {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)])),
             vec![Arc::new(Int64Array::from(keys.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn keyed_names_batch(keys: &[i64], names: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("name", DataType::Utf8View, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(keys.to_vec())),
+                Arc::new(StringViewArray::from(names.to_vec())),
+            ],
         )
         .unwrap()
     }
@@ -300,13 +335,148 @@ mod tests {
     }
 
     #[test]
-    fn probe_idx_reflects_position_in_probe_batch() {
+    fn probe_columns_pass_through() {
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![keyed_names_batch(&[99, 20, 99, 30], &["a", "b", "c", "d"])],
+        );
+
+        // Output: probe columns (key, name), then build columns (key).
+        let batch = &r.batches[0];
+        assert_eq!(batch.num_columns(), 3);
+        let names: Vec<&str> = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(names, vec!["b", "d"]);
+        assert_eq!(collect_i64_column(&r.batches, 2), vec![20, 30]);
+    }
+
+    #[test]
+    fn build_payload_columns_are_gathered() {
+        let r = build_and_probe(
+            vec![vec![keyed_names_batch(&[10, 20, 30], &["x", "y", "z"])]],
+            vec![int64_batch(&[30, 10])],
+        );
+
+        // Output: probe columns (key), then build columns (key, name).
+        let batch = &r.batches[0];
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(collect_i64_column(&r.batches, 0), vec![30, 10]);
+        assert_eq!(collect_i64_column(&r.batches, 1), vec![30, 10]);
+        let names: Vec<&str> = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect();
+        assert_eq!(names, vec!["z", "x"]);
+    }
+
+    #[test]
+    fn build_payload_spans_workers_and_batches() {
+        let r = build_and_probe(
+            vec![
+                vec![
+                    keyed_names_batch(&[1, 2], &["a", "b"]),
+                    keyed_names_batch(&[3], &["c"]),
+                ],
+                vec![keyed_names_batch(&[4, 5], &["d", "e"])],
+            ],
+            vec![int64_batch(&[5, 3, 1])],
+        );
+
+        let mut pairs: Vec<(i64, String)> = r
+            .batches
+            .iter()
+            .flat_map(|b| {
+                let keys = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                let names = b
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap();
+                (0..b.num_rows())
+                    .map(|i| (keys.value(i), names.value(i).to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (1, "a".to_string()),
+                (3, "c".to_string()),
+                (5, "e".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_beyond_u32_do_not_alias() {
+        // Two keys that collide when truncated to 32 bits.
+        let low = 7;
+        let high = 7 + (1i64 << 32);
+        let r = build_and_probe(
+            vec![vec![int64_batch(&[high])]],
+            vec![int64_batch(&[low, high])],
+        );
+
+        assert_eq!(collect_i64_column(&r.batches, 0), vec![high]);
+    }
+
+    #[test]
+    fn null_keys_never_match() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+        let build = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![Some(10), None]))],
+        )
+        .unwrap();
+        let probe = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![None, Some(10), None]))],
+        )
+        .unwrap();
+
+        let r = build_and_probe(vec![vec![build]], vec![probe]);
+
+        let total: usize = r.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn output_exceeding_batch_capacity_is_chunked() {
+        // One probe row matching more build rows than one output batch holds.
+        let n = crate::RECORD_BATCH_SIZE + 100;
+        let build_keys = vec![10i64; n];
+        let r = build_and_probe(
+            vec![vec![int64_batch(&build_keys)]],
+            vec![int64_batch(&[10])],
+        );
+
+        let total: usize = r.batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, n);
+        assert!(
+            r.batches
+                .iter()
+                .all(|b| b.num_rows() <= crate::RECORD_BATCH_SIZE)
+        );
+    }
+
+    #[test]
+    fn probe_row_multiplicity_matches_build_duplicates() {
         let r = build_and_probe(
             vec![vec![int64_batch(&[10, 20, 30])]],
             vec![int64_batch(&[99, 20, 99, 30])],
         );
 
-        // col 0 is now lineitem_keys (matched build keys), not probe_idx
         let mut keys = collect_i64_column(&r.batches, 0);
         keys.sort();
         assert_eq!(keys, vec![20, 30]);

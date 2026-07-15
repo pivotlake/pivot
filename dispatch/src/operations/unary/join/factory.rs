@@ -8,24 +8,27 @@ use crossbeam_deque::Injector;
 use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
 use crate::operations::unary::join::build::{
-    JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS, PartitionBuffers,
+    BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
 };
 use crate::operations::unary::join::directory::JoinDirectory;
-use crate::operations::unary::join::probe_new::Probe;
-use crate::operations::unary::join::{JoinCell, JoinTable, Value};
+use crate::operations::unary::join::probe::Probe;
+use crate::operations::unary::join::{JoinCell, JoinTable};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
 pub struct JoinBuildFactory {
     key_column: usize,
+    worker_id: usize,
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     directory: Arc<JoinCell<JoinDirectory>>,
-    arena: Arc<JoinCell<MultiSlabBuffer<Value>>>,
+    keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
+    rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    build_rows: Arc<JoinCell<Option<RecordBatch>>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
-    sender: mpsc::Sender<PartitionBuffers>,
-    receiver: Option<mpsc::Receiver<PartitionBuffers>>,
+    sender: mpsc::Sender<BuildWorkerOutput>,
+    receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
     gate: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
 }
@@ -39,7 +42,8 @@ pub struct JoinProbeFactory {
 }
 
 /// Create `worker_count` build factories and probe factories that share the
-/// same [`JoinTable`] (directory + arena) and hash state.
+/// same [`JoinTable`] (directory + key/row arenas + build payload) and hash
+/// state.
 ///
 /// Returns `(build_factories, probe_factories, gate)`. The gate is an
 /// [`AtomicBool`] that starts `false` and is set to `true` by the last
@@ -59,7 +63,9 @@ pub fn create_for_workers(
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
     let directory = Arc::new(JoinCell::new(JoinDirectory::initial()));
-    let arena = Arc::new(JoinCell::new(MultiSlabBuffer::<Value>::new(vec![])));
+    let keys = Arc::new(JoinCell::new(MultiSlabBuffer::<u64>::new(vec![])));
+    let rows = Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![])));
+    let build_rows = Arc::new(JoinCell::new(None));
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(AtomicBool::new(false));
@@ -68,16 +74,22 @@ pub fn create_for_workers(
     let mut rx_opt = Some(rx);
 
     let dir_clone = directory.clone();
-    let arena_clone = arena.clone();
+    let keys_clone = keys.clone();
+    let rows_clone = rows.clone();
+    let build_rows_clone = build_rows.clone();
     let hs_clone = hash_state.clone();
     let gate_ret = gate.clone();
+    let gate_probe = gate.clone();
 
-    let build_factories = (0..worker_count).map(move |_| JoinBuildFactory {
+    let build_factories = (0..worker_count).map(move |worker_id| JoinBuildFactory {
         key_column: build_key_column,
+        worker_id,
         hash_state: hash_state.clone(),
         partition_sizes: partition_sizes.clone(),
         directory: directory.clone(),
-        arena: arena.clone(),
+        keys: keys.clone(),
+        rows: rows.clone(),
+        build_rows: build_rows.clone(),
         injector: injector.clone(),
         jobs_injected: jobs_injected.clone(),
         sender: tx.clone(),
@@ -89,7 +101,10 @@ pub fn create_for_workers(
     let probe_factories = (0..worker_count).map(move |_| JoinProbeFactory {
         table: JoinTable {
             directory: dir_clone.clone(),
-            arena: arena_clone.clone(),
+            keys: keys_clone.clone(),
+            rows: rows_clone.clone(),
+            build_rows: build_rows_clone.clone(),
+            gate: gate_probe.clone(),
         },
         hash_state: hs_clone.clone(),
         key_column: probe_key_column,
@@ -105,12 +120,15 @@ impl UnaryFactory<RecordBatch, ()> for JoinBuildFactory {
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
             self.key_column,
+            self.worker_id,
             self.hash_state,
             self.sender,
             self.receiver,
             self.partition_sizes,
             self.directory,
-            self.arena,
+            self.keys,
+            self.rows,
+            self.build_rows,
             self.injector,
             self.jobs_injected,
             self.gate,

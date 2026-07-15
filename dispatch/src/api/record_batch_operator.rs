@@ -566,15 +566,17 @@ impl RecordBatchOperatorSpec {
         ))
     }
 
-    /// Hash join: build a hash table from `build`'s rows keyed on
-    /// `build_key_column`, then probe it with `self`'s rows keyed on
-    /// `probe_key_column`, emitting the probe rows whose key matches.
+    /// Inner hash equi-join: build a hash table from `build`'s rows keyed on
+    /// `build_key_column` (`Int64`), then probe it with `self`'s rows keyed on
+    /// `probe_key_column`, emitting one output row per matching pair. Each
+    /// output row is the probe row's columns (in probe schema order) followed
+    /// by the matched build row's columns (in build schema order). Rows with a
+    /// null key on either side never match.
     ///
     /// Both sides are plain unary operators. The build dataflow runs to
-    /// completion first (populating the shared
-    /// shared join table); only then is the probe stage appended to `self`.
-    /// Coordination is by sequencing plus the shared table,
-    /// not a fused binary operator.
+    /// completion first (populating the shared join table); only then is the
+    /// probe stage appended to `self`. Coordination is by sequencing plus the
+    /// shared table, not a fused binary operator.
     pub fn join(
         self,
         build: RecordBatchOperatorSpec,
