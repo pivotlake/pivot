@@ -47,14 +47,14 @@ The link **times out and kills foreground commands** that run more than ~1-2 min
 **Why `echo $$` inside the script, not `echo $!` after `setsid`:** `setsid` forks and the parent exits, so `$!` is the wrong PID. Capturing `$$` from inside is the reliable handle for `kill -0`. SIGKILL can't be trapped, so the PID liveness check is what covers OOM/`kill -9`.
 
 ## Running benchmarks
-The suite lives in `~/pivotdb/benchmarks`. Query/oracle pairs are `clickbench/qNN.sql` + `qNN.tsv` (drop in two files to add a query; IDs match ClickBench numbering, e.g. q02, q32).
+The crate lives in `~/pivotdb/benchmarks`; each benchmark is a suite subdirectory. ClickBench query/oracle pairs are `clickbench/qNN.sql` + `qNN.tsv` (drop in two files to add a query; IDs match ClickBench numbering, e.g. q02, q32). The ClickBench driver scripts live in `clickbench/`; `cargo`/`just` still run from the crate root `~/pivotdb/benchmarks`.
 
 - **pivot only, quick timing (non-PGO):**
   `cd ~/pivotdb/benchmarks && cargo build --release && ./target/release/pivot-bench --source ~/hits --query q32 --iterations 6 --update-results`
-  Prints `[i/N] Query qNN — Xms`. `--update-results` writes the `.tsv` (pivot grading itself) — needed when adding/changing a query or its result isn't a stable oracle.
-- **DuckDB only:** `./run-duckdb.sh --source ~/hits --query 32 --iterations 4 --no-drop-caches` → `Run Time (s): real 0.xxx`.
+  Prints `[i/N] Query qNN — Xms`. `--update-results` writes the `.tsv` (pivot grading itself) - needed when adding/changing a query or its result isn't a stable oracle. Pass `--suite tpch` to run the TPC-H flat suite instead of ClickBench.
+- **DuckDB only:** `clickbench/run-duckdb.sh --source ~/hits --query 32 --iterations 4 --no-drop-caches` → `Run Time (s): real 0.xxx`.
 - **Side-by-side table (pivot vs DuckDB, cold + hot + speedup):**
-  `./benchmark.sh --source ~/hits --query 32 --iterations 6`
+  `clickbench/benchmark.sh --source ~/hits --query 32 --iterations 6`
   `benchmark.sh` drives pivot via `just pgo-use run` (**needs a PGO profile first**, see below) and DuckDB via `run-duckdb.sh`.
 
 ## PGO build (what `benchmark.sh` expects)
@@ -66,7 +66,7 @@ ensure their origin is from clickbench (ie don't use a parquet created from duck
 cd ~/pivotdb/benchmarks
 just pgo-gen run --release -- --source ~/hits-pgo-subset --iterations 1 --update-results   # instrumented = ~80x slower, slow!
 # then:
-./benchmark.sh --source ~/hits --query 32 --iterations 6 --no-drop-caches
+clickbench/benchmark.sh --source ~/hits --query 32 --iterations 6 --no-drop-caches
 ```
 
 PGO is the user's expected default for `benchmark.sh` numbers. (Note: PGO sometimes *hurt* memory-bound queries — sanity-check vs the non-PGO build.)

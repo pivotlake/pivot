@@ -121,7 +121,7 @@ jobs:
       # commit is checked out into the tree later (the 'before' commit may
       # predate this script).
       - name: Stage A/B harness
-        run: cp benchmarks/bench-ab.sh /tmp/bench-ab.sh
+        run: cp benchmarks/clickbench/bench-ab.sh /tmp/bench-ab.sh
 
       - name: Start the perf box
         env:

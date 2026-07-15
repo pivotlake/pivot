@@ -58,7 +58,7 @@
 
 set -euo pipefail
 
-suite_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/clickbench"
+suite_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 source_path=""
 native_db=""

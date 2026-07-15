@@ -39,7 +39,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-suite_dir="$here/clickbench"
+suite_dir="$here"
 official_dir="$suite_dir/clickhouse-official"
 
 source_path=""
