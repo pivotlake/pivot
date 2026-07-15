@@ -19,6 +19,7 @@ mod dummy_scan;
 mod explain;
 mod filter;
 mod input;
+mod join;
 mod limit;
 mod materialize;
 mod order_by;
@@ -33,6 +34,7 @@ pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
+pub use join::Join;
 pub use limit::Limit;
 pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
@@ -59,6 +61,10 @@ pub enum Error {
     /// non-constant LIMIT, a table function with named parameters, ...).
     #[error("{0}")]
     Unsupported(String),
+    /// A subtree's output columns couldn't be typed while shaping the plan
+    /// (the join projection-map replay needs each side's width and types).
+    #[error("{0}")]
+    Typing(#[from] compile::Error),
 }
 
 /// Get-or-create the shared [`DynamicFilterSlot`] for `slot_id` within this
@@ -86,6 +92,8 @@ pub enum Operator {
     Filter(Filter),
     TopN(TopN),
     Limit(Limit),
+    /// Inner hash equi-join: probe (first input) against build (second input).
+    Join(Join),
     CreateTable(CreateTable),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
@@ -131,6 +139,8 @@ impl Operator {
             Operator::Filter(_) | Operator::OrderBy(_) | Operator::TopN(_) | Operator::Limit(_) => {
                 Ok(inputs[0].clone())
             }
+            // A join emits every probe column followed by every build column.
+            Operator::Join(_) => Ok(inputs[0].iter().chain(inputs[1].iter()).cloned().collect()),
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),
             // EXPLAIN renders its child plan as text, one line per row.
@@ -157,6 +167,7 @@ impl fmt::Display for Operator {
             Operator::Filter(fl) => write!(f, "{fl}"),
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::Limit(l) => write!(f, "{l}"),
+            Operator::Join(j) => write!(f, "{j}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),

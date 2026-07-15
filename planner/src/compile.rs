@@ -235,6 +235,11 @@ impl PlanNode {
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
             crate::Operator::Limit(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Join(o) => {
+                let probe = inputs.remove(0);
+                let build = inputs.remove(0);
+                o.compile(probe, build)
+            }
             crate::Operator::Materialize(o) => o.compile(inputs.remove(0), ctx),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {

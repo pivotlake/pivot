@@ -19,7 +19,7 @@ use cxx::UniquePtr;
 
 use crate::catalog_provider::OptionalTableWrapper;
 use crate::duckdb_bridge::duckdb_types::{
-    ExpressionType, LimitNodeType, LogicalOperatorType, LogicalTypeId, OrderType,
+    ExpressionType, JoinType, LimitNodeType, LogicalOperatorType, LogicalTypeId, OrderType,
 };
 use crate::duckdb_bridge::ffi;
 use crate::types::ScalarValue;
@@ -476,6 +476,47 @@ impl<'plan> ComparisonJoin<'plan> {
         (0..ffi::lo_late_materialization_column_count(self.raw))
             .map(move |i| ffi::lo_late_materialization_column(self.raw, i))
     }
+
+    /// The join's [`JoinType`] (INNER/SEMI/...).
+    pub fn join_type(self) -> JoinType {
+        JoinType::from_u8(ffi::lo_join_type(self.raw))
+    }
+
+    /// The join's conditions. Each side's expression is bound positionally to
+    /// that child's output (LHS into child 0, RHS into child 1).
+    pub fn conditions(self) -> impl Iterator<Item = JoinCondition<'plan>> {
+        (0..ffi::lo_join_condition_count(self.raw)).map(move |i| JoinCondition {
+            left: Expr {
+                raw: ffi::lo_join_condition_left(self.raw, i),
+            },
+            right: Expr {
+                raw: ffi::lo_join_condition_right(self.raw, i),
+            },
+            comparison: ExpressionType::from_u8(ffi::lo_join_condition_comparison(self.raw, i)),
+        })
+    }
+
+    /// Which LHS child output columns survive in the join's output, in order.
+    /// Empty means all of them. Filled by DuckDB's column-lifetime pass, e.g.
+    /// to drop a key column only referenced by the join condition.
+    pub fn left_projection_map(self) -> impl Iterator<Item = usize> + 'plan {
+        (0..ffi::lo_join_left_projection_map_count(self.raw))
+            .map(move |i| ffi::lo_join_left_projection_map_index(self.raw, i))
+    }
+
+    /// The RHS twin of [`left_projection_map`](Self::left_projection_map).
+    pub fn right_projection_map(self) -> impl Iterator<Item = usize> + 'plan {
+        (0..ffi::lo_join_right_projection_map_count(self.raw))
+            .map(move |i| ffi::lo_join_right_projection_map_index(self.raw, i))
+    }
+}
+
+/// One condition of a comparison join: `left <comparison> right`, each side
+/// bound positionally to the corresponding child's output.
+pub struct JoinCondition<'plan> {
+    pub left: Expr<'plan>,
+    pub right: Expr<'plan>,
+    pub comparison: ExpressionType,
 }
 
 /// One sort key of an ORDER BY / TopN: a direction plus the keyed expression.

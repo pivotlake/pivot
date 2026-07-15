@@ -237,6 +237,21 @@ pub mod ffi {
         fn lo_set_value(op: &LogicalOperator) -> String;
         fn lo_reset_name(op: &LogicalOperator) -> String;
 
+        // ---- ComparisonJoin: general accessors ----
+        /// DuckDB `JoinType` discriminant.
+        fn lo_join_type(op: &LogicalOperator) -> u8;
+        fn lo_join_condition_count(op: &LogicalOperator) -> usize;
+        fn lo_join_condition_left(op: &LogicalOperator, index: usize) -> &Expression;
+        fn lo_join_condition_right(op: &LogicalOperator, index: usize) -> &Expression;
+        /// DuckDB `ExpressionType` discriminant of the condition's comparison.
+        fn lo_join_condition_comparison(op: &LogicalOperator, index: usize) -> u8;
+        /// The join's projection maps: which of each child's output columns
+        /// survive in the join's output (empty = all of them).
+        fn lo_join_left_projection_map_count(op: &LogicalOperator) -> usize;
+        fn lo_join_left_projection_map_index(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_join_right_projection_map_count(op: &LogicalOperator) -> usize;
+        fn lo_join_right_projection_map_index(op: &LogicalOperator, index: usize) -> usize;
+
         // ---- ComparisonJoin: late materialization ----
         /// Whether this is the SEMI join DuckDB's late_materialization optimizer
         /// produces (vs a user IN/EXISTS), which the bridge collapses into a
