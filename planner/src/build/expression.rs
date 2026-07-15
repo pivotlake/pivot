@@ -23,7 +23,7 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, IsNull, Length, Not, NumericAggregate,
+    Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, Not, NumericAggregate,
     Prefix, Ref, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
@@ -285,6 +285,10 @@ impl Function {
         let name = func.name();
         match name.as_str() {
             "contains" => Ok(Function::Contains(Contains::from_handle(func)?)),
+            // Multi-wildcard LIKE stays a raw `~~` / `!~~` call (the simple
+            // shapes are rewritten to `prefix`/`contains` upstream).
+            "~~" => Ok(Function::Like(Like::from_handle(func, false)?)),
+            "!~~" => Ok(Function::Like(Like::from_handle(func, true)?)),
             // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`.
             "prefix" => Ok(Function::Prefix(Prefix::from_handle(func)?)),
             // `date`/`timestamp` ± `INTERVAL` carries an INTERVAL constant operand;
@@ -344,6 +348,17 @@ impl VariantGet {
             input: Box::new(Expression::from_handle(params[0])?),
             path: vec![field],
             as_type: None,
+        })
+    }
+}
+
+impl Like {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>, negated: bool) -> Result<Like, Error> {
+        let params = function_args(func, 2)?;
+        Ok(Like {
+            haystack: Box::new(Expression::from_handle(params[0])?),
+            pattern: Box::new(Expression::from_handle(params[1])?),
+            negated,
         })
     }
 }

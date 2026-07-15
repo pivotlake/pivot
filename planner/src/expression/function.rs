@@ -2,7 +2,7 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Prefix,
+    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Like, Prefix,
     RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
@@ -67,6 +67,8 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
 #[derive(Debug, Clone)]
 pub enum Function {
     Contains(Contains),
+    /// `LIKE` / `NOT LIKE` with a multi-wildcard pattern (see [`Like`]).
+    Like(Like),
     Prefix(Prefix),
     Arithmetic(Arithmetic),
     Length(Length),
@@ -103,6 +105,7 @@ impl Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Function::Contains(c) => write!(f, "{c}"),
+            Function::Like(l) => write!(f, "{l}"),
             Function::Prefix(p) => write!(f, "{p}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
@@ -126,7 +129,7 @@ impl Function {
     pub fn result_type(&self) -> Type {
         match self {
             // The string matchers yield booleans.
-            Function::Contains(_) | Function::Prefix(_) => Type::Boolean,
+            Function::Contains(_) | Function::Prefix(_) | Function::Like(_) => Type::Boolean,
             // Arithmetic and the extractors carry DuckDB's bound result type.
             Function::Arithmetic(a) => a.return_type.clone(),
             Function::Length(l) => l.return_type.clone(),
@@ -153,6 +156,7 @@ impl Function {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         match self {
             Function::Contains(c) => c.compile(),
+            Function::Like(l) => l.compile(),
             Function::Prefix(p) => p.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),

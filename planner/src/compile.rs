@@ -66,6 +66,8 @@ pub enum Error {
     IndeterminateResultType(Expression),
     #[error("Unsupported expression for contains: {0:?}")]
     UnsupportedExpressionForContainsNeedle(Expression),
+    #[error("Unsupported expression for LIKE pattern (must be a constant): {0}")]
+    UnsupportedExpressionForLikePattern(Expression),
     #[error("Unsupported haystack expression for contains: {0:?}")]
     UnsupportedExpressionForContainsHaystack(Expression),
     #[error("Unsupported pattern expression for prefix: {0:?}")]

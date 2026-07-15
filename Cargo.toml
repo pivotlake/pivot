@@ -38,6 +38,7 @@ arrow-buffer = { path = "arrow-rs/arrow-buffer" }
 arrow-cast = { path = "arrow-rs/arrow-cast" }
 arrow-json = { path = "arrow-rs/arrow-json" }
 arrow-ord = { path = "arrow-rs/arrow-ord" }
+arrow-string = { path = "arrow-rs/arrow-string" }
 arrow-schema = { path = "arrow-rs/arrow-schema" }
 arrow-select = { path = "arrow-rs/arrow-select" }
 parquet = { path = "arrow-rs/parquet", default-features = false, features = ["arrow", "snap"] }
