@@ -591,3 +591,36 @@ fn self_join_with_cross_side_or_and_extract(mut testing_planner: TestingPlanner)
         .clone()
     );
 }
+
+#[rstest]
+fn left_outer_join_pads_unmatched_rows_with_nulls(mut testing_planner: TestingPlanner) {
+    // An order with no items still comes out, its item columns null. (q13
+    // additionally needs COUNT(col) to skip those nulls, which the grouped
+    // count doesn't do yet.)
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key, i_qty FROM orders LEFT OUTER JOIN items ON i_order = o_key",
+    );
+    rows.sort_by_key(|r| {
+        (
+            r["o_key"].as_i64().unwrap(),
+            r["i_qty"].as_i64().unwrap_or(-1),
+        )
+    });
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"o_key": 1, "i_qty": 10},
+            {"o_key": 1, "i_qty": 20},
+            {"o_key": 2, "i_qty": 30},
+            // The harness omits null cells when serializing rows.
+            {"o_key": 3},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}

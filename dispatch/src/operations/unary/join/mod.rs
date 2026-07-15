@@ -51,6 +51,10 @@ pub enum JoinMode {
     /// Each BUILD row exactly when NO probe row matched it. Build columns
     /// only.
     BuildAnti,
+    /// LEFT OUTER: one row per matching pair, plus each probe row without a
+    /// match once, its build columns null. Matches verify exactly against
+    /// the build payload (a downstream filter can't re-check padded rows).
+    Left,
 }
 
 /// A fixed-length, index-addressed heap buffer for the join's key/row arenas.

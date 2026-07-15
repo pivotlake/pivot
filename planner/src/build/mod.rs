@@ -254,12 +254,17 @@ fn build_join(
 ) -> Result<PlanNode, OperatorError> {
     // The RIGHT_ variants are the optimizer's children-swapped SEMI/ANTI (so
     // the smaller side builds); normalize to emit-side-first terms.
-    let (existence, swap_sides) = match join.join_type() {
-        JoinType::INNER => (None, false),
-        JoinType::SEMI => (Some(false), false),
-        JoinType::ANTI => (Some(true), false),
-        JoinType::RIGHT_SEMI => (Some(false), true),
-        JoinType::RIGHT_ANTI => (Some(true), true),
+    let (existence, swap_sides, left_outer) = match join.join_type() {
+        JoinType::INNER => (None, false, false),
+        JoinType::LEFT => (None, false, true),
+        // RIGHT is the optimizer's children-flipped LEFT: the preserved
+        // (probe) side is child 1 and the padded (build) side child 0; the
+        // output reorders back to DuckDB's left-then-right below.
+        JoinType::RIGHT => (None, true, true),
+        JoinType::SEMI => (Some(false), false, false),
+        JoinType::ANTI => (Some(true), false, false),
+        JoinType::RIGHT_SEMI => (Some(false), true, false),
+        JoinType::RIGHT_ANTI => (Some(true), true, false),
         other => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported join type: {other:?}"
@@ -280,12 +285,13 @@ fn build_join(
             (Some(emit), Some(other)) => emit < other,
             _ => false,
         };
-    let mode = match (existence, build_on_emit) {
-        (None, _) => JoinMode::Inner,
-        (Some(false), false) => JoinMode::Semi,
-        (Some(true), false) => JoinMode::Anti,
-        (Some(false), true) => JoinMode::BuildSemi,
-        (Some(true), true) => JoinMode::BuildAnti,
+    let mode = match (existence, build_on_emit, left_outer) {
+        (None, _, true) => JoinMode::Left,
+        (None, _, false) => JoinMode::Inner,
+        (Some(false), false, _) => JoinMode::Semi,
+        (Some(true), false, _) => JoinMode::Anti,
+        (Some(false), true, _) => JoinMode::BuildSemi,
+        (Some(true), true, _) => JoinMode::BuildAnti,
     };
     // inputs[0] must be the dispatch probe (streamed) side: the emit side for
     // the probe-emitting modes, the big side for the build-emitting ones.
@@ -296,17 +302,12 @@ fn build_join(
     }
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
-    let (left_map, right_map): (Vec<usize>, Vec<usize>) = if probe_is_left {
-        (
-            join.left_projection_map().collect(),
-            join.right_projection_map().collect(),
-        )
-    } else {
-        (
-            join.right_projection_map().collect(),
-            join.left_projection_map().collect(),
-        )
-    };
+    // Kept in DuckDB's own orientation; each replay arm below orients to the
+    // (probe, build) layout itself.
+    let (left_map, right_map): (Vec<usize>, Vec<usize>) = (
+        join.left_projection_map().collect(),
+        join.right_projection_map().collect(),
+    );
 
     let mut probe_keys = Vec::new();
     let mut build_keys = Vec::new();
@@ -375,10 +376,12 @@ fn build_join(
                 return_type: Type::Boolean,
             }));
         } else if !hashable {
-            // The semi/anti probe verifies hash keys exactly, but has nowhere
-            // to evaluate a non-key condition (no build columns come out).
+            // The semi/anti/left probes verify hash keys exactly, but have
+            // nowhere to evaluate a non-key condition (a downstream filter
+            // would drop a left join's padded rows; existence modes emit no
+            // build columns at all).
             return Err(OperatorError::Unsupported(format!(
-                "Unsupported semi/anti join condition: {comparison:?}"
+                "Unsupported non-inner join condition: {comparison:?}"
             )));
         }
     }
@@ -407,7 +410,7 @@ fn build_join(
             }),
         };
     }
-    if left_map.is_empty() && right_map.is_empty() {
+    if left_map.is_empty() && right_map.is_empty() && probe_is_left {
         return Ok(node);
     }
 
@@ -415,24 +418,33 @@ fn build_join(
     // the emitted side's kept columns (both sides for INNER), so select
     // exactly those positions out of the join's output.
     let projections: Vec<Expression> = match mode {
-        JoinMode::Inner => {
+        JoinMode::Inner | JoinMode::Left => {
+            // The join emits probe then build columns; DuckDB's output is its
+            // LEFT child's kept columns then its RIGHT child's. When the probe
+            // is child 1 (a flipped RIGHT join), that means build-side (offset
+            // past the probe) first.
+            let (left_types, left_offset, right_types, right_offset) = if probe_is_left {
+                (&probe_types, 0, &build_types, probe_types.len())
+            } else {
+                (&build_types, probe_types.len(), &probe_types, 0)
+            };
             let left_kept: Vec<usize> = if left_map.is_empty() {
-                (0..probe_types.len()).collect()
+                (0..left_types.len()).collect()
             } else {
                 left_map
             };
             let right_kept: Vec<usize> = if right_map.is_empty() {
-                (0..build_types.len()).collect()
+                (0..right_types.len()).collect()
             } else {
                 right_map
             };
             left_kept
                 .into_iter()
-                .map(|i| (i, probe_types[i].clone()))
+                .map(|i| (left_offset + i, left_types[i].clone()))
                 .chain(
                     right_kept
                         .into_iter()
-                        .map(|i| (probe_types.len() + i, build_types[i].clone())),
+                        .map(|i| (right_offset + i, right_types[i].clone())),
                 )
                 .map(|(column_idx, return_type)| {
                     Expression::Ref(Ref {
@@ -443,28 +455,25 @@ fn build_join(
                 })
                 .collect()
         }
-        // The probe-emitting existence modes output probe columns...
-        JoinMode::Semi | JoinMode::Anti => left_map
-            .into_iter()
-            .map(|column_idx| {
-                Expression::Ref(Ref {
-                    return_type: probe_types[column_idx].clone(),
-                    column_idx,
-                    name: None,
+        // The existence modes output the emitted side's columns; its map is
+        // DuckDB's left map (or the right one for the RIGHT_ variants, where
+        // the emitted side is DuckDB's right child).
+        JoinMode::Semi | JoinMode::Anti | JoinMode::BuildSemi | JoinMode::BuildAnti => {
+            let emit_types = match mode {
+                JoinMode::Semi | JoinMode::Anti => &probe_types,
+                _ => &build_types,
+            };
+            let map = if swap_sides { right_map } else { left_map };
+            map.into_iter()
+                .map(|column_idx| {
+                    Expression::Ref(Ref {
+                        return_type: emit_types[column_idx].clone(),
+                        column_idx,
+                        name: None,
+                    })
                 })
-            })
-            .collect(),
-        // ...and the build-emitting ones output build columns.
-        JoinMode::BuildSemi | JoinMode::BuildAnti => right_map
-            .into_iter()
-            .map(|column_idx| {
-                Expression::Ref(Ref {
-                    return_type: build_types[column_idx].clone(),
-                    column_idx,
-                    name: None,
-                })
-            })
-            .collect(),
+                .collect()
+        }
     };
     if projections.is_empty() {
         return Ok(node);

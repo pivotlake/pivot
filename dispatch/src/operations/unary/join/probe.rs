@@ -51,6 +51,8 @@ pub struct Probe {
     /// Probe fields followed (for an inner join) by build payload fields;
     /// built on first batch.
     output_schema: Option<Arc<Schema>>,
+    /// The LEFT mode's build payload with its all-null padding row appended.
+    padded_build_rows: Option<RecordBatch>,
 }
 
 impl Probe {
@@ -73,6 +75,7 @@ impl Probe {
             use_probe_array,
             allocator: SlabAllocator::new(false),
             output_schema: None,
+            padded_build_rows: None,
         }
     }
 
@@ -243,6 +246,180 @@ impl Probe {
         Ok(())
     }
 
+    /// LEFT OUTER probe over one batch: emit every verified match, and each
+    /// probe row without one paired with the all-null sentinel row appended
+    /// to the build payload.
+    #[allow(clippy::too_many_arguments)]
+    fn run_left<S: Sender<RecordBatch>, B>(
+        &mut self,
+        directory: &Directory<B>,
+        keys: &JoinArena<u64>,
+        rows: &JoinArena<u32>,
+        build_rows: &RecordBatch,
+        build_key_columns: &[usize],
+        batch: &RecordBatch,
+        sender: &mut S,
+    ) -> unary::Result<()>
+    where
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+    {
+        let probe_keys: Vec<&Int64Array> = self
+            .key_columns
+            .iter()
+            .map(|&c| batch.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let build_keys: Vec<&Int64Array> = build_key_columns
+            .iter()
+            .map(|&c| build_rows.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let null_safe = self.null_safe.clone();
+
+        // The padded build payload: one all-null row appended, which
+        // unmatched probe rows select. Build once per probe operator.
+        let padded = self.padded_build_rows(build_rows)?;
+        let sentinel = build_rows.num_rows() as u32;
+        let output_schema = self
+            .output_schema
+            .get_or_insert_with(|| {
+                let fields: Vec<Field> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .chain(
+                        padded
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|field| field.as_ref().clone().with_nullable(true)),
+                    )
+                    .collect();
+                Arc::new(Schema::new(fields))
+            })
+            .clone();
+
+        let mut probe_sel =
+            JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut build_sel =
+            JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut output_idx = 0;
+        macro_rules! push_pair {
+            ($row:expr, $build_row:expr) => {{
+                probe_sel.write(output_idx, $row as u32);
+                build_sel.write(output_idx, $build_row);
+                output_idx += 1;
+                if output_idx == RECORD_BATCH_SIZE {
+                    let probe_array = mem::replace(
+                        &mut probe_sel,
+                        JoinPrimitiveBuilder::<UInt32Type>::new(
+                            &mut self.allocator,
+                            RECORD_BATCH_SIZE,
+                        ),
+                    )
+                    .into_array(output_idx);
+                    let build_array = mem::replace(
+                        &mut build_sel,
+                        JoinPrimitiveBuilder::<UInt32Type>::new(
+                            &mut self.allocator,
+                            RECORD_BATCH_SIZE,
+                        ),
+                    )
+                    .into_array(output_idx);
+                    send_joined(
+                        batch,
+                        &padded,
+                        &probe_array,
+                        &build_array,
+                        &output_schema,
+                        sender,
+                    )?;
+                    output_idx = 0;
+                }
+            }};
+        }
+        for row in 0..batch.num_rows() {
+            let strict_valid = probe_keys
+                .iter()
+                .zip(&null_safe)
+                .all(|(column, &null_safe)| null_safe || column.is_valid(row));
+            let mut matched = false;
+            if strict_valid {
+                let hash = hash_key_row(&self.hash_state, &probe_keys, &null_safe, row);
+                if directory.matches_bloom(hash) {
+                    let slot = directory.slot_for(hash);
+                    let start = directory.end_ptr(slot as isize);
+                    let end = directory.end_ptr((slot + 1) as isize);
+                    for j in start..end {
+                        if keys[j] != hash {
+                            continue;
+                        }
+                        let build_row = rows[j] as usize;
+                        let key_equal = build_keys.iter().zip(&probe_keys).zip(&null_safe).all(
+                            |((b, p), &null_safe)| {
+                                if null_safe {
+                                    match (b.is_valid(build_row), p.is_valid(row)) {
+                                        (true, true) => b.value(build_row) == p.value(row),
+                                        (false, false) => true,
+                                        _ => false,
+                                    }
+                                } else {
+                                    b.value(build_row) == p.value(row)
+                                }
+                            },
+                        );
+                        if key_equal {
+                            matched = true;
+                            push_pair!(row, build_row as u32);
+                        }
+                    }
+                }
+            }
+            if !matched {
+                push_pair!(row, sentinel);
+            }
+        }
+        if output_idx > 0 {
+            let probe_array = probe_sel.into_array(output_idx);
+            let build_array = build_sel.into_array(output_idx);
+            send_joined(
+                batch,
+                &padded,
+                &probe_array,
+                &build_array,
+                &output_schema,
+                sender,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The build payload with one all-null row appended (the LEFT join's
+    /// padding target), built lazily once.
+    fn padded_build_rows(&mut self, build_rows: &RecordBatch) -> unary::Result<RecordBatch> {
+        if let Some(padded) = &self.padded_build_rows {
+            return Ok(padded.clone());
+        }
+        let fields: Vec<Field> = build_rows
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone().with_nullable(true))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let null_row = RecordBatch::try_new(
+            schema.clone(),
+            build_rows
+                .columns()
+                .iter()
+                .map(|column| arrow_array::new_null_array(column.data_type(), 1))
+                .collect(),
+        )?;
+        let relaxed = RecordBatch::try_new(schema.clone(), build_rows.columns().to_vec())?;
+        let padded = arrow::compute::concat_batches(&schema, [&relaxed, &null_row])?;
+        self.padded_build_rows = Some(padded.clone());
+        Ok(padded)
+    }
+
     /// Emit the marked (semi) or unmarked (anti) build rows, in payload
     /// order, chunked to batch size. Runs once, in the last probe worker.
     fn emit_marked<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<()> {
@@ -279,6 +456,27 @@ impl Probe {
         }
         Ok(())
     }
+}
+
+/// Emit joined rows: probe columns taken by `probe_sel`, build columns taken
+/// by `build_sel` (which may select the LEFT padding row).
+fn send_joined<S: Sender<RecordBatch>>(
+    probe: &RecordBatch,
+    build: &RecordBatch,
+    probe_sel: &ArrayRef,
+    build_sel: &ArrayRef,
+    schema: &Arc<Schema>,
+    sender: &mut S,
+) -> unary::Result<()> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for column in probe.columns() {
+        columns.push(take(column, probe_sel, None)?);
+    }
+    for column in build.columns() {
+        columns.push(take(column, build_sel, None)?);
+    }
+    sender.send(RecordBatch::try_new(schema.clone(), columns)?)?;
+    Ok(())
 }
 
 /// Emit the probe rows selected by `sel` (semi/anti output: probe columns
@@ -612,8 +810,17 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         let Some(build_rows) = build_rows else {
             // Empty build side: nothing matches, so an inner or semi join
             // emits nothing and an anti join passes every probe row through.
-            if self.mode == JoinMode::Anti && batch.num_rows() > 0 {
-                sender.send(batch)?;
+            // (A LEFT join should pad every probe row with nulls, but the
+            // build side's schema is unknown with zero build batches; fail
+            // loudly rather than emit the wrong shape.)
+            match self.mode {
+                JoinMode::Anti if batch.num_rows() > 0 => sender.send(batch)?,
+                JoinMode::Left => {
+                    return Err(crate::operations::unary::Error::Operator(
+                        "LEFT join over an empty build side is not supported yet".into(),
+                    ));
+                }
+                _ => {}
             }
             return Ok(());
         };
@@ -645,6 +852,21 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
                 build_rows,
                 &build_key_columns,
                 &batch,
+            );
+        }
+        if self.mode == JoinMode::Left {
+            let directory = unsafe { &*self.table.directory.get() };
+            let keys = unsafe { &*self.table.keys.get() };
+            let rows = unsafe { &*self.table.rows.get() };
+            let build_key_columns = self.build_key_columns.clone();
+            return self.run_left(
+                directory,
+                keys,
+                rows,
+                build_rows,
+                &build_key_columns,
+                &batch,
+                sender,
             );
         }
 

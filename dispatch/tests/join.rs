@@ -213,3 +213,30 @@ fn build_anti_join_with_empty_probe_emits_all_build_rows() {
     keys.sort();
     assert_eq!(keys, vec![1, 2]);
 }
+
+#[test]
+fn left_join_pads_unmatched_probe_rows_with_nulls() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 10, 30])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 20])]).record_batches();
+
+    let results = probe
+        .join(build, vec![0], vec![0], vec![false], JoinMode::Left)
+        .collect()
+        .unwrap();
+
+    use arrow_array::Array;
+    let mut rows: Vec<(i64, Option<i64>)> = results
+        .iter()
+        .flat_map(|b| {
+            let probe = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let build = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..b.num_rows())
+                .map(|i| (probe.value(i), build.is_valid(i).then(|| build.value(i))))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+
+    assert_eq!(rows, vec![(10, Some(10)), (10, Some(10)), (20, None)]);
+}
