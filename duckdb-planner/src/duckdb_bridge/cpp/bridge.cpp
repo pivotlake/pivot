@@ -302,6 +302,10 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 			plan = optimizer.Optimize(std::move(plan));
 		}
 		collapse_delim_joins(plan, plan);
+		// Populate every operator's cardinality estimate (the field is a
+		// lazy cache; the join order optimizer only fills the nodes it
+		// visits). The Rust walk reads them to pick join strategies.
+		plan->EstimateCardinality(context);
 		plan->ResolveOperatorTypes();
 		duckdb::ColumnBindingResolver resolver;
 		resolver.Verify(*plan);
