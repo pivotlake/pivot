@@ -142,7 +142,9 @@ impl Operator {
             // An inner join emits every probe column followed by every build
             // column; the existence modes emit one side only.
             Operator::Join(join) => match join.mode {
-                dispatch::JoinMode::Inner | dispatch::JoinMode::Left => {
+                dispatch::JoinMode::Inner
+                | dispatch::JoinMode::Left
+                | dispatch::JoinMode::BuildOuter => {
                     Ok(inputs[0].iter().chain(inputs[1].iter()).cloned().collect())
                 }
                 dispatch::JoinMode::Semi | dispatch::JoinMode::Anti => Ok(inputs[0].clone()),

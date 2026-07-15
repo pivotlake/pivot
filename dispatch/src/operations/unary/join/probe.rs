@@ -26,7 +26,7 @@ use arrow::compute::take;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt32Type};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use std::cmp::min;
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -46,6 +46,10 @@ pub struct Probe {
     /// side's field of the same name).
     null_safe: Vec<bool>,
     mode: JoinMode,
+    /// The probe side's column types as the planner declared them, used by
+    /// the BuildOuter mode's padded emission (which may run on a worker that
+    /// never saw a probe batch).
+    probe_types: Vec<DataType>,
     use_probe_array: bool,
     allocator: SlabAllocator,
     /// Probe fields followed (for an inner join) by build payload fields;
@@ -63,6 +67,7 @@ impl Probe {
         build_key_columns: Vec<usize>,
         null_safe: Vec<bool>,
         mode: JoinMode,
+        probe_types: Vec<DataType>,
         use_probe_array: bool,
     ) -> Self {
         Self {
@@ -72,6 +77,7 @@ impl Probe {
             build_key_columns,
             null_safe,
             mode,
+            probe_types,
             use_probe_array,
             allocator: SlabAllocator::new(false),
             output_schema: None,
@@ -389,6 +395,204 @@ impl Probe {
                 &output_schema,
                 sender,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Build-side outer probe over one batch: emit every verified match (probe
+    /// columns then build columns) and mark the matched build rows; the last
+    /// probe worker later emits the unmarked build rows padded with null probe
+    /// columns (see `emit_unmatched_padded`). Matches verify exactly against
+    /// the build payload, since a downstream filter can't re-check padded rows.
+    #[allow(clippy::too_many_arguments)]
+    fn run_build_outer<S: Sender<RecordBatch>, B>(
+        &mut self,
+        directory: &Directory<B>,
+        keys: &JoinArena<u64>,
+        rows: &JoinArena<u32>,
+        build_rows: &RecordBatch,
+        build_key_columns: &[usize],
+        batch: &RecordBatch,
+        sender: &mut S,
+    ) -> unary::Result<()>
+    where
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+    {
+        let probe_keys: Vec<&Int64Array> = self
+            .key_columns
+            .iter()
+            .map(|&c| batch.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let build_keys: Vec<&Int64Array> = build_key_columns
+            .iter()
+            .map(|&c| build_rows.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let matched = unsafe { &*self.table.matched.get() };
+        let null_safe = self.null_safe.clone();
+        let output_schema = self.build_outer_schema(build_rows);
+
+        let mut probe_sel =
+            JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut build_sel =
+            JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut output_idx = 0;
+        for row in 0..batch.num_rows() {
+            let strict_valid = probe_keys
+                .iter()
+                .zip(&null_safe)
+                .all(|(column, &null_safe)| null_safe || column.is_valid(row));
+            if !strict_valid {
+                continue;
+            }
+            let hash = hash_key_row(&self.hash_state, &probe_keys, &null_safe, row);
+            if !directory.matches_bloom(hash) {
+                continue;
+            }
+            let slot = directory.slot_for(hash);
+            let start = directory.end_ptr(slot as isize);
+            let end = directory.end_ptr((slot + 1) as isize);
+            for j in start..end {
+                if keys[j] != hash {
+                    continue;
+                }
+                let build_row = rows[j] as usize;
+                let key_equal = build_keys.iter().zip(&probe_keys).zip(&null_safe).all(
+                    |((b, p), &null_safe)| {
+                        if null_safe {
+                            match (b.is_valid(build_row), p.is_valid(row)) {
+                                (true, true) => b.value(build_row) == p.value(row),
+                                (false, false) => true,
+                                _ => false,
+                            }
+                        } else {
+                            b.value(build_row) == p.value(row)
+                        }
+                    },
+                );
+                if !key_equal {
+                    continue;
+                }
+                matched[build_row].store(true, Ordering::Relaxed);
+                probe_sel.write(output_idx, row as u32);
+                build_sel.write(output_idx, build_row as u32);
+                output_idx += 1;
+                if output_idx == RECORD_BATCH_SIZE {
+                    let probe_array = mem::replace(
+                        &mut probe_sel,
+                        JoinPrimitiveBuilder::<UInt32Type>::new(
+                            &mut self.allocator,
+                            RECORD_BATCH_SIZE,
+                        ),
+                    )
+                    .into_array(output_idx);
+                    let build_array = mem::replace(
+                        &mut build_sel,
+                        JoinPrimitiveBuilder::<UInt32Type>::new(
+                            &mut self.allocator,
+                            RECORD_BATCH_SIZE,
+                        ),
+                    )
+                    .into_array(output_idx);
+                    send_joined(
+                        batch,
+                        build_rows,
+                        &probe_array,
+                        &build_array,
+                        &output_schema,
+                        sender,
+                    )?;
+                    output_idx = 0;
+                }
+            }
+        }
+        if output_idx > 0 {
+            let probe_array = probe_sel.into_array(output_idx);
+            let build_array = build_sel.into_array(output_idx);
+            send_joined(
+                batch,
+                build_rows,
+                &probe_array,
+                &build_array,
+                &output_schema,
+                sender,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The BuildOuter output schema: the planner-declared probe columns
+    /// (nullable, they hold the padding) followed by the build payload's.
+    /// Derived from `probe_types` rather than a probe batch so the padded
+    /// emission can build it on a worker that never consumed one.
+    fn build_outer_schema(&mut self, build_rows: &RecordBatch) -> Arc<Schema> {
+        self.output_schema
+            .get_or_insert_with(|| {
+                let fields: Vec<Field> = self
+                    .probe_types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, data_type)| Field::new(format!("probe_{i}"), data_type.clone(), true))
+                    .chain(
+                        build_rows
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|field| field.as_ref().clone()),
+                    )
+                    .collect();
+                Arc::new(Schema::new(fields))
+            })
+            .clone()
+    }
+
+    /// Emit the build rows no probe row matched, their probe columns null.
+    /// Runs once, in the last probe worker, after every mark is in.
+    fn emit_unmatched_padded<S: Sender<RecordBatch>>(
+        &mut self,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        let build_rows = unsafe { &*self.table.build_rows.get() };
+        let Some(build_rows) = build_rows else {
+            return Ok(());
+        };
+        let build_rows = build_rows.clone();
+        let matched = unsafe { &*self.table.matched.get() };
+        let schema = self.build_outer_schema(&build_rows);
+
+        let mut sel =
+            JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut output_idx = 0;
+        macro_rules! flush_padded {
+            ($sel_array:expr, $len:expr) => {{
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+                for data_type in &self.probe_types {
+                    columns.push(arrow_array::new_null_array(data_type, $len));
+                }
+                for column in build_rows.columns() {
+                    columns.push(take(column, &$sel_array, None)?);
+                }
+                sender.send(RecordBatch::try_new(schema.clone(), columns)?)?;
+            }};
+        }
+        for (row, flag) in matched.iter().enumerate() {
+            if flag.load(Ordering::Relaxed) {
+                continue;
+            }
+            sel.write(output_idx, row as u32);
+            output_idx += 1;
+            if output_idx == RECORD_BATCH_SIZE {
+                let sel_array = mem::replace(
+                    &mut sel,
+                    JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE),
+                )
+                .into_array(output_idx);
+                flush_padded!(sel_array, RECORD_BATCH_SIZE);
+                output_idx = 0;
+            }
+        }
+        if output_idx > 0 {
+            let sel_array = sel.into_array(output_idx);
+            flush_padded!(sel_array, output_idx);
         }
         Ok(())
     }
@@ -854,6 +1058,21 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
                 &batch,
             );
         }
+        if self.mode == JoinMode::BuildOuter {
+            let directory = unsafe { &*self.table.directory.get() };
+            let keys = unsafe { &*self.table.keys.get() };
+            let rows = unsafe { &*self.table.rows.get() };
+            let build_key_columns = self.build_key_columns.clone();
+            return self.run_build_outer(
+                directory,
+                keys,
+                rows,
+                build_rows,
+                &build_key_columns,
+                &batch,
+                sender,
+            );
+        }
         if self.mode == JoinMode::Left {
             let directory = unsafe { &*self.table.directory.get() };
             let keys = unsafe { &*self.table.keys.get() };
@@ -928,8 +1147,10 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
-        if matches!(self.mode, JoinMode::BuildSemi | JoinMode::BuildAnti)
-            && self.table.probes_remaining.fetch_sub(1, Ordering::AcqRel) == 1
+        if matches!(
+            self.mode,
+            JoinMode::BuildSemi | JoinMode::BuildAnti | JoinMode::BuildOuter
+        ) && self.table.probes_remaining.fetch_sub(1, Ordering::AcqRel) == 1
         {
             // Last probe worker: every mark is in, emit the build rows. An
             // all-empty probe input still lands here (finish always runs), so
@@ -937,7 +1158,11 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             while !self.table.gate.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-            self.emit_marked(sender)?;
+            if self.mode == JoinMode::BuildOuter {
+                self.emit_unmatched_padded(sender)?;
+            } else {
+                self.emit_marked(sender)?;
+            }
         }
         Ok(true)
     }

@@ -254,17 +254,19 @@ fn build_join(
 ) -> Result<PlanNode, OperatorError> {
     // The RIGHT_ variants are the optimizer's children-swapped SEMI/ANTI (so
     // the smaller side builds); normalize to emit-side-first terms.
-    let (existence, swap_sides, left_outer) = match join.join_type() {
-        JoinType::INNER => (None, false, false),
-        JoinType::LEFT => (None, false, true),
-        // RIGHT is the optimizer's children-flipped LEFT: the preserved
-        // (probe) side is child 1 and the padded (build) side child 0; the
-        // output reorders back to DuckDB's left-then-right below.
-        JoinType::RIGHT => (None, true, true),
-        JoinType::SEMI => (Some(false), false, false),
-        JoinType::ANTI => (Some(true), false, false),
-        JoinType::RIGHT_SEMI => (Some(false), true, false),
-        JoinType::RIGHT_ANTI => (Some(true), true, false),
+    let (existence, swap_sides, outer) = match join.join_type() {
+        JoinType::INNER => (None, false, None),
+        // The outer joins keep DuckDB's orientation (probe = left child,
+        // build = right child); only which side gets padded differs. LEFT
+        // preserves the probe side, RIGHT the build side, so a RIGHT join is
+        // the build-side outer mode rather than a children swap (the
+        // optimizer already put the smaller relation on the right).
+        JoinType::LEFT => (None, false, Some(JoinMode::Left)),
+        JoinType::RIGHT => (None, false, Some(JoinMode::BuildOuter)),
+        JoinType::SEMI => (Some(false), false, None),
+        JoinType::ANTI => (Some(true), false, None),
+        JoinType::RIGHT_SEMI => (Some(false), true, None),
+        JoinType::RIGHT_ANTI => (Some(true), true, None),
         other => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported join type: {other:?}"
@@ -285,9 +287,9 @@ fn build_join(
             (Some(emit), Some(other)) => emit < other,
             _ => false,
         };
-    let mode = match (existence, build_on_emit, left_outer) {
-        (None, _, true) => JoinMode::Left,
-        (None, _, false) => JoinMode::Inner,
+    let mode = match (existence, build_on_emit, outer) {
+        (None, _, Some(outer_mode)) => outer_mode,
+        (None, _, None) => JoinMode::Inner,
         (Some(false), false, _) => JoinMode::Semi,
         (Some(true), false, _) => JoinMode::Anti,
         (Some(false), true, _) => JoinMode::BuildSemi,
@@ -399,6 +401,7 @@ fn build_join(
             build_keys,
             null_safe,
             mode,
+            probe_types: probe_types.clone(),
         }),
     };
     if !verify_conditions.is_empty() {
@@ -418,7 +421,7 @@ fn build_join(
     // the emitted side's kept columns (both sides for INNER), so select
     // exactly those positions out of the join's output.
     let projections: Vec<Expression> = match mode {
-        JoinMode::Inner | JoinMode::Left => {
+        JoinMode::Inner | JoinMode::Left | JoinMode::BuildOuter => {
             // The join emits probe then build columns; DuckDB's output is its
             // LEFT child's kept columns then its RIGHT child's. When the probe
             // is child 1 (a flipped RIGHT join), that means build-side (offset

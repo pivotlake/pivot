@@ -42,6 +42,7 @@ pub struct JoinProbeFactory {
     build_key_columns: Vec<usize>,
     null_safe: Vec<bool>,
     mode: JoinMode,
+    probe_types: Vec<arrow_schema::DataType>,
     use_probe_array: bool,
 }
 
@@ -58,6 +59,7 @@ pub fn create_for_workers(
     probe_key_columns: Vec<usize>,
     null_safe: Vec<bool>,
     mode: JoinMode,
+    probe_types: Vec<arrow_schema::DataType>,
     worker_count: usize,
 ) -> (
     impl IntoIterator<Item = JoinBuildFactory>,
@@ -126,6 +128,7 @@ pub fn create_for_workers(
         build_key_columns: build_keys_probe.clone(),
         null_safe: null_safe_probe.clone(),
         mode,
+        probe_types: probe_types.clone(),
         use_probe_array,
     });
 
@@ -168,6 +171,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory {
             self.build_key_columns,
             self.null_safe,
             self.mode,
+            self.probe_types,
             self.use_probe_array,
         )
     }

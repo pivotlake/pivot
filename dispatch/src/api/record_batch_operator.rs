@@ -592,6 +592,7 @@ impl RecordBatchOperatorSpec {
         probe_key_columns: Vec<usize>,
         null_safe: Vec<bool>,
         mode: JoinMode,
+        probe_types: Vec<arrow_schema::DataType>,
     ) -> Self {
         let worker_count = self.worker_count();
         let (build_factories, probe_factories, _gate) = create_join_factories(
@@ -599,6 +600,7 @@ impl RecordBatchOperatorSpec {
             probe_key_columns,
             null_safe,
             mode,
+            probe_types,
             worker_count,
         );
 

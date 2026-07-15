@@ -55,6 +55,11 @@ pub enum JoinMode {
     /// match once, its build columns null. Matches verify exactly against
     /// the build payload (a downstream filter can't re-check padded rows).
     Left,
+    /// Outer on the BUILD side (a RIGHT OUTER whose preserved side is the
+    /// build input): one row per matching pair, plus each build row no probe
+    /// row matched once, its probe columns null. The last probe worker emits
+    /// the padded rows, exactly as the build-emitting existence modes do.
+    BuildOuter,
 }
 
 /// A fixed-length, index-addressed heap buffer for the join's key/row arenas.

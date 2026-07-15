@@ -28,6 +28,10 @@ pub struct Join {
     /// Which rows come out: `Inner` emits probe plus build columns per match;
     /// `Semi`/`Anti` emit probe columns only, by match existence.
     pub mode: JoinMode,
+    /// The probe input's column types. The BuildOuter mode's padded emission
+    /// needs them to type its null probe columns on a worker that never
+    /// consumed a probe batch.
+    pub probe_types: Vec<crate::types::Type>,
 }
 
 impl fmt::Display for Join {
@@ -52,6 +56,10 @@ impl Join {
             self.probe_keys.clone(),
             self.null_safe.clone(),
             self.mode,
+            self.probe_types
+                .iter()
+                .map(crate::types::physical_arrow_type)
+                .collect(),
         ))
     }
 }

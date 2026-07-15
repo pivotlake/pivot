@@ -26,7 +26,14 @@ fn join_matching_keys() {
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Inner)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Inner,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -42,7 +49,14 @@ fn join_no_matches() {
     let probe = values_input(&d, vec![int64_batch("id", &[4, 5, 6])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Inner)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Inner,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -56,7 +70,14 @@ fn join_duplicate_build_keys() {
     let probe = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Inner)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Inner,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -72,7 +93,14 @@ fn join_all_keys_match() {
     let probe = values_input(&d, vec![int64_batch("id", &[5, 4, 3, 2, 1])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Inner)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Inner,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -91,7 +119,14 @@ fn join_large_tables() {
     let probe = values_input(&d, vec![int64_batch("id", &probe_keys)]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Inner)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Inner,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -107,7 +142,14 @@ fn join_then_count() {
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Inner)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Inner,
+            vec![DataType::Int64],
+        )
         .aggregate::<i64>(vec![AggregationSlot::new(
             AggregationKind::CountStar,
             0,
@@ -126,7 +168,14 @@ fn semi_join_emits_each_matching_probe_row_once() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 20, 30, 10])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Semi)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Semi,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -142,7 +191,14 @@ fn anti_join_emits_probe_rows_without_matches() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 20, 30, 40])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Anti)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Anti,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -158,7 +214,14 @@ fn anti_join_with_empty_build_passes_everything() {
     let probe = values_input(&d, vec![int64_batch("id", &[1, 2])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Anti)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Anti,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -174,7 +237,14 @@ fn build_semi_join_emits_matched_build_rows() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 10, 30, 99])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::BuildSemi)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::BuildSemi,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -190,7 +260,14 @@ fn build_anti_join_emits_unmatched_build_rows() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 30])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::BuildAnti)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::BuildAnti,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -205,7 +282,14 @@ fn build_anti_join_with_empty_probe_emits_all_build_rows() {
     let probe = values_input(&d, vec![int64_batch("id", &[])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::BuildAnti)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::BuildAnti,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -221,7 +305,14 @@ fn left_join_pads_unmatched_probe_rows_with_nulls() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 20])]).record_batches();
 
     let results = probe
-        .join(build, vec![0], vec![0], vec![false], JoinMode::Left)
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::Left,
+            vec![DataType::Int64],
+        )
         .collect()
         .unwrap();
 
@@ -239,4 +330,38 @@ fn left_join_pads_unmatched_probe_rows_with_nulls() {
     rows.sort();
 
     assert_eq!(rows, vec![(10, Some(10)), (10, Some(10)), (20, None)]);
+}
+
+#[test]
+fn build_outer_join_pads_unmatched_build_rows_with_nulls() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 10, 30])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 20])]).record_batches();
+
+    let results = probe
+        .join(
+            build,
+            vec![0],
+            vec![0],
+            vec![false],
+            JoinMode::BuildOuter,
+            vec![DataType::Int64],
+        )
+        .collect()
+        .unwrap();
+
+    use arrow_array::Array;
+    let mut rows: Vec<(Option<i64>, i64)> = results
+        .iter()
+        .flat_map(|b| {
+            let probe = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let build = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..b.num_rows())
+                .map(|i| (probe.is_valid(i).then(|| probe.value(i)), build.value(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+
+    assert_eq!(rows, vec![(None, 30), (Some(10), 10), (Some(10), 10)]);
 }
