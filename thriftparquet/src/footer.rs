@@ -5,7 +5,7 @@ use std::io::Write;
 
 // LogicalType is a thrift union where most variants are empty structs. We model
 // the ones whose arrow type pivot decodes natively: String, Integer, Date,
-// Timestamp, and Variant; everything else is `Other`.
+// Timestamp, Decimal, and Variant; everything else is `Other`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalType {
     String,
@@ -19,6 +19,12 @@ pub enum LogicalType {
     Timestamp {
         unit: TimeUnit,
         is_adjusted_to_utc: bool,
+    },
+    /// `DECIMAL`: a scaled integer (`value * 10^-scale`) over an INT32/INT64
+    /// (or FIXED_LEN_BYTE_ARRAY, which pivot doesn't decode) physical type.
+    Decimal {
+        scale: i32,
+        precision: i32,
     },
     /// Marks a group as a Parquet `variant` (its `metadata`/`value` children are
     /// binary). The writer emits it; the reader uses it to read those leaves as
@@ -88,6 +94,25 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for LogicalType {
                     is_adjusted_to_utc,
                 }
             }
+            // DECIMAL: struct { 1: i32 scale, 2: i32 precision }
+            5 => {
+                let mut scale: i32 = 0;
+                let mut precision: i32 = 0;
+                let mut last_field_id = 0i16;
+                loop {
+                    let fi = prot.read_field_begin(last_field_id)?;
+                    if fi.field_type == FieldType::Stop {
+                        break;
+                    }
+                    match fi.id {
+                        1 => scale = prot.read_i32()?,
+                        2 => precision = prot.read_i32()?,
+                        _ => prot.skip(fi.field_type)?,
+                    }
+                    last_field_id = fi.id;
+                }
+                LogicalType::Decimal { scale, precision }
+            }
             // VARIANT: a (possibly empty) VariantType struct we don't read into.
             16 => {
                 prot.skip(field_ident.field_type)?;
@@ -153,6 +178,8 @@ thrift_struct!(
         4: required string name;
         5: optional i32 num_children;
         6: optional i32 converted_type;
+        7: optional i32 scale;
+        8: optional i32 precision;
         10: optional LogicalType logical_type;
     }
 );

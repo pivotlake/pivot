@@ -18,6 +18,9 @@
 mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
 
+mod decimal;
+pub use decimal::DecimalFloatDecoder;
+
 mod levels;
 
 mod primitive;

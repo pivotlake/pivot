@@ -361,6 +361,8 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
         name: "schema".to_string(),
         num_children: Some(schema.fields().len() as i32),
         converted_type: None,
+        scale: None,
+        precision: None,
         logical_type: None,
     });
     for field in schema.fields() {
@@ -375,6 +377,8 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
                 DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_UTF8),
                 _ => None,
             },
+            scale: None,
+            precision: None,
             logical_type: None,
         });
     }

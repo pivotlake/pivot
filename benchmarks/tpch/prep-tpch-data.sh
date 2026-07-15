@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# prep-tpch-data.sh — sync the normalized TPC-H parquet dataset from S3 to a
+# local directory (one subdirectory per table), the layout `setup.sql` expects.
+#
+# The canonical datasets (generated with tpchgen-cli, see the schema comment in
+# setup.sql):
+#   s3://epsio-tpch/sf10/                      SF10,  ~3.9 GB
+#   s3://epsio-tpch/sf100/                     SF100, ~41.5 GB, 7 MiB row groups
+#   s3://epsio-tpch/sf100-large-row-groups/    SF100, ~35.8 GB, 128 MiB row groups
+#
+# Usage:
+#   ./prep-tpch-data.sh                                  # sf100 → ~/tpch-sf100
+#   ./prep-tpch-data.sh --dataset sf10 --root ~/tpch-sf10
+#
+# Then run the suite (from the crate root):
+#   cargo run --release -- --suite tpch --source <root> --iterations 3
+
+set -euo pipefail
+
+dataset="sf100"
+root=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dataset) dataset="$2"; shift 2 ;;
+        --root)    root="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+root="${root:-$HOME/tpch-$dataset}"
+
+mkdir -p "$root"
+aws s3 sync "s3://epsio-tpch/$dataset/" "$root/"
+echo "ready: --suite tpch --source $root"

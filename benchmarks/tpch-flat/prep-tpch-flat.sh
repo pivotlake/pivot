@@ -14,7 +14,7 @@
 # The flat table is one row per lineitem (dims join 1:1, so no fan-out): at
 # SF100 that is ~600M rows. Point the suite at it:
 #
-#   cargo run --release -- --suite tpch --source <root>/flat --iterations 3
+#   cargo run --release -- --suite tpch-flat --source <root>/flat --iterations 3
 #
 # The denormalizing join is memory-hungry; DuckDB spills to --temp-dir. Give it a
 # fast disk with a few hundred GB free.
@@ -79,7 +79,7 @@ fi
 if [[ -d "$flat_dir" && -n "$(ls -A "$flat_dir" 2>/dev/null)" && $force -eq 0 ]]; then
     echo "  have  flat table ($flat_dir)"
     echo
-    echo "ready: --suite tpch --source $flat_dir"
+    echo "ready: --suite tpch-flat --source $flat_dir"
     exit 0
 fi
 
@@ -171,4 +171,4 @@ COPY (
 SQL
 
 echo
-echo "ready: --suite tpch --source $flat_dir"
+echo "ready: --suite tpch-flat --source $flat_dir"

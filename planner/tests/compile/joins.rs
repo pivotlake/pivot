@@ -170,3 +170,75 @@ fn non_equality_join_reports_unsupported(mut testing_planner: TestingPlanner) {
 
     assert!(error.to_string().contains("join"), "got: {error}");
 }
+
+#[rstest]
+fn join_with_case_in_list_and_date_arithmetic(mut testing_planner: TestingPlanner) {
+    // The shape of TPC-H q12: IN list, column-to-column date compares, a
+    // constant-folded date + interval bound, and SUM(CASE ...) per group.
+    testing_planner.add_table(
+        "orders2",
+        &[
+            ("o_orderkey", Type::Int64, int64_col(vec![1, 2, 3])),
+            (
+                "o_orderpriority",
+                Type::Utf8,
+                str_col(vec!["1-URGENT", "3-MEDIUM", "2-HIGH"]),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "lineitem2",
+        &[
+            ("l_orderkey", Type::Int64, int64_col(vec![1, 2, 3, 3])),
+            (
+                "l_shipmode",
+                Type::Utf8,
+                str_col(vec!["MAIL", "SHIP", "MAIL", "AIR"]),
+            ),
+            (
+                "l_shipdate",
+                Type::Date,
+                Arc::new(arrow_array::Date32Array::from(vec![8700; 4])),
+            ),
+            (
+                "l_commitdate",
+                Type::Date,
+                Arc::new(arrow_array::Date32Array::from(vec![8760; 4])),
+            ),
+            (
+                "l_receiptdate",
+                Type::Date,
+                Arc::new(arrow_array::Date32Array::from(vec![8790; 4])),
+            ),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "select l_shipmode, \
+            sum(case when o_orderpriority = '1-URGENT' or o_orderpriority = '2-HIGH' \
+                then 1 else 0 end) as high_line_count, \
+            sum(case when o_orderpriority <> '1-URGENT' and o_orderpriority <> '2-HIGH' \
+                then 1 else 0 end) as low_line_count \
+         from orders2, lineitem2 \
+         where o_orderkey = l_orderkey \
+           and l_shipmode in ('MAIL', 'SHIP') \
+           and l_commitdate < l_receiptdate \
+           and l_shipdate < l_commitdate \
+           and l_receiptdate >= date '1993-11-01' \
+           and l_receiptdate < date '1993-11-01' + interval '1' year \
+         group by l_shipmode \
+         order by l_shipmode",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"l_shipmode": "MAIL", "high_line_count": 2, "low_line_count": 0},
+            {"l_shipmode": "SHIP", "high_line_count": 0, "low_line_count": 1},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}

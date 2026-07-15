@@ -835,3 +835,61 @@ fn scan_empty_table() {
 
     assert_eq!(extract_count(&results), 0);
 }
+
+#[test]
+fn scan_decimal_columns_as_float64() {
+    // DECIMAL(15,2) stores scaled INT64, DECIMAL(9,2) scaled INT32; a table
+    // declaring them DECIMAL reads both as the Float64 values.
+    let dispatch = dispatch(1);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("wide", DataType::Decimal128(15, 2), false),
+        Field::new("narrow", DataType::Decimal128(9, 2), true),
+    ]));
+    let wide = arrow_array::Decimal128Array::from(vec![12345i128, -10, 0])
+        .with_precision_and_scale(15, 2)
+        .unwrap();
+    let narrow = arrow_array::Decimal128Array::from(vec![Some(999i128), None, Some(-1)])
+        .with_precision_and_scale(9, 2)
+        .unwrap();
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(wide), Arc::new(narrow)]).unwrap();
+    let dir = TempDir::new().unwrap();
+    let file = std::fs::File::create(dir.path().join("data.parquet")).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let declared = [
+        planner::catalog::Column {
+            name: "wide".into(),
+            col_type: planner::types::Type::Decimal,
+        },
+        planner::catalog::Column {
+            name: "narrow".into(),
+            col_type: planner::types::Type::Decimal,
+        },
+    ];
+    let table = Arc::new(ParquetTable::from_directory(&dispatch, dir.path(), &declared).unwrap());
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let batch = &results[0];
+    let wide = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(wide.values(), &[123.45, -0.1, 0.0]);
+    let narrow = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    use arrow_array::Array;
+    assert!(narrow.is_null(1));
+    assert_eq!(narrow.value(0), 9.99);
+    assert_eq!(narrow.value(2), -0.01);
+}

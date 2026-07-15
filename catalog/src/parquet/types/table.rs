@@ -29,6 +29,14 @@ use url::Url;
 
 static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
 
+/// Field-metadata key recording a decimal leaf's storage width (`"int32"` /
+/// `"int64"`), stamped at footer parse time.
+pub const DECIMAL_PHYSICAL_METADATA_KEY: &str = "pivot.decimal.physical";
+/// Field-metadata key recording a decimal leaf's scale, stamped when a
+/// declared DECIMAL column retypes the field to `Float64` — the page decoder
+/// reads it to divide the stored scaled integers out.
+pub const DECIMAL_SCALE_METADATA_KEY: &str = "pivot.decimal.scale";
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
@@ -241,7 +249,7 @@ fn build_row_groups(
                     let meta = cc.meta_data.expect("missing column metadata");
                     let statistics = meta
                         .statistics
-                        .and_then(|s| decode_statistics(s, leaves[j].data_type()));
+                        .and_then(|s| decode_statistics(s, &leaves[j]));
                     let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                         && data_pages_all_dictionary(meta.encoding_stats.as_deref());
                     ColumnChunkMeta {
@@ -294,13 +302,14 @@ fn data_pages_all_dictionary(encoding_stats: Option<&[PageEncodingStats]>) -> bo
 }
 
 /// Decode a Parquet `Statistics` blob into our [`ColumnStatistics`], using
-/// `data_type` to choose the right physical-bytes -> Arrow scalar conversion.
+/// the leaf's type to choose the right physical-bytes -> Arrow scalar
+/// conversion.
 ///
 /// Prefer the modern `min_value` / `max_value` fields and fall back to the
 /// legacy `min` / `max` only when those aren't populated. Unsupported types
 /// (or stats whose bytes don't match the expected width) yield `None` for
 /// that side rather than failing the parse.
-fn decode_statistics(stats: Statistics, data_type: &DataType) -> Option<ColumnStatistics> {
+fn decode_statistics(stats: Statistics, leaf: &Field) -> Option<ColumnStatistics> {
     let max_bytes = stats.max_value.or(stats.max);
     let min_bytes = stats.min_value.or(stats.min);
     if max_bytes.is_none()
@@ -310,12 +319,51 @@ fn decode_statistics(stats: Statistics, data_type: &DataType) -> Option<ColumnSt
     {
         return None;
     }
+    // A retyped decimal leaf reads Float64 but stores scaled-integer stats:
+    // decode the integer bytes and divide the scale out, so pruning compares
+    // in the same Float64 domain the queries do.
+    let decode = |bytes: Vec<u8>| match decimal_layout(leaf) {
+        Some((width, factor)) => {
+            let scaled = match width {
+                DecimalWidth::Int32 => i32::from_le_bytes(bytes.try_into().ok()?) as f64,
+                DecimalWidth::Int64 => i64::from_le_bytes(bytes.try_into().ok()?) as f64,
+            };
+            Some(Scalar::new(
+                Arc::new(Float64Array::new_scalar(scaled * factor).into_inner()) as ArrayRef,
+            ))
+        }
+        None => decode_scalar(&bytes, leaf.data_type()),
+    };
     Some(ColumnStatistics {
-        min: min_bytes.and_then(|bytes| decode_scalar(&bytes, data_type)),
-        max: max_bytes.and_then(|bytes| decode_scalar(&bytes, data_type)),
+        min: min_bytes.and_then(decode),
+        max: max_bytes.and_then(decode),
         null_count: stats.null_count,
         distinct_count: stats.distinct_count,
     })
+}
+
+/// A decimal leaf's storage width.
+#[derive(Clone, Copy)]
+pub(crate) enum DecimalWidth {
+    Int32,
+    Int64,
+}
+
+/// The storage width and scale factor of a decimal leaf retyped to `Float64`
+/// by [`apply_declared_types`], from its field metadata. `None` for every
+/// other leaf.
+pub(crate) fn decimal_layout(leaf: &Field) -> Option<(DecimalWidth, f64)> {
+    let scale: i32 = leaf
+        .metadata()
+        .get(DECIMAL_SCALE_METADATA_KEY)?
+        .parse()
+        .ok()?;
+    let width = match leaf.metadata().get(DECIMAL_PHYSICAL_METADATA_KEY)?.as_str() {
+        "int32" => DecimalWidth::Int32,
+        "int64" => DecimalWidth::Int64,
+        _ => return None,
+    };
+    Some((width, 10f64.powi(-scale)))
 }
 
 fn decode_scalar(bytes: &[u8], data_type: &DataType) -> Option<Scalar<ArrayRef>> {
@@ -462,6 +510,24 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
                     field.as_ref().clone().with_data_type(DataType::Int64),
                 ));
             }
+            // A declared DECIMAL over a file's decimal column reads as the
+            // Float64 the executor computes with: retype the field and record
+            // the storage scale, so the page decoder divides the stored
+            // scaled integers out. (A file storing plain DOUBLE — e.g. one
+            // pivot itself wrote back — passes the generic check below.)
+            if **declared == Type::Decimal
+                && let DataType::Decimal128(_, scale) = file_type
+            {
+                let mut metadata = field.metadata().clone();
+                metadata.insert(DECIMAL_SCALE_METADATA_KEY.to_owned(), scale.to_string());
+                return Ok(Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::Float64)
+                        .with_metadata(metadata),
+                ));
+            }
             let matches_declared = match declared {
                 Type::Variant => matches!(file_type, DataType::Struct(_)),
                 _ => *file_type == planner::types::physical_arrow_type(declared),
@@ -552,8 +618,22 @@ fn parse_schema_element(
                 elem.physical_type,
                 elem.converted_type,
                 elem.logical_type.as_ref(),
+                elem.scale.zip(elem.precision),
             )?;
-            Ok((Field::new(&elem.name, data_type, nullable), idx + 1))
+            let mut field = Field::new(&elem.name, data_type.clone(), nullable);
+            // A decimal leaf keeps its storage width on the field: the arrow
+            // type only carries precision/scale, but the page decoder needs to
+            // know whether the scaled integers are 4 or 8 bytes.
+            if matches!(data_type, DataType::Decimal128(_, _)) {
+                field = field.with_metadata(
+                    [(
+                        DECIMAL_PHYSICAL_METADATA_KEY.to_owned(),
+                        super::arrow_map::decimal_physical_label(elem.physical_type).to_owned(),
+                    )]
+                    .into(),
+                );
+            }
+            Ok((field, idx + 1))
         }
     }
 }
@@ -757,6 +837,8 @@ mod tests {
             name: name.to_string(),
             num_children,
             converted_type: None,
+            scale: None,
+            precision: None,
             logical_type: None,
         }
     }

@@ -57,6 +57,9 @@ const CONVERTED_INT_32: i32 = 17;
 const CONVERTED_DATE: i32 = 6;
 const CONVERTED_TIMESTAMP_MILLIS: i32 = 9;
 const CONVERTED_TIMESTAMP_MICROS: i32 = 10;
+/// Legacy decimal annotation (superseded by `LogicalType::Decimal`); the
+/// scale/precision then come from the schema element's own fields.
+const CONVERTED_DECIMAL: i32 = 5;
 
 /// Read path: a Parquet leaf's physical type (plus optional logical/converted
 /// annotations) -> the arrow [`DataType`] the executor decodes it into.
@@ -71,10 +74,26 @@ pub fn parquet_to_arrow(
     physical_type: Option<i32>,
     converted_type: Option<i32>,
     logical_type: Option<&LogicalType>,
+    decimal: Option<(i32, i32)>,
 ) -> Result<DataType> {
     let pt = physical_type.ok_or_else(|| {
         Error::UnsupportedType("leaf schema element missing physical type".to_string())
     })?;
+
+    // A DECIMAL annotation (modern or legacy) wins over the physical type: the
+    // stored integers are scaled and must not be read as plain ints. Only the
+    // INT32/INT64 encodings are decodable; a FIXED_LEN_BYTE_ARRAY decimal
+    // falls through to the unsupported-physical-type error below.
+    if (pt == INT32 || pt == INT64)
+        && let Some((scale, precision)) = decimal_annotation(converted_type, logical_type, decimal)
+    {
+        let (Ok(precision), Ok(scale)) = (u8::try_from(precision), i8::try_from(scale)) else {
+            return Err(Error::UnsupportedType(format!(
+                "DECIMAL({precision}, {scale}) column"
+            )));
+        };
+        return Ok(DataType::Decimal128(precision, scale));
+    }
 
     match pt {
         BOOLEAN => Ok(DataType::Boolean),
@@ -95,6 +114,24 @@ pub fn parquet_to_arrow(
             "Parquet physical type {pt}"
         ))),
     }
+}
+
+/// The `(scale, precision)` of a DECIMAL leaf, from the modern `LogicalType`
+/// or the legacy `ConvertedType` (whose numbers live in the schema element's
+/// own scale/precision fields, passed as `element_decimal`). `None` when the
+/// leaf isn't a decimal.
+fn decimal_annotation(
+    converted_type: Option<i32>,
+    logical_type: Option<&LogicalType>,
+    element_decimal: Option<(i32, i32)>,
+) -> Option<(i32, i32)> {
+    if let Some(LogicalType::Decimal { scale, precision }) = logical_type {
+        return Some((*scale, *precision));
+    }
+    if converted_type == Some(CONVERTED_DECIMAL) {
+        return element_decimal;
+    }
+    None
 }
 
 /// The arrow type of an INT32 leaf, resolved from its annotation: a `DATE` is
@@ -155,6 +192,18 @@ fn int64_arrow(
             }
             _ => Ok(DataType::Int64),
         },
+    }
+}
+
+/// The storage-width label a decimal leaf's field metadata records
+/// (`pivot.decimal.physical`). Only called for leaves [`parquet_to_arrow`]
+/// mapped to `Decimal128`, whose physical type is INT32 or INT64 by
+/// construction.
+pub fn decimal_physical_label(physical_type: Option<i32>) -> &'static str {
+    match physical_type {
+        Some(t) if t == INT32 => "int32",
+        Some(t) if t == INT64 => "int64",
+        other => unreachable!("decimal leaf with physical type {other:?}"),
     }
 }
 

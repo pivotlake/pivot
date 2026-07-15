@@ -9,7 +9,7 @@
 use crate::parquet::reading::decoding::ScanEqualityPredicate;
 use crate::parquet::reading::decoding::column_decoders;
 use crate::parquet::reading::decoding::column_decoders::{
-    BytesViewDecoder, ColumnDecoder, PrimitiveColumnDecoder,
+    BytesViewDecoder, ColumnDecoder, DecimalFloatDecoder, PrimitiveColumnDecoder,
 };
 use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
 use crate::parquet::types::leaves::{
@@ -53,14 +53,27 @@ fn native_scalar<T: ArrowPrimitiveType>(scalar: &Scalar<ArrayRef>) -> Option<T::
     (primitive.len() == 1).then(|| primitive.value(0))
 }
 
-/// Get a column decoder for a given data type. When `eq_const` is present and
+/// Get a column decoder for a leaf field. When `eq_const` is present and
 /// downcasts to the column's native type, the constant is installed for
 /// dictionary pruning.
-fn column_decoder_for_type(
-    data_type: &DataType,
+fn column_decoder_for_leaf(
+    leaf: &arrow_schema::Field,
     max_def_level: i16,
     eq_const: Option<&Scalar<ArrayRef>>,
 ) -> Result<Box<dyn ColumnDecoder>> {
+    // A decimal leaf retyped to Float64 stores scaled integers; its layout
+    // (width + scale factor) travels on the field metadata.
+    if let Some((width, factor)) = crate::parquet::types::table::decimal_layout(leaf) {
+        return Ok(match width {
+            crate::parquet::types::table::DecimalWidth::Int32 => {
+                Box::new(DecimalFloatDecoder::<Int32Type>::new(max_def_level, factor))
+            }
+            crate::parquet::types::table::DecimalWidth::Int64 => {
+                Box::new(DecimalFloatDecoder::<Int64Type>::new(max_def_level, factor))
+            }
+        });
+    }
+    let data_type = leaf.data_type();
     macro_rules! primitive {
         ($t:ty) => {{
             let mut decoder = PrimitiveColumnDecoder::<$t>::new(max_def_level);
@@ -173,8 +186,8 @@ impl RowGroupDecoder {
                 } else {
                     None
                 };
-                column_decoders.push(column_decoder_for_type(
-                    leaves[leaf].data_type(),
+                column_decoders.push(column_decoder_for_leaf(
+                    &leaves[leaf],
                     columns[leaf].max_def_level,
                     eq_value,
                 )?);
