@@ -241,7 +241,13 @@ pub mod ffi {
         /// DuckDB `JoinType` discriminant.
         fn lo_join_type(op: &LogicalOperator) -> u8;
         fn lo_join_condition_count(op: &LogicalOperator) -> usize;
+        /// Whether condition `index` is a left/right comparison (vs one
+        /// arbitrary boolean predicate over both sides).
+        fn lo_join_condition_is_comparison(op: &LogicalOperator, index: usize) -> bool;
         fn lo_join_condition_left(op: &LogicalOperator, index: usize) -> &Expression;
+        /// The non-comparison form's predicate, resolved against the join's
+        /// combined (left then right) child bindings.
+        fn lo_join_condition_predicate(op: &LogicalOperator, index: usize) -> &Expression;
         fn lo_join_condition_right(op: &LogicalOperator, index: usize) -> &Expression;
         /// DuckDB `ExpressionType` discriminant of the condition's comparison.
         fn lo_join_condition_comparison(op: &LogicalOperator, index: usize) -> u8;

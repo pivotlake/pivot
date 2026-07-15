@@ -377,3 +377,70 @@ fn four_way_join_with_string_payloads_and_grouping(mut testing_planner: TestingP
         .clone()
     );
 }
+
+#[rstest]
+fn join_with_like_and_aggregate_division(mut testing_planner: TestingPlanner) {
+    // The shape of TPC-H q14: LIKE prefix inside a CASE numerator, divided by
+    // another aggregate.
+    testing_planner.add_table(
+        "parts14",
+        &[
+            ("p_partkey", Type::Int64, int64_col(vec![1, 2])),
+            (
+                "p_type",
+                Type::Utf8,
+                str_col(vec!["PROMO BRUSHED", "STANDARD TIN"]),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "items14",
+        &[
+            ("l_partkey", Type::Int64, int64_col(vec![1, 2])),
+            (
+                "l_price",
+                Type::Decimal,
+                std::sync::Arc::new(arrow_array::Float64Array::from(vec![30.0, 70.0]))
+                    as arrow_array::ArrayRef,
+            ),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "select 100.00 * sum(case when p_type like 'PROMO%' then l_price else 0 end) \
+             / sum(l_price) as promo \
+         from items14, parts14 where l_partkey = p_partkey",
+    );
+
+    assert_eq!(rows, vec![serde_json::json!({"promo": 30.0})]);
+}
+
+#[rstest]
+fn join_with_or_of_condition_groups(mut testing_planner: TestingPlanner) {
+    // The shape of TPC-H q19: the join key equality repeated inside an OR of
+    // conjunction groups.
+    testing_planner.add_table(
+        "parts19",
+        &[
+            ("p_partkey", Type::Int64, int64_col(vec![1, 2, 3])),
+            ("p_brand", Type::Utf8, str_col(vec!["A", "B", "C"])),
+        ],
+    );
+    testing_planner.add_table(
+        "items19",
+        &[
+            ("l_partkey", Type::Int64, int64_col(vec![1, 2, 3])),
+            ("l_qty", Type::Int64, int64_col(vec![5, 15, 25])),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "select sum(l_qty) as total from items19, parts19 \
+         where (p_partkey = l_partkey and p_brand = 'A' and l_qty between 1 and 10) \
+            or (p_partkey = l_partkey and p_brand = 'B' and l_qty between 11 and 20)",
+    );
+
+    assert_eq!(rows, vec![serde_json::json!({"total": 20})]);
+}

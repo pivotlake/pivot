@@ -19,8 +19,8 @@ use std::collections::HashMap;
 use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType, LogicalTypeId};
 use duckdb_planner::handle::{
-    ComparisonJoin as ComparisonJoinView, DynamicFilterRef, Operator as DuckOperator,
-    TableScan as TableScanView, rowid_column_id,
+    ComparisonJoin as ComparisonJoinView, DynamicFilterRef, JoinCondition,
+    Operator as DuckOperator, TableScan as TableScanView, rowid_column_id,
 };
 
 use crate::catalog::Table;
@@ -262,17 +262,31 @@ fn build_join(
     let mut build_keys = Vec::new();
     let mut verify_conditions = Vec::new();
     for condition in join.conditions() {
-        let Expression::Ref(left) = Expression::from_handle(condition.left)? else {
+        let (left, right, comparison) = match condition {
+            JoinCondition::Comparison {
+                left,
+                right,
+                comparison,
+            } => (left, right, comparison),
+            // The non-comparison form (an arbitrary boolean over both sides,
+            // e.g. q19's OR of predicate groups) is already bound to the
+            // join's combined output, so it filters as-is.
+            JoinCondition::Predicate(expr) => {
+                verify_conditions.push(Expression::from_handle(expr)?);
+                continue;
+            }
+        };
+        let Expression::Ref(left) = Expression::from_handle(left)? else {
             return Err(OperatorError::Unsupported(
-                "join conditions must compare plain columns".to_string(),
+                "join comparison conditions must compare plain columns".to_string(),
             ));
         };
-        let Expression::Ref(right) = Expression::from_handle(condition.right)? else {
+        let Expression::Ref(right) = Expression::from_handle(right)? else {
             return Err(OperatorError::Unsupported(
-                "join conditions must compare plain columns".to_string(),
+                "join comparison conditions must compare plain columns".to_string(),
             ));
         };
-        if condition.comparison == ExpressionType::COMPARE_EQUAL
+        if comparison == ExpressionType::COMPARE_EQUAL
             && left.return_type == Type::Int64
             && right.return_type == Type::Int64
         {
@@ -285,10 +299,9 @@ fn build_join(
                 column_idx: probe_types.len() + right.column_idx,
                 ..right
             })),
-            compare_type: condition.comparison.clone().try_into().map_err(|_| {
+            compare_type: comparison.clone().try_into().map_err(|_| {
                 OperatorError::Unsupported(format!(
-                    "Unsupported join comparison type: {:?}",
-                    condition.comparison
+                    "Unsupported join comparison type: {comparison:?}"
                 ))
             })?,
             return_type: Type::Boolean,

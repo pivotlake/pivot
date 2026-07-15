@@ -482,17 +482,29 @@ impl<'plan> ComparisonJoin<'plan> {
         JoinType::from_u8(ffi::lo_join_type(self.raw))
     }
 
-    /// The join's conditions. Each side's expression is bound positionally to
-    /// that child's output (LHS into child 0, RHS into child 1).
+    /// The join's conditions. A comparison condition's sides are bound
+    /// positionally to their child's output (LHS into child 0, RHS into
+    /// child 1); a predicate condition is one boolean expression bound to the
+    /// combined (left then right) child outputs.
     pub fn conditions(self) -> impl Iterator<Item = JoinCondition<'plan>> {
-        (0..ffi::lo_join_condition_count(self.raw)).map(move |i| JoinCondition {
-            left: Expr {
-                raw: ffi::lo_join_condition_left(self.raw, i),
-            },
-            right: Expr {
-                raw: ffi::lo_join_condition_right(self.raw, i),
-            },
-            comparison: ExpressionType::from_u8(ffi::lo_join_condition_comparison(self.raw, i)),
+        (0..ffi::lo_join_condition_count(self.raw)).map(move |i| {
+            if ffi::lo_join_condition_is_comparison(self.raw, i) {
+                JoinCondition::Comparison {
+                    left: Expr {
+                        raw: ffi::lo_join_condition_left(self.raw, i),
+                    },
+                    right: Expr {
+                        raw: ffi::lo_join_condition_right(self.raw, i),
+                    },
+                    comparison: ExpressionType::from_u8(ffi::lo_join_condition_comparison(
+                        self.raw, i,
+                    )),
+                }
+            } else {
+                JoinCondition::Predicate(Expr {
+                    raw: ffi::lo_join_condition_predicate(self.raw, i),
+                })
+            }
         })
     }
 
@@ -511,12 +523,18 @@ impl<'plan> ComparisonJoin<'plan> {
     }
 }
 
-/// One condition of a comparison join: `left <comparison> right`, each side
-/// bound positionally to the corresponding child's output.
-pub struct JoinCondition<'plan> {
-    pub left: Expr<'plan>,
-    pub right: Expr<'plan>,
-    pub comparison: ExpressionType,
+/// One condition of a comparison join.
+pub enum JoinCondition<'plan> {
+    /// `left <comparison> right`, each side bound positionally to the
+    /// corresponding child's output.
+    Comparison {
+        left: Expr<'plan>,
+        right: Expr<'plan>,
+        comparison: ExpressionType,
+    },
+    /// An arbitrary boolean predicate over both sides, bound to the combined
+    /// (left then right) child outputs.
+    Predicate(Expr<'plan>),
 }
 
 /// One sort key of an ORDER BY / TopN: a direction plus the keyed expression.
