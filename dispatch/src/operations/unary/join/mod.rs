@@ -134,6 +134,22 @@ pub(crate) struct JoinTable {
     pub(crate) gate: Arc<AtomicBool>,
 }
 
+impl JoinTable {
+    /// An empty stand-in a probe swaps in once it is done with the shared
+    /// table, releasing its share of the real one.
+    pub(crate) fn released() -> Self {
+        JoinTable {
+            directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
+            keys: Arc::new(JoinCell::new(JoinArena::empty())),
+            rows: Arc::new(JoinCell::new(JoinArena::empty())),
+            build_rows: Arc::new(JoinCell::new(None)),
+            matched: Arc::new(JoinCell::new(Vec::new())),
+            probes_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            gate: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
