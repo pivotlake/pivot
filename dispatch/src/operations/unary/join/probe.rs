@@ -404,6 +404,11 @@ impl Probe {
     /// probe worker later emits the unmarked build rows padded with null probe
     /// columns (see `emit_unmatched_padded`). Matches verify exactly against
     /// the build payload, since a downstream filter can't re-check padded rows.
+    ///
+    /// Like the inner probe, null strict keys are filtered up front (a probe
+    /// row is not preserved by this mode, so dropping non-matching rows early
+    /// is sound), hashes are precomputed per batch, and the directory and key
+    /// arena are prefetched a fixed lookahead ahead of the scan.
     #[allow(clippy::too_many_arguments)]
     fn run_build_outer<S: Sender<RecordBatch>, B>(
         &mut self,
@@ -418,6 +423,13 @@ impl Probe {
     where
         B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
     {
+        let batch = filter_null_keys(
+            batch.clone(),
+            &strict_key_columns(&self.key_columns, &self.null_safe),
+        );
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
         let probe_keys: Vec<&Int64Array> = self
             .key_columns
             .iter()
@@ -427,6 +439,13 @@ impl Probe {
             .iter()
             .map(|&c| build_rows.column(c).as_primitive::<Int64Type>())
             .collect();
+        let hashes: Vec<u64> = (0..batch.num_rows())
+            .map(|i| hash_key_row(&self.hash_state, &probe_keys, &self.null_safe, i))
+            .collect();
+        // The common single strict Int64 key compares raw value slices; the
+        // general path (composite or null-safe keys) re-checks validity.
+        let single_key = probe_keys.len() == 1 && !self.null_safe[0];
+        let (probe_values, build_values) = (probe_keys[0].values(), build_keys[0].values());
         let matched = unsafe { &*self.table.matched.get() };
         let null_safe = self.null_safe.clone();
         let output_schema = self.build_outer_schema(build_rows);
@@ -437,14 +456,19 @@ impl Probe {
             JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
         let mut output_idx = 0;
         for row in 0..batch.num_rows() {
-            let strict_valid = probe_keys
-                .iter()
-                .zip(&null_safe)
-                .all(|(column, &null_safe)| null_safe || column.is_valid(row));
-            if !strict_valid {
-                continue;
+            const DIRECTORY_PREFETCH_DISTANCE: usize = 16;
+            const ARENA_PREFETCH_DISTANCE: usize = 8;
+            if row + DIRECTORY_PREFETCH_DISTANCE < hashes.len() {
+                directory.prefetch_l2(hashes[row + DIRECTORY_PREFETCH_DISTANCE]);
             }
-            let hash = hash_key_row(&self.hash_state, &probe_keys, &null_safe, row);
+            if row + ARENA_PREFETCH_DISTANCE < hashes.len() {
+                let future_hash = hashes[row + ARENA_PREFETCH_DISTANCE];
+                let future_slot = directory.slot_for(future_hash);
+                let future_start = directory.end_ptr(future_slot as isize);
+                prefetch_ptr_l2(keys.ptr_at_index(future_start) as *const u8);
+            }
+
+            let hash = hashes[row];
             if !directory.matches_bloom(hash) {
                 continue;
             }
@@ -456,19 +480,23 @@ impl Probe {
                     continue;
                 }
                 let build_row = rows[j] as usize;
-                let key_equal = build_keys.iter().zip(&probe_keys).zip(&null_safe).all(
-                    |((b, p), &null_safe)| {
-                        if null_safe {
-                            match (b.is_valid(build_row), p.is_valid(row)) {
-                                (true, true) => b.value(build_row) == p.value(row),
-                                (false, false) => true,
-                                _ => false,
+                let key_equal = if single_key {
+                    build_values[build_row] == probe_values[row]
+                } else {
+                    build_keys.iter().zip(&probe_keys).zip(&null_safe).all(
+                        |((b, p), &null_safe)| {
+                            if null_safe {
+                                match (b.is_valid(build_row), p.is_valid(row)) {
+                                    (true, true) => b.value(build_row) == p.value(row),
+                                    (false, false) => true,
+                                    _ => false,
+                                }
+                            } else {
+                                b.value(build_row) == p.value(row)
                             }
-                        } else {
-                            b.value(build_row) == p.value(row)
-                        }
-                    },
-                );
+                        },
+                    )
+                };
                 if !key_equal {
                     continue;
                 }
@@ -494,7 +522,7 @@ impl Probe {
                     )
                     .into_array(output_idx);
                     send_joined(
-                        batch,
+                        &batch,
                         build_rows,
                         &probe_array,
                         &build_array,
@@ -509,7 +537,7 @@ impl Probe {
             let probe_array = probe_sel.into_array(output_idx);
             let build_array = build_sel.into_array(output_idx);
             send_joined(
-                batch,
+                &batch,
                 build_rows,
                 &probe_array,
                 &build_array,
