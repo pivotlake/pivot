@@ -11,7 +11,9 @@
 use std::marker::PhantomData;
 use std::mem;
 
+use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
+use arrow_array::{ArrayRef, Scalar};
 use arrow_buffer::ArrowNativeType;
 
 use crate::parquet::reading::decoding::column_decoders::{DecodePlain, Dict, TypedColumnDecoder};
@@ -225,6 +227,15 @@ where
 {
     type Builder = PrimitiveBuilder<T>;
     type Item = T::Native;
+    type EqConstant = T::Native;
+
+    /// The scalar matches when its array is a single-element
+    /// `PrimitiveArray<T>`; a logical/physical type mismatch yields `None`.
+    fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<T::Native> {
+        let (arr, _) = arrow_array::Datum::get(scalar);
+        let primitive = arr.as_primitive_opt::<T>()?;
+        (primitive.len() == 1).then(|| primitive.value(0))
+    }
 
     fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
         let mut entries = allocator.create_multi_slab_buffer(size, false);

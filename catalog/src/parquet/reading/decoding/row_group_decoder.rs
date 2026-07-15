@@ -18,12 +18,11 @@ use crate::parquet::types::leaves::{
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
-use arrow_array::cast::AsArray;
+use arrow_array::RecordBatch;
 use arrow_array::types::{
-    ArrowPrimitiveType, BinaryViewType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type,
-    Int64Type, StringViewType, TimestampSecondType, UInt16Type,
+    BinaryViewType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    StringViewType, TimestampSecondType, UInt16Type,
 };
-use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_schema::{ArrowError, DataType, Fields, Schema, SchemaRef, TimeUnit};
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
@@ -43,32 +42,15 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Extracts the single native value from `scalar` if its array is a
-/// `PrimitiveArray<T>`; otherwise `None` (logical/physical type mismatch, which
-/// disables dictionary pruning for this column — always sound, the upstream
-/// `Filter` still runs).
-fn native_scalar<T: ArrowPrimitiveType>(scalar: &Scalar<ArrayRef>) -> Option<T::Native> {
-    let (arr, _) = arrow_array::Datum::get(scalar);
-    let primitive = arr.as_primitive_opt::<T>()?;
-    (primitive.len() == 1).then(|| primitive.value(0))
-}
-
-/// Get a column decoder for a given data type. When `eq_const` is present and
-/// downcasts to the column's native type, the constant is installed for
-/// dictionary pruning.
+/// Get a column decoder for a given data type.
 fn column_decoder_for_type(
     data_type: &DataType,
     max_def_level: i16,
-    eq_const: Option<&Scalar<ArrayRef>>,
 ) -> Result<Box<dyn ColumnDecoder>> {
     macro_rules! primitive {
-        ($t:ty) => {{
-            let mut decoder = PrimitiveColumnDecoder::<$t>::new(max_def_level);
-            if let Some(value) = eq_const.and_then(native_scalar::<$t>) {
-                decoder.set_eq_constant(value);
-            }
-            Box::new(decoder) as Box<dyn ColumnDecoder>
-        }};
+        ($t:ty) => {
+            Box::new(PrimitiveColumnDecoder::<$t>::new(max_def_level)) as Box<dyn ColumnDecoder>
+        };
     }
     match data_type {
         DataType::UInt16 => Ok(primitive!(UInt16Type)),
@@ -127,6 +109,15 @@ pub struct RowGroupDecoder {
     /// remaining, not-yet-decompressed pages instead of decompressing them only
     /// for this decoder to discard.
     pruned: Arc<AtomicBool>,
+    /// The batch column each decoder's output lands in, one entry per
+    /// decoder. Multi-leaf (variant) columns fold several decoders into the
+    /// same batch column.
+    decoder_output_columns: Vec<usize>,
+    /// Whether emitted batches may drop rows that fail a pushed-down
+    /// equality constant. The materializer path must not: it addresses rows
+    /// by their position inside the row group, so every row has to stay in
+    /// place.
+    filter_batches: bool,
 }
 
 impl RowGroupDecoder {
@@ -146,8 +137,11 @@ impl RowGroupDecoder {
 
         let mut column_decoders = Vec::new();
         let mut prunable_columns = Vec::new();
+        let mut decoder_output_columns = Vec::new();
+        let filter_batches =
+            !add_row_group_metadata && row_group_metadata.filtered_indices().is_none();
         let mut output_fields = Vec::with_capacity(projection.column_indices.len());
-        for &column in &projection.column_indices {
+        for (output_idx, &column) in projection.column_indices.iter().enumerate() {
             output_fields.push(fields[column].clone());
             let start = first_leaf(fields, column);
             let count = leaf_count(&fields[column]);
@@ -156,28 +150,27 @@ impl RowGroupDecoder {
                 .then(|| eq_predicates.iter().find(|p| p.column_idx == column))
                 .flatten();
             for leaf in start..start + count {
-                // Only a column chunk whose data pages are all dictionary
-                // encoded can be soundly pruned by dictionary contents.
+                decoder_output_columns.push(output_idx);
+                // A column chunk can only be pruned (or batch-filtered) by
+                // dictionary contents when every one of its data pages is
+                // dictionary encoded; a PLAIN fallback page could hold the
+                // constant even if the dictionary does not.
                 let prunable = predicate.is_some() && columns[leaf].data_pages_all_dictionary;
                 if prunable {
                     prunable_columns.push(column_decoders.len());
                 }
+                let mut decoder =
+                    column_decoder_for_type(leaves[leaf].data_type(), columns[leaf].max_def_level)?;
                 // Install the equality constant only when the column is prunable.
                 // The decoder uses it to skip building a dictionary that excludes
-                // the constant — sound only when an excluded dictionary prunes the
-                // whole row group. On a non-prunable column (e.g. PLAIN fallback
-                // data pages) the row group is still scanned, so the dictionary
-                // must be built to decode it.
-                let eq_value = if prunable {
-                    predicate.map(|p| &p.value)
-                } else {
-                    None
-                };
-                column_decoders.push(column_decoder_for_type(
-                    leaves[leaf].data_type(),
-                    columns[leaf].max_def_level,
-                    eq_value,
-                )?);
+                // the constant, which is sound only when an excluded dictionary
+                // prunes the whole row group. On a non-prunable column (e.g.
+                // PLAIN fallback data pages) the row group is still scanned, so
+                // the dictionary must be built to decode it.
+                if prunable && let Some(p) = predicate {
+                    decoder.set_eq_constant(&p.value);
+                }
+                column_decoders.push(decoder);
             }
         }
 
@@ -195,6 +188,8 @@ impl RowGroupDecoder {
             add_row_group_metadata,
             prunable_columns,
             pruned,
+            decoder_output_columns,
+            filter_batches,
         })
     }
 
@@ -264,6 +259,22 @@ impl RowGroupDecoder {
             let columns =
                 nest_leaves_into_columns(self.schema.fields(), &mut leaf_arrays.into_iter());
             let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
+            // Give each decoder a chance to drop rows that provably fail its
+            // pushed-down equality constant, before the batch travels any
+            // further. Most decoders leave the batch untouched; dictionary
+            // encoded string columns filter it with a cheap view comparison.
+            // Never done on the materializer path, which needs every row to
+            // stay in place.
+            let record_batch = if self.filter_batches {
+                self.column_decoders
+                    .iter()
+                    .zip(&self.decoder_output_columns)
+                    .fold(record_batch, |batch, (decoder, &column)| {
+                        decoder.fast_filter_record_batch(batch, column)
+                    })
+            } else {
+                record_batch
+            };
             let batch = if self.add_row_group_metadata {
                 with_row_group_metadata(record_batch, self.row_group_idx, self.row_offset)
             } else {

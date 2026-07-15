@@ -21,7 +21,7 @@ use crate::parquet::types::filter_mask::RunningFilterMask;
 use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::parquet::types::thrift::general::Encoding;
 use crate::parquet::types::thrift::headers::DataPageHeader;
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::arrays::ValidityBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
@@ -215,8 +215,10 @@ pub struct TypedColumnDecoder<
     read_page: Option<ReadPage<D, B, P>>,
     /// Dictionary built from a dictionary page, if one has been received.
     dict: Option<D>,
-    /// Pushed-down equality constant for dictionary pruning, if any.
-    eq_const: Option<B::Element>,
+    /// The pushed-down equality constant, in this dictionary flavour's own
+    /// representation (see [`Dict::EqConstant`]). Drives row-group pruning
+    /// and scan-side batch filtering once the dictionary is built.
+    eq_const: Option<D::EqConstant>,
     /// Whether the dictionary was scanned and found to exclude
     /// [`Self::eq_const`]. Stays `false` until a dictionary page proves the
     /// constant absent.
@@ -240,13 +242,6 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
             dict_excludes_eq_constant: false,
             phantom_data: Default::default(),
         }
-    }
-
-    /// Installs a pushed-down equality constant. When the dictionary is later
-    /// built, it is scanned once for this value; if absent, the enclosing row
-    /// group can be pruned (see [`ColumnDecoder::dict_excludes_eq_constant`]).
-    pub fn set_eq_constant(&mut self, value: B::Element) {
-        self.eq_const = Some(value);
     }
 
     /// Selects the appropriate [`ValueDecoder`] (plain or RLE-dictionary)
@@ -335,8 +330,19 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
 where
     B::Element: PartialEq,
 {
+    fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
+        self.eq_const = D::eq_constant_from_scalar(value);
+    }
+
     fn dict_excludes_eq_constant(&self) -> bool {
         self.dict_excludes_eq_constant
+    }
+
+    fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
+        match (&self.eq_const, &self.dict) {
+            (Some(needle), Some(dict)) => dict.filter_record_batch_by_const(batch, column, needle),
+            _ => batch,
+        }
     }
 
     fn available(&self) -> usize {
@@ -477,6 +483,10 @@ mod tests {
 
     fn encode_i32s(values: &[i32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn int_scalar(value: i32) -> Scalar<ArrayRef> {
+        Scalar::new(std::sync::Arc::new(Int32Array::from(vec![value])) as ArrayRef)
     }
 
     fn extract_i32s(arr: &ArrayRef) -> Vec<i32> {
@@ -634,7 +644,7 @@ mod tests {
     #[test]
     fn test_dict_excludes_false_before_dict_loaded() {
         let mut dec = Dec::new(0);
-        dec.set_eq_constant(20);
+        dec.set_eq_constant(&int_scalar(20));
 
         assert!(!dec.dict_excludes_eq_constant());
     }
@@ -645,7 +655,7 @@ mod tests {
         init_test_free_pool(4);
         let mut alloc = SlabAllocator::new(true);
         let mut dec = Dec::new(0);
-        dec.set_eq_constant(20);
+        dec.set_eq_constant(&int_scalar(20));
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
         assert!(!dec.dict_excludes_eq_constant());
@@ -657,7 +667,7 @@ mod tests {
         init_test_free_pool(4);
         let mut alloc = SlabAllocator::new(true);
         let mut dec = Dec::new(0);
-        dec.set_eq_constant(99);
+        dec.set_eq_constant(&int_scalar(99));
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
         assert!(dec.dict_excludes_eq_constant());

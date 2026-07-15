@@ -226,7 +226,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
 
 #[cfg(test)]
 mod tests {
-    use crate::parquet::reading::decoding::Decoder;
+    use crate::parquet::reading::decoding::{Decoder, ScanEqualityPredicate};
     use crate::parquet::types::metadata::{
         ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata,
     };
@@ -235,7 +235,7 @@ mod tests {
     use crate::parquet::types::table::ParquetTable;
     use crate::parquet::types::thrift::general::Encoding;
     use crate::parquet::types::thrift::headers::PageHeader;
-    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;
     use dispatch::memory::init_test_free_pool;
@@ -322,6 +322,91 @@ mod tests {
         ))
     }
 
+    /// A table over `(s: Utf8View, v: Int32)` with `s` marked fully
+    /// dictionary encoded (or not), the shape the view-equality tests need.
+    fn string_and_i32_table(num_rows: i64, all_dictionary: bool) -> Arc<ParquetTable> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8View, false),
+            Field::new("v", DataType::Int32, false),
+        ]));
+        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let column = |dict| ColumnChunkMeta {
+            dictionary_page_offset: None,
+            data_page_offset: 0,
+            total_compressed_size: 0,
+            max_def_level: 0,
+            statistics: None,
+            data_pages_all_dictionary: dict,
+        };
+        Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
+            location: dispatch::io::FileLocation::Local(file),
+            schema,
+            columns: vec![column(all_dictionary), column(false)],
+            num_rows,
+            file_row_group_idx: 0,
+            live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })]))
+    }
+
+    fn make_dict_page(
+        metadata: QueryRowGroupMetadata,
+        column_idx: usize,
+        entries: &[&str],
+    ) -> DecompressedPage {
+        let mut data = Vec::new();
+        for s in entries {
+            data.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            data.extend_from_slice(s.as_bytes());
+        }
+        let header = PageHeader::for_dict_page(entries.len() as i32);
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: metadata,
+            column_idx,
+            idx: 0,
+            data: DecompressedPageType::Dict {
+                header: header.dictionary_page_header.unwrap(),
+                data: vec![Bytes::from(data)],
+            },
+        }
+    }
+
+    /// An RLE-dictionary data page holding `keys` (bit width 8: one RLE run
+    /// per key keeps the encoding trivial).
+    fn make_rle_data_page(
+        metadata: QueryRowGroupMetadata,
+        column_idx: usize,
+        keys: &[u8],
+        page_idx: usize,
+    ) -> DecompressedPage {
+        let mut data = vec![8u8];
+        for &key in keys {
+            data.push(1 << 1);
+            data.push(key);
+        }
+        let header = PageHeader::for_data_page(keys.len() as i32, Encoding::RLE_DICTIONARY);
+        DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: metadata,
+            column_idx,
+            idx: page_idx,
+            data: DecompressedPageType::Data(DataPage {
+                header: header.data_page_header.unwrap(),
+                data: vec![Bytes::from(data)],
+                filter_mask: None,
+            }),
+        }
+    }
+
+    fn string_eq_predicate(column_idx: usize, value: &str) -> ScanEqualityPredicate {
+        ScanEqualityPredicate {
+            column_idx,
+            value: Scalar::new(
+                Arc::new(arrow_array::StringViewArray::from(vec![value])) as ArrayRef
+            ),
+        }
+    }
+
     fn new_decoder(table: &Arc<ParquetTable>, batch_size: usize) -> Decoder {
         Decoder::new(
             batch_size,
@@ -329,6 +414,81 @@ mod tests {
             false,
             Arc::new(Vec::new()),
         )
+    }
+
+    fn decoder_with_eq(table: &Arc<ParquetTable>, predicate: ScanEqualityPredicate) -> Decoder {
+        Decoder::new(
+            1024,
+            Projection::all_from_schema(table.schema()),
+            false,
+            Arc::new(vec![predicate]),
+        )
+    }
+
+    fn extract_strings(batch: &RecordBatch, col: usize) -> Vec<String> {
+        let a = batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<arrow_array::StringViewArray>()
+            .unwrap();
+        (0..a.len()).map(|i| a.value(i).to_string()).collect()
+    }
+
+    /// A pushed string equality filters emitted batches down to matching rows
+    /// via view equality against the dictionary's view of the constant.
+    #[test]
+    fn view_eq_filters_batches_to_matching_rows() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(5, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "DELIVER IN PERSON", "SHIP"]);
+        let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2, 1, 0], 0);
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0);
+        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "DELIVER IN PERSON"));
+
+        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
+        assert_eq!(rows, vec![2, 4]);
+        let kept: Vec<String> = out.iter().flat_map(|b| extract_strings(b, 0)).collect();
+        assert_eq!(kept, vec!["DELIVER IN PERSON", "DELIVER IN PERSON"]);
+    }
+
+    /// A duplicated dictionary entry makes the single-view test unfaithful,
+    /// so batches pass through unfiltered (the upstream Filter still applies
+    /// the predicate).
+    #[test]
+    fn duplicate_dictionary_entries_disable_view_eq() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(3, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict = make_dict_page(metadata.clone(), 0, &["AIR", "AIR", "RAIL"]);
+        let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2], 0);
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
+        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "AIR"));
+
+        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
+        assert_eq!(rows, vec![1, 2, 3]);
+    }
+
+    /// A chunk with non-dictionary data pages must not view-filter: equal
+    /// strings from a plain page carry different views.
+    #[test]
+    fn mixed_encoding_chunk_is_not_view_filtered() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(3, false);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "SHIP"]);
+        let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 0], 0);
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
+        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "MAIL"));
+
+        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
+        assert_eq!(rows, vec![1, 2, 3]);
     }
 
     /// Single Int32 column, one page → one RecordBatch with correct values.
