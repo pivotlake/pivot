@@ -1,4 +1,3 @@
-use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::directory::{Directory, JoinDirectory};
 use crate::operations::unary::join::{JoinArena, JoinCell};
@@ -27,7 +26,10 @@ pub(crate) struct BuildTuple {
     row: u32,
 }
 
-pub(crate) type PartitionBuffers = Vec<SlabVec<BuildTuple>>;
+/// Per-partition staging for one worker's build tuples. Plain heap (not ring
+/// slabs): a big build's staging would otherwise compete with group-bys and
+/// the caches for ring memory, and heap frees safely from any thread.
+pub(crate) type PartitionBuffers = Vec<Vec<BuildTuple>>;
 
 /// Everything one build worker hands to the single [`JoinBuilder`] that
 /// assembles the join table: which worker it was (payload row indices are
@@ -49,7 +51,6 @@ pub struct JoinBuildConsumer {
     values: PartitionBuffers,
     payload: Vec<RecordBatch>,
     rows_consumed: usize,
-    slab_allocator: SlabAllocator,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     sender: mpsc::Sender<BuildWorkerOutput>,
     outputter: JoinBuilder,
@@ -84,10 +85,9 @@ impl JoinBuildConsumer {
             null_safe,
             worker_id,
             hash_state,
-            values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
+            values: (0..NUM_PARTITIONS).map(|_| Vec::new()).collect(),
             payload: Vec::new(),
             rows_consumed: 0,
-            slab_allocator: SlabAllocator::new(false),
             partition_sizes: partition_sizes.clone(),
             sender,
             outputter: JoinBuilder {
@@ -195,13 +195,10 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
         for i in 0..n {
             let hash = hash_key_row(&self.hash_state, &columns, &self.null_safe, i);
             let partition = (hash >> PARTITION_SHIFT) as usize;
-            self.values[partition].push(
-                &mut self.slab_allocator,
-                BuildTuple {
-                    hash,
-                    row: (self.rows_consumed + i) as u32,
-                },
-            );
+            self.values[partition].push(BuildTuple {
+                hash,
+                row: (self.rows_consumed + i) as u32,
+            });
         }
         self.rows_consumed += n;
         self.payload.push(batch);
@@ -244,7 +241,7 @@ unsafe impl Send for JoinBuilder {}
 pub struct JoinPartitionJob {
     /// This partition's tuples, one entry per build worker, paired with that
     /// worker's global payload row base (added to each tuple's local row).
-    tuples: Vec<(u32, SlabVec<BuildTuple>)>,
+    tuples: Vec<(u32, Vec<BuildTuple>)>,
     directory: Arc<JoinCell<JoinDirectory>>,
     keys: Arc<JoinCell<JoinArena<u64>>>,
     rows: Arc<JoinCell<JoinArena<u32>>>,
@@ -276,13 +273,13 @@ impl JoinPartitionJob {
         // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
         // lower 16 bits
         for (_, worker_tuples) in &self.tuples {
-            worker_tuples.for_each(|tuple| {
+            for tuple in worker_tuples {
                 let slot = (tuple.hash >> shift) as usize;
                 unsafe {
                     directory.add_to_entry(slot, 1 << 16);
                     directory.or_to_entry(slot, Directory::<B>::compute_tag(tuple.hash) as u64);
                 }
-            });
+            }
         }
 
         // Pass 2: convert counts to absolute write cursors. Linear sweep
@@ -307,8 +304,8 @@ impl JoinPartitionJob {
         // slot before we reach it.
         const PREFETCH_AHEAD: usize = 64;
         for (row_base, worker_tuples) in &self.tuples {
-            worker_tuples.for_each_prefetched::<PREFETCH_AHEAD>(|tuple, ahead| {
-                if let Some(ahead_tuple) = ahead {
+            for (i, tuple) in worker_tuples.iter().enumerate() {
+                if let Some(ahead_tuple) = worker_tuples.get(i + PREFETCH_AHEAD) {
                     directory.prefetch_l2(ahead_tuple.hash);
                 }
                 let slot = (tuple.hash >> shift) as usize;
@@ -319,7 +316,7 @@ impl JoinPartitionJob {
                     keys.ptr_at_index(arena_idx).write(tuple.hash);
                     rows.ptr_at_index(arena_idx).write(row_base + tuple.row);
                 }
-            });
+            }
         }
 
         // Last partition job to complete opens the gate for the probe side.
@@ -405,7 +402,7 @@ impl Outputter<()> for JoinBuilder {
 
             let slots_per_partition = dir_capacity / NUM_PARTITIONS;
             for i in 0..NUM_PARTITIONS {
-                let tuples: Vec<(u32, SlabVec<BuildTuple>)> = worker_outputs
+                let tuples: Vec<(u32, Vec<BuildTuple>)> = worker_outputs
                     .iter_mut()
                     .zip(&row_bases)
                     .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))
