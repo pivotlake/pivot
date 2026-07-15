@@ -225,7 +225,7 @@ impl RowGroupDecoder {
             && self
                 .prunable_columns
                 .iter()
-                .any(|&pos| self.column_decoders[pos].dict_excludes_constant() == Some(true))
+                .any(|&pos| self.column_decoders[pos].dict_excludes_eq_constant())
         {
             // Publish to the shared flag (seen by every page of this row group):
             // the decoder discards the rest, and the decompressor can skip the

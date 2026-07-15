@@ -244,7 +244,7 @@ where
     /// dictionary would get, minus the copy. Anything else (unaligned, split
     /// across buffers, or a narrowed physical type) falls back to the scalar
     /// reader.
-    fn contains(data: &[Bytes], size: usize, needle: &T::Native) -> bool {
+    fn maybe_contains(data: &[Bytes], size: usize, needle: &T::Native) -> bool {
         let width = T::Native::PHYSICAL_SIZE;
         if data.len() == 1 && width == mem::size_of::<T::Native>() && data[0].len() >= size * width
         {
@@ -289,19 +289,19 @@ mod tests {
     use dispatch::memory::init_test_free_pool;
 
     #[test]
-    fn contains_finds_present_and_rejects_absent() {
+    fn maybe_contains_finds_present_and_rejects_absent() {
         init_test_free_pool(4);
         // A contiguous, aligned i64 dictionary (the vectorized fast path).
         let data = vec![Bytes::from(encode_i64s(&[10, 20, 30, 40, 50]))];
-        assert!(PrimitiveDict::<Int64Type>::contains(&data, 5, &10));
-        assert!(PrimitiveDict::<Int64Type>::contains(&data, 5, &50));
-        assert!(PrimitiveDict::<Int64Type>::contains(&data, 5, &30));
-        assert!(!PrimitiveDict::<Int64Type>::contains(&data, 5, &35));
-        assert!(!PrimitiveDict::<Int64Type>::contains(&data, 5, &0));
+        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &10));
+        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &50));
+        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &30));
+        assert!(!PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &35));
+        assert!(!PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &0));
     }
 
     #[test]
-    fn contains_finds_value_straddling_a_buffer_boundary() {
+    fn maybe_contains_finds_value_straddling_a_buffer_boundary() {
         init_test_free_pool(4);
         // Three i64 values split so the middle one straddles the seam — this
         // takes the scalar-reader fallback (data.len() != 1).
@@ -310,10 +310,10 @@ mod tests {
             Bytes::from(bytes[..12].to_vec()), // v0 + first half of v1
             Bytes::from(bytes[12..].to_vec()), // second half of v1 + v2
         ];
-        assert!(PrimitiveDict::<Int64Type>::contains(&data, 3, &10));
-        assert!(PrimitiveDict::<Int64Type>::contains(&data, 3, &20)); // straddles seam
-        assert!(PrimitiveDict::<Int64Type>::contains(&data, 3, &30));
-        assert!(!PrimitiveDict::<Int64Type>::contains(&data, 3, &99));
+        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &10));
+        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &20)); // straddles seam
+        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &30));
+        assert!(!PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &99));
     }
 
     fn make_data_page(

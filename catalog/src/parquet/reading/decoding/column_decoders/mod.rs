@@ -65,13 +65,12 @@ pub trait ColumnDecoder {
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
-    /// For a column carrying a pushed-down equality constant: once the
-    /// dictionary has been loaded, returns `Some(true)` if the constant is
-    /// **absent** from the dictionary (so no dictionary-encoded row can match),
-    /// `Some(false)` if present. Returns `None` when no constant was pushed or
-    /// the dictionary has not been loaded yet (so no decision can be made).
-    fn dict_excludes_constant(&self) -> Option<bool> {
-        None
+    /// Whether the loaded dictionary is known to exclude the pushed-down
+    /// equality constant, meaning no row of this column can match and the row
+    /// group can be pruned. `false` until a dictionary page proves otherwise
+    /// (no constant pushed, dictionary not loaded yet, or constant present).
+    fn dict_excludes_eq_constant(&self) -> bool {
+        false
     }
 }
 
@@ -101,13 +100,12 @@ pub trait Dict {
     /// Builds the dictionary from raw page bytes containing `size` entries.
     fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self;
 
-    /// Whether `needle` appears among the first `size` raw entries of `data`,
-    /// *without* building the dictionary. Used for equality pushdown: when the
-    /// constant is absent the row group is pruned, so we avoid the (allocate +
-    /// copy) cost of materializing a dictionary we'd never read. Defaults to
-    /// `true` (assume present → never prune here, always sound); overridden by
-    /// impls that support the pushdown.
-    fn contains(_data: &[Bytes], _size: usize, _needle: &Self::Item) -> bool {
+    /// Whether `needle` might appear among the first `size` raw entries of
+    /// `data`, checked without building the dictionary. Only a definite `no`
+    /// matters - it prunes the row group and the dictionary is never
+    /// materialized - so answering `true` is always sound. The default cannot
+    /// rule anything out; implementations override it to enable the pushdown.
+    fn maybe_contains(_data: &[Bytes], _size: usize, _needle: &Self::Item) -> bool {
         true
     }
 

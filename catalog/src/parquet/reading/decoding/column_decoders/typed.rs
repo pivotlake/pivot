@@ -217,10 +217,10 @@ pub struct TypedColumnDecoder<
     dict: Option<D>,
     /// Pushed-down equality constant for dictionary pruning, if any.
     eq_const: Option<B::Element>,
-    /// Cached result of scanning the dictionary for [`Self::eq_const`]:
-    /// `Some(true)` when the constant is absent, `Some(false)` when present,
-    /// `None` before the dictionary is built (or when no constant is set).
-    dict_excludes: Option<bool>,
+    /// Whether the dictionary was scanned and found to exclude
+    /// [`Self::eq_const`]. Stays `false` until a dictionary page proves the
+    /// constant absent.
+    dict_excludes_eq_constant: bool,
     phantom_data: PhantomData<B>,
 }
 
@@ -237,14 +237,14 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
             read_page: None,
             dict: None,
             eq_const: None,
-            dict_excludes: None,
+            dict_excludes_eq_constant: false,
             phantom_data: Default::default(),
         }
     }
 
     /// Installs a pushed-down equality constant. When the dictionary is later
     /// built, it is scanned once for this value; if absent, the enclosing row
-    /// group can be pruned (see [`ColumnDecoder::dict_excludes_constant`]).
+    /// group can be pruned (see [`ColumnDecoder::dict_excludes_eq_constant`]).
     pub fn set_eq_constant(&mut self, value: B::Element) {
         self.eq_const = Some(value);
     }
@@ -335,8 +335,8 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
 where
     B::Element: PartialEq,
 {
-    fn dict_excludes_constant(&self) -> Option<bool> {
-        self.dict_excludes
+    fn dict_excludes_eq_constant(&self) -> bool {
+        self.dict_excludes_eq_constant
     }
 
     fn available(&self) -> usize {
@@ -377,8 +377,8 @@ where
                     // before materializing it. If absent, the row group is pruned
                     // — so skip building the dictionary entirely (no allocation,
                     // no copy of values we'd never read).
-                    let present = D::contains(&data, size, needle);
-                    self.dict_excludes = Some(!present);
+                    let present = D::maybe_contains(&data, size, needle);
+                    self.dict_excludes_eq_constant = !present;
                     if !present {
                         // Row group will be pruned. Install an *empty* dictionary
                         // instead of the real one: this skips the copy but keeps
@@ -619,27 +619,27 @@ mod tests {
 
     // -- Dictionary pruning (pushed-down equality constant) --
 
-    /// No constant set → never reports a pruning decision.
+    /// No constant set → never prunes.
     #[test]
-    fn test_dict_excludes_none_without_constant() {
+    fn test_dict_excludes_false_without_constant() {
         init_test_free_pool(4);
         let mut alloc = SlabAllocator::new(true);
         let mut dec = Dec::new(0);
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
-        assert_eq!(dec.dict_excludes_constant(), None);
+        assert!(!dec.dict_excludes_eq_constant());
     }
 
-    /// Constant set but dictionary not yet loaded → no decision.
+    /// Constant set but dictionary not yet loaded → not prunable yet.
     #[test]
-    fn test_dict_excludes_none_before_dict_loaded() {
+    fn test_dict_excludes_false_before_dict_loaded() {
         let mut dec = Dec::new(0);
         dec.set_eq_constant(20);
 
-        assert_eq!(dec.dict_excludes_constant(), None);
+        assert!(!dec.dict_excludes_eq_constant());
     }
 
-    /// Constant present in the dictionary → `Some(false)` (cannot prune).
+    /// Constant present in the dictionary → cannot prune.
     #[test]
     fn test_dict_excludes_false_when_present() {
         init_test_free_pool(4);
@@ -648,10 +648,10 @@ mod tests {
         dec.set_eq_constant(20);
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
-        assert_eq!(dec.dict_excludes_constant(), Some(false));
+        assert!(!dec.dict_excludes_eq_constant());
     }
 
-    /// Constant absent from the dictionary → `Some(true)` (row group prunable).
+    /// Constant absent from the dictionary → the row group is prunable.
     #[test]
     fn test_dict_excludes_true_when_absent() {
         init_test_free_pool(4);
@@ -660,7 +660,7 @@ mod tests {
         dec.set_eq_constant(99);
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
-        assert_eq!(dec.dict_excludes_constant(), Some(true));
+        assert!(dec.dict_excludes_eq_constant());
     }
 
     // -- Page insertion order --
