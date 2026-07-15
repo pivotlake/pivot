@@ -10,7 +10,10 @@ use crate::parquet::reading::decoding::column_decoders::Dict;
 use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
-use arrow_buffer::Buffer;
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, GenericByteViewArray, RecordBatch, Scalar, StringViewArray,
+};
+use arrow_buffer::{BooleanBuffer, Buffer, ScalarBuffer};
 use bytes::Bytes;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
@@ -136,6 +139,16 @@ impl<V: ByteViewType> ViewDict<V> {
         self.views[idx]
     }
 
+    /// The dictionary's entries as an Arrow array, so entry bytes can be
+    /// read through Arrow's own view decoding.
+    fn as_arrow_array(&self) -> GenericByteViewArray<V> {
+        GenericByteViewArray::<V>::new(
+            ScalarBuffer::from(self.views.clone()),
+            self.data.clone(),
+            None,
+        )
+    }
+
     #[cfg(test)]
     fn get_str(&self, idx: usize) -> String {
         use dispatch::env::MAX_INLINE_STRING_VIEW;
@@ -155,6 +168,15 @@ impl<V: ByteViewType> ViewDict<V> {
 impl<V: ByteViewType> Dict for ViewDict<V> {
     type Builder = ViewsBuilder<V>;
     type Item = u128;
+    type EqConstant = Vec<u8>;
+
+    /// The scalar matches when its array is a single, valid `StringViewArray`
+    /// element; anything else yields `None`.
+    fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<Vec<u8>> {
+        let (arr, _) = arrow_array::Datum::get(scalar);
+        let strings = arr.as_any().downcast_ref::<StringViewArray>()?;
+        (strings.len() == 1 && strings.is_valid(0)).then(|| strings.value(0).as_bytes().to_vec())
+    }
 
     fn new(data: Vec<Bytes>, size: usize, _allocator: &mut SlabAllocator) -> Self {
         DictFactory::new(data, size).create_dict()
@@ -171,6 +193,51 @@ impl<V: ByteViewType> Dict for ViewDict<V> {
                 panic!("Unexpected id");
             }
         }
+    }
+
+    fn filter_record_batch_by_const(
+        &self,
+        batch: RecordBatch,
+        column: usize,
+        needle: &Vec<u8>,
+    ) -> RecordBatch {
+        // Every row of a fully dictionary-encoded chunk copies its dictionary
+        // entry's 128-bit view verbatim, so once we know which entry holds
+        // `needle`, "row equals needle" becomes "row view equals that entry's
+        // view" - an integer comparison instead of a string comparison.
+        let entries = self.as_arrow_array();
+        let needle_entry = GenericByteViewArray::<V>::new(
+            ScalarBuffer::from(vec![make_view(needle, 0, 0)]),
+            vec![Buffer::from(needle.as_slice())],
+            None,
+        );
+        let matches = arrow_ord::cmp::eq(&entries, &Scalar::new(&needle_entry))
+            .expect("the needle entry is built as the entries' own type");
+        // A unique entry must hold the needle: with duplicates, matching rows
+        // may carry either view and no single view decides the equality. When
+        // no entry holds it, the query's `Filter` drops the rows instead.
+        if matches.true_count() != 1 {
+            return batch;
+        }
+        let matching_entry = matches
+            .values()
+            .set_indices()
+            .next()
+            .expect("true_count is one");
+        let matching_view = self.views[matching_entry];
+
+        let views = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<GenericByteViewArray<V>>()
+            .expect("the pushed constant only installs on this column's own type")
+            .views();
+        let keep = BooleanBuffer::collect_bool(views.len(), |i| views[i] == matching_view);
+        if keep.count_set_bits() == keep.len() {
+            return batch;
+        }
+        arrow_select::filter::filter_record_batch(&batch, &BooleanArray::new(keep, None))
+            .expect("the mask is built to the batch's row count")
     }
 }
 

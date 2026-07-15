@@ -30,7 +30,7 @@ pub use typed::TypedColumnDecoder;
 
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::thrift::general::Encoding;
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::memory::{ReaderPosition, SlabAllocator};
 use thiserror::Error;
@@ -65,12 +65,30 @@ pub trait ColumnDecoder {
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
+    /// Installs a pushed-down equality constant. A constant whose type does
+    /// not match the column is ignored (the query's `Filter` still applies
+    /// the condition). Once the dictionary is built the constant decides
+    /// row-group pruning and scan-side batch filtering.
+    fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>);
+
     /// Whether the loaded dictionary is known to exclude the pushed-down
     /// equality constant, meaning no row of this column can match and the row
     /// group can be pruned. `false` until a dictionary page proves otherwise
     /// (no constant pushed, dictionary not loaded yet, or constant present).
     fn dict_excludes_eq_constant(&self) -> bool {
         false
+    }
+
+    /// Drops rows that cannot pass this column's pushed-down equality
+    /// constant from a decoded batch, where `column` is this column's
+    /// position in the batch. This only ever removes rows the query would
+    /// discard anyway, so the default - returning the batch untouched - is
+    /// always valid, and so is any partial filtering. Byte-view columns use
+    /// it to pre-filter batches with a cheap view comparison instead of
+    /// leaving all the string comparisons to the query's `Filter` (see
+    /// [`Dict::filter_record_batch_by_const`]).
+    fn fast_filter_record_batch(&self, batch: RecordBatch, _column: usize) -> RecordBatch {
+        batch
     }
 }
 
@@ -96,6 +114,17 @@ pub trait DecodePlain {
 pub trait Dict {
     type Builder: ArrayBuilder;
     type Item;
+    /// How a pushed-down equality constant is represented for this
+    /// dictionary flavour. Primitive dictionaries take the native value;
+    /// byte-view dictionaries take the raw bytes, because the value's Arrow
+    /// view can only be resolved against a dictionary that has been built.
+    type EqConstant;
+
+    /// Converts a pushed-down constant into this dictionary flavour's own
+    /// representation, or `None` when the scalar's type does not match the
+    /// column (which simply forgoes the pushdown; the query's `Filter` still
+    /// applies the condition).
+    fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<Self::EqConstant>;
 
     /// Builds the dictionary from raw page bytes containing `size` entries.
     fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self;
@@ -105,7 +134,7 @@ pub trait Dict {
     /// matters - it prunes the row group and the dictionary is never
     /// materialized - so answering `true` is always sound. The default cannot
     /// rule anything out; implementations override it to enable the pushdown.
-    fn maybe_contains(_data: &[Bytes], _size: usize, _needle: &Self::Item) -> bool {
+    fn maybe_contains(_data: &[Bytes], _size: usize, _needle: &Self::EqConstant) -> bool {
         true
     }
 
@@ -115,4 +144,18 @@ pub trait Dict {
     /// Registers dictionary buffers onto the builder (e.g. for StringView
     /// block tracking). No-op by default.
     fn register_onto(&self, _builder: &mut Self::Builder) {}
+
+    /// Drops rows of `batch` whose value in `column` cannot equal `needle`,
+    /// or returns the batch untouched when the dictionary cannot decide that
+    /// cheaply (the default). Only rows that provably fail the equality may
+    /// be dropped; keeping extra rows is always sound because the query's
+    /// `Filter` re-applies every condition.
+    fn filter_record_batch_by_const(
+        &self,
+        batch: RecordBatch,
+        _column: usize,
+        _needle: &Self::EqConstant,
+    ) -> RecordBatch {
+        batch
+    }
 }

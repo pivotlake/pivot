@@ -11,6 +11,9 @@ arrow-array = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-buffer = { workspace = true }
+# Filtering a decoded batch down to the rows a pushed-down equality keeps
+# (see the row-group decoder's view-equality test).
+arrow-select = { workspace = true }
 # Encode a pushed-down constant to the same JSON a partition tuple is stamped
 # with (ingest uses arrow-json too), so partition pruning compares like for like.
 arrow-json = { workspace = true }
