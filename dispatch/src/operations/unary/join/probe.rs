@@ -1,6 +1,11 @@
-//! The probe side of the hash join: for each probe row whose key matches a
-//! build row, emit the probe row's columns followed by the matched build row's
-//! columns (gathered from the concatenated build payload batch).
+//! The probe side of the hash join: for each probe row whose key hash matches
+//! a build row's, emit the probe row's columns followed by the matched build
+//! row's columns (gathered from the concatenated build payload batch).
+//!
+//! Matches are decided on the full 64-bit combined key hash (see
+//! [`hash_key_row`]); the planner layers an equality filter over the join's
+//! output that re-compares the actual key columns, which screens out both
+//! hash collisions and any residual join conditions in one place.
 //!
 //! Matches are collected as two parallel selection vectors — probe row index
 //! and build payload row index — and materialized per output batch with the
@@ -12,7 +17,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::join::build::filter_null_keys;
+use crate::operations::unary::join::build::{filter_null_keys, hash_key_row};
 use crate::operations::unary::join::directory::{Directory, PtrBuffer, prefetch_ptr_l2};
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
 use crate::operations::unary::join::{JoinArena, JoinTable};
@@ -28,14 +33,12 @@ use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-const RING_SIZE: usize = 64;
-const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
 
 pub struct Probe {
     table: JoinTable,
     hash_state: RandomState,
-    key_column: usize,
+    key_columns: Vec<usize>,
     use_probe_array: bool,
     allocator: SlabAllocator,
     /// Probe fields followed by build payload fields; built on first batch.
@@ -46,13 +49,13 @@ impl Probe {
     pub(crate) fn new(
         table: JoinTable,
         hash_state: RandomState,
-        key_column: usize,
+        key_columns: Vec<usize>,
         use_probe_array: bool,
     ) -> Self {
         Self {
             table,
             hash_state,
-            key_column,
+            key_columns,
             use_probe_array,
             allocator: SlabAllocator::new(false),
             output_schema: None,
@@ -60,13 +63,14 @@ impl Probe {
     }
 }
 
-/// The per-batch probe state: scans `col` against the directory, collecting
-/// matched (probe row, build payload row) pairs into the two selection-vector
-/// builders and flushing full output batches through `sender`.
+/// The per-batch probe state: scans the precomputed key `hashes` against the
+/// directory, collecting matched (probe row, build payload row) pairs into the
+/// two selection-vector builders and flushing full output batches through
+/// `sender`.
 struct BatchProbe<'a, 'b, S: Sender<RecordBatch>> {
     keys: &'a JoinArena<u64>,
     rows: &'a JoinArena<u32>,
-    col: &'b Int64Array,
+    hashes: &'b [u64],
     probe_batch: &'b RecordBatch,
     build_rows: &'a RecordBatch,
     output_schema: &'a Arc<Schema>,
@@ -111,49 +115,42 @@ impl<'a, 'b, S: Sender<RecordBatch>> BatchProbe<'a, 'b, S> {
 
     /// Record the match candidate at arena index `j` for probe row
     /// `probe_row`: write both selection vectors at the current cursor and
-    /// advance it only when the full-width key matches (branchless on the
-    /// match itself; the capacity flush branch is almost never taken).
+    /// advance it only when the full hash matches (branchless on the match
+    /// itself; the capacity flush branch is almost never taken).
     #[inline(always)]
-    fn record_match(&mut self, j: usize, probe_row: usize, probe_key: u64) -> unary::Result<()> {
+    fn record_match(&mut self, j: usize, probe_row: usize) -> unary::Result<()> {
         let key = self.keys[j];
         self.probe_sel.write(self.output_idx, probe_row as u32);
         self.build_sel.write(self.output_idx, self.rows[j]);
-        self.output_idx += (key == probe_key) as usize;
+        self.output_idx += (key == self.hashes[probe_row]) as usize;
         if self.output_idx == RECORD_BATCH_SIZE {
             self.flush()?;
         }
         Ok(())
     }
 
-    /// Scalar reference probe: hash, bloom-check and scan each probe row's
+    /// Scalar reference probe: bloom-check and scan each probe row's
     /// directory slot in order, with light lookahead prefetching.
     fn run_scalar<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(
         mut self,
         directory: &Directory<B>,
-        hash_state: &RandomState,
     ) -> unary::Result<()> {
-        let col = self.col;
-        let mut batch_hashes = vec![0u64; col.len()];
-        for (row_idx, hash) in batch_hashes.iter_mut().enumerate() {
-            *hash = hash_state.hash_one(unsafe { col.value_unchecked(row_idx) });
-        }
-
-        for row_idx in 0..col.len() {
+        for row_idx in 0..self.hashes.len() {
             const DIRECTORY_PREFETCH_DISTANCE: usize = 16;
             const ARENA_PREFETCH_DISTANCE: usize = 8;
 
-            if row_idx + DIRECTORY_PREFETCH_DISTANCE < col.len() {
-                directory.prefetch_l2(batch_hashes[row_idx + DIRECTORY_PREFETCH_DISTANCE]);
+            if row_idx + DIRECTORY_PREFETCH_DISTANCE < self.hashes.len() {
+                directory.prefetch_l2(self.hashes[row_idx + DIRECTORY_PREFETCH_DISTANCE]);
             }
 
-            if row_idx + ARENA_PREFETCH_DISTANCE < col.len() {
-                let future_hash = batch_hashes[row_idx + ARENA_PREFETCH_DISTANCE];
+            if row_idx + ARENA_PREFETCH_DISTANCE < self.hashes.len() {
+                let future_hash = self.hashes[row_idx + ARENA_PREFETCH_DISTANCE];
                 let future_slot = directory.slot_for(future_hash);
                 let future_start = directory.end_ptr(future_slot as isize);
                 prefetch_ptr_l2(self.keys.ptr_at_index(future_start) as *const u8);
             }
 
-            let hash = batch_hashes[row_idx];
+            let hash = self.hashes[row_idx];
             if !directory.matches_bloom(hash) {
                 continue;
             }
@@ -161,10 +158,8 @@ impl<'a, 'b, S: Sender<RecordBatch>> BatchProbe<'a, 'b, S> {
             let slot = directory.slot_for(hash);
             let start = directory.end_ptr(slot as isize);
             let end = directory.end_ptr((slot + 1) as isize);
-            let probe_key = unsafe { col.value_unchecked(row_idx) } as u64;
-
             for j in start..end {
-                self.record_match(j, row_idx, probe_key)?;
+                self.record_match(j, row_idx)?;
             }
         }
 
@@ -172,9 +167,9 @@ impl<'a, 'b, S: Sender<RecordBatch>> BatchProbe<'a, 'b, S> {
     }
 }
 
-/// The prefetch-pipelined probe: hashes ahead, bloom-filters into a ring of
-/// matched directory slots, prefetches their arena ranges, then drains matches
-/// a window behind — keeping many independent loads in flight.
+/// The prefetch-pipelined probe: bloom-filters the precomputed hashes into a
+/// ring of matched directory slots, prefetches their arena ranges, then drains
+/// matches a window behind — keeping many independent loads in flight.
 struct ProbeArray<
     'a,
     'b,
@@ -182,10 +177,7 @@ struct ProbeArray<
     S: Sender<RecordBatch>,
 > {
     row_idx: usize,
-    hash_state: RandomState,
     directory: &'a Directory<B>,
-
-    hashes: [u64; RING_SIZE],
 
     // If we made this two separate variables, e.g. matched_slots and next_matched_slots, swapping
     // became an issue. The reason for this is that because it is of constant size, it was being
@@ -201,28 +193,25 @@ struct ProbeArray<
 impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sender<RecordBatch>>
     ProbeArray<'a, 'b, B, S>
 {
+    /// Bloom-check `length` rows, recording matched (slot, row) pairs. When
+    /// `PREFETCH_AHEAD`, also prefetch the directory slot of the row a window
+    /// ahead so its entry is resident by the time its own pass reads it.
     #[inline(always)]
-    pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
+    pub fn generate_matched_slots<const PREFETCH_AHEAD: bool>(&mut self, length: usize) {
         let next_matched_slots: &mut [(usize, usize); PREFETCH_LENGTH] =
             &mut self.matched_slots[self.matched_idx];
         let mut size = self.matched_size[self.matched_idx];
         let mut row_idx = self.row_idx;
         let shift = self.directory.shift;
+        let hashes = self.out.hashes;
         for _ in 0..length {
-            if HASH {
-                // hash
-                let value = unsafe { self.out.col.value_unchecked(row_idx + PREFETCH_LENGTH) };
-                let hash_offset = (row_idx + PREFETCH_LENGTH) & MASK;
-                self.hashes[hash_offset] = self.hash_state.hash_one(value);
-                let dir_slot = (self.hashes[hash_offset] >> shift) as usize;
-                // Prefetch this hash from the directory; we're going to need it soon when we run bloom
-                // on it
-                prefetch_ptr_l2(self.directory.ptr_for_slot(dir_slot) as *const u8);
+            if PREFETCH_AHEAD {
+                let ahead = hashes[row_idx + PREFETCH_LENGTH];
+                prefetch_ptr_l2(self.directory.ptr_for_slot((ahead >> shift) as usize) as *const u8);
             }
 
             // bloom check, arena
-            let bloom_offset = row_idx & MASK;
-            let hash = self.hashes[bloom_offset];
+            let hash = hashes[row_idx];
 
             let slot = (hash >> shift) as usize;
             let stored = unsafe { *self.directory.ptr_for_slot(slot) };
@@ -232,7 +221,7 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
                 // Given that we matched, let's prefetch the slot after ours. Cache lines are 64 bytes,
                 // so there's a one in eight chance this will be relevant
                 prefetch_ptr_l2(self.directory.ptr_for_slot(slot + 1) as *const u8);
-                next_matched_slots[size & MASK] = (slot, row_idx);
+                next_matched_slots[size % PREFETCH_LENGTH] = (slot, row_idx);
                 size += 1;
             }
 
@@ -274,10 +263,9 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
             let (slot, idx) = current_matched_slots[i];
             let start = directory.end_ptr(slot as isize);
             let end = directory.end_ptr((slot + 1) as isize);
-            let probe_key = unsafe { out.col.value_unchecked(idx) } as u64;
 
             for j in start..end {
-                out.record_match(j, idx, probe_key)?;
+                out.record_match(j, idx)?;
             }
         }
         Ok(())
@@ -301,20 +289,6 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
     }
 
     #[inline(always)]
-    pub fn bootstrap_initial_hashes(&mut self) {
-        for i in 0..min(PREFETCH_LENGTH, self.out.col.len()) {
-            self.hashes[i] = self
-                .hash_state
-                .hash_one(unsafe { self.out.col.value_unchecked(i) });
-            prefetch_ptr_l2(
-                self.directory
-                    .ptr_for_slot((self.hashes[i] >> self.directory.shift) as usize)
-                    as *const u8,
-            );
-        }
-    }
-
-    #[inline(always)]
     fn swap_matched_slots(&mut self) {
         self.matched_idx ^= 1;
         self.matched_size[self.matched_idx] = 0;
@@ -322,11 +296,9 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
 
     #[inline(always)]
     pub fn run(mut self) -> unary::Result<()> {
-        self.bootstrap_initial_hashes();
+        let len = self.out.hashes.len();
 
-        let len = self.out.col.len();
-
-        // No row has a `row + PREFETCH_LENGTH`, so never use HASH=true.
+        // No row has a `row + PREFETCH_LENGTH`, so never prefetch ahead.
         if len <= PREFETCH_LENGTH {
             if len != 0 {
                 self.generate_matched_slots::<false>(len);
@@ -339,23 +311,23 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
         }
 
         // From here on, len > PREFETCH_LENGTH, so this cannot underflow.
-        let hash_end = len - PREFETCH_LENGTH;
+        let ahead_end = len - PREFETCH_LENGTH;
 
         // Prime the pipeline: generate first matched buffer and prefetch its arena ranges.
-        let first = min(PREFETCH_LENGTH, hash_end);
+        let first = min(PREFETCH_LENGTH, ahead_end);
         self.generate_matched_slots::<true>(first);
         self.only_prefetch();
         self.swap_matched_slots();
 
-        while self.row_idx < hash_end {
-            let n = min(PREFETCH_LENGTH, hash_end - self.row_idx);
+        while self.row_idx < ahead_end {
+            let n = min(PREFETCH_LENGTH, ahead_end - self.row_idx);
 
             self.generate_matched_slots::<true>(n);
             self.build_output::<true>()?;
             self.swap_matched_slots();
         }
 
-        // Tail rows already have hashes; do not hash-ahead.
+        // Tail rows have no row a window ahead; do not prefetch ahead.
         self.generate_matched_slots::<false>(len - self.row_idx);
         self.build_output::<true>()?;
         self.swap_matched_slots();
@@ -371,7 +343,6 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
 /// backing so the inner loops carry no per-element dispatch.
 fn run_probe_array<'a, 'b, B, S>(
     directory: &'a Directory<B>,
-    hash_state: &RandomState,
     out: BatchProbe<'a, 'b, S>,
 ) -> unary::Result<()>
 where
@@ -380,9 +351,7 @@ where
 {
     ProbeArray {
         row_idx: 0,
-        hash_state: hash_state.clone(),
         directory,
-        hashes: [0; RING_SIZE],
         matched_slots: [[(0, 0); PREFETCH_LENGTH]; 2],
         matched_size: [0; 2],
         matched_idx: 0,
@@ -410,11 +379,18 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             return Ok(());
         };
 
-        let batch = filter_null_keys(batch, self.key_column);
+        let batch = filter_null_keys(batch, &self.key_columns);
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let col = batch.column(self.key_column).as_primitive::<Int64Type>();
+        let key_columns: Vec<&Int64Array> = self
+            .key_columns
+            .iter()
+            .map(|&c| batch.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let hashes: Vec<u64> = (0..batch.num_rows())
+            .map(|i| hash_key_row(&self.hash_state, &key_columns, i))
+            .collect();
 
         let output_schema = self
             .output_schema
@@ -439,7 +415,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         let out = BatchProbe {
             keys,
             rows,
-            col,
+            hashes: &hashes,
             probe_batch: &batch,
             build_rows,
             output_schema: &output_schema,
@@ -452,9 +428,9 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
 
         let directory = unsafe { &*self.table.directory.get() };
         if !self.use_probe_array {
-            return out.run_scalar(directory, &self.hash_state);
+            return out.run_scalar(directory);
         }
-        run_probe_array(directory, &self.hash_state, out)
+        run_probe_array(directory, out)
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {

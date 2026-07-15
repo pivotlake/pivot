@@ -567,11 +567,13 @@ impl RecordBatchOperatorSpec {
     }
 
     /// Inner hash equi-join: build a hash table from `build`'s rows keyed on
-    /// `build_key_column` (`Int64`), then probe it with `self`'s rows keyed on
-    /// `probe_key_column`, emitting one output row per matching pair. Each
-    /// output row is the probe row's columns (in probe schema order) followed
-    /// by the matched build row's columns (in build schema order). Rows with a
-    /// null key on either side never match.
+    /// `build_key_columns` (`Int64` each), then probe it with `self`'s rows
+    /// keyed on `probe_key_columns`, emitting one output row per pair whose
+    /// combined 64-bit key hash matches. The caller re-verifies key equality
+    /// on the output (the planner's join filter does), which screens the rare
+    /// hash collision. Each output row is the probe row's columns (in probe
+    /// schema order) followed by the matched build row's columns (in build
+    /// schema order). Rows with a null in any key column never match.
     ///
     /// Both sides are plain unary operators. The build dataflow runs to
     /// completion first (populating the shared join table); only then is the
@@ -580,12 +582,12 @@ impl RecordBatchOperatorSpec {
     pub fn join(
         self,
         build: RecordBatchOperatorSpec,
-        build_key_column: usize,
-        probe_key_column: usize,
+        build_key_columns: Vec<usize>,
+        probe_key_columns: Vec<usize>,
     ) -> Self {
         let worker_count = self.worker_count();
         let (build_factories, probe_factories, _gate) =
-            create_join_factories(build_key_column, probe_key_column, worker_count);
+            create_join_factories(build_key_columns, probe_key_columns, worker_count);
 
         // Run the build dataflow to completion. Each build head feeds a JoinBuild
         // unary sink (RecordBatch -> ()) that populates the shared hash table; the

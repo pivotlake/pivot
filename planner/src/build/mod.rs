@@ -226,11 +226,17 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
 }
 
 /// Translate a general comparison join into pivot's [`Join`]. The supported
-/// shape is an INNER join with a single equality condition whose sides are
-/// plain column refs of a key type the dispatch join handles (`Int64`);
-/// anything else reports the specific gap. The probe is DuckDB's left child
-/// and the build its right, matching its hash-join convention (the cost model
-/// puts the smaller relation on the right).
+/// shape is an INNER join whose conditions compare plain column refs, with at
+/// least one `Int64` equality; anything else reports the specific gap. The
+/// probe is DuckDB's left child and the build its right, matching its
+/// hash-join convention (the cost model puts the smaller relation on the
+/// right).
+///
+/// Every `Int64` equality condition becomes a hash key (the dispatch join
+/// matches on the combined key hash), and EVERY condition — the hash ones
+/// included — is replayed as a Filter over the join's output: the equalities
+/// re-compare the actual columns (screening hash collisions), and any other
+/// comparison applies its predicate, which is equivalent for an INNER join.
 ///
 /// DuckDB's join projection maps (which trim the join's output to the columns
 /// actually used above it) are replayed as a `Projection` on top, since the
@@ -247,78 +253,68 @@ fn build_join(
             join.join_type()
         )));
     }
-    let conditions: Vec<_> = join.conditions().collect();
-    // The hash join keys on one equality condition; every other condition
-    // (further equalities, or range comparisons) filters the joined rows
-    // below, which is equivalent for an INNER join.
-    let hash_condition = conditions
-        .iter()
-        .position(|c| c.comparison == ExpressionType::COMPARE_EQUAL)
-        .ok_or_else(|| {
-            OperatorError::Unsupported(
-                "joins must have at least one equality condition".to_string(),
-            )
-        })?;
-
-    let probe_key = join_key_ref(Expression::from_handle(conditions[hash_condition].left)?)?;
-    let build_key = join_key_ref(Expression::from_handle(conditions[hash_condition].right)?)?;
-
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
     let left_map: Vec<usize> = join.left_projection_map().collect();
     let right_map: Vec<usize> = join.right_projection_map().collect();
 
-    // The residual conditions, rebased onto the join's output: probe columns
-    // keep their index, build columns shift past them.
-    let residual_conditions = conditions
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != hash_condition)
-        .map(|(_, condition)| {
-            let Expression::Ref(left) = Expression::from_handle(condition.left)? else {
-                return Err(OperatorError::Unsupported(
-                    "extra join conditions must compare plain columns".to_string(),
-                ));
-            };
-            let Expression::Ref(right) = Expression::from_handle(condition.right)? else {
-                return Err(OperatorError::Unsupported(
-                    "extra join conditions must compare plain columns".to_string(),
-                ));
-            };
-            Ok(Expression::Compare(Compare {
-                left: Box::new(Expression::Ref(left)),
-                right: Box::new(Expression::Ref(Ref {
-                    column_idx: probe_types.len() + right.column_idx,
-                    ..right
-                })),
-                compare_type: condition.comparison.clone().try_into().map_err(|_| {
-                    OperatorError::Unsupported(format!(
-                        "Unsupported join comparison type: {:?}",
-                        condition.comparison
-                    ))
-                })?,
-                return_type: Type::Boolean,
-            }))
-        })
-        .collect::<Result<Vec<_>, OperatorError>>()?;
+    let mut probe_keys = Vec::new();
+    let mut build_keys = Vec::new();
+    let mut verify_conditions = Vec::new();
+    for condition in join.conditions() {
+        let Expression::Ref(left) = Expression::from_handle(condition.left)? else {
+            return Err(OperatorError::Unsupported(
+                "join conditions must compare plain columns".to_string(),
+            ));
+        };
+        let Expression::Ref(right) = Expression::from_handle(condition.right)? else {
+            return Err(OperatorError::Unsupported(
+                "join conditions must compare plain columns".to_string(),
+            ));
+        };
+        if condition.comparison == ExpressionType::COMPARE_EQUAL
+            && left.return_type == Type::Int64
+            && right.return_type == Type::Int64
+        {
+            probe_keys.push(left.column_idx);
+            build_keys.push(right.column_idx);
+        }
+        verify_conditions.push(Expression::Compare(Compare {
+            left: Box::new(Expression::Ref(left)),
+            right: Box::new(Expression::Ref(Ref {
+                column_idx: probe_types.len() + right.column_idx,
+                ..right
+            })),
+            compare_type: condition.comparison.clone().try_into().map_err(|_| {
+                OperatorError::Unsupported(format!(
+                    "Unsupported join comparison type: {:?}",
+                    condition.comparison
+                ))
+            })?,
+            return_type: Type::Boolean,
+        }));
+    }
+    if probe_keys.is_empty() {
+        return Err(OperatorError::Unsupported(
+            "joins must have at least one Int64 equality condition".to_string(),
+        ));
+    }
 
-    let mut node = PlanNode {
+    let node = PlanNode {
         name: op.name(),
         inputs,
         operator: Operator::Join(Join {
-            probe_key,
-            build_key,
+            probe_keys,
+            build_keys,
         }),
     };
-    if !residual_conditions.is_empty() {
-        node = PlanNode {
-            name: "JOIN_RESIDUAL_FILTER".to_string(),
-            inputs: vec![node],
-            operator: Operator::Filter(Filter {
-                conditions: residual_conditions,
-            }),
-        };
-    }
+    let node = PlanNode {
+        name: "JOIN_VERIFY_FILTER".to_string(),
+        inputs: vec![node],
+        operator: Operator::Filter(Filter {
+            conditions: verify_conditions,
+        }),
+    };
     if left_map.is_empty() && right_map.is_empty() {
         return Ok(node);
     }
@@ -357,23 +353,6 @@ fn build_join(
         inputs: vec![node],
         operator: Operator::Projection(Projection { projections }),
     })
-}
-
-/// The column ref a join key must be, with the key type restriction the
-/// dispatch join imposes.
-fn join_key_ref(key: Expression) -> Result<usize, OperatorError> {
-    let Expression::Ref(key) = key else {
-        return Err(OperatorError::Unsupported(format!(
-            "join keys must be plain columns, got: {key:?}"
-        )));
-    };
-    if key.return_type != Type::Int64 {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join key type: {:?}",
-            key.return_type
-        )));
-    }
-    Ok(key.column_idx)
 }
 
 /// A scan's projected output columns (and a filter's `projection_map`), each a

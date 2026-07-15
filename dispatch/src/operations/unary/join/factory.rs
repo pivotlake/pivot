@@ -16,7 +16,7 @@ use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
 pub struct JoinBuildFactory {
-    key_column: usize,
+    key_columns: Vec<usize>,
     worker_id: usize,
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
@@ -36,7 +36,7 @@ pub struct JoinBuildFactory {
 pub struct JoinProbeFactory {
     pub(crate) table: JoinTable,
     hash_state: RandomState,
-    key_column: usize,
+    key_columns: Vec<usize>,
     use_probe_array: bool,
 }
 
@@ -49,8 +49,8 @@ pub struct JoinProbeFactory {
 /// [`JoinPartitionJob`] to complete, signalling that the build hash table is
 /// fully populated and the probe side may run.
 pub fn create_for_workers(
-    build_key_column: usize,
-    probe_key_column: usize,
+    build_key_columns: Vec<usize>,
+    probe_key_columns: Vec<usize>,
     worker_count: usize,
 ) -> (
     impl IntoIterator<Item = JoinBuildFactory>,
@@ -81,7 +81,7 @@ pub fn create_for_workers(
     let gate_probe = gate.clone();
 
     let build_factories = (0..worker_count).map(move |worker_id| JoinBuildFactory {
-        key_column: build_key_column,
+        key_columns: build_key_columns.clone(),
         worker_id,
         hash_state: hash_state.clone(),
         partition_sizes: partition_sizes.clone(),
@@ -106,7 +106,7 @@ pub fn create_for_workers(
             gate: gate_probe.clone(),
         },
         hash_state: hs_clone.clone(),
-        key_column: probe_key_column,
+        key_columns: probe_key_columns.clone(),
         use_probe_array,
     });
 
@@ -118,7 +118,7 @@ impl UnaryFactory<RecordBatch, ()> for JoinBuildFactory {
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
-            self.key_column,
+            self.key_columns,
             self.worker_id,
             self.hash_state,
             self.sender,
@@ -143,7 +143,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory {
         Probe::new(
             self.table,
             self.hash_state,
-            self.key_column,
+            self.key_columns,
             self.use_probe_array,
         )
     }

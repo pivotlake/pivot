@@ -8,8 +8,10 @@
 //! `gate`), then the probe stage runs against the populated [`JoinTable`].
 //!
 //! Output layout: every probe-side column (in probe schema order) followed by
-//! every build-side column (in build schema order). An inner equi-join on a
-//! single `Int64` key is the supported shape.
+//! every build-side column (in build schema order). An inner equi-join on one
+//! or more `Int64` key columns is the supported shape; matches are decided on
+//! the combined key hash and re-verified by the planner's equality filter
+//! above the join.
 
 mod build;
 mod directory;
@@ -86,9 +88,11 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 
 /// Shared hash-table state handed from the build factories to the probe
 /// factories. `keys` and `rows` are parallel arenas indexed by the directory's
-/// slot cursors: the full-width join key, and the row's index into
-/// `build_rows` (the concatenated build-side payload batch). All fields are
-/// populated by the build phase and must only be read after `gate` is true.
+/// slot cursors: the row's full 64-bit combined key hash (matches compare it
+/// whole; the planner's equality filter above the join screens collisions),
+/// and the row's index into `build_rows` (the concatenated build-side payload
+/// batch). All fields are populated by the build phase and must only be read
+/// after `gate` is true.
 pub(crate) struct JoinTable {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<JoinArena<u64>>>,
@@ -166,7 +170,7 @@ mod tests {
     ) -> JoinResult {
         init_test_free_pool(16);
         let workers = build_worker_batches.len();
-        let (builds, probes, gate) = factory::create_for_workers(0, 0, workers);
+        let (builds, probes, gate) = factory::create_for_workers(vec![0], vec![0], workers);
 
         let mut consumers: Vec<_> = builds
             .into_iter()

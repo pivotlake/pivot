@@ -17,14 +17,13 @@ use tracing::debug;
 pub(crate) const NUM_PARTITIONS: usize = 64;
 const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
 
-/// One build-side row, radix-partitioned by `hash`: the full-width key (for
-/// exact match rejection of hash collisions in the probe) and the row's index
-/// into this worker's payload batches (globalized with the worker's base
-/// offset at scatter time).
+/// One build-side row, radix-partitioned by `hash` (the combined hash of every
+/// key column, which the probe compares in full — see the module doc on
+/// verification), and the row's index into this worker's payload batches
+/// (globalized with the worker's base offset at scatter time).
 #[derive(Clone, Copy)]
 pub(crate) struct BuildTuple {
     hash: u64,
-    key: u64,
     row: u32,
 }
 
@@ -41,7 +40,7 @@ pub(crate) struct BuildWorkerOutput {
 }
 
 pub struct JoinBuildConsumer {
-    key_column: usize,
+    key_columns: Vec<usize>,
     worker_id: usize,
     hash_state: RandomState,
     values: PartitionBuffers,
@@ -58,7 +57,7 @@ unsafe impl Send for JoinBuildConsumer {}
 impl JoinBuildConsumer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        key_column: usize,
+        key_columns: Vec<usize>,
         worker_id: usize,
         hash_state: RandomState,
         sender: mpsc::Sender<BuildWorkerOutput>,
@@ -74,7 +73,7 @@ impl JoinBuildConsumer {
         remaining_jobs: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            key_column,
+            key_columns,
             worker_id,
             hash_state,
             values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
@@ -99,15 +98,45 @@ impl JoinBuildConsumer {
     }
 }
 
-/// Drop rows whose join key is null: an inner equi-join can never match them,
-/// and the hot loops read key values without validity checks.
-pub(crate) fn filter_null_keys(batch: RecordBatch, key_column: usize) -> RecordBatch {
-    let col = batch.column(key_column);
-    if col.null_count() == 0 {
-        return batch;
+/// Drop rows where any join-key column is null: an inner equi-join can never
+/// match them, and the hot loops read key values without validity checks.
+pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> RecordBatch {
+    let mut mask: Option<BooleanArray> = None;
+    for &key_column in key_columns {
+        let col = batch.column(key_column);
+        if col.null_count() == 0 {
+            continue;
+        }
+        let valid = BooleanArray::new(col.nulls().unwrap().inner().clone(), None);
+        mask = Some(match mask {
+            None => valid,
+            Some(mask) => arrow::compute::and(&mask, &valid).expect("equal-length masks"),
+        });
     }
-    let mask = BooleanArray::new(col.nulls().unwrap().inner().clone(), None);
+    let Some(mask) = mask else {
+        return batch;
+    };
     filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
+}
+
+/// The combined hash of one row's key columns. A single column hashes exactly
+/// as `RandomState::hash_one(value)` does; more columns fold in through the
+/// same hasher.
+#[inline(always)]
+pub(crate) fn hash_key_row(
+    hash_state: &RandomState,
+    columns: &[&arrow_array::Int64Array],
+    row: usize,
+) -> u64 {
+    if let [column] = columns {
+        return hash_state.hash_one(unsafe { column.value_unchecked(row) });
+    }
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = hash_state.build_hasher();
+    for column in columns {
+        hasher.write_i64(unsafe { column.value_unchecked(row) });
+    }
+    hasher.finish()
 }
 
 impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
@@ -115,23 +144,25 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 
     fn consume<S: Sender<()>>(&mut self, batch: RecordBatch, _sender: &mut S) -> unary::Result<()> {
         debug!("Consuming build");
-        let batch = filter_null_keys(batch, self.key_column);
-        let col = batch.column(self.key_column).as_primitive::<Int64Type>();
-        let n = col.len();
+        let batch = filter_null_keys(batch, &self.key_columns);
+        let columns: Vec<&arrow_array::Int64Array> = self
+            .key_columns
+            .iter()
+            .map(|&c| batch.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let n = batch.num_rows();
         assert!(
             self.rows_consumed + n <= u32::MAX as usize,
             "join build side exceeds u32 row indexing"
         );
 
         for i in 0..n {
-            let key = unsafe { col.value_unchecked(i) };
-            let hash = self.hash_state.hash_one(key);
+            let hash = hash_key_row(&self.hash_state, &columns, i);
             let partition = (hash >> PARTITION_SHIFT) as usize;
             self.values[partition].push(
                 &mut self.slab_allocator,
                 BuildTuple {
                     hash,
-                    key: key as u64,
                     row: (self.rows_consumed + i) as u32,
                 },
             );
@@ -248,7 +279,7 @@ impl JoinPartitionJob {
                 directory.set_entry(slot, entry);
                 let arena_idx = (entry >> 16) as usize;
                 unsafe {
-                    keys.ptr_at_index(arena_idx).write(tuple.key);
+                    keys.ptr_at_index(arena_idx).write(tuple.hash);
                     rows.ptr_at_index(arena_idx).write(row_base + tuple.row);
                 }
             });

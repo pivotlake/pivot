@@ -25,7 +25,7 @@ fn join_matching_keys() {
     let build = values_input(&d, vec![int64_batch("id", &[10, 20, 30])]).record_batches();
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
-    let results = probe.join(build, 0, 0).collect().unwrap();
+    let results = probe.join(build, vec![0], vec![0]).collect().unwrap();
 
     let mut keys = collect_i64s(&results, 1);
     keys.sort();
@@ -38,7 +38,7 @@ fn join_no_matches() {
     let build = values_input(&d, vec![int64_batch("id", &[1, 2, 3])]).record_batches();
     let probe = values_input(&d, vec![int64_batch("id", &[4, 5, 6])]).record_batches();
 
-    let results = probe.join(build, 0, 0).collect().unwrap();
+    let results = probe.join(build, vec![0], vec![0]).collect().unwrap();
 
     assert!(results.is_empty());
 }
@@ -49,7 +49,7 @@ fn join_duplicate_build_keys() {
     let build = values_input(&d, vec![int64_batch("id", &[10, 10, 20])]).record_batches();
     let probe = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
 
-    let results = probe.join(build, 0, 0).collect().unwrap();
+    let results = probe.join(build, vec![0], vec![0]).collect().unwrap();
 
     let mut keys = collect_i64s(&results, 1);
     keys.sort();
@@ -62,7 +62,7 @@ fn join_all_keys_match() {
     let build = values_input(&d, vec![int64_batch("id", &[1, 2, 3, 4, 5])]).record_batches();
     let probe = values_input(&d, vec![int64_batch("id", &[5, 4, 3, 2, 1])]).record_batches();
 
-    let results = probe.join(build, 0, 0).collect().unwrap();
+    let results = probe.join(build, vec![0], vec![0]).collect().unwrap();
 
     let mut keys = collect_i64s(&results, 1);
     keys.sort();
@@ -78,7 +78,7 @@ fn join_large_tables() {
     let build = values_input(&d, vec![int64_batch("id", &build_keys)]).record_batches();
     let probe = values_input(&d, vec![int64_batch("id", &probe_keys)]).record_batches();
 
-    let results = probe.join(build, 0, 0).collect().unwrap();
+    let results = probe.join(build, vec![0], vec![0]).collect().unwrap();
 
     let mut keys = collect_i64s(&results, 1);
     keys.sort();
@@ -92,7 +92,7 @@ fn join_then_count() {
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
     let results = probe
-        .join(build, 0, 0)
+        .join(build, vec![0], vec![0])
         .aggregate::<i64>(vec![AggregationSlot::new(
             AggregationKind::CountStar,
             0,

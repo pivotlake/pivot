@@ -12,21 +12,24 @@ use crate::compile::Error;
 use dispatch::RecordBatchOperatorSpec;
 use std::fmt;
 
-/// Inner hash equi-join on a single key column per side.
+/// Inner hash equi-join on one or more key columns per side (`probe_keys[i]`
+/// pairs with `build_keys[i]`). Matches are decided on the combined key hash;
+/// the walk layers an equality filter above the join that re-compares the key
+/// columns, screening hash collisions.
 #[derive(Debug)]
 pub struct Join {
-    /// The key's column index in the probe (first) input's output.
-    pub probe_key: usize,
-    /// The key's column index in the build (second) input's output.
-    pub build_key: usize,
+    /// The keys' column indices in the probe (first) input's output.
+    pub probe_keys: Vec<usize>,
+    /// The keys' column indices in the build (second) input's output.
+    pub build_keys: Vec<usize>,
 }
 
 impl fmt::Display for Join {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Join(probe_key: {}, build_key: {})",
-            self.probe_key, self.build_key
+            "Join(probe_keys: {:?}, build_keys: {:?})",
+            self.probe_keys, self.build_keys
         )
     }
 }
@@ -37,6 +40,6 @@ impl Join {
         probe: RecordBatchOperatorSpec,
         build: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        Ok(probe.join(build, self.build_key, self.probe_key))
+        Ok(probe.join(build, self.build_keys.clone(), self.probe_keys.clone()))
     }
 }
