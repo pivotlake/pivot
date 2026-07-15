@@ -20,6 +20,22 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition};
 mod bit_pack_decoder;
 pub use bit_pack_decoder::{BitDecoderOverflow, BitPackDecoder};
 
+/// Writes `dict`'s entry for each key into `dest` (same length).
+///
+/// Kept out of line: with its own small frame the lookup loop unrolls,
+/// while inlined into the decode body it competes for registers with
+/// everything else and stays scalar.
+///
+/// # Safety
+///
+/// Every key must be `< dict.len()`.
+#[inline(never)]
+unsafe fn gather_entries<D: Dict>(dict: &D, keys: &[u32], dest: &mut [D::Item]) {
+    for (d, &k) in dest.iter_mut().zip(keys) {
+        *d = unsafe { dict.entry_unchecked(k as usize) };
+    }
+}
+
 /// A single run in the RLE/bit-packed stream.
 pub enum Run {
     Rle {
@@ -210,6 +226,13 @@ impl Run {
                 partial,
                 partial_count,
             } => {
+                // Keys are bounded by the bit width; when the dictionary is
+                // at least that large no key can be out of range. Otherwise
+                // one max-scan per chunk (auto-vectorized) checks the whole
+                // chunk up front: slab-backed dictionaries index with no
+                // per-element bounds check, so out-of-range keys must be
+                // impossible by the time the lookup loop runs.
+                let keys_in_range = (1u64 << bit_width) as usize <= dict.len();
                 let (_, leftover) = decode_bitpacked(
                     remaining_in_run,
                     partial,
@@ -220,10 +243,19 @@ impl Run {
                     position,
                     limit,
                     |scratch, count| {
-                        let dest = builder.spare_mut(count);
-                        for i in 0..count {
-                            dest[i] = dict.entry(scratch[i] as usize);
+                        let keys = &scratch[..count];
+                        if !keys_in_range {
+                            let max = keys.iter().copied().max().unwrap_or(0);
+                            assert!(
+                                (max as usize) < dict.len(),
+                                "dictionary key {max} out of range ({} entries)",
+                                dict.len()
+                            );
                         }
+                        let dest = builder.spare_mut(count);
+                        // SAFETY: every key is < dict.len() - by the bit-width
+                        // bound or the max-scan assert above.
+                        unsafe { gather_entries(dict, keys, dest) };
                     },
                 );
                 leftover
