@@ -5,14 +5,13 @@ use ahash::RandomState;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Injector;
 
-use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
 use crate::operations::unary::join::build::{
     BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
 };
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::probe::Probe;
-use crate::operations::unary::join::{JoinCell, JoinTable};
+use crate::operations::unary::join::{JoinArena, JoinCell, JoinTable};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
@@ -22,8 +21,8 @@ pub struct JoinBuildFactory {
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     directory: Arc<JoinCell<JoinDirectory>>,
-    keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-    rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    keys: Arc<JoinCell<JoinArena<u64>>>,
+    rows: Arc<JoinCell<JoinArena<u32>>>,
     build_rows: Arc<JoinCell<Option<RecordBatch>>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
@@ -63,8 +62,8 @@ pub fn create_for_workers(
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
     let directory = Arc::new(JoinCell::new(JoinDirectory::initial()));
-    let keys = Arc::new(JoinCell::new(MultiSlabBuffer::<u64>::new(vec![])));
-    let rows = Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![])));
+    let keys = Arc::new(JoinCell::new(JoinArena::<u64>::empty()));
+    let rows = Arc::new(JoinCell::new(JoinArena::<u32>::empty()));
     let build_rows = Arc::new(JoinCell::new(None));
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));

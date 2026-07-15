@@ -1,7 +1,7 @@
-use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer, SlabAllocator, SlabVec};
+use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
-use crate::operations::unary::join::JoinCell;
 use crate::operations::unary::join::directory::{Directory, JoinDirectory};
+use crate::operations::unary::join::{JoinArena, JoinCell};
 use crate::operations::{Consumer, Outputter, unary};
 use ahash::RandomState;
 use arrow::compute::{concat_batches, filter_record_batch};
@@ -65,8 +65,8 @@ impl JoinBuildConsumer {
         receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
         directory: Arc<JoinCell<JoinDirectory>>,
-        keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-        rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+        keys: Arc<JoinCell<JoinArena<u64>>>,
+        rows: Arc<JoinCell<JoinArena<u32>>>,
         build_rows: Arc<JoinCell<Option<RecordBatch>>>,
         injector: Arc<Injector<JoinPartitionJob>>,
         jobs_injected: Arc<AtomicBool>,
@@ -160,8 +160,8 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 
 pub struct JoinBuilder {
     directory: Arc<JoinCell<JoinDirectory>>,
-    keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-    rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    keys: Arc<JoinCell<JoinArena<u64>>>,
+    rows: Arc<JoinCell<JoinArena<u32>>>,
     build_rows: Arc<JoinCell<Option<RecordBatch>>>,
     receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
@@ -178,8 +178,8 @@ pub struct JoinPartitionJob {
     /// worker's global payload row base (added to each tuple's local row).
     tuples: Vec<(u32, SlabVec<BuildTuple>)>,
     directory: Arc<JoinCell<JoinDirectory>>,
-    keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-    rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    keys: Arc<JoinCell<JoinArena<u64>>>,
+    rows: Arc<JoinCell<JoinArena<u32>>>,
     arena_offset: usize,
 
     slot_start: usize,
@@ -192,11 +192,8 @@ unsafe impl Send for JoinPartitionJob {}
 impl JoinPartitionJob {
     fn run(self) {
         debug!("Running partition job");
-        let join_dir = unsafe { &*self.directory.get() };
-        match join_dir {
-            JoinDirectory::Contiguous(dir) => self.run_with_dir(dir),
-            JoinDirectory::NonContiguous(dir) => self.run_with_dir(dir),
-        }
+        let directory = unsafe { &*self.directory.get() };
+        self.run_with_dir(directory);
     }
 
     #[inline(always)]
@@ -291,46 +288,39 @@ impl Outputter<()> for JoinBuilder {
             }
 
             // Concatenate every worker's payload into the single batch probe
-            // rows are gathered from. No batches means an empty build side;
-            // the probe then emits nothing.
+            // rows are gathered from, then detach it onto the heap: the
+            // concatenated views still share the scans' ring buffers, and the
+            // shared join table can be dropped from a non-worker thread (where
+            // ring memory must never be released) besides pinning ring slots
+            // for the whole query. No batches means an empty build side; the
+            // probe then emits nothing.
             let payload_batches: Vec<RecordBatch> = worker_outputs
                 .iter()
                 .flat_map(|output| output.payload.iter().cloned())
                 .collect();
             let build_rows = unsafe { &mut *self.build_rows.get() };
             *build_rows = payload_batches.first().map(|first| {
-                concat_batches(&first.schema(), &payload_batches)
-                    .expect("build payload batches share a schema")
+                let joined = concat_batches(&first.schema(), &payload_batches)
+                    .expect("build payload batches share a schema");
+                crate::operations::unary::copy_out::detach_batch(&joined)
+                    .expect("detaching the build payload to heap buffers")
             });
 
-            // Pre-allocate directory and arenas.
+            // Pre-allocate directory and arenas (heap, see JoinArena's doc).
             let dir_capacity = ((total as f64 * 1.125) as usize)
                 .next_power_of_two()
                 .max(NUM_PARTITIONS);
             let directory = unsafe { &mut *self.directory.get() };
-            *directory = match ContiguousMultiBuffer::<u64>::new(dir_capacity + 1) {
-                Ok(buf) => JoinDirectory::Contiguous(Directory::new(buf, dir_capacity)),
-                Err(_) => {
-                    let mut alloc = SlabAllocator::new(false);
-                    JoinDirectory::NonContiguous(Directory::new(
-                        alloc.create_multi_slab_buffer(dir_capacity + 1, true),
-                        dir_capacity,
-                    ))
-                }
-            };
+            *directory = Directory::new(vec![0u64; dir_capacity + 1], dir_capacity);
 
             // Sentinel at entry[capacity] holds the end pointer of the last slot.
             // Probe reads end_ptr(slot+1) for slot = capacity-1, which lands here.
-            match directory {
-                JoinDirectory::Contiguous(d) => d.set_entry(dir_capacity, (total as u64) << 16),
-                JoinDirectory::NonContiguous(d) => d.set_entry(dir_capacity, (total as u64) << 16),
-            }
+            directory.set_entry(dir_capacity, (total as u64) << 16);
 
-            let mut arena_alloc = SlabAllocator::new(false);
             let keys = unsafe { &mut *self.keys.get() };
-            *keys = arena_alloc.create_multi_slab_buffer::<u64>(total.max(1), false);
+            *keys = JoinArena::new(total.max(1));
             let rows = unsafe { &mut *self.rows.get() };
-            *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
+            *rows = JoinArena::new(total.max(1));
 
             // Prefix sums give each partition its arena offset.
             let mut offsets = vec![0usize; NUM_PARTITIONS];

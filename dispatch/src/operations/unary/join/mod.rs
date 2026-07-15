@@ -23,9 +23,48 @@ use std::sync::atomic::AtomicBool;
 
 use arrow_array::RecordBatch;
 
-use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
+
+/// A fixed-length, index-addressed heap buffer for the join's key/row arenas.
+///
+/// Deliberately plain heap (not ring slabs): the join table is shared through
+/// `Arc`s whose last drop can land on a non-worker thread, where ring-backed
+/// memory must never be released. Writes go through raw pointers because the
+/// partitioned build jobs scatter into disjoint index ranges concurrently.
+pub(crate) struct JoinArena<T> {
+    data: Box<[T]>,
+}
+
+impl<T: Copy + Default> JoinArena<T> {
+    pub(crate) fn new(len: usize) -> Self {
+        Self {
+            data: vec![T::default(); len].into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            data: Box::from([]),
+        }
+    }
+
+    /// Raw pointer to element `idx`, for the build's disjoint concurrent
+    /// scatter writes and the probe's prefetches.
+    #[inline(always)]
+    pub(crate) fn ptr_at_index(&self, idx: usize) -> *mut T {
+        debug_assert!(idx <= self.data.len());
+        unsafe { self.data.as_ptr().add(idx) as *mut T }
+    }
+}
+
+impl<T> std::ops::Index<usize> for JoinArena<T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, idx: usize) -> &T {
+        &self.data[idx]
+    }
+}
 
 /// Interior-mutable storage shared by partitioned build workers.
 pub(crate) struct JoinCell<T>(UnsafeCell<T>);
@@ -52,8 +91,8 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 /// populated by the build phase and must only be read after `gate` is true.
 pub(crate) struct JoinTable {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
-    pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-    pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    pub(crate) keys: Arc<JoinCell<JoinArena<u64>>>,
+    pub(crate) rows: Arc<JoinCell<JoinArena<u32>>>,
     pub(crate) build_rows: Arc<JoinCell<Option<RecordBatch>>>,
     /// Set by the last build partition job; probes must wait on it, since the
     /// build dataflow's collect can return while a stolen job is still running.

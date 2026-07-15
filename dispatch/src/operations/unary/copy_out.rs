@@ -45,22 +45,31 @@ impl Unary<RecordBatch, RecordBatch> for CopyOut {
         batch: RecordBatch,
         sender: &mut S,
     ) -> unary::Result<()> {
-        let schema = batch.schema();
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|c| Ok(make_array(copy_to_malloc(&c.to_data())?)))
-            .collect::<unary::Result<Vec<_>>>()?;
-
-        // Carry the row count explicitly: a batch with no columns (e.g. a
-        // metadata-only / row-count scan) has no column lengths to infer it from,
-        // and `RecordBatch::try_new` would reject it.
-        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-        sender.send(RecordBatch::try_new_with_options(
-            schema, columns, &options,
-        )?)?;
+        sender.send(detach_batch(&batch)?)?;
         Ok(())
     }
+}
+
+/// Deep-copy `batch` into fresh heap allocations, detaching it from any ring
+/// buffers backing its columns. Used by [`CopyOut`] at the dataflow boundary,
+/// and by operators that must hold a batch beyond their own worker's lifetime
+/// (e.g. the hash join's shared build payload).
+pub(crate) fn detach_batch(batch: &RecordBatch) -> unary::Result<RecordBatch> {
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| Ok(make_array(copy_to_malloc(&c.to_data())?)))
+        .collect::<unary::Result<Vec<_>>>()?;
+
+    // Carry the row count explicitly: a batch with no columns (e.g. a
+    // metadata-only / row-count scan) has no column lengths to infer it from,
+    // and `RecordBatch::try_new` would reject it.
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &options,
+    )?)
 }
 
 /// Recursively copy every `Buffer`, null buffer, and child `ArrayData` into

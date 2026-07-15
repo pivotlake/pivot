@@ -8,16 +8,14 @@
 //! the key/row arenas.
 
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use crate::memory::SlabAllocator;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::build::filter_null_keys;
-use crate::operations::unary::join::directory::{
-    Directory, JoinDirectory, PtrBuffer, prefetch_ptr_l2,
-};
+use crate::operations::unary::join::directory::{Directory, PtrBuffer, prefetch_ptr_l2};
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
+use crate::operations::unary::join::{JoinArena, JoinTable};
 use ahash::RandomState;
 use arrow::compute::take;
 use arrow_array::cast::AsArray;
@@ -66,8 +64,8 @@ impl Probe {
 /// matched (probe row, build payload row) pairs into the two selection-vector
 /// builders and flushing full output batches through `sender`.
 struct BatchProbe<'a, 'b, S: Sender<RecordBatch>> {
-    keys: &'a MultiSlabBuffer<u64>,
-    rows: &'a MultiSlabBuffer<u32>,
+    keys: &'a JoinArena<u64>,
+    rows: &'a JoinArena<u32>,
     col: &'b Int64Array,
     probe_batch: &'b RecordBatch,
     build_rows: &'a RecordBatch,
@@ -452,18 +450,11 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             allocator: &mut self.allocator,
         };
 
-        let join_dir = unsafe { &*self.table.directory.get() };
+        let directory = unsafe { &*self.table.directory.get() };
         if !self.use_probe_array {
-            return match join_dir {
-                JoinDirectory::Contiguous(dir) => out.run_scalar(dir, &self.hash_state),
-                JoinDirectory::NonContiguous(dir) => out.run_scalar(dir, &self.hash_state),
-            };
+            return out.run_scalar(directory, &self.hash_state);
         }
-
-        match join_dir {
-            JoinDirectory::Contiguous(dir) => run_probe_array(dir, &self.hash_state, out),
-            JoinDirectory::NonContiguous(dir) => run_probe_array(dir, &self.hash_state, out),
-        }
+        run_probe_array(directory, &self.hash_state, out)
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {

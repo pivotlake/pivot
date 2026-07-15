@@ -82,7 +82,7 @@ pub use map::MapFactory;
 mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 
-mod copy_out;
+pub(crate) mod copy_out;
 mod join;
 mod limit;
 mod order_by_limit;

@@ -1,4 +1,3 @@
-use crate::memory::{ContiguousMultiBuffer, MultiSlabBuffer};
 use std::cell::UnsafeCell;
 use std::ops::{Index, IndexMut};
 
@@ -147,30 +146,23 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     }
 }
 
-impl PtrBuffer for ContiguousMultiBuffer<u64> {
+impl PtrBuffer for Vec<u64> {
     #[inline(always)]
     fn get_ptr(&self, slot: usize) -> *const u64 {
-        self.ptr_at_index(slot) as *const u64
+        // Raw pointer arithmetic (no slice indexing) so the probe can compute
+        // slot addresses ahead of time without bounds checks.
+        unsafe { self.as_ptr().add(slot) }
     }
 }
 
-impl PtrBuffer for MultiSlabBuffer<u64> {
-    #[inline(always)]
-    fn get_ptr(&self, slot: usize) -> *const u64 {
-        self.ptr_at_index(slot) as *const u64
-    }
-}
-
-/// Wraps two monomorphized `Directory` variants. The match happens once per
-/// partition job / probe batch, then the inner loop runs on the concrete
-/// `Directory<B>` — no branch per element.
-pub enum JoinDirectory {
-    Contiguous(Directory<ContiguousMultiBuffer<u64>>),
-    NonContiguous(Directory<MultiSlabBuffer<u64>>),
-}
+/// The join hash directory. Plain heap memory on purpose: the join table is
+/// shared between build and probe stages through `Arc`s whose last drop can
+/// land on a non-worker thread, where ring-backed buffers (which return to
+/// the per-worker free pool on drop) must never be released.
+pub type JoinDirectory = Directory<Vec<u64>>;
 
 impl JoinDirectory {
     pub fn initial() -> Self {
-        JoinDirectory::NonContiguous(Directory::new(MultiSlabBuffer::new(vec![]), 0))
+        Directory::new(Vec::new(), 0)
     }
 }
