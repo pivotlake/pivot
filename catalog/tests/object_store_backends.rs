@@ -73,6 +73,25 @@ fn pq(values: &[i64]) -> Vec<u8> {
     buf
 }
 
+/// Parse Parquet `bytes` and return the `value` column (index 1), sorted.
+fn parquet_values(bytes: &[u8]) -> Vec<i64> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::io::Write as _;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut values = Vec::new();
+    for batch in reader {
+        values.extend(collect_i64s(&[batch.unwrap()], 1));
+    }
+    values.sort();
+    values
+}
+
 /// Put `files` (name → values) under `events/` and `CREATE TABLE events` over them.
 fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> ParquetCatalog {
     for (name, values) in files {
@@ -177,6 +196,50 @@ mod bodies {
         assert_eq!(row_groups(&cat, "events"), 1);
     }
 
+    /// INSERT uploads each Parquet file over the io_uring ring — a local `write`,
+    /// or an S3/GCS `PUT`/`POST` (never a synchronous store call). Runs the insert
+    /// pipeline, then reads the uploaded file straight back out of the store and
+    /// parses it, asserting the ring wrote a valid Parquet file the store accepted
+    /// with the expected rows. (Reads back via the store's own `get` rather than a
+    /// table scan, so it checks the write path in isolation.)
+    pub fn insert_uploads_over_the_ring(b: &Backend) {
+        let d = dispatch_with_buffers(2, 32);
+        let cat = std::sync::Arc::new(ParquetCatalog::open(&b.root, &d).unwrap());
+        cat.create_table(path_request("uploaded", "uploaded"), &d)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+
+        let transaction = cat.begin_transaction();
+        let mut planner = planner::Planner::new(cat.clone());
+        let plan = planner
+            .plan(
+                "INSERT INTO uploaded VALUES ('a', 1), ('b', 2), ('c', 3)",
+                transaction.clone(),
+            )
+            .unwrap();
+        plan.compile(&d, transaction.as_ref())
+            .unwrap()
+            .collect()
+            .unwrap();
+
+        // The ring uploaded one file under the table's directory; read it back and
+        // parse it to confirm the store accepted valid Parquet with all rows.
+        let uploaded: Vec<_> = b
+            .store
+            .list(&ObjectPath::new("uploaded"))
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.path.as_str().ends_with(".parquet"))
+            .collect();
+        assert_eq!(uploaded.len(), 1);
+        let key = ObjectPath::new(format!("uploaded/{}", uploaded[0].path.as_str()));
+        let bytes = b.store.get(&key).unwrap().unwrap();
+        assert_eq!(bytes.len() as u64, uploaded[0].size);
+        assert_eq!(parquet_values(&bytes), vec![1, 2, 3]);
+    }
+
     /// A stored object reads back through `source` — the read source the ring is
     /// handed (a presigned S3 URL, a GCS media URL, or a local path).
     pub fn source_reads_object_back(b: &Backend) {
@@ -255,6 +318,7 @@ macro_rules! backend_tests {
 }
 
 backend_tests!(create_and_scan);
+backend_tests!(insert_uploads_over_the_ring);
 backend_tests!(survives_reopen);
 backend_tests!(append_registers_new_file);
 backend_tests!(compaction_replaces_files);

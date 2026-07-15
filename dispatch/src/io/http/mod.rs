@@ -14,7 +14,7 @@
 //! tracks which dataflow each in-flight request belongs to and commits the block
 //! once its body has fully landed.
 
-use crate::io::RemoteFile;
+use crate::io::{HttpMethod, RemoteFile};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -22,6 +22,7 @@ mod backend;
 mod http1;
 mod proto;
 mod tls;
+mod upload;
 
 pub use tls::default_client_config;
 
@@ -30,6 +31,12 @@ pub(crate) use backend::HTTP_TAG;
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) use backend::HttpCompletion;
 pub(crate) use backend::HttpEngine;
+
+#[cfg(target_os = "linux")]
+pub(crate) use upload::UPLOAD_TAG;
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) use upload::UploadCompletion;
+pub(crate) use upload::UploadEngine;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -67,3 +74,17 @@ pub(crate) struct RemoteRead {
 // writes to `[dest, dest+len)` (currently-invalid sub-blocks), so moving the
 // descriptor into the engine is sound. Mirrors the file path's PendingRead.
 unsafe impl Send for RemoteRead {}
+
+/// A single object upload: send `data` to `remote` with `method` and the
+/// backend-signed `headers`. `Clone` so a transient transport failure can
+/// re-issue it on a fresh connection — a PUT to a unique object key is
+/// idempotent, so a retry either creates the object once or overwrites it with
+/// the identical bytes. `data` is reference-counted, so a clone shares the buffer
+/// rather than copying the (multi-megabyte) file.
+#[derive(Clone)]
+pub(crate) struct RemoteWrite {
+    pub remote: Arc<RemoteFile>,
+    pub method: HttpMethod,
+    pub headers: Vec<(String, String)>,
+    pub data: Arc<Vec<u8>>,
+}

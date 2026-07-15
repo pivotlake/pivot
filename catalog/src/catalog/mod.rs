@@ -29,6 +29,7 @@
 //! pushdown accumulates on that binding alone.
 
 mod binding;
+mod insert_sink;
 mod metadata_function;
 mod table;
 mod transaction;
@@ -98,10 +99,6 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("INSERT target table `{0}` is not present in the transaction snapshot")]
     InsertTableMissing(String),
-    #[error("the transaction's INSERT writer is no longer available")]
-    InsertWriterUnavailable,
-    #[error("the transaction's INSERT writer panicked")]
-    InsertWriterPanicked,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -594,8 +591,10 @@ impl ParquetTransaction {
         self.snapshot.table(name)
     }
 
-    pub(in crate::catalog) fn insert_writer(&self) -> Result<transaction::WriteSender> {
-        self.writer.write_sender()
+    /// The transaction's shared writer, cloned into each INSERT sink operator so
+    /// dispatch workers record their uploaded files against it.
+    pub(in crate::catalog) fn insert_writer(&self) -> Arc<transaction::TransactionWriter> {
+        self.writer.clone()
     }
 }
 

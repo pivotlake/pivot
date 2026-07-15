@@ -7,6 +7,7 @@
 //! Keeping the policy here (rather than in `http1`) means both platform backends
 //! share identical, socket-free, unit-testable logic.
 
+use super::RemoteWrite;
 use super::http1;
 use thiserror::Error;
 
@@ -49,6 +50,36 @@ pub fn build_range_get(
          \r\n"
     )
     .into_bytes()
+}
+
+/// Build an origin-form HTTP/1.1 request head for an object upload: the request
+/// line, `Host`, a `Content-Length` matching the body, the backend-signed
+/// `headers` (SigV4 for S3, a bearer token for GCS), and the remote's own
+/// `Authorization` when it mints one per request. `Connection: close` because
+/// uploads use a fresh socket each (no keep-alive pool). The body follows this
+/// head on the wire; it is not included here.
+pub fn build_object_write(write: &RemoteWrite) -> Vec<u8> {
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n",
+        write.method.as_str(),
+        write.remote.request_target(),
+        write.remote.host_header(),
+        write.data.len(),
+    )
+    .into_bytes();
+    for (name, value) in &write.headers {
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    if let Some(auth) = write.remote.auth_header() {
+        head.extend_from_slice(b"Authorization: ");
+        head.extend_from_slice(auth.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"Connection: close\r\nUser-Agent: pivotdb-dispatch/0.1\r\n\r\n");
+    head
 }
 
 /// A parsed (and validated `206`) response head.

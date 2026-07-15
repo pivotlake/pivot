@@ -56,7 +56,7 @@ mod factory;
 pub use factory::*;
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{FsRequest, FsWriteRequest, HttpRequest, HttpWriteRequest};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -161,6 +161,36 @@ pub trait Unary<I, O> {
         unreachable!()
     }
 
+    /// Return any pending local-file write requests (INSERT'd Parquet files to
+    /// land on disk). See [`Operator::next_fs_write_requests`].
+    fn next_fs_write_requests(&mut self) -> Result<Vec<FsWriteRequest>> {
+        Ok(vec![])
+    }
+
+    /// Return any pending object-upload requests (INSERT'd Parquet files to PUT
+    /// to S3/GCS). See [`Operator::next_http_write_requests`].
+    fn next_http_write_requests(&mut self) -> Result<Vec<HttpWriteRequest>> {
+        Ok(vec![])
+    }
+
+    /// Handle a completed local-file write; its bytes are durable.
+    fn process_fs_write_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: FsWriteRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed object upload the store accepted.
+    fn process_http_write_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: HttpWriteRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
     /// Called each iteration even when no input is available. Useful for operators
     /// that generate work independently of input (e.g. emitting buffered results).
     fn run<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<WorkStatus> {
@@ -257,6 +287,26 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(self
             .unary
             .process_http_response(&mut self.sender, request)?)
+    }
+
+    fn next_fs_write_requests(&mut self) -> super::Result<Vec<FsWriteRequest>> {
+        Ok(self.unary.next_fs_write_requests()?)
+    }
+
+    fn next_http_write_requests(&mut self) -> super::Result<Vec<HttpWriteRequest>> {
+        Ok(self.unary.next_http_write_requests()?)
+    }
+
+    fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
+        Ok(self
+            .unary
+            .process_fs_write_response(&mut self.sender, request)?)
+    }
+
+    fn process_http_write_response(&mut self, request: HttpWriteRequest) -> super::Result<()> {
+        Ok(self
+            .unary
+            .process_http_write_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<FinishStatus> {

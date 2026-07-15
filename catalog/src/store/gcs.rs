@@ -16,8 +16,12 @@
 //! [`source`](GcsStore::source)), so a worker only ever *reads* a current token.
 //! RS256 signing uses `ring`; everything is synchronous, no async runtime.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileSource, DataWriteTarget, FileRef, ObjectPath, ObjectStore, Result, StoreError,
+    object_key,
+};
 use base64::Engine;
+use dispatch::io::{HttpMethod, RemoteFile};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -382,6 +386,43 @@ impl ObjectStore for GcsStore {
         Ok(DataFileSource::Remote {
             url,
             auth: Some(Arc::new(move || auth.current())),
+        })
+    }
+
+    fn open_data_write(&self, key: &ObjectPath, data: &[u8]) -> Result<DataWriteTarget> {
+        // Prime the token here (blocking mint, cached; an emulator returns
+        // immediately) so the ring upload finds a fresh one via the auth closure.
+        self.auth.header()?;
+        // The JSON API media upload: POST the bytes to `.../o?uploadType=media`.
+        let url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            self.endpoint,
+            self.bucket,
+            self.object_path(key)
+        );
+        let parsed = url::Url::parse(&url)
+            .map_err(|e| StoreError::Config(format!("building gcs upload url: {e}")))?;
+        // An emulator ignores `Authorization`; real GCS reads a fresh bearer per
+        // request, exactly like the range-read path.
+        let auth: Option<dispatch::io::AuthHeader> = if self.auth.emulated {
+            None
+        } else {
+            let auth = self.auth.clone();
+            Some(Arc::new(move || auth.current()))
+        };
+        let remote = Arc::new(RemoteFile::open(parsed, auth, data.len() as u64).map_err(
+            |source| StoreError::Io {
+                key: key.to_string(),
+                source,
+            },
+        )?);
+        Ok(DataWriteTarget::Remote {
+            remote,
+            method: HttpMethod::Post,
+            headers: vec![(
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            )],
         })
     }
 }

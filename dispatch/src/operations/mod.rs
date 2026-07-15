@@ -44,7 +44,7 @@
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{FsRequest, FsWriteRequest, HttpRequest, HttpWriteRequest};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -126,6 +126,34 @@ pub trait Operator {
     /// Handle a completed HTTP read; its bytes are already committed to the
     /// cache. Called by the worker when the read finishes.
     fn process_http_response(&mut self, request: HttpRequest) -> Result<()>;
+
+    /// Return any pending local-file write requests (an INSERT'd Parquet file to
+    /// land on disk). The worker submits them on the same per-core ring the disk
+    /// reads use and delivers completions via
+    /// [`process_fs_write_response`](Self::process_fs_write_response). Default:
+    /// none — only the INSERT sink issues writes.
+    fn next_fs_write_requests(&mut self) -> Result<Vec<FsWriteRequest>> {
+        Ok(vec![])
+    }
+
+    /// Return any pending object-upload requests (an INSERT'd Parquet file to PUT
+    /// to S3/GCS). Submitted on the same ring as HTTP reads, with completions
+    /// delivered via [`process_http_write_response`](Self::process_http_write_response).
+    /// Default: none.
+    fn next_http_write_requests(&mut self) -> Result<Vec<HttpWriteRequest>> {
+        Ok(vec![])
+    }
+
+    /// Handle a completed local-file write; its bytes are durable. Default: this
+    /// operator issued no writes, so it is never called.
+    fn process_fs_write_response(&mut self, _request: FsWriteRequest) -> Result<()> {
+        Ok(())
+    }
+
+    /// Handle a completed object upload the store accepted. Default: never called.
+    fn process_http_write_response(&mut self, _request: HttpWriteRequest) -> Result<()> {
+        Ok(())
+    }
 
     /// Attempt to finish. Returns a [`FinishStatus`] telling the worker whether
     /// the operator is done, still working (re-drive, don't park), or not yet

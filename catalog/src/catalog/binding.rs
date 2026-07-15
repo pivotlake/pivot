@@ -10,10 +10,11 @@ use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
-use crate::parquet_writing::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, encode_spec};
-use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, Sender};
+use crate::parquet_writing::{EncodedFile, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, encode_spec};
+use arrow_array::{Array, ArrayRef, RecordBatch, Scalar};
+use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, stealable};
+
+use super::insert_sink::InsertSinkFactory;
 use planner::catalog::{
     CatalogTransaction, Column, DynamicScanPredicate, Error as CatalogError,
     Result as CatalogResult, Table,
@@ -203,27 +204,25 @@ impl Table for TableBinding {
             ROW_GROUP_ROWS,
             ROW_GROUPS_PER_FILE,
         );
-        let writer = transaction.insert_writer()?;
-        let table_name = self.name.clone();
+        // One sink per worker: each consumes its encoded files, uploads them over
+        // the io_uring ring (local `write` or S3/GCS `PUT`/`POST`), and records
+        // the manifest entry each write produces. Dispatch performs the byte
+        // transfer, so no worker blocks on an object-store call.
+        let writer = transaction.insert_writer();
         let count_emitted = Arc::new(AtomicBool::new(false));
-        let staged = encoded.sink_each(
-            move |encoded| {
-                writer.submit(table_name.clone(), encoded);
-                Ok(())
-            },
-            move |sender: &mut dyn Sender<RecordBatch>| {
-                if count_emitted.swap(true, Ordering::Relaxed) {
-                    return Ok(());
-                }
-                let count = UInt64Array::from(vec![rows_written.load(Ordering::Relaxed)]);
-                let schema = Schema::new(vec![Field::new("count", DataType::UInt64, false)]);
-                sender.send(RecordBatch::try_new(
-                    Arc::new(schema),
-                    vec![Arc::new(count)],
-                )?)?;
-                Ok(())
-            },
-        );
+        let workers = encoded.dispatcher().worker_count();
+        let channels: Vec<_> = stealable::<EncodedFile>(workers).into_iter().collect();
+        let factories: Vec<_> = (0..workers)
+            .map(|_| InsertSinkFactory {
+                store: table.store().clone(),
+                location: table.location_path().clone(),
+                table: self.name.clone(),
+                writer: writer.clone(),
+                rows_written: rows_written.clone(),
+                count_emitted: count_emitted.clone(),
+            })
+            .collect();
+        let staged = encoded.chain(channels, factories);
         Ok(RecordBatchOperatorSpec::from_spec(staged))
     }
 

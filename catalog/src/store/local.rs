@@ -1,7 +1,9 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError};
+use super::{
+    DataFileSource, DataWriteTarget, FileRef, ObjectPath, ObjectStore, Result, StoreError,
+};
 use std::path::PathBuf;
 
 /// The local-filesystem backend: keys are paths under `root`.
@@ -144,6 +146,30 @@ impl ObjectStore for LocalStore {
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
         Ok(DataFileSource::Local(self.path_for(key)))
+    }
+
+    fn open_data_write(&self, key: &ObjectPath, _data: &[u8]) -> Result<DataWriteTarget> {
+        let path = self.path_for(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
+                key: key.to_string(),
+                source,
+            })?;
+        }
+        // Create/truncate the target for the ring to write into. Unlike `put`
+        // there's no temp-file rename: an INSERT'd file is not referenced by any
+        // manifest until commit publishes it, so no reader can observe a
+        // partially-written file (and a crash leaves only an unreferenced orphan).
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|source| StoreError::Io {
+                key: key.to_string(),
+                source,
+            })?;
+        Ok(DataWriteTarget::Local(file))
     }
 }
 

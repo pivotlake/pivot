@@ -2,14 +2,18 @@ use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
-use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteReadSplit};
+use crate::io::http::{RemoteWrite, UploadEngine, default_client_config};
+use crate::io::{
+    Completion, DataFlowRequest, FailedRead, FsRequest, FsWriteRequest, HttpRequest,
+    HttpWriteRequest, RemoteReadSplit,
+};
 use std::collections::HashMap;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
-use crate::io::http::HTTP_TAG;
+use crate::io::http::{HTTP_TAG, UPLOAD_TAG};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -38,16 +42,36 @@ pub const RING_SIZE: u32 = 64;
 /// `user_data`.
 ///
 /// Held one per worker.
+/// A local-file write in flight on the ring. `written` tracks bytes durably
+/// landed so a short write (the kernel may move fewer bytes than asked) resubmits
+/// only the remaining tail rather than duplicating or truncating the file.
+struct PendingFsWrite {
+    request: DataFlowRequest<FsWriteRequest>,
+    written: usize,
+}
+
 pub struct IORequester {
     backend: IOBackend,
     /// In-flight local-file reads, keyed by their backend `user_data` id.
     pending_io_requests: HashMap<Identifier, DataFlowRequest<FsRequest>>,
+    /// In-flight local-file writes (INSERT'd Parquet files landing on disk),
+    /// keyed by their backend `user_data` id — a disjoint id space from the reads
+    /// and the engine's cache ops, so a completion routes by which map holds it.
+    pending_fs_writes: HashMap<Identifier, PendingFsWrite>,
     /// Allocates backend disk-op ids - shared by fs reads here and the engine's
     /// cache-file reads/write-backs, so a completion routes by which map holds it.
     next_id: Identifier,
     /// Remote reads, optionally served from the on-disk cache. Ring-less like the
     /// underlying `HttpEngine`: it borrows `backend` (and `next_id`) to submit.
     http: CachedHttpEngine,
+    /// Object uploads (INSERT'd Parquet files PUT to S3/GCS). Ring-less like the
+    /// read engine: it borrows the shared ring to submit its socket ops.
+    upload: UploadEngine,
+    /// In-flight uploads, keyed by their engine request id, held until the store
+    /// accepts them so the original request is yielded unchanged on completion.
+    pending_http_writes: HashMap<Identifier, DataFlowRequest<HttpWriteRequest>>,
+    /// Engine request-id space for uploads (disjoint from the backend disk ids).
+    next_upload_id: Identifier,
 }
 
 impl Default for IORequester {
@@ -62,9 +86,14 @@ impl IORequester {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             pending_io_requests: Default::default(),
+            pending_fs_writes: Default::default(),
             next_id: 0,
             http: CachedHttpEngine::with_default_config(disk_cache)
                 .expect("Unable to create http engine"),
+            upload: UploadEngine::new(default_client_config())
+                .expect("Unable to create upload engine"),
+            pending_http_writes: Default::default(),
+            next_upload_id: 0,
         }
     }
 
@@ -77,9 +106,13 @@ impl IORequester {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             pending_io_requests: Default::default(),
+            pending_fs_writes: Default::default(),
             next_id: 0,
-            http: CachedHttpEngine::new(http_config, disk_cache)
+            http: CachedHttpEngine::new(http_config.clone(), disk_cache)
                 .expect("Unable to create http engine"),
+            upload: UploadEngine::new(http_config).expect("Unable to create upload engine"),
+            pending_http_writes: Default::default(),
+            next_upload_id: 0,
         }
     }
 
@@ -107,6 +140,47 @@ impl IORequester {
         Ok(())
     }
 
+    /// Submit a whole-file write onto the ring — an INSERT'd Parquet file landing
+    /// on local disk. `data` is pinned by the request (held in
+    /// `pending_fs_writes`) so its address stays valid until the write completes.
+    /// A short write resubmits the remaining tail; only a fully-written file is
+    /// reported as a [`Completion::FsWrite`].
+    pub fn request_fs_write(&mut self, request: DataFlowRequest<FsWriteRequest>) -> Result<()> {
+        let fd = request.request.file.as_raw_fd();
+        let data_ptr = request.request.data.as_ptr();
+        let len = request.request.data.len();
+        self.submit_fs_write_from(fd, data_ptr, 0, len)?;
+        self.pending_fs_writes.insert(
+            self.next_id,
+            PendingFsWrite {
+                request,
+                written: 0,
+            },
+        );
+        self.next_id += 1;
+        self.backend.submit()?;
+        Ok(())
+    }
+
+    /// Stage one write op for `[offset, len)` of the buffer at `data_ptr`, using
+    /// the current `next_id` as its backend id.
+    fn submit_fs_write_from(
+        &mut self,
+        fd: RawFd,
+        data_ptr: *const u8,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        self.backend.submit_write(
+            fd,
+            offset as u64,
+            unsafe { data_ptr.add(offset) },
+            len - offset,
+            self.next_id,
+        )?;
+        Ok(())
+    }
+
     /// Submit a read for a remote region, served from the on-disk cache where
     /// possible (only the missing ranges hit the network). Delegates to the
     /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
@@ -118,20 +192,61 @@ impl IORequester {
             .request(&mut self.backend, &mut self.next_id, request)
     }
 
+    /// Submit an object upload onto the ring — an INSERT'd Parquet file PUT to
+    /// S3/GCS. The request is held until the store accepts it (a 2xx) and yielded
+    /// back unchanged as a [`Completion::HttpWrite`], or fails the owning dataflow.
+    pub fn request_http_write(&mut self, request: DataFlowRequest<HttpWriteRequest>) -> Result<()> {
+        let write = RemoteWrite {
+            remote: request.request.remote.clone(),
+            method: request.request.method,
+            headers: request.request.headers.clone(),
+            data: request.request.data.clone(),
+        };
+        let id = self.next_upload_id;
+        self.next_upload_id += 1;
+        self.start_upload(id, write)?;
+        self.pending_http_writes.insert(id, request);
+        Ok(())
+    }
+
+    /// Hand an upload to the engine (ring-driven on Linux, synchronous else).
+    fn start_upload(&mut self, id: Identifier, write: RemoteWrite) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.upload.start(&mut self.backend.ring, id, write)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.upload.start(id, write)?;
+        }
+        Ok(())
+    }
+
     /// Returns `true` if any read (disk or HTTP) has not yet completed.
     pub fn has_pending(&self) -> bool {
         self.has_file_pending() || self.has_http_pending()
     }
 
     /// Returns `true` if any disk read is in flight - operator reads here, plus
-    /// the engine's cache-file reads / write-backs (all on the shared backend).
+    /// the engine's cache-file reads / write-backs (all on the shared backend) -
+    /// or any local-file write (an INSERT'd Parquet file landing on disk).
     pub fn has_file_pending(&self) -> bool {
-        !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
+        !self.pending_io_requests.is_empty()
+            || !self.pending_fs_writes.is_empty()
+            || self.http.has_disk_pending()
     }
 
-    /// Returns `true` if any HTTP read is in flight.
+    /// Returns `true` if any HTTP read or object upload is in flight.
     pub fn has_http_pending(&self) -> bool {
         self.http.has_network_pending()
+            || self.upload.has_active()
+            || !self.pending_http_writes.is_empty()
+    }
+
+    /// Number of object uploads issued but not yet completed — the current upload
+    /// depth a worker uses to decide whether to submit more.
+    pub fn uploads_in_flight(&self) -> usize {
+        self.pending_http_writes.len()
     }
 
     /// Number of HTTP reads issued but not yet completed — the current read-ahead
@@ -154,14 +269,17 @@ impl IORequester {
     pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedRead>>> {
         let raw = self.backend.completions()?;
 
-        // HTTP socket CQEs drive the engine first: they may submit follow-up SQEs
-        // and populate its completed/failed lists. On non-Linux the ring is
-        // disk-only (the engine runs synchronously), so there are none here.
+        // HTTP/upload socket CQEs drive their engines first: they may submit
+        // follow-up SQEs and populate completed/failed lists. On non-Linux the
+        // ring is disk-only (the engines run synchronously), so there are none.
         #[cfg(target_os = "linux")]
         for &(result, ud) in &raw {
             if (ud as u64) & HTTP_TAG != 0 {
                 self.http
                     .on_socket_completion(&mut self.backend, ud as u64, result)?;
+            } else if (ud as u64) & UPLOAD_TAG != 0 {
+                self.upload
+                    .on_cqe(&mut self.backend.ring, ud as u64, result)?;
             }
         }
 
@@ -185,6 +303,8 @@ impl IORequester {
                     request.request.block.commit();
                     out.push(Ok(Completion::Fs(request)));
                 }
+            } else if let Some(pending) = self.pending_fs_writes.remove(&ud) {
+                self.complete_fs_write(pending, result, &mut out)?;
             } else {
                 // Not one of ours → a cache-file read or write-back.
                 self.http.complete_disk(ud, result, &mut out);
@@ -195,7 +315,58 @@ impl IORequester {
         self.http
             .drain(&mut self.backend, &mut self.next_id, &mut out)?;
 
+        // Object uploads the engine finished this pass: yield the original request
+        // on success, or fail just the owning dataflow.
+        for id in self.upload.take_completed() {
+            if let Some(request) = self.pending_http_writes.remove(&id) {
+                out.push(Ok(Completion::HttpWrite(request)));
+            }
+        }
+        for (id, error) in self.upload.take_failed() {
+            if let Some(request) = self.pending_http_writes.remove(&id) {
+                out.push(Err(FailedRead {
+                    data_flow_id: request.data_flow_id,
+                    operator_idx: request.operator_idx,
+                    error: error.into(),
+                }));
+            }
+        }
+
         Ok(out)
+    }
+
+    /// Fold a completed write op into its `PendingFsWrite`: a negative result
+    /// fails just the owning dataflow; a short write resubmits the remaining tail;
+    /// a fully-written file is reported as a [`Completion::FsWrite`].
+    fn complete_fs_write(
+        &mut self,
+        mut pending: PendingFsWrite,
+        result: i32,
+        out: &mut Vec<std::result::Result<Completion, FailedRead>>,
+    ) -> Result<()> {
+        if result < 0 {
+            out.push(Err(FailedRead {
+                data_flow_id: pending.request.data_flow_id,
+                operator_idx: pending.request.operator_idx,
+                error: std::io::Error::from_raw_os_error(-result).into(),
+            }));
+            return Ok(());
+        }
+
+        pending.written += result as usize;
+        let total = pending.request.request.data.len();
+        if pending.written < total {
+            let fd = pending.request.request.file.as_raw_fd();
+            let data_ptr = pending.request.request.data.as_ptr();
+            self.submit_fs_write_from(fd, data_ptr, pending.written, total)?;
+            self.pending_fs_writes.insert(self.next_id, pending);
+            self.next_id += 1;
+            self.backend.submit()?;
+            return Ok(());
+        }
+
+        out.push(Ok(Completion::FsWrite(pending.request)));
+        Ok(())
     }
 
     /// Blocks until at least one pending read (disk or HTTP) makes progress. On
@@ -213,14 +384,18 @@ impl IORequester {
     pub fn wait(&mut self) -> Result<()> {
         // Flush any staged disk ops so they are in flight before we park.
         self.backend.submit()?;
-        if self.backend.has_ready_completion() || self.http.has_ready_completion() {
+        if self.backend.has_ready_completion()
+            || self.http.has_ready_completion()
+            || self.upload.has_ready_completion()
+        {
             return Ok(());
         }
-        // Park until either channel has a completion, without consuming it
-        // (completions() drains both).
+        // Park until any channel has a completion, without consuming it
+        // (completions() drains all).
         let mut select = crossbeam_channel::Select::new();
         select.recv(self.backend.completion_receiver());
         select.recv(self.http.completion_receiver());
+        select.recv(self.upload.completion_receiver());
         select.ready();
         Ok(())
     }
@@ -231,7 +406,7 @@ impl IORequester {
 /// are small counters that never reach it.
 #[cfg(target_os = "linux")]
 fn disk_completion(ud: Identifier) -> bool {
-    (ud as u64) & HTTP_TAG == 0
+    (ud as u64) & (HTTP_TAG | UPLOAD_TAG) == 0
 }
 #[cfg(not(target_os = "linux"))]
 fn disk_completion(_ud: Identifier) -> bool {
@@ -823,5 +998,132 @@ mod tests {
         settle(&mut after);
 
         assert_cached(&loc, 0, 4096);
+    }
+
+    /// A whole-file write submitted to the ring lands its bytes on disk. Larger
+    /// than a single write op typically moves in one go, so it also exercises the
+    /// short-write resubmit tail.
+    #[test]
+    fn a_local_file_write_lands_every_byte_on_disk() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.parquet");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let data: Arc<Vec<u8>> = Arc::new((0..300_000).map(|i| (i % 251) as u8).collect());
+
+        let mut requester = IORequester::default();
+        requester
+            .request_fs_write(DataFlowRequest::new(
+                0,
+                0,
+                FsWriteRequest {
+                    file: Arc::new(file),
+                    data: data.clone(),
+                    tag: 7,
+                },
+            ))
+            .unwrap();
+
+        let mut completed = None;
+        while completed.is_none() {
+            if requester.has_pending() {
+                requester.wait().unwrap();
+            }
+            for result in requester.completions().unwrap() {
+                match result {
+                    Ok(Completion::FsWrite(request)) => completed = Some(request.request.tag),
+                    Ok(_) => {}
+                    Err(failed) => panic!("write failed: {}", failed.error),
+                }
+            }
+        }
+        assert_eq!(completed, Some(7));
+
+        let mut got = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, *data);
+    }
+
+    /// Parse the `Content-Length` from a request head.
+    fn parse_content_length(head: &[u8]) -> usize {
+        let text = String::from_utf8_lossy(head);
+        text.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split(':').nth(1))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("request has a Content-Length header")
+    }
+
+    /// Spawn a loopback HTTPS server that accepts one `PUT`, records its whole
+    /// body into `sink`, and replies `200 OK`. Returns the bound port.
+    fn spawn_put_server(sink: Arc<Mutex<Vec<u8>>>) -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let head = read_head(&mut tls);
+            assert!(head.starts_with(b"PUT "), "expected a PUT request");
+            let content_length = parse_content_length(&head);
+            let mut body = vec![0u8; content_length];
+            tls.read_exact(&mut body).unwrap();
+            *sink.lock().unwrap() = body;
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            tls.flush().unwrap();
+        });
+        port
+    }
+
+    /// An object upload sends the whole body over the ring and completes on the
+    /// store's `2xx` — the write-side mirror of the range-read test, over TLS.
+    #[test]
+    fn an_object_upload_puts_the_whole_body_and_succeeds() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_put_server(sink.clone());
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/bucket/obj.parquet")).unwrap();
+        let data: Arc<Vec<u8>> = Arc::new((0..200_000).map(|i| (i % 251) as u8).collect());
+        let remote = Arc::new(RemoteFile::open(url, None, data.len() as u64).unwrap());
+
+        let mut requester = IORequester::with_http_config(client_config());
+        requester
+            .request_http_write(DataFlowRequest::new(
+                0,
+                0,
+                crate::io::HttpWriteRequest {
+                    remote,
+                    method: crate::io::HttpMethod::Put,
+                    headers: vec![("x-test".to_string(), "1".to_string())],
+                    data: data.clone(),
+                    tag: 9,
+                },
+            ))
+            .unwrap();
+
+        let mut completed = None;
+        while completed.is_none() {
+            if requester.has_pending() {
+                requester.wait().unwrap();
+            }
+            for result in requester.completions().unwrap() {
+                match result {
+                    Ok(Completion::HttpWrite(request)) => completed = Some(request.request.tag),
+                    Ok(_) => {}
+                    Err(failed) => panic!("upload failed: {}", failed.error),
+                }
+            }
+        }
+        assert_eq!(completed, Some(9));
+        assert_eq!(*sink.lock().unwrap(), *data);
     }
 }

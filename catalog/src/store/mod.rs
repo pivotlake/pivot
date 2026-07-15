@@ -12,9 +12,10 @@
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
-use dispatch::io::AuthHeader;
+use dispatch::io::{AuthHeader, HttpMethod, RemoteFile};
 use std::fmt::Debug;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 mod gcs;
 mod local;
@@ -139,6 +140,25 @@ impl DataFile {
     }
 }
 
+/// Where dispatch should transfer a new data file's bytes, prepared by the store
+/// but written by the io_uring ring (never a synchronous store call). A local
+/// backend hands back an opened file for the ring's `write`; a remote one a
+/// pre-signed HTTP endpoint for the ring's `PUT`/`POST`. The mirror image of
+/// [`DataFileSource`] on the write side.
+pub enum DataWriteTarget {
+    /// A local file created and opened for writing; the ring writes the bytes to it.
+    Local(std::fs::File),
+    /// A remote object endpoint the ring uploads to. `headers` are the store's
+    /// signed request headers (SigV4 for S3, `Content-Type` for GCS); `remote`
+    /// carries the URL and any per-request bearer (GCS) the upload authenticates
+    /// with.
+    Remote {
+        remote: Arc<RemoteFile>,
+        method: HttpMethod,
+        headers: Vec<(String, String)>,
+    },
+}
+
 /// A flat key→bytes object store rooted at one database. [`ObjectPath`] keys are
 /// relative to that root, e.g. `_pivot_manifest.json` or `events/a.parquet`.
 pub trait ObjectStore: Debug + Send + Sync {
@@ -186,6 +206,15 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// with a per-request bearer token. (Identity — the [`FileRef`] — is the
     /// caller's; this is only how to read the bytes.)
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource>;
+
+    /// Prepare a [`DataWriteTarget`] for writing `data` to object `key` over the
+    /// io_uring ring — the write-side counterpart of [`source`](Self::source).
+    /// The store creates the local file or signs the remote request here (control
+    /// plane); the ring performs the byte transfer. `data` is needed up front to
+    /// size and sign the request (S3 signs the payload hash), but the store does
+    /// not transfer it. The small mutable control objects (manifests, the initial
+    /// Delta commit) keep using synchronous [`put`](Self::put).
+    fn open_data_write(&self, key: &ObjectPath, data: &[u8]) -> Result<DataWriteTarget>;
 
     /// A human-readable description of where this store is rooted - e.g.
     /// `file:///var/lib/pivot`, `s3://bucket/prefix`, or `gs://bucket/prefix`.

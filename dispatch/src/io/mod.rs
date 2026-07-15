@@ -321,6 +321,47 @@ pub struct HttpRequest {
     pub block: MissingExtent,
 }
 
+/// A local-file write request: write the whole of `data` to `file` starting at
+/// offset 0. `data` is reference-counted so its address stays stable while the
+/// ring (or the non-Linux `pwrite` pool) reads from it for the write's whole
+/// flight, exactly as [`HttpRequest`] owns its `Arc<RemoteFile>`. `tag` lets the
+/// issuing operator match the completion back to the file it was uploading.
+pub struct FsWriteRequest {
+    pub file: Arc<File>,
+    pub data: Arc<Vec<u8>>,
+    pub tag: u64,
+}
+
+/// The HTTP method an object upload uses (S3 signs a `PUT`; GCS's JSON media
+/// upload is a `POST`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HttpMethod {
+    Put,
+    Post,
+}
+
+impl HttpMethod {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Put => "PUT",
+            Self::Post => "POST",
+        }
+    }
+}
+
+/// An HTTP(S) object upload: send `data` to `remote` with `method` and the
+/// backend-signed `headers`. The owned `data` stays pinned for every socket send
+/// the transfer submits; `tag` matches the completion back to the issuing
+/// operator's pending file. Mirrors [`HttpRequest`] on the write side — the
+/// transport (io_uring on Linux, a blocking pool elsewhere) is the read path's.
+pub struct HttpWriteRequest {
+    pub remote: Arc<RemoteFile>,
+    pub method: HttpMethod,
+    pub headers: Vec<(String, String)>,
+    pub data: Arc<Vec<u8>>,
+    pub tag: u64,
+}
+
 /// A read request that knows how many bytes it transfers, so stats can total
 /// the bytes read alongside the request count. Both transports read a
 /// [`MissingExtent`], so both report its byte length.
@@ -393,6 +434,13 @@ pub struct RemoteReadTime {
 pub enum Completion {
     Fs(DataFlowRequest<FsRequest>),
     Http(DataFlowRequest<HttpRequest>, RemoteReadTime),
+    /// A local-file write (an INSERT'd Parquet file landing on disk) whose bytes
+    /// are now durable; routed back to the operator that issued it so it can
+    /// record the file for commit.
+    FsWrite(DataFlowRequest<FsWriteRequest>),
+    /// An object upload (an INSERT'd Parquet file PUT to S3/GCS) the store
+    /// accepted with a 2xx; routed back to the issuing operator like `FsWrite`.
+    HttpWrite(DataFlowRequest<HttpWriteRequest>),
 }
 
 /// A read that failed transport-side — an HTTP read that exhausted its retries

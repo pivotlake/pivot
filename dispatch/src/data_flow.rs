@@ -21,7 +21,7 @@
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
-use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
+use crate::io::{DataFlowRequest, FsRequest, FsWriteRequest, HttpRequest, HttpWriteRequest};
 use crate::operations::{AbandonedOperator, FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::worker::worker_waker;
@@ -434,6 +434,28 @@ impl DataFlow {
         });
     }
 
+    /// Notify the operator that issued it that one of its local-file writes has
+    /// landed durably (an INSERT'd Parquet file).
+    pub fn process_fs_write(&mut self, node_id: Identifier, request: FsWriteRequest) {
+        self.try_run(|d| {
+            d.graph.operators[node_id]
+                .operator
+                .process_fs_write_response(request)?;
+            Ok(())
+        });
+    }
+
+    /// Notify the operator that issued it that one of its object uploads was
+    /// accepted by the store.
+    pub fn process_http_write(&mut self, node_id: Identifier, request: HttpWriteRequest) {
+        self.try_run(|d| {
+            d.graph.operators[node_id]
+                .operator
+                .process_http_write_response(request)?;
+            Ok(())
+        });
+    }
+
     /// Run one unit of CPU work, traversing leaf-to-root (downstream first for cache locality).
     /// Returns [`WorkStatus::Ran`] if any operator did work.
     pub fn run_ready_cpu_work(&mut self) -> WorkStatus {
@@ -495,6 +517,52 @@ impl DataFlow {
             d.graph
                 .traverse_backwards(|op| {
                     let requests = op.operator.next_http_requests()?;
+                    if !requests.is_empty() {
+                        Ok(ControlFlow::Break(
+                            requests
+                                .into_iter()
+                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
+                                .collect(),
+                        ))
+                    } else {
+                        Ok(ControlFlow::Continue(()))
+                    }
+                })
+                .map(|c| c.break_value())
+        })
+    }
+
+    /// Collect pending local-file write requests from operators (leaf-to-root).
+    /// Mirrors [`get_next_fs_request`](Self::get_next_fs_request) on the write side.
+    pub fn get_next_fs_write_request(&mut self) -> Option<Vec<DataFlowRequest<FsWriteRequest>>> {
+        self.try_run_or(None, |d| {
+            d.graph
+                .traverse_backwards(|op| {
+                    let requests = op.operator.next_fs_write_requests()?;
+                    if !requests.is_empty() {
+                        Ok(ControlFlow::Break(
+                            requests
+                                .into_iter()
+                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
+                                .collect(),
+                        ))
+                    } else {
+                        Ok(ControlFlow::Continue(()))
+                    }
+                })
+                .map(|c| c.break_value())
+        })
+    }
+
+    /// Collect pending object-upload requests from operators (leaf-to-root).
+    /// Mirrors [`get_next_http_request`](Self::get_next_http_request) on the write side.
+    pub fn get_next_http_write_request(
+        &mut self,
+    ) -> Option<Vec<DataFlowRequest<HttpWriteRequest>>> {
+        self.try_run_or(None, |d| {
+            d.graph
+                .traverse_backwards(|op| {
+                    let requests = op.operator.next_http_write_requests()?;
                     if !requests.is_empty() {
                         Ok(ControlFlow::Break(
                             requests

@@ -390,6 +390,66 @@ impl Worker {
         Ok(())
     }
 
+    /// Submit local-file writes (INSERT'd Parquet files) from dataflows onto the
+    /// same ring the disk reads use, until the disk queue is busy or none remain.
+    /// A failed submission cancels just the owning dataflow, like a read.
+    fn saturate_fs_writes(&mut self) -> Result<()> {
+        for flow in self.data_flows.values_mut() {
+            #[cfg(feature = "perf")]
+            if Self::paused_for_profiling(flow) {
+                continue;
+            }
+            if self.io.has_file_pending() {
+                break;
+            }
+
+            while let Some(requests) = flow.get_next_fs_write_request() {
+                for r in requests {
+                    self.io.request_fs_write(r)?;
+                }
+                if self.io.has_file_pending() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit object uploads (INSERT'd Parquet files PUT to S3/GCS) from
+    /// dataflows onto the same ring the HTTP reads use, until this worker has
+    /// `PIVOT_UPLOAD_INFLIGHT` uploads in flight or none remain. A failed
+    /// submission cancels just the owning dataflow.
+    fn saturate_http_writes(&mut self) -> Result<()> {
+        static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let upload_inflight_target = *VALUE
+            .get_or_init(|| crate::env::get_env_var_with_default("PIVOT_UPLOAD_INFLIGHT", 32));
+        'flows: for flow in self.data_flows.values_mut() {
+            #[cfg(feature = "perf")]
+            if Self::paused_for_profiling(flow) {
+                continue;
+            }
+            if self.io.uploads_in_flight() >= upload_inflight_target {
+                break;
+            }
+
+            while let Some(requests) = flow.get_next_http_write_request() {
+                for r in requests {
+                    match self.io.request_http_write(r) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            flow.bail_and_cancel(e.into());
+                            continue 'flows;
+                        }
+                    }
+                }
+                if self.io.uploads_in_flight() >= upload_inflight_target {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Run one unit of CPU work from the first dataflow that has work ready.
     fn step_run_ready_cpu_work(&mut self) {
         // While a `perf` capture is in progress, run only the profiled dataflow
@@ -426,6 +486,22 @@ impl Worker {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_remote_time(time);
                         data_flow.process_http(r.operator_idx, r.request);
+                    }
+                }
+                // A local-file write (INSERT'd Parquet file) landed durably; hand
+                // it back so the sink can record the file for commit. The owning
+                // dataflow may already be gone (cancelled INSERT), in which case
+                // the file is orphaned and rollback's cleanup covers it.
+                Ok(Completion::FsWrite(r)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.process_fs_write(r.operator_idx, r.request);
+                    }
+                }
+                // An object upload (INSERT'd Parquet file) the store accepted;
+                // routed back like `FsWrite`.
+                Ok(Completion::HttpWrite(r)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.process_http_write(r.operator_idx, r.request);
                     }
                 }
                 Err(failed) => {
@@ -587,6 +663,8 @@ impl Worker {
             self.process_io_completions()?;
             self.saturate_io()?;
             self.saturate_http()?;
+            self.saturate_fs_writes()?;
+            self.saturate_http_writes()?;
 
             self.step_run_ready_cpu_work();
 

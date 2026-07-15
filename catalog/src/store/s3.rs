@@ -6,13 +6,18 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileSource, DataWriteTarget, FileRef, ObjectPath, ObjectStore, Result, StoreError,
+    object_key,
+};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use dispatch::io::{HttpMethod, RemoteFile};
 use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
@@ -248,6 +253,29 @@ impl ObjectStore for S3Store {
         Ok(DataFileSource::Remote {
             url: self.presign_get(key)?,
             auth: None,
+        })
+    }
+
+    fn open_data_write(&self, key: &ObjectPath, data: &[u8]) -> Result<DataWriteTarget> {
+        let object = object_key(&self.prefix, key);
+        let url = self.url_for(&object);
+        // SigV4-sign the PUT over the exact bytes (XAmzSha256 payload hash), so the
+        // signed `Authorization`/`x-amz-*` headers ride with the ring upload just
+        // as they would on the blocking `put`. The `Host`/`Content-Length` the
+        // signature covers are added by the ring's request builder.
+        let headers = self.sign("PUT", &url, &[], data)?;
+        let parsed = url::Url::parse(&url)
+            .map_err(|e| StoreError::Http(format!("parsing upload url: {e}")))?;
+        let remote = Arc::new(RemoteFile::open(parsed, None, data.len() as u64).map_err(
+            |source| StoreError::Io {
+                key: key.to_string(),
+                source,
+            },
+        )?);
+        Ok(DataWriteTarget::Remote {
+            remote,
+            method: HttpMethod::Put,
+            headers,
         })
     }
 }

@@ -353,6 +353,18 @@ impl CatalogTable {
         Arc::new(ParquetTable::new(row_groups))
     }
 
+    /// This table's object store, shared into the INSERT sink operators so they
+    /// can prepare ring writes ([`ObjectStore::open_data_write`]).
+    pub(in crate::catalog) fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    /// This table's location, against which a new data file's relative path is
+    /// resolved to a store key.
+    pub(in crate::catalog) fn location_path(&self) -> &ObjectPath {
+        &self.location
+    }
+
     /// Write `bytes` as a new data file at `path` (resolved against the table's
     /// location like any [`FileRef`] path), returning its [`FileRef`]. The
     /// compaction writer's output, committed with
