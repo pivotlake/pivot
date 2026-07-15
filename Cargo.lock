@@ -1198,7 +1198,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=b896aa24d6c85fa1b40f8746c3cc2185ca4084b9)",
+ "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
@@ -2579,7 +2579,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=b896aa24d6c85fa1b40f8746c3cc2185ca4084b9)",
+ "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
  "tempfile",
  "thiserror 2.0.18",
  "thriftparquet",
@@ -4461,7 +4461,7 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 [[package]]
 name = "snap"
 version = "1.1.1"
-source = "git+https://github.com/Epsio-Labs/rust-snappy.git?rev=b896aa24d6c85fa1b40f8746c3cc2185ca4084b9#b896aa24d6c85fa1b40f8746c3cc2185ca4084b9"
+source = "git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5#c1754fc37fe43db77c3b5428d57689cd5f2182a5"
 
 [[package]]
 name = "socket2"
