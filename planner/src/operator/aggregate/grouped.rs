@@ -403,9 +403,10 @@ fn project_leading_columns(
 }
 
 /// Per-slot signature used to recognise the `Compiled` specialisations in
-/// `select_value`. `CountStar` and `Count` collapse to one `Count` (both add +1 per
-/// row); a `Sum` carries its column type so the specialisation can fix the read
-/// width.
+/// `select_value`. Only `CountStar` maps to `Count`: `COUNT(col)` skips nulls, and
+/// whether the column has any is only known per batch, so it takes the `Dynamic`
+/// path (which binds the null buffer when needed). A `Sum` carries its column type
+/// so the specialisation can fix the read width.
 pub(super) enum Sig {
     Count,
     Sum(Type),
@@ -423,9 +424,7 @@ fn signatures(exprs: &[Expression]) -> Vec<Sig> {
             Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
                 Sig::Sum(a.column().return_type.clone())
             }
-            Expression::AggregateFunc(AggregateFunc::CountStar(_) | AggregateFunc::Count(_)) => {
-                Sig::Count
-            }
+            Expression::AggregateFunc(AggregateFunc::CountStar(_)) => Sig::Count,
             _ => Sig::Other,
         })
         .collect()

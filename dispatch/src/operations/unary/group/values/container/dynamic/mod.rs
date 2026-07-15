@@ -25,8 +25,8 @@ use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
 use super::super::fold::Fold;
 use super::super::read::{Read, StrRead};
 use super::super::{
-    AggregationKind, AggregationSlot, AggregationValue, Count, F64Max, F64Min, F64Sum, Max, Min,
-    StrMax, StrMin, Sum, U128Max, U128Min, U128Sum, ValueColumns,
+    AggregationKind, AggregationSlot, AggregationValue, Count, CountValid, F64Max, F64Min, F64Sum,
+    Max, Min, StrMax, StrMin, Sum, U128Max, U128Min, U128Sum, ValueColumns, read_validity,
 };
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
@@ -44,6 +44,10 @@ pub use readers::{F64Reader, I64Reader, U128Reader};
 /// type with no per-row `is_float` branch.
 pub enum BoundSlot<'b> {
     Count,
+    /// `COUNT(col)` over a batch whose column has nulls: counts only valid rows.
+    /// A batch with no nulls binds plain [`Count`](BoundSlot::Count) instead, so
+    /// the common all-valid case reads nothing.
+    CountValid(&'b arrow_buffer::NullBuffer),
     I64Sum(I64Reader<'b>),
     I64Min(I64Reader<'b>),
     I64Max(I64Reader<'b>),
@@ -61,7 +65,11 @@ impl<'b> BoundSlot<'b> {
     fn bind(batch: &'b RecordBatch, slot: &AggregationSlot) -> Self {
         use AggregationKind::*;
         match slot.kind {
-            CountStar | Count => BoundSlot::Count,
+            CountStar => BoundSlot::Count,
+            Count => match batch.column(slot.column).nulls() {
+                Some(nulls) if nulls.null_count() > 0 => BoundSlot::CountValid(nulls),
+                _ => BoundSlot::Count,
+            },
             Sum => Self::bind_numeric(
                 batch,
                 slot.column,
@@ -214,6 +222,7 @@ impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_AD
             // additive ops the fast path keeps.
             cells[s] = match &reader[s] {
                 BoundSlot::Count => Count::<A>::seed(()),
+                BoundSlot::CountValid(nulls) => CountValid::<A>::seed(read_validity(nulls, idx)),
                 BoundSlot::I64Sum(r) => Sum::<A>::seed(r.read(idx)),
                 BoundSlot::U128Sum(r) => U128Sum::<A>::seed(r.read(idx)),
                 BoundSlot::I64Min(r) => {
@@ -301,6 +310,9 @@ impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_AD
             let c = self.cells[s];
             self.cells[s] = match &reader[s] {
                 BoundSlot::Count => Count::<A>::update(c, ()),
+                BoundSlot::CountValid(nulls) => {
+                    CountValid::<A>::update(c, read_validity(nulls, idx))
+                }
                 BoundSlot::I64Sum(r) => Sum::<A>::update(c, r.read(idx)),
                 BoundSlot::U128Sum(r) => U128Sum::<A>::update(c, r.read(idx)),
                 BoundSlot::I64Min(r) => {

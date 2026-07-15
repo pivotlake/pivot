@@ -27,7 +27,7 @@ mod string;
 mod sum;
 mod u128;
 
-pub use count::Count;
+pub use count::{Count, CountValid, read_validity};
 pub use extreme::{Max, Min};
 pub use f64::{F64Max, F64Min, F64Sum};
 pub use string::{StrMax, StrMin};

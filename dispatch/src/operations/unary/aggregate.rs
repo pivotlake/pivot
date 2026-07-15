@@ -193,8 +193,10 @@ where
 /// rows stays a SQL `NULL` rather than a fabricated `0`/bound; a count over zero
 /// rows is `0`, so it needs no such distinction.
 enum Slot<A: IntCell> {
-    /// `COUNT(*)` / `COUNT(col)` - with no NULLs, both are the row count.
+    /// `COUNT(*)` - the row count.
     Count { count: i64 },
+    /// `COUNT(col)` - the non-null row count.
+    CountColumn { count: i64, column: usize },
     /// `SUM`/`MIN`/`MAX` over an integer column, accumulating in the width `A`
     /// the planner picks (`i128` only when a sum reads a 64-bit column).
     Int {
@@ -227,7 +229,8 @@ impl<A: IntCell + F64Cell> Slot<A> {
     fn build(spec: &AggregationSlot) -> Self {
         let column = spec.column;
         let op = match spec.kind {
-            AggregationKind::CountStar | AggregationKind::Count => return Slot::Count { count: 0 },
+            AggregationKind::CountStar => return Slot::Count { count: 0 },
+            AggregationKind::Count => return Slot::CountColumn { count: 0, column },
             AggregationKind::Sum => NumOp::Sum,
             AggregationKind::Min => NumOp::Min,
             AggregationKind::Max => NumOp::Max,
@@ -257,6 +260,10 @@ impl<A: IntCell + F64Cell> Slot<A> {
     fn consume(&mut self, batch: &RecordBatch) {
         match self {
             Slot::Count { count } => *count += batch.num_rows() as i64,
+            Slot::CountColumn { count, column } => {
+                let column = batch.column(*column);
+                *count += (column.len() - column.null_count()) as i64;
+            }
             Slot::Int { op, column, acc } => {
                 let op = *op;
                 let reduced = op.reduce_int_column::<A>(batch.column(*column).as_ref());
@@ -282,7 +289,10 @@ impl<A: IntCell + F64Cell> Slot<A> {
     /// builds its slots from the same specs, so the variants always match.
     fn merge(&mut self, other: Slot<A>) {
         match (self, other) {
-            (Slot::Count { count }, Slot::Count { count: other }) => *count += other,
+            (Slot::Count { count }, Slot::Count { count: other })
+            | (Slot::CountColumn { count, .. }, Slot::CountColumn { count: other, .. }) => {
+                *count += other
+            }
             (Slot::Int { op, acc, .. }, Slot::Int { acc: other, .. }) => {
                 let op = *op;
                 fold_into(acc, other, |a, b| op.merge(a, b));
@@ -303,7 +313,7 @@ impl<A: IntCell + F64Cell> Slot<A> {
     /// total (`0` over zero rows, never NULL).
     fn into_column(self) -> (Field, ArrayRef) {
         match self {
-            Slot::Count { count } => (
+            Slot::Count { count } | Slot::CountColumn { count, .. } => (
                 Field::new("count", DataType::Int64, false),
                 Arc::new(Int64Array::from(vec![count])),
             ),

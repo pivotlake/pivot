@@ -593,6 +593,44 @@ fn self_join_with_cross_side_or_and_extract(mut testing_planner: TestingPlanner)
 }
 
 #[rstest]
+fn count_column_skips_left_join_padding_nulls(mut testing_planner: TestingPlanner) {
+    // The q13 shape: COUNT(col) after a LEFT OUTER join counts only real
+    // matches; the padded row's null contributes zero.
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key, COUNT(i_order) AS n FROM orders \
+         LEFT OUTER JOIN items ON i_order = o_key GROUP BY o_key",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"o_key": 1, "n": 2},
+            {"o_key": 2, "n": 1},
+            {"o_key": 3, "n": 0},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn global_count_column_skips_left_join_padding_nulls(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(i_order) AS n FROM orders LEFT OUTER JOIN items ON i_order = o_key",
+    );
+
+    assert_eq!(rows, vec![serde_json::json!({"n": 3})]);
+}
+
+#[rstest]
 fn left_outer_join_pads_unmatched_rows_with_nulls(mut testing_planner: TestingPlanner) {
     // An order with no items still comes out, its item columns null. (q13
     // additionally needs COUNT(col) to skip those nulls, which the grouped

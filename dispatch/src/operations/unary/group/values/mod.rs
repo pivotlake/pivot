@@ -32,8 +32,8 @@ pub use cell::{Cell, F64Cell, IntCell};
 pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, SumSlot};
 pub use distinct::Distinct;
 pub use fold::{
-    Count, F64Max, F64Min, F64Sum, Fold, Max, Min, StrMax, StrMin, Sum, U128Max, U128Min, U128Sum,
-    WideSum,
+    Count, CountValid, F64Max, F64Min, F64Sum, Fold, Max, Min, StrMax, StrMin, Sum, U128Max,
+    U128Min, U128Sum, WideSum, read_validity,
 };
 pub use read::{IntRead, NoRead, Read, StrRead};
 
