@@ -498,3 +498,19 @@ fn in_subquery_on_grouped_keys(mut testing_planner: TestingPlanner) {
             .clone()
     );
 }
+
+#[rstest]
+fn filtered_exists_collapses_the_delim_join(mut testing_planner: TestingPlanner) {
+    // With a filter on the outer side DuckDB keeps a DELIM_JOIN (its executor
+    // exploits the dedup); the bridge collapses it into the plain semi join.
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM orders WHERE o_status = 'open' AND EXISTS \
+            (SELECT * FROM items WHERE i_order = o_key AND i_qty > 5)",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    assert_eq!(rows, vec![serde_json::json!({"o_key": 1})]);
+}

@@ -32,6 +32,10 @@
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/planner/operator/logical_delim_get.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -138,6 +142,134 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
+// ---- Delim join collapse ----
+//
+// DuckDB's Deliminator deliberately keeps a delim join when the outer side
+// carries a filter (its executor exploits the de-duplicated probe keys to
+// shrink the subquery side). Pivot has no delim execution, so finish the
+// removal here: every join-with-DELIM_GET is redundant once its delim columns
+// are remapped onto the join's other side (with the IS NOT NULL filters plain
+// equality implies), after which the delim join is the plain comparison join
+// pivot runs. A shape that doesn't qualify is left untouched, and the plan
+// walk reports DELIM_GET as unsupported rather than running anything wrong.
+
+static bool is_delim_get_child(duckdb::LogicalOperator &op) {
+	if (op.type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET) {
+		return true;
+	}
+	return op.type == duckdb::LogicalOperatorType::LOGICAL_FILTER && !op.children.empty() &&
+	       op.children[0]->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET;
+}
+
+static void find_delim_get_joins(duckdb::unique_ptr<duckdb::LogicalOperator> &op,
+                                 std::vector<duckdb::unique_ptr<duckdb::LogicalOperator> *> &joins,
+                                 duckdb::idx_t &delim_gets) {
+	for (auto &child : op->children) {
+		find_delim_get_joins(child, joins, delim_gets);
+	}
+	if (op->type == duckdb::LogicalOperatorType::LOGICAL_DELIM_GET) {
+		delim_gets++;
+	}
+	if (op->type == duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN &&
+	    (is_delim_get_child(*op->children[0]) || is_delim_get_child(*op->children[1]))) {
+		joins.push_back(&op);
+	}
+}
+
+// Mirrors Deliminator::RemoveJoinWithDelimGet's equality path.
+static bool remove_delim_get_join(duckdb::unique_ptr<duckdb::LogicalOperator> &join_ref,
+                                  duckdb::LogicalOperator &root) {
+	auto &join = join_ref->Cast<duckdb::LogicalComparisonJoin>();
+	if (join.join_type != duckdb::JoinType::INNER && join.join_type != duckdb::JoinType::SEMI) {
+		return false;
+	}
+	const duckdb::idx_t delim_idx = is_delim_get_child(*join_ref->children[0]) ? 0 : 1;
+
+	duckdb::optional_ptr<duckdb::LogicalFilter> filter;
+	duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> filter_expressions;
+	if (join_ref->children[delim_idx]->type == duckdb::LogicalOperatorType::LOGICAL_FILTER) {
+		filter = &join_ref->children[delim_idx]->Cast<duckdb::LogicalFilter>();
+		for (auto &expr : filter->expressions) {
+			filter_expressions.emplace_back(expr->Copy());
+		}
+	}
+	auto &delim_get =
+	    (filter ? filter->children[0] : join_ref->children[delim_idx])->Cast<duckdb::LogicalDelimGet>();
+	if (join.conditions.size() != delim_get.chunk_types.size()) {
+		return false; // joining with the DelimGet adds information beyond the delim columns
+	}
+
+	duckdb::ColumnBindingReplacer replacer;
+	for (auto &cond : join.conditions) {
+		if (!cond.IsComparison()) {
+			return false;
+		}
+		auto comparison = cond.GetComparisonType();
+		if (comparison != duckdb::ExpressionType::COMPARE_EQUAL &&
+		    comparison != duckdb::ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+			return false;
+		}
+		auto &delim_side = delim_idx == 0 ? cond.GetLHS() : cond.GetRHS();
+		auto &other_side = delim_idx == 0 ? cond.GetRHS() : cond.GetLHS();
+		if (delim_side.GetExpressionType() != duckdb::ExpressionType::BOUND_COLUMN_REF ||
+		    other_side.GetExpressionType() != duckdb::ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		replacer.replacement_bindings.emplace_back(
+		    delim_side.Cast<duckdb::BoundColumnRefExpression>().binding,
+		    other_side.Cast<duckdb::BoundColumnRefExpression>().binding);
+		// Plain equality never matches a null; the delim columns' values came
+		// from the outer side, so pin the remapped column non-null the way
+		// the Deliminator does.
+		if (comparison == duckdb::ExpressionType::COMPARE_EQUAL) {
+			auto is_not_null = duckdb::make_uniq<duckdb::BoundOperatorExpression>(
+			    duckdb::ExpressionType::OPERATOR_IS_NOT_NULL, duckdb::LogicalType::BOOLEAN);
+			is_not_null->children.push_back(other_side.Copy());
+			filter_expressions.push_back(std::move(is_not_null));
+		}
+	}
+
+	auto replacement = std::move(join_ref->children[1 - delim_idx]);
+	if (!filter_expressions.empty()) {
+		auto new_filter = duckdb::make_uniq<duckdb::LogicalFilter>();
+		new_filter->expressions = std::move(filter_expressions);
+		new_filter->children.emplace_back(std::move(replacement));
+		replacement = std::move(new_filter);
+	}
+	join_ref = std::move(replacement);
+	replacer.VisitOperator(root);
+	return true;
+}
+
+static void collapse_delim_joins(duckdb::unique_ptr<duckdb::LogicalOperator> &op,
+                                 duckdb::unique_ptr<duckdb::LogicalOperator> &root) {
+	for (auto &child : op->children) {
+		collapse_delim_joins(child, root);
+	}
+	if (op->type != duckdb::LogicalOperatorType::LOGICAL_DELIM_JOIN) {
+		return;
+	}
+	auto &delim_join = op->Cast<duckdb::LogicalComparisonJoin>();
+	std::vector<duckdb::unique_ptr<duckdb::LogicalOperator> *> joins;
+	duckdb::idx_t delim_gets = 0;
+	for (auto &child : op->children) {
+		find_delim_get_joins(child, joins, delim_gets);
+	}
+	// Every delim scan must sit under a removable join, else the plan keeps
+	// its delim join (and fails the walk as unsupported instead of running
+	// anything wrong).
+	if (joins.size() != delim_gets) {
+		return;
+	}
+	for (auto *join : joins) {
+		if (!remove_delim_get_join(*join, *root)) {
+			return;
+		}
+	}
+	delim_join.type = duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
+	delim_join.duplicate_eliminated_columns.clear();
+}
+
 // Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
 // binder-resolved result column names (in select order) via `result_names`.
 // The stock `ExtractPlan` computes those names on its local `Planner` and then
@@ -164,6 +296,7 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 			duckdb::Optimizer optimizer(*planner.binder, context);
 			plan = optimizer.Optimize(std::move(plan));
 		}
+		collapse_delim_joins(plan, plan);
 		plan->ResolveOperatorTypes();
 		duckdb::ColumnBindingResolver resolver;
 		resolver.Verify(*plan);
