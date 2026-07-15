@@ -514,3 +514,80 @@ fn filtered_exists_collapses_the_delim_join(mut testing_planner: TestingPlanner)
 
     assert_eq!(rows, vec![serde_json::json!({"o_key": 1})]);
 }
+
+#[rstest]
+fn self_join_with_cross_side_or_and_extract(mut testing_planner: TestingPlanner) {
+    // The q07 shape: nation joined twice, an OR predicate across both
+    // bindings, extract(year) of a date, grouped.
+    testing_planner.add_table(
+        "nations7",
+        &[
+            ("n_nationkey", Type::Int64, int64_col(vec![1, 2])),
+            ("n_name", Type::Utf8, str_col(vec!["FRANCE", "GERMANY"])),
+        ],
+    );
+    testing_planner.add_table(
+        "supp7",
+        &[
+            ("s_suppkey", Type::Int64, int64_col(vec![10, 20])),
+            ("s_nationkey", Type::Int64, int64_col(vec![1, 2])),
+        ],
+    );
+    testing_planner.add_table(
+        "cust7",
+        &[
+            ("c_custkey", Type::Int64, int64_col(vec![100, 200])),
+            ("c_nationkey", Type::Int64, int64_col(vec![2, 1])),
+        ],
+    );
+    testing_planner.add_table(
+        "line7",
+        &[
+            ("l_suppkey", Type::Int64, int64_col(vec![10, 20, 10])),
+            ("l_custkey", Type::Int64, int64_col(vec![100, 200, 200])),
+            (
+                "l_shipdate",
+                Type::Date,
+                std::sync::Arc::new(arrow_array::Date32Array::from(vec![9131, 9500, 9866]))
+                    as arrow_array::ArrayRef,
+            ),
+            (
+                "l_volume",
+                Type::Decimal,
+                std::sync::Arc::new(arrow_array::Float64Array::from(vec![10.0, 20.0, 40.0]))
+                    as arrow_array::ArrayRef,
+            ),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "select supp_nation, cust_nation, l_year, sum(volume) as revenue \
+         from (select n1.n_name as supp_nation, n2.n_name as cust_nation, \
+                      extract(year from l_shipdate) as l_year, l_volume as volume \
+               from supp7, line7, cust7, nations7 n1, nations7 n2 \
+               where s_suppkey = l_suppkey and c_custkey = l_custkey \
+                 and s_nationkey = n1.n_nationkey and c_nationkey = n2.n_nationkey \
+                 and ((n1.n_name = 'FRANCE' and n2.n_name = 'GERMANY') \
+                   or (n1.n_name = 'GERMANY' and n2.n_name = 'FRANCE'))) as shipping \
+         group by supp_nation, cust_nation, l_year \
+         order by supp_nation, cust_nation, l_year",
+    );
+    rows.sort_by_key(|r| {
+        (
+            r["supp_nation"].as_str().unwrap().to_string(),
+            r["l_year"].as_i64().unwrap(),
+        )
+    });
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"supp_nation": "FRANCE", "cust_nation": "GERMANY", "l_year": 1995, "revenue": 10.0},
+            {"supp_nation": "GERMANY", "cust_nation": "FRANCE", "l_year": 1996, "revenue": 20.0},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}

@@ -1054,3 +1054,28 @@ fn decimal_sum_and_filter(mut testing_planner: TestingPlanner) {
     );
     assert_eq!(rows, vec![serde_json::json!({"s": 4.0})]);
 }
+
+#[rstest]
+fn extract_year_from_date(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "dated",
+        &[(
+            "d",
+            planner::types::Type::Date,
+            std::sync::Arc::new(arrow_array::Date32Array::from(vec![9131, 9862])) as ArrayRef,
+        )],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "select extract(year from d) as y from dated order by y",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"y": 1995}, {"y": 1997}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}

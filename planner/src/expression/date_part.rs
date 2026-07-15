@@ -191,8 +191,21 @@ impl DatePart {
             Box::new(move |batch: &RecordBatch| {
                 let src = source_expr(batch);
                 let (arr, _) = src.as_datum().get();
+                // A DATE source casts to its day count; rescale to the epoch
+                // seconds every arm below computes on (a date's time-of-day
+                // parts read as midnight, matching DuckDB).
+                let is_date = arr.data_type() == &DataType::Date32;
                 let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
                 let vals = i64arr.as_primitive::<Int64Type>();
+                let scaled;
+                let vals = if is_date {
+                    scaled = arrow_array::PrimitiveArray::<Int64Type>::unary(vals, |days: i64| {
+                        days * SECS_PER_DAY
+                    });
+                    &scaled
+                } else {
+                    vals
+                };
                 // Dispatch on the part ONCE per batch, then run a single
                 // monomorphic, branch-free row loop per arm — so e.g. `minute`
                 // compiles to exactly its two-op loop with no per-row `kind`
