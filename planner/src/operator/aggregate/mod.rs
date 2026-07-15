@@ -23,9 +23,11 @@ mod grouped;
 mod grouped_distinct;
 mod reinterpret;
 
-use self::reinterpret::{reinterpret_columns, temporal_to_int};
+use self::reinterpret::{
+    pun_float_columns_to_bits, reinterpret_columns, temporal_to_int, unpun_bits_to_float,
+};
 use crate::compile::Error;
-use crate::expression::{AggregateFunc, Expression};
+use crate::expression::{AggregateFunc, Expression, Ref};
 use crate::types::Type;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
@@ -78,9 +80,102 @@ impl Aggregate {
         // materialising (the common all-plain-column case) the input and `self`
         // are reused as-is, with no projection and no clone.
         match self.materialize_inputs(input)? {
-            (input, Some(resolved)) => resolved.compile_resolved(input),
-            (input, None) => self.compile_resolved(input),
+            (input, Some(resolved)) => resolved.compile_float_keys_as_bits(input),
+            (input, None) => self.compile_float_keys_as_bits(input),
         }
+    }
+
+    /// Group on float keys through their bit pattern: the key extractors pack
+    /// integers, so a `Float64` (or decimal, which pivot computes as Float64)
+    /// group key is bit-punned to `Int64` on the way in and restored on the
+    /// way out. `-0.0` is normalised to `0.0` in the pun so both encode as one
+    /// group. A no-op when no group key is a float.
+    ///
+    /// Every key is a plain column ref here (computed keys were materialised),
+    /// so the pun rewrites the input columns in place; an aggregate reading
+    /// the same column would then see bits instead of values, which has no
+    /// use, so it is rejected rather than silently mis-summed.
+    fn compile_float_keys_as_bits(
+        &self,
+        input: RecordBatchOperatorSpec,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
+        let is_float_key = |g: &Expression| {
+            matches!(
+                g,
+                Expression::Ref(r) if matches!(r.return_type, Type::Float64 | Type::Decimal)
+            )
+        };
+        if !self.groups.iter().any(is_float_key) {
+            return self.compile_resolved(input);
+        }
+
+        let key_columns: Vec<usize> = self
+            .groups
+            .iter()
+            .filter(|g| is_float_key(g))
+            .map(|g| match g {
+                Expression::Ref(r) => r.column_idx,
+                _ => unreachable!("float keys are refs by the check above"),
+            })
+            .collect();
+        for e in &self.expressions {
+            let Expression::AggregateFunc(func) = e else {
+                continue;
+            };
+            for arg in func.arguments() {
+                if let Expression::Ref(r) = arg
+                    && key_columns.contains(&r.column_idx)
+                {
+                    return Err(Error::UnsupportedAggregateExpression(e.clone()));
+                }
+            }
+        }
+
+        let punned_columns = Arc::new(key_columns);
+        let input = {
+            let punned_columns = punned_columns.clone();
+            input.project(move || {
+                let punned_columns = punned_columns.clone();
+                move |batch: RecordBatch| pun_float_columns_to_bits(batch, &punned_columns)
+            })
+        };
+
+        let rewritten = Aggregate {
+            groups: self
+                .groups
+                .iter()
+                .map(|g| match g {
+                    g if is_float_key(g) => {
+                        let Expression::Ref(r) = g else {
+                            unreachable!()
+                        };
+                        Expression::Ref(Ref {
+                            column_idx: r.column_idx,
+                            return_type: Type::Int64,
+                            name: r.name.clone(),
+                        })
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+            expressions: self.expressions.clone(),
+            output_limit: self.output_limit.clone(),
+        };
+        let out = rewritten.compile_resolved(input)?;
+
+        // The output leads with the group keys; restore the punned ones.
+        let float_key_positions: Arc<Vec<usize>> = Arc::new(
+            self.groups
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| is_float_key(g))
+                .map(|(i, _)| i)
+                .collect(),
+        );
+        Ok(out.project(move || {
+            let positions = float_key_positions.clone();
+            move |batch: RecordBatch| unpun_bits_to_float(batch, &positions)
+        }))
     }
 
     /// Compile a *resolved* aggregate: one whose group keys and aggregate
@@ -328,11 +423,13 @@ fn row_key_arrow_type(t: &Type) -> Option<DataType> {
 
 /// Whether any key extractor can group on this type. The dedicated single/pair/
 /// int-string extractors handle exactly the integer widths and `Utf8`; every
-/// other groupable type (`Date`/`Timestamp`) rides the row encoder. A type this
-/// rejects (`Float`/`Boolean`/`Decimal`/`Int128`) has no grouping path at all,
-/// so the caller can reject it up front and name the offending column.
+/// other groupable type rides the row encoder: `Date`/`Timestamp` as their
+/// backing int, `Float64`/`Decimal` bit-punned to `Int64` (see
+/// [`Aggregate::compile_float_keys_as_bits`]). A type this rejects
+/// (`Boolean`/`Float32`/`Int128`) has no grouping path at all, so the caller
+/// can reject it up front and name the offending column.
 pub(super) fn is_groupable_key_type(t: &Type) -> bool {
-    row_key_arrow_type(t).is_some()
+    matches!(t, Type::Float64 | Type::Decimal) || row_key_arrow_type(t).is_some()
 }
 
 /// The accumulator-width rule shared by the global and grouped paths: `i128`

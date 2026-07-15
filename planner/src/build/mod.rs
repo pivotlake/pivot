@@ -25,7 +25,9 @@ use duckdb_planner::handle::{
 
 use crate::catalog::Table;
 use crate::dynamic_filter::DynamicFilter;
-use crate::expression::{Error as ExpressionError, Expression, Function, Ref, VariantToJson};
+use crate::expression::{
+    Compare, Error as ExpressionError, Expression, Function, Ref, VariantToJson,
+};
 use crate::operator::{
     Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Join, Limit,
     Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
@@ -245,31 +247,62 @@ fn build_join(
             join.join_type()
         )));
     }
-    let mut conditions = join.conditions();
-    let condition = match (conditions.next(), conditions.next()) {
-        (Some(condition), None) => condition,
-        _ => {
-            return Err(OperatorError::Unsupported(
-                "joins must have exactly one equality condition".to_string(),
-            ));
-        }
-    };
-    if condition.comparison != ExpressionType::COMPARE_EQUAL {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join comparison type: {:?}",
-            condition.comparison
-        )));
-    }
+    let conditions: Vec<_> = join.conditions().collect();
+    // The hash join keys on one equality condition; every other condition
+    // (further equalities, or range comparisons) filters the joined rows
+    // below, which is equivalent for an INNER join.
+    let hash_condition = conditions
+        .iter()
+        .position(|c| c.comparison == ExpressionType::COMPARE_EQUAL)
+        .ok_or_else(|| {
+            OperatorError::Unsupported(
+                "joins must have at least one equality condition".to_string(),
+            )
+        })?;
 
-    let probe_key = join_key_ref(Expression::from_handle(condition.left)?)?;
-    let build_key = join_key_ref(Expression::from_handle(condition.right)?)?;
+    let probe_key = join_key_ref(Expression::from_handle(conditions[hash_condition].left)?)?;
+    let build_key = join_key_ref(Expression::from_handle(conditions[hash_condition].right)?)?;
 
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
     let left_map: Vec<usize> = join.left_projection_map().collect();
     let right_map: Vec<usize> = join.right_projection_map().collect();
 
-    let node = PlanNode {
+    // The residual conditions, rebased onto the join's output: probe columns
+    // keep their index, build columns shift past them.
+    let residual_conditions = conditions
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != hash_condition)
+        .map(|(_, condition)| {
+            let Expression::Ref(left) = Expression::from_handle(condition.left)? else {
+                return Err(OperatorError::Unsupported(
+                    "extra join conditions must compare plain columns".to_string(),
+                ));
+            };
+            let Expression::Ref(right) = Expression::from_handle(condition.right)? else {
+                return Err(OperatorError::Unsupported(
+                    "extra join conditions must compare plain columns".to_string(),
+                ));
+            };
+            Ok(Expression::Compare(Compare {
+                left: Box::new(Expression::Ref(left)),
+                right: Box::new(Expression::Ref(Ref {
+                    column_idx: probe_types.len() + right.column_idx,
+                    ..right
+                })),
+                compare_type: condition.comparison.clone().try_into().map_err(|_| {
+                    OperatorError::Unsupported(format!(
+                        "Unsupported join comparison type: {:?}",
+                        condition.comparison
+                    ))
+                })?,
+                return_type: Type::Boolean,
+            }))
+        })
+        .collect::<Result<Vec<_>, OperatorError>>()?;
+
+    let mut node = PlanNode {
         name: op.name(),
         inputs,
         operator: Operator::Join(Join {
@@ -277,6 +310,15 @@ fn build_join(
             build_key,
         }),
     };
+    if !residual_conditions.is_empty() {
+        node = PlanNode {
+            name: "JOIN_RESIDUAL_FILTER".to_string(),
+            inputs: vec![node],
+            operator: Operator::Filter(Filter {
+                conditions: residual_conditions,
+            }),
+        };
+    }
     if left_map.is_empty() && right_map.is_empty() {
         return Ok(node);
     }

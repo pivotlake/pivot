@@ -2023,29 +2023,74 @@ fn group_by_error_names_the_unsupported_key_not_the_first(mut testing_planner: T
                 Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef,
             ),
             (
-                "k_float",
-                Type::Float64,
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])) as ArrayRef,
+                "k_bool",
+                Type::Boolean,
+                Arc::new(arrow_array::BooleanArray::from(vec![true, false, true])) as ArrayRef,
             ),
         ],
     );
 
     let compiled = testing_planner
         .planner
-        .plan("SELECT k_int, k_float, COUNT(*) FROM mixed_keys GROUP BY k_int, k_float")
+        .plan("SELECT k_int, k_bool, COUNT(*) FROM mixed_keys GROUP BY k_int, k_bool")
         .unwrap()
         .compile(testing_planner.dispatcher());
     let err = match compiled {
-        Ok(_) => panic!("grouping by a float key should fail to compile"),
+        Ok(_) => panic!("grouping by a boolean key should fail to compile"),
         Err(err) => err.to_string(),
     };
 
     assert!(
-        err.contains("Float64"),
-        "group-by error should name the unsupported float key (Float64), got: {err}"
+        err.contains("Boolean"),
+        "group-by error should name the unsupported boolean key, got: {err}"
     );
     assert!(
-        err.contains("k_float"),
-        "group-by error should name the offending column (k_float), got: {err}"
+        err.contains("k_bool"),
+        "group-by error should name the offending column (k_bool), got: {err}"
+    );
+}
+
+#[rstest]
+fn group_by_float_key(mut testing_planner: TestingPlanner) {
+    // -0.0 and 0.0 must land in one group; equal floats otherwise group by
+    // value (keys ride the group-by bit-punned to Int64).
+    testing_planner.add_table(
+        "float_keys",
+        &[
+            (
+                "k",
+                Type::Float64,
+                Arc::new(Float64Array::from(vec![-0.0, 0.0, 1.5, 1.5, 2.5])) as ArrayRef,
+            ),
+            (
+                "v",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5])) as ArrayRef,
+            ),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT k, SUM(v) AS total FROM float_keys GROUP BY k ORDER BY k",
+    );
+    rows.sort_by(|a, b| {
+        a["k"]
+            .as_f64()
+            .unwrap()
+            .partial_cmp(&b["k"].as_f64().unwrap())
+            .unwrap()
+    });
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"k": 0.0, "total": 3},
+            {"k": 1.5, "total": 7},
+            {"k": 2.5, "total": 5},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
     );
 }

@@ -50,3 +50,64 @@ pub(crate) fn temporal_to_int(data_type: &DataType) -> Option<DataType> {
         _ => None,
     }
 }
+
+/// Rebuild `batch` with the `Float64` columns at `columns` bit-punned to
+/// `Int64` group keys. `-0.0` normalises to `0.0` (`v + 0.0`) so both bit
+/// patterns land in one group; equal floats otherwise have equal bits.
+pub(crate) fn pun_float_columns_to_bits(batch: RecordBatch, columns: &[usize]) -> RecordBatch {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float64Type, Int64Type};
+
+    let schema = batch.schema();
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut arrays = Vec::with_capacity(batch.num_columns());
+    for i in 0..batch.num_columns() {
+        let column = batch.column(i);
+        if columns.contains(&i) {
+            let floats = column.as_primitive::<Float64Type>();
+            let bits: arrow_array::PrimitiveArray<Int64Type> =
+                floats.unary(|v| (v + 0.0).to_bits() as i64);
+            let field = schema.field(i);
+            fields.push(Field::new(
+                field.name(),
+                DataType::Int64,
+                field.is_nullable(),
+            ));
+            arrays.push(Arc::new(bits) as arrow_array::ArrayRef);
+        } else {
+            fields.push(schema.field(i).clone());
+            arrays.push(column.clone());
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("punned schema")
+}
+
+/// The inverse of [`pun_float_columns_to_bits`] on the aggregate's output: the
+/// `Int64` key columns at `columns` become `Float64` again, bit for bit.
+pub(crate) fn unpun_bits_to_float(batch: RecordBatch, columns: &[usize]) -> RecordBatch {
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float64Type, Int64Type};
+
+    let schema = batch.schema();
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut arrays = Vec::with_capacity(batch.num_columns());
+    for i in 0..batch.num_columns() {
+        let column = batch.column(i);
+        if columns.contains(&i) {
+            let bits = column.as_primitive::<Int64Type>();
+            let floats: arrow_array::PrimitiveArray<Float64Type> =
+                bits.unary(|v| f64::from_bits(v as u64));
+            let field = schema.field(i);
+            fields.push(Field::new(
+                field.name(),
+                DataType::Float64,
+                field.is_nullable(),
+            ));
+            arrays.push(Arc::new(floats) as arrow_array::ArrayRef);
+        } else {
+            fields.push(schema.field(i).clone());
+            arrays.push(column.clone());
+        }
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("unpunned schema")
+}

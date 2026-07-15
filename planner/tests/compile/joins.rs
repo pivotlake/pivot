@@ -242,3 +242,138 @@ fn join_with_case_in_list_and_date_arithmetic(mut testing_planner: TestingPlanne
         .clone()
     );
 }
+
+#[rstest]
+fn join_with_two_equality_conditions(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "pairs_a",
+        &[
+            ("a_key", Type::Int64, int64_col(vec![1, 2, 3])),
+            ("a_tag", Type::Int64, int64_col(vec![10, 20, 30])),
+        ],
+    );
+    testing_planner.add_table(
+        "pairs_b",
+        &[
+            ("b_key", Type::Int64, int64_col(vec![1, 2, 3])),
+            ("b_tag", Type::Int64, int64_col(vec![10, 99, 30])),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT a_key FROM pairs_a JOIN pairs_b ON a_key = b_key AND a_tag = b_tag",
+    );
+    rows.sort_by_key(|r| r["a_key"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"a_key": 1}, {"a_key": 3}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[rstest]
+fn join_with_equality_and_range_condition(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "spans",
+        &[
+            ("s_key", Type::Int64, int64_col(vec![1, 1, 2])),
+            ("s_lo", Type::Int64, int64_col(vec![5, 50, 5])),
+        ],
+    );
+    testing_planner.add_table(
+        "points",
+        &[
+            ("p_key", Type::Int64, int64_col(vec![1, 2])),
+            ("p_val", Type::Int64, int64_col(vec![10, 3])),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) AS n FROM spans JOIN points ON s_key = p_key AND s_lo < p_val",
+    );
+
+    assert_eq!(rows, vec![serde_json::json!({"n": 1})]);
+}
+
+#[rstest]
+fn four_way_join_with_string_payloads_and_grouping(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "cust4",
+        &[
+            ("c_custkey", Type::Int64, int64_col(vec![1, 2])),
+            ("c_name", Type::Utf8, str_col(vec!["alice", "bob"])),
+            (
+                "c_acctbal",
+                Type::Decimal,
+                std::sync::Arc::new(arrow_array::Float64Array::from(vec![10.5, 20.5]))
+                    as arrow_array::ArrayRef,
+            ),
+            ("c_nationkey", Type::Int64, int64_col(vec![7, 8])),
+            ("c_address", Type::Utf8, str_col(vec!["a st", "b st"])),
+            ("c_phone", Type::Utf8, str_col(vec!["111", "222"])),
+            ("c_comment", Type::Utf8, str_col(vec!["cc1", "cc2"])),
+        ],
+    );
+    testing_planner.add_table(
+        "ord4",
+        &[
+            ("o_orderkey", Type::Int64, int64_col(vec![100, 101, 102])),
+            ("o_custkey", Type::Int64, int64_col(vec![1, 1, 2])),
+        ],
+    );
+    testing_planner.add_table(
+        "line4",
+        &[
+            (
+                "l_orderkey",
+                Type::Int64,
+                int64_col(vec![100, 101, 102, 102]),
+            ),
+            ("l_flag", Type::Utf8, str_col(vec!["R", "R", "R", "N"])),
+            (
+                "l_price",
+                Type::Decimal,
+                std::sync::Arc::new(arrow_array::Float64Array::from(vec![5.0, 6.0, 7.0, 9.0]))
+                    as arrow_array::ArrayRef,
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "nat4",
+        &[
+            ("n_nationkey", Type::Int64, int64_col(vec![7, 8])),
+            ("n_name", Type::Utf8, str_col(vec!["FR", "DE"])),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "select c_custkey, c_name, sum(l_price) as revenue, c_acctbal, n_name, c_address, \
+                c_phone, c_comment \
+         from cust4, ord4, line4, nat4 \
+         where c_custkey = o_custkey and l_orderkey = o_orderkey and l_flag = 'R' \
+           and c_nationkey = n_nationkey \
+         group by c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment \
+         order by revenue desc \
+         limit 20",
+    );
+    rows.sort_by_key(|r| r["c_custkey"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"c_custkey": 1, "c_name": "alice", "revenue": 11.0, "c_acctbal": 10.5,
+             "n_name": "FR", "c_address": "a st", "c_phone": "111", "c_comment": "cc1"},
+            {"c_custkey": 2, "c_name": "bob", "revenue": 7.0, "c_acctbal": 20.5,
+             "n_name": "DE", "c_address": "b st", "c_phone": "222", "c_comment": "cc2"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
