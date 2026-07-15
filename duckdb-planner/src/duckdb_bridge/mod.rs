@@ -27,6 +27,9 @@ pub mod ffi {
     struct DuckDBColumn {
         pub name: String,
         pub duckdb_logical_type_id: u8,
+        /// Declared NOT NULL; becomes a binder constraint, which unlocks
+        /// optimizations (e.g. delim join removal over non-null keys).
+        pub not_null: bool,
     }
 
     /// Result of a catalog table lookup, allowing C++ to inspect the outcome.
@@ -231,6 +234,10 @@ pub mod ffi {
         fn lo_create_temporary(op: &LogicalOperator) -> bool;
         fn lo_create_has_query(op: &LogicalOperator) -> bool;
         fn lo_create_constraint_count(op: &LogicalOperator) -> usize;
+        /// DuckDB `ConstraintType` discriminant (NOT_NULL = 1).
+        fn lo_create_constraint_kind(op: &LogicalOperator, index: usize) -> u8;
+        /// The column a NOT NULL constraint names (valid for NOT_NULL only).
+        fn lo_create_constraint_column(op: &LogicalOperator, index: usize) -> usize;
 
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> String;

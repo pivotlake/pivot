@@ -86,10 +86,12 @@ fn two_int_cols() -> Vec<Column> {
         Column {
             name: "a".to_string(),
             col_type: Type::Int32,
+            not_null: false,
         },
         Column {
             name: "b".to_string(),
             col_type: Type::Int32,
+            not_null: false,
         },
     ]
 }

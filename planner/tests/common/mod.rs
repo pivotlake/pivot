@@ -48,6 +48,7 @@ impl TestTable {
             .map(|(name, col_type, _)| Column {
                 name: name.to_string(),
                 col_type: col_type.clone(),
+                not_null: false,
             })
             .collect();
         Self::from_batches(dispatch, cols, &[batch])

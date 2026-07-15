@@ -50,6 +50,7 @@ impl TableFunction for MetadataTableFunction {
                 .map(|(name, col_type)| Column {
                     name: name.to_string(),
                     col_type: col_type.clone(),
+                    not_null: false,
                 })
                 .collect(),
         }

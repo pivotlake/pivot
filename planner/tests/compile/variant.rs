@@ -106,6 +106,7 @@ fn docs_table_files(planner: &mut TestingPlanner, batches: &[RecordBatch]) {
         vec![Column {
             name: "d".to_string(),
             col_type: Type::Variant,
+            not_null: false,
         }],
         batches,
     );

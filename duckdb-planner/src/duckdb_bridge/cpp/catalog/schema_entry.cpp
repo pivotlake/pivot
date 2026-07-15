@@ -9,6 +9,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/column_definition.hpp"
+#include "duckdb/parser/constraints/list.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -138,10 +139,16 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	}
 
 	CreateTableInfo table_info(*this, table_name);
+	idx_t col_idx = 0;
 	for (const auto &col : result.columns) {
 		auto col_name = std::string(col.name);
 		table_info.columns.AddColumn(
 		    ColumnDefinition(col_name, logical_type_from(col.duckdb_logical_type_id)));
+		if (col.not_null) {
+			table_info.constraints.push_back(
+			    duckdb::make_uniq<duckdb::NotNullConstraint>(duckdb::LogicalIndex(col_idx)));
+		}
+		col_idx++;
 	}
 
 	auto &db_instance = ParentCatalog().GetAttached().GetDatabase();

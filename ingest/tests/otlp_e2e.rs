@@ -84,6 +84,7 @@ fn create_otel_logs(catalog: &ParquetCatalog, d: &DataFlowDispatcher, dir: &std:
         columns: vec![Column {
             name: "Timestamp".to_string(),
             col_type: planner::types::Type::Int64,
+            not_null: false,
         }],
         options: HashMap::from([("path".to_string(), dir.to_str().unwrap().to_string())]),
         if_not_exists: false,
@@ -113,10 +114,12 @@ fn create_partitioned_otel_logs(
             Column {
                 name: "ServiceName".to_string(),
                 col_type: Type::Utf8,
+                not_null: false,
             },
             Column {
                 name: "Timestamp".to_string(),
                 col_type: Type::Int64,
+                not_null: false,
             },
         ],
         options: HashMap::from([

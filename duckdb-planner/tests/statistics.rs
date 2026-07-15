@@ -20,6 +20,7 @@ impl DuckDBTable for CountingTable {
         vec![DuckDBColumn {
             name: "id".to_string(),
             duckdb_logical_type_id: LogicalTypeId::INTEGER as u8,
+            not_null: false,
         }]
     }
 

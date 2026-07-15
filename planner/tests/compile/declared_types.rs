@@ -39,6 +39,7 @@ fn declared_varchar_reads_unannotated_binary_as_text(mut testing_planner: Testin
         vec![Column {
             name: "s".to_string(),
             col_type: Type::Utf8,
+            not_null: false,
         }],
         &[unannotated_text_batch(&[b"alpha", b"beta"])],
     );
@@ -57,6 +58,7 @@ fn declared_varchar_surfaces_a_string_column(mut testing_planner: TestingPlanner
         vec![Column {
             name: "s".to_string(),
             col_type: Type::Utf8,
+            not_null: false,
         }],
         &[unannotated_text_batch(&[b"alpha"])],
     );

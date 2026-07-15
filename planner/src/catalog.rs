@@ -55,6 +55,11 @@ pub struct DynamicScanPredicate {
 pub struct Column {
     pub name: String,
     pub col_type: Type,
+    /// Declared `NOT NULL`. Reaches DuckDB's binder as a constraint, which
+    /// changes how it plans (e.g. correlated subqueries over provably
+    /// non-null keys flatten to plain joins instead of delim joins).
+    #[serde(default)]
+    pub not_null: bool,
 }
 
 /// Description of a table to be created — produced by translating a
@@ -215,6 +220,7 @@ fn duckdb_columns(columns: &[Column]) -> Vec<DuckDBColumn> {
             DuckDBColumn {
                 name: column.name.clone(),
                 duckdb_logical_type_id: logical_from_type(&bind_type) as u8,
+                not_null: column.not_null,
             }
         })
         .collect()

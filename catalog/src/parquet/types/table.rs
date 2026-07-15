@@ -708,6 +708,7 @@ mod tests {
         Column {
             name: name.to_string(),
             col_type,
+            not_null: false,
         }
     }
 

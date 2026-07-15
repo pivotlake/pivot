@@ -138,25 +138,36 @@ impl TableFunctionScan {
 
 impl CreateTable {
     pub(crate) fn from_handle(view: CreateTableView<'_>) -> Result<CreateTable, OperatorError> {
+        let mut columns = view
+            .columns()
+            .map(|(name, col_type)| {
+                Ok(Column {
+                    name,
+                    col_type: type_from_logical(col_type)?,
+                    not_null: false,
+                })
+            })
+            .collect::<Result<Vec<Column>, OperatorError>>()?;
+        // NOT NULL constraints mark their column; anything else stays counted
+        // so compile can reject it as unsupported.
+        let mut unsupported_constraints = 0;
+        for constraint in view.constraints() {
+            match constraint {
+                Some(column) => columns[column].not_null = true,
+                None => unsupported_constraints += 1,
+            }
+        }
         Ok(CreateTable {
             request: CreateTableRequest {
                 name: view.name(),
-                columns: view
-                    .columns()
-                    .map(|(name, col_type)| {
-                        Ok(Column {
-                            name,
-                            col_type: type_from_logical(col_type)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, OperatorError>>()?,
+                columns,
                 options: view.options().collect(),
                 if_not_exists: view.if_not_exists(),
             },
             or_replace: view.or_replace(),
             temporary: view.temporary(),
             has_query: view.has_query(),
-            constraint_count: view.constraint_count(),
+            constraint_count: unsupported_constraints,
         })
     }
 }

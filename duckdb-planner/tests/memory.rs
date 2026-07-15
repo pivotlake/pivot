@@ -14,14 +14,17 @@ impl DuckDBTable for UsersTable {
             DuckDBColumn {
                 name: "id".to_string(),
                 duckdb_logical_type_id: LogicalTypeId::INTEGER as u8,
+                not_null: false,
             },
             DuckDBColumn {
                 name: "name".to_string(),
                 duckdb_logical_type_id: LogicalTypeId::VARCHAR as u8,
+                not_null: false,
             },
             DuckDBColumn {
                 name: "age".to_string(),
                 duckdb_logical_type_id: LogicalTypeId::SMALLINT as u8,
+                not_null: false,
             },
         ]
     }

@@ -123,6 +123,8 @@ bool lo_create_or_replace(const LogicalOperator &op);
 bool lo_create_temporary(const LogicalOperator &op);
 bool lo_create_has_query(const LogicalOperator &op);
 size_t lo_create_constraint_count(const LogicalOperator &op);
+uint8_t lo_create_constraint_kind(const LogicalOperator &op, size_t index);
+size_t lo_create_constraint_column(const LogicalOperator &op, size_t index);
 
 // ---- Set / Reset ----
 rust::String lo_set_name(const LogicalOperator &op);

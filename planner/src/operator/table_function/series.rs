@@ -59,6 +59,7 @@ impl TableFunction for SeriesTableFunction {
             columns: vec![Column {
                 name: self.name.to_string(),
                 col_type: Type::Int64,
+                not_null: false,
             }],
         }
     }

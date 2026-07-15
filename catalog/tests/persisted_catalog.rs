@@ -39,10 +39,12 @@ fn columns() -> Vec<Column> {
         Column {
             name: "name".to_string(),
             col_type: Type::Utf8,
+            not_null: false,
         },
         Column {
             name: "value".to_string(),
             col_type: Type::Int64,
+            not_null: false,
         },
     ]
 }

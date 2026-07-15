@@ -24,6 +24,17 @@ fn total_memory_bytes() -> usize {
     .total_memory() as usize
 }
 
+/// The fraction of total memory given to the ring, as a percentage.
+/// `PIVOT_BENCH_MEMORY_PCT` overrides the default 80: join-heavy suites also
+/// allocate build payloads and hash arenas on the plain heap, which on a
+/// small-memory box must come out of the ring's share.
+fn ring_memory_pct() -> usize {
+    std::env::var("PIVOT_BENCH_MEMORY_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80)
+}
+
 pub struct ServerHandle {
     port: u16,
     shutdown: Option<oneshot::Sender<()>>,
@@ -77,7 +88,11 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
         .parse()
         .expect("valid socket addr");
 
-    let dispatch = Dispatch::spin_up(workers, total_memory_bytes() * 4 / 5 / BUFFER_SIZE, None);
+    let dispatch = Dispatch::spin_up(
+        workers,
+        total_memory_bytes() * ring_memory_pct() / 100 / BUFFER_SIZE,
+        None,
+    );
     let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

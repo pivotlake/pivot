@@ -448,6 +448,17 @@ impl<'plan> CreateTable<'plan> {
     pub fn constraint_count(self) -> usize {
         ffi::lo_create_constraint_count(self.raw)
     }
+
+    /// The statement's constraints: `Some(column)` for a NOT NULL on that
+    /// column, `None` for any other constraint kind (which the consumer
+    /// rejects).
+    pub fn constraints(self) -> impl Iterator<Item = Option<usize>> {
+        const NOT_NULL: u8 = 1;
+        (0..ffi::lo_create_constraint_count(self.raw)).map(move |i| {
+            (ffi::lo_create_constraint_kind(self.raw, i) == NOT_NULL)
+                .then(|| ffi::lo_create_constraint_column(self.raw, i))
+        })
+    }
 }
 
 impl<'plan> Set<'plan> {

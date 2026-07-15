@@ -92,10 +92,12 @@ fn three_row_table() -> (TempDir, Vec<Column>) {
         Column {
             name: "id".to_string(),
             col_type: Type::Int32,
+            not_null: false,
         },
         Column {
             name: "name".to_string(),
             col_type: Type::Utf8,
+            not_null: false,
         },
     ];
     (dir, columns)
@@ -710,6 +712,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     let columns = vec![Column {
         name: "id".to_string(),
         col_type: Type::Int32,
+        not_null: false,
     }];
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
@@ -740,10 +743,12 @@ fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
             Column {
                 name: "id".to_string(),
                 col_type: Type::Int32,
+                not_null: false,
             },
             Column {
                 name: "name".to_string(),
                 col_type: Type::Utf8,
+                not_null: false,
             },
         ],
         options: HashMap::from([
@@ -884,6 +889,7 @@ fn shredded_docs_catalog(dir: &Path) -> (Arc<ParquetCatalog>, TableBinding) {
     let columns = vec![Column {
         name: "doc".to_string(),
         col_type: Type::Variant,
+        not_null: false,
     }];
     create_table(&catalog, create_request("docs", dir, columns)).unwrap();
     let binding = catalog.binding("docs").unwrap();

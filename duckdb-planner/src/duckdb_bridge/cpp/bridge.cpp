@@ -15,6 +15,7 @@
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/constraints/list.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -601,6 +602,17 @@ bool lo_create_has_query(const LogicalOperator &op) {
 
 size_t lo_create_constraint_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalCreateTable>(op).info->constraints.size();
+}
+
+// duckdb::ConstraintType discriminant (NOT_NULL = 1, CHECK = 2, ...).
+uint8_t lo_create_constraint_kind(const LogicalOperator &op, size_t index) {
+	return static_cast<uint8_t>(as<duckdb::LogicalCreateTable>(op).info->constraints[index]->type);
+}
+
+// The column a NOT NULL constraint names. Only valid when the kind is NOT_NULL.
+size_t lo_create_constraint_column(const LogicalOperator &op, size_t index) {
+	auto &constraint = *as<duckdb::LogicalCreateTable>(op).info->constraints[index];
+	return constraint.Cast<duckdb::NotNullConstraint>().index.index;
 }
 
 // ---- Set / Reset ----

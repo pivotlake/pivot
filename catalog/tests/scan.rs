@@ -864,10 +864,12 @@ fn scan_decimal_columns_as_float64() {
         planner::catalog::Column {
             name: "wide".into(),
             col_type: planner::types::Type::Decimal,
+            not_null: false,
         },
         planner::catalog::Column {
             name: "narrow".into(),
             col_type: planner::types::Type::Decimal,
+            not_null: false,
         },
     ];
     let table = Arc::new(ParquetTable::from_directory(&dispatch, dir.path(), &declared).unwrap());

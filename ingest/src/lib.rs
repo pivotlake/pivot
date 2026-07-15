@@ -420,10 +420,12 @@ mod tests {
                 Column {
                     name: "ServiceName".to_string(),
                     col_type: planner::types::Type::Utf8,
+                    not_null: false,
                 },
                 Column {
                     name: "Timestamp".to_string(),
                     col_type: planner::types::Type::Int64,
+                    not_null: false,
                 },
             ],
             options: std::collections::HashMap::from([
@@ -463,6 +465,7 @@ mod tests {
             columns: vec![Column {
                 name: "Timestamp".to_string(),
                 col_type: planner::types::Type::Int64,
+                not_null: false,
             }],
             options,
             if_not_exists: false,
