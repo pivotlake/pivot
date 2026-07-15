@@ -32,7 +32,7 @@ mod plain_page_decoder;
 /// (a [`ByteViewType`](arrow_array::types::ByteViewType)) picks whether it
 /// finalises as a `StringViewArray` or a `BinaryViewArray`.
 pub type BytesViewDecoder<V> =
-    TypedColumnDecoder<ViewDict<V>, ViewsBuilder<V>, PlainPageDecoder<V>>;
+    TypedColumnDecoder<ViewDict<V>, ViewDict<V>, ViewsBuilder<V>, PlainPageDecoder<V>>;
 
 #[cfg(test)]
 mod tests {

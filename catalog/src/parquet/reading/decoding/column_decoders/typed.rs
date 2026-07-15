@@ -1,10 +1,12 @@
 //! [`TypedColumnDecoder`] — the generic, type-parameterised implementation of
 //! [`ColumnDecoder`].
 //!
-//! This struct is parameterised over three traits that together describe how to
+//! This struct is parameterised over the traits that together describe how to
 //! decode a particular Parquet column type:
-//! - `D: Dict` — builds and queries the dictionary (if the column uses
-//!   dictionary encoding).
+//! - `DC: DictFromBytes` / `DS: DictFromVecBytes` - the two dictionary
+//!   flavours; which one is built depends on whether the dictionary page
+//!   arrives in one contiguous buffer or scattered across several (see
+//!   [`DictStorage`]).
 //! - `B: ArrayBuilder` — accumulates decoded values into an Arrow array.
 //! - `P: DecodePlain` — reads plain-encoded values from raw page bytes.
 //!
@@ -15,7 +17,7 @@
 use crate::parquet::reading::decoding::column_decoders::levels::decode_def_levels;
 use crate::parquet::reading::decoding::column_decoders::rle::RleDecoder;
 use crate::parquet::reading::decoding::column_decoders::{
-    ArrayBuilder, ColumnDecoder, DecodePlain, Dict, Error, Result,
+    ArrayBuilder, ColumnDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, Result,
 };
 use crate::parquet::types::filter_mask::RunningFilterMask;
 use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
@@ -35,15 +37,18 @@ pub enum ValueDecoder<P: DecodePlain> {
 
 /// Decode `n` values into `builder` (a dictionary page looks each index up in
 /// `dict`). Shared by the required and nullable read loops.
-fn decode_run<D, B, P>(decoder: &mut ValueDecoder<P>, builder: &mut B, dict: &Option<D>, n: usize)
-where
-    D: Dict<Builder = B, Item = B::Element>,
-    B: ArrayBuilder,
-    P: DecodePlain<Builder = B>,
+fn decode_run<D, P>(
+    decoder: &mut ValueDecoder<P>,
+    builder: &mut P::Builder,
+    dict: Option<&D>,
+    n: usize,
+) where
+    D: Dict<Builder = P::Builder, Item = <P::Builder as ArrayBuilder>::Element>,
+    P: DecodePlain,
 {
     match decoder {
         ValueDecoder::Plain(p) => p.read(builder, n),
-        ValueDecoder::Rle(r) => r.read(builder, dict.as_ref().expect("No dict available!"), n),
+        ValueDecoder::Rle(r) => r.read(builder, dict.expect("No dict available!"), n),
     }
 }
 
@@ -81,11 +86,7 @@ impl DefLevels {
 /// Tracks the value decoder, the optional filter mask cursor, how many rows
 /// remain in the page, and, for a nullable column, the page's definition
 /// levels (which logical rows are null).
-pub struct ReadPage<
-    D: Dict<Builder = B, Item = B::Element>,
-    B: ArrayBuilder,
-    P: DecodePlain<Builder = B>,
-> {
+pub struct ReadPage<P: DecodePlain> {
     /// Plain or RLE decoder for this page's values.
     decoder: ValueDecoder<P>,
     /// Filter mask cursor; `None` when the full page is kept.
@@ -95,18 +96,18 @@ pub struct ReadPage<
     /// Definition levels for a page with nulls; `None` for a required column or
     /// an all-present page.
     def_levels: Option<DefLevels>,
-    phantom_data: PhantomData<(D, B)>,
 }
 
-impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Builder = B>>
-    ReadPage<D, B, P>
-{
+impl<P: DecodePlain> ReadPage<P> {
     /// Decodes up to `size` rows from this page into `builder`.
     ///
     /// When a [`RunningFilterMask`] is present, false runs are skipped and
     /// only true runs are decoded, so the actual number of values pushed may
     /// be less than `size`.
-    pub fn read_into(&mut self, dict: &Option<D>, builder: &mut B, size: usize) {
+    pub fn read_into<D>(&mut self, dict: Option<&D>, builder: &mut P::Builder, size: usize)
+    where
+        D: Dict<Builder = P::Builder, Item = <P::Builder as ArrayBuilder>::Element>,
+    {
         let current_len = builder.len();
         let mut read_left = size.min(self.remaining);
         while read_left > 0 {
@@ -135,13 +136,15 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
     /// rows still advance the value stream past their present values; only
     /// kept rows reach the builder and validity. `remaining` and `size` count
     /// *kept* rows (`DataPage::rows()` is the kept count when filtered).
-    pub fn read_into_nullable(
+    pub fn read_into_nullable<D>(
         &mut self,
-        dict: &Option<D>,
-        builder: &mut B,
+        dict: Option<&D>,
+        builder: &mut P::Builder,
         validity: &mut ValidityBuilder,
         size: usize,
-    ) {
+    ) where
+        D: Dict<Builder = P::Builder, Item = <P::Builder as ArrayBuilder>::Element>,
+    {
         let start_len = builder.len();
         let mut kept_left = size.min(self.remaining);
         while kept_left > 0 {
@@ -167,7 +170,9 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
                     // safe to interpret.
                     (true, true) => decode_run(&mut self.decoder, builder, dict, n),
                     (true, false) => {
-                        builder.spare_mut(n).fill(B::Element::default());
+                        builder
+                            .spare_mut(n)
+                            .fill(<P::Builder as ArrayBuilder>::Element::default());
                     }
                     // Skipped present rows still consume their values; skipped
                     // nulls have no value in the stream.
@@ -194,17 +199,42 @@ enum PageSlot {
     Data(DataPage),
 }
 
+/// The dictionary, in whichever representation its page's buffer shape
+/// allowed: a page held in one contiguous buffer builds the `Contiguous`
+/// flavour, a page scattered across buffers the `Scattered` one.
+///
+/// The variant is picked once when the dictionary page arrives; readers match
+/// it once per call and run monomorphic code from there, so lookups never
+/// branch per element.
+enum DictStorage<DC, DS> {
+    Contiguous(DC),
+    Scattered(DS),
+}
+
+impl<DC: DictFromBytes, DS: DictFromVecBytes> DictStorage<DC, DS> {
+    fn build(mut data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
+        if data.len() == 1 {
+            let bytes = data.pop().expect("data holds one buffer");
+            Self::Contiguous(DC::new_from_bytes(bytes, size, allocator))
+        } else {
+            Self::Scattered(DS::new_from_vec_bytes(data, size, allocator))
+        }
+    }
+}
+
 /// Generic column decoder parameterised by dictionary, builder, and plain
 /// decoder types.
 ///
 /// Accumulates [`DecompressedPage`]s and decodes them into Arrow arrays on
 /// demand. See the [module docs](self) for how the type parameters fit
 /// together.
-pub struct TypedColumnDecoder<
-    D: Dict<Builder = B, Item = B::Element>,
+pub struct TypedColumnDecoder<DC, DS, B, P>
+where
+    DC: DictFromBytes<Builder = B, Item = B::Element>,
+    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
     B: ArrayBuilder,
     P: DecodePlain<Builder = B>,
-> {
+{
     /// Indexed by page number. `None` means the page hasn't arrived yet.
     pages: Vec<Option<PageSlot>>,
     /// Index of the next page to decode.
@@ -212,13 +242,13 @@ pub struct TypedColumnDecoder<
     /// Maximum definition level for this column (0 = non-nullable).
     max_def_level: i16,
     /// The page currently being consumed, if any.
-    read_page: Option<ReadPage<D, B, P>>,
+    read_page: Option<ReadPage<P>>,
     /// Dictionary built from a dictionary page, if one has been received.
-    dict: Option<D>,
+    dict: Option<DictStorage<DC, DS>>,
     /// The pushed-down equality constant, in this dictionary flavour's own
     /// representation (see [`Dict::EqConstant`]). Drives row-group pruning
     /// and scan-side batch filtering once the dictionary is built.
-    eq_const: Option<D::EqConstant>,
+    eq_const: Option<DC::EqConstant>,
     /// Whether the dictionary was scanned and found to exclude
     /// [`Self::eq_const`]. Stays `false` until a dictionary page proves the
     /// constant absent.
@@ -226,8 +256,12 @@ pub struct TypedColumnDecoder<
     phantom_data: PhantomData<B>,
 }
 
-impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Builder = B>>
-    TypedColumnDecoder<D, B, P>
+impl<DC, DS, B, P> TypedColumnDecoder<DC, DS, B, P>
+where
+    DC: DictFromBytes<Builder = B, Item = B::Element>,
+    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
+    B: ArrayBuilder,
+    P: DecodePlain<Builder = B>,
 {
     /// Creates a new decoder for a column with the given maximum definition
     /// level. Use `0` for non-nullable columns.
@@ -318,20 +352,22 @@ impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Bu
             running_filter_mask_opt: page.filter_mask.map(RunningFilterMask::new),
             remaining: kept,
             def_levels,
-            phantom_data: Default::default(),
         });
 
         Ok(Some(()))
     }
 }
 
-impl<D: Dict<Builder = B, Item = B::Element>, B: ArrayBuilder, P: DecodePlain<Builder = B>>
-    ColumnDecoder for TypedColumnDecoder<D, B, P>
+impl<DC, DS, B, P> ColumnDecoder for TypedColumnDecoder<DC, DS, B, P>
 where
+    DC: DictFromBytes<Builder = B, Item = B::Element>,
+    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
+    B: ArrayBuilder,
+    P: DecodePlain<Builder = B>,
     B::Element: PartialEq,
 {
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
-        self.eq_const = D::eq_constant_from_scalar(value);
+        self.eq_const = DC::eq_constant_from_scalar(value);
     }
 
     fn dict_excludes_eq_constant(&self) -> bool {
@@ -340,7 +376,12 @@ where
 
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
         match (&self.eq_const, &self.dict) {
-            (Some(needle), Some(dict)) => dict.filter_record_batch_by_const(batch, column, needle),
+            (Some(needle), Some(DictStorage::Contiguous(dict))) => {
+                dict.filter_record_batch_by_const(batch, column, needle)
+            }
+            (Some(needle), Some(DictStorage::Scattered(dict))) => {
+                dict.filter_record_batch_by_const(batch, column, needle)
+            }
             _ => batch,
         }
     }
@@ -383,7 +424,7 @@ where
                     // before materializing it. If absent, the row group is pruned
                     // — so skip building the dictionary entirely (no allocation,
                     // no copy of values we'd never read).
-                    let present = D::maybe_contains(&data, size, needle);
+                    let present = DC::maybe_contains(&data, size, needle);
                     self.dict_excludes_eq_constant = !present;
                     if !present {
                         // Row group will be pruned. Install an *empty* dictionary
@@ -394,11 +435,11 @@ where
                         // `None` makes `available()` report 0, parking every
                         // worker before the prune completes → lost-wakeup hang.)
                         // The dictionary is never read — the row group is pruned.
-                        self.dict = Some(D::new(data, 0, allocator));
+                        self.dict = Some(DictStorage::build(data, 0, allocator));
                         return;
                     }
                 }
-                self.dict = Some(D::new(data, size, allocator));
+                self.dict = Some(DictStorage::build(data, size, allocator));
             }
             DecompressedPageType::Data(data) => {
                 let idx = page.idx;
@@ -419,8 +460,10 @@ where
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
         let mut builder = B::with_capacity(allocator, size);
-        if let Some(d) = self.dict.as_ref() {
-            d.register_onto(&mut builder)
+        match &self.dict {
+            Some(DictStorage::Contiguous(d)) => d.register_onto(&mut builder),
+            Some(DictStorage::Scattered(d)) => d.register_onto(&mut builder),
+            None => {}
         }
         // Validity is built lazily on slab memory only once a page actually has
         // a null. A required column, and a nullable one whose pages are all
@@ -446,10 +489,26 @@ where
                     vb.append_n(builder.len(), true);
                     vb
                 });
-                read_page.read_into_nullable(&self.dict, &mut builder, v, remaining);
+                match &self.dict {
+                    Some(DictStorage::Contiguous(d)) => {
+                        read_page.read_into_nullable(Some(d), &mut builder, v, remaining)
+                    }
+                    Some(DictStorage::Scattered(d)) => {
+                        read_page.read_into_nullable(Some(d), &mut builder, v, remaining)
+                    }
+                    None => read_page.read_into_nullable(None::<&DC>, &mut builder, v, remaining),
+                }
             } else {
                 let before = builder.len();
-                read_page.read_into(&self.dict, &mut builder, remaining);
+                match &self.dict {
+                    Some(DictStorage::Contiguous(d)) => {
+                        read_page.read_into(Some(d), &mut builder, remaining)
+                    }
+                    Some(DictStorage::Scattered(d)) => {
+                        read_page.read_into(Some(d), &mut builder, remaining)
+                    }
+                    None => read_page.read_into(None::<&DC>, &mut builder, remaining),
+                }
                 if let Some(v) = &mut validity {
                     v.append_n(builder.len() - before, true);
                 }

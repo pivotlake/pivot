@@ -6,8 +6,8 @@
 //! and builds a `Vec<u128>` of Arrow views so that each RLE index can be
 //! resolved to a view in O(1).
 
-use crate::parquet::reading::decoding::column_decoders::Dict;
 use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::parquet::reading::decoding::column_decoders::{Dict, DictFromBytes, DictFromVecBytes};
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
 use arrow_array::{
@@ -178,13 +178,18 @@ impl<V: ByteViewType> Dict for ViewDict<V> {
         (strings.len() == 1 && strings.is_valid(0)).then(|| strings.value(0).as_bytes().to_vec())
     }
 
-    fn new(data: Vec<Bytes>, size: usize, _allocator: &mut SlabAllocator) -> Self {
-        DictFactory::new(data, size).create_dict()
+    fn len(&self) -> usize {
+        self.views.len()
     }
 
     #[inline(always)]
     fn entry(&self, idx: usize) -> Self::Item {
         self.view(idx)
+    }
+
+    #[inline(always)]
+    unsafe fn entry_unchecked(&self, idx: usize) -> Self::Item {
+        unsafe { *self.views.get_unchecked(idx) }
     }
 
     fn register_onto(&self, builder: &mut Self::Builder) {
@@ -238,6 +243,23 @@ impl<V: ByteViewType> Dict for ViewDict<V> {
         }
         arrow_select::filter::filter_record_batch(&batch, &BooleanArray::new(keep, None))
             .expect("the mask is built to the batch's row count")
+    }
+}
+
+// Views are `Vec<u128>`-backed either way (unlike a fixed-width dictionary,
+// the view count doesn't shrink with the page's byte size, so one contiguous
+// buffer doesn't bound them); the split only decides what `DictFactory` has
+// to handle. A single buffer can't straddle, so entries parse on the fast
+// path throughout.
+impl<V: ByteViewType> DictFromBytes for ViewDict<V> {
+    fn new_from_bytes(data: Bytes, size: usize, _allocator: &mut SlabAllocator) -> Self {
+        DictFactory::new(vec![data], size).create_dict()
+    }
+}
+
+impl<V: ByteViewType> DictFromVecBytes for ViewDict<V> {
+    fn new_from_vec_bytes(data: Vec<Bytes>, size: usize, _allocator: &mut SlabAllocator) -> Self {
+        DictFactory::new(data, size).create_dict()
     }
 }
 
