@@ -476,18 +476,23 @@ fn build_join(
     })
 }
 
-/// The optimizer's row estimate for `op`, read off the nearest node that
-/// carries one down a single-child chain (a filter or projection synthesized
-/// after optimization has none of its own, and pass-through operators only
-/// shrink rows, so a descendant's estimate still orders two sides).
+/// The row estimate a join side's hash table would hold, read off the
+/// DEEPEST estimate down the side's single-child chain (its scan, or a join
+/// below). Filters above the scan keep the shallower estimates too, but
+/// those bake in guessed selectivities — a column-to-column comparison gets
+/// a default guess that can be off by orders of magnitude (q04's
+/// l_commitdate < l_receiptdate reads ~1% when the truth is ~63%) — while a
+/// scan's estimate only reflects the pushed constant filters, which come
+/// from statistics.
 fn subtree_estimate(op: LogicalOp<'_>) -> Option<u64> {
     let mut current = op;
+    let mut deepest = None;
     loop {
         if let Some(estimate) = current.estimated_cardinality() {
-            return Some(estimate);
+            deepest = Some(estimate);
         }
         if current.child_count() != 1 {
-            return None;
+            return deepest;
         }
         current = current.child(0);
     }
