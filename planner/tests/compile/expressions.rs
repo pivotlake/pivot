@@ -1032,3 +1032,25 @@ fn computed_group_key_with_computed_aggregate_argument(mut testing_planner: Test
     let high = rows.iter().find(|r| r["bucket"] == 0).unwrap();
     assert_eq!(high["s"], 410);
 }
+
+#[rstest]
+fn decimal_sum_and_filter(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "dec_t",
+        &[(
+            "q",
+            planner::types::Type::Decimal,
+            std::sync::Arc::new(arrow_array::Float64Array::from(vec![1.5, 2.5, 30.0]))
+                as arrow_array::ArrayRef,
+        )],
+    );
+
+    let rows = run(&mut testing_planner, "select sum(q) as s from dec_t");
+    assert_eq!(rows, vec![serde_json::json!({"s": 34.0})]);
+
+    let rows = run(
+        &mut testing_planner,
+        "select sum(q) as s from dec_t where q < 24",
+    );
+    assert_eq!(rows, vec![serde_json::json!({"s": 4.0})]);
+}

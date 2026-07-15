@@ -199,12 +199,23 @@ pub trait Table: Debug + Send + Sync {
 /// Convert Pivot columns into the DuckDB-typed columns the binder consumes
 /// (logical type as a `u8` discriminant). Shared by base-table and table-function
 /// binding.
+///
+/// A DECIMAL column binds as DOUBLE: pivot decodes and computes decimals as
+/// `Float64`, and the bridge can only hand DuckDB a bare type id — a DECIMAL
+/// without width/scale, which its function binding rejects. Binding DOUBLE
+/// makes DuckDB plan the very arithmetic pivot executes.
 fn duckdb_columns(columns: &[Column]) -> Vec<DuckDBColumn> {
     columns
         .iter()
-        .map(|column| DuckDBColumn {
-            name: column.name.clone(),
-            duckdb_logical_type_id: logical_from_type(&column.col_type) as u8,
+        .map(|column| {
+            let bind_type = match column.col_type {
+                Type::Decimal => Type::Float64,
+                ref other => other.clone(),
+            };
+            DuckDBColumn {
+                name: column.name.clone(),
+                duckdb_logical_type_id: logical_from_type(&bind_type) as u8,
+            }
         })
         .collect()
 }
