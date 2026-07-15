@@ -50,6 +50,8 @@ size_t rowid_column_id();
 // ---- LogicalOperator: shared structure ----
 uint8_t lo_type(const LogicalOperator &op);
 rust::String lo_name(const LogicalOperator &op);
+bool lo_has_estimated_cardinality(const LogicalOperator &op);
+uint64_t lo_estimated_cardinality(const LogicalOperator &op);
 size_t lo_child_count(const LogicalOperator &op);
 const LogicalOperator &lo_child(const LogicalOperator &op, size_t index);
 

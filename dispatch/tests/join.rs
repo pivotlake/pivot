@@ -166,3 +166,50 @@ fn anti_join_with_empty_build_passes_everything() {
     keys.sort();
     assert_eq!(keys, vec![1, 2]);
 }
+
+#[test]
+fn build_semi_join_emits_matched_build_rows() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 20, 30])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 10, 30, 99])]).record_batches();
+
+    let results = probe
+        .join(build, vec![0], vec![0], vec![false], JoinMode::BuildSemi)
+        .collect()
+        .unwrap();
+
+    let mut keys = collect_i64s(&results, 0);
+    keys.sort();
+    assert_eq!(keys, vec![10, 30]);
+}
+
+#[test]
+fn build_anti_join_emits_unmatched_build_rows() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 20, 30])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 30])]).record_batches();
+
+    let results = probe
+        .join(build, vec![0], vec![0], vec![false], JoinMode::BuildAnti)
+        .collect()
+        .unwrap();
+
+    let keys = collect_i64s(&results, 0);
+    assert_eq!(keys, vec![20]);
+}
+
+#[test]
+fn build_anti_join_with_empty_probe_emits_all_build_rows() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[1, 2])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[])]).record_batches();
+
+    let results = probe
+        .join(build, vec![0], vec![0], vec![false], JoinMode::BuildAnti)
+        .collect()
+        .unwrap();
+
+    let mut keys = collect_i64s(&results, 0);
+    keys.sort();
+    assert_eq!(keys, vec![1, 2]);
+}

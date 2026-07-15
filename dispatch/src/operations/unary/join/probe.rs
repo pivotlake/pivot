@@ -172,6 +172,115 @@ impl Probe {
     }
 }
 
+impl Probe {
+    /// The build-emitting existence modes' probe pass over one batch: mark
+    /// every build row some probe row's keys equal (verified exactly against
+    /// the build payload). Emission happens once, in the last probe worker's
+    /// finish.
+    #[allow(clippy::too_many_arguments)]
+    fn run_marking<B>(
+        &mut self,
+        directory: &Directory<B>,
+        keys: &JoinArena<u64>,
+        rows: &JoinArena<u32>,
+        build_rows: &RecordBatch,
+        build_key_columns: &[usize],
+        batch: &RecordBatch,
+    ) -> unary::Result<()>
+    where
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+    {
+        let probe_keys: Vec<&Int64Array> = self
+            .key_columns
+            .iter()
+            .map(|&c| batch.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let build_keys: Vec<&Int64Array> = build_key_columns
+            .iter()
+            .map(|&c| build_rows.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let matched = unsafe { &*self.table.matched.get() };
+        let null_safe = &self.null_safe;
+
+        for row in 0..batch.num_rows() {
+            let strict_valid = probe_keys
+                .iter()
+                .zip(null_safe)
+                .all(|(column, &null_safe)| null_safe || column.is_valid(row));
+            if !strict_valid {
+                continue;
+            }
+            let hash = hash_key_row(&self.hash_state, &probe_keys, null_safe, row);
+            if !directory.matches_bloom(hash) {
+                continue;
+            }
+            let slot = directory.slot_for(hash);
+            let start = directory.end_ptr(slot as isize);
+            let end = directory.end_ptr((slot + 1) as isize);
+            for j in start..end {
+                if keys[j] != hash {
+                    continue;
+                }
+                let build_row = rows[j] as usize;
+                let key_equal = build_keys.iter().zip(&probe_keys).zip(null_safe).all(
+                    |((b, p), &null_safe)| {
+                        if null_safe {
+                            match (b.is_valid(build_row), p.is_valid(row)) {
+                                (true, true) => b.value(build_row) == p.value(row),
+                                (false, false) => true,
+                                _ => false,
+                            }
+                        } else {
+                            b.value(build_row) == p.value(row)
+                        }
+                    },
+                );
+                if key_equal {
+                    matched[build_row].store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the marked (semi) or unmarked (anti) build rows, in payload
+    /// order, chunked to batch size. Runs once, in the last probe worker.
+    fn emit_marked<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<()> {
+        let build_rows = unsafe { &*self.table.build_rows.get() };
+        let Some(build_rows) = build_rows else {
+            return Ok(());
+        };
+        let matched = unsafe { &*self.table.matched.get() };
+        let emit_on_match = self.mode == JoinMode::BuildSemi;
+        let schema = build_rows.schema();
+
+        let mut sel =
+            JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut output_idx = 0;
+        for (row, flag) in matched.iter().enumerate() {
+            if flag.load(Ordering::Relaxed) != emit_on_match {
+                continue;
+            }
+            sel.write(output_idx, row as u32);
+            output_idx += 1;
+            if output_idx == RECORD_BATCH_SIZE {
+                let sel_array = mem::replace(
+                    &mut sel,
+                    JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE),
+                )
+                .into_array(output_idx);
+                send_selected(build_rows, &sel_array, &schema, sender)?;
+                output_idx = 0;
+            }
+        }
+        if output_idx > 0 {
+            let sel_array = sel.into_array(output_idx);
+            send_selected(build_rows, &sel_array, &schema, sender)?;
+        }
+        Ok(())
+    }
+}
+
 /// Emit the probe rows selected by `sel` (semi/anti output: probe columns
 /// only).
 fn send_selected<S: Sender<RecordBatch>>(
@@ -509,7 +618,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             return Ok(());
         };
 
-        if self.mode != JoinMode::Inner {
+        if matches!(self.mode, JoinMode::Semi | JoinMode::Anti) {
             let directory = unsafe { &*self.table.directory.get() };
             let keys = unsafe { &*self.table.keys.get() };
             let rows = unsafe { &*self.table.rows.get() };
@@ -522,6 +631,20 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
                 &build_key_columns,
                 &batch,
                 sender,
+            );
+        }
+        if matches!(self.mode, JoinMode::BuildSemi | JoinMode::BuildAnti) {
+            let directory = unsafe { &*self.table.directory.get() };
+            let keys = unsafe { &*self.table.keys.get() };
+            let rows = unsafe { &*self.table.rows.get() };
+            let build_key_columns = self.build_key_columns.clone();
+            return self.run_marking(
+                directory,
+                keys,
+                rows,
+                build_rows,
+                &build_key_columns,
+                &batch,
             );
         }
 
@@ -582,7 +705,18 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         run_probe_array(directory, out)
     }
 
-    fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
+    fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+        if matches!(self.mode, JoinMode::BuildSemi | JoinMode::BuildAnti)
+            && self.table.probes_remaining.fetch_sub(1, Ordering::AcqRel) == 1
+        {
+            // Last probe worker: every mark is in, emit the build rows. An
+            // all-empty probe input still lands here (finish always runs), so
+            // the gate may not have been awaited yet.
+            while !self.table.gate.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            self.emit_marked(sender)?;
+        }
         Ok(true)
     }
 }

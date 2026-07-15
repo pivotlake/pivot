@@ -60,6 +60,7 @@ unsafe impl Send for JoinBuildConsumer {}
 impl JoinBuildConsumer {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         key_columns: Vec<usize>,
         null_safe: Vec<bool>,
@@ -72,6 +73,7 @@ impl JoinBuildConsumer {
         keys: Arc<JoinCell<JoinArena<u64>>>,
         rows: Arc<JoinCell<JoinArena<u32>>>,
         build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+        matched: Arc<JoinCell<Vec<std::sync::atomic::AtomicBool>>>,
         injector: Arc<Injector<JoinPartitionJob>>,
         jobs_injected: Arc<AtomicBool>,
         gate: Arc<AtomicBool>,
@@ -93,6 +95,7 @@ impl JoinBuildConsumer {
                 keys,
                 rows,
                 build_rows,
+                matched,
                 receiver,
                 partition_sizes,
                 injector,
@@ -227,6 +230,7 @@ pub struct JoinBuilder {
     keys: Arc<JoinCell<JoinArena<u64>>>,
     rows: Arc<JoinCell<JoinArena<u32>>>,
     build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+    matched: Arc<JoinCell<Vec<std::sync::atomic::AtomicBool>>>,
     receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     injector: Arc<Injector<JoinPartitionJob>>,
@@ -369,6 +373,13 @@ impl Outputter<()> for JoinBuilder {
                 crate::operations::unary::copy_out::detach_batch(&joined)
                     .expect("detaching the build payload to heap buffers")
             });
+            // One match flag per payload row, for the build-emitting
+            // existence modes (unused by the others).
+            let matched = unsafe { &mut *self.matched.get() };
+            let payload_rows = build_rows.as_ref().map(|b| b.num_rows()).unwrap_or(0);
+            *matched = (0..payload_rows)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect();
 
             // Pre-allocate directory and arenas (heap, see JoinArena's doc).
             let dir_capacity = ((total as f64 * 1.125) as usize)

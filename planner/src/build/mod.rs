@@ -253,34 +253,58 @@ fn build_join(
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
     // The RIGHT_ variants are the optimizer's children-swapped SEMI/ANTI (so
-    // the smaller side builds); swap back to probe-side-emits terms.
-    let (mode, swap_sides) = match join.join_type() {
-        JoinType::INNER => (JoinMode::Inner, false),
-        JoinType::SEMI => (JoinMode::Semi, false),
-        JoinType::ANTI => (JoinMode::Anti, false),
-        JoinType::RIGHT_SEMI => (JoinMode::Semi, true),
-        JoinType::RIGHT_ANTI => (JoinMode::Anti, true),
+    // the smaller side builds); normalize to emit-side-first terms.
+    let (existence, swap_sides) = match join.join_type() {
+        JoinType::INNER => (None, false),
+        JoinType::SEMI => (Some(false), false),
+        JoinType::ANTI => (Some(true), false),
+        JoinType::RIGHT_SEMI => (Some(false), true),
+        JoinType::RIGHT_ANTI => (Some(true), true),
         other => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported join type: {other:?}"
             )));
         }
     };
+    // An existence join's hash table holds one side wholesale while the other
+    // streams. When the emitted side is estimated smaller, build ON it and
+    // stream the big side, marking matches (the BuildSemi/BuildAnti modes) —
+    // e.g. q04 keeps its 6M filtered orders in the table instead of 380M
+    // filtered lineitems.
+    let emit_child = usize::from(swap_sides);
+    let build_on_emit = existence.is_some()
+        && match (
+            op.child(emit_child).estimated_cardinality(),
+            op.child(1 - emit_child).estimated_cardinality(),
+        ) {
+            (Some(emit), Some(other)) => emit < other,
+            _ => false,
+        };
+    let mode = match (existence, build_on_emit) {
+        (None, _) => JoinMode::Inner,
+        (Some(false), false) => JoinMode::Semi,
+        (Some(true), false) => JoinMode::Anti,
+        (Some(false), true) => JoinMode::BuildSemi,
+        (Some(true), true) => JoinMode::BuildAnti,
+    };
+    // inputs[0] must be the dispatch probe (streamed) side: the emit side for
+    // the probe-emitting modes, the big side for the build-emitting ones.
+    let probe_is_left = (emit_child == 0) != build_on_emit;
     let mut inputs = inputs;
-    if swap_sides {
+    if !probe_is_left {
         inputs.swap(0, 1);
     }
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
-    let (left_map, right_map): (Vec<usize>, Vec<usize>) = if swap_sides {
+    let (left_map, right_map): (Vec<usize>, Vec<usize>) = if probe_is_left {
         (
-            join.right_projection_map().collect(),
             join.left_projection_map().collect(),
+            join.right_projection_map().collect(),
         )
     } else {
         (
-            join.left_projection_map().collect(),
             join.right_projection_map().collect(),
+            join.left_projection_map().collect(),
         )
     };
 
@@ -295,10 +319,11 @@ fn build_join(
                 right,
                 comparison,
             } => {
-                if swap_sides {
-                    (right, left, comparison)
-                } else {
+                // Condition left binds to child 0; reorient to (probe, build).
+                if probe_is_left {
                     (left, right, comparison)
+                } else {
+                    (right, left, comparison)
                 }
             }
             // The non-comparison form (an arbitrary boolean over both sides,
@@ -387,36 +412,63 @@ fn build_join(
     }
 
     // Replay the projection maps: refs above the join were resolved against
-    // the trimmed output (kept probe columns then, for INNER, kept build
-    // columns), so select exactly those positions out of the join's output.
-    let left_kept = if left_map.is_empty() {
-        (0..probe_types.len()).collect()
-    } else {
-        left_map
-    };
-    let right_kept: Vec<usize> = if mode != JoinMode::Inner {
-        Vec::new()
-    } else if right_map.is_empty() {
-        (0..build_types.len()).collect()
-    } else {
-        right_map
-    };
-    let projections = left_kept
-        .into_iter()
-        .map(|i| (i, probe_types[i].clone()))
-        .chain(
-            right_kept
+    // the emitted side's kept columns (both sides for INNER), so select
+    // exactly those positions out of the join's output.
+    let projections: Vec<Expression> = match mode {
+        JoinMode::Inner => {
+            let left_kept: Vec<usize> = if left_map.is_empty() {
+                (0..probe_types.len()).collect()
+            } else {
+                left_map
+            };
+            let right_kept: Vec<usize> = if right_map.is_empty() {
+                (0..build_types.len()).collect()
+            } else {
+                right_map
+            };
+            left_kept
                 .into_iter()
-                .map(|i| (probe_types.len() + i, build_types[i].clone())),
-        )
-        .map(|(column_idx, return_type)| {
-            Expression::Ref(Ref {
-                column_idx,
-                return_type,
-                name: None,
+                .map(|i| (i, probe_types[i].clone()))
+                .chain(
+                    right_kept
+                        .into_iter()
+                        .map(|i| (probe_types.len() + i, build_types[i].clone())),
+                )
+                .map(|(column_idx, return_type)| {
+                    Expression::Ref(Ref {
+                        column_idx,
+                        return_type,
+                        name: None,
+                    })
+                })
+                .collect()
+        }
+        // The probe-emitting existence modes output probe columns...
+        JoinMode::Semi | JoinMode::Anti => left_map
+            .into_iter()
+            .map(|column_idx| {
+                Expression::Ref(Ref {
+                    return_type: probe_types[column_idx].clone(),
+                    column_idx,
+                    name: None,
+                })
             })
-        })
-        .collect();
+            .collect(),
+        // ...and the build-emitting ones output build columns.
+        JoinMode::BuildSemi | JoinMode::BuildAnti => right_map
+            .into_iter()
+            .map(|column_idx| {
+                Expression::Ref(Ref {
+                    return_type: build_types[column_idx].clone(),
+                    column_idx,
+                    name: None,
+                })
+            })
+            .collect(),
+    };
+    if projections.is_empty() {
+        return Ok(node);
+    }
     Ok(PlanNode {
         name: "JOIN_PROJECTION".to_string(),
         inputs: vec![node],

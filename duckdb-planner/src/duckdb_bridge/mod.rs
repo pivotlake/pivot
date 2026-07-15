@@ -141,6 +141,9 @@ pub mod ffi {
         fn lo_type(op: &LogicalOperator) -> u8;
         /// The operator's display name (`LogicalOperator::GetName`).
         fn lo_name(op: &LogicalOperator) -> String;
+        /// The optimizer's row estimate for this operator, when set.
+        fn lo_has_estimated_cardinality(op: &LogicalOperator) -> bool;
+        fn lo_estimated_cardinality(op: &LogicalOperator) -> u64;
         fn lo_child_count(op: &LogicalOperator) -> usize;
         fn lo_child(op: &LogicalOperator, index: usize) -> &LogicalOperator;
 

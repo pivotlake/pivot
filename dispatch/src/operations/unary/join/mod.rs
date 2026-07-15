@@ -42,6 +42,15 @@ pub enum JoinMode {
     /// probe row with a null key matches nothing, so it is emitted). Probe
     /// columns only.
     Anti,
+    /// Each BUILD row at most once, when some probe row's keys equal its
+    /// keys: the probe marks matched build rows and the last probe worker
+    /// emits them. Build columns only. Used when the emitted side is the
+    /// smaller one, so the hash table (and its payload) stays small while
+    /// the big side streams.
+    BuildSemi,
+    /// Each BUILD row exactly when NO probe row matched it. Build columns
+    /// only.
+    BuildAnti,
 }
 
 /// A fixed-length, index-addressed heap buffer for the join's key/row arenas.
@@ -114,6 +123,12 @@ pub(crate) struct JoinTable {
     pub(crate) keys: Arc<JoinCell<JoinArena<u64>>>,
     pub(crate) rows: Arc<JoinCell<JoinArena<u32>>>,
     pub(crate) build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+    /// One flag per build payload row, set by the build-emitting existence
+    /// modes' probes when a probe row matches it. Sized by the build phase.
+    pub(crate) matched: Arc<JoinCell<Vec<std::sync::atomic::AtomicBool>>>,
+    /// Probe workers still running, for the build-emitting modes: the worker
+    /// that decrements it to zero has seen every mark and emits the rows.
+    pub(crate) probes_remaining: Arc<std::sync::atomic::AtomicUsize>,
     /// Set by the last build partition job; probes must wait on it, since the
     /// build dataflow's collect can return while a stolen job is still running.
     pub(crate) gate: Arc<AtomicBool>,

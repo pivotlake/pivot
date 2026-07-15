@@ -25,6 +25,7 @@ pub struct JoinBuildFactory {
     keys: Arc<JoinCell<JoinArena<u64>>>,
     rows: Arc<JoinCell<JoinArena<u32>>>,
     build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+    matched: Arc<JoinCell<Vec<std::sync::atomic::AtomicBool>>>,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
     sender: mpsc::Sender<BuildWorkerOutput>,
@@ -71,6 +72,8 @@ pub fn create_for_workers(
     let keys = Arc::new(JoinCell::new(JoinArena::<u64>::empty()));
     let rows = Arc::new(JoinCell::new(JoinArena::<u32>::empty()));
     let build_rows = Arc::new(JoinCell::new(None));
+    let matched = Arc::new(JoinCell::new(Vec::new()));
+    let probes_remaining = Arc::new(AtomicUsize::new(worker_count));
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(AtomicBool::new(false));
@@ -83,6 +86,7 @@ pub fn create_for_workers(
     let keys_clone = keys.clone();
     let rows_clone = rows.clone();
     let build_rows_clone = build_rows.clone();
+    let matched_clone = matched.clone();
     let hs_clone = hash_state.clone();
     let gate_ret = gate.clone();
     let gate_probe = gate.clone();
@@ -98,6 +102,7 @@ pub fn create_for_workers(
         keys: keys.clone(),
         rows: rows.clone(),
         build_rows: build_rows.clone(),
+        matched: matched.clone(),
         injector: injector.clone(),
         jobs_injected: jobs_injected.clone(),
         sender: tx.clone(),
@@ -112,6 +117,8 @@ pub fn create_for_workers(
             keys: keys_clone.clone(),
             rows: rows_clone.clone(),
             build_rows: build_rows_clone.clone(),
+            matched: matched_clone.clone(),
+            probes_remaining: probes_remaining.clone(),
             gate: gate_probe.clone(),
         },
         hash_state: hs_clone.clone(),
@@ -141,6 +148,7 @@ impl UnaryFactory<RecordBatch, ()> for JoinBuildFactory {
             self.keys,
             self.rows,
             self.build_rows,
+            self.matched,
             self.injector,
             self.jobs_injected,
             self.gate,

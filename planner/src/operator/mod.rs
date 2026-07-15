@@ -140,12 +140,15 @@ impl Operator {
                 Ok(inputs[0].clone())
             }
             // An inner join emits every probe column followed by every build
-            // column; a semi/anti join emits the probe columns only.
+            // column; the existence modes emit one side only.
             Operator::Join(join) => match join.mode {
                 dispatch::JoinMode::Inner => {
                     Ok(inputs[0].iter().chain(inputs[1].iter()).cloned().collect())
                 }
                 dispatch::JoinMode::Semi | dispatch::JoinMode::Anti => Ok(inputs[0].clone()),
+                dispatch::JoinMode::BuildSemi | dispatch::JoinMode::BuildAnti => {
+                    Ok(inputs[1].clone())
+                }
             },
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),

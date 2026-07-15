@@ -367,6 +367,14 @@ rust::String lo_name(const LogicalOperator &op) {
 	return rust::String::lossy(const_cast<LogicalOperator &>(op).GetName());
 }
 
+bool lo_has_estimated_cardinality(const LogicalOperator &op) {
+	return op.has_estimated_cardinality;
+}
+
+uint64_t lo_estimated_cardinality(const LogicalOperator &op) {
+	return op.estimated_cardinality;
+}
+
 size_t lo_child_count(const LogicalOperator &op) {
 	return op.children.size();
 }

@@ -121,6 +121,11 @@ impl<'plan> LogicalOp<'plan> {
         ffi::lo_child_count(self.raw)
     }
 
+    /// The optimizer's row estimate for this operator, when it computed one.
+    pub fn estimated_cardinality(self) -> Option<u64> {
+        ffi::lo_has_estimated_cardinality(self.raw).then(|| ffi::lo_estimated_cardinality(self.raw))
+    }
+
     pub fn child(self, index: usize) -> LogicalOp<'plan> {
         LogicalOp {
             raw: ffi::lo_child(self.raw, index),
