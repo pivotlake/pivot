@@ -16,6 +16,7 @@
 //! so a fetch never blocks the dataflow worker and many run concurrently.
 
 use super::RemoteRead;
+use super::RemoteWrite;
 use super::proto;
 
 #[cfg(target_os = "linux")]
@@ -64,12 +65,19 @@ mod blocking_engine {
     /// to the owning dataflow). The id is the read's engine-side request id.
     pub(crate) type HttpCompletion = (Identifier, Result<()>);
 
-    /// One range read for a pool thread to perform: fetch `read` into its pinned
-    /// slot and report `(id, outcome)` on `sink`. `client_config` builds any fresh
-    /// connection the fetch needs.
+    /// What a pool thread should do: fetch a range into a pinned slot, or upload
+    /// a file's bytes to the object store. Both report `(id, outcome)` on the
+    /// job's `sink`.
+    enum JobKind {
+        Read(RemoteRead),
+        Write(RemoteWrite),
+    }
+
+    /// One job for a pool thread to perform, reporting `(id, outcome)` on `sink`.
+    /// `client_config` builds any fresh connection it needs.
     struct HttpJob {
         id: Identifier,
-        read: RemoteRead,
+        kind: JobKind,
         client_config: Arc<rustls::ClientConfig>,
         sink: Sender<HttpCompletion>,
     }
@@ -151,14 +159,16 @@ mod blocking_engine {
             // reports back) and this thread must survive to serve the next job, so
             // a panic in the fetch fails just this read rather than stranding the
             // worker or shrinking the pool.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_fetch(conns, &job.client_config, &job.read)
-            }))
-            .unwrap_or_else(|_| {
-                Err(Error::Io(std::io::Error::other(
-                    "http pool thread panicked",
-                )))
-            });
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &job.kind {
+                    JobKind::Read(read) => run_fetch(conns, &job.client_config, read),
+                    JobKind::Write(write) => run_upload(&job.client_config, write),
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Error::Io(std::io::Error::other(
+                        "http pool thread panicked",
+                    )))
+                });
             // The issuing engine may have been dropped mid-flight (its receiver
             // gone); a failed send is then expected and ignored.
             let _ = job.sink.send((job.id, outcome));
@@ -201,20 +211,91 @@ mod blocking_engine {
     }
 
     fn connect(client_config: &Arc<rustls::ClientConfig>, read: &RemoteRead) -> Result<Conn> {
-        let tcp = TcpStream::connect_timeout(&read.remote.addr(), CONNECT_TIMEOUT)?;
+        connect_endpoint(
+            client_config,
+            read.remote.addr(),
+            read.remote.host(),
+            read.remote.is_https(),
+        )
+    }
+
+    /// Open a (optionally TLS-wrapped) connection to `addr`, used by both reads
+    /// and uploads.
+    fn connect_endpoint(
+        client_config: &Arc<rustls::ClientConfig>,
+        addr: std::net::SocketAddr,
+        host: &str,
+        is_https: bool,
+    ) -> Result<Conn> {
+        let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
         tcp.set_nodelay(true).ok();
         // These bound every read/write so a hung server can't pin a pool thread
         // (and stall Drop) forever, so a failure to set them must fail the
         // connection rather than be ignored.
         tcp.set_read_timeout(Some(IO_TIMEOUT))?;
         tcp.set_write_timeout(Some(IO_TIMEOUT))?;
-        if read.remote.is_https() {
-            let server_name =
-                rustls::pki_types::ServerName::try_from(read.remote.host().to_string())?;
+        if is_https {
+            let server_name = rustls::pki_types::ServerName::try_from(host.to_string())?;
             let client = ClientConnection::new(client_config.clone(), server_name)?;
             Ok(Conn::Tls(Box::new(StreamOwned::new(client, tcp))))
         } else {
             Ok(Conn::Plain(tcp))
+        }
+    }
+
+    /// Upload `write.bytes` to its object with one PUT/POST on a fresh connection
+    /// (upload connections send `Connection: close` and are never pooled).
+    fn run_upload(client_config: &Arc<rustls::ClientConfig>, write: &RemoteWrite) -> Result<()> {
+        let conn = connect_endpoint(
+            client_config,
+            write.remote.addr(),
+            write.remote.host(),
+            write.remote.is_https(),
+        )?;
+        do_upload(conn, write)
+    }
+
+    /// Send the upload request (head + body) on `conn` and read its response,
+    /// succeeding on a 2xx status.
+    fn do_upload(mut conn: Conn, write: &RemoteWrite) -> Result<()> {
+        let auth = write.remote.auth_header();
+        let head = proto::build_put(
+            write.remote.method().as_str(),
+            write.remote.host_header(),
+            write.remote.request_target(),
+            write.bytes.len(),
+            write.remote.content_type(),
+            auth.as_deref(),
+        );
+        conn.write_all(&head)?;
+        conn.write_all(&write.bytes)?;
+        conn.flush()?;
+
+        // Read until the response head parses; any 2xx is success.
+        let mut chunk = vec![0u8; 16 * 1024];
+        let mut acc: Vec<u8> = Vec::new();
+        loop {
+            let n = conn.read(&mut chunk)?;
+            if n == 0 {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before upload response",
+                )));
+            }
+            acc.extend_from_slice(&chunk[..n]);
+            // Any 2xx is success; a rejected status carries the server's error body
+            // in the `ProtoError` snippet.
+            match proto::parse_response(&acc, (200, 299), None) {
+                Ok(proto::RespParse::Ready { .. }) => return Ok(()),
+                Ok(proto::RespParse::Incomplete) => continue,
+                Err(e) => {
+                    return Err(Error::Io(std::io::Error::other(format!(
+                        "{e}; {} {}",
+                        write.remote.host_header(),
+                        write.remote.request_target(),
+                    ))));
+                }
+            }
         }
     }
 
@@ -232,10 +313,12 @@ mod blocking_engine {
         conn.write_all(&request)?;
         conn.flush()?;
 
-        // Accumulate until the response head parses.
+        // Accumulate until the response head parses. A range read requires (and
+        // `parse_response` enforces) a `Content-Length` that fits the slot; a
+        // rejected status carries the server's error body in the snippet.
         let mut chunk = vec![0u8; 16 * 1024];
         let mut acc: Vec<u8> = Vec::new();
-        let head = loop {
+        let (head_len, content_length) = loop {
             let n = conn.read(&mut chunk)?;
             if n == 0 {
                 return Err(Error::Io(std::io::Error::new(
@@ -244,20 +327,20 @@ mod blocking_engine {
                 )));
             }
             acc.extend_from_slice(&chunk[..n]);
-            match proto::parse_response_head(&acc, read.len) {
-                Ok(proto::HeadParse::Complete(h)) => break h,
-                Ok(proto::HeadParse::Incomplete) => continue,
+            match proto::parse_response(&acc, (206, 206), Some(read.len as u64)) {
+                Ok(proto::RespParse::Ready {
+                    head_len,
+                    content_length,
+                }) => {
+                    break (
+                        head_len,
+                        content_length.expect("read requires Content-Length"),
+                    );
+                }
+                Ok(proto::RespParse::Incomplete) => continue,
                 Err(e) => {
-                    // A rejected request (e.g. a GCS 404/403) carries an error
-                    // body explaining why; pull a little more so it lands in the
-                    // message, since a bare status is hard to diagnose.
-                    if let Ok(extra) = conn.read(&mut chunk) {
-                        acc.extend_from_slice(&chunk[..extra]);
-                    }
-                    let response = String::from_utf8_lossy(&acc);
-                    let response = &response[..response.len().min(800)];
                     return Err(Error::Io(std::io::Error::other(format!(
-                        "{e}; {} {} -> {response}",
+                        "{e}; {} {}",
                         read.remote.host_header(),
                         read.remote.request_target(),
                     ))));
@@ -265,10 +348,10 @@ mod blocking_engine {
             }
         };
 
-        let body_len = head.content_length as usize;
+        let body_len = content_length as usize;
         // SAFETY: dest points into the pinned cache slot for exactly this block's
         // currently-invalid sub-blocks; body_len <= read.len <= the block length
-        // (validated in parse_response_head).
+        // (validated in parse_response).
         let dest = unsafe { std::slice::from_raw_parts_mut(read.dest, body_len) };
 
         // Drive the body through the sans-IO decoder. The range policy guarantees
@@ -277,9 +360,9 @@ mod blocking_engine {
         // buffer. `decode` first absorbs any body bytes that arrived alongside the
         // head, and would transparently handle a chunked body too were the range
         // policy ever relaxed.
-        let mut body = http1::BodyDecoder::new(head.content_length);
+        let mut body = http1::BodyDecoder::new(content_length);
         let mut written = 0usize;
-        let leftover = &acc[head.head_len..];
+        let leftover = &acc[head_len..];
         body.decode(leftover, |bytes| {
             dest[written..written + bytes.len()].copy_from_slice(bytes);
             written += bytes.len();
@@ -345,10 +428,20 @@ mod blocking_engine {
         /// Dispatch a range read onto the pool (non-blocking); it completes later
         /// on `rx`.
         pub fn start(&mut self, id: Identifier, read: RemoteRead) -> Result<()> {
+            self.dispatch(id, JobKind::Read(read))
+        }
+
+        /// Dispatch an upload onto the pool (non-blocking); it completes later on
+        /// `rx`, exactly like a read.
+        pub fn start_upload(&mut self, id: Identifier, write: RemoteWrite) -> Result<()> {
+            self.dispatch(id, JobKind::Write(write))
+        }
+
+        fn dispatch(&mut self, id: Identifier, kind: JobKind) -> Result<()> {
             self.pool
                 .send(HttpJob {
                     id,
-                    read,
+                    kind,
                     client_config: self.client_config.clone(),
                     sink: self.sink.clone(),
                 })
@@ -459,6 +552,11 @@ mod uring_engine {
         }
     }
 
+    /// How many body bytes to hand the transport per pump. Bounds the ciphertext
+    /// (or plaintext) buffered for one in-flight `send`, so a large upload streams
+    /// in bounded memory rather than one giant buffered write.
+    const SEND_CHUNK: usize = 256 * 1024;
+
     /// What the connection's last in-flight SQE was, so its CQE can be interpreted.
     enum State {
         Connecting,
@@ -471,71 +569,165 @@ mod uring_engine {
         Tls(Box<ClientConnection>),
     }
 
-    /// One socket + its (optional) TLS session, reused across requests via the
-    /// keep-alive pool.
+    /// A read's response-body destination: a pointer into the pinned cache slot and
+    /// its capacity. An upload has no slot (its response is drained, not kept).
+    #[derive(Clone, Copy)]
+    struct Slot {
+        ptr: *mut u8,
+        cap: usize,
+    }
+
+    /// A prepared HTTP request, self-contained so a transient transport failure can
+    /// rebuild a fresh connection and re-issue it (a range GET and an object
+    /// PUT/POST are both idempotent).
+    ///
+    /// It is **generic over method**: the difference between a read and an upload is
+    /// entirely *data* — whether there is a `send_body`, where the response body
+    /// goes (`slot`), and the acceptance policy — not a separate type. Both always
+    /// receive and parse a response, so a rejected upload's body is available for
+    /// the error message just like a read's.
+    #[derive(Clone)]
+    struct PreparedOp {
+        addr: SocketAddr,
+        /// TLS SNI host name.
+        server_name: String,
+        /// Per-host pool key — reads and uploads to the same host share connections.
+        host_key: String,
+        is_https: bool,
+        /// The request line + headers, prebuilt.
+        request_head: Vec<u8>,
+        /// The request body to stream out (an upload); `None` for a GET.
+        send_body: Option<Arc<[u8]>>,
+        /// Where the response body is written: a read's pinned cache slot, or `None`
+        /// to drain it (an upload only needs the status).
+        slot: Option<Slot>,
+        /// Accepted status codes, inclusive: `(206, 206)` for a range read, `(200,
+        /// 299)` for an upload. Whether the whole body must land is implied by
+        /// `slot`: a read (`Some`) needs its payload; an upload (`None`) does not.
+        status_range: (u16, u16),
+    }
+
+    impl PreparedOp {
+        /// A range read into `read`'s pinned cache slot.
+        fn for_read(read: &RemoteRead) -> Self {
+            PreparedOp {
+                addr: read.remote.addr(),
+                server_name: read.remote.host().to_string(),
+                host_key: host_key(&read.remote),
+                is_https: read.remote.is_https(),
+                request_head: proto::build_range_get(
+                    read.remote.host_header(),
+                    read.remote.request_target(),
+                    read.offset,
+                    read.len,
+                    read.remote.auth_header().as_deref(),
+                ),
+                send_body: None,
+                slot: Some(Slot {
+                    ptr: read.dest,
+                    cap: read.len,
+                }),
+                status_range: (206, 206),
+            }
+        }
+
+        /// An object upload (PUT/POST) streaming `write`'s bytes; its response is
+        /// drained, not kept.
+        fn for_upload(write: &RemoteWrite) -> Self {
+            PreparedOp {
+                addr: write.remote.addr(),
+                server_name: write.remote.host().to_string(),
+                host_key: format!("{}:{}", write.remote.host(), write.remote.addr().port()),
+                is_https: write.remote.is_https(),
+                request_head: proto::build_put(
+                    write.remote.method().as_str(),
+                    write.remote.host_header(),
+                    write.remote.request_target(),
+                    write.bytes.len(),
+                    write.remote.content_type(),
+                    write.remote.auth_header().as_deref(),
+                ),
+                send_body: Some(write.bytes.clone()),
+                slot: None,
+                status_range: (200, 299),
+            }
+        }
+    }
+
+    /// One socket + its (optional) TLS session, reused across requests — reads *or*
+    /// uploads — via the keep-alive pool. The read/upload difference lives entirely
+    /// in [`op`](Conn::op)'s data, not in the connection's shape.
     struct Conn {
         fd: OwnedFd,
         transport: Transport,
-        host_key: String,
         /// Connect target; boxed so the SQE can hold a stable pointer to it.
         sockaddr: Box<libc::sockaddr_storage>,
         sockaddr_len: libc::socklen_t,
 
         // --- current request ---
         id: Identifier,
-        dest: *mut u8,
-        req_len: usize,
-        request_bytes: Vec<u8>,
-        request_queued: bool,
-        /// The originating read, kept so a transient transport failure can
-        /// rebuild a fresh connection and re-issue it (the GET is idempotent).
-        read: RemoteRead,
-        /// How many times this request has already been retried on a fresh
-        /// connection; bounded by [`MAX_HTTP_RETRIES`].
+        /// The request being performed, kept whole so a failure can re-issue it.
+        op: PreparedOp,
+        /// How many times this request has been retried; bounded by [`MAX_HTTP_RETRIES`].
         retries: u32,
 
-        // Bytes pending send (ciphertext for TLS, the request for plain).
+        // --- send progress ---
+        /// Whether the request head has been handed to the transport yet.
+        head_queued: bool,
+        /// How many `send_body` bytes have been handed to the transport.
+        body_sent: usize,
+
+        // --- receive progress ---
+        /// Accumulates the response head; on a rejected status it also holds the
+        /// leading body bytes for the error message.
+        resp_acc: Vec<u8>,
+        /// The response body decoder, `None` until the head parses.
+        resp_body: Option<http1::BodyDecoder>,
+        /// Bytes of the response body written into the read slot.
+        resp_written: usize,
+        /// True when the last recv was posted straight into the slot (a plaintext
+        /// read body, zero-copy) rather than into `in_buf`.
+        recv_in_dest: bool,
+        /// True once the request succeeded (an accepted status, and — for a read —
+        /// the full body landed).
+        complete: bool,
+        /// True when the connection is clean and can be returned to the pool.
+        poolable: bool,
+
+        // Bytes pending send (ciphertext for TLS, plaintext for plain).
         out_buf: Vec<u8>,
         out_pos: usize,
-        // Reusable recv scratch (TLS ciphertext, or plaintext headers). Allocated
-        // once at `RECV_CHUNK` and never re-zeroed — recv overwrites `[..n]` and we
-        // only read that. Plaintext bodies skip it entirely (recv'd into `dest`).
+        // Reusable recv scratch (TLS ciphertext, or plaintext headers / response).
         in_buf: Vec<u8>,
-
-        // Response assembly. `head_acc` accumulates header bytes until the head
-        // parses; `body` is then the sans-IO decoder that tracks body progress and
-        // completion (`None` until the head is in). `body_written` is the write
-        // cursor into `dest`.
-        head_acc: Vec<u8>,
-        body: Option<http1::BodyDecoder>,
-        body_written: usize,
-        /// True when the last recv was posted to read straight into `dest` (a
-        /// plaintext body, zero-copy) rather than into `in_buf`.
-        recv_in_dest: bool,
 
         state: State,
     }
 
     impl Conn {
-        /// Reset the request-specific fields, keeping the live socket/TLS session
-        /// so it can be returned to the pool for reuse.
+        /// Reset request state for pooling, keeping the live socket/TLS session.
+        /// `bind_request` fully re-installs the request on reuse; here we wipe the
+        /// slot pointer so no stale pointer lingers in an idle connection.
         fn clear_request(&mut self) {
             self.id = 0;
-            self.dest = std::ptr::null_mut();
-            self.req_len = 0;
-            self.request_bytes.clear();
-            self.request_queued = false;
+            self.op.request_head.clear();
+            self.op.send_body = None;
+            self.op.slot = None;
+            self.head_queued = false;
+            self.body_sent = 0;
             self.out_buf.clear();
             self.out_pos = 0;
             // `in_buf` is reused as-is (not cleared); recv overwrites what it needs.
-            self.head_acc.clear();
-            self.body = None;
-            self.body_written = 0;
+            self.resp_acc.clear();
+            self.resp_body = None;
+            self.resp_written = 0;
             self.recv_in_dest = false;
+            self.complete = false;
+            self.poolable = false;
         }
 
-        /// Ensure `out_buf` holds the next bytes to send: queue the HTTP request
-        /// once it's allowed, then drain rustls's outgoing records.
+        /// Ensure `out_buf` holds the next bytes to send: queue the request head
+        /// once, then stream any `send_body` in [`SEND_CHUNK`] pieces, then drain
+        /// rustls's outgoing records.
         fn fill_out(&mut self) {
             if self.out_pos < self.out_buf.len() {
                 return; // still have unsent bytes
@@ -544,17 +736,37 @@ mod uring_engine {
             self.out_pos = 0;
             match &mut self.transport {
                 Transport::Plain => {
-                    if !self.request_queued {
-                        self.out_buf.extend_from_slice(&self.request_bytes);
-                        self.request_queued = true;
+                    if !self.head_queued {
+                        self.out_buf.extend_from_slice(&self.op.request_head);
+                        self.head_queued = true;
+                    } else if let Some(body) = &self.op.send_body
+                        && self.body_sent < body.len()
+                    {
+                        let end = (self.body_sent + SEND_CHUNK).min(body.len());
+                        self.out_buf.extend_from_slice(&body[self.body_sent..end]);
+                        self.body_sent = end;
                     }
                 }
                 Transport::Tls(tls) => {
-                    if !tls.is_handshaking() && !self.request_queued {
-                        tls.writer()
-                            .write_all(&self.request_bytes)
-                            .expect("rustls writer is infallible into its buffer");
-                        self.request_queued = true;
+                    if !tls.is_handshaking() {
+                        if !self.head_queued {
+                            tls.writer()
+                                .write_all(&self.op.request_head)
+                                .expect("rustls writer is infallible into its buffer");
+                            self.head_queued = true;
+                        } else if let Some(body) = &self.op.send_body
+                            && self.body_sent < body.len()
+                        {
+                            // rustls buffers bounded plaintext, so feed only what it
+                            // accepts (a short `write` when its buffer fills); the
+                            // drain below flushes it before we feed the rest.
+                            let end = (self.body_sent + SEND_CHUNK).min(body.len());
+                            let n = tls
+                                .writer()
+                                .write(&body[self.body_sent..end])
+                                .expect("rustls writer is infallible into its buffer");
+                            self.body_sent += n;
+                        }
                     }
                     while tls.wants_write() {
                         tls.write_tls(&mut self.out_buf)
@@ -564,54 +776,51 @@ mod uring_engine {
             }
         }
 
-        /// Process `n` freshly received bytes from `in_buf`.
+        /// Process `n` freshly received bytes from `in_buf` (recv landed in
+        /// scratch): parse the response head, then feed the body to its
+        /// destination — copied into the read slot, or drained for an upload.
         ///
-        /// Only called when the recv landed in `in_buf` (TLS ciphertext, or — for
-        /// plaintext — the header phase before the body is recv'd straight into
-        /// `dest`). For TLS this decrypts the body **directly into the cache slot**:
-        /// the single copy TLS requires, since rustls AEAD-decrypts into its own
-        /// buffer and `read` moves the plaintext out (no decrypt-into-user-buffer
-        /// API exists).
+        /// A read's plaintext body never reaches here (`pump` recvs it straight
+        /// into the slot); a read's TLS body is decrypted straight into the slot
+        /// below (the single copy TLS requires). Header bytes and an upload's
+        /// response always go through here.
         fn consume_received(&mut self, n: usize) -> Result<()> {
             let Conn {
                 transport,
                 in_buf,
-                head_acc,
-                body,
-                dest,
-                req_len,
-                body_written,
+                op,
+                resp_acc,
+                resp_body,
+                resp_written,
+                complete,
+                poolable,
                 ..
             } = self;
-            let dest = *dest;
-            let req_len = *req_len;
 
             match transport {
-                // Reached only in the header phase; once the head parses, `pump`
-                // recvs the body straight into `dest`, so plaintext bodies never
-                // pass through here.
-                Transport::Plain => {
-                    parse_head(head_acc, body, dest, req_len, body_written, &in_buf[..n])
-                }
+                Transport::Plain => feed_response(
+                    op,
+                    resp_acc,
+                    resp_body,
+                    resp_written,
+                    complete,
+                    poolable,
+                    &in_buf[..n],
+                ),
                 Transport::Tls(tls) => {
-                    // `read_tls` only accepts as much ciphertext as fits rustls's
-                    // bounded buffer, so one call may not consume all of `in_buf`.
-                    // Loop: feed, process, drain (draining frees buffer space) until
-                    // the chunk is consumed — dropping the remainder would silently
-                    // lose body bytes and hang the read.
+                    // `read_tls` accepts only as much ciphertext as fits rustls's
+                    // bounded buffer, so loop: feed, process, drain until consumed.
                     let mut cursor = &in_buf[..n];
-                    let mut header_scratch = [0u8; 8192];
+                    let mut scratch = [0u8; 8192];
                     while !cursor.is_empty() {
                         let fed = tls.read_tls(&mut cursor)?;
                         tls.process_new_packets().map_err(Error::Tls)?;
                         let mut drained = 0usize;
                         loop {
-                            if let Some(decoder) = body.as_mut() {
-                                // Body phase: decrypt straight into the cache slot.
-                                // A range body is identity-framed (the `proto`
-                                // policy enforces `Content-Length`), so the decoder
-                                // hands back a Direct plan whose `max` is the bytes
-                                // still expected — exactly the room to decrypt into.
+                            // Once the head is in, a read decrypts its body straight
+                            // into the slot (one copy); header bytes and an upload's
+                            // drained body go through the scratch + `feed_response`.
+                            if let (Some(decoder), Some(slot)) = (resp_body.as_mut(), op.slot) {
                                 let remaining = match decoder.read_plan() {
                                     http1::ReadPlan::Direct { max } => max as usize,
                                     http1::ReadPlan::Done => 0,
@@ -619,12 +828,11 @@ mod uring_engine {
                                 if remaining == 0 {
                                     break;
                                 }
-                                // SAFETY: writing this block's currently-invalid,
-                                // pinned slot region; content_length <= req_len ==
-                                // block length (validated when parsing the head).
+                                // SAFETY: pinned slot region; content_length <=
+                                // slot.cap (validated when the head parsed).
                                 let dst = unsafe {
                                     std::slice::from_raw_parts_mut(
-                                        dest.add(*body_written),
+                                        slot.ptr.add(*resp_written),
                                         remaining,
                                     )
                                 };
@@ -632,25 +840,29 @@ mod uring_engine {
                                     Ok(0) => break,
                                     Ok(m) => {
                                         decoder.consumed(m as u64)?;
-                                        *body_written += m;
+                                        *resp_written += m;
                                         drained += m;
+                                        if decoder.is_complete() {
+                                            *complete = true;
+                                            *poolable = true;
+                                        }
                                     }
                                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                                     Err(e) => return Err(Error::Io(e)),
                                 }
                             } else {
-                                // Header phase: small scratch until the head parses.
-                                match tls.reader().read(&mut header_scratch) {
+                                match tls.reader().read(&mut scratch) {
                                     Ok(0) => break,
                                     Ok(m) => {
                                         drained += m;
-                                        parse_head(
-                                            head_acc,
-                                            body,
-                                            dest,
-                                            req_len,
-                                            body_written,
-                                            &header_scratch[..m],
+                                        feed_response(
+                                            op,
+                                            resp_acc,
+                                            resp_body,
+                                            resp_written,
+                                            complete,
+                                            poolable,
+                                            &scratch[..m],
                                         )?;
                                     }
                                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -658,9 +870,6 @@ mod uring_engine {
                                 }
                             }
                         }
-                        // No ciphertext accepted and no plaintext produced: rustls
-                        // can't make progress on the rest (e.g. a partial trailing
-                        // record). Stop; the next recv delivers it.
                         if fed == 0 && drained == 0 {
                             break;
                         }
@@ -669,46 +878,97 @@ mod uring_engine {
                 }
             }
         }
-
-        fn request_complete(&self) -> bool {
-            self.body.as_ref().is_some_and(|b| b.is_complete())
-        }
     }
 
-    /// Feed a header-phase (plaintext) chunk: accumulate into `head_acc` until the
-    /// response head parses, then install the body decoder and copy any body bytes
-    /// that arrived in the same packet as the head into `dest`. (Subsequent body
-    /// bytes are recv'd/decrypted straight into `dest`, zero-copy.)
-    fn parse_head(
-        head_acc: &mut Vec<u8>,
-        body: &mut Option<http1::BodyDecoder>,
-        dest: *mut u8,
-        req_len: usize,
-        body_written: &mut usize,
+    /// Feed a chunk of received response bytes: accumulate and parse the head, then
+    /// decode the body to its destination via [`write_body`] — copied into the read
+    /// slot, or drained for an upload. A status outside `op.status_range` is a
+    /// terminal error carrying the captured head + leading body.
+    ///
+    /// Once the head is in, a plaintext read's body is recv'd straight into the slot
+    /// by `pump` and a TLS read's is decrypted straight into it by `consume_received`
+    /// — so for a read this only sees header bytes. An upload's whole response comes
+    /// through here (and is drained).
+    fn feed_response(
+        op: &PreparedOp,
+        resp_acc: &mut Vec<u8>,
+        resp_body: &mut Option<http1::BodyDecoder>,
+        resp_written: &mut usize,
+        complete: &mut bool,
+        poolable: &mut bool,
         chunk: &[u8],
     ) -> Result<()> {
-        head_acc.extend_from_slice(chunk);
-        if let proto::HeadParse::Complete(h) = proto::parse_response_head(head_acc, req_len)? {
-            let mut decoder = http1::BodyDecoder::new(h.content_length);
-            // The body bytes that arrived alongside the head — the one copy (out of
-            // the shared recv scratch into the slot) the identity path needs; the
-            // rest of the body never passes through scratch.
-            let leftover = &head_acc[h.head_len..];
-            decoder.decode(leftover, |bytes| {
-                // SAFETY: as in consume_received — pinned, currently-invalid slot
-                // region; total body (content_length) <= req_len == block length.
+        // Body phase.
+        if let Some(decoder) = resp_body.as_mut() {
+            write_body(op, decoder, resp_written, chunk);
+            if decoder.is_complete() {
+                *complete = true;
+                *poolable = true;
+            }
+            return Ok(());
+        }
+
+        // Head phase. `parse_response` checks the status range and (for a read's
+        // fixed slot) that the body fits, so a rejected status surfaces here with
+        // the server's explanation.
+        resp_acc.extend_from_slice(chunk);
+        let (head_len, content_length) = match proto::parse_response(
+            resp_acc,
+            op.status_range,
+            op.slot.map(|s| s.cap as u64),
+        )? {
+            proto::RespParse::Incomplete => return Ok(()),
+            proto::RespParse::Ready {
+                head_len,
+                content_length,
+            } => (head_len, content_length),
+        };
+        let content_length = match content_length {
+            Some(len) => len,
+            // No Content-Length on an accepted response: only an upload reaches here
+            // (a read required one via `max_body`). The write is done, but the
+            // connection can't be drained, so it isn't pooled.
+            None => {
+                *complete = true;
+                *poolable = false;
+                return Ok(());
+            }
+        };
+        let mut decoder = http1::BodyDecoder::new(content_length);
+        // Body bytes that arrived alongside the head.
+        write_body(op, &mut decoder, resp_written, &resp_acc[head_len..]);
+        if decoder.is_complete() {
+            *complete = true;
+            *poolable = true;
+        }
+        *resp_body = Some(decoder);
+        Ok(())
+    }
+
+    /// Write decoded response-body bytes to their destination: copy into the read
+    /// slot (advancing `resp_written`), or discard for an upload. The range policy
+    /// guarantees a read's body fits its slot, so no truncation.
+    fn write_body(
+        op: &PreparedOp,
+        decoder: &mut http1::BodyDecoder,
+        resp_written: &mut usize,
+        chunk: &[u8],
+    ) {
+        match op.slot {
+            Some(slot) => decoder.decode(chunk, |bytes| {
+                // SAFETY: pinned slot region; total body <= slot.cap (validated when
+                // the head parsed), so writes stay within the slot.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr(),
-                        dest.add(*body_written),
+                        slot.ptr.add(*resp_written),
                         bytes.len(),
                     );
                 }
-                *body_written += bytes.len();
-            });
-            *body = Some(decoder);
-        }
-        Ok(())
+                *resp_written += bytes.len();
+            }),
+            None => decoder.decode(chunk, |_| {}),
+        };
     }
 
     /// Ring-less HTTP state machine. Submits onto a borrowed [`IoUring`] (the
@@ -719,9 +979,10 @@ mod uring_engine {
         /// is the SQE `user_data`.
         conns: Vec<Option<Conn>>,
         free_slots: Vec<usize>,
-        /// host_key -> idle connection slab indices.
+        /// host_key -> idle connection slab indices. Reads and uploads to the same
+        /// host share this pool, so a PUT can reuse a connection a GET left warm.
         pool: HashMap<String, Vec<usize>>,
-        /// Requests in flight (not counting idle pooled connections).
+        /// Requests in flight (reads and uploads; not counting idle pooled ones).
         active: usize,
         /// Ids whose body fully landed during the last completion routing pass.
         completed: Vec<Identifier>,
@@ -763,16 +1024,33 @@ mod uring_engine {
             id: Identifier,
             read: RemoteRead,
         ) -> Result<()> {
-            let key = host_key(&read.remote);
+            self.begin(ring, id, PreparedOp::for_read(&read))
+        }
+
+        /// Begin an upload, the write-side twin of [`start`](Self::start). Shares
+        /// the same pool, so it can reuse a connection a read left warm.
+        pub fn start_upload(
+            &mut self,
+            ring: &mut IoUring,
+            id: Identifier,
+            write: RemoteWrite,
+        ) -> Result<()> {
+            self.begin(ring, id, PreparedOp::for_upload(&write))
+        }
+
+        /// Bind a prepared request to a pooled or fresh connection and submit its
+        /// first SQE. Generic over read/upload — the difference is `op`'s data.
+        fn begin(&mut self, ring: &mut IoUring, id: Identifier, op: PreparedOp) -> Result<()> {
+            let key = op.host_key.clone();
             self.active += 1;
 
             if let Some(idx) = self.pool.get_mut(&key).and_then(|v| v.pop()) {
                 // Reuse a pooled keep-alive connection: bind and pump straight to
                 // sending (handshake already done).
-                bind_request(self.conns[idx].as_mut().unwrap(), id, &read);
+                bind_request(self.conns[idx].as_mut().unwrap(), id, op);
                 self.pump(ring, idx)
             } else {
-                let conn = self.new_conn(key, &read, id)?;
+                let conn = self.new_conn(op, id)?;
                 let idx = self.alloc_slot(conn);
                 self.start_connect(ring, idx)
             }
@@ -805,9 +1083,18 @@ mod uring_engine {
             if finished {
                 let conn = self.conns[idx].as_mut().unwrap();
                 let id = conn.id;
-                let key = conn.host_key.clone();
-                conn.clear_request();
-                self.pool.entry(key).or_default().push(idx);
+                if conn.poolable {
+                    // Clean (a read, or an upload with a fully-drained response):
+                    // return it to the pool for a later read or upload to this host.
+                    let key = conn.op.host_key.clone();
+                    conn.clear_request();
+                    self.pool.entry(key).or_default().push(idx);
+                } else {
+                    // An upload whose response body length was unknown: the write
+                    // succeeded, but the connection can't be safely reused. Drop it.
+                    self.conns[idx] = None;
+                    self.free_slots.push(idx);
+                }
                 self.active -= 1;
                 self.completed.push(id);
                 return Ok(());
@@ -817,39 +1104,53 @@ mod uring_engine {
         }
 
         /// Fold `size` freshly transferred bytes into the connection's request
-        /// state, returning whether the response body is now complete. Errors
-        /// (an EOF mid-body, a parse failure) are surfaced to [`on_cqe`](Self::on_cqe), which
-        /// turns them into a retry or a recorded failure.
+        /// state, returning whether the request is now complete. Errors (an EOF
+        /// mid-body, a parse failure) are surfaced to [`on_cqe`](Self::on_cqe),
+        /// which turns them into a retry or a recorded failure.
         fn advance(&mut self, idx: usize, size: usize) -> Result<bool> {
             let conn = self.conns[idx].as_mut().unwrap();
-            Ok(match conn.state {
-                State::Connecting => false, // connected; pump starts the exchange
+            match conn.state {
+                State::Connecting => Ok(false), // connected; pump starts the exchange
                 State::Sending => {
                     conn.out_pos += size;
-                    false
+                    Ok(false)
                 }
                 State::Receiving => {
                     if size == 0 {
+                        // An upload (no slot) whose accepted head already parsed is
+                        // durable — a truncated/absent response body just means we
+                        // can't reuse the connection. A read (has a slot), or a
+                        // head-not-yet-in, closing mid-response is a transport error.
+                        if conn.op.slot.is_none() && (conn.resp_body.is_some() || conn.complete) {
+                            conn.complete = true;
+                            conn.poolable = false;
+                            return Ok(true);
+                        }
                         return Err(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "connection closed mid-response",
                         )));
                     }
+                    // A read's plaintext body recv'd straight into the slot advances
+                    // its decoder here; every other recv (TLS, headers, an upload's
+                    // response) is parsed by `consume_received`.
                     if conn.recv_in_dest {
-                        // Plaintext body recv'd straight into the cache slot
-                        // (zero-copy) — nothing to copy or parse, just advance
-                        // the decoder and the write cursor.
-                        conn.body
+                        conn.resp_written += size;
+                        let decoder = conn
+                            .resp_body
                             .as_mut()
-                            .expect("body decoder set before a Direct recv")
-                            .consumed(size as u64)?;
-                        conn.body_written += size;
+                            .expect("body decoder set before a Direct recv");
+                        decoder.consumed(size as u64)?;
+                        if decoder.is_complete() {
+                            conn.complete = true;
+                            conn.poolable = true;
+                        }
                     } else {
                         conn.consume_received(size)?;
                     }
-                    conn.request_complete()
+                    Ok(conn.complete)
                 }
-            })
+            }
         }
 
         /// Handle a dead connection for the request at slot `idx`: tear it down
@@ -858,18 +1159,17 @@ mod uring_engine {
         /// retry budget is spent, record the failure for the requester to surface.
         fn retry_or_fail(&mut self, ring: &mut IoUring, idx: usize, err: Error) -> Result<()> {
             // Take the dead connection out of the slab; dropping it closes the
-            // socket. It was in-flight (popped from the pool at `start`), so it
+            // socket. It was in-flight (popped from the pool at `begin`), so it
             // leaves no stale pool entry behind.
             let dead = self.conns[idx].take().expect("cqe for a live connection");
             self.free_slots.push(idx);
             let id = dead.id;
             let retries = dead.retries;
-            let key = dead.host_key.clone();
-            let read = dead.read.clone();
+            let op = dead.op.clone();
             drop(dead);
 
             if is_retryable(&err) && retries < MAX_HTTP_RETRIES {
-                match self.new_conn(key, &read, id) {
+                match self.new_conn(op, id) {
                     Ok(mut fresh) => {
                         fresh.retries = retries + 1;
                         let new_idx = self.alloc_slot(fresh);
@@ -889,9 +1189,8 @@ mod uring_engine {
             Ok(())
         }
 
-        fn new_conn(&self, key: String, read: &RemoteRead, id: Identifier) -> Result<Conn> {
-            let addr = read.remote.addr();
-            let domain = match addr {
+        fn new_conn(&self, op: PreparedOp, id: Identifier) -> Result<Conn> {
+            let domain = match op.addr {
                 SocketAddr::V4(_) => libc::AF_INET,
                 SocketAddr::V6(_) => libc::AF_INET6,
             };
@@ -900,11 +1199,10 @@ mod uring_engine {
                 return Err(Error::Io(std::io::Error::last_os_error()));
             }
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-            let (sockaddr, sockaddr_len) = to_sockaddr(addr);
+            let (sockaddr, sockaddr_len) = to_sockaddr(op.addr);
 
-            let transport = if read.remote.is_https() {
-                let server_name =
-                    rustls::pki_types::ServerName::try_from(read.remote.host().to_string())?;
+            let transport = if op.is_https {
+                let server_name = rustls::pki_types::ServerName::try_from(op.server_name.clone())?;
                 Transport::Tls(Box::new(ClientConnection::new(
                     self.client_config.clone(),
                     server_name,
@@ -913,35 +1211,26 @@ mod uring_engine {
                 Transport::Plain
             };
 
-            let request_bytes = proto::build_range_get(
-                read.remote.host_header(),
-                read.remote.request_target(),
-                read.offset,
-                read.len,
-                read.remote.auth_header().as_deref(),
-            );
-
             Ok(Conn {
                 fd,
                 transport,
-                host_key: key,
                 sockaddr,
                 sockaddr_len,
                 id,
-                dest: read.dest,
-                req_len: read.len,
-                request_bytes,
-                request_queued: false,
-                read: read.clone(),
+                op,
                 retries: 0,
+                head_queued: false,
+                body_sent: 0,
+                resp_acc: Vec::new(),
+                resp_body: None,
+                resp_written: 0,
+                recv_in_dest: false,
+                complete: false,
+                poolable: false,
                 out_buf: Vec::new(),
                 out_pos: 0,
                 // Allocated once; reused (never re-zeroed) for every recv.
                 in_buf: vec![0u8; RECV_CHUNK],
-                head_acc: Vec::new(),
-                body: None,
-                body_written: 0,
-                recv_in_dest: false,
                 state: State::Connecting,
             })
         }
@@ -983,23 +1272,24 @@ mod uring_engine {
                 } else {
                     conn.state = State::Receiving;
                     let fd = conn.fd.as_raw_fd();
-                    // Plaintext body phase: recv straight into the cache slot
-                    // (zero-copy). Otherwise recv into the scratch `in_buf` — TLS
-                    // ciphertext, or the response headers (for either scheme).
-                    let plain_body =
-                        matches!(conn.transport, Transport::Plain) && conn.body.is_some();
-                    if plain_body {
+                    // A read's plaintext body phase recvs straight into the cache
+                    // slot (zero-copy). Everything else (TLS ciphertext, response
+                    // headers, an upload's response) recvs into the scratch `in_buf`.
+                    let plain_read_body = matches!(conn.transport, Transport::Plain)
+                        && conn.op.slot.is_some()
+                        && conn.resp_body.is_some();
+                    if plain_read_body {
+                        let slot = conn.op.slot.expect("plain_read_body implies a slot");
                         // Identity body: the decoder's Direct plan gives the bytes
-                        // still expected. `pump` only runs while the request is
-                        // unfinished, so this is always > 0 here.
-                        let remaining = match conn.body.as_ref().unwrap().read_plan() {
+                        // still expected. `pump` only runs while unfinished, so > 0.
+                        let remaining = match conn.resp_body.as_ref().unwrap().read_plan() {
                             http1::ReadPlan::Direct { max } => max as usize,
                             http1::ReadPlan::Done => 0,
                         };
                         conn.recv_in_dest = true;
                         // SAFETY: pinned, currently-invalid slot region; remaining
-                        // bytes are within the block (content_length <= req_len).
-                        let a = unsafe { conn.dest.add(conn.body_written) } as usize;
+                        // bytes are within the slot (content_length <= slot.cap).
+                        let a = unsafe { slot.ptr.add(conn.resp_written) } as usize;
                         (false, a, remaining, fd)
                     } else {
                         conn.recv_in_dest = false;
@@ -1035,30 +1325,23 @@ mod uring_engine {
         Ok(())
     }
 
-    /// Bind a new request onto an already-connected (pooled) connection.
-    fn bind_request(conn: &mut Conn, id: Identifier, read: &RemoteRead) {
+    /// Bind a new request onto an already-connected (pooled) connection, resetting
+    /// all per-request state for a fresh exchange on the reused socket.
+    fn bind_request(conn: &mut Conn, id: Identifier, op: PreparedOp) {
         conn.id = id;
-        conn.dest = read.dest;
-        conn.req_len = read.len;
-        conn.request_bytes = proto::build_range_get(
-            read.remote.host_header(),
-            read.remote.request_target(),
-            read.offset,
-            read.len,
-            read.remote.auth_header().as_deref(),
-        );
-        // Fresh request on a healthy pooled connection: reset the retry budget
-        // and keep the read so a later transport failure can re-issue it.
-        conn.read = read.clone();
+        conn.op = op;
         conn.retries = 0;
-        conn.request_queued = false;
+        conn.head_queued = false;
+        conn.body_sent = 0;
         conn.out_buf.clear();
         conn.out_pos = 0;
         // `in_buf` is reused as-is (not cleared); recv overwrites what it needs.
-        conn.head_acc.clear();
-        conn.body = None;
-        conn.body_written = 0;
+        conn.resp_acc.clear();
+        conn.resp_body = None;
+        conn.resp_written = 0;
         conn.recv_in_dest = false;
+        conn.complete = false;
+        conn.poolable = false;
         conn.state = State::Sending;
     }
 

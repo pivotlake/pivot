@@ -3,17 +3,18 @@
 //! prunes its own view without affecting anyone else.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::manifest::PartitionEqFilter;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
-use crate::parquet_writing::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, encode_spec};
-use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, UInt64Array};
-use arrow_schema::{DataType, Field, Schema};
-use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec, Sender};
+use crate::parquet_writing::{EncodedFile, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE, encode_spec};
+use arrow_array::{Array, ArrayRef, RecordBatch, Scalar};
+use dispatch::{DataFlowDispatcher, OperatorSpec, Projection, RecordBatchOperatorSpec, stealable};
+
+use super::insert_sink::UploadSinkFactory;
 use planner::catalog::{
     CatalogTransaction, Column, DynamicScanPredicate, Error as CatalogError,
     Result as CatalogResult, Table,
@@ -170,12 +171,12 @@ impl Table for TableBinding {
 
     /// Build the transactional Parquet write pipeline for this table.
     ///
-    /// Dispatch workers conform and encode batches, then enqueue completed files
-    /// directly through worker-local transaction writer producers. Submission
-    /// does not acquire the transaction lifecycle mutex. A dedicated thread
-    /// performs object-store writes and retains their paths until commit adds
-    /// them to Delta or rollback deletes them. The pipeline's only output is the
-    /// inserted row count used for PostgreSQL's command-completion tag.
+    /// Dispatch workers conform and encode batches, then the terminal upload sink
+    /// writes each finished file to the object store over the worker's io_uring
+    /// (the same ring that fetches Parquet) and records its committed entry in the
+    /// transaction's collector. Commit publishes those entries as one Delta version
+    /// per table; rollback deletes the uploaded files. The pipeline's only output
+    /// is the inserted row count used for PostgreSQL's command-completion tag.
     fn insert(
         &self,
         source: RecordBatchOperatorSpec,
@@ -203,26 +204,21 @@ impl Table for TableBinding {
             ROW_GROUP_ROWS,
             ROW_GROUPS_PER_FILE,
         );
-        let writer = transaction.insert_writer()?;
-        let table_name = self.name.clone();
-        let count_emitted = Arc::new(AtomicBool::new(false));
-        let staged = encoded.sink_each(
-            move |encoded| {
-                writer.submit(table_name.clone(), encoded);
-                Ok(())
-            },
-            move |sender: &mut dyn Sender<RecordBatch>| {
-                if count_emitted.swap(true, Ordering::Relaxed) {
-                    return Ok(());
-                }
-                let count = UInt64Array::from(vec![rows_written.load(Ordering::Relaxed)]);
-                let schema = Schema::new(vec![Field::new("count", DataType::UInt64, false)]);
-                sender.send(RecordBatch::try_new(
-                    Arc::new(schema),
-                    vec![Arc::new(count)],
-                )?)?;
-                Ok(())
-            },
+        let collector = transaction.insert_collector();
+
+        // Chain the upload sink: each worker encodes files, uploads them over its
+        // io_uring, and records committed entries. Its finish emits the row count.
+        let (dispatcher, heads) = encoded.into_parts();
+        let workers = heads.len();
+        let staged = OperatorSpec::new(dispatcher, heads).chain(
+            stealable::<EncodedFile>(workers).into_iter().collect(),
+            UploadSinkFactory::factories(
+                workers,
+                table,
+                self.name.clone(),
+                collector,
+                rows_written,
+            ),
         );
         Ok(RecordBatchOperatorSpec::from_spec(staged))
     }

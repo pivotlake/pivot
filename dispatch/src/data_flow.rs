@@ -21,7 +21,7 @@
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
-use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
+use crate::io::{DataFlowRequest, FsRequest, HttpRequest, UploadRequest};
 use crate::operations::{AbandonedOperator, FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::worker::worker_waker;
@@ -412,26 +412,36 @@ impl DataFlow {
         });
     }
 
-    /// Notify the operator that requested it that one of its filesystem reads
-    /// has landed (already committed into the cache slot by the requester).
-    pub fn process_fs(&mut self, node_id: Identifier, request: FsRequest) {
+    /// Deliver a completed IO op to the operator at `node_id` via `deliver`, which
+    /// calls the matching `process_*_response`. Shared by the read and upload paths.
+    fn process<R>(
+        &mut self,
+        node_id: Identifier,
+        request: R,
+        deliver: impl FnOnce(&mut Box<dyn Operator>, R) -> crate::operations::Result<()>,
+    ) {
         self.try_run(|d| {
-            d.graph.operators[node_id]
-                .operator
-                .process_fs_response(request)?;
+            deliver(&mut d.graph.operators[node_id].operator, request)?;
             Ok(())
         });
     }
 
-    /// Notify the operator that requested it that one of its HTTP reads has
+    /// Notify the operator that requested it that one of its filesystem reads has
     /// landed (already committed into the cache slot by the requester).
+    pub fn process_fs(&mut self, node_id: Identifier, request: FsRequest) {
+        self.process(node_id, request, |op, r| op.process_fs_response(r));
+    }
+
+    /// Notify the operator that requested it that one of its HTTP reads has landed
+    /// (already committed into the cache slot by the requester).
     pub fn process_http(&mut self, node_id: Identifier, request: HttpRequest) {
-        self.try_run(|d| {
-            d.graph.operators[node_id]
-                .operator
-                .process_http_response(request)?;
-            Ok(())
-        });
+        self.process(node_id, request, |op, r| op.process_http_response(r));
+    }
+
+    /// Notify the operator that requested it that one of its uploads has landed
+    /// (its bytes are durable in the object store / on disk).
+    pub fn process_upload(&mut self, node_id: Identifier, request: UploadRequest) {
+        self.process(node_id, request, |op, r| op.process_upload_response(r));
     }
 
     /// Run one unit of CPU work, traversing leaf-to-root (downstream first for cache locality).
@@ -466,48 +476,46 @@ impl DataFlow {
         })
     }
 
-    /// Collect pending filesystem read requests from operators (leaf-to-root).
-    /// Returns the first batch found, or `None` if no operator needs disk IO.
-    pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
+    /// Collect the first non-empty batch of pending requests from operators
+    /// (leaf-to-root), each tagged with this dataflow + its operator, or `None` if
+    /// none need IO. `next` pulls one operator's requests (fs reads, HTTP reads, or
+    /// uploads). Shared by the three `get_next_*_request` accessors.
+    fn get_next_requests<R>(
+        &mut self,
+        next: impl Fn(&mut Box<dyn Operator>) -> crate::operations::Result<Vec<R>>,
+    ) -> Option<Vec<DataFlowRequest<R>>> {
         self.try_run_or(None, |d| {
             d.graph
                 .traverse_backwards(|op| {
-                    let requests = op.operator.next_fs_requests()?;
-                    if !requests.is_empty() {
+                    let requests = next(&mut op.operator)?;
+                    if requests.is_empty() {
+                        Ok(ControlFlow::Continue(()))
+                    } else {
                         Ok(ControlFlow::Break(
                             requests
                                 .into_iter()
                                 .map(|r| DataFlowRequest::new(d.id, op.id, r))
                                 .collect(),
                         ))
-                    } else {
-                        Ok(ControlFlow::Continue(()))
                     }
                 })
                 .map(|c| c.break_value())
         })
     }
 
-    /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
-    /// [`get_next_fs_request`](Self::get_next_fs_request).
+    /// Collect pending filesystem read requests from operators (leaf-to-root).
+    pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
+        self.get_next_requests(|op| op.next_fs_requests())
+    }
+
+    /// Collect pending HTTP read requests from operators (leaf-to-root).
     pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
-        self.try_run_or(None, |d| {
-            d.graph
-                .traverse_backwards(|op| {
-                    let requests = op.operator.next_http_requests()?;
-                    if !requests.is_empty() {
-                        Ok(ControlFlow::Break(
-                            requests
-                                .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
-                                .collect(),
-                        ))
-                    } else {
-                        Ok(ControlFlow::Continue(()))
-                    }
-                })
-                .map(|c| c.break_value())
-        })
+        self.get_next_requests(|op| op.next_http_requests())
+    }
+
+    /// Collect pending upload requests from operators (leaf-to-root).
+    pub fn get_next_upload_request(&mut self) -> Option<Vec<DataFlowRequest<UploadRequest>>> {
+        self.get_next_requests(|op| op.next_upload_requests())
     }
 }
 

@@ -6,7 +6,10 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, UploadMethod,
+    UploadTarget, object_key,
+};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -250,12 +253,36 @@ impl ObjectStore for S3Store {
             auth: None,
         })
     }
+
+    fn upload_target(&self, key: &ObjectPath) -> Result<UploadTarget> {
+        // A presigned PUT: auth rides in the query string, so the ring uploads
+        // with no signing and no per-request header — symmetric with `source`.
+        Ok(UploadTarget::Remote {
+            url: self.presign_put(key)?,
+            method: UploadMethod::Put,
+            auth: None,
+            content_type: None,
+        })
+    }
 }
 
 impl S3Store {
     /// A time-limited GET URL for `key`, signed in the query string so the
     /// io_uring HTTP reader can range-read it with no auth headers.
     fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {
+        self.presign("GET", key)
+    }
+
+    /// A time-limited PUT URL for `key`, signed in the query string so the
+    /// io_uring writer can upload the bytes with no auth headers or signing.
+    fn presign_put(&self, key: &ObjectPath) -> Result<url::Url> {
+        self.presign("PUT", key)
+    }
+
+    /// A time-limited `method` URL for `key`, signed in the query string. Only
+    /// `host` is signed and the payload is unsigned, so the ring can add the
+    /// header (`Range` for a GET) or body (a PUT) the signature doesn't cover.
+    fn presign(&self, method: &str, key: &ObjectPath) -> Result<url::Url> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
 
@@ -281,11 +308,9 @@ impl S3Store {
             .build()
             .map_err(|e| StoreError::Http(format!("sigv4 presign params: {e}")))?;
 
-        // A presigned GET signs only `host`; the payload is unsigned so the ring
-        // can add a `Range` header the signature doesn't cover.
         let host_header = [("host", self.host.as_str())];
         let signable = SignableRequest::new(
-            "GET",
+            method,
             &url,
             host_header.iter().copied(),
             SignableBody::UnsignedPayload,

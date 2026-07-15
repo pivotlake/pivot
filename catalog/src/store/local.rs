@@ -1,7 +1,7 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError};
+use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, UploadTarget};
 use std::path::PathBuf;
 
 /// The local-filesystem backend: keys are paths under `root`.
@@ -144,6 +144,10 @@ impl ObjectStore for LocalStore {
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
         Ok(DataFileSource::Local(self.path_for(key)))
+    }
+
+    fn upload_target(&self, key: &ObjectPath) -> Result<UploadTarget> {
+        Ok(UploadTarget::Local(self.path_for(key)))
     }
 }
 

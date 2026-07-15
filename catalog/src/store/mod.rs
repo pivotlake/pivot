@@ -112,6 +112,55 @@ impl Debug for DataFileSource {
     }
 }
 
+/// The HTTP method a remote store uses to upload an object over the ring: S3
+/// takes a `PUT` (to a presigned URL), the GCS JSON media API a `POST`. Carried
+/// on [`UploadTarget::Remote`] so the ring's request builder writes the right
+/// request line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadMethod {
+    Put,
+    Post,
+}
+
+/// How the io_uring writer should upload object `key`: a local filesystem path
+/// to write, or a remote URL to send the bytes to. The write-side mirror of
+/// [`DataFileSource`] — a local backend writes straight to a file over the ring,
+/// a remote one issues a single HTTP upload on the same ring. A remote target
+/// either carries its own auth in a presigned URL (S3, `auth: None`) or pairs a
+/// stable URL with an [`AuthHeader`] minting a fresh bearer token per request
+/// (GCS). Which variant a store yields is its own business, not the caller's.
+pub enum UploadTarget {
+    Local(PathBuf),
+    Remote {
+        url: url::Url,
+        method: UploadMethod,
+        auth: Option<AuthHeader>,
+        /// `Content-Type` to send with the body, when the backend needs one (GCS
+        /// wants `application/octet-stream`; S3's presigned PUT needs none).
+        content_type: Option<&'static str>,
+    },
+}
+
+impl Debug for UploadTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(path) => f.debug_tuple("Local").field(path).finish(),
+            Self::Remote {
+                url,
+                method,
+                auth,
+                content_type,
+            } => f
+                .debug_struct("Remote")
+                .field("url", url)
+                .field("method", method)
+                .field("auth", &auth.is_some())
+                .field("content_type", content_type)
+                .finish(),
+        }
+    }
+}
+
 impl DataFile {
     /// A data file on the local filesystem; its [`FileRef`] path is the
     /// filesystem path (these constructors feed the whole-directory readers,
@@ -186,6 +235,13 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// with a per-request bearer token. (Identity — the [`FileRef`] — is the
     /// caller's; this is only how to read the bytes.)
     fn source(&self, key: &ObjectPath) -> Result<DataFileSource>;
+
+    /// How the io_uring writer should upload object `key`: a local backend yields
+    /// a filesystem path, a remote one an upload URL (presigned, or paired with a
+    /// per-request bearer token) plus the HTTP method to use. The write-side
+    /// mirror of [`source`](Self::source) — the ring writes the bytes, this only
+    /// says where and how.
+    fn upload_target(&self, key: &ObjectPath) -> Result<UploadTarget>;
 
     /// A human-readable description of where this store is rooted - e.g.
     /// `file:///var/lib/pivot`, `s3://bucket/prefix`, or `gs://bucket/prefix`.

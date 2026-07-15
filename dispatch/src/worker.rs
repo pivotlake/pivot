@@ -25,7 +25,7 @@
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
-use crate::io::{Completion, DiskCache, IORequester};
+use crate::io::{Completion, DataFlowRequest, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use core_affinity::CoreId;
@@ -343,51 +343,81 @@ impl Worker {
         Ok(())
     }
 
-    /// Submit HTTP reads from dataflows onto the same ring until this worker has
-    /// `HTTP_INFLIGHT_TARGET` reads in flight or no more requests remain. Gated
-    /// on HTTP activity only (not disk) so the two queues fill independently.
-    ///
-    /// Remote objects sit behind ~tens-of-ms RTTs, so a deep read-ahead is what
-    /// hides the latency. Stopping at the *first* outstanding read serialises a
-    /// scan to one read at a time per worker — catastrophic over a table of many
-    /// small files, where the whole query becomes round-trip bound.
-    fn saturate_http(&mut self) -> Result<()> {
-        // Per-worker remote read-ahead ceiling, tunable via `PIVOT_HTTP_INFLIGHT`.
+    /// Per-worker in-flight ceiling for remote ops (reads and uploads alike),
+    /// tunable via `PIVOT_HTTP_INFLIGHT`. Remote objects sit behind ~tens-of-ms
+    /// RTTs, so a deep read-ahead is what hides the latency: stopping at the first
+    /// outstanding op serialises a scan to one round trip at a time per worker,
+    /// catastrophic over a table of many small files.
+    fn remote_inflight_target() -> usize {
         static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let http_inflight_target =
-            *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_HTTP_INFLIGHT", 100));
+        *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_HTTP_INFLIGHT", 100))
+    }
+
+    /// Submit remote ops of one kind from dataflows onto the ring until this worker
+    /// has `ceiling` of them in flight (`in_flight`) or none remain. `next` pulls
+    /// the next batch from a dataflow and `submit` issues one; a submit failure
+    /// (socket exhaustion, TLS setup, opening a local file) cancels just that
+    /// dataflow rather than propagating and tearing down the worker.
+    fn saturate_remote<R>(
+        &mut self,
+        ceiling: usize,
+        in_flight: fn(&IORequester) -> usize,
+        next: fn(&mut DataFlow) -> Option<Vec<DataFlowRequest<R>>>,
+        mut submit: impl FnMut(
+            &mut IORequester,
+            &mut DataFlow,
+            DataFlowRequest<R>,
+        ) -> std::result::Result<(), crate::io::IORequesterError>,
+    ) -> Result<()> {
         'flows: for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
                 continue;
             }
-            if self.io.http_in_flight() >= http_inflight_target {
+            if in_flight(&self.io) >= ceiling {
                 break;
             }
 
-            while let Some(mut requests) = flow.get_next_http_request() {
+            while let Some(mut requests) = next(flow) {
                 flow.stats().stamp_issued(&mut requests);
                 for r in requests {
-                    // Submitting a remote read can fail (socket exhaustion, TLS
-                    // setup). Fail just this dataflow rather than propagating, which
-                    // would panic the worker and take the whole server down. The
-                    // disk cache resolves how each read splits across tiers, so the
-                    // per-tier counts come from what it returns.
-                    match self.io.request_http(r) {
-                        Ok(split) => flow.stats().record_issued_remote(split),
-                        Err(e) => {
-                            flow.bail_and_cancel(e.into());
-                            continue 'flows;
-                        }
+                    if let Err(e) = submit(&mut self.io, flow, r) {
+                        flow.bail_and_cancel(e.into());
+                        continue 'flows;
                     }
                 }
-
-                if self.io.http_in_flight() >= http_inflight_target {
+                if in_flight(&self.io) >= ceiling {
                     break;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Submit HTTP range reads. The disk cache resolves how each read splits across
+    /// tiers, so the per-tier stats come from what `request_http` returns.
+    fn saturate_http(&mut self) -> Result<()> {
+        self.saturate_remote(
+            Self::remote_inflight_target(),
+            IORequester::http_in_flight,
+            DataFlow::get_next_http_request,
+            |io, flow, r| {
+                let split = io.request_http(r)?;
+                flow.stats().record_issued_remote(split);
+                Ok(())
+            },
+        )
+    }
+
+    /// Submit uploads (local file writes and remote PUT/POST), sharing the read
+    /// ceiling and the same submit loop.
+    fn saturate_uploads(&mut self) -> Result<()> {
+        self.saturate_remote(
+            Self::remote_inflight_target(),
+            IORequester::uploads_in_flight,
+            DataFlow::get_next_upload_request,
+            |io, _flow, r| io.request_upload(r),
+        )
     }
 
     /// Run one unit of CPU work from the first dataflow that has work ready.
@@ -426,6 +456,11 @@ impl Worker {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_remote_time(time);
                         data_flow.process_http(r.operator_idx, r.request);
+                    }
+                }
+                Ok(Completion::Upload(r)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.process_upload(r.operator_idx, r.request);
                     }
                 }
                 Err(failed) => {
@@ -587,6 +622,7 @@ impl Worker {
             self.process_io_completions()?;
             self.saturate_io()?;
             self.saturate_http()?;
+            self.saturate_uploads()?;
 
             self.step_run_ready_cpu_work();
 

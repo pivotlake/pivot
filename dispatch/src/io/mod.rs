@@ -30,6 +30,7 @@ use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
@@ -125,20 +126,9 @@ pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
 pub struct RemoteFile {
     /// Process-unique id; the only thing `Hash`/`Eq` look at.
     id: u32,
-    /// `IP:port`, resolved once at construction (the port lives here too).
-    addr: SocketAddr,
-    /// Bare hostname for TLS SNI — `addr` only carries the IP, and SNI must not
-    /// include a port.
-    host: String,
-    /// Value for the `Host:` request header: the bare host, plus the port when
-    /// the URL carries a non-default one. A presigned URL's SigV4 signature
-    /// covers this exact `host` header, so an S3-compatible endpoint on a custom
-    /// port (e.g. MinIO at `localhost:9000`) rejects the request as a signature
-    /// mismatch if the port is dropped.
-    host_header: String,
-    /// Origin-form request target (path + query) for the HTTP request line.
-    request_target: String,
-    is_https: bool,
+    /// The parsed transport endpoint (address, SNI host, `Host:` header, request
+    /// target, scheme); its accessors are reached through [`Deref`].
+    endpoint: ParsedEndpoint,
     /// Mints the `Authorization` header for each request (a bearer token whose
     /// freshness is the store's concern), or `None` for a self-authenticating
     /// URL. Read per request, never on the URL's `Hash`/`Eq` path.
@@ -157,6 +147,15 @@ pub struct RemoteFile {
     size: u64,
 }
 
+/// Transport accessors (`host`, `host_header`, `request_target`, `is_https`,
+/// `addr`, `port`) come from the shared [`ParsedEndpoint`], not duplicated here.
+impl Deref for RemoteFile {
+    type Target = ParsedEndpoint;
+    fn deref(&self) -> &ParsedEndpoint {
+        &self.endpoint
+    }
+}
+
 impl RemoteFile {
     /// Parse `url`, resolve its host to a [`SocketAddr`], and intern it. The DNS
     /// lookup happens here (once) so the per-request hot path never blocks on
@@ -165,6 +164,108 @@ impl RemoteFile {
     /// length (from the store listing), carried so the disk cache can size its
     /// bitmap exactly.
     pub fn open(url: Url, auth: Option<AuthHeader>, size: u64) -> std::io::Result<Self> {
+        let endpoint = ParsedEndpoint::parse(&url)?;
+
+        // Key the disk cache by the authority (host plus any non-default port) and
+        // path, so two endpoints sharing a host but on different ports never
+        // collide onto one cache file.
+        let cache_identity = format!("{}\0{}", endpoint.host_header, endpoint.path);
+
+        Ok(Self {
+            id: NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed),
+            endpoint,
+            auth,
+            cache_identity,
+            size,
+        })
+    }
+
+    /// The `Authorization` header value for the next request, or `None` when the
+    /// URL is self-authenticating. Cheap and non-blocking — reads a cached token.
+    pub fn auth_header(&self) -> Option<Arc<str>> {
+        self.auth.as_ref().and_then(|f| f())
+    }
+
+    /// Total object size in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Stable identity (authority + path, no query) for keying the on-disk cache.
+    /// See [`cache_identity`](Self::cache_identity) field docs.
+    pub fn cache_identity(&self) -> &str {
+        &self.cache_identity
+    }
+
+    /// The origin URL, reconstructed for display (the parsed `Url` isn't kept).
+    /// The port is shown only when non-default.
+    fn display_url(&self) -> String {
+        let scheme = if self.is_https() { "https" } else { "http" };
+        let default_port = if self.is_https() { 443 } else { 80 };
+        let port = self.addr().port();
+        if port == default_port {
+            format!("{scheme}://{}{}", self.host(), self.request_target())
+        } else {
+            format!("{scheme}://{}:{port}{}", self.host(), self.request_target())
+        }
+    }
+}
+
+impl PartialEq for RemoteFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for RemoteFile {}
+
+impl Hash for RemoteFile {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+/// The transport-level fields parsed once from an HTTP(S) URL, shared by
+/// [`RemoteFile`] (reads) and [`RemoteUpload`] (writes): the resolved address,
+/// the SNI host, the `Host:` header value, the origin-form request target, and
+/// the scheme. The DNS lookup happens here so the per-request hot path never
+/// blocks on resolution.
+pub struct ParsedEndpoint {
+    addr: SocketAddr,
+    host: String,
+    host_header: String,
+    request_target: String,
+    is_https: bool,
+    /// Path component only (no query), for keying a cache by stable identity.
+    path: String,
+}
+
+impl ParsedEndpoint {
+    /// Bare hostname for TLS SNI — `addr` carries only the IP, and SNI must not
+    /// include a port.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+    /// The `Host:` request-header value (host plus a non-default port). Distinct
+    /// from [`host`](Self::host), which is the bare hostname for TLS SNI.
+    pub fn host_header(&self) -> &str {
+        &self.host_header
+    }
+    /// Origin-form request target (path + query) for the HTTP request line.
+    pub fn request_target(&self) -> &str {
+        &self.request_target
+    }
+    pub fn is_https(&self) -> bool {
+        self.is_https
+    }
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    fn parse(url: &Url) -> std::io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -194,9 +295,9 @@ impl RemoteFile {
                 )
             })?;
 
-        let path = url.path();
+        let path = url.path().to_string();
 
-        let mut request_target = path.to_string();
+        let mut request_target = path.clone();
         if let Some(query) = url.query() {
             request_target.push('?');
             request_target.push_str(query);
@@ -209,21 +310,75 @@ impl RemoteFile {
             None => host.clone(),
         };
 
-        // Key the disk cache by the authority (host plus any non-default port) and
-        // path, so two endpoints sharing a host but on different ports never
-        // collide onto one cache file.
-        let cache_identity = format!("{host_header}\0{path}");
-
         Ok(Self {
-            id: NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed),
             addr,
             host,
             host_header,
             request_target,
             is_https,
+            path,
+        })
+    }
+}
+
+/// The HTTP method a remote upload uses: S3 takes a `PUT` (to a presigned URL),
+/// the GCS JSON media API a `POST`. The write-side analogue of a read's fixed
+/// `GET`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadMethod {
+    Put,
+    Post,
+}
+
+impl UploadMethod {
+    /// The request-line token (`PUT`/`POST`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UploadMethod::Put => "PUT",
+            UploadMethod::Post => "POST",
+        }
+    }
+}
+
+/// A remote HTTP(S) object to upload to, resolved once from its URL. The
+/// write-side mirror of [`RemoteFile`]: it carries the same pre-parsed transport
+/// fields plus the method, per-request auth, and body `Content-Type` the upload
+/// needs. Unlike [`RemoteFile`] it is never a cache key, so it interns no id and
+/// records no size.
+pub struct RemoteUpload {
+    /// The parsed transport endpoint; its accessors are reached through [`Deref`].
+    endpoint: ParsedEndpoint,
+    method: UploadMethod,
+    /// Mints the `Authorization` header for each request (GCS bearer token), or
+    /// `None` for a self-authenticating presigned URL (S3).
+    auth: Option<AuthHeader>,
+    /// `Content-Type` to send with the body, when the backend needs one.
+    content_type: Option<&'static str>,
+}
+
+/// Transport accessors come from the shared [`ParsedEndpoint`], as for [`RemoteFile`].
+impl Deref for RemoteUpload {
+    type Target = ParsedEndpoint;
+    fn deref(&self) -> &ParsedEndpoint {
+        &self.endpoint
+    }
+}
+
+impl RemoteUpload {
+    /// Parse `url`, resolve its host, and record how to upload to it. `auth`
+    /// supplies a fresh `Authorization` header per request (or `None` for a
+    /// presigned URL); `content_type` is sent with the body when present.
+    pub fn open(
+        url: Url,
+        method: UploadMethod,
+        auth: Option<AuthHeader>,
+        content_type: Option<&'static str>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            endpoint: ParsedEndpoint::parse(&url)?,
+            method,
             auth,
-            cache_identity,
-            size,
+            content_type,
         })
     }
 
@@ -233,64 +388,41 @@ impl RemoteFile {
         self.auth.as_ref().and_then(|f| f())
     }
 
-    /// Total object size in bytes.
-    pub fn size(&self) -> u64 {
-        self.size
+    pub fn method(&self) -> UploadMethod {
+        self.method
     }
-
-    /// Stable identity (authority + path, no query) for keying the on-disk cache.
-    /// See [`cache_identity`](Self::cache_identity) field docs.
-    pub fn cache_identity(&self) -> &str {
-        &self.cache_identity
-    }
-
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    /// The `Host:` request-header value (host plus a non-default port). Distinct
-    /// from [`host`](Self::host), which is the bare hostname for TLS SNI.
-    pub fn host_header(&self) -> &str {
-        &self.host_header
-    }
-    pub fn port(&self) -> u16 {
-        self.addr.port()
-    }
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
-    }
-    pub fn request_target(&self) -> &str {
-        &self.request_target
-    }
-    pub fn is_https(&self) -> bool {
-        self.is_https
-    }
-
-    /// The origin URL, reconstructed for display (the parsed `Url` isn't kept).
-    /// The port is shown only when non-default.
-    fn display_url(&self) -> String {
-        let scheme = if self.is_https { "https" } else { "http" };
-        let default_port = if self.is_https { 443 } else { 80 };
-        let port = self.addr.port();
-        if port == default_port {
-            format!("{scheme}://{}{}", self.host, self.request_target)
-        } else {
-            format!("{scheme}://{}:{port}{}", self.host, self.request_target)
-        }
+    pub fn content_type(&self) -> Option<&'static str> {
+        self.content_type
     }
 }
 
-impl PartialEq for RemoteFile {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
+/// Where an upload's bytes are written: a local file (the `Arc<File>` keeps the
+/// descriptor alive for the whole flight, exactly as a read's `Arc<File>` does)
+/// or a remote HTTP(S) object reached with a single PUT/POST.
+#[derive(Clone)]
+pub enum UploadDest {
+    Local(Arc<File>),
+    Remote(Arc<RemoteUpload>),
 }
 
-impl Eq for RemoteFile {}
+/// A request to upload `bytes` to `dest`, submitted onto the same per-core
+/// io_uring as reads and completed back to the issuing operator. The write-side
+/// mirror of [`FsRequest`]/[`HttpRequest`]: a local dest becomes ring `write`
+/// ops, a remote one a single HTTP upload on the shared ring.
+///
+/// `bytes` is an `Arc<[u8]>` so it stays alive for the whole flight (through any
+/// transport retry) without a copy — the same role a read's pinned cache slot
+/// plays. `token` is opaque to the I/O layer: the issuing operator sets it and
+/// reads it back on completion to match the upload to the file it staged.
+pub struct UploadRequest {
+    pub dest: UploadDest,
+    pub bytes: Arc<[u8]>,
+    pub token: u64,
+}
 
-impl Hash for RemoteFile {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+impl ReadyBytesLen for UploadRequest {
+    fn ready_bytes_len(&self) -> u64 {
+        self.bytes.len() as u64
     }
 }
 
@@ -393,15 +525,18 @@ pub struct RemoteReadTime {
 pub enum Completion {
     Fs(DataFlowRequest<FsRequest>),
     Http(DataFlowRequest<HttpRequest>, RemoteReadTime),
+    /// A finished upload (local file write, or a remote PUT/POST). Its bytes are
+    /// durable; the issuing operator reads `token` back to commit the file.
+    Upload(DataFlowRequest<UploadRequest>),
 }
 
-/// A read that failed transport-side — an HTTP read that exhausted its retries
-/// (or hit a non-retryable error), or a disk read whose CQE came back negative.
-/// Carries the dataflow/operator that issued it so the worker can cancel just
-/// that dataflow, plus the error to report. Surfaced as the `Err` arm of a
-/// per-read result from [`IORequester::completions`], so one failed read never
-/// aborts the whole completion drain or tears down the worker. The block is
-/// left uncommitted.
+/// An I/O op that failed transport-side — an HTTP read/upload that exhausted its
+/// retries (or hit a non-retryable error), or a disk read/write whose CQE came
+/// back negative. Carries the dataflow/operator that issued it so the worker can
+/// cancel just that dataflow, plus the error to report. Surfaced as the `Err` arm
+/// of a per-op result from [`IORequester::completions`], so one failure never
+/// aborts the whole completion drain or tears down the worker. A failed read
+/// leaves its block uncommitted; a failed upload leaves no file committed.
 pub struct FailedRead {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,

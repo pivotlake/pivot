@@ -2,7 +2,10 @@ use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
-use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteReadSplit};
+use crate::io::{
+    Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteReadSplit, UploadDest,
+    UploadRequest,
+};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -42,12 +45,29 @@ pub struct IORequester {
     backend: IOBackend,
     /// In-flight local-file reads, keyed by their backend `user_data` id.
     pending_io_requests: HashMap<Identifier, DataFlowRequest<FsRequest>>,
-    /// Allocates backend disk-op ids - shared by fs reads here and the engine's
-    /// cache-file reads/write-backs, so a completion routes by which map holds it.
+    /// In-flight local-file uploads, keyed by the backend `user_data` id of the
+    /// write op currently draining that upload's buffer. Declared after
+    /// `backend`/`pending_io_requests` so it drops last: on non-Linux the
+    /// backend's `Drop` blocks until in-flight writes finish, and those writes
+    /// read the `Arc<[u8]>` these entries keep alive.
+    pending_local_uploads: HashMap<Identifier, LocalUpload>,
+    /// Allocates backend disk-op ids - shared by fs reads here, local upload
+    /// writes, and the engine's cache-file reads/write-backs, so a completion
+    /// routes by which map holds it.
     next_id: Identifier,
-    /// Remote reads, optionally served from the on-disk cache. Ring-less like the
-    /// underlying `HttpEngine`: it borrows `backend` (and `next_id`) to submit.
+    /// Remote reads, optionally served from the on-disk cache, and remote
+    /// uploads. Ring-less like the underlying `HttpEngine`: it borrows `backend`
+    /// (and `next_id`) to submit.
     http: CachedHttpEngine,
+}
+
+/// A local-file upload in flight: its request (owning the `Arc<File>` dest and
+/// the `Arc<[u8]>` source) and how many bytes have been written so far. A ring
+/// `write` may move fewer bytes than asked, so the requester re-submits the
+/// remainder until the whole buffer has landed.
+struct LocalUpload {
+    request: DataFlowRequest<UploadRequest>,
+    written: usize,
 }
 
 impl Default for IORequester {
@@ -62,6 +82,7 @@ impl IORequester {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             pending_io_requests: Default::default(),
+            pending_local_uploads: Default::default(),
             next_id: 0,
             http: CachedHttpEngine::with_default_config(disk_cache)
                 .expect("Unable to create http engine"),
@@ -77,6 +98,7 @@ impl IORequester {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             pending_io_requests: Default::default(),
+            pending_local_uploads: Default::default(),
             next_id: 0,
             http: CachedHttpEngine::new(http_config, disk_cache)
                 .expect("Unable to create http engine"),
@@ -118,18 +140,109 @@ impl IORequester {
             .request(&mut self.backend, &mut self.next_id, request)
     }
 
-    /// Returns `true` if any read (disk or HTTP) has not yet completed.
+    /// Submit an upload onto the same ring: a local dest becomes `write` ops
+    /// straight from the request's `Arc<[u8]>`, a remote one a single HTTP
+    /// upload driven by the [`CachedHttpEngine`]. Completes as a
+    /// [`Completion::Upload`] carrying the original request back.
+    pub fn request_upload(&mut self, request: DataFlowRequest<UploadRequest>) -> Result<()> {
+        match &request.request.dest {
+            UploadDest::Local(file) => {
+                let fd = file.as_raw_fd();
+                let bytes = request.request.bytes.clone();
+                let id = self.next_id;
+                self.next_id += 1;
+                self.backend
+                    .submit_write(fd, 0, bytes.as_ptr(), bytes.len(), id)?;
+                self.backend.submit()?;
+                self.pending_local_uploads.insert(
+                    id,
+                    LocalUpload {
+                        request,
+                        written: 0,
+                    },
+                );
+                Ok(())
+            }
+            UploadDest::Remote(_) => {
+                self.http.request_upload(&mut self.backend, request)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Fold a completed local-upload `write` into its upload: on failure surface
+    /// a [`FailedRead`]; once the whole buffer has landed yield a
+    /// [`Completion::Upload`]; on a short write re-submit the remainder.
+    fn advance_local_upload(
+        &mut self,
+        mut upload: LocalUpload,
+        result: i32,
+        out: &mut Vec<std::result::Result<Completion, FailedRead>>,
+    ) -> Result<()> {
+        if result < 0 {
+            out.push(Err(FailedRead {
+                data_flow_id: upload.request.data_flow_id,
+                operator_idx: upload.request.operator_idx,
+                error: std::io::Error::from_raw_os_error(-result).into(),
+            }));
+            return Ok(());
+        }
+
+        upload.written += result as usize;
+        let total = upload.request.request.bytes.len();
+        if upload.written >= total {
+            out.push(Ok(Completion::Upload(upload.request)));
+            return Ok(());
+        }
+        if result == 0 {
+            // A write that moved no bytes yet left the file short would spin
+            // forever if re-submitted; fail the upload instead.
+            out.push(Err(FailedRead {
+                data_flow_id: upload.request.data_flow_id,
+                operator_idx: upload.request.operator_idx,
+                error: std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "upload write made no progress",
+                )
+                .into(),
+            }));
+            return Ok(());
+        }
+
+        let UploadDest::Local(file) = &upload.request.request.dest else {
+            unreachable!("pending_local_uploads holds only local dests");
+        };
+        let fd = file.as_raw_fd();
+        let bytes = upload.request.request.bytes.clone();
+        let id = self.next_id;
+        self.next_id += 1;
+        self.backend.submit_write(
+            fd,
+            upload.written as u64,
+            bytes[upload.written..].as_ptr(),
+            total - upload.written,
+            id,
+        )?;
+        self.backend.submit()?;
+        self.pending_local_uploads.insert(id, upload);
+        Ok(())
+    }
+
+    /// Returns `true` if any read or upload (disk or HTTP) has not yet completed.
     pub fn has_pending(&self) -> bool {
         self.has_file_pending() || self.has_http_pending()
     }
 
-    /// Returns `true` if any disk read is in flight - operator reads here, plus
-    /// the engine's cache-file reads / write-backs (all on the shared backend).
+    /// Returns `true` if any disk op is in flight - operator reads here, local
+    /// upload writes, plus the engine's cache-file reads / write-backs (all on
+    /// the shared backend).
     pub fn has_file_pending(&self) -> bool {
-        !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
+        !self.pending_io_requests.is_empty()
+            || !self.pending_local_uploads.is_empty()
+            || self.http.has_disk_pending()
     }
 
-    /// Returns `true` if any HTTP read is in flight.
+    /// Returns `true` if any HTTP read or upload is in flight.
     pub fn has_http_pending(&self) -> bool {
         self.http.has_network_pending()
     }
@@ -138,6 +251,12 @@ impl IORequester {
     /// depth a worker uses to decide whether to submit more.
     pub fn http_in_flight(&self) -> usize {
         self.http.network_in_flight()
+    }
+
+    /// Number of uploads (local writes + remote HTTP) issued but not yet
+    /// completed — the in-flight depth a worker uses to pace upload submission.
+    pub fn uploads_in_flight(&self) -> usize {
+        self.pending_local_uploads.len() + self.http.uploads_in_flight()
     }
 
     /// Drain finished reads, one per-read result each. The outer `Result` is for
@@ -185,6 +304,8 @@ impl IORequester {
                     request.request.block.commit();
                     out.push(Ok(Completion::Fs(request)));
                 }
+            } else if let Some(upload) = self.pending_local_uploads.remove(&ud) {
+                self.advance_local_upload(upload, result, &mut out)?;
             } else {
                 // Not one of ours → a cache-file read or write-back.
                 self.http.complete_disk(ud, result, &mut out);
@@ -823,5 +944,250 @@ mod tests {
         settle(&mut after);
 
         assert_cached(&loc, 0, 4096);
+    }
+
+    use crate::io::{RemoteUpload, UploadDest, UploadMethod, UploadRequest};
+
+    /// Parse the `Content-Length` from a request head.
+    fn parse_content_length(head: &[u8]) -> usize {
+        let text = String::from_utf8_lossy(head);
+        text.lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|v| v.trim().parse().unwrap())
+            .expect("request has a Content-Length header")
+    }
+
+    /// Read one upload request's body from `tls`: its head, then exactly the
+    /// `Content-Length` body bytes.
+    fn read_upload_body<S: Read + Write>(tls: &mut S) -> Vec<u8> {
+        let head = read_head(tls);
+        let mut body = vec![0u8; parse_content_length(&head)];
+        tls.read_exact(&mut body).unwrap();
+        body
+    }
+
+    /// Spawn a loopback HTTPS server that accepts **one** TCP connection and serves
+    /// `count` uploads on it (keep-alive), recording each request body and
+    /// answering `200 OK`. A later upload that opened a fresh connection would
+    /// never be accepted, so the test would hang — which is what proves reuse.
+    fn spawn_upload_server(count: usize) -> (u16, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let bodies_for = bodies.clone();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            for _ in 0..count {
+                let body = read_upload_body(&mut tls);
+                bodies_for.lock().unwrap().push(body);
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+                tls.write_all(resp.as_bytes()).unwrap();
+                tls.flush().unwrap();
+            }
+        });
+
+        (port, bodies)
+    }
+
+    /// Submit `request` and drive the requester until it reports a terminal
+    /// result, returning it (asserting exactly one upload was in flight).
+    fn drive_upload(
+        requester: &mut IORequester,
+        request: UploadRequest,
+    ) -> std::result::Result<Completion, FailedRead> {
+        requester
+            .request_upload(DataFlowRequest::new(0, 0, request))
+            .unwrap();
+        loop {
+            if requester.has_pending() {
+                requester.wait().unwrap();
+            }
+            let mut results = requester.completions().unwrap();
+            if let Some(result) = results.pop() {
+                return result;
+            }
+        }
+    }
+
+    #[test]
+    fn a_local_upload_writes_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.parquet");
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap(),
+        );
+        let bytes: Arc<[u8]> = (0..300_000u32).map(|i| i as u8).collect::<Vec<u8>>().into();
+        let mut requester = IORequester::default();
+
+        let result = drive_upload(
+            &mut requester,
+            UploadRequest {
+                dest: UploadDest::Local(file),
+                bytes: bytes.clone(),
+                token: 7,
+            },
+        );
+
+        match result {
+            Ok(Completion::Upload(r)) => assert_eq!(r.request.token, 7),
+            _ => panic!("expected an upload completion"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), &*bytes);
+    }
+
+    #[test]
+    fn a_remote_upload_sends_the_body_over_https() {
+        let (port, bodies) = spawn_upload_server(1);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/bucket/obj.parquet")).unwrap();
+        let remote = Arc::new(RemoteUpload::open(url, UploadMethod::Put, None, None).unwrap());
+        let bytes: Arc<[u8]> = (0..200_000u32)
+            .map(|i| (i * 7) as u8)
+            .collect::<Vec<u8>>()
+            .into();
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let result = drive_upload(
+            &mut requester,
+            UploadRequest {
+                dest: UploadDest::Remote(remote),
+                bytes: bytes.clone(),
+                token: 9,
+            },
+        );
+
+        match result {
+            Ok(Completion::Upload(r)) => assert_eq!(r.request.token, 9),
+            _ => panic!("expected an upload completion"),
+        }
+        assert_eq!(bodies.lock().unwrap()[0], *bytes);
+    }
+
+    /// A non-2xx response is a terminal upload failure, surfaced as a `FailedRead`
+    /// (never a hang or a false success).
+    #[test]
+    fn a_rejected_remote_upload_fails() {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            read_upload_body(&mut tls);
+            let resp =
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\nConnection: close\r\n\r\nno access";
+            tls.write_all(resp.as_bytes()).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/bucket/obj.parquet")).unwrap();
+        let remote = Arc::new(RemoteUpload::open(url, UploadMethod::Put, None, None).unwrap());
+        let bytes: Arc<[u8]> = vec![1u8; 4096].into();
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let result = drive_upload(
+            &mut requester,
+            UploadRequest {
+                dest: UploadDest::Remote(remote),
+                bytes,
+                token: 0,
+            },
+        );
+
+        assert!(result.is_err(), "a 403 upload should fail");
+    }
+
+    /// Two uploads to one host ride a single pooled connection: the server accepts
+    /// one TCP connection and serves both, so the second must have reused the
+    /// connection the first left in the pool.
+    #[test]
+    fn remote_uploads_reuse_a_pooled_connection() {
+        let (port, bodies) = spawn_upload_server(2);
+        let url = Url::parse(&format!("https://127.0.0.1:{port}/bucket/obj.parquet")).unwrap();
+        let remote = Arc::new(RemoteUpload::open(url, UploadMethod::Put, None, None).unwrap());
+        let mut requester = IORequester::with_http_config(client_config());
+
+        for (token, len) in [(1u64, 5000usize), (2, 7000)] {
+            let result = drive_upload(
+                &mut requester,
+                UploadRequest {
+                    dest: UploadDest::Remote(remote.clone()),
+                    bytes: vec![token as u8; len].into(),
+                    token,
+                },
+            );
+            assert!(result.is_ok(), "upload {token} should succeed");
+        }
+
+        let lengths: Vec<usize> = bodies.lock().unwrap().iter().map(Vec::len).collect();
+        assert_eq!(lengths, vec![5000, 7000]);
+    }
+
+    /// A PUT reuses a connection a GET left warm: the server accepts one TCP
+    /// connection, serves a range read, then an upload — proving reads and uploads
+    /// share the one pool.
+    #[test]
+    fn an_upload_reuses_a_connection_a_read_left_warm() {
+        init_test_free_pool(16);
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_for = received.clone();
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            serve_one_range(&mut tls); // the GET
+            let body = read_upload_body(&mut tls); // then the PUT, same connection
+            received_for.lock().unwrap().extend_from_slice(&body);
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+            tls.write_all(resp.as_bytes()).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let read_loc = FileLocation::Remote(Arc::new(
+            RemoteFile::open(
+                Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap(),
+                None,
+                1 << 20,
+            )
+            .unwrap(),
+        ));
+        memory_ctx().compressed_cache().open_entry(read_loc.clone());
+        fetch(&mut requester, &read_loc, 0, 4096); // GET → pools the connection
+        assert_cached(&read_loc, 0, 4096);
+
+        let upload_url =
+            Url::parse(&format!("https://127.0.0.1:{port}/bucket/obj.parquet")).unwrap();
+        let upload =
+            Arc::new(RemoteUpload::open(upload_url, UploadMethod::Put, None, None).unwrap());
+        let bytes: Arc<[u8]> = vec![42u8; 6000].into();
+        let result = drive_upload(
+            &mut requester,
+            UploadRequest {
+                dest: UploadDest::Remote(upload),
+                bytes: bytes.clone(),
+                token: 1,
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "the upload should reuse the pooled connection"
+        );
+        assert_eq!(*received.lock().unwrap(), *bytes);
     }
 }

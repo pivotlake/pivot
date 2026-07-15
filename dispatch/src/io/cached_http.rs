@@ -24,9 +24,10 @@ use crate::Identifier;
 use crate::io::IORequesterError as Error;
 use crate::io::backend::IOBackend;
 use crate::io::disk_cache::{DiskCache, Object, Segment};
-use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
+use crate::io::http::{HttpEngine, RemoteRead, RemoteWrite, default_client_config};
 use crate::io::{
     Completion, DataFlowRequest, FailedRead, HttpRequest, RemoteReadSplit, RemoteReadTime,
+    UploadDest, UploadRequest,
 };
 use crate::memory::compressed_cache::MissingExtent;
 use std::collections::HashMap;
@@ -60,6 +61,10 @@ pub(crate) struct CachedHttpEngine {
     cache_reads: HashMap<Identifier, CacheRead>,
     /// Pieces being fetched over HTTP (engine request-id space).
     http_reads: HashMap<Identifier, HttpRead>,
+    /// Uploads in flight over HTTP (same engine request-id space as reads, so a
+    /// completion routes by which map holds the id). Holds the original request
+    /// until the upload lands, then yields it back unchanged.
+    http_uploads: HashMap<Identifier, DataFlowRequest<UploadRequest>>,
     next_http_id: Identifier,
     /// Write-backs populating the cache file after an HTTP piece landed (backend
     /// disk-id space). Each holds the slot pin until the write has read it.
@@ -114,6 +119,7 @@ impl CachedHttpEngine {
             next_read_id: 0,
             cache_reads: HashMap::new(),
             http_reads: HashMap::new(),
+            http_uploads: HashMap::new(),
             next_http_id: 0,
             cache_writes: HashMap::new(),
         })
@@ -250,6 +256,52 @@ impl CachedHttpEngine {
         Ok(())
     }
 
+    /// Submit a remote upload: hand its bytes to the engine as one HTTP PUT/POST
+    /// and hold the request until it lands. The request's dest is remote (a local
+    /// dest never reaches here — the requester handles those directly).
+    pub fn request_upload(
+        &mut self,
+        backend: &mut IOBackend,
+        request: DataFlowRequest<UploadRequest>,
+    ) -> Result<()> {
+        let UploadDest::Remote(remote) = &request.request.dest else {
+            unreachable!("request_upload is only called for remote uploads");
+        };
+        let write = RemoteWrite {
+            remote: remote.clone(),
+            bytes: request.request.bytes.clone(),
+        };
+        let id = self.next_http_id;
+        self.next_http_id += 1;
+        self.start_upload(backend, id, write)?;
+        self.http_uploads.insert(id, request);
+        Ok(())
+    }
+
+    /// Hand a remote upload to the engine (ring-driven on Linux, synchronous else).
+    fn start_upload(
+        &mut self,
+        backend: &mut IOBackend,
+        id: Identifier,
+        write: RemoteWrite,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.http.start_upload(&mut backend.ring, id, write)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = backend;
+            self.http.start_upload(id, write)?;
+        }
+        Ok(())
+    }
+
+    /// Number of HTTP uploads issued but not yet completed.
+    pub fn uploads_in_flight(&self) -> usize {
+        self.http_uploads.len()
+    }
+
     /// Feed an HTTP socket completion to the engine (it may submit follow-up SQEs,
     /// including transparent reconnect-and-retry). Linux only - elsewhere the
     /// engine runs synchronously and never produces ring completions.
@@ -300,15 +352,23 @@ impl CachedHttpEngine {
         for id in self.http.take_completed() {
             if let Some(http_read) = self.http_reads.remove(&id) {
                 self.complete_http_read(backend, disk_id, http_read, out)?;
+            } else if let Some(request) = self.http_uploads.remove(&id) {
+                out.push(Ok(Completion::Upload(request)));
             }
         }
         for (id, error) in self.http.take_failed() {
-            if let Some(http_read) = self.http_reads.remove(&id)
-                && let Some((data_flow_id, operator_idx)) = self.fail_read(http_read.read)
-            {
+            if let Some(http_read) = self.http_reads.remove(&id) {
+                if let Some((data_flow_id, operator_idx)) = self.fail_read(http_read.read) {
+                    out.push(Err(FailedRead {
+                        data_flow_id,
+                        operator_idx,
+                        error: error.into(),
+                    }));
+                }
+            } else if let Some(request) = self.http_uploads.remove(&id) {
                 out.push(Err(FailedRead {
-                    data_flow_id,
-                    operator_idx,
+                    data_flow_id: request.data_flow_id,
+                    operator_idx: request.operator_idx,
                     error: error.into(),
                 }));
             }
@@ -316,9 +376,9 @@ impl CachedHttpEngine {
         Ok(())
     }
 
-    /// `true` while any HTTP read is in flight.
+    /// `true` while any HTTP read or upload is in flight.
     pub fn has_network_pending(&self) -> bool {
-        self.http.has_active() || !self.http_reads.is_empty()
+        self.http.has_active() || !self.http_reads.is_empty() || !self.http_uploads.is_empty()
     }
 
     /// `true` if an HTTP completion is already in hand (non-Linux only, where the

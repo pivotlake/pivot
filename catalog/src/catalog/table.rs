@@ -365,6 +365,14 @@ impl CatalogTable {
         })
     }
 
+    /// How the io_uring writer should upload a new data file at `path` (resolved
+    /// against the table's location like any [`FileRef`] path). The write-side
+    /// counterpart of the read source: the INSERT pipeline asks for this, uploads
+    /// the encoded bytes over the ring, then commits the resulting [`FileRef`].
+    pub fn upload_target(&self, path: &ObjectPath) -> crate::Result<store::UploadTarget> {
+        Ok(self.store.upload_target(&self.location.resolve(path))?)
+    }
+
     /// Delete a data file (a compaction input swapped out of the manifest).
     /// `path` resolves against the table's location like any [`FileRef`] path.
     pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {

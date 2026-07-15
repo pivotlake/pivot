@@ -26,7 +26,8 @@ use catalog::parquet::table_input;
 use catalog::store::ObjectPath;
 use catalog::{FileRef, ParquetCatalog};
 use common::{
-    DispatchGuard, collect_i64s, current_parquet, dispatch_with_buffers, strings_and_ints,
+    DispatchGuard, collect_i64s, collect_u64s, current_parquet, dispatch_with_buffers,
+    strings_and_ints,
 };
 use dispatch::Projection;
 use harness::Backend;
@@ -205,6 +206,52 @@ mod bodies {
         assert_eq!(names, vec!["x.bin".to_string()]);
     }
 
+    /// `INSERT ... VALUES` uploads its Parquet over the io_uring (a local file
+    /// write, or an S3 presigned PUT / GCS media POST) and commits — the ring
+    /// write path end to end over each backend. The uploaded data file then reads
+    /// back through `source` (the ring's read path) with its Parquet magic intact.
+    pub fn insert_over_ring(b: &Backend) {
+        let d = dispatch_with_buffers(2, 32);
+        let cat = std::sync::Arc::new(ParquetCatalog::open(&b.root, &d).unwrap());
+        cat.create_table(path_request("inserted", "inserted"), &d)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+
+        let transaction = cat.begin_transaction();
+        let mut planner = planner::Planner::new(cat.clone());
+        let plan = planner
+            .plan(
+                "INSERT INTO inserted VALUES ('a', 1), ('b', 2), ('c', 3)",
+                transaction.clone(),
+            )
+            .unwrap();
+        let counts = plan
+            .compile(&d, transaction.as_ref())
+            .unwrap()
+            .collect()
+            .unwrap();
+        cat.commit_transaction(transaction).unwrap();
+
+        // The INSERT reports three rows written.
+        assert_eq!(collect_u64s(&counts, 0), vec![3]);
+
+        // The upload landed: a Parquet data file sits under the table's location
+        // and reads back through the ring's read source, its magic bytes intact.
+        let files: Vec<FileRef> = b
+            .store
+            .list(&ObjectPath::new("inserted"))
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.path.as_str().ends_with(".parquet"))
+            .collect();
+        assert_eq!(files.len(), 1, "one uploaded data file");
+        let key = ObjectPath::new(format!("inserted/{}", files[0].path.as_str()));
+        let bytes = harness::read_via_source(b.store.as_ref(), &key);
+        assert!(bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"));
+    }
+
     /// `put_if_absent` is a CAS: the second writer loses and the first's bytes
     /// stay — the primitive the manifest commit is built on.
     pub fn put_if_absent_is_a_cas(b: &Backend) {
@@ -260,6 +307,7 @@ backend_tests!(append_registers_new_file);
 backend_tests!(compaction_replaces_files);
 backend_tests!(source_reads_object_back);
 backend_tests!(list_is_one_level);
+backend_tests!(insert_over_ring);
 
 /// CAS-conflict tests, for backends that enforce the precondition. The
 /// `fake-gcs-server` emulator ignores `ifGenerationMatch=0`, so GCS is excluded

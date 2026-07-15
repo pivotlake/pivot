@@ -44,7 +44,7 @@
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{FsRequest, HttpRequest, UploadRequest};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -119,6 +119,15 @@ pub trait Operator {
         Ok(vec![])
     }
 
+    /// Return any pending uploads (write a data file to the object store / local
+    /// disk over the same per-core io_uring). The worker submits these and
+    /// delivers completions via
+    /// [`process_upload_response`](Self::process_upload_response) once the bytes
+    /// are durable. Default: none — only a write sink (INSERT) uploads.
+    fn next_upload_requests(&mut self) -> Result<Vec<UploadRequest>> {
+        Ok(vec![])
+    }
+
     /// Handle a completed filesystem read; its bytes are already committed to
     /// the cache. Called by the worker when the read finishes.
     fn process_fs_response(&mut self, request: FsRequest) -> Result<()>;
@@ -126,6 +135,14 @@ pub trait Operator {
     /// Handle a completed HTTP read; its bytes are already committed to the
     /// cache. Called by the worker when the read finishes.
     fn process_http_response(&mut self, request: HttpRequest) -> Result<()>;
+
+    /// Handle a completed upload; its bytes are durable. Called by the worker
+    /// when the upload finishes. Default: unreachable — only an operator that
+    /// yields uploads via [`next_upload_requests`](Self::next_upload_requests)
+    /// ever receives one.
+    fn process_upload_response(&mut self, _request: UploadRequest) -> Result<()> {
+        unreachable!("operator received an upload completion it never requested")
+    }
 
     /// Attempt to finish. Returns a [`FinishStatus`] telling the worker whether
     /// the operator is done, still working (re-drive, don't park), or not yet

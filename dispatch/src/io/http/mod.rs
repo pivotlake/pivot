@@ -67,3 +67,17 @@ pub(crate) struct RemoteRead {
 // writes to `[dest, dest+len)` (currently-invalid sub-blocks), so moving the
 // descriptor into the engine is sound. Mirrors the file path's PendingRead.
 unsafe impl Send for RemoteRead {}
+
+/// A single remote upload: send `bytes` to `remote` with one PUT/POST. The
+/// write-side mirror of [`RemoteRead`] — where a read streams a body *into* a
+/// pinned slot, an upload streams `bytes` *out* to the object store.
+///
+/// `Clone` so a transient transport failure can re-issue the same upload on a
+/// fresh connection (an object-store PUT is idempotent). The `Arc<[u8]>` keeps
+/// the body alive for the whole flight (and every retry) with no copy, so no
+/// `unsafe Send` is needed here.
+#[derive(Clone)]
+pub(crate) struct RemoteWrite {
+    pub remote: Arc<super::RemoteUpload>,
+    pub bytes: Arc<[u8]>,
+}

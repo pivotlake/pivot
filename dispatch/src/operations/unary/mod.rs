@@ -56,7 +56,7 @@ mod factory;
 pub use factory::*;
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{FsRequest, HttpRequest, UploadRequest};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -135,6 +135,12 @@ pub trait Unary<I, O> {
         Ok(vec![])
     }
 
+    /// Return any pending uploads (write a data file over the ring). See
+    /// [`Operator::next_upload_requests`]. Only a write sink (INSERT) yields any.
+    fn next_upload_requests(&mut self) -> Result<Vec<UploadRequest>> {
+        Ok(vec![])
+    }
+
     /// Whether this unary is ready to accept another input. Returns `false` when
     /// backpressured (e.g. waiting for IO to complete before consuming more).
     fn ready_for_more_work(&mut self) -> bool {
@@ -157,6 +163,16 @@ pub trait Unary<I, O> {
         &mut self,
         _sender: &mut S,
         _request: HttpRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed upload; its bytes are durable. Only a sink that yields
+    /// uploads via [`next_upload_requests`](Self::next_upload_requests) receives one.
+    fn process_upload_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: UploadRequest,
     ) -> Result<()> {
         unreachable!()
     }
@@ -249,6 +265,10 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(self.unary.next_http_requests()?)
     }
 
+    fn next_upload_requests(&mut self) -> super::Result<Vec<UploadRequest>> {
+        Ok(self.unary.next_upload_requests()?)
+    }
+
     fn process_fs_response(&mut self, request: FsRequest) -> super::Result<()> {
         Ok(self.unary.process_fs_response(&mut self.sender, request)?)
     }
@@ -257,6 +277,12 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(self
             .unary
             .process_http_response(&mut self.sender, request)?)
+    }
+
+    fn process_upload_response(&mut self, request: UploadRequest) -> super::Result<()> {
+        Ok(self
+            .unary
+            .process_upload_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<FinishStatus> {

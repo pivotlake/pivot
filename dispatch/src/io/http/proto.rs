@@ -1,11 +1,12 @@
-//! Object-store range-read **policy** over the sans-IO HTTP/1.1 helpers
+//! Object-store request/response **policy** over the sans-IO HTTP/1.1 helpers
 //! ([`super::http1`]).
 //!
 //! `http1` parses a response head and tracks an identity body; this layer adds
-//! the range-read policy on top: build the `Range` GET, and accept only a `206
-//! Partial Content` response whose `Content-Length` body fits the requested slot.
-//! Keeping the policy here (rather than in `http1`) means both platform backends
-//! share identical, socket-free, unit-testable logic.
+//! the policy: build the request (a `Range` GET, or a PUT/POST upload), and
+//! [`parse_response`] checks a response head against an accepted status range and
+//! (for a fixed-slot read) a body-size bound. One function serves both reads and
+//! uploads on both platform backends, so the policy lives in one socket-free,
+//! unit-testable place.
 
 use super::http1;
 use thiserror::Error;
@@ -14,11 +15,11 @@ use thiserror::Error;
 pub enum ProtoError {
     #[error("{0}")]
     Http1(#[from] http1::Http1Error),
-    #[error("unexpected http status {0} (expected 206 Partial Content)")]
-    UnexpectedStatus(u16),
-    #[error("range response missing Content-Length")]
+    #[error("unexpected http status {status}: {snippet}")]
+    UnexpectedStatus { status: u16, snippet: String },
+    #[error("response missing Content-Length")]
     MissingContentLength,
-    #[error("range response body ({got} bytes) larger than requested ({want} bytes)")]
+    #[error("response body ({got} bytes) larger than the {want} requested")]
     BodyTooLarge { got: u64, want: usize },
 }
 
@@ -51,57 +52,96 @@ pub fn build_range_get(
     .into_bytes()
 }
 
-/// A parsed (and validated `206`) response head.
-#[derive(Debug, Clone, Copy)]
-pub struct ResponseHead {
-    /// Length of the header section, including the terminating `\r\n\r\n`. The
-    /// body begins at this offset in the buffer that was parsed.
-    pub head_len: usize,
-    /// Body length from `Content-Length`.
-    pub content_length: u64,
+/// Build an origin-form HTTP/1.1 upload request (`PUT`/`POST`) carrying a
+/// `content_length`-byte body.
+///
+/// `Connection: keep-alive` so a connection can be returned to the pool and reused
+/// (by a later upload or read to the same host), exactly like a range GET — the
+/// caller drains the response body first. `content_type`, when the backend
+/// requires one (GCS wants `application/octet-stream`), and `auth` (a `Bearer`
+/// token, when the URL is not presigned) are emitted only when present.
+pub fn build_put(
+    method: &str,
+    host: &str,
+    target: &str,
+    content_length: usize,
+    content_type: Option<&str>,
+    auth: Option<&str>,
+) -> Vec<u8> {
+    let content_type = content_type.map_or(String::new(), |c| format!("Content-Type: {c}\r\n"));
+    let auth = auth.map_or(String::new(), |a| format!("Authorization: {a}\r\n"));
+    format!(
+        "{method} {target} HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Content-Length: {content_length}\r\n\
+         {content_type}\
+         {auth}\
+         Connection: keep-alive\r\n\
+         User-Agent: pivotdb-dispatch/0.1\r\n\
+         \r\n"
+    )
+    .into_bytes()
 }
 
-/// Outcome of trying to parse a (possibly incomplete) response head.
-pub enum HeadParse {
+/// Outcome of parsing a (possibly incomplete) response head against a policy.
+pub enum RespParse {
     /// Need more bytes before the head is complete.
     Incomplete,
-    Complete(ResponseHead),
+    /// The head parsed with an accepted status.
+    Ready {
+        /// Length of the header section, including the terminating `\r\n\r\n`; the
+        /// body begins at this offset in the parsed buffer.
+        head_len: usize,
+        /// `Content-Length`, if the header was present.
+        content_length: Option<u64>,
+    },
 }
 
-/// Try to parse the response head from `buf`. Returns [`HeadParse::Incomplete`]
-/// if the header section hasn't fully arrived yet.
+/// Parse and policy-check a response head from `buf` — shared by both platform
+/// backends and by reads and uploads.
 ///
-/// Validates that the status is `206 Partial Content` and that a `Content-Length`
-/// is present and no larger than `requested_len` — range responses are never
-/// chunked and must fit the destination slot region.
-pub fn parse_response_head(buf: &[u8], requested_len: usize) -> Result<HeadParse, ProtoError> {
+/// A status outside `status_range` (inclusive) is rejected with a snippet of the
+/// captured head/body, so a failed request surfaces the server's explanation.
+/// `max_body`, when `Some` (a read into a fixed cache slot), additionally requires
+/// a `Content-Length` present and no larger than it — range responses are
+/// identity-framed and must fit the slot. `None` (an upload) leaves the response
+/// body length unconstrained. Returns [`RespParse::Incomplete`] until the head has
+/// fully arrived.
+pub fn parse_response(
+    buf: &[u8],
+    status_range: (u16, u16),
+    max_body: Option<u64>,
+) -> Result<RespParse, ProtoError> {
     let head = match http1::parse_response_head(buf)? {
-        http1::HeadStatus::Incomplete => return Ok(HeadParse::Incomplete),
+        http1::HeadStatus::Incomplete => return Ok(RespParse::Incomplete),
         http1::HeadStatus::Complete(head) => head,
     };
 
-    if head.status != 206 {
-        return Err(ProtoError::UnexpectedStatus(head.status));
-    }
-
-    // A range response is always identity-framed (we send `Accept-Encoding:
-    // identity` and don't request multipart), so it must carry a Content-Length
-    // — the body size we land in the slot.
-    let content_length = head
-        .content_length
-        .ok_or(ProtoError::MissingContentLength)?;
-
-    if content_length > requested_len as u64 {
-        return Err(ProtoError::BodyTooLarge {
-            got: content_length,
-            want: requested_len,
+    let (lo, hi) = status_range;
+    if head.status < lo || head.status > hi {
+        let snippet = String::from_utf8_lossy(&buf[..buf.len().min(800)]).into_owned();
+        return Err(ProtoError::UnexpectedStatus {
+            status: head.status,
+            snippet,
         });
     }
 
-    Ok(HeadParse::Complete(ResponseHead {
+    if let Some(max) = max_body {
+        let content_length = head
+            .content_length
+            .ok_or(ProtoError::MissingContentLength)?;
+        if content_length > max {
+            return Err(ProtoError::BodyTooLarge {
+                got: content_length,
+                want: max as usize,
+            });
+        }
+    }
+
+    Ok(RespParse::Ready {
         head_len: head.head_len,
-        content_length,
-    }))
+        content_length: head.content_length,
+    })
 }
 
 #[cfg(test)]
@@ -128,15 +168,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_complete_206_head() {
+    fn parses_complete_head_within_policy() {
         let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes 0-9/100\r\n\r\nXXXXXXXXXX";
-        match parse_response_head(raw, 4096).unwrap() {
-            HeadParse::Complete(h) => {
-                assert_eq!(h.content_length, 10);
+        match parse_response(raw, (206, 206), Some(4096)).unwrap() {
+            RespParse::Ready {
+                head_len,
+                content_length,
+            } => {
+                assert_eq!(content_length, Some(10));
                 // head_len points at the first body byte.
-                assert_eq!(&raw[h.head_len..], b"XXXXXXXXXX");
+                assert_eq!(&raw[head_len..], b"XXXXXXXXXX");
             }
-            HeadParse::Incomplete => panic!("expected complete head"),
+            RespParse::Incomplete => panic!("expected complete head"),
         }
     }
 
@@ -144,26 +187,38 @@ mod tests {
     fn reports_incomplete_when_terminator_missing() {
         let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\n";
         assert!(matches!(
-            parse_response_head(raw, 4096).unwrap(),
-            HeadParse::Incomplete
+            parse_response(raw, (206, 206), Some(4096)).unwrap(),
+            RespParse::Incomplete
         ));
     }
 
     #[test]
-    fn rejects_non_206_status() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+    fn rejects_status_outside_the_range() {
+        let raw = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nno!";
         assert!(matches!(
-            parse_response_head(raw, 4096),
-            Err(ProtoError::UnexpectedStatus(200))
+            parse_response(raw, (206, 206), Some(4096)),
+            Err(ProtoError::UnexpectedStatus { status: 404, .. })
         ));
     }
 
     #[test]
-    fn rejects_body_larger_than_requested() {
+    fn rejects_body_larger_than_the_slot() {
         let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 9000\r\n\r\n";
         assert!(matches!(
-            parse_response_head(raw, 4096),
+            parse_response(raw, (206, 206), Some(4096)),
             Err(ProtoError::BodyTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn upload_accepts_any_2xx_with_no_content_length_bound() {
+        let raw = b"HTTP/1.1 201 Created\r\n\r\n";
+        assert!(matches!(
+            parse_response(raw, (200, 299), None).unwrap(),
+            RespParse::Ready {
+                content_length: None,
+                ..
+            }
         ));
     }
 }

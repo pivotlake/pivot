@@ -16,7 +16,10 @@
 //! [`source`](GcsStore::source)), so a worker only ever *reads* a current token.
 //! RS256 signing uses `ring`; everything is synchronous, no async runtime.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, UploadMethod,
+    UploadTarget, object_key,
+};
 use base64::Engine;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -370,23 +373,47 @@ impl ObjectStore for GcsStore {
         );
         let url = url::Url::parse(&url)
             .map_err(|e| StoreError::Config(format!("building gcs media url: {e}")))?;
-
-        // An emulator ignores `Authorization`, so its reads need no header.
-        if self.auth.emulated {
-            return Ok(DataFileSource::Remote { url, auth: None });
-        }
-        // Prime the token here on the control thread (a blocking mint is fine off
-        // the ring) so the query's worker reads find a fresh one and never mint.
-        self.auth.header()?;
-        let auth = self.auth.clone();
         Ok(DataFileSource::Remote {
             url,
-            auth: Some(Arc::new(move || auth.current())),
+            auth: self.ring_auth()?,
+        })
+    }
+
+    fn upload_target(&self, key: &ObjectPath) -> Result<UploadTarget> {
+        // The JSON API media-upload endpoint the blocking `put` posts to, but
+        // sent straight off the ring. Auth rides in a per-request `Authorization`
+        // header (a fresh bearer token), mirroring `source`.
+        let url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            self.endpoint,
+            self.bucket,
+            self.object_path(key)
+        );
+        let url = url::Url::parse(&url)
+            .map_err(|e| StoreError::Config(format!("building gcs upload url: {e}")))?;
+        Ok(UploadTarget::Remote {
+            url,
+            method: UploadMethod::Post,
+            auth: self.ring_auth()?,
+            content_type: Some("application/octet-stream"),
         })
     }
 }
 
 impl GcsStore {
+    /// The per-request `Authorization` provider for ring IO (reads and uploads):
+    /// `None` against an emulator, which ignores auth, else a fresh bearer token.
+    /// The token is primed here on the control thread (a blocking mint is fine off
+    /// the ring) so a query's workers only ever read a cached one and never mint.
+    fn ring_auth(&self) -> Result<Option<dispatch::io::AuthHeader>> {
+        if self.auth.emulated {
+            return Ok(None);
+        }
+        self.auth.header()?;
+        let auth = self.auth.clone();
+        Ok(Some(Arc::new(move || auth.current())))
+    }
+
     /// One-page list of objects directly under `prefix`, optionally beginning at
     /// `start` (`startOffset`) so the scan skips everything lexicographically
     /// below it.
