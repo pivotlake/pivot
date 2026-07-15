@@ -107,6 +107,12 @@ struct Cli {
     #[arg(long, conflicts_with = "update_results")]
     skip_check: bool,
 
+    /// SQL statement to run once, untimed, after setup and before the first
+    /// query. Warms the server (worker spin-up, page faults, plan paths) so
+    /// the first timed query isn't charged for one-time session costs.
+    #[arg(long)]
+    warmup: Option<String>,
+
     /// Before each query, evict pivot's file cache (`SELECT drop_cache()`) and
     /// flush the OS page cache, so each query's first iteration is a true cold
     /// read without restarting the warm server. Needs passwordless sudo (Linux).
@@ -195,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         skip_check: cli.skip_check,
         query_filter,
         drop_caches: cli.drop_caches,
+        warmup: cli.warmup.clone(),
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
