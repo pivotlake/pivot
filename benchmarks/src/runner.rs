@@ -295,7 +295,7 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
             });
         }
     };
-    if expected.trim_end() == actual.trim_end() {
+    if results_match(expected.trim_end(), actual.trim_end()) {
         Ok(())
     } else {
         Err(Error::ResultMismatch {
@@ -304,6 +304,44 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
             actual: actual.to_string(),
         })
     }
+}
+
+/// Whether the captured TSV matches the expected one. Non-numeric cells must
+/// match exactly; numeric cells tolerate relative drift up to 1e-9, because a
+/// float aggregate's parallel accumulation order varies run to run and moves
+/// the last couple of ulps (row order and row/column counts stay exact).
+fn results_match(expected: &str, actual: &str) -> bool {
+    if expected == actual {
+        return true;
+    }
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    if expected_lines.len() != actual_lines.len() {
+        return false;
+    }
+    expected_lines
+        .iter()
+        .zip(&actual_lines)
+        .all(|(expected_line, actual_line)| {
+            let expected_cells: Vec<&str> = expected_line.split('\t').collect();
+            let actual_cells: Vec<&str> = actual_line.split('\t').collect();
+            expected_cells.len() == actual_cells.len()
+                && expected_cells
+                    .iter()
+                    .zip(&actual_cells)
+                    .all(|(e, a)| cells_match(e, a))
+        })
+}
+
+fn cells_match(expected: &str, actual: &str) -> bool {
+    if expected == actual {
+        return true;
+    }
+    let (Ok(e), Ok(a)) = (expected.parse::<f64>(), actual.parse::<f64>()) else {
+        return false;
+    };
+    let scale = e.abs().max(a.abs());
+    (e - a).abs() <= scale * 1e-9
 }
 
 /// Run every query in `suite` (filtered by `opts.query_filter`).
