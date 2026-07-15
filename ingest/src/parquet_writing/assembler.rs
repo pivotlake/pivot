@@ -3,9 +3,9 @@
 //! A plain `Unary` map: the [`partition`](super::partition) stage routes every
 //! column chunk of a file to `file_id % worker_count`, so all of a file's chunks
 //! arrive at one [`FileAssembler`]. It gathers a row group's chunks (by
-//! `row_group_id`, one per schema column), assembles the row group — laying each
-//! chunk's dictionary page (if any) and data pages out contiguously and stamping
-//! sort columns' footer `Statistics` — and once a `file_id` has all its
+//! `row_group_id`, one per primitive schema leaf), assembles the row group —
+//! laying each chunk's dictionary page (if any) and data pages out contiguously
+//! and stamping sort columns' footer `Statistics` — and once a `file_id` has all its
 //! `n_row_groups`, builds the file and emits it as an [`EncodedFile`] tagged with
 //! the partition tuple and `sort_bounds` to record in the manifest. Nothing
 //! crosses workers and there is no finish phase: every file completes in
@@ -25,15 +25,16 @@ use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
     StringViewArray,
 };
-use arrow_schema::{DataType, Field, SchemaRef};
+use arrow_schema::{DataType, FieldRef, SchemaRef};
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::{
-    ColumnChunk, ColumnMetaData, FileMetaData, RowGroup, SchemaElement, Statistics,
+    ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement, Statistics,
 };
 use thriftparquet::general::Encoding;
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use super::error::{WriteError, WriteResult};
+use super::shredding;
 use super::types::{
     EncodedColumnChunk, EncodedFile, FileId, RowGroupHeader, RowGroupId, RowGroupSortStats,
 };
@@ -41,6 +42,8 @@ use super::types::{
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// Parquet repetition type for a required (non-null) field.
 const REPETITION_REQUIRED: i32 = 0;
+/// Parquet repetition type for a nullable field.
+const REPETITION_OPTIONAL: i32 = 1;
 /// Parquet `CompressionCodec::SNAPPY`.
 const SNAPPY_CODEC: i32 = 1;
 /// Parquet format version written into the footer.
@@ -97,9 +100,9 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
         chunk: EncodedColumnChunk,
         sender: &mut S,
     ) -> UnaryResult<()> {
-        // Gather this row group's column chunks (one per schema column).
+        // Gather this row group's column chunks (one per primitive leaf).
         let row_group_id = chunk.header.row_group_id;
-        let columns = chunk.header.schema.fields().len();
+        let columns = chunk.header.leaf_count;
         let header = chunk.header.clone();
         if !self
             .chunks_by_row_group
@@ -117,7 +120,7 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
             ..
         } = self.chunks_by_row_group.remove(&row_group_id).unwrap();
         let stats = build_stats(&header.tag.sort_stats);
-        let group = assemble_row_group(&header.schema, chunks, &stats)?;
+        let group = assemble_row_group(chunks, &stats)?;
 
         // Add it to its file; emit the file once all its row groups are in.
         let file_id = header.tag.file_id;
@@ -215,17 +218,16 @@ struct AssembledRowGroup {
     columns: Vec<ColumnChunk>,
 }
 
-/// Assemble one row group from its column chunks (one per schema column, any
-/// order). `stats` maps a column index to the footer `Statistics` to write for it
-/// (sort columns).
+/// Assemble one row group from its column chunks (one per primitive schema
+/// leaf, any order). `stats` maps a top-level column index to the footer
+/// `Statistics` to write for it (sort columns are scalar, single-leaf fields).
 fn assemble_row_group(
-    schema: &SchemaRef,
     mut chunks: Vec<EncodedColumnChunk>,
     stats: &HashMap<usize, Statistics>,
 ) -> WriteResult<AssembledRowGroup> {
     // Footer column chunks must be in schema order; work-stealing delivers them
     // in any order.
-    chunks.sort_by_key(|c| c.column);
+    chunks.sort_by_key(|c| c.leaf);
 
     let mut bytes = Vec::new();
     let mut columns = Vec::with_capacity(chunks.len());
@@ -233,7 +235,6 @@ fn assemble_row_group(
         let col = chunk.column;
         columns.push(write_column_chunk(
             &mut bytes,
-            schema.field(col),
             chunk,
             stats.get(&col).cloned(),
         )?);
@@ -297,7 +298,6 @@ fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult
 /// `out` (rebased to the file by [`build_file`]).
 fn write_column_chunk(
     out: &mut Vec<u8>,
-    field: &Field,
     chunk: EncodedColumnChunk,
     statistics: Option<Statistics>,
 ) -> WriteResult<ColumnChunk> {
@@ -336,9 +336,9 @@ fn write_column_chunk(
     Ok(ColumnChunk {
         file_offset: chunk_start,
         meta_data: Some(ColumnMetaData {
-            physical_type: catalog::parquet::arrow_to_parquet_physical(field.data_type())?,
+            physical_type: catalog::parquet::arrow_to_parquet_physical(chunk.field.data_type())?,
             encodings,
-            path_in_schema: vec![field.name().clone()],
+            path_in_schema: chunk.path.to_vec(),
             codec: SNAPPY_CODEC,
             num_values,
             total_uncompressed_size: uncompressed,
@@ -351,10 +351,11 @@ fn write_column_chunk(
     })
 }
 
-/// Build the footer schema: a root group element followed by one leaf per
-/// column (string columns marked UTF8).
+/// Build the footer schema depth-first. VARIANT top-level groups carry the
+/// Parquet logical annotation; their metadata/value leaves remain unannotated
+/// binary, while shredded string leaves carry UTF8.
 fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> {
-    let mut elements = Vec::with_capacity(schema.fields().len() + 1);
+    let mut elements = Vec::new();
     elements.push(SchemaElement {
         physical_type: None,
         repetition_type: None,
@@ -364,21 +365,42 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
         logical_type: None,
     });
     for field in schema.fields() {
-        elements.push(SchemaElement {
-            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(
-                field.data_type(),
-            )?),
-            repetition_type: Some(REPETITION_REQUIRED),
-            name: field.name().clone(),
-            num_children: None,
-            converted_type: match field.data_type() {
-                DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_UTF8),
-                _ => None,
-            },
-            logical_type: None,
-        });
+        push_schema_element(field, &mut elements)?;
     }
     Ok(elements)
+}
+
+fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> WriteResult<()> {
+    let repetition_type = Some(if field.is_nullable() {
+        REPETITION_OPTIONAL
+    } else {
+        REPETITION_REQUIRED
+    });
+    match field.data_type() {
+        DataType::Struct(children) => {
+            elements.push(SchemaElement {
+                physical_type: None,
+                repetition_type,
+                name: field.name().clone(),
+                num_children: Some(children.len() as i32),
+                converted_type: None,
+                logical_type: shredding::is_variant(field).then_some(LogicalType::Variant),
+            });
+            for child in children {
+                push_schema_element(child, elements)?;
+            }
+        }
+        data_type => elements.push(SchemaElement {
+            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(data_type)?),
+            repetition_type,
+            name: field.name().clone(),
+            num_children: None,
+            converted_type: matches!(data_type, DataType::Utf8 | DataType::Utf8View)
+                .then_some(CONVERTED_UTF8),
+            logical_type: None,
+        }),
+    }
+    Ok(())
 }
 
 /// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`.
@@ -394,19 +416,23 @@ fn write_footer(out: &mut Vec<u8>, file_meta: &FileMetaData) -> WriteResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet_writing::encoder::encode_column_chunk;
+    use crate::parquet_writing::encoder::encode_values;
     use crate::parquet_writing::types::{EncodedColumnChunk, PartitionTag};
+    use crate::parquet_writing::{leaves, shredding};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use arrow_schema::Schema;
+    use arrow_schema::{Field, Schema};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet_variant_compute::{VariantArray, json_to_variant, unshred_variant};
+    use parquet_variant_json::VariantToJson;
     use std::sync::Arc;
 
     /// A minimal header for assembling one standalone row group in a test.
-    fn header(schema: &SchemaRef) -> Arc<RowGroupHeader> {
+    fn header(schema: &SchemaRef, leaf_count: usize) -> Arc<RowGroupHeader> {
         Arc::new(RowGroupHeader {
             row_group_id: 0,
             dest_worker: 0,
             schema: schema.clone(),
+            leaf_count,
             tag: Arc::new(PartitionTag {
                 file_id: 0,
                 n_row_groups: 1,
@@ -421,21 +447,35 @@ mod tests {
     /// (dictionary or PLAIN, the encoder's choice) → `assemble_row_group` →
     /// `build_file` — and return the bytes (a single-row-group file, no stats).
     fn encode(batch: &RecordBatch) -> Vec<u8> {
-        let header = header(&batch.schema());
-        let chunks: Vec<EncodedColumnChunk> = (0..batch.num_columns())
-            .map(|column| {
-                let (dictionary_page, data_pages) = encode_column_chunk(batch.column(column))?;
-                Ok(EncodedColumnChunk {
-                    header: header.clone(),
-                    column,
-                    dictionary_page,
-                    data_pages,
+        encode_with_row_group_rows(batch, batch.num_rows())
+    }
+
+    fn encode_with_row_group_rows(batch: &RecordBatch, row_group_rows: usize) -> Vec<u8> {
+        let batch = shredding::shred_file(batch.clone()).unwrap();
+        let mut groups = Vec::new();
+        for offset in (0..batch.num_rows()).step_by(row_group_rows) {
+            let slice = batch.slice(offset, row_group_rows.min(batch.num_rows() - offset));
+            let leaves = leaves::flatten(&slice).unwrap();
+            let header = header(&batch.schema(), leaves.len());
+            let chunks: Vec<EncodedColumnChunk> = leaves
+                .into_iter()
+                .map(|leaf| {
+                    let (dictionary_page, data_pages) = encode_values(&leaf.values, &leaf.levels)?;
+                    Ok(EncodedColumnChunk {
+                        header: header.clone(),
+                        leaf: leaf.leaf,
+                        column: leaf.column,
+                        field: leaf.field,
+                        path: leaf.path,
+                        dictionary_page,
+                        data_pages,
+                    })
                 })
-            })
-            .collect::<WriteResult<_>>()
-            .unwrap();
-        let group = assemble_row_group(&batch.schema(), chunks, &HashMap::new()).unwrap();
-        build_file(&batch.schema(), vec![group]).unwrap()
+                .collect::<WriteResult<_>>()
+                .unwrap();
+            groups.push(assemble_row_group(chunks, &HashMap::new()).unwrap());
+        }
+        build_file(&batch.schema(), groups).unwrap()
     }
 
     /// Write `batch` and read it back through arrow-rs's strict reader (our
@@ -507,5 +547,80 @@ mod tests {
                 .unwrap(),
             &StringArray::from(values)
         );
+    }
+
+    /// The full write boundary: infer a file-level object layout, emit nested
+    /// optional leaves and a VARIANT logical annotation, and recover every
+    /// original document (including a type-mismatch fallback and SQL null).
+    #[test]
+    fn inferred_variant_shredding_round_trips_through_strict_reader() {
+        let json: ArrayRef = Arc::new(StringArray::from(vec![
+            Some(r#"{"age":10,"score":1.5,"user":{"name":"alice"}}"#),
+            Some(r#"{"age":20,"score":2.5,"user":{"name":"bob"}}"#),
+            Some(r#"{"age":"unknown","score":3,"user":{"name":3}}"#),
+            None,
+        ]));
+        let input = json_to_variant(&json).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![input.field("doc")])),
+            vec![Arc::new(input.clone().into_inner())],
+        )
+        .unwrap();
+
+        let got = round_trip(&batch);
+        let got = VariantArray::try_new(got.column(0).as_ref()).unwrap();
+        assert!(got.typed_value_field().is_some());
+        let got = unshred_variant(&got).unwrap();
+        for row in 0..input.len() {
+            assert_eq!(got.is_null(row), input.is_null(row));
+            if !input.is_null(row) {
+                assert_eq!(
+                    got.value(row).to_json_value().unwrap(),
+                    input.value(row).to_json_value().unwrap(),
+                    "row {row}"
+                );
+            }
+        }
+    }
+
+    /// One layout is selected from the complete file even when its row groups
+    /// favor different types. The second group's strings use the fallback of
+    /// the integer layout selected by the file-wide tie break.
+    #[test]
+    fn multiple_row_groups_share_one_inferred_variant_layout() {
+        let json: ArrayRef = Arc::new(StringArray::from(vec![
+            r#"{"value":1}"#,
+            r#"{"value":2}"#,
+            r#"{"value":"three"}"#,
+            r#"{"value":"four"}"#,
+        ]));
+        let input = json_to_variant(&json).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![input.field("doc")])),
+            vec![Arc::new(input.clone().into_inner())],
+        )
+        .unwrap();
+        let bytes = encode_with_row_group_rows(&batch, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.parquet");
+        std::fs::write(&path, bytes).unwrap();
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 2);
+        let batches: Vec<RecordBatch> = builder
+            .build()
+            .unwrap()
+            .map(|batch| batch.unwrap())
+            .collect();
+        let got = arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let got = VariantArray::try_new(got.column(0).as_ref()).unwrap();
+        let got = unshred_variant(&got).unwrap();
+        for row in 0..input.len() {
+            assert_eq!(
+                got.value(row).to_json_value().unwrap(),
+                input.value(row).to_json_value().unwrap(),
+                "row {row}"
+            );
+        }
     }
 }

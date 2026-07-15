@@ -10,6 +10,8 @@
 use std::sync::Arc;
 
 use arrow_array::ArrayRef;
+use arrow_buffer::NullBuffer;
+use arrow_schema::FieldRef;
 use arrow_schema::SchemaRef;
 use catalog::SortBounds;
 use dispatch::{Identifier, WorkerIdOutput};
@@ -75,22 +77,82 @@ pub(crate) struct EncodedFile {
 /// identity and owner worker (for routing), schema, and [`PartitionTag`]. Built
 /// once by the [`partition`](super::partition) stage and shared by `Arc`, so each
 /// column job clones a single pointer instead of re-copying all of this. The row
-/// group is complete once the assembler has one chunk per `schema` column.
+/// group is complete once the assembler has one chunk per primitive schema
+/// leaf.
 pub(crate) struct RowGroupHeader {
     pub(crate) row_group_id: RowGroupId,
     /// Worker that owns this row group; its chunks all route there for assembly
     /// (`file_id % worker_count`, so a file's row groups co-locate).
     pub(crate) dest_worker: usize,
     pub(crate) schema: SchemaRef,
+    /// Number of primitive Parquet columns in `schema`, computed once when the
+    /// row group is flattened so the assembler does not repeatedly walk a
+    /// nested schema as its chunks arrive.
+    pub(crate) leaf_count: usize,
     pub(crate) tag: Arc<PartitionTag>,
 }
 
 /// One column's values for one row group, to encode into a column chunk.
 pub(crate) struct ColumnChunkJob {
     pub(crate) header: Arc<RowGroupHeader>,
-    /// Index of this column in the schema.
+    /// Depth-first leaf index. Parquet stores one chunk per leaf, not per
+    /// top-level struct column.
+    pub(crate) leaf: usize,
+    /// Top-level schema column that owns this leaf (for sort statistics).
     pub(crate) column: usize,
+    pub(crate) field: FieldRef,
+    pub(crate) path: Arc<[String]>,
     pub(crate) values: ArrayRef,
+    pub(crate) levels: DefinitionLevels,
+}
+
+/// The nullable nodes on the path from a top-level field to one leaf, in path
+/// order. A data page materializes definition levels from these bitmaps while
+/// it is being encoded, avoiding a persistent byte-per-row-per-leaf buffer.
+#[derive(Clone)]
+pub(crate) struct DefinitionLevels {
+    pub(crate) nulls: Arc<[Option<NullBuffer>]>,
+    /// Logical row offset into the shared path bitmaps. Page slicing advances
+    /// this cursor without allocating or slicing every ancestor bitmap.
+    pub(crate) offset: usize,
+}
+
+impl DefinitionLevels {
+    pub(crate) fn required() -> Self {
+        Self {
+            nulls: Arc::from([]),
+            offset: 0,
+        }
+    }
+
+    pub(crate) fn max(&self) -> i16 {
+        self.nulls.len() as i16
+    }
+
+    pub(crate) fn slice(&self, offset: usize, len: usize) -> Self {
+        debug_assert!(
+            self.nulls
+                .iter()
+                .flatten()
+                .all(|nulls| self.offset + offset + len <= nulls.len())
+        );
+        Self {
+            nulls: self.nulls.clone(),
+            offset: self.offset + offset,
+        }
+    }
+
+    /// Definition level for one logical row: the number of nullable nodes
+    /// defined before the first absent node.
+    #[inline]
+    pub(crate) fn value(&self, row: usize) -> u32 {
+        for (level, nulls) in self.nulls.iter().enumerate() {
+            if nulls.as_ref().is_some_and(|n| n.is_null(self.offset + row)) {
+                return level as u32;
+            }
+        }
+        self.nulls.len() as u32
+    }
 }
 
 /// An encoded page (data or dictionary): its snappy-compressed body behind a
@@ -111,7 +173,10 @@ pub(crate) struct EncodedPage {
 /// indices).
 pub(crate) struct EncodedColumnChunk {
     pub(crate) header: Arc<RowGroupHeader>,
+    pub(crate) leaf: usize,
     pub(crate) column: usize,
+    pub(crate) field: FieldRef,
+    pub(crate) path: Arc<[String]>,
     pub(crate) dictionary_page: Option<EncodedPage>,
     pub(crate) data_pages: Vec<EncodedPage>,
 }

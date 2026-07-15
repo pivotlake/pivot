@@ -45,6 +45,8 @@ use json::row_object;
 use stats::column_min_max;
 
 use super::error::WriteResult;
+use super::leaves;
+use super::shredding;
 use super::types::{ColumnChunkJob, PartitionTag, RowGroupHeader, RowGroupSortStats, SortColStat};
 
 /// A partition tuple (a one-row arrow-json object), or `None` for an
@@ -258,8 +260,13 @@ impl RowGroupBuilder {
         batches: Vec<RecordBatch>,
         sender: &mut S,
     ) -> UnaryResult<()> {
+        // Files read during compaction may each carry a different VARIANT
+        // layout. Canonicalize first so concatenation has one schema, then infer
+        // and apply exactly one new layout across the complete output file.
+        let batches = shredding::unshred_batches(batches)?;
         let schema = batches[0].schema();
         let batch = concat_batches(&schema, &batches)?;
+        let batch = shredding::shred_file(batch)?;
         let rows = batch.num_rows();
         if rows == 0 {
             return Ok(());
@@ -281,6 +288,7 @@ impl RowGroupBuilder {
             let len = self.target_rows.min(rows - offset);
             let slice = batch.slice(offset, len);
             offset += len;
+            let leaves = leaves::flatten(&slice)?;
             let tag = Arc::new(PartitionTag {
                 file_id,
                 n_row_groups,
@@ -293,13 +301,18 @@ impl RowGroupBuilder {
                 row_group_id: self.next_row_group_id.fetch_add(1, Ordering::Relaxed),
                 dest_worker,
                 schema: schema.clone(),
+                leaf_count: leaves.len(),
                 tag,
             });
-            for column in 0..slice.num_columns() {
+            for leaf in leaves {
                 sender.send(ColumnChunkJob {
                     header: header.clone(),
-                    column,
-                    values: slice.column(column).clone(),
+                    leaf: leaf.leaf,
+                    column: leaf.column,
+                    field: leaf.field,
+                    path: leaf.path,
+                    values: leaf.values,
+                    levels: leaf.levels,
                 })?;
             }
         }

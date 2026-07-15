@@ -18,7 +18,7 @@ use arrow_array::ArrayRef;
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
 use super::error::WriteResult;
-use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedPage};
+use super::types::{ColumnChunkJob, DefinitionLevels, EncodedColumnChunk, EncodedPage};
 
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
 
@@ -37,10 +37,13 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
         job: ColumnChunkJob,
         sender: &mut S,
     ) -> UnaryResult<()> {
-        let (dictionary_page, data_pages) = encode_column_chunk(&job.values)?;
+        let (dictionary_page, data_pages) = encode_values(&job.values, &job.levels)?;
         sender.send(EncodedColumnChunk {
             header: job.header,
+            leaf: job.leaf,
             column: job.column,
+            field: job.field,
+            path: job.path,
             dictionary_page,
             data_pages,
         })?;
@@ -48,13 +51,14 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
     }
 }
 
-/// Encode a column chunk, preferring a dictionary and falling back to PLAIN.
-/// Returns the optional dictionary page and the data pages.
-pub(in crate::parquet_writing) fn encode_column_chunk(
+/// Encode one primitive leaf, preferring a dictionary and falling back to
+/// PLAIN. Definition levels describe its logical null rows separately.
+pub(in crate::parquet_writing) fn encode_values(
     values: &ArrayRef,
+    levels: &DefinitionLevels,
 ) -> WriteResult<(Option<EncodedPage>, Vec<EncodedPage>)> {
-    match dictionary::try_encode(values)? {
+    match dictionary::try_encode(values, levels)? {
         Some((dictionary_page, index_page)) => Ok((Some(dictionary_page), vec![index_page])),
-        None => Ok((None, plain::encode_chunk(values)?)),
+        None => Ok((None, plain::encode_chunk(values, levels)?)),
     }
 }

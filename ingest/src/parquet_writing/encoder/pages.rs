@@ -4,7 +4,7 @@
 //!
 //! A page's values are a zero-copy slice of the column, so cutting copies nothing.
 
-use arrow_array::{Array, ArrayRef, StringArray, StringViewArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, BinaryViewArray, StringArray, StringViewArray};
 use arrow_schema::DataType;
 use snap::raw::Encoder;
 use thriftparquet::general::{Encoding, PageType};
@@ -12,7 +12,8 @@ use thriftparquet::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use super::super::error::WriteResult;
-use super::super::types::EncodedPage;
+use super::super::types::{DefinitionLevels, EncodedPage};
+use super::rle;
 
 /// Target uncompressed size of one data page. Matches Parquet's usual ~1 MiB
 /// data page size: large enough to amortize per-page overhead and compress
@@ -61,8 +62,8 @@ fn variable_ranges(values: &ArrayRef, target: usize) -> Vec<(usize, usize)> {
     let mut page_start = 0;
     let mut row = 0;
     let mut acc = 0usize;
-    for_each_value_len(values.as_ref(), |value_len| {
-        acc += BYTE_ARRAY_LEN_PREFIX + value_len;
+    for_each_plain_value_size(values.as_ref(), |value_size| {
+        acc += value_size;
         row += 1;
         if acc >= target {
             ranges.push((page_start, row - page_start));
@@ -85,20 +86,71 @@ fn plain_fixed_width(data_type: &DataType) -> Option<usize> {
     }
 }
 
-/// Call `f` with each value's byte length (for BYTE_ARRAY size accounting).
-fn for_each_value_len(array: &dyn Array, mut f: impl FnMut(usize)) {
+/// Call `f` with each value's PLAIN-encoded size. Nulls have no value bytes;
+/// their presence is carried by definition levels.
+fn for_each_plain_value_size(array: &dyn Array, mut f: impl FnMut(usize)) {
     match array.data_type() {
         DataType::Utf8 => {
             let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            (0..a.len()).for_each(|i| f(a.value(i).len()));
+            (0..a.len()).for_each(|i| {
+                f(if a.is_valid(i) {
+                    BYTE_ARRAY_LEN_PREFIX + a.value(i).len()
+                } else {
+                    0
+                })
+            });
         }
         DataType::Utf8View => {
             let a = array.as_any().downcast_ref::<StringViewArray>().unwrap();
-            (0..a.len()).for_each(|i| f(a.value(i).len()));
+            (0..a.len()).for_each(|i| {
+                f(if a.is_valid(i) {
+                    BYTE_ARRAY_LEN_PREFIX + a.value(i).len()
+                } else {
+                    0
+                })
+            });
+        }
+        DataType::Binary => {
+            let a = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+            (0..a.len()).for_each(|i| {
+                f(if a.is_valid(i) {
+                    BYTE_ARRAY_LEN_PREFIX + a.value(i).len()
+                } else {
+                    0
+                })
+            });
+        }
+        DataType::BinaryView => {
+            let a = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            (0..a.len()).for_each(|i| {
+                f(if a.is_valid(i) {
+                    BYTE_ARRAY_LEN_PREFIX + a.value(i).len()
+                } else {
+                    0
+                })
+            });
         }
         // Unsupported here; the encoder rejects it during encoding.
         _ => (0..array.len()).for_each(|_| f(0)),
     }
+}
+
+/// Prefix a V1 data page's value stream with RLE-encoded definition levels.
+/// Repetition levels are absent because the writer does not emit repeated
+/// fields. The four-byte length is required by the V1 page format.
+pub(super) fn encode_definition_levels(
+    out: &mut Vec<u8>,
+    levels: &DefinitionLevels,
+    num_rows: usize,
+) {
+    let max = levels.max();
+    if max == 0 {
+        return;
+    }
+    let bit_width = (max as u32 + 1).next_power_of_two().trailing_zeros() as u8;
+    let encoded = rle::encode((0..num_rows).map(|row| levels.value(row)), bit_width);
+    out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    out.extend_from_slice(&encoded);
 }
 
 /// Which page to build — everything in the page header except the body sizes,
@@ -198,5 +250,15 @@ mod tests {
         let ranges = page_ranges(&column, 25);
 
         assert_eq!(ranges, vec![(0, 3), (3, 3), (6, 3), (9, 1)]);
+    }
+
+    #[test]
+    fn nulls_do_not_spend_bytes_in_the_value_stream() {
+        let column: ArrayRef = Arc::new(StringArray::from(vec![None, None, Some("a")]));
+
+        // Only "a" occupies the PLAIN value stream (4-byte prefix + one byte).
+        // Counting a fictitious prefix for each null would cut this into two
+        // pages at this target.
+        assert_eq!(page_ranges(&column, 5), vec![(0, 3)]);
     }
 }

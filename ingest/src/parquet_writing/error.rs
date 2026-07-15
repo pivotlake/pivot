@@ -32,9 +32,6 @@ pub(super) enum WriteError {
     /// A row group whose column yielded no pages — an internal invariant break.
     #[error("column {column} of a row group produced no pages")]
     MissingPages { column: usize },
-    /// Only required (non-null) columns are supported; this one has nulls.
-    #[error("column has {nulls} null(s); only required (non-null) columns are supported")]
-    NullsInRequiredColumn { nulls: usize },
     /// An array did not have the Arrow type its column's schema declared.
     #[error("array downcast to {expected} failed")]
     Downcast { expected: &'static str },

@@ -6,14 +6,14 @@
 //! low-cardinality columns dictionary-encode and high-cardinality ones (e.g.
 //! timestamps) stay PLAIN.
 
-use arrow_array::ArrayRef;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use thriftparquet::general::Encoding;
 
 use super::super::error::WriteResult;
-use super::super::types::EncodedPage;
+use super::super::types::{DefinitionLevels, EncodedPage};
 use super::pages::{self, PageKind};
 use super::{plain, rle};
 
@@ -26,7 +26,10 @@ const DICTIONARY_PAGE_SIZE_LIMIT: usize = 1024 * 1024;
 /// dictionary page and the RLE-encoded index page. `None` means fall back to
 /// PLAIN — the dictionary grew too large, or the value type doesn't
 /// dictionary-cast.
-pub(super) fn try_encode(values: &ArrayRef) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
+pub(super) fn try_encode(
+    values: &ArrayRef,
+    levels: &DefinitionLevels,
+) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
     let dict_type = DataType::Dictionary(
         Box::new(DataType::Int32),
         Box::new(values.data_type().clone()),
@@ -36,6 +39,9 @@ pub(super) fn try_encode(values: &ArrayRef) -> WriteResult<Option<(EncodedPage, 
     };
     let dictionary = dictionary.as_dictionary::<Int32Type>();
     let distinct = dictionary.values();
+    if distinct.is_empty() {
+        return Ok(None);
+    }
 
     // The PLAIN-encoded distinct values are the dictionary page body; their size
     // is arrow's fallback signal.
@@ -45,15 +51,14 @@ pub(super) fn try_encode(values: &ArrayRef) -> WriteResult<Option<(EncodedPage, 
         return Ok(None);
     }
 
-    let indices: Vec<u32> = dictionary
-        .keys()
-        .values()
-        .iter()
-        .map(|&k| k as u32)
-        .collect();
+    let bit_width = index_bit_width(distinct.len());
+    let index_stream = rle::encode(
+        dictionary.keys().iter().flatten().map(|k| k as u32),
+        bit_width,
+    );
     Ok(Some((
         dictionary_page(dict_raw, distinct.len())?,
-        index_page(&indices, index_bit_width(distinct.len()))?,
+        index_page(index_stream, bit_width, values.len(), levels)?,
     )))
 }
 
@@ -75,15 +80,21 @@ fn dictionary_page(raw: Vec<u8>, num_values: usize) -> WriteResult<EncodedPage> 
 
 /// Encode the index data page: a one-byte index bit-width followed by the
 /// RLE/bit-packed indices.
-fn index_page(indices: &[u32], bit_width: u8) -> WriteResult<EncodedPage> {
-    let mut raw = Vec::with_capacity(1 + indices.len());
+fn index_page(
+    index_stream: Vec<u8>,
+    bit_width: u8,
+    num_rows: usize,
+    levels: &DefinitionLevels,
+) -> WriteResult<EncodedPage> {
+    let mut raw = Vec::with_capacity(1 + index_stream.len());
+    pages::encode_definition_levels(&mut raw, levels, num_rows);
     raw.push(bit_width);
-    raw.extend_from_slice(&rle::encode_indices(indices, bit_width));
+    raw.extend_from_slice(&index_stream);
     pages::assemble_page(
-        indices.len() as i64,
+        num_rows as i64,
         raw,
         PageKind::Data {
-            num_values: indices.len(),
+            num_values: num_rows,
             encoding: Encoding::RLE_DICTIONARY,
         },
     )

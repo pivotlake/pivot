@@ -6,28 +6,37 @@
 //! a dictionary page's distinct values.
 
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    StringViewArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, Float32Array, Float64Array, Int32Array,
+    Int64Array, StringArray, StringViewArray,
 };
 use arrow_schema::DataType;
 use thriftparquet::general::Encoding;
 
 use super::super::error::{WriteError, WriteResult};
-use super::super::types::EncodedPage;
+use super::super::types::{DefinitionLevels, EncodedPage};
 use super::pages::{self, PageKind};
 
 /// PLAIN-encode a column chunk: cut it into pages and encode each.
-pub(super) fn encode_chunk(values: &ArrayRef) -> WriteResult<Vec<EncodedPage>> {
+pub(super) fn encode_chunk(
+    values: &ArrayRef,
+    levels: &DefinitionLevels,
+) -> WriteResult<Vec<EncodedPage>> {
+    let mut offset = 0;
     pages::page_slices(values)
-        .iter()
-        .map(encode_data_page)
+        .into_iter()
+        .map(|page| {
+            let page_levels = levels.slice(offset, page.len());
+            offset += page.len();
+            encode_data_page(&page, &page_levels)
+        })
         .collect()
 }
 
 /// Encode one PLAIN data page from a column slice.
-fn encode_data_page(values: &ArrayRef) -> WriteResult<EncodedPage> {
+fn encode_data_page(values: &ArrayRef, levels: &DefinitionLevels) -> WriteResult<EncodedPage> {
     let num_rows = values.len();
     let mut raw = Vec::new();
+    pages::encode_definition_levels(&mut raw, levels, num_rows);
     encode_into(values.as_ref(), &mut raw)?;
     pages::assemble_page(
         num_rows as i64,
@@ -39,28 +48,36 @@ fn encode_data_page(values: &ArrayRef) -> WriteResult<EncodedPage> {
     )
 }
 
-/// Append a required column's PLAIN-encoded values to `out`: fixed-width values
-/// little-endian, BYTE_ARRAY values a length-prefixed copy.
+/// Append the non-null values of a column in PLAIN encoding. Definition levels
+/// carry the logical null rows separately, so the value stream contains only
+/// present values.
 pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<()> {
-    if array.null_count() > 0 {
-        return Err(WriteError::NullsInRequiredColumn {
-            nulls: array.null_count(),
-        });
-    }
     let len = array.len();
     // Fixed-width values: their native little-endian bytes, back to back.
     macro_rules! fixed {
         ($arr:ty) => {{
             let a = downcast::<$arr>(array)?;
-            (0..len).for_each(|i| out.extend_from_slice(&a.value(i).to_le_bytes()));
+            (0..len)
+                .filter(|&i| a.is_valid(i))
+                .for_each(|i| out.extend_from_slice(&a.value(i).to_le_bytes()));
         }};
     }
     // BYTE_ARRAY values: a 4-byte LE length prefix then the bytes.
     macro_rules! byte_array {
         ($arr:ty) => {{
             let a = downcast::<$arr>(array)?;
-            (0..len).for_each(|i| {
+            (0..len).filter(|&i| a.is_valid(i)).for_each(|i| {
                 let bytes = a.value(i).as_bytes();
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(bytes);
+            });
+        }};
+    }
+    macro_rules! binary_array {
+        ($arr:ty) => {{
+            let a = downcast::<$arr>(array)?;
+            (0..len).filter(|&i| a.is_valid(i)).for_each(|i| {
+                let bytes = a.value(i);
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 out.extend_from_slice(bytes);
             });
@@ -73,6 +90,8 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         DataType::Float64 => fixed!(Float64Array),
         DataType::Utf8 => byte_array!(StringArray),
         DataType::Utf8View => byte_array!(StringViewArray),
+        DataType::Binary => binary_array!(BinaryArray),
+        DataType::BinaryView => binary_array!(BinaryViewArray),
         other => return Err(WriteError::UnsupportedType(other.clone())),
     }
     Ok(())

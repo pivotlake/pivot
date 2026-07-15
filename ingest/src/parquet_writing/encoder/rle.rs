@@ -1,7 +1,5 @@
-//! RLE/bit-packed hybrid encoder for dictionary indices — the write-side mirror
-//! of the reader's `RleDecoder`. Produces the run stream a dictionary data page
-//! carries after its one leading bit-width byte (which the data-page builder
-//! prepends).
+//! Parquet RLE/bit-packed hybrid encoder for dictionary indices and definition
+//! levels — the write-side mirror of the reader's `RleDecoder`.
 //!
 //! A faithful port of the Parquet reference encoder (arrow's `RleEncoder`):
 //! values are buffered eight at a time, and each group of eight is emitted as a
@@ -18,10 +16,18 @@ const GROUP: usize = 8;
 
 /// Encode dictionary `indices` as a Parquet RLE/bit-packed hybrid stream at
 /// `bit_width` bits per index (`bit_width >= 1`).
+#[cfg(test)]
 pub(super) fn encode_indices(indices: &[u32], bit_width: u8) -> Vec<u8> {
+    encode(indices.iter().copied(), bit_width)
+}
+
+/// Encode a stream whose values are generated on demand. Definition levels use
+/// this path so a nullable leaf does not allocate an intermediate integer per
+/// row before RLE compression.
+pub(super) fn encode(values: impl IntoIterator<Item = u32>, bit_width: u8) -> Vec<u8> {
     let mut encoder = RleEncoder::new(bit_width);
-    for &index in indices {
-        encoder.put(index);
+    for value in values {
+        encoder.put(value);
     }
     encoder.finish()
 }

@@ -41,7 +41,9 @@ mod assembler;
 mod convert;
 mod encoder;
 mod error;
+mod leaves;
 mod partition;
+mod shredding;
 mod types;
 
 pub(crate) use types::EncodedFile;

@@ -13,6 +13,7 @@ thriftparquet = { workspace = true }
 catalog = { workspace = true }
 
 arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
 # Partitioned/sorted ingest: lexsort + partition (arrow-ord), concat + take
 # (arrow-select), and arrow-json to record each file's partition tuple in the
@@ -23,6 +24,8 @@ arrow-arith = { workspace = true }
 arrow-json = { workspace = true }
 # Dictionary encoding: cast a column to a dictionary array (intern + index).
 arrow-cast = { workspace = true }
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 # In-house Parquet encoding (no upstream `parquet` crate): the shared
 # `thriftparquet` metadata/codec layer plus the same snappy lib the reader uses.
@@ -56,6 +59,7 @@ planner = { workspace = true }
 # Strict, spec-compliant reader used only as a test oracle: if arrow-rs's
 # reader accepts our hand-rolled files, other engines (DuckDB, etc.) will too.
 parquet = { workspace = true }
+parquet-variant-json = { workspace = true }
 # The OTLP-over-gRPC end-to-end test drives a running `Ingestor` from outside:
 # `dispatch`/`catalog` to set up the engine + table and read rows back, and a
 # `tonic` OTLP client (built from `opentelemetry-proto`'s gen-tonic code) to
