@@ -139,8 +139,14 @@ impl Operator {
             Operator::Filter(_) | Operator::OrderBy(_) | Operator::TopN(_) | Operator::Limit(_) => {
                 Ok(inputs[0].clone())
             }
-            // A join emits every probe column followed by every build column.
-            Operator::Join(_) => Ok(inputs[0].iter().chain(inputs[1].iter()).cloned().collect()),
+            // An inner join emits every probe column followed by every build
+            // column; a semi/anti join emits the probe columns only.
+            Operator::Join(join) => match join.mode {
+                dispatch::JoinMode::Inner => {
+                    Ok(inputs[0].iter().chain(inputs[1].iter()).cloned().collect())
+                }
+                dispatch::JoinMode::Semi | dispatch::JoinMode::Anti => Ok(inputs[0].clone()),
+            },
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),
             // EXPLAIN renders its child plan as text, one line per row.

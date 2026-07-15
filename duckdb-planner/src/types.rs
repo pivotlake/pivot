@@ -20,6 +20,9 @@ pub enum ScalarValue {
     UInt16(u16),
     UInt32(u32),
     UInt64(u64),
+    /// `HUGEINT`: DuckDB's 128-bit integer (e.g. a `SUM` result compared
+    /// against a constant).
+    Int128(i128),
     Float32(f32),
     Float64(f64),
     Utf8(String),
@@ -49,6 +52,7 @@ impl fmt::Display for ScalarValue {
             ScalarValue::UInt16(v) => write!(f, "{v}"),
             ScalarValue::UInt32(v) => write!(f, "{v}"),
             ScalarValue::UInt64(v) => write!(f, "{v}"),
+            ScalarValue::Int128(v) => write!(f, "{v}"),
             ScalarValue::Float32(v) => write!(f, "{v}"),
             ScalarValue::Float64(v) => write!(f, "{v}"),
             ScalarValue::Utf8(v) => write!(f, "{v}"),

@@ -797,6 +797,16 @@ uint64_t value_u64(const Value &v) {
 float value_f32(const Value &v) {
 	return v.GetValue<float>();
 }
+// HUGEINT crosses CXX as two halves (no i128 in the bridge); Rust reassembles
+// (hi as i128) << 64 | lo.
+int64_t value_hugeint_hi(const Value &v) {
+	return v.GetValueUnsafe<duckdb::hugeint_t>().upper;
+}
+
+uint64_t value_hugeint_lo(const Value &v) {
+	return v.GetValueUnsafe<duckdb::hugeint_t>().lower;
+}
+
 double value_f64(const Value &v) {
 	return v.GetValue<double>();
 }

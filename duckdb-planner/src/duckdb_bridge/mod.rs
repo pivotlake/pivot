@@ -312,6 +312,9 @@ pub mod ffi {
         fn value_u64(v: &Value) -> u64;
         fn value_f32(v: &Value) -> f32;
         fn value_f64(v: &Value) -> f64;
+        /// HUGEINT halves; Rust reassembles `(hi as i128) << 64 | lo`.
+        fn value_hugeint_hi(v: &Value) -> i64;
+        fn value_hugeint_lo(v: &Value) -> u64;
         fn value_string(v: &Value) -> String;
         fn value_date(v: &Value) -> i32;
         fn value_timestamp(v: &Value) -> i64;

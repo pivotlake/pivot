@@ -24,6 +24,10 @@ pub enum CompareType {
     Greater,
     LessEqual,
     GreaterEqual,
+    /// Null-safe equality (`IS NOT DISTINCT FROM`): two nulls compare equal,
+    /// and the result is never null. DuckDB's subquery flattening emits it
+    /// for correlated equalities.
+    NotDistinct,
 }
 
 impl TryFrom<ExpressionType> for CompareType {
@@ -36,6 +40,7 @@ impl TryFrom<ExpressionType> for CompareType {
             ExpressionType::COMPARE_GREATERTHAN => Ok(CompareType::Greater),
             ExpressionType::COMPARE_LESSTHANOREQUALTO => Ok(CompareType::LessEqual),
             ExpressionType::COMPARE_GREATERTHANOREQUALTO => Ok(CompareType::GreaterEqual),
+            ExpressionType::COMPARE_NOT_DISTINCT_FROM => Ok(CompareType::NotDistinct),
             _ => Err(Error::UnsupportedComparisonType(c)),
         }
     }
@@ -50,6 +55,7 @@ impl Display for CompareType {
             CompareType::Greater => f.write_str(">"),
             CompareType::LessEqual => f.write_str("<="),
             CompareType::GreaterEqual => f.write_str(">="),
+            CompareType::NotDistinct => f.write_str("IS NOT DISTINCT FROM"),
         }
     }
 }
@@ -82,6 +88,7 @@ impl Compare {
             CompareType::Greater => gt,
             CompareType::LessEqual => lt_eq,
             CompareType::GreaterEqual => gt_eq,
+            CompareType::NotDistinct => arrow_ord::cmp::not_distinct,
         };
         let left_builder = self.left.compile()?;
         let right_builder = self.right.compile()?;

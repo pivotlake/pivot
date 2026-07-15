@@ -444,3 +444,57 @@ fn join_with_or_of_condition_groups(mut testing_planner: TestingPlanner) {
 
     assert_eq!(rows, vec![serde_json::json!({"total": 20})]);
 }
+
+#[rstest]
+fn exists_becomes_a_semi_join(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM orders WHERE EXISTS \
+            (SELECT 1 FROM items WHERE i_order = o_key)",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"o_key": 1}, {"o_key": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[rstest]
+fn not_exists_becomes_an_anti_join(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM orders WHERE NOT EXISTS \
+            (SELECT 1 FROM items WHERE i_order = o_key)",
+    );
+
+    assert_eq!(rows, vec![serde_json::json!({"o_key": 3})]);
+}
+
+#[rstest]
+fn in_subquery_on_grouped_keys(mut testing_planner: TestingPlanner) {
+    // The q18 shape: IN over a grouped/HAVING subquery lowers to a semi join.
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM orders WHERE o_key IN \
+            (SELECT i_order FROM items GROUP BY i_order HAVING SUM(i_qty) > 25)",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"o_key": 1}, {"o_key": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}

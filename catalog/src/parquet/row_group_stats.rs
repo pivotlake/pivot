@@ -132,6 +132,10 @@ pub fn row_group_eliminated(
         CompareType::LessEqual => bool_kernel(min, constant, arrow_ord::cmp::gt)?,
         // `col >= k` matches nothing when every value is < k, i.e. max < k.
         CompareType::GreaterEqual => bool_kernel(max, constant, arrow_ord::cmp::lt)?,
+        // Null-safe equality prunes like `=` on the value range, except a row
+        // group whose column holds nulls could still match a null constant;
+        // stats can't prove that, so don't prune.
+        CompareType::NotDistinct => false,
     })
 }
 

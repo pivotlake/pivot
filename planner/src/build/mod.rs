@@ -34,6 +34,7 @@ use crate::operator::{
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, type_from_logical};
+use dispatch::JoinMode;
 
 mod expression;
 mod operator;
@@ -226,40 +227,66 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
 }
 
 /// Translate a general comparison join into pivot's [`Join`]. The supported
-/// shape is an INNER join whose conditions compare plain column refs, with at
-/// least one `Int64` equality; anything else reports the specific gap. The
-/// probe is DuckDB's left child and the build its right, matching its
+/// join types are INNER, SEMI and ANTI (plus their RIGHT_ variants, which
+/// swap the children back so the emitted side probes); conditions must
+/// compare plain column refs, with at least one `Int64` equality. The probe
+/// is the streamed side and the build the hashed side, matching DuckDB's
 /// hash-join convention (the cost model puts the smaller relation on the
-/// right).
+/// build side).
 ///
 /// Every `Int64` equality condition becomes a hash key (the dispatch join
-/// matches on the combined key hash), and EVERY condition — the hash ones
-/// included — is replayed as a Filter over the join's output: the equalities
-/// re-compare the actual columns (screening hash collisions), and any other
-/// comparison applies its predicate, which is equivalent for an INNER join.
+/// matches on the combined key hash). For an INNER join, EVERY condition —
+/// the hash ones included — is replayed as a Filter over the join's output:
+/// the equalities re-compare the actual columns (screening hash collisions),
+/// and any other comparison applies its predicate, which is equivalent for an
+/// INNER join. A SEMI/ANTI join emits probe columns only, so no such filter
+/// can exist; the dispatch probe verifies key equality exactly instead, and
+/// only pure-equality conditions are supported.
 ///
 /// DuckDB's join projection maps (which trim the join's output to the columns
 /// actually used above it) are replayed as a `Projection` on top, since the
-/// dispatch join always emits every probe column followed by every build
-/// column.
+/// dispatch join always emits every probe column (followed, for INNER, by
+/// every build column).
 fn build_join(
     op: LogicalOp<'_>,
     join: ComparisonJoinView<'_>,
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
-    if join.join_type() != JoinType::INNER {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join type: {:?}",
-            join.join_type()
-        )));
+    // The RIGHT_ variants are the optimizer's children-swapped SEMI/ANTI (so
+    // the smaller side builds); swap back to probe-side-emits terms.
+    let (mode, swap_sides) = match join.join_type() {
+        JoinType::INNER => (JoinMode::Inner, false),
+        JoinType::SEMI => (JoinMode::Semi, false),
+        JoinType::ANTI => (JoinMode::Anti, false),
+        JoinType::RIGHT_SEMI => (JoinMode::Semi, true),
+        JoinType::RIGHT_ANTI => (JoinMode::Anti, true),
+        other => {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported join type: {other:?}"
+            )));
+        }
+    };
+    let mut inputs = inputs;
+    if swap_sides {
+        inputs.swap(0, 1);
     }
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
-    let left_map: Vec<usize> = join.left_projection_map().collect();
-    let right_map: Vec<usize> = join.right_projection_map().collect();
+    let (left_map, right_map): (Vec<usize>, Vec<usize>) = if swap_sides {
+        (
+            join.right_projection_map().collect(),
+            join.left_projection_map().collect(),
+        )
+    } else {
+        (
+            join.left_projection_map().collect(),
+            join.right_projection_map().collect(),
+        )
+    };
 
     let mut probe_keys = Vec::new();
     let mut build_keys = Vec::new();
+    let mut null_safe = Vec::new();
     let mut verify_conditions = Vec::new();
     for condition in join.conditions() {
         let (left, right, comparison) = match condition {
@@ -267,45 +294,68 @@ fn build_join(
                 left,
                 right,
                 comparison,
-            } => (left, right, comparison),
+            } => {
+                if swap_sides {
+                    (right, left, comparison)
+                } else {
+                    (left, right, comparison)
+                }
+            }
             // The non-comparison form (an arbitrary boolean over both sides,
             // e.g. q19's OR of predicate groups) is already bound to the
-            // join's combined output, so it filters as-is.
+            // join's combined output, so it filters as-is. Only an INNER join
+            // emits both sides for it to read.
             JoinCondition::Predicate(expr) => {
+                if mode != JoinMode::Inner || swap_sides {
+                    return Err(OperatorError::Unsupported(
+                        "predicate join conditions are only supported on inner joins".to_string(),
+                    ));
+                }
                 verify_conditions.push(Expression::from_handle(expr)?);
                 continue;
             }
         };
-        let Expression::Ref(left) = Expression::from_handle(left)? else {
+        let Expression::Ref(probe_side) = Expression::from_handle(left)? else {
             return Err(OperatorError::Unsupported(
                 "join comparison conditions must compare plain columns".to_string(),
             ));
         };
-        let Expression::Ref(right) = Expression::from_handle(right)? else {
+        let Expression::Ref(build_side) = Expression::from_handle(right)? else {
             return Err(OperatorError::Unsupported(
                 "join comparison conditions must compare plain columns".to_string(),
             ));
         };
-        if comparison == ExpressionType::COMPARE_EQUAL
-            && left.return_type == Type::Int64
-            && right.return_type == Type::Int64
-        {
-            probe_keys.push(left.column_idx);
-            build_keys.push(right.column_idx);
+        let hashable = matches!(
+            comparison,
+            ExpressionType::COMPARE_EQUAL | ExpressionType::COMPARE_NOT_DISTINCT_FROM
+        ) && probe_side.return_type == Type::Int64
+            && build_side.return_type == Type::Int64;
+        if hashable {
+            probe_keys.push(probe_side.column_idx);
+            build_keys.push(build_side.column_idx);
+            null_safe.push(comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM);
         }
-        verify_conditions.push(Expression::Compare(Compare {
-            left: Box::new(Expression::Ref(left)),
-            right: Box::new(Expression::Ref(Ref {
-                column_idx: probe_types.len() + right.column_idx,
-                ..right
-            })),
-            compare_type: comparison.clone().try_into().map_err(|_| {
-                OperatorError::Unsupported(format!(
-                    "Unsupported join comparison type: {comparison:?}"
-                ))
-            })?,
-            return_type: Type::Boolean,
-        }));
+        if mode == JoinMode::Inner {
+            verify_conditions.push(Expression::Compare(Compare {
+                left: Box::new(Expression::Ref(probe_side)),
+                right: Box::new(Expression::Ref(Ref {
+                    column_idx: probe_types.len() + build_side.column_idx,
+                    ..build_side
+                })),
+                compare_type: comparison.clone().try_into().map_err(|_| {
+                    OperatorError::Unsupported(format!(
+                        "Unsupported join comparison type: {comparison:?}"
+                    ))
+                })?,
+                return_type: Type::Boolean,
+            }));
+        } else if !hashable {
+            // The semi/anti probe verifies hash keys exactly, but has nowhere
+            // to evaluate a non-key condition (no build columns come out).
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported semi/anti join condition: {comparison:?}"
+            )));
+        }
     }
     if probe_keys.is_empty() {
         return Err(OperatorError::Unsupported(
@@ -313,34 +363,40 @@ fn build_join(
         ));
     }
 
-    let node = PlanNode {
+    let mut node = PlanNode {
         name: op.name(),
         inputs,
         operator: Operator::Join(Join {
             probe_keys,
             build_keys,
+            null_safe,
+            mode,
         }),
     };
-    let node = PlanNode {
-        name: "JOIN_VERIFY_FILTER".to_string(),
-        inputs: vec![node],
-        operator: Operator::Filter(Filter {
-            conditions: verify_conditions,
-        }),
-    };
+    if !verify_conditions.is_empty() {
+        node = PlanNode {
+            name: "JOIN_VERIFY_FILTER".to_string(),
+            inputs: vec![node],
+            operator: Operator::Filter(Filter {
+                conditions: verify_conditions,
+            }),
+        };
+    }
     if left_map.is_empty() && right_map.is_empty() {
         return Ok(node);
     }
 
     // Replay the projection maps: refs above the join were resolved against
-    // the trimmed output (kept left columns, then kept right columns), so
-    // select exactly those positions out of the join's full concatenation.
+    // the trimmed output (kept probe columns then, for INNER, kept build
+    // columns), so select exactly those positions out of the join's output.
     let left_kept = if left_map.is_empty() {
         (0..probe_types.len()).collect()
     } else {
         left_map
     };
-    let right_kept = if right_map.is_empty() {
+    let right_kept: Vec<usize> = if mode != JoinMode::Inner {
+        Vec::new()
+    } else if right_map.is_empty() {
         (0..build_types.len()).collect()
     } else {
         right_map

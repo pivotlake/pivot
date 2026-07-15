@@ -88,6 +88,7 @@ mod limit;
 mod order_by_limit;
 
 pub use copy_out::CopyOutFactory;
+pub use join::JoinMode;
 pub(crate) use join::create_join_factories;
 pub use limit::LimitFactory;
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};

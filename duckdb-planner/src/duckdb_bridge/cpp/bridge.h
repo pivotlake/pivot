@@ -170,6 +170,8 @@ uint16_t value_u16(const Value &v);
 uint32_t value_u32(const Value &v);
 uint64_t value_u64(const Value &v);
 float value_f32(const Value &v);
+int64_t value_hugeint_hi(const Value &v);
+uint64_t value_hugeint_lo(const Value &v);
 double value_f64(const Value &v);
 rust::String value_string(const Value &v);
 int32_t value_date(const Value &v);

@@ -17,15 +17,15 @@ use crate::memory::SlabAllocator;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::join::build::{filter_null_keys, hash_key_row};
+use crate::operations::unary::join::build::{filter_null_keys, hash_key_row, strict_key_columns};
 use crate::operations::unary::join::directory::{Directory, PtrBuffer, prefetch_ptr_l2};
 use crate::operations::unary::join::primitive_builder::JoinPrimitiveBuilder;
-use crate::operations::unary::join::{JoinArena, JoinTable};
+use crate::operations::unary::join::{JoinArena, JoinMode, JoinTable};
 use ahash::RandomState;
 use arrow::compute::take;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int64Type, UInt32Type};
-use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{Field, Schema};
 use std::cmp::min;
 use std::mem;
@@ -39,9 +39,17 @@ pub struct Probe {
     table: JoinTable,
     hash_state: RandomState,
     key_columns: Vec<usize>,
+    /// The key columns' indices in the build payload, used by the semi/anti
+    /// modes' exact match verification.
+    build_key_columns: Vec<usize>,
+    /// Aligned with `key_columns`: `true` for a null-safe key (see the build
+    /// side's field of the same name).
+    null_safe: Vec<bool>,
+    mode: JoinMode,
     use_probe_array: bool,
     allocator: SlabAllocator,
-    /// Probe fields followed by build payload fields; built on first batch.
+    /// Probe fields followed (for an inner join) by build payload fields;
+    /// built on first batch.
     output_schema: Option<Arc<Schema>>,
 }
 
@@ -50,17 +58,135 @@ impl Probe {
         table: JoinTable,
         hash_state: RandomState,
         key_columns: Vec<usize>,
+        build_key_columns: Vec<usize>,
+        null_safe: Vec<bool>,
+        mode: JoinMode,
         use_probe_array: bool,
     ) -> Self {
         Self {
             table,
             hash_state,
             key_columns,
+            build_key_columns,
+            null_safe,
+            mode,
             use_probe_array,
             allocator: SlabAllocator::new(false),
             output_schema: None,
         }
     }
+
+    /// Semi/anti probe over one batch: for each probe row decide whether some
+    /// build row's keys equal its keys — verified exactly against the build
+    /// payload's key columns, since no downstream filter can re-check a match
+    /// that emits probe columns only — and emit the row for a match (semi) or
+    /// for no match (anti). A row with a null key matches nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn run_existence<S: Sender<RecordBatch>, B>(
+        &mut self,
+        directory: &Directory<B>,
+        keys: &JoinArena<u64>,
+        rows: &JoinArena<u32>,
+        build_rows: &RecordBatch,
+        build_key_columns: &[usize],
+        batch: &RecordBatch,
+        sender: &mut S,
+    ) -> unary::Result<()>
+    where
+        B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
+    {
+        let probe_keys: Vec<&Int64Array> = self
+            .key_columns
+            .iter()
+            .map(|&c| batch.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let build_keys: Vec<&Int64Array> = build_key_columns
+            .iter()
+            .map(|&c| build_rows.column(c).as_primitive::<Int64Type>())
+            .collect();
+        let emit_on_match = self.mode == JoinMode::Semi;
+        let null_safe = self.null_safe.clone();
+
+        let output_schema = self
+            .output_schema
+            .get_or_insert_with(|| batch.schema())
+            .clone();
+
+        let mut sel =
+            JoinPrimitiveBuilder::<UInt32Type>::new(&mut self.allocator, RECORD_BATCH_SIZE);
+        let mut output_idx = 0;
+        for row in 0..batch.num_rows() {
+            // A null in a strict key column matches nothing; a null-safe
+            // column's null hashes and compares through its validity.
+            let strict_valid = probe_keys
+                .iter()
+                .zip(&null_safe)
+                .all(|(column, &null_safe)| null_safe || column.is_valid(row));
+            let matched = strict_valid && {
+                let hash = hash_key_row(&self.hash_state, &probe_keys, &null_safe, row);
+                directory.matches_bloom(hash) && {
+                    let slot = directory.slot_for(hash);
+                    let start = directory.end_ptr(slot as isize);
+                    let end = directory.end_ptr((slot + 1) as isize);
+                    (start..end).any(|j| {
+                        keys[j] == hash
+                            && build_keys.iter().zip(&probe_keys).zip(&null_safe).all(
+                                |((b, p), &null_safe)| {
+                                    let build_row = rows[j] as usize;
+                                    if null_safe {
+                                        match (b.is_valid(build_row), p.is_valid(row)) {
+                                            (true, true) => b.value(build_row) == p.value(row),
+                                            (false, false) => true,
+                                            _ => false,
+                                        }
+                                    } else {
+                                        b.value(build_row) == p.value(row)
+                                    }
+                                },
+                            )
+                    })
+                }
+            };
+            if matched == emit_on_match {
+                sel.write(output_idx, row as u32);
+                output_idx += 1;
+                if output_idx == RECORD_BATCH_SIZE {
+                    let sel_array = mem::replace(
+                        &mut sel,
+                        JoinPrimitiveBuilder::<UInt32Type>::new(
+                            &mut self.allocator,
+                            RECORD_BATCH_SIZE,
+                        ),
+                    )
+                    .into_array(output_idx);
+                    send_selected(batch, &sel_array, &output_schema, sender)?;
+                    output_idx = 0;
+                }
+            }
+        }
+        if output_idx > 0 {
+            let sel_array = sel.into_array(output_idx);
+            send_selected(batch, &sel_array, &output_schema, sender)?;
+        }
+        Ok(())
+    }
+}
+
+/// Emit the probe rows selected by `sel` (semi/anti output: probe columns
+/// only).
+fn send_selected<S: Sender<RecordBatch>>(
+    batch: &RecordBatch,
+    sel: &ArrayRef,
+    schema: &Arc<Schema>,
+    sender: &mut S,
+) -> unary::Result<()> {
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| take(column, sel, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    sender.send(RecordBatch::try_new(schema.clone(), columns)?)?;
+    Ok(())
 }
 
 /// The per-batch probe state: scans the precomputed key `hashes` against the
@@ -375,11 +501,34 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
 
         let build_rows = unsafe { &*self.table.build_rows.get() };
         let Some(build_rows) = build_rows else {
-            // Empty build side: an inner join emits nothing.
+            // Empty build side: nothing matches, so an inner or semi join
+            // emits nothing and an anti join passes every probe row through.
+            if self.mode == JoinMode::Anti && batch.num_rows() > 0 {
+                sender.send(batch)?;
+            }
             return Ok(());
         };
 
-        let batch = filter_null_keys(batch, &self.key_columns);
+        if self.mode != JoinMode::Inner {
+            let directory = unsafe { &*self.table.directory.get() };
+            let keys = unsafe { &*self.table.keys.get() };
+            let rows = unsafe { &*self.table.rows.get() };
+            let build_key_columns = self.build_key_columns.clone();
+            return self.run_existence(
+                directory,
+                keys,
+                rows,
+                build_rows,
+                &build_key_columns,
+                &batch,
+                sender,
+            );
+        }
+
+        let batch = filter_null_keys(
+            batch,
+            &strict_key_columns(&self.key_columns, &self.null_safe),
+        );
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -389,7 +538,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
             .map(|&c| batch.column(c).as_primitive::<Int64Type>())
             .collect();
         let hashes: Vec<u64> = (0..batch.num_rows())
-            .map(|i| hash_key_row(&self.hash_state, &key_columns, i))
+            .map(|i| hash_key_row(&self.hash_state, &key_columns, &self.null_safe, i))
             .collect();
 
         let output_schema = self

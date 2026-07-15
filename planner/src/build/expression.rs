@@ -16,15 +16,15 @@ use duckdb_planner::handle::{
     AggregateFunc as AggregateFuncHandle, Between as BetweenHandle, Case as CaseHandle,
     Cast as CastHandle, Compare as CompareHandle, Conjunction as ConjunctionHandle,
     Expression as DuckExpression, Function as FunctionHandle, InList as InListHandle,
-    Not as NotHandle, Ref as RefHandle,
+    IsNull as IsNullHandle, Not as NotHandle, Ref as RefHandle,
 };
 use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Expression, Function, InList, IntervalArithmetic, IsNull, Length, Not, NumericAggregate,
+    Prefix, Ref, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -47,6 +47,7 @@ impl Expression {
             DuckExpression::Conjunction(c) => Expression::Conjunction(Conjunction::from_handle(c)?),
             DuckExpression::Case(c) => Expression::Case(Case::from_handle(c)?),
             DuckExpression::Not(n) => Expression::Not(Not::from_handle(n)?),
+            DuckExpression::IsNull(n) => Expression::IsNull(IsNull::from_handle(n)?),
             DuckExpression::Cast(c) => Cast::from_handle(c)?,
             DuckExpression::Unsupported(t) => return Err(Error::UnsupportedExpressionType(t)),
         })
@@ -95,6 +96,15 @@ impl Not {
     pub(crate) fn from_handle(view: NotHandle<'_>) -> Result<Not, Error> {
         Ok(Not {
             input: Box::new(Expression::from_handle(view.input())?),
+        })
+    }
+}
+
+impl IsNull {
+    pub(crate) fn from_handle(view: IsNullHandle<'_>) -> Result<IsNull, Error> {
+        Ok(IsNull {
+            input: Box::new(Expression::from_handle(view.input())?),
+            negated: view.negated(),
         })
     }
 }

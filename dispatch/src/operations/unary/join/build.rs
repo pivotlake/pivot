@@ -41,6 +41,9 @@ pub(crate) struct BuildWorkerOutput {
 
 pub struct JoinBuildConsumer {
     key_columns: Vec<usize>,
+    /// Aligned with `key_columns`: `true` for a null-safe (`IS NOT DISTINCT
+    /// FROM`) key, where two nulls match each other.
+    null_safe: Vec<bool>,
     worker_id: usize,
     hash_state: RandomState,
     values: PartitionBuffers,
@@ -56,8 +59,10 @@ unsafe impl Send for JoinBuildConsumer {}
 
 impl JoinBuildConsumer {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         key_columns: Vec<usize>,
+        null_safe: Vec<bool>,
         worker_id: usize,
         hash_state: RandomState,
         sender: mpsc::Sender<BuildWorkerOutput>,
@@ -74,6 +79,7 @@ impl JoinBuildConsumer {
     ) -> Self {
         Self {
             key_columns,
+            null_safe,
             worker_id,
             hash_state,
             values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
@@ -98,8 +104,20 @@ impl JoinBuildConsumer {
     }
 }
 
-/// Drop rows where any join-key column is null: an inner equi-join can never
-/// match them, and the hot loops read key values without validity checks.
+/// The key columns whose comparison is strict equality (`= `), where a null
+/// never matches and the row can be dropped up front.
+pub(crate) fn strict_key_columns(key_columns: &[usize], null_safe: &[bool]) -> Vec<usize> {
+    key_columns
+        .iter()
+        .zip(null_safe)
+        .filter(|&(_, &null_safe)| !null_safe)
+        .map(|(&column, _)| column)
+        .collect()
+}
+
+/// Drop rows where any strict join-key column is null: an equi-join can never
+/// match them. Null-safe (`IS NOT DISTINCT FROM`) keys keep their null rows,
+/// which hash and compare through their validity bit.
 pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> RecordBatch {
     let mut mask: Option<BooleanArray> = None;
     for &key_column in key_columns {
@@ -119,22 +137,34 @@ pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> Rec
     filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
 }
 
-/// The combined hash of one row's key columns. A single column hashes exactly
-/// as `RandomState::hash_one(value)` does; more columns fold in through the
-/// same hasher.
+/// The combined hash of one row's key columns. A single strict column hashes
+/// exactly as `RandomState::hash_one(value)` does; more columns fold in
+/// through the same hasher. A null-safe key folds its validity bit and reads
+/// null as 0, so two nulls hash (and later compare) equal.
 #[inline(always)]
 pub(crate) fn hash_key_row(
     hash_state: &RandomState,
     columns: &[&arrow_array::Int64Array],
+    null_safe: &[bool],
     row: usize,
 ) -> u64 {
-    if let [column] = columns {
+    if let ([column], [false]) = (columns, null_safe) {
         return hash_state.hash_one(unsafe { column.value_unchecked(row) });
     }
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = hash_state.build_hasher();
-    for column in columns {
-        hasher.write_i64(unsafe { column.value_unchecked(row) });
+    for (column, &null_safe) in columns.iter().zip(null_safe) {
+        if null_safe {
+            let valid = column.is_valid(row);
+            hasher.write_u8(valid as u8);
+            hasher.write_i64(if valid {
+                unsafe { column.value_unchecked(row) }
+            } else {
+                0
+            });
+        } else {
+            hasher.write_i64(unsafe { column.value_unchecked(row) });
+        }
     }
     hasher.finish()
 }
@@ -144,7 +174,10 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 
     fn consume<S: Sender<()>>(&mut self, batch: RecordBatch, _sender: &mut S) -> unary::Result<()> {
         debug!("Consuming build");
-        let batch = filter_null_keys(batch, &self.key_columns);
+        let batch = filter_null_keys(
+            batch,
+            &strict_key_columns(&self.key_columns, &self.null_safe),
+        );
         let columns: Vec<&arrow_array::Int64Array> = self
             .key_columns
             .iter()
@@ -157,7 +190,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
         );
 
         for i in 0..n {
-            let hash = hash_key_row(&self.hash_state, &columns, i);
+            let hash = hash_key_row(&self.hash_state, &columns, &self.null_safe, i);
             let partition = (hash >> PARTITION_SHIFT) as usize;
             self.values[partition].push(
                 &mut self.slab_allocator,

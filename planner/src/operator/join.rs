@@ -9,7 +9,7 @@
 //! always emits the full concatenation.
 
 use crate::compile::Error;
-use dispatch::RecordBatchOperatorSpec;
+use dispatch::{JoinMode, RecordBatchOperatorSpec};
 use std::fmt;
 
 /// Inner hash equi-join on one or more key columns per side (`probe_keys[i]`
@@ -22,14 +22,20 @@ pub struct Join {
     pub probe_keys: Vec<usize>,
     /// The keys' column indices in the build (second) input's output.
     pub build_keys: Vec<usize>,
+    /// Aligned with the keys: `true` for a null-safe (`IS NOT DISTINCT FROM`)
+    /// key, where two nulls match each other.
+    pub null_safe: Vec<bool>,
+    /// Which rows come out: `Inner` emits probe plus build columns per match;
+    /// `Semi`/`Anti` emit probe columns only, by match existence.
+    pub mode: JoinMode,
 }
 
 impl fmt::Display for Join {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Join(probe_keys: {:?}, build_keys: {:?})",
-            self.probe_keys, self.build_keys
+            "Join({:?}, probe_keys: {:?}, build_keys: {:?})",
+            self.mode, self.probe_keys, self.build_keys
         )
     }
 }
@@ -40,6 +46,12 @@ impl Join {
         probe: RecordBatchOperatorSpec,
         build: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        Ok(probe.join(build, self.build_keys.clone(), self.probe_keys.clone()))
+        Ok(probe.join(
+            build,
+            self.build_keys.clone(),
+            self.probe_keys.clone(),
+            self.null_safe.clone(),
+            self.mode,
+        ))
     }
 }

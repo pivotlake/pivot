@@ -24,6 +24,7 @@ mod divide;
 mod function;
 mod in_list;
 mod interval;
+mod is_null;
 mod length;
 mod not;
 mod prefix;
@@ -47,6 +48,7 @@ pub use divide::Divide;
 pub use function::{Function, ScalarFunctionSignature, builtin_scalar_function};
 pub use in_list::InList;
 pub use interval::IntervalArithmetic;
+pub use is_null::IsNull;
 pub use length::Length;
 pub use not::Not;
 pub use prefix::Prefix;
@@ -110,6 +112,7 @@ pub enum Expression {
     Conjunction(Conjunction),
     Case(Case),
     Not(Not),
+    IsNull(IsNull),
     Cast(Cast),
 }
 
@@ -139,6 +142,7 @@ impl Expression {
                     + c.else_expr.count_kernels()
             }
             Expression::Not(n) => 1 + n.input.count_kernels(),
+            Expression::IsNull(n) => 1 + n.input.count_kernels(),
             Expression::Cast(c) => 1 + c.source.count_kernels(),
         }
     }
@@ -158,7 +162,8 @@ impl Expression {
             | Expression::Between(_)
             | Expression::InList(_)
             | Expression::Conjunction(_)
-            | Expression::Not(_) => Ok(Type::Boolean),
+            | Expression::Not(_)
+            | Expression::IsNull(_) => Ok(Type::Boolean),
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
@@ -186,6 +191,7 @@ impl Expression {
             Expression::Conjunction(c) => c.compile(),
             Expression::Case(c) => c.compile(),
             Expression::Not(n) => n.compile(),
+            Expression::IsNull(n) => n.compile(),
             Expression::Cast(c) => c.compile(),
             _ => Err(compile::Error::UnsupportedExpression(self.clone())),
         }
@@ -205,6 +211,7 @@ impl Display for Expression {
             Expression::Conjunction(c) => write!(f, "{c}"),
             Expression::Case(c) => write!(f, "{c}"),
             Expression::Not(n) => write!(f, "{n}"),
+            Expression::IsNull(n) => write!(f, "{n}"),
             Expression::Cast(c) => write!(f, "{c}"),
         }
     }

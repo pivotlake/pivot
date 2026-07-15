@@ -203,6 +203,13 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::UInt16(v) => Arc::new(UInt16Array::new_scalar(v).into_inner()),
         ScalarValue::UInt32(v) => Arc::new(UInt32Array::new_scalar(v).into_inner()),
         ScalarValue::UInt64(v) => Arc::new(UInt64Array::new_scalar(v).into_inner()),
+        // HUGEINT carries the arrow type SUM emits (`Decimal128(38, 0)`, see
+        // `Type::Int128`), so a HAVING's comparison sees matching types.
+        ScalarValue::Int128(v) => Arc::new(
+            arrow_array::Decimal128Array::from(vec![v])
+                .with_precision_and_scale(38, 0)
+                .expect("38,0 is a valid decimal width"),
+        ),
         ScalarValue::Float32(v) => Arc::new(Float32Array::new_scalar(v).into_inner()),
         ScalarValue::Float64(v) => Arc::new(Float64Array::new_scalar(v).into_inner()),
         ScalarValue::Utf8(v) => Arc::new(StringViewArray::new_scalar(v).into_inner()),

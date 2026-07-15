@@ -28,6 +28,22 @@ use arrow_array::RecordBatch;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
 
+/// Which rows a join emits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JoinMode {
+    /// One row per matching (probe, build) pair: probe columns then build
+    /// columns. Matches are decided on the combined key hash; the caller
+    /// re-verifies key equality on the output.
+    Inner,
+    /// Each probe row at most once, when some build row's keys equal its keys
+    /// (verified exactly against the build payload). Probe columns only.
+    Semi,
+    /// Each probe row exactly when NO build row's keys equal its keys (a
+    /// probe row with a null key matches nothing, so it is emitted). Probe
+    /// columns only.
+    Anti,
+}
+
 /// A fixed-length, index-addressed heap buffer for the join's key/row arenas.
 ///
 /// Deliberately plain heap (not ring slabs): the join table is shared through
@@ -170,7 +186,13 @@ mod tests {
     ) -> JoinResult {
         init_test_free_pool(16);
         let workers = build_worker_batches.len();
-        let (builds, probes, gate) = factory::create_for_workers(vec![0], vec![0], workers);
+        let (builds, probes, gate) = factory::create_for_workers(
+            vec![0],
+            vec![0],
+            vec![false],
+            super::JoinMode::Inner,
+            workers,
+        );
 
         let mut consumers: Vec<_> = builds
             .into_iter()

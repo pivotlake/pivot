@@ -58,9 +58,9 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
-    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, KeyExtractor,
-    LimitFactory, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
-    UnaryFactory, UnaryOperator, UnaryOperatorFactory, create_join_factories,
+    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinMode,
+    KeyExtractor, LimitFactory, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    OrderByLimitFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -579,15 +579,28 @@ impl RecordBatchOperatorSpec {
     /// completion first (populating the shared join table); only then is the
     /// probe stage appended to `self`. Coordination is by sequencing plus the
     /// shared table, not a fused binary operator.
+    /// `mode` selects which rows come out (see [`JoinMode`]): `Inner` emits
+    /// probe plus build columns per matching pair; `Semi`/`Anti` emit probe
+    /// columns only, per probe row with/without a verified match.
+    /// `null_safe` aligns with the key columns: `true` marks an
+    /// `IS NOT DISTINCT FROM` key, where two nulls match each other; a strict
+    /// key's null rows never match and are dropped up front.
     pub fn join(
         self,
         build: RecordBatchOperatorSpec,
         build_key_columns: Vec<usize>,
         probe_key_columns: Vec<usize>,
+        null_safe: Vec<bool>,
+        mode: JoinMode,
     ) -> Self {
         let worker_count = self.worker_count();
-        let (build_factories, probe_factories, _gate) =
-            create_join_factories(build_key_columns, probe_key_columns, worker_count);
+        let (build_factories, probe_factories, _gate) = create_join_factories(
+            build_key_columns,
+            probe_key_columns,
+            null_safe,
+            mode,
+            worker_count,
+        );
 
         // Run the build dataflow to completion. Each build head feeds a JoinBuild
         // unary sink (RecordBatch -> ()) that populates the shared hash table; the

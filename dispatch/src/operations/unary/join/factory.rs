@@ -11,12 +11,13 @@ use crate::operations::unary::join::build::{
 };
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::probe::Probe;
-use crate::operations::unary::join::{JoinArena, JoinCell, JoinTable};
+use crate::operations::unary::join::{JoinArena, JoinCell, JoinMode, JoinTable};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
 pub struct JoinBuildFactory {
     key_columns: Vec<usize>,
+    null_safe: Vec<bool>,
     worker_id: usize,
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
@@ -37,6 +38,9 @@ pub struct JoinProbeFactory {
     pub(crate) table: JoinTable,
     hash_state: RandomState,
     key_columns: Vec<usize>,
+    build_key_columns: Vec<usize>,
+    null_safe: Vec<bool>,
+    mode: JoinMode,
     use_probe_array: bool,
 }
 
@@ -51,6 +55,8 @@ pub struct JoinProbeFactory {
 pub fn create_for_workers(
     build_key_columns: Vec<usize>,
     probe_key_columns: Vec<usize>,
+    null_safe: Vec<bool>,
+    mode: JoinMode,
     worker_count: usize,
 ) -> (
     impl IntoIterator<Item = JoinBuildFactory>,
@@ -72,6 +78,7 @@ pub fn create_for_workers(
     let (tx, rx) = mpsc::channel();
     let mut rx_opt = Some(rx);
 
+    let build_keys_probe = build_key_columns.clone();
     let dir_clone = directory.clone();
     let keys_clone = keys.clone();
     let rows_clone = rows.clone();
@@ -80,8 +87,10 @@ pub fn create_for_workers(
     let gate_ret = gate.clone();
     let gate_probe = gate.clone();
 
+    let null_safe_probe = null_safe.clone();
     let build_factories = (0..worker_count).map(move |worker_id| JoinBuildFactory {
         key_columns: build_key_columns.clone(),
+        null_safe: null_safe.clone(),
         worker_id,
         hash_state: hash_state.clone(),
         partition_sizes: partition_sizes.clone(),
@@ -107,6 +116,9 @@ pub fn create_for_workers(
         },
         hash_state: hs_clone.clone(),
         key_columns: probe_key_columns.clone(),
+        build_key_columns: build_keys_probe.clone(),
+        null_safe: null_safe_probe.clone(),
+        mode,
         use_probe_array,
     });
 
@@ -119,6 +131,7 @@ impl UnaryFactory<RecordBatch, ()> for JoinBuildFactory {
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
             self.key_columns,
+            self.null_safe,
             self.worker_id,
             self.hash_state,
             self.sender,
@@ -144,6 +157,9 @@ impl UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory {
             self.table,
             self.hash_state,
             self.key_columns,
+            self.build_key_columns,
+            self.null_safe,
+            self.mode,
             self.use_probe_array,
         )
     }

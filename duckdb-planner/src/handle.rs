@@ -46,6 +46,9 @@ fn scalar_from_value(v: &ffi::Value) -> ScalarValue {
         L::USMALLINT => ScalarValue::UInt16(ffi::value_u16(v)),
         L::UINTEGER => ScalarValue::UInt32(ffi::value_u32(v)),
         L::UBIGINT => ScalarValue::UInt64(ffi::value_u64(v)),
+        L::HUGEINT => ScalarValue::Int128(
+            ((ffi::value_hugeint_hi(v) as i128) << 64) | ffi::value_hugeint_lo(v) as i128,
+        ),
         L::FLOAT => ScalarValue::Float32(ffi::value_f32(v)),
         L::DOUBLE => ScalarValue::Float64(ffi::value_f64(v)),
         L::VARCHAR => ScalarValue::Utf8(ffi::value_string(v)),
@@ -610,6 +613,9 @@ impl<'plan> Expr<'plan> {
             }
             T::CASE_EXPR => Expression::Case(Case { raw: self.raw }),
             T::OPERATOR_NOT => Expression::Not(Not { raw: self.raw }),
+            T::OPERATOR_IS_NULL | T::OPERATOR_IS_NOT_NULL => {
+                Expression::IsNull(IsNull { raw: self.raw })
+            }
             T::OPERATOR_CAST => Expression::Cast(Cast { raw: self.raw }),
             other => Expression::Unsupported(other),
         }
@@ -638,6 +644,8 @@ pub enum Expression<'plan> {
     Case(Case<'plan>),
     /// Logical negation (`NOT expr`).
     Not(Not<'plan>),
+    /// `expr IS [NOT] NULL`.
+    IsNull(IsNull<'plan>),
     /// A type cast.
     Cast(Cast<'plan>),
     /// Any expression type the consumer doesn't handle, carrying the raw type.
@@ -665,6 +673,8 @@ define_handles! { ffi::Expression;
     Case,
     /// Logical negation (`NOT expr`).
     Not,
+    /// `expr IS [NOT] NULL`.
+    IsNull,
     /// A type cast (`CAST(child AS return_type)`).
     Cast,
 }
@@ -841,6 +851,20 @@ impl<'plan> Not<'plan> {
         Expr {
             raw: ffi::expr_operator_child(self.raw, 0),
         }
+    }
+}
+
+impl<'plan> IsNull<'plan> {
+    /// The tested operand (a single child).
+    pub fn input(self) -> Expr<'plan> {
+        Expr {
+            raw: ffi::expr_operator_child(self.raw, 0),
+        }
+    }
+
+    /// `true` for `IS NOT NULL`, `false` for `IS NULL`.
+    pub fn negated(self) -> bool {
+        ExpressionType::from_u8(ffi::expr_type(self.raw)) == ExpressionType::OPERATOR_IS_NOT_NULL
     }
 }
 
