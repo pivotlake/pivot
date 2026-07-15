@@ -233,6 +233,11 @@ static bool remove_delim_get_join(duckdb::unique_ptr<duckdb::LogicalOperator> &j
 	if (!filter_expressions.empty()) {
 		auto new_filter = duckdb::make_uniq<duckdb::LogicalFilter>();
 		new_filter->expressions = std::move(filter_expressions);
+		// Keep the child's row estimate visible: downstream planning (e.g.
+		// picking which side of an existence join to build on) reads it.
+		if (replacement->has_estimated_cardinality) {
+			new_filter->SetEstimatedCardinality(replacement->estimated_cardinality);
+		}
 		new_filter->children.emplace_back(std::move(replacement));
 		replacement = std::move(new_filter);
 	}

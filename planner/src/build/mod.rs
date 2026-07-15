@@ -274,8 +274,8 @@ fn build_join(
     let emit_child = usize::from(swap_sides);
     let build_on_emit = existence.is_some()
         && match (
-            op.child(emit_child).estimated_cardinality(),
-            op.child(1 - emit_child).estimated_cardinality(),
+            subtree_estimate(op.child(emit_child)),
+            subtree_estimate(op.child(1 - emit_child)),
         ) {
             (Some(emit), Some(other)) => emit < other,
             _ => false,
@@ -474,6 +474,23 @@ fn build_join(
         inputs: vec![node],
         operator: Operator::Projection(Projection { projections }),
     })
+}
+
+/// The optimizer's row estimate for `op`, read off the nearest node that
+/// carries one down a single-child chain (a filter or projection synthesized
+/// after optimization has none of its own, and pass-through operators only
+/// shrink rows, so a descendant's estimate still orders two sides).
+fn subtree_estimate(op: LogicalOp<'_>) -> Option<u64> {
+    let mut current = op;
+    loop {
+        if let Some(estimate) = current.estimated_cardinality() {
+            return Some(estimate);
+        }
+        if current.child_count() != 1 {
+            return None;
+        }
+        current = current.child(0);
+    }
 }
 
 /// A scan's projected output columns (and a filter's `projection_map`), each a
