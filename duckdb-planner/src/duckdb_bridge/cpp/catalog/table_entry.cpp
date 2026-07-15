@@ -9,15 +9,28 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
-
-#include <cstdio>
 
 using namespace duckdb;
 
 static BindInfo PivotScanGetBindInfo(const optional_ptr<FunctionData> bind_data) {
 	auto &data = bind_data->Cast<PivotScanBindData>();
 	return BindInfo(data.catalog_entry);
+}
+
+// Feed DuckDB's cost model the table's real size. The optimizer reaches this
+// through LogicalGet::EstimateCardinality, and the join order optimizer's
+// relation stats build on it — so join ordering (and with it the hash join's
+// build/probe side choice) sees actual row counts instead of the default
+// guess. Returning null means "unknown" and keeps DuckDB's defaults.
+static unique_ptr<NodeStatistics> PivotScanCardinality(ClientContext &context, const FunctionData *bind_data) {
+	auto &data = bind_data->Cast<PivotScanBindData>();
+	auto estimate = table_estimate_row_count(data.table);
+	if (!estimate.known) {
+		return nullptr;
+	}
+	return make_uniq<NodeStatistics>(estimate.rows, estimate.rows);
 }
 
 // Walk an expression tree and rewrite every BoundReferenceExpression's index
@@ -135,12 +148,14 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	func.late_materialization = true;
 	func.get_virtual_columns = PivotScanGetVirtualColumns;
 	func.get_row_id_columns = PivotScanGetRowIdColumns;
+	func.cardinality = PivotScanCardinality;
 	return func;
 }
 
+// Per-column statistics (min/max, distinct counts) are not plumbed from the
+// Rust catalog; table-level cardinality (PivotScanCardinality) is. Null means
+// "unknown" and is always safe.
 unique_ptr<BaseStatistics> PivotTableCatalogEntry::GetStatistics(ClientContext &context, column_t column_id) {
-	std::fprintf(stderr, "[PivotTableCatalogEntry::GetStatistics] reached, column_id=%llu\n",
-	             static_cast<unsigned long long>(column_id));
 	return nullptr;
 }
 

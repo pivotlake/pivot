@@ -10,7 +10,7 @@ pub mod duckdb_types;
 
 use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, catalog_get_scalar_function, catalog_get_table,
-    catalog_get_table_function, pushdown_filter,
+    catalog_get_table_function, pushdown_filter, table_estimate_row_count,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -63,6 +63,14 @@ pub mod ffi {
         pub function: ScalarFunctionDef,
     }
 
+    /// A table's estimated total row count for DuckDB's cost model.
+    /// `known = false` when the backend has no metadata-only answer; DuckDB
+    /// then uses its own defaults.
+    struct CardinalityEstimate {
+        pub known: bool,
+        pub rows: u64,
+    }
+
     /// Outcome of `extract_plan`.
     ///
     /// On success `error_kind` is empty and `plan` owns DuckDB's resolved plan
@@ -94,6 +102,7 @@ pub mod ffi {
             name: &str,
         ) -> CatalogGetScalarFunctionResult;
         fn pushdown_filter(table: &mut OptionalTableWrapper, expr: &Expression) -> Result<bool>;
+        fn table_estimate_row_count(table: &OptionalTableWrapper) -> CardinalityEstimate;
     }
 
     unsafe extern "C++" {

@@ -308,6 +308,22 @@ impl Table for TableBinding {
         let parquet = self.resolve_files(ctx).ok()?;
         Some(parquet.row_groups().iter().map(|rg| rg.num_rows).sum())
     }
+
+    fn estimate_row_count(&self, ctx: &dyn QueryContext) -> Option<u64> {
+        // A planning estimate wants the base table's full size — pushed
+        // predicates and partition pruning deliberately don't apply, since the
+        // cost model accounts for filter selectivity itself. Resolve the whole
+        // (unfiltered) file set and sum the footers' row-group counts.
+        let ctx = ctx.as_any().downcast_ref::<super::ParquetQueryContext>()?;
+        let parquet = ctx.parquet(&self.name, std::iter::empty()).ok()?;
+        Some(
+            parquet
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows as u64)
+                .sum(),
+        )
+    }
 }
 
 /// `a < b` over two single-value scalars of the same physical type. A null,

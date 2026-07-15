@@ -126,6 +126,16 @@ impl Table for TestTable {
             projection,
         ))
     }
+
+    fn estimate_row_count(&self, _ctx: &dyn planner::catalog::QueryContext) -> Option<u64> {
+        Some(
+            self.parquet_table
+                .row_groups()
+                .iter()
+                .map(|rg| rg.num_rows as u64)
+                .sum(),
+        )
+    }
 }
 
 /// In-memory catalog used by tests. Pre-populated with `example_table` (see

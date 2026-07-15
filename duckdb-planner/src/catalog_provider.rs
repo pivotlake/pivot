@@ -45,6 +45,15 @@ pub trait DuckDBTable: Any {
     fn pushdown_filter(&mut self, _filter: Expr<'_>) -> Result<bool> {
         Ok(false)
     }
+
+    /// The table's total row count, if the backend can answer from metadata
+    /// alone. Feeds DuckDB's cardinality hook during optimization, so its cost
+    /// model (join ordering, hash-join build/probe side choice) sees real
+    /// table sizes. `None` means unknown; DuckDB then falls back to its own
+    /// defaults.
+    fn estimate_row_count(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Newtype around `Option<Box<dyn DuckDBTable>>` needed because CXX cannot declare
@@ -172,4 +181,18 @@ pub(crate) fn pushdown_filter(
         .as_mut()
         .ok_or_else(|| -> Error { "pushdown_filter called on unbound table".into() })?;
     table.pushdown_filter(Expr::from_raw(expr))
+}
+
+pub(crate) fn table_estimate_row_count(table: &OptionalTableWrapper) -> ffi::CardinalityEstimate {
+    let table = table
+        .table
+        .as_ref()
+        .expect("estimate_row_count called on unbound table");
+    match table.estimate_row_count() {
+        Some(rows) => ffi::CardinalityEstimate { known: true, rows },
+        None => ffi::CardinalityEstimate {
+            known: false,
+            rows: 0,
+        },
+    }
 }

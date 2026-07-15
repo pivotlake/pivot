@@ -183,6 +183,17 @@ pub trait Table: Debug + Send + Sync {
     fn row_count(&self, _ctx: &dyn QueryContext) -> Option<i64> {
         None
     }
+
+    /// The table's estimated total row count for cost-based planning (join
+    /// ordering, hash-join build/probe side choice). Unlike
+    /// [`row_count`](Table::row_count) this is an estimate, not an exact
+    /// answer: predicates pushed into this binding don't invalidate it, since
+    /// the cost model wants the base table's size and applies filter
+    /// selectivity itself. `None` means unknown; the planner then uses its own
+    /// defaults.
+    fn estimate_row_count(&self, _ctx: &dyn QueryContext) -> Option<u64> {
+        None
+    }
 }
 
 /// Convert Pivot columns into the DuckDB-typed columns the binder consumes
@@ -201,15 +212,28 @@ fn duckdb_columns(columns: &[Column]) -> Vec<DuckDBColumn> {
 /// Adapts a Pivot [`Table`] to DuckDB's [`DuckDBTable`] trait,
 /// converting our column types into DuckDB logical types. Required because
 /// Rust's orphan rule prevents implementing a foreign trait for a foreign type.
-#[derive(Debug)]
 pub struct DuckDBTableAdapter {
     pub table: Box<dyn Table>,
+    /// Per-binding query context threaded to plan-time stats asks
+    /// ([`Table::estimate_row_count`]), so a backend resolves its current
+    /// files the same way a scan compile does. Shared (`Arc`) because clones
+    /// of one binding must see one pinned snapshot.
+    pub stats_context: Arc<dyn QueryContext>,
+}
+
+impl Debug for DuckDBTableAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuckDBTableAdapter")
+            .field("table", &self.table)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DuckDBTable for DuckDBTableAdapter {
     fn clone_box(&self) -> Box<dyn DuckDBTable> {
         Box::new(DuckDBTableAdapter {
             table: self.table.clone_box(),
+            stats_context: self.stats_context.clone(),
         })
     }
 
@@ -227,6 +251,10 @@ impl DuckDBTable for DuckDBTableAdapter {
             filter,
         )?));
         Ok(self.table.pushdown_filter(filter)?)
+    }
+
+    fn estimate_row_count(&self) -> Option<u64> {
+        self.table.estimate_row_count(self.stats_context.as_ref())
     }
 }
 
@@ -288,7 +316,10 @@ pub struct DuckDBCatalogAdapter {
 impl DuckDBBind for DuckDBCatalogAdapter {
     fn try_bind(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
         let table = self.catalog.table(name)?;
-        Some(Box::new(DuckDBTableAdapter { table }))
+        Some(Box::new(DuckDBTableAdapter {
+            table,
+            stats_context: Arc::from(self.catalog.query_context()),
+        }))
     }
 
     fn table_function(&self, name: &str) -> Option<TableFunctionDef> {
