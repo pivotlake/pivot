@@ -10,13 +10,16 @@
 
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::Index;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_buffer::ArrowNativeType;
 
-use crate::parquet::reading::decoding::column_decoders::{DecodePlain, Dict, TypedColumnDecoder};
+use crate::parquet::reading::decoding::column_decoders::{
+    DecodePlain, Dict, DictFromBytes, DictFromVecBytes, TypedColumnDecoder,
+};
 use bytes::Bytes;
 use dispatch::memory::{
     MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
@@ -211,17 +214,24 @@ where
     }
 }
 
-/// [`Dict`] implementation for fixed-width primitives.
+/// [`Dict`] implementation for fixed-width primitives, generic over the
+/// buffer holding the entries.
 ///
-/// Stores dictionary entries in a [`MultiSlabBuffer`] for O(1) index lookups.
-pub struct PrimitiveDict<T: ArrowPrimitiveType>
+/// A dictionary page that arrives in one contiguous buffer fits a single
+/// [`SlabBuffer`] (the buffer is at most one 2MB ring slot and the native
+/// width never exceeds the physical width), where every lookup is plain
+/// pointer arithmetic. A scattered page falls back to a [`MultiSlabBuffer`]
+/// and its per-element slab addressing.
+pub struct PrimitiveDict<T: ArrowPrimitiveType, B>
 where
     T::Native: ReadLeBytes,
 {
-    entries: MultiSlabBuffer<T::Native>,
+    entries: B,
+    len: usize,
+    phantom: PhantomData<T>,
 }
 
-impl<T: ArrowPrimitiveType> Dict for PrimitiveDict<T>
+impl<T: ArrowPrimitiveType, B: Index<usize, Output = T::Native>> Dict for PrimitiveDict<T, B>
 where
     T::Native: ReadLeBytes,
 {
@@ -235,14 +245,6 @@ where
         let (arr, _) = arrow_array::Datum::get(scalar);
         let primitive = arr.as_primitive_opt::<T>()?;
         (primitive.len() == 1).then(|| primitive.value(0))
-    }
-
-    fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
-        let mut entries = allocator.create_multi_slab_buffer(size, false);
-        let mut position = ReaderPosition::default();
-        let mut len = 0;
-        read_primitives::<T::Native, _>(&data, &mut position, &mut entries, &mut len, size);
-        Self { entries }
     }
 
     /// Scans the raw dictionary for `needle` without allocating or copying — so a
@@ -272,16 +274,58 @@ where
         (0..size).any(|_| T::Native::read_le(&mut reader) == *needle)
     }
 
+    fn len(&self) -> usize {
+        self.len
+    }
+
     #[inline(always)]
     fn entry(&self, idx: usize) -> T::Native {
         self.entries[idx]
     }
 }
 
+impl<T: ArrowPrimitiveType> DictFromBytes for PrimitiveDict<T, SlabBuffer<T::Native>>
+where
+    T::Native: ReadLeBytes,
+{
+    fn new_from_bytes(data: Bytes, size: usize, allocator: &mut SlabAllocator) -> Self {
+        let mut entries = allocator.create_slab_buffer(size, false);
+        let mut position = ReaderPosition::default();
+        let mut len = 0;
+        read_primitives::<T::Native, _>(&[data], &mut position, &mut entries, &mut len, size);
+        Self {
+            entries,
+            len: size,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<T: ArrowPrimitiveType> DictFromVecBytes for PrimitiveDict<T, MultiSlabBuffer<T::Native>>
+where
+    T::Native: ReadLeBytes,
+{
+    fn new_from_vec_bytes(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self {
+        let mut entries = allocator.create_multi_slab_buffer(size, false);
+        let mut position = ReaderPosition::default();
+        let mut len = 0;
+        read_primitives::<T::Native, _>(&data, &mut position, &mut entries, &mut len, size);
+        Self {
+            entries,
+            len: size,
+            phantom: PhantomData,
+        }
+    }
+}
+
 /// Ready-to-use column decoder for any [`ArrowPrimitiveType`] whose native
 /// type implements [`ReadLeBytes`].
-pub type PrimitiveColumnDecoder<T> =
-    TypedColumnDecoder<PrimitiveDict<T>, PrimitiveBuilder<T>, PrimitivePlainDecoder<T>>;
+pub type PrimitiveColumnDecoder<T> = TypedColumnDecoder<
+    PrimitiveDict<T, SlabBuffer<<T as ArrowPrimitiveType>::Native>>,
+    PrimitiveDict<T, MultiSlabBuffer<<T as ArrowPrimitiveType>::Native>>,
+    PrimitiveBuilder<T>,
+    PrimitivePlainDecoder<T>,
+>;
 //
 #[cfg(test)]
 mod tests {
@@ -294,6 +338,11 @@ mod tests {
     use bytes::Bytes;
 
     use super::{Dict, PrimitiveColumnDecoder, PrimitiveDict};
+    use dispatch::memory::SlabBuffer;
+
+    /// `maybe_contains` scans raw page bytes, so the buffer flavour is
+    /// irrelevant; any instantiation works.
+    type Int64Dict = PrimitiveDict<Int64Type, SlabBuffer<i64>>;
     use crate::parquet::reading::decoding::column_decoders::ColumnDecoder;
     use crate::parquet::test_utils::dummy_metadata;
     use dispatch::memory::SlabAllocator;
@@ -304,11 +353,11 @@ mod tests {
         init_test_free_pool(4);
         // A contiguous, aligned i64 dictionary (the vectorized fast path).
         let data = vec![Bytes::from(encode_i64s(&[10, 20, 30, 40, 50]))];
-        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &10));
-        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &50));
-        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &30));
-        assert!(!PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &35));
-        assert!(!PrimitiveDict::<Int64Type>::maybe_contains(&data, 5, &0));
+        assert!(Int64Dict::maybe_contains(&data, 5, &10));
+        assert!(Int64Dict::maybe_contains(&data, 5, &50));
+        assert!(Int64Dict::maybe_contains(&data, 5, &30));
+        assert!(!Int64Dict::maybe_contains(&data, 5, &35));
+        assert!(!Int64Dict::maybe_contains(&data, 5, &0));
     }
 
     #[test]
@@ -321,10 +370,10 @@ mod tests {
             Bytes::from(bytes[..12].to_vec()), // v0 + first half of v1
             Bytes::from(bytes[12..].to_vec()), // second half of v1 + v2
         ];
-        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &10));
-        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &20)); // straddles seam
-        assert!(PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &30));
-        assert!(!PrimitiveDict::<Int64Type>::maybe_contains(&data, 3, &99));
+        assert!(Int64Dict::maybe_contains(&data, 3, &10));
+        assert!(Int64Dict::maybe_contains(&data, 3, &20)); // straddles seam
+        assert!(Int64Dict::maybe_contains(&data, 3, &30));
+        assert!(!Int64Dict::maybe_contains(&data, 3, &99));
     }
 
     fn make_data_page(

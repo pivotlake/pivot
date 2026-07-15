@@ -9,7 +9,9 @@
 //!
 //! - [`ArrayBuilder`] — accumulates decoded values and produces an Arrow array.
 //! - [`DecodePlain`] — reads plain-encoded values from raw page bytes.
-//! - [`Dict`] — builds and queries a dictionary for RLE-dictionary pages.
+//! - [`Dict`] - queries a dictionary for RLE-dictionary pages, built via
+//!   [`DictFromBytes`] or [`DictFromVecBytes`] depending on the dictionary
+//!   page's buffer shape.
 //!
 //! Concrete column decoders are type aliases over `TypedColumnDecoder`:
 //! - [`primitive::PrimitiveColumnDecoder`] for fixed-width numeric types.
@@ -110,7 +112,11 @@ pub trait DecodePlain {
     fn skip(&mut self, size: usize);
 }
 
-/// Builds and queries a dictionary for RLE-dictionary-encoded columns.
+/// Queries a dictionary for RLE-dictionary-encoded columns.
+///
+/// Construction lives in [`DictFromBytes`] / [`DictFromVecBytes`], keyed by
+/// whether the dictionary page's bytes sit in one contiguous buffer or are
+/// scattered across several.
 pub trait Dict {
     type Builder: ArrayBuilder;
     type Item;
@@ -126,9 +132,6 @@ pub trait Dict {
     /// applies the condition).
     fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<Self::EqConstant>;
 
-    /// Builds the dictionary from raw page bytes containing `size` entries.
-    fn new(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self;
-
     /// Whether `needle` might appear among the first `size` raw entries of
     /// `data`, checked without building the dictionary. Only a definite `no`
     /// matters - it prunes the row group and the dictionary is never
@@ -138,8 +141,23 @@ pub trait Dict {
         true
     }
 
+    /// Number of entries in the dictionary.
+    fn len(&self) -> usize;
+
     /// Looks up the value at `idx` in the dictionary.
     fn entry(&self, idx: usize) -> Self::Item;
+
+    /// Looks up the value at `idx` without validating it.
+    ///
+    /// # Safety
+    ///
+    /// `idx` must be `< self.len()`. The default just calls
+    /// [`entry`](Self::entry); an implementation whose storage bounds-checks
+    /// overrides this so the decode hot loop, whose caller proves every key
+    /// in range up front, skips the per-element check.
+    unsafe fn entry_unchecked(&self, idx: usize) -> Self::Item {
+        self.entry(idx)
+    }
 
     /// Registers dictionary buffers onto the builder (e.g. for StringView
     /// block tracking). No-op by default.
@@ -158,4 +176,23 @@ pub trait Dict {
     ) -> RecordBatch {
         batch
     }
+}
+
+/// A [`Dict`] buildable from a dictionary page held in one contiguous buffer.
+///
+/// A contiguous page is at most one 2MB ring slot, so implementations can
+/// pick a representation that relies on that bound, e.g. entries in a single
+/// [`SlabBuffer`](dispatch::memory::SlabBuffer) indexed by plain pointer
+/// arithmetic with no per-element slab lookup.
+pub trait DictFromBytes: Dict {
+    /// Builds the dictionary from one buffer of raw page bytes containing
+    /// `size` entries.
+    fn new_from_bytes(data: Bytes, size: usize, allocator: &mut SlabAllocator) -> Self;
+}
+
+/// A [`Dict`] buildable from a dictionary page scattered across buffers.
+pub trait DictFromVecBytes: Dict {
+    /// Builds the dictionary from scattered raw page bytes containing `size`
+    /// entries in total.
+    fn new_from_vec_bytes(data: Vec<Bytes>, size: usize, allocator: &mut SlabAllocator) -> Self;
 }
