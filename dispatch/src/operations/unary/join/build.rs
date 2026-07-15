@@ -201,7 +201,12 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
             });
         }
         self.rows_consumed += n;
-        self.payload.push(batch);
+        // Detach the retained payload from ring memory NOW: holding the scan's
+        // ring-backed batches until the build assembles would pin a big build
+        // side's entire input in the ring and starve the caches (and any
+        // group-by) of evictable slots.
+        self.payload
+            .push(crate::operations::unary::copy_out::detach_batch(&batch)?);
 
         Ok(())
     }
@@ -363,12 +368,12 @@ impl Outputter<()> for JoinBuilder {
                 .iter()
                 .flat_map(|output| output.payload.iter().cloned())
                 .collect();
+            // The per-batch payloads were detached to the heap at consume
+            // time, so the concatenation is heap-backed too.
             let build_rows = unsafe { &mut *self.build_rows.get() };
             *build_rows = payload_batches.first().map(|first| {
-                let joined = concat_batches(&first.schema(), &payload_batches)
-                    .expect("build payload batches share a schema");
-                crate::operations::unary::copy_out::detach_batch(&joined)
-                    .expect("detaching the build payload to heap buffers")
+                concat_batches(&first.schema(), &payload_batches)
+                    .expect("build payload batches share a schema")
             });
             // One match flag per payload row, for the build-emitting
             // existence modes (unused by the others).
