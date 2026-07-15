@@ -36,29 +36,44 @@ cargo run -- --show --baseline gs://my-bucket/clickbench.json
 
 ## Suite layout
 
-A suite is a directory under `benchmarks/<name>/`. Today only `clickbench`
-ships, `tpch` will sit alongside.
+A suite is a self-contained directory under `benchmarks/<name>/`: its schema,
+its queries + oracles, and any suite-specific driver/data-prep scripts all live
+together, so `clickbench` and `tpch` don't sit flat side by side. The shared
+Rust harness (`src/`, `Cargo.toml`, `justfile`) stays at the crate root and
+serves every suite via `--suite <name>`.
 
 ```
-benchmarks/clickbench/
-├── setup.sql          # CREATE TABLE etc. {source} is substituted with --source
-├── q07.sql            # one query per file; stem is the query ID
-├── q07.tsv            # expected pgwire output (TSV, tab-separated rows)
-├── q20.sql
-├── q20.tsv
-├── ...
-└── baseline.json      # default location for saved timings (created on demand)
+benchmarks/
+├── src/ Cargo.toml justfile      # shared harness (suite-agnostic)
+├── clickbench/
+│   ├── setup.sql                 # CREATE TABLE etc. {source} → --source
+│   ├── q07.sql  q07.tsv          # one query per file; stem is the query ID;
+│   ├── q20.sql  q20.tsv          #   qNN.tsv is the expected pgwire output
+│   ├── baseline.json             # default location for saved timings
+│   ├── benchmark.sh bench-modes.sh bench-ab.sh   # ClickBench drivers
+│   ├── prep-modes-data.sh prep-clickhouse-native.sh
+│   ├── run-duckdb.sh run-clickhouse.sh
+│   └── duckdb-official/ clickhouse-official/      # vendored native schemas
+└── tpch/
+    ├── setup.sql                 # the denormalized flat table
+    ├── qNN.sql  qNN.tsv
+    └── prep-tpch-flat.sh         # tpchgen-cli → DuckDB denormalize → flat parquet
 ```
 
-Adding a query: drop in `qNN.sql` + `qNN.tsv`. The harness picks them up via
-directory listing — no code change. Give every query a *total* `ORDER BY`:
-output is compared exact-string, so any tie in row order makes the `.tsv`
-flaky. For the expected `.tsv`, prefer an independent oracle over pivot grading
-its own output — `./run-duckdb.sh --source ~/hits --query NN --write-expected`
-runs the same query through DuckDB on the same parquet and writes `qNN.tsv` in
-pivot's wire format. Then confirm pivot agrees with a plain run. (DuckDB rewrites
-a few columns — chiefly `EventDate` → a real `DATE` — so for `SELECT *`/date
-queries that path won't match; fall back to `--update-results` and eyeball.)
+`cargo` / `just` always run from the crate root (`benchmarks/`); the suite's
+shell scripts are invoked by path (e.g. `clickbench/benchmark.sh`). Those
+scripts internally `cd` to the crate root for `just`, so they work from any cwd.
+
+Adding a query: drop in `qNN.sql` + `qNN.tsv` under the suite dir. The harness
+picks them up via directory listing - no code change. Give every query a
+*total* `ORDER BY`: output is compared exact-string, so any tie in row order
+makes the `.tsv` flaky. For the expected `.tsv`, prefer an independent oracle
+over pivot grading its own output - `clickbench/run-duckdb.sh --source ~/hits
+--query NN --write-expected` runs the same query through DuckDB on the same
+parquet and writes `qNN.tsv` in pivot's wire format. Then confirm pivot agrees
+with a plain run. (DuckDB rewrites a few columns - chiefly `EventDate` → a real
+`DATE` - so for `SELECT *`/date queries that path won't match; fall back to
+`--update-results` and eyeball.)
 
 Adding a suite: `mkdir benchmarks/<name>`, fill in `setup.sql` and the
 queries, then run with `--suite <name>`.
