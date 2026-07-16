@@ -88,7 +88,7 @@ set -euxo pipefail
 
 sudo apt-get update -q
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy \
-    build-essential clang lld cmake git zstd curl unzip pkg-config libssl-dev python3
+    build-essential clang lld cmake git git-restore-mtime zstd curl unzip pkg-config libssl-dev python3
 
 # aws cli v2 (the base image ships none)
 curl -sSf https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip -o /tmp/awscli.zip

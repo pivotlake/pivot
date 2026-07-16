@@ -189,6 +189,13 @@ checkout_side() {
         -c submodule.alternateErrorStrategy=info \
         -c protocol.file.allow=always \
         submodule update --quiet --init --recursive
+    # Cargo fingerprints path dependencies by mtime, and a fresh clone stamps
+    # fresh mtimes, so a restored target dir would rebuild every workspace and
+    # submodule crate anyway. Re-stamping each file with its last commit's
+    # time makes mtimes stable across runs, so unchanged crates really do
+    # come out of the cache.
+    git -C "$dir" restore-mtime --quiet
+    git -C "$dir" submodule foreach --quiet --recursive 'git restore-mtime --quiet'
 }
 
 # ---------------------------------------------------------------------------
