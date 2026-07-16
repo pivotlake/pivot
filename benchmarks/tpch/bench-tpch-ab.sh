@@ -243,10 +243,13 @@ save_cache() {
 # Builds. PGO: instrumented build (shared warm cache; the profile-generate
 # path is the fixed pgo_dir from benchmarks/justfile, so its RUSTFLAGS never
 # change and restored artifacts stay valid), profiling run on the small scale
-# with LLVM_PROFILE_FILE separating the sides, then a profile-use build whose
-# profdata path embeds this run's id: that flag change is what forces every
-# Rust unit to rebuild under the fresh profile while the restored target dir
-# donates its profile-independent build-script outputs (the DuckDB C++ build).
+# with LLVM_PROFILE_FILE separating the sides, then a profile-use build. The
+# profdata path embeds this run's id so the rebuild of every Rust unit under
+# the fresh profile follows from the flags hash alone; rustc's dep-info also
+# tracks the profile file, but that check compares mtimes against artifacts
+# restored from another machine's clock. The restored target dir still
+# donates its profile-independent build-script outputs (the DuckDB C++
+# build), which the explicit --target keeps unflagged.
 # ---------------------------------------------------------------------------
 # Fixed profile-generate path, matching benchmarks/justfile's pgo_dir: the
 # path sits inside RUSTFLAGS, and identical flags are what keep the restored

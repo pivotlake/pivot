@@ -46,12 +46,13 @@ pgo-gen-build subcmd *args:
     RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
         CARGO_TARGET_DIR=target-pgogen cargo {{subcmd}} --target {{host_target}} {{args}}
 
-# Like pgo-use but with a caller-supplied profdata path. Cargo fingerprints
-# the RUSTFLAGS string, not the profile file's content, so a caller restoring
-# a cached target-pgouse MUST pass a path unique to this profile: the fresh
-# path rebuilds every Rust unit under the new profile, while the build-script
-# outputs (unflagged thanks to the explicit --target) stay cached. Binaries
-# land under target-pgouse/{{host_target}}/.
+# Like pgo-use but with a caller-supplied profdata path. rustc records the
+# profile file in dep-info, so even at a constant path a regenerated profile
+# rebuilds every Rust unit; passing a per-profile path makes that rebuild a
+# consequence of the flags hash too, immune to mtime comparisons against
+# artifacts restored from another machine. Build-script outputs (unflagged
+# thanks to the explicit --target) stay cached either way. Binaries land
+# under target-pgouse/{{host_target}}/.
 pgo-use-with profdata subcmd *args:
     RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{profdata}} -Ctarget-cpu=native" \
         CARGO_TARGET_DIR=target-pgouse cargo {{subcmd}} --target {{host_target}} {{args}}
