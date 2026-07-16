@@ -17,6 +17,12 @@
 //! group `total_byte_size`, file `version`/`num_rows`, string columns marked
 //! UTF8), so the output round-trips through pivot's reader and through strict
 //! readers like arrow-rs and DuckDB.
+//!
+//! A row group holds one column chunk per *leaf*, while a job (and so an arriving
+//! [`EncodedColumnChunk`]) covers one top-level column: a flat column is its own
+//! leaf, and a shredded variant is a group of them. So the gathering still counts
+//! one chunk per schema column, and a chunk lays its leaves down in the
+//! depth-first order the footer schema numbers them in.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,22 +31,26 @@ use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
     StringViewArray,
 };
-use arrow_schema::{DataType, Field, SchemaRef};
+use arrow_schema::{DataType, FieldRef, SchemaRef};
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::{
-    ColumnChunk, ColumnMetaData, FileMetaData, RowGroup, SchemaElement, Statistics,
+    ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement, Statistics,
 };
 use thriftparquet::general::Encoding;
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    EncodedColumnChunk, EncodedFile, FileId, RowGroupHeader, RowGroupId, RowGroupSortStats,
+    EncodedColumnChunk, EncodedFile, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
+    RowGroupSortStats,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// Parquet repetition type for a required (non-null) field.
 const REPETITION_REQUIRED: i32 = 0;
+/// Parquet repetition type for an optional (nullable) field — a field whose rows
+/// carry definition levels.
+const REPETITION_OPTIONAL: i32 = 1;
 /// Parquet `CompressionCodec::SNAPPY`.
 const SNAPPY_CODEC: i32 = 1;
 /// Parquet format version written into the footer.
@@ -117,7 +127,7 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
             ..
         } = self.chunks_by_row_group.remove(&row_group_id).unwrap();
         let stats = build_stats(&header.tag.sort_stats);
-        let group = assemble_row_group(&header.schema, chunks, &stats)?;
+        let group = assemble_row_group(chunks, &stats)?;
 
         // Add it to its file; emit the file once all its row groups are in.
         let file_id = header.tag.file_id;
@@ -219,24 +229,25 @@ struct AssembledRowGroup {
 /// order). `stats` maps a column index to the footer `Statistics` to write for it
 /// (sort columns).
 fn assemble_row_group(
-    schema: &SchemaRef,
     mut chunks: Vec<EncodedColumnChunk>,
     stats: &HashMap<usize, Statistics>,
 ) -> WriteResult<AssembledRowGroup> {
     // Footer column chunks must be in schema order; work-stealing delivers them
-    // in any order.
+    // in any order. Within a column, its leaves are already in footer order.
     chunks.sort_by_key(|c| c.column);
 
     let mut bytes = Vec::new();
     let mut columns = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        let col = chunk.column;
-        columns.push(write_column_chunk(
-            &mut bytes,
-            schema.field(col),
-            chunk,
-            stats.get(&col).cloned(),
-        )?);
+        // Only sort columns get footer statistics, and a sort key is always a
+        // flat column — one leaf, which takes them. A wider column (a variant)
+        // is never a sort key, so it gets none.
+        let mut statistics = (chunk.leaves.len() == 1)
+            .then(|| stats.get(&chunk.column).cloned())
+            .flatten();
+        for leaf in chunk.leaves {
+            columns.push(write_leaf_chunk(&mut bytes, leaf, statistics.take())?);
+        }
     }
     Ok(AssembledRowGroup { bytes, columns })
 }
@@ -292,25 +303,24 @@ fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult
     Ok(out)
 }
 
-/// Append one column chunk to `out`: its dictionary page (if any) followed by its
-/// data pages, contiguously. Returns the chunk metadata with offsets relative to
-/// `out` (rebased to the file by [`build_file`]).
-fn write_column_chunk(
+/// Append one leaf's column chunk to `out`: its dictionary page (if any) followed
+/// by its data pages, contiguously. Returns the chunk metadata with offsets
+/// relative to `out` (rebased to the file by [`build_file`]).
+fn write_leaf_chunk(
     out: &mut Vec<u8>,
-    field: &Field,
-    chunk: EncodedColumnChunk,
+    leaf: EncodedLeaf,
     statistics: Option<Statistics>,
 ) -> WriteResult<ColumnChunk> {
-    if chunk.data_pages.is_empty() {
+    if leaf.data_pages.is_empty() {
         return Err(WriteError::MissingPages {
-            column: chunk.column,
+            path: leaf.path.join("."),
         });
     }
     let chunk_start = out.len() as i64;
     let mut uncompressed = 0i64;
 
     // The dictionary page, if any, precedes the data pages.
-    let dictionary_page_offset = chunk.dictionary_page.as_ref().map(|dict| {
+    let dictionary_page_offset = leaf.dictionary_page.as_ref().map(|dict| {
         let offset = out.len() as i64;
         uncompressed += (dict.header_len + dict.uncompressed_size) as i64;
         out.extend_from_slice(&dict.bytes);
@@ -319,7 +329,7 @@ fn write_column_chunk(
 
     let data_page_offset = out.len() as i64;
     let mut num_values = 0i64;
-    for page in &chunk.data_pages {
+    for page in &leaf.data_pages {
         num_values += page.num_rows;
         uncompressed += (page.header_len + page.uncompressed_size) as i64;
         out.extend_from_slice(&page.bytes);
@@ -336,9 +346,9 @@ fn write_column_chunk(
     Ok(ColumnChunk {
         file_offset: chunk_start,
         meta_data: Some(ColumnMetaData {
-            physical_type: catalog::parquet::arrow_to_parquet_physical(field.data_type())?,
+            physical_type: leaf.physical_type,
             encodings,
-            path_in_schema: vec![field.name().clone()],
+            path_in_schema: leaf.path,
             codec: SNAPPY_CODEC,
             num_values,
             total_uncompressed_size: uncompressed,
@@ -351,34 +361,64 @@ fn write_column_chunk(
     })
 }
 
-/// Build the footer schema: a root group element followed by one leaf per
-/// column (string columns marked UTF8).
+/// Build the footer schema: a root group element followed by every field's,
+/// depth-first — the flat, pre-order element list Parquet stores a schema tree
+/// as, and the order the reader rebuilds it from.
 fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> {
-    let mut elements = Vec::with_capacity(schema.fields().len() + 1);
-    elements.push(SchemaElement {
+    let mut elements = vec![SchemaElement {
         physical_type: None,
         repetition_type: None,
         name: "schema".to_string(),
         num_children: Some(schema.fields().len() as i32),
         converted_type: None,
         logical_type: None,
-    });
+    }];
     for field in schema.fields() {
-        elements.push(SchemaElement {
-            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(
-                field.data_type(),
-            )?),
-            repetition_type: Some(REPETITION_REQUIRED),
+        push_schema_element(field, &mut elements)?;
+    }
+    Ok(elements)
+}
+
+/// Append `field`'s schema element, and for a struct its children's after it. A
+/// nullable field is OPTIONAL, which is what tells the reader its leaves carry
+/// definition levels.
+fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> WriteResult<()> {
+    let repetition_type = Some(if field.is_nullable() {
+        REPETITION_OPTIONAL
+    } else {
+        REPETITION_REQUIRED
+    });
+    match field.data_type() {
+        DataType::Struct(children) => {
+            elements.push(SchemaElement {
+                physical_type: None,
+                repetition_type,
+                name: field.name().clone(),
+                num_children: Some(children.len() as i32),
+                converted_type: None,
+                // The VARIANT annotation is the whole difference between a
+                // variant column and a plain struct of binary leaves: it is what
+                // a reader keys off to treat the group as semi-structured.
+                logical_type: catalog::parquet::is_variant_field(field)
+                    .then_some(LogicalType::Variant),
+            });
+            for child in children {
+                push_schema_element(child, elements)?;
+            }
+        }
+        data_type => elements.push(SchemaElement {
+            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(data_type)?),
+            repetition_type,
             name: field.name().clone(),
             num_children: None,
-            converted_type: match field.data_type() {
+            converted_type: match data_type {
                 DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_UTF8),
                 _ => None,
             },
             logical_type: None,
-        });
+        }),
     }
-    Ok(elements)
+    Ok(())
 }
 
 /// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`.
@@ -396,8 +436,11 @@ mod tests {
     use super::*;
     use crate::parquet_writing::encoder::encode_column_chunk;
     use crate::parquet_writing::types::{EncodedColumnChunk, PartitionTag};
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use arrow_schema::Schema;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+    use arrow_buffer::NullBuffer;
+    use arrow_schema::{Field, Fields, Schema};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
 
@@ -417,25 +460,25 @@ mod tests {
         })
     }
 
-    /// Encode a batch the way the pipeline does — encode each column into a chunk
-    /// (dictionary or PLAIN, the encoder's choice) → `assemble_row_group` →
-    /// `build_file` — and return the bytes (a single-row-group file, no stats).
+    /// Encode a batch the way the pipeline does — flatten each column into leaves
+    /// and encode them (dictionary or PLAIN, the encoder's choice) →
+    /// `assemble_row_group` → `build_file` — and return the bytes (a
+    /// single-row-group file, no stats).
     fn encode(batch: &RecordBatch) -> Vec<u8> {
-        let header = header(&batch.schema());
+        let schema = batch.schema();
+        let header = header(&schema);
         let chunks: Vec<EncodedColumnChunk> = (0..batch.num_columns())
             .map(|column| {
-                let (dictionary_page, data_pages) = encode_column_chunk(batch.column(column))?;
                 Ok(EncodedColumnChunk {
                     header: header.clone(),
                     column,
-                    dictionary_page,
-                    data_pages,
+                    leaves: encode_column_chunk(schema.field(column), batch.column(column))?,
                 })
             })
             .collect::<WriteResult<_>>()
             .unwrap();
-        let group = assemble_row_group(&batch.schema(), chunks, &HashMap::new()).unwrap();
-        build_file(&batch.schema(), vec![group]).unwrap()
+        let group = assemble_row_group(chunks, &HashMap::new()).unwrap();
+        build_file(&schema, vec![group]).unwrap()
     }
 
     /// Write `batch` and read it back through arrow-rs's strict reader (our
@@ -481,6 +524,46 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .unwrap(),
             &StringArray::from(vec!["a", "bb", "ccc"])
+        );
+    }
+
+    /// A nullable column and a nullable struct round-trip through arrow-rs: the
+    /// footer carries a real group with OPTIONAL fields, and the definition
+    /// levels place the nulls back where they were. This is the shape a shredded
+    /// variant is built out of.
+    #[test]
+    fn a_nested_nullable_column_round_trips() {
+        let inner = Fields::from(vec![Field::new("a", DataType::Int64, true)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("s", DataType::Struct(inner.clone()), true),
+        ]));
+        // Row 1's struct is absent entirely; row 2 has a struct whose field is
+        // null — two different depths of absence, one level apart.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+                Arc::new(StructArray::new(
+                    inner,
+                    vec![Arc::new(Int64Array::from(vec![Some(10), None, None]))],
+                    Some(NullBuffer::from(vec![true, false, true])),
+                )),
+            ],
+        )
+        .unwrap();
+
+        let got = round_trip(&batch);
+
+        assert_eq!(
+            got.column(0).as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(1), None, Some(3)])
+        );
+        let structs = got.column(1).as_struct();
+        assert!(structs.is_null(1), "row 1's struct is absent");
+        assert_eq!(
+            structs.column(0).as_primitive::<Int64Type>(),
+            &Int64Array::from(vec![Some(10), None, None])
         );
     }
 

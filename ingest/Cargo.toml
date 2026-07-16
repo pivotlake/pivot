@@ -23,6 +23,11 @@ arrow-arith = { workspace = true }
 arrow-json = { workspace = true }
 # Dictionary encoding: cast a column to a dictionary array (intern + index).
 arrow-cast = { workspace = true }
+# Variant (JSON) columns: `parquet-variant` supplies the value/path types the
+# shredding inference walks, `parquet-variant-compute` the shred/unshred kernels
+# each output file's layout is applied with.
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 # In-house Parquet encoding (no upstream `parquet` crate): the shared
 # `thriftparquet` metadata/codec layer plus the same snappy lib the reader uses.
@@ -50,6 +55,14 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Building struct arrays with null rows, to exercise the writer's definition
+# levels directly.
+arrow-buffer = { workspace = true }
+# Reading a just-written file back from memory, without a temp file round-trip.
+bytes = { workspace = true }
+# Rendering a written-back variant to JSON to assert the documents survived
+# shredding, the same way a query renders a variant output column.
+parquet-variant-json = { workspace = true }
 # `CreateTableRequest` etc., to set up catalog tables in the register/compact
 # integration tests.
 planner = { workspace = true }

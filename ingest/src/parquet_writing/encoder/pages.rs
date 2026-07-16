@@ -1,18 +1,27 @@
 //! Page mechanics shared by both encode strategies ([`plain`](super::plain) and
-//! [`dictionary`](super::dictionary)): cut a column chunk into ~1 MiB pages, and
-//! frame an encoded page body into an [`EncodedPage`].
+//! [`dictionary`](super::dictionary)): cut a leaf into ~1 MiB pages, frame a
+//! page body behind its definition levels, and wrap it into an [`EncodedPage`].
 //!
-//! A page's values are a zero-copy slice of the column, so cutting copies nothing.
+//! Pages are cut in *row* space, not value space: a leaf under a nullable path
+//! stores no value for an absent row but still spends a definition level on it,
+//! so a page's row range and its value range are different things. For the flat
+//! required columns that make up most of a table the two coincide, and a page's
+//! values are a zero-copy slice of the column.
 
-use arrow_array::{Array, ArrayRef, StringArray, StringViewArray};
+use std::ops::Range;
+
+use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, BinaryViewArray, StringArray, StringViewArray};
 use arrow_schema::DataType;
 use snap::raw::Encoder;
 use thriftparquet::general::{Encoding, PageType};
 use thriftparquet::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
-use super::super::error::WriteResult;
+use super::super::error::{WriteError, WriteResult};
 use super::super::types::EncodedPage;
+use super::leaves::Leaf;
+use super::rle;
 
 /// Target uncompressed size of one data page. Matches Parquet's usual ~1 MiB
 /// data page size: large enough to amortize per-page overhead and compress
@@ -24,80 +33,106 @@ const TARGET_PAGE_SIZE: usize = 1024 * 1024;
 /// Counted per value when estimating a page's encoded size.
 const BYTE_ARRAY_LEN_PREFIX: usize = size_of::<u32>();
 
-/// Split one column's values into ~1 MiB pages, each a zero-copy slice in row
-/// order.
-pub(super) fn page_slices(values: &ArrayRef) -> Vec<ArrayRef> {
-    page_ranges(values, TARGET_PAGE_SIZE)
-        .into_iter()
-        .map(|(start, len)| values.slice(start, len))
-        .collect()
+/// One page's extent, in rows and in stored values. The two differ only for a
+/// leaf with absent rows, which spend a definition level but no value.
+pub(super) struct PageRange {
+    pub(super) rows: Range<usize>,
+    pub(super) values: Range<usize>,
 }
 
-/// Split a column into contiguous `(start, len)` row ranges, each ~`target`
-/// uncompressed bytes when PLAIN-encoded.
-fn page_ranges(values: &ArrayRef, target: usize) -> Vec<(usize, usize)> {
-    let len = values.len();
-    if len == 0 {
-        return Vec::new();
+/// Cut a leaf into ~[`TARGET_PAGE_SIZE`] pages of contiguous rows.
+pub(super) fn page_ranges(leaf: &Leaf) -> WriteResult<Vec<PageRange>> {
+    page_ranges_of_size(leaf, TARGET_PAGE_SIZE)
+}
+
+/// Cut a leaf into pages of about `target` uncompressed value bytes each. A leaf
+/// whose every row is absent still yields one page — levels, no values — which
+/// is what a shredded path's unused `value` fallback looks like.
+fn page_ranges_of_size(leaf: &Leaf, target: usize) -> WriteResult<Vec<PageRange>> {
+    let rows = leaf.rows();
+    if rows == 0 {
+        return Ok(Vec::new());
     }
-    match plain_fixed_width(values.data_type()) {
-        Some(width) => fixed_ranges(len, (target / width).max(1)),
-        None => variable_ranges(values, target),
-    }
-}
+    let sizes = PlainSizes::new(&leaf.values)?;
 
-fn fixed_ranges(len: usize, rows_per_page: usize) -> Vec<(usize, usize)> {
-    (0..len)
-        .step_by(rows_per_page)
-        .map(|start| (start, rows_per_page.min(len - start)))
-        .collect()
-}
-
-/// Walk a BYTE_ARRAY column's values, cutting a page once the accumulated PLAIN
-/// size (length prefix + bytes per value) reaches `target`. Always at least one
-/// row per page.
-fn variable_ranges(values: &ArrayRef, target: usize) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
-    let mut page_start = 0;
-    let mut row = 0;
-    let mut acc = 0usize;
-    for_each_value_len(values.as_ref(), |value_len| {
-        acc += BYTE_ARRAY_LEN_PREFIX + value_len;
-        row += 1;
-        if acc >= target {
-            ranges.push((page_start, row - page_start));
-            page_start = row;
-            acc = 0;
+    let (mut row_start, mut value_start, mut value, mut page_size) = (0, 0, 0, 0usize);
+    for row in 0..rows {
+        if leaf.is_present(row) {
+            page_size += sizes.at(value);
+            value += 1;
         }
-    });
-    if page_start < row {
-        ranges.push((page_start, row - page_start));
+        if page_size >= target {
+            ranges.push(PageRange {
+                rows: row_start..row + 1,
+                values: value_start..value,
+            });
+            (row_start, value_start, page_size) = (row + 1, value, 0);
+        }
     }
-    ranges
+    // The rows left over once the last page was cut — and, for a leaf that never
+    // reached `target`, the only page.
+    if row_start < rows {
+        ranges.push(PageRange {
+            rows: row_start..rows,
+            values: value_start..value,
+        });
+    }
+    Ok(ranges)
 }
 
-/// PLAIN byte size of one fixed-width value, or `None` for variable-width types.
-fn plain_fixed_width(data_type: &DataType) -> Option<usize> {
-    match data_type {
-        DataType::Int32 | DataType::Float32 => Some(4),
-        DataType::Int64 | DataType::Float64 => Some(8),
-        _ => None,
-    }
+/// A data page's body: its definition levels, then the encoded values. Parquet
+/// frames a v1 page's levels as an RLE stream behind a 4-byte little-endian
+/// length; a leaf nothing on whose path is nullable carries no level section at
+/// all, which is what the reader assumes when `max_def_level` is 0.
+pub(super) fn data_page_body(
+    def_levels: Option<&[i16]>,
+    max_def_level: i16,
+    values: Vec<u8>,
+) -> Vec<u8> {
+    let Some(levels) = def_levels else {
+        return values;
+    };
+    let levels = rle::encode_levels(levels, max_def_level);
+    let mut body = Vec::with_capacity(BYTE_ARRAY_LEN_PREFIX + levels.len() + values.len());
+    body.extend_from_slice(&(levels.len() as u32).to_le_bytes());
+    body.extend_from_slice(&levels);
+    body.extend_from_slice(&values);
+    body
 }
 
-/// Call `f` with each value's byte length (for BYTE_ARRAY size accounting).
-fn for_each_value_len(array: &dyn Array, mut f: impl FnMut(usize)) {
-    match array.data_type() {
-        DataType::Utf8 => {
-            let a = array.as_any().downcast_ref::<StringArray>().unwrap();
-            (0..a.len()).for_each(|i| f(a.value(i).len()));
+/// Measures the PLAIN size of a column's values. The value type is resolved once
+/// per leaf, so the page cutter's inner loop is a size lookup rather than a
+/// downcast per value.
+enum PlainSizes<'a> {
+    /// Fixed-width values, all of this many bytes.
+    Fixed(usize),
+    Utf8(&'a StringArray),
+    Utf8View(&'a StringViewArray),
+    BinaryView(&'a BinaryViewArray),
+}
+
+impl<'a> PlainSizes<'a> {
+    fn new(values: &'a ArrayRef) -> WriteResult<Self> {
+        Ok(match values.data_type() {
+            DataType::Int32 | DataType::Float32 => Self::Fixed(4),
+            DataType::Int64 | DataType::Float64 => Self::Fixed(8),
+            DataType::Utf8 => Self::Utf8(values.as_string()),
+            DataType::Utf8View => Self::Utf8View(values.as_string_view()),
+            DataType::BinaryView => Self::BinaryView(values.as_binary_view()),
+            other => return Err(WriteError::UnsupportedType(other.clone())),
+        })
+    }
+
+    /// The PLAIN size of value `i`: a fixed-width value's width, or a
+    /// BYTE_ARRAY's length prefix plus its bytes.
+    fn at(&self, i: usize) -> usize {
+        match self {
+            Self::Fixed(width) => *width,
+            Self::Utf8(values) => BYTE_ARRAY_LEN_PREFIX + values.value(i).len(),
+            Self::Utf8View(values) => BYTE_ARRAY_LEN_PREFIX + values.value(i).len(),
+            Self::BinaryView(values) => BYTE_ARRAY_LEN_PREFIX + values.value(i).len(),
         }
-        DataType::Utf8View => {
-            let a = array.as_any().downcast_ref::<StringViewArray>().unwrap();
-            (0..a.len()).for_each(|i| f(a.value(i).len()));
-        }
-        // Unsupported here; the encoder rejects it during encoding.
-        _ => (0..array.len()).for_each(|_| f(0)),
     }
 }
 
@@ -130,8 +165,9 @@ pub(super) fn assemble_page(
             Some(DataPageHeader {
                 num_values: num_values as i32,
                 encoding,
-                // Unused for required columns (the reader skips levels when
-                // max_def_level == 0), but the fields are required.
+                // The definition levels are RLE (see `data_page_body`); a
+                // required leaf writes none, but the field is required. Nothing
+                // here repeats, so the repetition levels are always absent.
                 definition_level_encoding: Encoding::RLE,
                 repetition_level_encoding: Encoding::RLE,
                 statistics: None,
@@ -175,28 +211,100 @@ pub(super) fn assemble_page(
 
 #[cfg(test)]
 mod tests {
+    use super::super::leaves;
     use super::*;
-    use arrow_array::Int64Array;
+    use arrow_array::{Array, Int64Array};
+    use arrow_schema::Field;
     use std::sync::Arc;
+
+    /// A leaf over `values` with no absent rows.
+    fn required(values: ArrayRef) -> Leaf {
+        leaf(values, false)
+    }
+
+    /// A leaf over a nullable column, so absent rows spend a level but no value.
+    fn nullable(values: ArrayRef) -> Leaf {
+        leaf(values, true)
+    }
+
+    fn leaf(values: ArrayRef, nullable: bool) -> Leaf {
+        let field = Field::new("n", values.data_type().clone(), nullable);
+        leaves::flatten(&field, &values).unwrap().pop().unwrap()
+    }
+
+    fn ranges(leaf: &Leaf, target: usize) -> Vec<(Range<usize>, Range<usize>)> {
+        page_ranges_of_size(leaf, target)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.rows, r.values))
+            .collect()
+    }
 
     #[test]
     fn fixed_width_pages_split_by_row_count() {
-        let column: ArrayRef = Arc::new(Int64Array::from((0..250).collect::<Vec<i64>>()));
+        let leaf = required(Arc::new(Int64Array::from((0..250).collect::<Vec<i64>>())));
 
         // 8 bytes/value, target 800 bytes => 100 rows/page => 100, 100, 50.
-        let ranges = page_ranges(&column, 800);
+        let cuts = ranges(&leaf, 800);
 
-        assert_eq!(ranges, vec![(0, 100), (100, 100), (200, 50)]);
+        assert_eq!(
+            cuts,
+            vec![(0..100, 0..100), (100..200, 100..200), (200..250, 200..250)]
+        );
     }
 
     #[test]
     fn variable_width_pages_split_by_byte_size() {
         // Each value encodes as 4 + 6 = 10 bytes ("abcdef").
-        let column: ArrayRef = Arc::new(StringArray::from(vec!["abcdef"; 10]));
+        let leaf = required(Arc::new(StringArray::from(vec!["abcdef"; 10])));
 
         // Target 25 bytes => cut after 3 values (30 >= 25): 3, 3, 3, 1.
-        let ranges = page_ranges(&column, 25);
+        let cuts = ranges(&leaf, 25);
 
-        assert_eq!(ranges, vec![(0, 3), (3, 3), (6, 3), (9, 1)]);
+        assert_eq!(
+            cuts,
+            vec![(0..3, 0..3), (3..6, 3..6), (6..9, 6..9), (9..10, 9..10)]
+        );
+    }
+
+    /// Absent rows advance a page's rows but not its values, so a page covers
+    /// more rows than it stores values.
+    #[test]
+    fn absent_rows_cost_a_row_but_not_a_value() {
+        // 6 rows, every other one null => 3 stored values of 8 bytes.
+        let values: Vec<Option<i64>> = (0..6).map(|i| (i % 2 == 0).then_some(i)).collect();
+        let leaf = nullable(Arc::new(Int64Array::from(values)));
+
+        // Target 16 bytes => cut once two values have accumulated (rows 0..3).
+        let cuts = ranges(&leaf, 16);
+
+        assert_eq!(cuts, vec![(0..3, 0..2), (3..6, 2..3)]);
+    }
+
+    /// A leaf that is absent on every row still yields one page: the reader needs
+    /// its levels to know the rows are null, and a shredded path's unused `value`
+    /// fallback is exactly this.
+    #[test]
+    fn an_all_absent_leaf_is_one_page_of_levels() {
+        let leaf = nullable(Arc::new(Int64Array::from(vec![None::<i64>; 4])));
+
+        let cuts = ranges(&leaf, 16);
+
+        assert_eq!(cuts, vec![(0..4, 0..0)]);
+    }
+
+    /// A required leaf's page body is the values alone; a nullable one prefixes
+    /// the RLE levels behind their byte length.
+    #[test]
+    fn only_a_nullable_leaf_carries_a_level_section() {
+        assert_eq!(data_page_body(None, 0, vec![1, 2, 3]), vec![1, 2, 3]);
+
+        let body = data_page_body(Some(&[1, 1]), 1, vec![9]);
+
+        let levels = rle::encode_levels(&[1, 1], 1);
+        let mut expected = (levels.len() as u32).to_le_bytes().to_vec();
+        expected.extend_from_slice(&levels);
+        expected.push(9);
+        assert_eq!(body, expected);
     }
 }

@@ -1,12 +1,13 @@
-//! The PLAIN encode path: cut a column chunk into pages and PLAIN-encode each.
+//! The PLAIN encode path: cut a leaf into pages and PLAIN-encode each.
 //!
-//! A page's body is the column's values written back to back — fixed-width values
-//! little-endian, BYTE_ARRAY values a 4-byte LE length prefix then the bytes.
-//! [`encode_into`] is also reused by [`dictionary`](super::dictionary) to encode
-//! a dictionary page's distinct values.
+//! A page's body is its definition levels (for a leaf that has any) followed by
+//! the stored values back to back — fixed-width values little-endian, BYTE_ARRAY
+//! values a 4-byte LE length prefix then the bytes. [`encode_into`] is also
+//! reused by [`dictionary`](super::dictionary) to encode a dictionary page's
+//! distinct values.
 
 use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    Array, BinaryViewArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
     StringViewArray,
 };
 use arrow_schema::DataType;
@@ -14,21 +15,28 @@ use thriftparquet::general::Encoding;
 
 use super::super::error::{WriteError, WriteResult};
 use super::super::types::EncodedPage;
-use super::pages::{self, PageKind};
+use super::leaves::Leaf;
+use super::pages::{self, PageKind, PageRange};
 
-/// PLAIN-encode a column chunk: cut it into pages and encode each.
-pub(super) fn encode_chunk(values: &ArrayRef) -> WriteResult<Vec<EncodedPage>> {
-    pages::page_slices(values)
-        .iter()
-        .map(encode_data_page)
+/// PLAIN-encode a leaf: cut it into pages and encode each.
+pub(super) fn encode_chunk(leaf: &Leaf) -> WriteResult<Vec<EncodedPage>> {
+    pages::page_ranges(leaf)?
+        .into_iter()
+        .map(|range| encode_data_page(leaf, range))
         .collect()
 }
 
-/// Encode one PLAIN data page from a column slice.
-fn encode_data_page(values: &ArrayRef) -> WriteResult<EncodedPage> {
-    let num_rows = values.len();
-    let mut raw = Vec::new();
-    encode_into(values.as_ref(), &mut raw)?;
+/// Encode one PLAIN data page: the page's rows' definition levels, then its
+/// stored values. A page counts its rows, not its values — the absent rows have
+/// a level but nothing in the value stream.
+fn encode_data_page(leaf: &Leaf, range: PageRange) -> WriteResult<EncodedPage> {
+    let num_rows = range.rows.len();
+    let values = leaf.values.slice(range.values.start, range.values.len());
+    let mut encoded = Vec::new();
+    encode_into(values.as_ref(), &mut encoded)?;
+
+    let levels = leaf.def_levels.as_ref().map(|levels| &levels[range.rows]);
+    let raw = pages::data_page_body(levels, leaf.max_def_level, encoded);
     pages::assemble_page(
         num_rows as i64,
         raw,
@@ -39,8 +47,14 @@ fn encode_data_page(values: &ArrayRef) -> WriteResult<EncodedPage> {
     )
 }
 
-/// Append a required column's PLAIN-encoded values to `out`: fixed-width values
+/// Append `array`'s PLAIN-encoded values to `out`: fixed-width values
 /// little-endian, BYTE_ARRAY values a length-prefixed copy.
+///
+/// Parquet stores only the values that are present, so a leaf's absent rows are
+/// already dropped by the time they reach here (see
+/// [`leaves`](super::leaves)) — a null left in the array would mean a field
+/// nullable in the data but required in the schema, which would silently write
+/// the wrong values, so it errors instead.
 pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<()> {
     if array.null_count() > 0 {
         return Err(WriteError::NullsInRequiredColumn {
@@ -57,10 +71,11 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
     }
     // BYTE_ARRAY values: a 4-byte LE length prefix then the bytes.
     macro_rules! byte_array {
-        ($arr:ty) => {{
+        ($arr:ty, |$value:ident| $bytes:expr) => {{
             let a = downcast::<$arr>(array)?;
             (0..len).for_each(|i| {
-                let bytes = a.value(i).as_bytes();
+                let $value = a.value(i);
+                let bytes: &[u8] = $bytes;
                 out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 out.extend_from_slice(bytes);
             });
@@ -71,8 +86,9 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         DataType::Int64 => fixed!(Int64Array),
         DataType::Float32 => fixed!(Float32Array),
         DataType::Float64 => fixed!(Float64Array),
-        DataType::Utf8 => byte_array!(StringArray),
-        DataType::Utf8View => byte_array!(StringViewArray),
+        DataType::Utf8 => byte_array!(StringArray, |value| value.as_bytes()),
+        DataType::Utf8View => byte_array!(StringViewArray, |value| value.as_bytes()),
+        DataType::BinaryView => byte_array!(BinaryViewArray, |value| value),
         other => return Err(WriteError::UnsupportedType(other.clone())),
     }
     Ok(())
@@ -109,5 +125,17 @@ mod tests {
             expected.extend_from_slice(s.as_bytes());
         }
         assert_eq!(out, expected);
+    }
+
+    /// A variant's `metadata`/`value` leaves are binary, and encode as
+    /// length-prefixed bytes just like strings do.
+    #[test]
+    fn encodes_binary_view_values() {
+        let array = BinaryViewArray::from(vec![b"\x01\x02".as_slice(), b"\xff".as_slice()]);
+
+        let mut out = Vec::new();
+        encode_into(&array, &mut out).unwrap();
+
+        assert_eq!(out, vec![2, 0, 0, 0, 1, 2, 1, 0, 0, 0, 255]);
     }
 }
