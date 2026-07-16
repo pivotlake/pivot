@@ -103,6 +103,24 @@ fn read_back(bytes: &[u8]) -> RecordBatch {
     arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
 }
 
+/// A file's first row group's statistics per leaf, keyed by dotted path.
+fn leaf_stats(bytes: &[u8]) -> Vec<(String, Option<u64>, bool)> {
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+    let row_group = reader.metadata().row_group(0);
+    (0..row_group.num_columns())
+        .map(|i| {
+            let column = row_group.column(i);
+            let stats = column.statistics();
+            (
+                column.column_path().string(),
+                stats.and_then(|s| s.null_count_opt()),
+                stats.is_some_and(|s| s.min_bytes_opt().is_some()),
+            )
+        })
+        .collect()
+}
+
 /// A file's leaf column paths, dotted — the shape the writer actually stamped
 /// into the footer.
 fn leaf_paths(bytes: &[u8]) -> Vec<String> {
@@ -298,6 +316,53 @@ fn already_shredded_input_re_shreds_to_the_merged_rows() {
             r#"{"id":4,"n":40}"#,
         ]
     );
+}
+
+/// Every leaf carries footer statistics, shredded or not, so a reader can prune
+/// row groups by any of them. The typed leaves get a range; the binary
+/// `metadata`/`value` leaves have no orderable type and get a null count alone.
+#[test]
+fn every_leaf_carries_footer_statistics() {
+    let files = write(
+        vec![JsonItem(rows(&[r#"{"id": 1}"#, r#"{"id": 5}"#]))],
+        usize::MAX,
+    );
+
+    let stats = leaf_stats(&files[0]);
+
+    assert!(
+        stats.iter().all(|(_, null_count, _)| null_count.is_some()),
+        "every leaf needs a null count: {stats:?}"
+    );
+    let typed = stats
+        .iter()
+        .find(|(path, ..)| path == "attrs.typed_value.id.typed_value")
+        .unwrap();
+    assert_eq!(typed.1, Some(0), "every row shredded into the typed leaf");
+    assert!(typed.2, "a typed leaf carries a min/max to prune on");
+}
+
+/// A shredded path may only be pruned by its typed leaf when the `value`
+/// fallback beside it holds nothing, and a reader establishes that from the
+/// fallback's null count against the row count. So an unused fallback has to
+/// record one, even though it is all-null and has no range to report.
+#[test]
+fn an_unused_fallback_leaf_records_a_full_null_count() {
+    let documents = rows(&[r#"{"id": 1}"#, r#"{"id": 5}"#, r#"{"id": 9}"#]);
+    let files = write(vec![JsonItem(documents.clone())], usize::MAX);
+
+    let stats = leaf_stats(&files[0]);
+
+    let fallback = stats
+        .iter()
+        .find(|(path, ..)| path == "attrs.typed_value.id.value")
+        .unwrap();
+    assert_eq!(
+        fallback.1,
+        Some(documents.len() as u64),
+        "every row shredded, so the fallback is null throughout: {stats:?}"
+    );
+    assert!(!fallback.2, "an all-null leaf has no min/max to report");
 }
 
 /// A nested path shreds into nested groups, and the document still reads back

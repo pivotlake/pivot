@@ -47,6 +47,7 @@ mod encoder;
 mod error;
 mod partition;
 mod shredding;
+mod stats;
 mod types;
 
 pub(crate) use types::EncodedFile;
