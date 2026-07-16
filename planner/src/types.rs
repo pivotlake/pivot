@@ -49,9 +49,10 @@ pub enum Type {
     Float32,
     /// DuckDB `DOUBLE` — a double-precision float column and the result type of `AVG`.
     Float64,
-    /// DuckDB `DECIMAL` — the result type of integer division (`AVG` lowers to
-    /// `sum / count`, whose `/` yields DECIMAL). Pivot computes it as `Float64`,
-    /// so this only needs to round-trip through plan translation.
+    /// DuckDB `DECIMAL`. Pivot computes it as `Float64`, so this only needs to
+    /// round-trip through plan translation. Division does not produce it: `/`
+    /// only has `REAL` and `DOUBLE` overloads, so decimal operands bind to the
+    /// `DOUBLE` one.
     Decimal,
     Utf8,
     /// DuckDB `DATE` — days since the epoch. The source parquet stores it as a
