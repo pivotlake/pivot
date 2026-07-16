@@ -133,8 +133,8 @@ impl Function {
             Function::DatePart(d) => d.return_type.clone(),
             // The regex replacers rewrite strings.
             Function::RegexpReplace(_) | Function::RegexpJitReplace(_) => Type::Utf8,
-            // `/` always computes a float quotient.
-            Function::Divide(_) => Type::Float64,
+            // `/` computes a float quotient, single- or double-precision.
+            Function::Divide(d) => d.return_type.clone(),
             // `date_trunc` and `now()` yield a timestamp.
             Function::DateTrunc(_) | Function::Now => Type::Timestamp,
             // `date`/`timestamp` ± interval keeps the temporal operand's type,

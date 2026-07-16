@@ -384,6 +384,7 @@ impl Divide {
         Ok(Divide {
             left: Box::new(Expression::from_handle(params[0])?),
             right: Box::new(Expression::from_handle(params[1])?),
+            return_type: type_from_logical(func.return_type())?,
         })
     }
 }
