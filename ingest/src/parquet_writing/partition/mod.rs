@@ -45,6 +45,7 @@ use json::row_object;
 use stats::column_min_max;
 
 use super::error::WriteResult;
+use super::shredding;
 use super::types::{ColumnChunkJob, PartitionTag, RowGroupHeader, RowGroupSortStats, SortColStat};
 
 /// A partition tuple (a one-row arrow-json object), or `None` for an
@@ -182,6 +183,12 @@ impl Consumer<RecordBatch, ColumnChunkJob> for Partitioner {
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        // Fold any variant column back to its plain `{metadata, value}` pair
+        // before buffering. Batches read back from files each carry the layout
+        // their file chose, and only once they agree on a schema can they be
+        // concatenated and re-cut into files that shred afresh. Ingest's batches
+        // are already this shape, so this is a no-op for them.
+        let batch = shredding::unshred_batch(batch)?;
         for (key, slice) in self.split(batch)? {
             let buffer = self.buffered_by_partition.entry(key.clone()).or_default();
             buffer.rows += slice.num_rows();
@@ -264,6 +271,10 @@ impl RowGroupBuilder {
         if rows == 0 {
             return Ok(());
         }
+        // This file's rows are all here, so this is where its variant columns
+        // pick their shredding — from the rows the file actually got, and for
+        // this file alone. It widens the schema, so read it back afterwards.
+        let batch = shredding::shred_batch(batch)?;
         let schema = batch.schema();
         let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
         // The assembler gathers a whole file on one worker, so every column chunk

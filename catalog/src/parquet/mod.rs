@@ -50,7 +50,7 @@ pub use types::arrow_map::arrow_to_parquet_physical;
 pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
 pub use types::page::{CompressedPage, DecompressedPage};
 pub use types::requests::{RowGroupBuffer, RowGroupRequest};
-pub use types::table::{Error as ParquetTableError, ParquetTable};
+pub use types::table::{Error as ParquetTableError, ParquetTable, is_variant_field};
 
 #[cfg(test)]
 pub(crate) mod test_utils {
