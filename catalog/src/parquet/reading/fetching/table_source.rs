@@ -400,10 +400,18 @@ impl RowGroupInjector {
             // releases it when the row group completes). While throttled the
             // pool is mostly parked (gated claims are no-op passes) and a
             // claim, unlike a channel send, wakes nobody on its own; waking
-            // one sibling per admitted claim lets the working set grow with
-            // the allowance.
+            // one worker per admitted claim lets the working set grow with
+            // the allowance. The wake prefers this node but spills to the
+            // others when nobody here is parked: every other wake during the
+            // throttled phase is node-local, so a purely local wake can leave
+            // an entire node parked for the whole phase whenever the other
+            // node wins the early tickets (a self-reinforcing race: awake
+            // workers claim freed tickets before parked ones hear of them),
+            // while an unconditional cross-node wake invites remote workers
+            // to claim, and decode through, the other node's cached bytes
+            // even when local workers were available.
             gate.admitted_claims.fetch_add(1, Ordering::Relaxed);
-            dispatch::worker::worker_waker().notify_one();
+            dispatch::worker::waker_set().notify_one_near(self.numa_node_idx);
         }
         ticket.transfer_to_decoder();
         Some(RowGroupRequest::from(row_group, &self.projection))

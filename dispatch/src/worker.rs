@@ -167,18 +167,21 @@ impl WorkerWaker {
     /// Bump the wake count and wake **one** parked worker, if any. For data
     /// sends: one new stealable item needs one thief, and any same-node worker
     /// is a valid one. When nobody is parked (spinners poll the count), this is
-    /// a single atomic bump.
-    pub fn notify_one(&self) {
+    /// a single atomic bump. Returns whether a parked worker was actually
+    /// woken, so a caller determined to grow the working set can go wake
+    /// somewhere else when this node had nobody to give.
+    pub fn notify_one(&self) -> bool {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
         if self.parked_workers.load(Ordering::SeqCst) == 0 {
-            return;
+            return false;
         }
         let start = self.next_wake.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.slots.len() {
             if self.wake_slot(&self.slots[(start + i) % self.slots.len()]) {
-                return;
+                return true;
             }
         }
+        false
     }
 
     /// Bump the wake count and wake worker `local_idx` if it is parked. For
@@ -325,6 +328,21 @@ impl WakerSet {
     pub fn notify_worker(&self, worker: usize) {
         self.node_wakers[worker / self.workers_per_node]
             .notify_slot(worker % self.workers_per_node);
+    }
+
+    /// Wake one parked worker, preferring node `node` and spilling to the
+    /// other nodes in order only when the preferred node had nobody parked.
+    /// For producers that want a pool-wide working set to grow one worker at
+    /// a time without herding a whole node awake: as long as the local node
+    /// has parked workers the wake stays local (no cross-node work migration
+    /// is invited), and only a fully-awake local node passes the wake on, so
+    /// a node that is parked in its entirety still gets pulled in.
+    pub fn notify_one_near(&self, node: usize) {
+        for offset in 0..self.node_wakers.len() {
+            if self.node_wakers[(node + offset) % self.node_wakers.len()].notify_one() {
+                return;
+            }
+        }
     }
 
     /// Wake every node group. For events whose consumers may be parked on any
@@ -495,6 +513,38 @@ mod tests {
         // The count advanced, so the park must return immediately.
         assert_eq!(waker.wait_if_unchanged(last_seen, 0), waker.wake_count());
         assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn notify_one_near_stays_local_while_the_local_node_has_parked_workers() {
+        let local = Arc::new(WorkerWaker::new(1));
+        let remote = Arc::new(WorkerWaker::new(1));
+        let set = WakerSet::new(vec![local.clone(), remote.clone()], 1);
+        let a = park_worker(&local, 0);
+        let b = park_worker(&remote, 0);
+        await_parked(&local, 1);
+        await_parked(&remote, 1);
+
+        set.notify_one_near(0);
+
+        a.join().unwrap();
+        assert_eq!(remote.parked_workers.load(Ordering::SeqCst), 1);
+        remote.notify();
+        b.join().unwrap();
+    }
+
+    #[test]
+    fn notify_one_near_spills_to_the_next_node_when_the_local_node_is_awake() {
+        let local = Arc::new(WorkerWaker::new(1));
+        let remote = Arc::new(WorkerWaker::new(1));
+        let set = WakerSet::new(vec![local.clone(), remote.clone()], 1);
+        let b = park_worker(&remote, 0);
+        await_parked(&remote, 1);
+
+        set.notify_one_near(0);
+
+        b.join().unwrap();
+        assert_eq!(remote.parked_workers.load(Ordering::SeqCst), 0);
     }
 }
 
