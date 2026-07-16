@@ -17,15 +17,19 @@
 //!    `partition_by` tuple, buffer per partition, and once a partition reaches one
 //!    file's worth, cut it into row groups and emit one job per column — stamping
 //!    each with its file/partition provenance, `sort_bounds`, and sort-column
-//!    statistics. The sub-file remainder is consolidated per partition on worker
-//!    0. This is the pipeline's only pipeline-breaker, so every later stage is a
-//!    plain parallel map or a gather. (Its partition-tuple and column-statistics
-//!    helpers live in the `partition` directory.)
-//! 3. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) — encode each column
-//!    chunk: dictionary-encode it where it pays, else PLAIN; cut into pages and
-//!    snappy-compress. The one heavy stage; finished chunks route back to their
-//!    file's owner worker. (Page cutting and index RLE live in the `encoder`
+//!    statistics. This is also where each file's variant columns pick their
+//!    [`shredding`], which is why that decision is per file: this stage is the
+//!    only one that sees a whole file's rows at once. The sub-file remainder is
+//!    consolidated per partition on worker 0. This is the pipeline's only
+//!    pipeline-breaker, so every later stage is a plain parallel map or a gather.
+//!    (Its partition-tuple and column-statistics helpers live in the `partition`
 //!    directory.)
+//! 3. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) — encode each column
+//!    chunk: flatten the column into the leaves Parquet stores, then for each,
+//!    dictionary-encode it where it pays, else PLAIN; cut into pages and
+//!    snappy-compress. The one heavy stage; finished chunks route back to their
+//!    file's owner worker. (Leaf flattening, page cutting and index RLE live in
+//!    the `encoder` directory.)
 //! 4. [`assembler`] (`EncodedColumnChunk → EncodedFile`) — gather a file's column
 //!    chunks, lay each out (the dictionary page, then the data pages) with
 //!    sort-column footer statistics, and emit the finished file.
@@ -42,6 +46,7 @@ mod convert;
 mod encoder;
 mod error;
 mod partition;
+mod shredding;
 mod types;
 
 pub(crate) use types::EncodedFile;
@@ -127,6 +132,9 @@ pub fn encode_record_batches(
         target_row_groups,
     )
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Chain the encode stages (partition onward) onto a `RecordBatch` dataflow and
 /// run it, yielding finished [`EncodedFile`]s as they complete.

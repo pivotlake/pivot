@@ -26,6 +26,29 @@ pub(super) fn encode_indices(indices: &[u32], bit_width: u8) -> Vec<u8> {
     encoder.finish()
 }
 
+/// Encode definition `levels` as a Parquet RLE/bit-packed hybrid stream — the
+/// same encoding as the indices, over the levels `0..=max_def_level`. A leaf
+/// present on every row collapses to a single RLE run, so the levels cost a few
+/// bytes when they carry no information.
+pub(super) fn encode_levels(levels: &[i16], max_def_level: i16) -> Vec<u8> {
+    let mut encoder = RleEncoder::new(bit_width(max_def_level as usize));
+    for &level in levels {
+        encoder.put(level as u32);
+    }
+    encoder.finish()
+}
+
+/// Bits needed to encode the values `0..=max` — at least one, so a stream whose
+/// only value is zero still carries a real bit width. Mirrors the reader's
+/// `bit_width_for`; the two must agree or a page's levels decode as garbage.
+pub(super) fn bit_width(max: usize) -> u8 {
+    if max == 0 {
+        1
+    } else {
+        (usize::BITS - max.leading_zeros()) as u8
+    }
+}
+
 struct RleEncoder {
     bit_width: u8,
     out: Vec<u8>,

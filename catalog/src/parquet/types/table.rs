@@ -558,17 +558,35 @@ fn parse_schema_element(
     }
 }
 
+/// The canonical Arrow extension type name for a Parquet variant. The reader
+/// stamps it onto a VARIANT group's field and the writer looks for it to decide
+/// which struct columns to write back as VARIANT, so both name it from here.
+pub const VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
+
 /// The Arrow field metadata that marks a struct as a Parquet variant.
 fn variant_extension_metadata() -> std::collections::HashMap<String, String> {
     use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
     [
         (
             EXTENSION_TYPE_NAME_KEY.to_owned(),
-            "arrow.parquet.variant".to_owned(),
+            VARIANT_EXTENSION_NAME.to_owned(),
         ),
         (EXTENSION_TYPE_METADATA_KEY.to_owned(), String::new()),
     ]
     .into()
+}
+
+/// Whether `field` is a variant column — a struct carrying the Arrow variant
+/// extension tag, stamped either by [`parse_schema_element`] when reading a
+/// VARIANT group back or by a producer building one to write.
+pub fn is_variant_field(field: &Field) -> bool {
+    use arrow_schema::extension::EXTENSION_TYPE_NAME_KEY;
+    matches!(field.data_type(), DataType::Struct(_))
+        && field
+            .metadata()
+            .get(EXTENSION_TYPE_NAME_KEY)
+            .map(String::as_str)
+            == Some(VARIANT_EXTENSION_NAME)
 }
 
 #[cfg(test)]

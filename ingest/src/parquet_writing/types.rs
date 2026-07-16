@@ -3,9 +3,10 @@
 //! The unit of encode work is one **column chunk** (a single column's values for
 //! one row group): the [`partition`](super::partition) stage emits a
 //! [`ColumnChunkJob`], the [`encoder`](super::encoder) turns it into an
-//! [`EncodedColumnChunk`] (PLAIN, or dictionary-encoded), and the
-//! [`assembler`](super::assembler) lays the chunks out into a file. Each carries
-//! the row group's shared [`RowGroupHeader`] for routing and provenance.
+//! [`EncodedColumnChunk`] holding one [`EncodedLeaf`] per leaf of that column
+//! (PLAIN, or dictionary-encoded), and the [`assembler`](super::assembler) lays
+//! the leaves out into a file. Each carries the row group's shared
+//! [`RowGroupHeader`] for routing and provenance.
 
 use std::sync::Arc;
 
@@ -105,15 +106,26 @@ pub(crate) struct EncodedPage {
     pub(crate) bytes: Vec<u8>,
 }
 
+/// One leaf's encoded pages. Parquet stores a chunk per *leaf*, not per column:
+/// a flat column has exactly one, and a shredded variant one per primitive under
+/// its `{metadata, value, typed_value{..}}` struct. Either PLAIN
+/// (`dictionary_page` is `None`) or dictionary-encoded (`dictionary_page` holds
+/// the distinct values; `data_pages` hold RLE-encoded indices).
+pub(crate) struct EncodedLeaf {
+    /// The leaf's path from its top-level column down, e.g. `["attrs",
+    /// "typed_value", "user", "typed_value"]` — the footer's `path_in_schema`.
+    pub(crate) path: Vec<String>,
+    pub(crate) physical_type: i32,
+    pub(crate) dictionary_page: Option<EncodedPage>,
+    pub(crate) data_pages: Vec<EncodedPage>,
+}
+
 /// A fully-encoded column chunk, routed back to its row group's owner worker for
-/// assembly. Either PLAIN (`dictionary_page` is `None`) or dictionary-encoded
-/// (`dictionary_page` holds the distinct values; `data_pages` hold RLE-encoded
-/// indices).
+/// assembly: one column's leaves, in the depth-first order Parquet numbers them.
 pub(crate) struct EncodedColumnChunk {
     pub(crate) header: Arc<RowGroupHeader>,
     pub(crate) column: usize,
-    pub(crate) dictionary_page: Option<EncodedPage>,
-    pub(crate) data_pages: Vec<EncodedPage>,
+    pub(crate) leaves: Vec<EncodedLeaf>,
 }
 
 impl WorkerIdOutput for EncodedColumnChunk {

@@ -22,12 +22,12 @@
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
 //!   Date32            INT32              Date                    read only
 //!   Timestamp(Second) INT64              Timestamp{..}           read only
-//!   BinaryView        BYTE_ARRAY         unannotated             read only
+//!   BinaryView        BYTE_ARRAY         unannotated             read+write
 //! ```
 //!
 //! The "read only" rows resolve files written elsewhere; pivot's own writer only
 //! emits the column set its encoder supports (Int32/Int64/Float32/Float64/
-//! strings), so [`arrow_to_parquet_physical`] errors on the rest.
+//! strings/binary), so [`arrow_to_parquet_physical`] errors on the rest.
 
 use arrow_schema::{DataType, TimeUnit};
 
@@ -161,13 +161,18 @@ fn int64_arrow(
 /// Write path: the Parquet physical type id for an arrow column. The inverse of
 /// [`parquet_to_arrow`] over the writable subset; errors on a type the encoder
 /// doesn't emit.
+///
+/// A `BinaryView` writes as an unannotated BYTE_ARRAY — the spec's own
+/// definition of binary, and what a variant's `metadata`/`value` leaves are.
+/// Leaving off the UTF8 annotation is what keeps [`parquet_to_arrow`] reading it
+/// back as binary rather than as text.
 pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
     Ok(match data_type {
         DataType::Int32 => INT32,
         DataType::Int64 => INT64,
         DataType::Float32 => FLOAT,
         DataType::Float64 => DOUBLE,
-        DataType::Utf8 | DataType::Utf8View => BYTE_ARRAY,
+        DataType::Utf8 | DataType::Utf8View | DataType::BinaryView => BYTE_ARRAY,
         other => {
             return Err(Error::UnsupportedType(format!("arrow type {other:?}")));
         }

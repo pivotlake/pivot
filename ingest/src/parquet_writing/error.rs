@@ -29,11 +29,12 @@ pub(super) enum WriteError {
     /// physical type (from [`catalog::parquet::arrow_to_parquet_physical`]).
     #[error(transparent)]
     Catalog(#[from] catalog::parquet::ParquetTableError),
-    /// A row group whose column yielded no pages — an internal invariant break.
-    #[error("column {column} of a row group produced no pages")]
-    MissingPages { column: usize },
-    /// Only required (non-null) columns are supported; this one has nulls.
-    #[error("column has {nulls} null(s); only required (non-null) columns are supported")]
+    /// A row group whose leaf yielded no pages — an internal invariant break.
+    #[error("leaf {path} of a row group produced no pages")]
+    MissingPages { path: String },
+    /// A leaf whose values still hold nulls once its absent rows were dropped,
+    /// which means the array is nullable where its field is declared required.
+    #[error("a required leaf has {nulls} null(s)")]
     NullsInRequiredColumn { nulls: usize },
     /// An array did not have the Arrow type its column's schema declared.
     #[error("array downcast to {expected} failed")]
