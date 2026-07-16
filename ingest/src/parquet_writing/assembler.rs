@@ -27,14 +27,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    StringViewArray,
-};
 use arrow_schema::{DataType, FieldRef, SchemaRef};
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::{
-    ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement, Statistics,
+    ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement,
 };
 use thriftparquet::general::Encoding;
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
@@ -42,7 +38,6 @@ use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use super::error::{WriteError, WriteResult};
 use super::types::{
     EncodedColumnChunk, EncodedFile, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
-    RowGroupSortStats,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -126,8 +121,7 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
             items: chunks,
             ..
         } = self.chunks_by_row_group.remove(&row_group_id).unwrap();
-        let stats = build_stats(&header.tag.sort_stats);
-        let group = assemble_row_group(chunks, &stats)?;
+        let group = assemble_row_group(chunks)?;
 
         // Add it to its file; emit the file once all its row groups are in.
         let file_id = header.tag.file_id;
@@ -156,68 +150,6 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
     }
 }
 
-/// Build the column-index → footer `Statistics` map for a row group's sort
-/// columns (min/max as the bytes the reader decodes; skip any column whose type
-/// has no encodable stats).
-fn build_stats(sort_stats: &RowGroupSortStats) -> HashMap<usize, Statistics> {
-    let mut map = HashMap::new();
-    for col in &sort_stats.cols {
-        let (Some(min_value), Some(max_value)) = (stat_bytes(&col.min), stat_bytes(&col.max))
-        else {
-            continue;
-        };
-        map.insert(
-            col.column,
-            Statistics {
-                max: None,
-                min: None,
-                null_count: Some(col.null_count),
-                distinct_count: None,
-                max_value: Some(max_value),
-                min_value: Some(min_value),
-            },
-        );
-    }
-    map
-}
-
-/// Encode a single-element stats array (a sort column's min or max, computed by
-/// the partition stage) into the Parquet `min_value`/`max_value` bytes. The
-/// encoding must match the reader's `decode_scalar` exactly — little-endian for
-/// primitives, raw UTF-8 for strings — or stats-based row-group pruning would
-/// silently drop rows.
-fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
-    macro_rules! le_bytes {
-        ($arr:ty) => {
-            value
-                .as_any()
-                .downcast_ref::<$arr>()?
-                .value(0)
-                .to_le_bytes()
-                .to_vec()
-        };
-    }
-    macro_rules! raw_bytes {
-        ($arr:ty) => {
-            value
-                .as_any()
-                .downcast_ref::<$arr>()?
-                .value(0)
-                .as_bytes()
-                .to_vec()
-        };
-    }
-    Some(match value.data_type() {
-        DataType::Int32 => le_bytes!(Int32Array),
-        DataType::Int64 => le_bytes!(Int64Array),
-        DataType::Float32 => le_bytes!(Float32Array),
-        DataType::Float64 => le_bytes!(Float64Array),
-        DataType::Utf8 => raw_bytes!(StringArray),
-        DataType::Utf8View => raw_bytes!(StringViewArray),
-        _ => return None,
-    })
-}
-
 /// One fully-encoded row group: its column-chunk bytes plus the chunk metadata,
 /// with offsets relative to the start of `bytes` (rebased by [`build_file`]).
 struct AssembledRowGroup {
@@ -226,12 +158,8 @@ struct AssembledRowGroup {
 }
 
 /// Assemble one row group from its column chunks (one per schema column, any
-/// order). `stats` maps a column index to the footer `Statistics` to write for it
-/// (sort columns).
-fn assemble_row_group(
-    mut chunks: Vec<EncodedColumnChunk>,
-    stats: &HashMap<usize, Statistics>,
-) -> WriteResult<AssembledRowGroup> {
+/// order). Each leaf brings its own footer statistics from the encoder.
+fn assemble_row_group(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<AssembledRowGroup> {
     // Footer column chunks must be in schema order; work-stealing delivers them
     // in any order. Within a column, its leaves are already in footer order.
     chunks.sort_by_key(|c| c.column);
@@ -239,14 +167,8 @@ fn assemble_row_group(
     let mut bytes = Vec::new();
     let mut columns = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        // Only sort columns get footer statistics, and a sort key is always a
-        // flat column — one leaf, which takes them. A wider column (a variant)
-        // is never a sort key, so it gets none.
-        let mut statistics = (chunk.leaves.len() == 1)
-            .then(|| stats.get(&chunk.column).cloned())
-            .flatten();
         for leaf in chunk.leaves {
-            columns.push(write_leaf_chunk(&mut bytes, leaf, statistics.take())?);
+            columns.push(write_leaf_chunk(&mut bytes, leaf)?);
         }
     }
     Ok(AssembledRowGroup { bytes, columns })
@@ -306,11 +228,7 @@ fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult
 /// Append one leaf's column chunk to `out`: its dictionary page (if any) followed
 /// by its data pages, contiguously. Returns the chunk metadata with offsets
 /// relative to `out` (rebased to the file by [`build_file`]).
-fn write_leaf_chunk(
-    out: &mut Vec<u8>,
-    leaf: EncodedLeaf,
-    statistics: Option<Statistics>,
-) -> WriteResult<ColumnChunk> {
+fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnChunk> {
     if leaf.data_pages.is_empty() {
         return Err(WriteError::MissingPages {
             path: leaf.path.join("."),
@@ -355,7 +273,7 @@ fn write_leaf_chunk(
             total_compressed_size: compressed,
             data_page_offset,
             dictionary_page_offset,
-            statistics,
+            statistics: Some(leaf.statistics),
             encoding_stats: None,
         }),
     })
@@ -438,7 +356,7 @@ mod tests {
     use crate::parquet_writing::types::{EncodedColumnChunk, PartitionTag};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int64Type;
-    use arrow_array::{Array, Int64Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
     use arrow_buffer::NullBuffer;
     use arrow_schema::{Field, Fields, Schema};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -455,7 +373,6 @@ mod tests {
                 n_row_groups: 1,
                 partition: None,
                 sort_bounds: None,
-                sort_stats: RowGroupSortStats { cols: vec![] },
             }),
         })
     }
@@ -477,7 +394,7 @@ mod tests {
             })
             .collect::<WriteResult<_>>()
             .unwrap();
-        let group = assemble_row_group(chunks, &HashMap::new()).unwrap();
+        let group = assemble_row_group(chunks).unwrap();
         build_file(&schema, vec![group]).unwrap()
     }
 

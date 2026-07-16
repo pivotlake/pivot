@@ -71,7 +71,7 @@ pub(super) fn flatten(field: &Field, values: &ArrayRef) -> WriteResult<Vec<Leaf>
     let mut leaves = Vec::new();
     // A top-level column starts defined at level 0 on every row: it has no
     // ancestor that could be absent.
-    collect(
+    append_leaves(
         field,
         values,
         &mut Vec::new(),
@@ -128,9 +128,9 @@ impl Defined {
     }
 }
 
-/// Walk one node, appending its leaves. `path` names the fields from the
-/// top-level column down to and including `field`.
-fn collect(
+/// Append the leaves at or under `field` to `leaves`, depth-first. `path` names
+/// the fields from the top-level column down to and including `field`.
+fn append_leaves(
     field: &Field,
     values: &ArrayRef,
     path: &mut Vec<String>,
@@ -145,7 +145,7 @@ fn collect(
             // A struct stores nothing itself — it is only a footer group. Its
             // children carry its absence in their own levels.
             for (child, child_values) in fields.iter().zip(values.as_struct().columns()) {
-                collect(child.as_ref(), child_values, path, &defined, leaves)?;
+                append_leaves(child.as_ref(), child_values, path, &defined, leaves)?;
             }
         }
         _ => leaves.push(build_leaf(path.clone(), values, defined)?),
