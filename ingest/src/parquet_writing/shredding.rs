@@ -3,8 +3,8 @@
 //! Parquet fixes a column's physical schema for the whole file, so shredding is
 //! chosen after a file-worth of batches has been gathered and before it is cut
 //! into row groups. For every VARIANT location we count the supported physical
-//! types and select the most frequent one. Values of another type remain in the
-//! spec's binary `value` fallback, preserving the document exactly.
+//! types and select the most frequent one. Values that cannot be represented by
+//! the selected leaf remain in the spec's binary `value` fallback.
 //!
 //! Object fields are inferred recursively. Hard limits bound both work and the
 //! resulting footer for documents used as high-cardinality maps (for example,
@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::extension::ExtensionType;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet_variant::Variant;
 use parquet_variant_compute::{VariantArray, VariantType, shred_variant, unshred_variant};
@@ -28,8 +29,6 @@ const MAX_INFERRED_FIELDS: usize = 256;
 /// into unbounded recursion. Parquet's two wrappers per shredded object make
 /// even this limit far deeper than practical query paths.
 const MAX_INFERRED_DEPTH: usize = 16;
-
-const VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
 
 /// Convert every VARIANT batch to the canonical unshredded shape. Compaction
 /// can receive batches from files with different shredding layouts; normalizing
@@ -126,7 +125,7 @@ pub(super) fn shred_file(batch: RecordBatch) -> WriteResult<RecordBatch> {
 
 #[inline]
 pub(super) fn is_variant(field: &Field) -> bool {
-    field.extension_type_name() == Some(VARIANT_EXTENSION_NAME)
+    field.extension_type_name() == Some(VariantType::NAME)
         && field.try_extension_type::<VariantType>().is_ok()
 }
 
@@ -154,10 +153,6 @@ const KINDS: [Kind; 5] = [
 #[derive(Default)]
 struct Node {
     counts: [usize; KINDS.len()],
-    /// `shred_variant` accepts zero-scale decimals for an Int64 target. That
-    /// conversion changes the Variant's semantic type, so such a value makes
-    /// integer shredding unsafe at this location.
-    blocks_integer: bool,
     fields: HashMap<String, Node>,
 }
 
@@ -211,7 +206,9 @@ fn observe_node(
         }
         // The reader does not yet decode BOOLEAN leaves, and lists require
         // repetition levels. Temporal/decimal/UUID values are likewise outside
-        // today's writable leaf set. They safely remain in `value`.
+        // today's inferred leaf set. Arrow may losslessly place a fitting,
+        // zero-scale decimal in an inferred Int64 leaf; the rest remain in
+        // `value`.
         Variant::Null
         | Variant::BooleanTrue
         | Variant::BooleanFalse
@@ -221,20 +218,11 @@ fn observe_node(
         | Variant::TimestampNtzMicros(_)
         | Variant::TimestampNanos(_)
         | Variant::TimestampNtzNanos(_)
+        | Variant::Decimal4(_)
+        | Variant::Decimal8(_)
+        | Variant::Decimal16(_)
         | Variant::Time(_)
         | Variant::Uuid(_) => return,
-        Variant::Decimal4(decimal) => {
-            node.blocks_integer |= decimal.scale() == 0;
-            return;
-        }
-        Variant::Decimal8(decimal) => {
-            node.blocks_integer |= decimal.scale() == 0;
-            return;
-        }
-        Variant::Decimal16(decimal) => {
-            node.blocks_integer |= decimal.scale() == 0;
-            return;
-        }
     };
     node.counts[kind as usize] += 1;
 }
@@ -252,14 +240,11 @@ impl Node {
                 break;
             }
             let data_type = match kind {
-                // The Arrow shredding kernel deliberately permits numeric
-                // coercions. Preserve Variant semantics instead: Int64 may
-                // widen integer widths, but must not absorb decimals; Float64
-                // may widen Float, but must not turn integers into doubles.
-                // If floats outnumber integers, skipping both avoids choosing a
-                // tiny integer leaf merely because the useful float leaf is
-                // unsafe.
-                Kind::Integer if self.blocks_integer || floats > integers => None,
+                // The Arrow shredding kernel permits integer-to-double
+                // coercion, which changes JSON `3` into `3.0`. If floats
+                // outnumber integers, skipping both avoids choosing a tiny
+                // integer leaf merely because the useful float leaf is unsafe.
+                Kind::Integer if floats > integers => None,
                 Kind::Integer => Some(DataType::Int64),
                 Kind::Float if integers > 0 => None,
                 Kind::Float => Some(DataType::Float64),
@@ -293,8 +278,9 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use arrow_array::{Int64Array, StringArray};
     use arrow_select::concat::concat_batches;
+    use parquet_variant::VariantDecimal4;
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant};
 
     fn variant_batch(rows: Vec<Option<&str>>) -> RecordBatch {
@@ -341,6 +327,29 @@ mod tests {
         let batch = shred_file(batch).unwrap();
         let doc = VariantArray::try_new(batch.column(0).as_ref()).unwrap();
         assert!(doc.typed_value_field().is_none());
+    }
+
+    #[test]
+    fn zero_scale_decimal_joins_an_integer_leaf() {
+        let variant = VariantArray::from_iter([
+            Variant::from(1_i64),
+            Variant::from(VariantDecimal4::try_new(2, 0).unwrap()),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![variant.field("doc")])),
+            vec![Arc::new(variant.into_inner())],
+        )
+        .unwrap();
+
+        let shredded = shred_file(batch).unwrap();
+        let doc = VariantArray::try_new(shredded.column(0).as_ref()).unwrap();
+        let typed = doc
+            .typed_value_field()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(typed.values(), &[1, 2]);
     }
 
     #[test]
