@@ -28,6 +28,35 @@ pgo-use *args:
         CARGO_TARGET_DIR=target-pgouse cargo {{args}}
 
 
+# Host triple, for the A/B recipes below. Passing an explicit --target (even
+# the host's own triple) makes cargo stop applying RUSTFLAGS to host units
+# (build scripts, proc macros): instrumentation never reaches them, and a
+# profile-use flag change no longer invalidates their outputs, chiefly the
+# DuckDB C++ cmake build, which no profile flag affects anyway.
+host_target := `rustc -vV | sed -n 's/^host: //p'`
+
+# Build instrumented for profile generation, without running or merging:
+# for A/B automation that runs the workload itself, redirects each side's
+# profiles via LLVM_PROFILE_FILE, and merges per side. Binaries land under
+# target-pgogen/{{host_target}}/.
+# lld because instrumentation can grow the text past the 128MB aarch64
+# branch range, which GNU ld fails with relocation overflows.
+pgo-gen-build subcmd *args:
+    mkdir -p {{pgo_dir}}
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
+        CARGO_TARGET_DIR=target-pgogen cargo {{subcmd}} --target {{host_target}} {{args}}
+
+# Like pgo-use but with a caller-supplied profdata path. rustc records the
+# profile file in dep-info, so even at a constant path a regenerated profile
+# rebuilds every Rust unit; passing a per-profile path makes that rebuild a
+# consequence of the flags hash too, immune to mtime comparisons against
+# artifacts restored from another machine. Build-script outputs (unflagged
+# thanks to the explicit --target) stay cached either way. Binaries land
+# under target-pgouse/{{host_target}}/.
+pgo-use-with profdata subcmd *args:
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{profdata}} -Ctarget-cpu=native" \
+        CARGO_TARGET_DIR=target-pgouse cargo {{subcmd}} --target {{host_target}} {{args}}
+
 # Remove all PGO profiles and merged data.
 pgo-clean:
     rm -rf {{pgo_dir}}
