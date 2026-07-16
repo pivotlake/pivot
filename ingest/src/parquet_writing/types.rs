@@ -15,6 +15,7 @@ use arrow_schema::SchemaRef;
 use catalog::SortBounds;
 use dispatch::{Identifier, WorkerIdOutput};
 use serde_json::Value;
+use thriftparquet::footer::Statistics;
 
 /// Identifies a row group across the pipeline so its column chunks reassemble
 /// together.
@@ -24,29 +25,11 @@ pub(crate) type RowGroupId = u64;
 /// together (and route to one worker).
 pub(crate) type FileId = u64;
 
-/// One sort column's min/max (+ null count) over a single row group, as
-/// single-element Arrow arrays — written into the row group's footer
-/// `Statistics` and aggregated into the file's manifest `sort_bounds`.
-pub(crate) struct SortColStat {
-    /// Column index within the schema.
-    pub(crate) column: usize,
-    pub(crate) min: ArrayRef,
-    pub(crate) max: ArrayRef,
-    pub(crate) null_count: i64,
-}
-
-/// The sort-column statistics for one row group (one [`SortColStat`] per
-/// `sort_by` column; empty when the table has no sort key).
-pub(crate) struct RowGroupSortStats {
-    pub(crate) cols: Vec<SortColStat>,
-}
-
-/// Per-row-group provenance threaded from the [`partition`](super::partition) stage to
-/// the [`assembler`](super::assembler). The file-level fields (`file_id`,
-/// `n_row_groups`, `partition`) are shared by every row group of a file;
-/// `sort_stats` is this row group's own. Always present (an unpartitioned,
-/// unsorted write carries one with `partition`/`sort_bounds` `None` and empty
-/// `sort_stats`). `Arc` so the chunk stages clone it cheaply.
+/// Per-row-group provenance threaded from the [`partition`](super::partition)
+/// stage to the [`assembler`](super::assembler). Every field is file-level, so a
+/// file's row groups all carry the same one. Always present (an unpartitioned,
+/// unsorted write carries one with `partition`/`sort_bounds` `None`). `Arc` so
+/// the chunk stages clone it cheaply.
 pub(crate) struct PartitionTag {
     /// The output file this row group belongs to; the assembler packs all row
     /// groups of one `file_id` into a single Parquet file.
@@ -55,12 +38,10 @@ pub(crate) struct PartitionTag {
     pub(crate) n_row_groups: usize,
     pub(crate) partition: Option<Value>,
     /// The file's sort-key bounds (min/max per sort column over the whole file),
-    /// recorded in the manifest. File-level: the same on every row group of the
-    /// file. `None` when the table has no sort key.
+    /// recorded in the manifest. `None` when the table has no sort key. The
+    /// per-row-group, per-column statistics the footer carries are a separate
+    /// thing, computed by the encoder for every leaf.
     pub(crate) sort_bounds: Option<SortBounds>,
-    /// This row group's own sort-column min/max, written into its footer
-    /// `Statistics`.
-    pub(crate) sort_stats: RowGroupSortStats,
 }
 
 /// A finished Parquet file from the write pipeline, with the manifest metadata to
@@ -116,6 +97,9 @@ pub(crate) struct EncodedLeaf {
     /// "typed_value", "user", "typed_value"]` — the footer's `path_in_schema`.
     pub(crate) path: Vec<String>,
     pub(crate) physical_type: i32,
+    /// This leaf's min/max and null count over the row group, for the footer.
+    /// Every leaf carries them, so a reader can prune by any column.
+    pub(crate) statistics: Statistics,
     pub(crate) dictionary_page: Option<EncodedPage>,
     pub(crate) data_pages: Vec<EncodedPage>,
 }

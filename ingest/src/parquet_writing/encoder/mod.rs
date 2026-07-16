@@ -27,8 +27,10 @@ mod rle;
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
+use thriftparquet::footer::Statistics;
 
 use super::error::WriteResult;
+use super::stats;
 use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedLeaf};
 use leaves::Leaf;
 
@@ -75,6 +77,7 @@ pub(in crate::parquet_writing) fn encode_column_chunk(
 /// Encode one leaf, preferring a dictionary and falling back to PLAIN.
 fn encode_leaf(leaf: Leaf) -> WriteResult<EncodedLeaf> {
     let physical_type = catalog::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
+    let statistics = leaf_statistics(&leaf);
     let (dictionary_page, data_pages) = match dictionary::try_encode(&leaf)? {
         Some((dictionary_page, index_page)) => (Some(dictionary_page), vec![index_page]),
         None => (None, plain::encode_chunk(&leaf)?),
@@ -82,7 +85,34 @@ fn encode_leaf(leaf: Leaf) -> WriteResult<EncodedLeaf> {
     Ok(EncodedLeaf {
         path: leaf.path,
         physical_type,
+        statistics,
         dictionary_page,
         data_pages,
     })
+}
+
+/// This leaf's footer statistics: the range of the values it stores, and how many
+/// of its rows store none at all.
+///
+/// Every leaf gets them, which is what lets a reader prune row groups by any
+/// column instead of only by the sort key. The null count is recorded even for a
+/// leaf with no range to give — a leaf absent on every row has no values to take
+/// one from — because it prunes on its own account: a shredded path's typed leaf
+/// may only be trusted when every `value` fallback beside it is all-null, and the
+/// null count is how a reader establishes that.
+fn leaf_statistics(leaf: &Leaf) -> Statistics {
+    let (min_value, max_value) = match stats::column_min_max(&leaf.values) {
+        Some((min, max)) => (stats::stat_bytes(&min), stats::stat_bytes(&max)),
+        None => (None, None),
+    };
+    Statistics {
+        // The deprecated pair, superseded by `min_value`/`max_value`.
+        min: None,
+        max: None,
+        // Absent rows: the leaf spans every row, but stores only the present.
+        null_count: Some((leaf.rows() - leaf.values.len()) as i64),
+        distinct_count: None,
+        min_value,
+        max_value,
+    }
 }

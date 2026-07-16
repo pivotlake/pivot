@@ -39,14 +39,13 @@ use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, Unary
 use serde_json::Value;
 
 mod json;
-mod stats;
 
 use json::row_object;
-use stats::column_min_max;
 
 use super::error::WriteResult;
 use super::shredding;
-use super::types::{ColumnChunkJob, PartitionTag, RowGroupHeader, RowGroupSortStats, SortColStat};
+use super::stats::column_min_max;
+use super::types::{ColumnChunkJob, PartitionTag, RowGroupHeader};
 
 /// A partition tuple (a one-row arrow-json object), or `None` for an
 /// unpartitioned write — used directly as the grouping key (`Value` is `Hash +
@@ -297,7 +296,6 @@ impl RowGroupBuilder {
                 n_row_groups,
                 partition: partition.clone(),
                 sort_bounds: sort_bounds.clone(),
-                sort_stats: self.row_group_stats(&slice, &schema),
             });
             // Every column chunk of this row group shares one header.
             let header = Arc::new(RowGroupHeader {
@@ -317,26 +315,6 @@ impl RowGroupBuilder {
         Ok(())
     }
 
-    /// One row group's per-sort-column min/max (skipping columns whose type has
-    /// no stats — they just get no footer statistics).
-    fn row_group_stats(&self, slice: &RecordBatch, schema: &SchemaRef) -> RowGroupSortStats {
-        let mut cols = Vec::new();
-        for name in self.sort_by.iter() {
-            let Ok(i) = schema.index_of(name) else {
-                continue;
-            };
-            if let Some((min, max, null_count)) = column_min_max(slice.column(i)) {
-                cols.push(SortColStat {
-                    column: i,
-                    min,
-                    max,
-                    null_count,
-                });
-            }
-        }
-        RowGroupSortStats { cols }
-    }
-
     /// The file's sort-key bounds: each sort column's min/max over the whole file,
     /// as `{col: min}` / `{col: max}` arrow-json objects. `None` if there's no
     /// sort key or no sort column has stats.
@@ -354,7 +332,7 @@ impl RowGroupBuilder {
         let mut included = Vec::new();
         for name in self.sort_by.iter() {
             let i = schema.index_of(name)?;
-            let Some((min, max, _)) = column_min_max(batch.column(i)) else {
+            let Some((min, max)) = column_min_max(batch.column(i)) else {
                 continue;
             };
             fields.push(schema.field(i).as_ref().clone());
