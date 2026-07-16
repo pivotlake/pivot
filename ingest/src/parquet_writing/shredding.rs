@@ -233,20 +233,12 @@ impl Node {
     fn inferred_type(&self) -> Option<DataType> {
         let mut candidates = KINDS;
         candidates.sort_by_key(|kind| std::cmp::Reverse(self.counts[*kind as usize]));
-        let integers = self.counts[Kind::Integer as usize];
-        let floats = self.counts[Kind::Float as usize];
         for kind in candidates {
             if self.counts[kind as usize] == 0 {
                 break;
             }
             let data_type = match kind {
-                // The Arrow shredding kernel permits integer-to-double
-                // coercion, which changes JSON `3` into `3.0`. If floats
-                // outnumber integers, skipping both avoids choosing a tiny
-                // integer leaf merely because the useful float leaf is unsafe.
-                Kind::Integer if floats > integers => None,
                 Kind::Integer => Some(DataType::Int64),
-                Kind::Float if integers > 0 => None,
                 Kind::Float => Some(DataType::Float64),
                 Kind::String => Some(DataType::Utf8View),
                 Kind::Binary => Some(DataType::BinaryView),
@@ -278,7 +270,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{Float64Array, Int64Array, StringArray};
     use arrow_select::concat::concat_batches;
     use parquet_variant::VariantDecimal4;
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant};
@@ -350,6 +342,30 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(typed.values(), &[1, 2]);
+    }
+
+    #[test]
+    fn most_frequent_kind_wins_for_mixed_numbers() {
+        let variant = VariantArray::from_iter([
+            Variant::from(1.5_f64),
+            Variant::from(2.5_f64),
+            Variant::from(3_i64),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![variant.field("doc")])),
+            vec![Arc::new(variant.into_inner())],
+        )
+        .unwrap();
+
+        let shredded = shred_file(batch).unwrap();
+        let doc = VariantArray::try_new(shredded.column(0).as_ref()).unwrap();
+        let typed = doc
+            .typed_value_field()
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(typed.values(), &[1.5, 2.5, 3.0]);
     }
 
     #[test]

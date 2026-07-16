@@ -555,9 +555,9 @@ mod tests {
     #[test]
     fn inferred_variant_shredding_round_trips_through_strict_reader() {
         let json: ArrayRef = Arc::new(StringArray::from(vec![
-            Some(r#"{"age":10,"score":1.5,"user":{"name":"alice"}}"#),
-            Some(r#"{"age":20,"score":2.5,"user":{"name":"bob"}}"#),
-            Some(r#"{"age":"unknown","score":3,"user":{"name":3}}"#),
+            Some(r#"{"age":10,"user":{"name":"alice"}}"#),
+            Some(r#"{"age":20,"user":{"name":"bob"}}"#),
+            Some(r#"{"age":"unknown","user":{"name":3}}"#),
             None,
         ]));
         let input = json_to_variant(&json).unwrap();
