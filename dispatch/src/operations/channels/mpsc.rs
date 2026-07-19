@@ -4,7 +4,7 @@
 //! check [`is_empty`](Receiver::is_empty) without blocking. Used for the final
 //! output channel in [`collect`](crate::api::RecordBatchOperatorSpec::collect)
 //! and internally by the [`return_to_worker`](super::return_to_worker) and
-//! [`fan_in`](super::fan_in) channels.
+//! [`fan_in`](mod@super::fan_in) channels.
 
 use crate::operations::channels;
 use crate::operations::channels::{Receiver, Sender};
