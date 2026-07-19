@@ -8,7 +8,8 @@ use crate::manifest::{ManifestEntry, PartitionEqFilter, SortBounds, TableManifes
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use arrow_array::{ArrayRef, Scalar};
-use dispatch::DataFlowDispatcher;
+use crossbeam_deque::{Injector, Steal};
+use dispatch::{DataFlowDispatcher, Projection};
 use planner::catalog::Column;
 
 /// One data file of a table: its identity ([`FileRef`]) paired with its
@@ -213,57 +214,86 @@ impl CatalogTable {
         )])
     }
 
-    /// Commit files whose data and footer metadata are already complete. The
-    /// caller may have uploaded them in parallel; this method performs only the
-    /// small Delta control-plane CAS and updates this table copy.
-    pub(crate) fn commit_uploaded_files(
+    /// The commit primitive behind every data-file change: atomically remove
+    /// `removed` and add `added` (each with its already-built row groups) in one
+    /// Delta version, retrying past concurrent commits. `added`'s row groups come
+    /// from what the caller holds, so no footer is re-read. `data_change` labels
+    /// the commit (see [`crate::delta::replace_files`]).
+    ///
+    /// Returns whether it committed. It is **aborted** (`Ok(false)`, nothing
+    /// committed) when any `removed` path is no longer in the latest version:
+    /// another writer already removed it, so re-adding `added` (which holds those
+    /// rows) would double-count. The caller then discards its `added` files as
+    /// orphans and leaves the inputs alone — they belong to the commit that won.
+    fn cas_commit(
         &mut self,
-        uploaded: Vec<(ManifestEntry, TableFile)>,
-    ) -> crate::Result<()> {
-        let entries = uploaded
+        removed: &[ObjectPath],
+        added: Vec<(ManifestEntry, TableFile)>,
+        data_change: bool,
+    ) -> crate::Result<bool> {
+        let entries = added
             .iter()
             .map(|(entry, _)| entry.clone())
             .collect::<Vec<_>>();
         loop {
+            if !removed
+                .iter()
+                .all(|p| self.manifest.entries.iter().any(|e| &e.file.path == p))
+            {
+                return Ok(false);
+            }
             let next_version = self.manifest.version + 1;
-            if crate::delta::append_files(
+            if crate::delta::replace_files(
                 self.store.as_ref(),
                 &self.location,
                 next_version,
+                removed,
                 &entries,
+                data_change,
             )? {
                 self.manifest.version = next_version;
+                self.manifest
+                    .entries
+                    .retain(|e| !removed.contains(&e.file.path));
                 self.manifest.entries.extend(entries.iter().cloned());
+                self.files.retain(|f| !removed.contains(&f.file.path));
                 self.files
-                    .extend(uploaded.iter().map(|(_, file)| file.clone()));
-                return Ok(());
+                    .extend(added.iter().map(|(_, table_file)| table_file.clone()));
+                return Ok(true);
             }
-            // A concurrent writer took this version. Rebuild from Delta, then
-            // retry our same unique files at the following version.
+            // A concurrent writer took this version. The footer refresh below is
+            // itself a dataflow and must never be launched recursively from a
+            // terminal worker; both commit paths (INSERT, compaction) run
+            // off-worker (`WORKER_IDX == usize::MAX`), so a caller committing from
+            // a worker (which would deadlock on the refresh) fails cleanly here.
             if dispatch::worker::WORKER_IDX.get() != usize::MAX {
-                // Footer refresh is itself a dataflow and must never be launched
-                // recursively from a terminal worker. The INSERT commit path runs
-                // off-worker (`WORKER_IDX == usize::MAX`) and reaches the refresh
-                // below; this branch guards any caller that does commit from a
-                // worker (it would deadlock on the refresh), failing cleanly so
-                // the client can retry.
                 return Err(Error::ConcurrentInsert(self.name.clone()));
             }
             self.refresh()?;
         }
     }
 
-    /// Atomically swap a set of this table's files for another — the compaction
-    /// commit. Commits a new version whose file list is `latest − removed +
-    /// added`, retrying past concurrent commits, so no reader ever sees the rows
-    /// doubled or missing.
+    /// Commit files whose data and footer metadata are already complete — the
+    /// INSERT / ingest append. A plain add (`data_change = true`), no removes.
+    pub(crate) fn commit_uploaded_files(
+        &mut self,
+        uploaded: Vec<(ManifestEntry, TableFile)>,
+    ) -> crate::Result<()> {
+        self.cas_commit(&[], uploaded, true).map(|_| ())
+    }
+
+    /// Atomically swap a set of this table's files for another as a raw manifest
+    /// edit — `added` given as bare manifest entries, their footers read only on
+    /// success (via [`sync_files_to_manifest`](Self::sync_files_to_manifest)), so
+    /// a losing swap aborts before reading its output. Compaction, which already
+    /// holds the footer metadata, commits through
+    /// [`compact_files`](Self::compact_files) instead. `data_change = false`: a
+    /// swap rearranges bytes without changing rows.
     ///
-    /// Returns whether the swap was committed. It is **aborted** (`Ok(false)`,
-    /// nothing committed) if any of `removed` is no longer in the latest
-    /// version: that means another writer already swapped these inputs out, so
-    /// re-adding `added` (which holds their rows) would double-count. A
-    /// concurrent compacter that loses this race must discard its `added` files
-    /// as orphans and leave the inputs alone — they belong to the swap that won.
+    /// Returns whether the swap committed. It is **aborted** (`Ok(false)`) when
+    /// any `removed` path is no longer in the latest version: another writer
+    /// already swapped these inputs out, so re-adding `added` (which holds their
+    /// rows) would double-count. The loser then discards its `added` as orphans.
     pub fn replace_data_files(
         &mut self,
         removed: &[ObjectPath],
@@ -283,6 +313,7 @@ impl CatalogTable {
                 next_version,
                 removed,
                 added,
+                false,
             )? {
                 self.manifest.version = next_version;
                 self.manifest
@@ -480,6 +511,73 @@ impl CatalogTable {
 
     pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
+    }
+
+    /// Merge `inputs` into fresh target-sized files and atomically swap them in
+    /// for the inputs, one Delta version labelled as a rearrangement
+    /// (`data_change = false`, so incremental log readers skip it). The merged
+    /// files are written over the shared io_uring ring by the same upload
+    /// operators an INSERT uses, and their row groups come straight from the
+    /// writer's own footer metadata — no footer is re-read.
+    ///
+    /// Returns the merged files, or an empty vec when another writer already
+    /// swapped these inputs out (this merge is discarded, its output deleted).
+    /// `inputs` must share one partition tuple; the caller batches them so.
+    pub fn compact_files(
+        &mut self,
+        inputs: &[FileRef],
+        target_rows: usize,
+        target_row_groups: usize,
+    ) -> crate::Result<Vec<FileRef>> {
+        // Scan only the inputs and re-encode their rows. They share one partition
+        // tuple, so re-applying the table's partition/sort spec reproduces that
+        // tuple and recomputes the merged files' sort bounds.
+        let parquet = self.parquet_table_for(inputs);
+        let columns = parquet.schema().fields().len();
+        let scan = crate::parquet::table_input(
+            &self.dispatcher,
+            &parquet,
+            Projection::all(columns),
+            false,
+        );
+        let commit_queue = Arc::new(Injector::new());
+        let spec = super::insert_sink::upload_spec(
+            self.store(),
+            self.location.clone(),
+            self.id(),
+            commit_queue.clone(),
+            scan,
+            Arc::from(self.partition_by()),
+            Arc::from(self.sort_by()),
+            target_rows,
+            target_row_groups,
+            &self.dispatcher,
+        );
+        // Drive scan → encode → upload to completion. Its emitted row-count batch
+        // is ignored here; the uploaded files arrive on `commit_queue`.
+        spec.collect()?;
+
+        let mut added = Vec::new();
+        loop {
+            match commit_queue.steal() {
+                Steal::Success(file) => added.push((file.entry, file.table_file)),
+                Steal::Retry => continue,
+                Steal::Empty => break,
+            }
+        }
+        let removed: Vec<ObjectPath> = inputs.iter().map(|f| f.path.clone()).collect();
+        let merged: Vec<FileRef> = added.iter().map(|(entry, _)| entry.file.clone()).collect();
+        if self.cas_commit(&removed, added, false)? {
+            Ok(merged)
+        } else {
+            // Another writer won the swap; our merged output is now an orphan.
+            for file in &merged {
+                if let Err(e) = self.delete_data_file(&file.path) {
+                    tracing::warn!(error = %e, file = %file.path, "compaction: deleting discarded merge output failed (orphan left)");
+                }
+            }
+            Ok(Vec::new())
+        }
     }
 
     /// Each committed file's manifest path paired with its loaded row groups, in

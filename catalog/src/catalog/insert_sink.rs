@@ -65,15 +65,41 @@ pub(super) fn build_insert_spec(
 
     const TARGET_ROWS_PER_GROUP: usize = 128 * 1024;
     const TARGET_ROW_GROUPS_PER_FILE: usize = 8;
-    let encoded = encode_record_batches_spec(
+    Ok(upload_spec(
+        store,
+        table.object_location().clone(),
+        table.id(),
+        commit_queue,
         input,
         table.partition_by().to_vec().into(),
         table.sort_by().to_vec().into(),
         TARGET_ROWS_PER_GROUP,
         TARGET_ROW_GROUPS_PER_FILE,
-    );
+        dispatcher,
+    ))
+}
+
+/// The shared write stage: encode `input`'s rows into Parquet files and upload
+/// each over the ring, pushing every finished file onto `commit_queue`. Both
+/// INSERT (which stamps the durable schema first) and compaction (which feeds a
+/// table scan) build on this; whoever owns `commit_queue` decides how the files
+/// commit. The finish emits the inserted-row count as a single batch.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn upload_spec(
+    store: Arc<dyn ObjectStore>,
+    location: ObjectPath,
+    table_id: Uuid,
+    commit_queue: Arc<Injector<TransactionFile>>,
+    input: RecordBatchOperatorSpec,
+    partition_by: Arc<[String]>,
+    sort_by: Arc<[String]>,
+    target_rows: usize,
+    target_row_groups: usize,
+    dispatcher: &DataFlowDispatcher,
+) -> RecordBatchOperatorSpec {
+    let encoded =
+        encode_record_batches_spec(input, partition_by, sort_by, target_rows, target_row_groups);
     let workers = dispatcher.worker_count();
-    let location = table.object_location().clone();
     // One shared total; every worker's `Upload` adds its completions to it and the
     // first worker into `finish` emits it once all uploads have landed (the finish
     // barrier waits on each `Upload`'s `has_pending_work`), so no fan-in is needed.
@@ -86,7 +112,7 @@ pub(super) fn build_insert_spec(
                 UploadFactory::new(
                     store.clone(),
                     location.clone(),
-                    table.id(),
+                    table_id,
                     commit_queue.clone(),
                     rows.clone(),
                     emitted.clone(),
@@ -94,8 +120,7 @@ pub(super) fn build_insert_spec(
             })
             .collect(),
     );
-
-    Ok(RecordBatchOperatorSpec::from_spec(uploads))
+    RecordBatchOperatorSpec::from_spec(uploads)
 }
 
 /// One uploaded file waiting on the statement transaction's Delta commit. It

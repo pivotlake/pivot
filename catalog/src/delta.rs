@@ -157,36 +157,20 @@ pub(crate) fn initialize_table(
     Ok((uri, id))
 }
 
-/// Atomically append data-file Add actions at `version`. A false return means
-/// another writer already committed that version; callers refresh and retry at
-/// the next one.
-pub(crate) fn append_files(
-    store: &dyn ObjectStore,
-    location: &ObjectPath,
-    version: u64,
-    entries: &[ManifestEntry],
-) -> Result<bool, Error> {
-    let modification_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let lines = entries
-        .iter()
-        .map(|entry| add_action(entry, modification_time))
-        .collect::<Result<Vec<_>, Error>>()?;
-    commit_actions(store, location, version, lines)
-}
-
-/// Atomically swap data files at `version` — the compaction commit: one Delta
-/// commit holding a Remove action per swapped-out input and an Add action per
-/// merged output. A false return means another writer already committed that
-/// version; callers refresh and retry at the next one.
+/// Atomically commit a data-file change at `version`: a Remove action per path
+/// in `removed` and an Add action per entry in `added`, in one Delta commit. An
+/// empty `removed` is a plain append. `data_change` is stamped on every action:
+/// `true` for a logical change (INSERT, DELETE), `false` for a rearrangement
+/// that leaves the table's rows identical (compaction), which lets incremental
+/// log readers skip it. A false return means another writer already committed
+/// that version; callers refresh and retry at the next one.
 pub(crate) fn replace_files(
     store: &dyn ObjectStore,
     location: &ObjectPath,
     version: u64,
     removed: &[ObjectPath],
     added: &[ManifestEntry],
+    data_change: bool,
 ) -> Result<bool, Error> {
     let modification_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -199,20 +183,24 @@ pub(crate) fn replace_files(
                 "remove": {
                     "path": path.as_str(),
                     "deletionTimestamp": modification_time,
-                    "dataChange": true,
+                    "dataChange": data_change,
                 }
             }))
             .expect("Delta Remove action is serializable")
         })
         .collect::<Vec<_>>();
     for entry in added {
-        lines.push(add_action(entry, modification_time)?);
+        lines.push(add_action(entry, modification_time, data_change)?);
     }
     commit_actions(store, location, version, lines)
 }
 
 /// Serialize one committed file as a Delta `Add` action line.
-fn add_action(entry: &ManifestEntry, modification_time: u64) -> Result<String, Error> {
+fn add_action(
+    entry: &ManifestEntry,
+    modification_time: u64,
+    data_change: bool,
+) -> Result<String, Error> {
     let mut partition_values = serde_json::Map::new();
     if let Some(partition) = &entry.partition {
         for (column, scalar) in partition {
@@ -225,7 +213,7 @@ fn add_action(entry: &ManifestEntry, modification_time: u64) -> Result<String, E
             "partitionValues": partition_values,
             "size": entry.file.size,
             "modificationTime": modification_time,
-            "dataChange": true,
+            "dataChange": data_change,
         }
     }))
     .expect("Delta Add action is serializable"))

@@ -699,6 +699,32 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     assert_eq!(groups[0].num_rows, 4);
 }
 
+/// Compaction merges a table's small files into one target-sized file over the
+/// async upload path and swaps them in, preserving every row in one commit.
+#[test]
+fn compact_files_merges_small_files_into_one() {
+    let dir = TempDir::new().unwrap();
+    let columns = vec![Column {
+        name: "id".to_string(),
+        col_type: Type::Int32,
+    }];
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
+    run_sql(&catalog, "INSERT INTO t VALUES (10), (20), (30)");
+    run_sql(&catalog, "INSERT INTO t VALUES (40), (50)");
+
+    let mut table = catalog.table_handle("t").unwrap();
+    table.refresh().unwrap();
+    let inputs = table.file_refs();
+    assert_eq!(inputs.len(), 2, "two inserts wrote two files");
+    let merged = table.compact_files(&inputs, 128 * 1024, 8).unwrap();
+
+    assert_eq!(merged.len(), 1, "the two inputs merge into one file");
+    let parquet = current_parquet(&catalog, "t");
+    assert_eq!(parquet.row_groups().len(), 1);
+    assert_eq!(parquet.row_groups()[0].num_rows, 5);
+}
+
 /// A binding's pushed-down predicates are a pure filter over whatever file set
 /// they are applied to: the same binding prunes a wider, later file set just as
 /// well, so predicate state and file state stay independent.
