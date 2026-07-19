@@ -27,12 +27,7 @@ use std::sync::Arc;
 /// Factory for building one worker's stealable channel endpoint.
 ///
 /// Holds the local [`Worker`] deque plus a *shared* slice of every worker's
-/// [`Stealer`] and this worker's place in it. Sharing one stealer slice across
-/// all factories keeps channel construction cheap: it is one `Arc` clone per
-/// worker instead of a per-worker stealer list (workers x siblings clones per
-/// stage), which showed up as per-query dispatch latency on large pools.
-/// [`stealable()`] creates one factory per worker; each is consumed by
-/// [`ChannelFactory::build`] to produce the sender/receiver pair for that worker.
+/// [`Stealer`] and this worker's place in it.
 pub struct StealableChannelFactory<T: Send> {
     worker: Worker<T>,
     stealers: Arc<[Stealer<T>]>,

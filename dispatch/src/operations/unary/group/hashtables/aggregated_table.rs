@@ -86,6 +86,9 @@ unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionBuffers<K, V
 /// merge slot-range-combines the stack and the buffers by the same top hash bits,
 /// so a switched worker's pre-switch stack needs no pre-fold into the buffers.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue> {
+    /// The NUMA node whose worker flushed this output; the merge groups
+    /// sources by it.
+    pub node: usize,
     /// In-place table stack: the full result if the worker never switched,
     /// otherwise its pre-switch tables.
     pub tables: Vec<MultiSlabTable<K, V>>,
@@ -415,6 +418,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         self.key_arena.flush();
         self.worker_context.flush();
         AggregatedTableOutput {
+            node: crate::worker::current_node(),
             tables: self.tables,
             buffers: self.buffers.map(PartitionBuffers),
             hll: self.hll,
