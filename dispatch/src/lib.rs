@@ -477,11 +477,11 @@ mod tests {
         use arrow_schema::{DataType, Field, Schema};
 
         // Enough ring slots per node region for the group-by's arenas, slab
-        // tables, and merge fragments.
+        // tables, and merge targets.
         let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 256, None);
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         // Every key appears once per batch, so each of the 8 batches contributes
-        // to every group and the per-node merge fragments must combine across
+        // to every group and the per-node aggregated tables must merge across
         // nodes to produce the right counts.
         let batches: Vec<RecordBatch> = (0..8)
             .map(|_| {
