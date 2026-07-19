@@ -44,8 +44,8 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue> {
     injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
 
-    sender: mpsc::Sender<(usize, AggregatedTableOutput<K, V>)>,
-    receiver: Option<mpsc::Receiver<(usize, AggregatedTableOutput<K, V>)>>,
+    sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
+    receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     /// Radix scatter config with the per-worker bucket count sized for the pool
     /// (see [`get_scatter_bucket_count_for_worker`](super::get_scatter_bucket_count_for_worker)).
     radix: RadixConfig,

@@ -18,9 +18,6 @@ use std::sync::Arc;
 ///
 /// Holds a *shared* slice of all workers' mpsc senders (so the built
 /// [`WorkerAwareSender`] can route to any worker) and this worker's receiver.
-/// Sharing one sender slice keeps construction to one `Arc` clone per worker
-/// instead of workers-squared sender clones per stage, which showed up as
-/// per-query dispatch latency on large pools.
 pub struct ReturnToWorkerMpscFactory<T> {
     senders: Arc<[MpscSender<T>]>,
     receiver: MpscReceiver<T>,
