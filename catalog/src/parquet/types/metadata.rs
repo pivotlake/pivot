@@ -11,7 +11,7 @@
 use crate::parquet::types::table::ParquetTable;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
-use dispatch::io::FileLocation;
+use dispatch::io::OpenFile;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -65,7 +65,7 @@ pub struct ColumnChunkMeta {
 pub struct RowGroupMetadata {
     /// The open file holding this row group's bytes (local file or remote
     /// object) — what the fetcher reads from and the compressed cache keys on.
-    pub location: FileLocation,
+    pub open_file: OpenFile,
     /// Arrow schema describing the columns in this row group.
     pub schema: SchemaRef,
     /// Per-column-chunk byte layout (offsets and sizes).

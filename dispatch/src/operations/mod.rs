@@ -109,7 +109,7 @@ pub trait Operator {
     /// [`process_fs_response`](Self::process_fs_response).
     fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>>;
 
-    /// Return any pending HTTP requests (reads of [`Remote`](crate::io::FileLocation::Remote)
+    /// Return any pending HTTP requests (reads of [`Remote`](crate::io::OpenFile::Remote)
     /// regions). The worker submits these on the same per-core io_uring and
     /// delivers completions via
     /// [`process_http_response`](Self::process_http_response) — by the time it

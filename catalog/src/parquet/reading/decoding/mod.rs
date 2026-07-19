@@ -291,7 +291,7 @@ mod tests {
         let num_cols = schema.fields().len();
         let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
-            location: dispatch::io::FileLocation::Local(file),
+            open_file: dispatch::io::OpenFile::Local(file),
             schema,
             columns: (0..num_cols)
                 .map(|_| ColumnChunkMeta {
@@ -384,7 +384,7 @@ mod tests {
             data_pages_all_dictionary: dict,
         };
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
-            location: dispatch::io::FileLocation::Local(file),
+            open_file: dispatch::io::OpenFile::Local(file),
             schema,
             columns: vec![column(all_dictionary), column(false)],
             num_rows,

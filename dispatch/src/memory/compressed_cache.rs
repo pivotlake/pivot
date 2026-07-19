@@ -45,7 +45,7 @@
 //! Callers feed the fragments into a scattered reader, so more (smaller) fragments
 //! are fine.
 
-use crate::io::FileLocation;
+use crate::io::OpenFile;
 use crate::memory::clock::Owner;
 use crate::memory::context::memory_ctx;
 use crate::memory::fill_cursor::FillCursor;
@@ -129,8 +129,8 @@ impl Extent {
 /// drop the run's extent when it recycles the slot.
 struct Tenant {
     /// The file the packed run belongs to.
-    location: FileLocation,
-    /// The run's first file block - the key into `location`'s extent map.
+    open_file: OpenFile,
+    /// The run's first file block - the key into `open_file`'s extent map.
     first_file_block: usize,
 }
 
@@ -306,7 +306,7 @@ struct ResolvedRun {
 /// A CLOCK-eviction cache over the shared [`Ring`](super::Ring) that packs many
 /// small reads per slot.
 ///
-/// Runs are bucketed by [`FileLocation`], so the same cache serves both local
+/// Runs are bucketed by [`OpenFile`], so the same cache serves both local
 /// files and remote HTTP objects - only the transport that fills a missing block
 /// differs.
 pub struct CompressedCache {
@@ -321,7 +321,7 @@ pub struct CompressedCache {
     ///                └─ block 40 → Extent { slot 3, slot block 88,  2 blocks }
     ///   bar.parquet ─── block 12 → Extent { slot 7, slot block 200, 1 block  }
     /// ```
-    file_maps: RwLock<HashMap<FileLocation, RwLock<BTreeMap<usize, Extent>>>>,
+    file_maps: RwLock<HashMap<OpenFile, RwLock<BTreeMap<usize, Extent>>>>,
     /// Per-slot metadata, indexed by ring slot. `UnsafeCell` because `tenants` is
     /// mutated through a shared `&self` under the pin/exclusivity discipline.
     entries: Box<[UnsafeCell<Entry>]>,
@@ -346,11 +346,11 @@ impl CompressedCache {
         }
     }
 
-    /// Look up the file byte range `[offset, offset + len)` of `location`. The
+    /// Look up the file byte range `[offset, offset + len)` of `open_file`. The
     /// range is resolved into a sequence of contiguous runs in file order, yielding
     /// one [`CacheLookup`] per run: read & fill every lookup's
     /// [`missing`](CacheLookup::missing) blocks, then concatenate the runs' bytes.
-    pub fn get(&self, location: &FileLocation, offset: usize, len: usize) -> Vec<CacheLookup> {
+    pub fn get(&self, open_file: &OpenFile, offset: usize, len: usize) -> Vec<CacheLookup> {
         if len == 0 {
             return Vec::new();
         }
@@ -366,7 +366,7 @@ impl CompressedCache {
             // worker just covered `file_block`, so retrying resolves it as a hit.
             let run = loop {
                 if let Some(run) = self.resolve_from_extent(
-                    location,
+                    open_file,
                     file_block,
                     last_file_block,
                     offset,
@@ -375,7 +375,7 @@ impl CompressedCache {
                     break run;
                 }
                 if let Some(run) =
-                    self.allocate_run(location, file_block, last_file_block, offset, end_offset)
+                    self.allocate_run(open_file, file_block, last_file_block, offset, end_offset)
                 {
                     break run;
                 }
@@ -393,14 +393,14 @@ impl CompressedCache {
     /// covers `file_block`, or its slot is mid-reclaim - either way, pack it.
     fn resolve_from_extent(
         &self,
-        location: &FileLocation,
+        open_file: &OpenFile,
         file_block: usize,
         last_file_block: usize,
         start_offset: usize,
         end_offset: usize,
     ) -> Option<ResolvedRun> {
         let file_maps = self.file_maps.read().unwrap();
-        let extents = file_maps.get(location)?.read().unwrap();
+        let extents = file_maps.get(open_file)?.read().unwrap();
         let covering = find_extent_covering(&extents, file_block)?;
 
         let pin = Arc::new(memory_ctx().ring().try_read(covering.slot_idx as usize)?);
@@ -440,7 +440,7 @@ impl CompressedCache {
     /// it as a hit).
     fn allocate_run(
         &self,
-        location: &FileLocation,
+        open_file: &OpenFile,
         file_block: usize,
         last_file_block: usize,
         start_offset: usize,
@@ -458,7 +458,7 @@ impl CompressedCache {
             (last_file_block - file_block + 1).min(BLOCKS_PER_SLOT - first_slot_block);
 
         let extent = self.claim_run(
-            location,
+            open_file,
             cursor.slot_idx,
             first_slot_block,
             file_block,
@@ -478,7 +478,7 @@ impl CompressedCache {
     }
 
     /// Reserve a run of up to `requested_blocks` free blocks at `file_block` in
-    /// `location`'s extent map, place it at `first_slot_block` of slot `slot_idx`, and
+    /// `open_file`'s extent map, place it at `first_slot_block` of slot `slot_idx`, and
     /// record its tenant + extent.
     ///
     /// `None` when another worker already covered `file_block`: two workers can miss
@@ -487,7 +487,7 @@ impl CompressedCache {
     /// caller then re-resolves it as a hit).
     fn claim_run(
         &self,
-        location: &FileLocation,
+        open_file: &OpenFile,
         slot_idx: usize,
         first_slot_block: usize,
         file_block: usize,
@@ -510,7 +510,7 @@ impl CompressedCache {
             // (eviction only drops runs listed as tenants), while a tenant with no
             // extent is harmless (eviction skips it).
             self.tenants_mut(slot_idx).push(Tenant {
-                location: location.clone(),
+                open_file: open_file.clone(),
                 first_file_block: file_block,
             });
             extents.insert(file_block, extent);
@@ -526,7 +526,7 @@ impl CompressedCache {
         // write at once, so it must be released before the miss path below.
         {
             let file_maps = self.file_maps.read().unwrap();
-            if let Some(extents_lock) = file_maps.get(location) {
+            if let Some(extents_lock) = file_maps.get(open_file) {
                 return reserve(extents_lock);
             }
         }
@@ -536,7 +536,7 @@ impl CompressedCache {
             self.file_maps
                 .write()
                 .unwrap()
-                .entry(location.clone())
+                .entry(open_file.clone())
                 .or_default(),
         )
     }
@@ -599,7 +599,7 @@ impl CompressedCache {
         {
             let file_maps = self.file_maps.read().unwrap();
             for tenant in tenants {
-                let Some(extents_lock) = file_maps.get(&tenant.location) else {
+                let Some(extents_lock) = file_maps.get(&tenant.open_file) else {
                     continue;
                 };
                 let mut extents = extents_lock.write().unwrap();
@@ -615,14 +615,14 @@ impl CompressedCache {
                     // maps after dropping its own (see its reclaim) - the two
                     // lock sets are never taken in the opposite order.
                     memory_ctx().decompressed_cache().reinforce_range(
-                        &tenant.location,
+                        &tenant.open_file,
                         extent.first_file_block * BLOCK_SIZE,
                         extent.block_count as usize * BLOCK_SIZE,
                     );
                     extents.remove(&tenant.first_file_block);
                 }
                 if extents.is_empty() {
-                    emptied_files.push(tenant.location);
+                    emptied_files.push(tenant.open_file);
                 }
             }
         }
@@ -636,7 +636,7 @@ impl CompressedCache {
     /// evicts a block over that range, leaving these runs the last in-memory
     /// copy of it. Takes only read locks; slot granularity, so a multi-tenant
     /// slot's other runs shelter under the same reinforcement.
-    pub(crate) fn reinforce_range(&self, location: &FileLocation, offset: usize, len: usize) {
+    pub(crate) fn reinforce_range(&self, open_file: &OpenFile, offset: usize, len: usize) {
         if len == 0 {
             return;
         }
@@ -644,7 +644,7 @@ impl CompressedCache {
         let last_file_block = (offset + len - 1) / BLOCK_SIZE;
 
         let file_maps = self.file_maps.read().unwrap();
-        let Some(extents_lock) = file_maps.get(location) else {
+        let Some(extents_lock) = file_maps.get(open_file) else {
             return;
         };
         let extents = extents_lock.read().unwrap();
@@ -664,41 +664,41 @@ impl CompressedCache {
     }
 
     /// Remove `file_maps` entries for the given locations whose extent map is now
-    /// empty. `file_maps` is keyed by a never-reused [`FileLocation`] (an
+    /// empty. `file_maps` is keyed by a never-reused [`OpenFile`] (an
     /// `Arc<File>` / `Arc<RemoteFile>`), so without this a dead entry - pinning its
     /// `Arc` and the file/connection it holds - lingers for every file ever opened.
     /// Re-checks emptiness under the write lock so a concurrent `get` that just
     /// re-cached a run isn't dropped.
-    fn prune_empty_file_locations(&self, locations: Vec<FileLocation>) {
+    fn prune_empty_file_locations(&self, locations: Vec<OpenFile>) {
         if locations.is_empty() {
             return;
         }
         let mut file_maps = self.file_maps.write().unwrap();
-        for location in locations {
-            if let Some(extents_lock) = file_maps.get(&location)
+        for open_file in locations {
+            if let Some(extents_lock) = file_maps.get(&open_file)
                 && extents_lock.read().unwrap().is_empty()
             {
-                file_maps.remove(&location);
+                file_maps.remove(&open_file);
             }
         }
     }
 
-    /// Register a [`FileLocation`] (a local fd or a remote object) so its runs can
-    /// be cached. Clears any runs from a previous registration of an equal location
+    /// Register a [`OpenFile`] (a local fd or a remote object) so its runs can
+    /// be cached. Clears any runs from a previous registration of an equal file
     /// (e.g. a reused fd number) by dropping its extent map - the next lookup then
     /// misses. The orphaned tenants in their slots self-clean on eviction (their
     /// extent is gone, so the per-slot guard skips them).
-    pub fn open_entry(&self, location: FileLocation) {
-        // Drop any decompressed pages cached under this (possibly reused) location
+    pub fn open_entry(&self, open_file: OpenFile) {
+        // Drop any decompressed pages cached under this (possibly reused) file
         // for the same reason the compressed map is reset below: a reopened fd may
         // now name a different file, so its old pages must not serve a later read.
-        memory_ctx().decompressed_cache().invalidate(&location);
+        memory_ctx().decompressed_cache().invalidate(&open_file);
         // The `file_maps` write lock serializes with `pack_gap`'s read, so a racing
         // miss either sees the fresh empty map or has its run dropped here.
         self.file_maps
             .write()
             .unwrap()
-            .insert(location, Default::default());
+            .insert(open_file, Default::default());
     }
 
     /// Evict every cached run: drop all extent maps and recycle the ring slots they
@@ -779,21 +779,21 @@ mod tests {
 
     const SB: usize = BLOCK_SIZE;
 
-    /// A local location used as the cache key throughout these tests. One shared
+    /// A local file used as the cache key throughout these tests. One shared
     /// open file, so every call keys the same cache bucket.
     #[allow(non_snake_case)]
-    fn FD() -> FileLocation {
+    fn FD() -> OpenFile {
         use std::sync::OnceLock;
         static FILE: OnceLock<std::sync::Arc<std::fs::File>> = OnceLock::new();
-        FileLocation::Local(
+        OpenFile::Local(
             FILE.get_or_init(|| std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()))
                 .clone(),
         )
     }
 
-    /// A fresh, independent local location (distinct cache bucket).
-    fn new_file() -> FileLocation {
-        FileLocation::Local(std::sync::Arc::new(
+    /// A fresh, independent local file (distinct cache bucket).
+    fn new_file() -> OpenFile {
+        OpenFile::Local(std::sync::Arc::new(
             std::fs::File::open("/dev/null").unwrap(),
         ))
     }
@@ -861,7 +861,7 @@ mod tests {
         use crate::memory::decompressed_cache::BlockKey;
         let cache = memory_ctx().decompressed_cache();
         let key = BlockKey {
-            location: FD(),
+            open_file: FD(),
             offset,
             len,
         };
@@ -1137,7 +1137,7 @@ mod tests {
     #[test]
     fn evicting_a_slot_drops_every_tenants_extent() {
         init_test_free_pool(16);
-        let files: Vec<FileLocation> = (0..3).map(|_| new_file()).collect();
+        let files: Vec<OpenFile> = (0..3).map(|_| new_file()).collect();
         for f in &files {
             cache().open_entry(f.clone());
             fill_pattern(&cache().get(f, 0, SB)); // all pack into one fill slot

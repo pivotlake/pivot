@@ -12,7 +12,7 @@ use crate::parquet::request_tracker::{PendingRequest, ReadRequest, RequestTracke
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
 use crate::store::{DataFile, DataFileSource, FileRef};
-use dispatch::io::{FileLocation, FsRequest, HttpRequest, RemoteFile, open_direct_read};
+use dispatch::io::{FsRequest, HttpRequest, OpenFile, RemoteFile, open_direct_read};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
 use planner::catalog::Column;
@@ -107,22 +107,22 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
             source,
         } = file;
         let size = file_ref.size as usize;
-        let location = match source {
+        let open_file = match source {
             DataFileSource::Local(path) => {
                 let fd = open_direct_read(&path).map_err(crate::parquet::op_err)?;
-                FileLocation::Local(Arc::new(fd))
+                OpenFile::Local(Arc::new(fd))
             }
             DataFileSource::Remote { url, auth } => {
                 let remote = Arc::new(
                     RemoteFile::open(url, auth, file_ref.size).map_err(crate::parquet::op_err)?,
                 );
-                FileLocation::Remote(remote)
+                OpenFile::Remote(remote)
             }
         };
 
         let slot = self
             .tracker
-            .admit_request(FooterRead::start(file_ref, location, size));
+            .admit_request(FooterRead::start(file_ref, open_file, size));
         self.advance(slot, sender)
     }
 
@@ -179,8 +179,8 @@ struct FooterRead {
     /// The file's durable identity, stamped onto the emitted [`TableFile`].
     file: FileRef,
     /// The open file (it keeps the handle alive, and travels into the row
-    /// groups as their location).
-    location: FileLocation,
+    /// groups as their file).
+    open_file: OpenFile,
     /// Total file size, known when the read starts.
     size: usize,
     /// Cache lookups pinning the region currently being read.
@@ -207,11 +207,13 @@ impl PendingRequest for FooterRead {
 impl FooterRead {
     /// Register the file in the cache and issue the tail probe read
     /// `[size - probe, size)`.
-    fn start(file: FileRef, location: FileLocation, size: usize) -> Self {
-        memory_ctx().compressed_cache().open_entry(location.clone());
+    fn start(file: FileRef, open_file: OpenFile, size: usize) -> Self {
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
         let mut request = Self {
             file,
-            location,
+            open_file,
             size,
             lookups: Vec::new(),
             pending_fs: Vec::new(),
@@ -249,16 +251,16 @@ impl FooterRead {
         );
         self.lookups = memory_ctx()
             .compressed_cache()
-            .get(&self.location, offset, len);
+            .get(&self.open_file, offset, len);
         self.remaining = 0;
         for lookup in &self.lookups {
             if let Some(block) = lookup.missing() {
-                match &self.location {
-                    FileLocation::Local(file) => self.pending_fs.push(FsRequest {
+                match &self.open_file {
+                    OpenFile::Local(file) => self.pending_fs.push(FsRequest {
                         file: file.clone(),
                         block: block.clone(),
                     }),
-                    FileLocation::Remote(remote) => self.pending_http.push(HttpRequest {
+                    OpenFile::Remote(remote) => self.pending_http.push(HttpRequest {
                         remote: remote.clone(),
                         block: block.clone(),
                     }),
@@ -312,7 +314,7 @@ impl FooterRead {
 
         Ok(Some(row_groups_from_footer(
             footer,
-            self.location.clone(),
+            self.open_file.clone(),
             declared_columns,
         )?))
     }
