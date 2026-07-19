@@ -53,7 +53,7 @@ pub fn pending_claim_bound(table: &crate::parquet::ParquetTable) -> usize {
     let any_remote = table
         .row_groups()
         .iter()
-        .any(|rg| matches!(rg.location, dispatch::io::FileLocation::Remote(_)));
+        .any(|rg| matches!(rg.open_file, dispatch::io::OpenFile::Remote(_)));
     if any_remote {
         MAX_PENDING_REMOTE_ROW_GROUPS
     } else {

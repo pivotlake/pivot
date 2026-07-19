@@ -191,16 +191,16 @@ impl ParquetTable {
 pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 
 /// Parse raw thrift footer bytes into this file's row groups (file-local
-/// indices), tying each to `location` for the column-chunk reads that follow.
+/// indices), tying each to `open_file` for the column-chunk reads that follow.
 /// `declared_columns` is the table's declared schema (empty when the table has
 /// none), reconciled with the file's own schema by [`apply_declared_types`].
 pub(crate) fn row_groups_from_footer(
     footer: &[u8],
-    location: dispatch::io::FileLocation,
+    open_file: dispatch::io::OpenFile,
     declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    build_row_groups(file_meta, location, declared_columns)
+    build_row_groups(file_meta, open_file, declared_columns)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
@@ -209,7 +209,7 @@ pub(crate) fn row_groups_from_footer(
 /// position in the table's flat list.
 fn build_row_groups(
     file_meta: FileMetaData,
-    location: dispatch::io::FileLocation,
+    open_file: dispatch::io::OpenFile,
     declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
@@ -255,7 +255,7 @@ fn build_row_groups(
                 })
                 .collect();
             Ok(RowGroupMetadata {
-                location: location.clone(),
+                open_file: open_file.clone(),
                 schema: schema.clone(),
                 columns,
                 num_rows,
