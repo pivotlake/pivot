@@ -5,7 +5,7 @@ use crate::parquet::types::projection::Projection;
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::ThriftReadInputProtocol;
 use bytes::Bytes;
-use dispatch::io::{FileLocation, FsRequest, HttpRequest};
+use dispatch::io::{FsRequest, HttpRequest, OpenFile};
 use dispatch::memory::{CacheLookup, MultiBufferReader, ReaderPosition, Segment, memory_ctx};
 
 /// One resolved piece of a column chunk, in file order, named by the form its
@@ -77,7 +77,7 @@ impl ColumnRequest {
     /// according to where the file lives.
     fn from(
         meta: &ColumnChunkMeta,
-        location: &FileLocation,
+        open_file: &OpenFile,
         fs_requests: &mut Vec<FsRequest>,
         http_requests: &mut Vec<HttpRequest>,
     ) -> Self {
@@ -86,12 +86,12 @@ impl ColumnRequest {
 
         let parts = memory_ctx()
             .decompressed_cache()
-            .get_range(location, col_start, len)
+            .get_range(open_file, col_start, len)
             .into_iter()
             .map(|segment| match segment {
                 Segment::Gap { offset, len } => ColumnPart::Compressed {
                     offset,
-                    bytes: compressed_lookup(location, offset, len, fs_requests, http_requests),
+                    bytes: compressed_lookup(open_file, offset, len, fs_requests, http_requests),
                 },
                 Segment::Cached {
                     offset,
@@ -116,25 +116,25 @@ impl ColumnRequest {
     }
 }
 
-/// Look up `[offset, offset+len)` of `location` in the compressed cache, queueing
+/// Look up `[offset, offset+len)` of `open_file` in the compressed cache, queueing
 /// any missing blocks onto the filesystem or HTTP request list according to where
 /// the file lives.
 fn compressed_lookup(
-    location: &FileLocation,
+    open_file: &OpenFile,
     offset: usize,
     len: usize,
     fs_requests: &mut Vec<FsRequest>,
     http_requests: &mut Vec<HttpRequest>,
 ) -> Vec<CacheLookup> {
-    let parts = memory_ctx().compressed_cache().get(location, offset, len);
+    let parts = memory_ctx().compressed_cache().get(open_file, offset, len);
     for lookup in &parts {
         if let Some(block) = lookup.missing() {
-            match location {
-                FileLocation::Local(file) => fs_requests.push(FsRequest {
+            match open_file {
+                OpenFile::Local(file) => fs_requests.push(FsRequest {
                     file: file.clone(),
                     block: block.clone(),
                 }),
-                FileLocation::Remote(remote) => http_requests.push(HttpRequest {
+                OpenFile::Remote(remote) => http_requests.push(HttpRequest {
                     remote: remote.clone(),
                     block: block.clone(),
                 }),
@@ -180,7 +180,7 @@ pub struct RowGroupRequest {
 impl RowGroupRequest {
     /// Build a request for all projected columns in the given row group.
     pub fn from(metadata_handle: QueryRowGroupMetadata, projection: &Projection) -> Self {
-        let location = metadata_handle.get_metadata().location.clone();
+        let open_file = metadata_handle.get_metadata().open_file.clone();
         let columns = metadata_handle.columns();
         // The projection names top-level columns; fetch each one's run of leaf
         // chunks in this file's layout. The decoder resolves leaves the same
@@ -195,7 +195,7 @@ impl RowGroupRequest {
             .map(|&leaf| {
                 ColumnRequest::from(
                     &columns[leaf],
-                    &location,
+                    &open_file,
                     &mut pending_fs,
                     &mut pending_http,
                 )

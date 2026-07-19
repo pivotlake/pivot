@@ -249,7 +249,7 @@ mod tests {
     //! issuing a second read for a different region of the same object.
 
     use super::*;
-    use crate::io::{FileLocation, RemoteFile};
+    use crate::io::{OpenFile, RemoteFile};
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -471,7 +471,7 @@ mod tests {
 
     /// Fetch `[offset, offset + len)` of `loc` via the requester and block until
     /// it completes.
-    fn fetch(requester: &mut IORequester, loc: &FileLocation, offset: usize, len: usize) {
+    fn fetch(requester: &mut IORequester, loc: &OpenFile, offset: usize, len: usize) {
         fetch_split(requester, loc, offset, len);
     }
 
@@ -480,11 +480,11 @@ mod tests {
     /// hits versus network fetches).
     fn fetch_split(
         requester: &mut IORequester,
-        loc: &FileLocation,
+        loc: &OpenFile,
         offset: usize,
         len: usize,
     ) -> RemoteReadSplit {
-        let FileLocation::Remote(remote) = loc else {
+        let OpenFile::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
         let lookups = memory_ctx().compressed_cache().get(loc, offset, len);
@@ -521,7 +521,7 @@ mod tests {
 
     /// Assert `[offset, offset + len)` of `loc` is now a full cache hit holding
     /// the expected pattern.
-    fn assert_cached(loc: &FileLocation, offset: usize, len: usize) {
+    fn assert_cached(loc: &OpenFile, offset: usize, len: usize) {
         let hit = memory_ctx().compressed_cache().get(loc, offset, len);
         assert_eq!(hit.len(), 1);
         assert!(hit[0].missing().is_none(), "expected a cache hit");
@@ -539,7 +539,7 @@ mod tests {
 
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
-        let loc = FileLocation::Remote(remote);
+        let loc = OpenFile::Remote(remote);
         memory_ctx().compressed_cache().open_entry(loc.clone());
 
         let mut requester = IORequester::with_http_config(client_config());
@@ -561,7 +561,7 @@ mod tests {
 
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
         let remote = Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap());
-        let loc = FileLocation::Remote(remote);
+        let loc = OpenFile::Remote(remote);
         memory_ctx().compressed_cache().open_entry(loc.clone());
 
         let mut requester = IORequester::with_http_config(client_config());
@@ -601,11 +601,11 @@ mod tests {
     /// of `fetch_split`).
     fn fetch_results(
         requester: &mut IORequester,
-        loc: &FileLocation,
+        loc: &OpenFile,
         offset: usize,
         len: usize,
     ) -> Vec<std::result::Result<Completion, FailedRead>> {
-        let FileLocation::Remote(remote) = loc else {
+        let OpenFile::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
         let lookups = memory_ctx().compressed_cache().get(loc, offset, len);
@@ -671,9 +671,9 @@ mod tests {
     }
 
     /// Register a remote object served by the loopback server on `port`.
-    fn remote_loc(port: u16) -> FileLocation {
+    fn remote_loc(port: u16) -> OpenFile {
         let url = Url::parse(&format!("https://127.0.0.1:{port}/obj")).unwrap();
-        let loc = FileLocation::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()));
+        let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, 1 << 20).unwrap()));
         memory_ctx().compressed_cache().open_entry(loc.clone());
         loc
     }
