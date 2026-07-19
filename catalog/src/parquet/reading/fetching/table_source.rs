@@ -36,7 +36,7 @@ use crate::parquet::{RowGroupFilter, ScanOrder};
 /// to split any table's row groups evenly across nodes.
 fn affinity_node(row_group: &RowGroupMetadata, node_count: usize) -> usize {
     let mut hasher = DefaultHasher::new();
-    row_group.location.hash(&mut hasher);
+    row_group.open_file.hash(&mut hasher);
     row_group.file_row_group_idx.hash(&mut hasher);
     (hasher.finish() % node_count as u64) as usize
 }
@@ -488,7 +488,7 @@ mod tests {
     fn sized_row_group(compressed_size: i64) -> Arc<RowGroupMetadata> {
         let dummy = dummy_row_group();
         Arc::new(RowGroupMetadata {
-            location: dummy.location.clone(),
+            open_file: dummy.open_file.clone(),
             schema: dummy.schema.clone(),
             columns: vec![crate::parquet::types::metadata::ColumnChunkMeta {
                 dictionary_page_offset: None,

@@ -60,32 +60,32 @@ pub mod http;
 /// carries an [`Arc<RemoteFile>`] whose `Hash`/`Eq` delegate to a single
 /// interned id (never the URL string).
 #[derive(Clone)]
-pub enum FileLocation {
+pub enum OpenFile {
     Local(Arc<File>),
     Remote(Arc<RemoteFile>),
 }
 
-impl PartialEq for FileLocation {
+impl PartialEq for OpenFile {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (FileLocation::Local(a), FileLocation::Local(b)) => a.as_raw_fd() == b.as_raw_fd(),
+            (OpenFile::Local(a), OpenFile::Local(b)) => a.as_raw_fd() == b.as_raw_fd(),
             // RemoteFile's Eq compares the interned id, not the URL.
-            (FileLocation::Remote(a), FileLocation::Remote(b)) => a == b,
+            (OpenFile::Remote(a), OpenFile::Remote(b)) => a == b,
             _ => false,
         }
     }
 }
 
-impl Eq for FileLocation {}
+impl Eq for OpenFile {}
 
-impl Hash for FileLocation {
+impl Hash for OpenFile {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
-            FileLocation::Local(file) => {
+            OpenFile::Local(file) => {
                 0u8.hash(state);
                 file.as_raw_fd().hash(state);
             }
-            FileLocation::Remote(remote) => {
+            OpenFile::Remote(remote) => {
                 1u8.hash(state);
                 remote.hash(state);
             }
@@ -93,11 +93,11 @@ impl Hash for FileLocation {
     }
 }
 
-impl Debug for FileLocation {
+impl Debug for OpenFile {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            FileLocation::Local(file) => write!(f, "Local({})", file.as_raw_fd()),
-            FileLocation::Remote(r) => write!(f, "Remote({})", r.display_url()),
+            OpenFile::Local(file) => write!(f, "Local({})", file.as_raw_fd()),
+            OpenFile::Remote(r) => write!(f, "Remote({})", r.display_url()),
         }
     }
 }
@@ -108,7 +108,7 @@ static NEXT_REMOTE_FILE_ID: AtomicU32 = AtomicU32::new(0);
 /// GCS bearer token. Invoked once per request on a worker thread, so it must be
 /// cheap and non-blocking: it reads an already-minted, cached token, it never
 /// mints one. `None` means the URL is self-authenticating (an S3 presigned URL)
-/// or needs no auth at all. `Arc` so a [`crate::io::FileLocation`]/source can be
+/// or needs no auth at all. `Arc` so a [`crate::io::OpenFile`]/source can be
 /// cloned (the work-stealing fetch queue clones each file) while sharing one
 /// token cell.
 pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;

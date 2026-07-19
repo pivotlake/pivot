@@ -9,7 +9,7 @@
 //! a completion hands back every slot waiting on that read so the fetcher can
 //! advance it.
 
-use dispatch::io::{FileLocation, FsRequest, HttpRequest, RING_SIZE};
+use dispatch::io::{FsRequest, HttpRequest, OpenFile, RING_SIZE};
 use std::collections::HashMap;
 
 /// Most reads to hand the worker for submission in one pass. The worker submits a
@@ -55,7 +55,7 @@ fn take_batch<R>(pending: &mut Vec<R>) -> Vec<R> {
 /// onto a read filling a different slot - which a file-range-only match could do.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReadRequest {
-    pub location: FileLocation,
+    pub open_file: OpenFile,
     pub offset: usize,
     pub len: usize,
     /// Address of the cache slot region this read fills (`MissingExtent::dest`).
@@ -66,7 +66,7 @@ impl ReadRequest {
     /// The read a local filesystem request fulfills.
     pub fn of_fs(req: &FsRequest) -> Self {
         Self {
-            location: FileLocation::Local(req.file.clone()),
+            open_file: OpenFile::Local(req.file.clone()),
             offset: req.block.file_offset(),
             len: req.block.len(),
             dest: req.block.dest() as usize,
@@ -76,7 +76,7 @@ impl ReadRequest {
     /// The read a remote HTTP request fulfills.
     pub fn of_http(req: &HttpRequest) -> Self {
         Self {
-            location: FileLocation::Remote(req.remote.clone()),
+            open_file: OpenFile::Remote(req.remote.clone()),
             offset: req.block.file_offset(),
             len: req.block.len(),
             dest: req.block.dest() as usize,
@@ -105,7 +105,7 @@ pub(crate) struct RequestTracker<T: PendingRequest> {
     /// flight at once. A new read identical to, or fully contained in, one already
     /// here joins its waiter list rather than issuing its own IO (see
     /// [`schedule_or_join`](Self::schedule_or_join)).
-    routing: HashMap<FileLocation, HashMap<ReadRequest, Vec<usize>>>,
+    routing: HashMap<OpenFile, HashMap<ReadRequest, Vec<usize>>>,
     /// Deduped reads queued for submission to the ring (drained by
     /// [`take_fs_requests`](Self::take_fs_requests) / `take_http_requests`).
     pending_fs: Vec<FsRequest>,
@@ -201,7 +201,7 @@ impl<T: PendingRequest> RequestTracker<T> {
             return false;
         }
         self.routing
-            .entry(read.location.clone())
+            .entry(read.open_file.clone())
             .or_default()
             .insert(read, vec![slot]);
         true
@@ -234,7 +234,7 @@ impl<T: PendingRequest> RequestTracker<T> {
     /// scanning it avoids a second index to keep in lock-step.
     fn find_containing_read(&mut self, read: &ReadRequest) -> Option<&mut Vec<usize>> {
         self.routing
-            .get_mut(&read.location)?
+            .get_mut(&read.open_file)?
             .iter_mut()
             .find(|(scheduled, _)| {
                 scheduled.dest <= read.dest
@@ -261,19 +261,19 @@ impl<T: PendingRequest> RequestTracker<T> {
     pub fn complete(&mut self, read: &ReadRequest) -> Vec<usize> {
         let file = self
             .routing
-            .get_mut(&read.location)
+            .get_mut(&read.open_file)
             .expect("completion for an unrouted file");
         let waiters = file.remove(read).expect("completion for an unrouted read");
         // Drop the file's bucket once its last read lands, so it doesn't accumulate
         // an empty map per file ever read.
         if file.is_empty() {
-            self.routing.remove(&read.location);
+            self.routing.remove(&read.open_file);
         }
         // Drop the charge only after confirming the read was in flight, so the
         // counter can't underflow ahead of the guards above.
-        match read.location {
-            FileLocation::Local(_) => self.disk_in_flight -= 1,
-            FileLocation::Remote(_) => self.http_in_flight -= 1,
+        match read.open_file {
+            OpenFile::Local(_) => self.disk_in_flight -= 1,
+            OpenFile::Remote(_) => self.http_in_flight -= 1,
         }
         waiters
     }
@@ -339,31 +339,33 @@ mod tests {
     }
 
     /// A local file registered with the cache, so it can hand out reads. The
-    /// returned `TempDir` must outlive the location.
-    fn registered_file() -> (FileLocation, TempDir) {
+    /// returned `TempDir` must outlive the file.
+    fn registered_file() -> (OpenFile, TempDir) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("data");
         std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
-        let location = FileLocation::Local(Arc::new(std::fs::File::open(&path).unwrap()));
-        memory_ctx().compressed_cache().open_entry(location.clone());
-        (location, dir)
+        let open_file = OpenFile::Local(Arc::new(std::fs::File::open(&path).unwrap()));
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        (open_file, dir)
     }
 
     /// Wrap a cache missing-block as a local `FsRequest`.
-    fn as_fs_request(location: &FileLocation, block: MissingExtent) -> FsRequest {
-        match location {
-            FileLocation::Local(file) => FsRequest {
+    fn as_fs_request(open_file: &OpenFile, block: MissingExtent) -> FsRequest {
+        match open_file {
+            OpenFile::Local(file) => FsRequest {
                 file: file.clone(),
                 block,
             },
-            FileLocation::Remote(_) => unreachable!("test builds local reads"),
+            OpenFile::Remote(_) => unreachable!("test builds local reads"),
         }
     }
 
     /// The first fs read a `get` of `[offset, offset+len)` produces - the
     /// descriptor a single-block column lookup would yield.
-    fn fs_read(location: &FileLocation, offset: usize, len: usize) -> FsRequest {
-        fs_reads(location, offset, len)
+    fn fs_read(open_file: &OpenFile, offset: usize, len: usize) -> FsRequest {
+        fs_reads(open_file, offset, len)
             .into_iter()
             .next()
             .expect("an uncached range yields a missing block")
@@ -373,21 +375,24 @@ mod tests {
     /// column chunk can split into a shared-boundary refill block (rounding into
     /// the previous column's last block) plus its own body, so this returns more
     /// than one when that happens.
-    fn fs_reads(location: &FileLocation, offset: usize, len: usize) -> Vec<FsRequest> {
+    fn fs_reads(open_file: &OpenFile, offset: usize, len: usize) -> Vec<FsRequest> {
         memory_ctx()
             .compressed_cache()
-            .get(location, offset, len)
+            .get(open_file, offset, len)
             .iter()
             .flat_map(|lookup| lookup.missing())
-            .map(|block| as_fs_request(location, block.clone()))
+            .map(|block| as_fs_request(open_file, block.clone()))
             .collect()
     }
 
     #[test]
     fn stage_queues_each_distinct_read_and_counts_it() {
         init_test_free_pool(4);
-        let (location, _dir) = registered_file();
-        let reads = vec![fs_read(&location, 0, 4096), fs_read(&location, 8192, 4096)];
+        let (open_file, _dir) = registered_file();
+        let reads = vec![
+            fs_read(&open_file, 0, 4096),
+            fs_read(&open_file, 8192, 4096),
+        ];
         let mut tracker = RequestTracker::default();
         tracker.admit_request(TestRequest::with_fs(reads));
 
@@ -398,11 +403,12 @@ mod tests {
     #[test]
     fn stage_dedups_an_already_scheduled_read_and_credits_both_waiters() {
         init_test_free_pool(4);
-        let (location, _dir) = registered_file();
-        let shared = ReadRequest::of_fs(&fs_read(&location, 0, 4096));
+        let (open_file, _dir) = registered_file();
+        let shared = ReadRequest::of_fs(&fs_read(&open_file, 0, 4096));
         let mut tracker = RequestTracker::default();
-        let first = tracker.admit_request(TestRequest::with_fs(vec![fs_read(&location, 0, 4096)]));
-        let second = tracker.admit_request(TestRequest::with_fs(vec![fs_read(&location, 0, 4096)]));
+        let first = tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 4096)]));
+        let second =
+            tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 4096)]));
 
         // One physical read submitted and counted, but both slots wait on it.
         assert_eq!(tracker.take_fs_requests().len(), 1);
@@ -413,15 +419,15 @@ mod tests {
     #[test]
     fn a_read_contained_in_a_scheduled_one_is_deduped() {
         init_test_free_pool(4);
-        let (location, _dir) = registered_file();
+        let (open_file, _dir) = registered_file();
         // Schedule [0,8192). A later [0,4096) is fully inside it (it refills into
         // the same slot), so it rides on the bigger read instead of issuing its own.
-        let big = ReadRequest::of_fs(&fs_read(&location, 0, 8192));
+        let big = ReadRequest::of_fs(&fs_read(&open_file, 0, 8192));
         let mut tracker = RequestTracker::default();
         let big_slot =
-            tracker.admit_request(TestRequest::with_fs(vec![fs_read(&location, 0, 8192)]));
+            tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 8192)]));
         let inner_slot =
-            tracker.admit_request(TestRequest::with_fs(vec![fs_read(&location, 0, 4096)]));
+            tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 4096)]));
 
         // One physical read; both slots wait on it, and completing it advances both.
         assert_eq!(tracker.take_fs_requests().len(), 1);
@@ -432,14 +438,16 @@ mod tests {
     #[test]
     fn a_reread_into_a_different_slot_is_not_folded_onto_the_stale_read() {
         init_test_free_pool(8);
-        let (location, _dir) = registered_file();
+        let (open_file, _dir) = registered_file();
         // Read [0,4096), then drop the file's cached extents so the same range
         // re-reads into a *different* slot. Same file range, different memory: the
         // second read must NOT be folded onto the first - doing so would credit it
         // when the first's slot fills and leave its own slot full of garbage.
-        let first = fs_read(&location, 0, 4096);
-        memory_ctx().compressed_cache().open_entry(location.clone());
-        let second = fs_read(&location, 0, 4096);
+        let first = fs_read(&open_file, 0, 4096);
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let second = fs_read(&open_file, 0, 4096);
         assert_ne!(
             ReadRequest::of_fs(&first).dest,
             ReadRequest::of_fs(&second).dest,
@@ -458,17 +466,17 @@ mod tests {
     #[test]
     fn a_shared_column_boundary_block_rides_on_the_previous_column() {
         init_test_free_pool(8);
-        let (location, _dir) = registered_file();
+        let (open_file, _dir) = registered_file();
         // Column N covers blocks 0,1 (file [0,8192)). Column N+1 covers blocks 1,2
         // (file [4096,12288)), sharing block 1. The cache splits N+1 into a block-1
         // refill (into N's slot) + a block-2 body read; the refill is contained in
         // N's read, so only N's read and N+1's body are issued.
-        let n_reads = fs_reads(&location, 0, 8192);
+        let n_reads = fs_reads(&open_file, 0, 8192);
         let n = ReadRequest::of_fs(&n_reads[0]);
         let mut tracker = RequestTracker::default();
         let n_slot = tracker.admit_request(TestRequest::with_fs(n_reads));
 
-        let n1_reads = fs_reads(&location, 4096, 8192);
+        let n1_reads = fs_reads(&open_file, 4096, 8192);
         assert_eq!(n1_reads.len(), 2, "shared head + body");
         let n1_body = ReadRequest::of_fs(&n1_reads[1]);
         let n1_slot = tracker.admit_request(TestRequest::with_fs(n1_reads));
@@ -484,15 +492,15 @@ mod tests {
     #[test]
     fn a_multi_block_shared_run_folds_in_as_one_unit() {
         init_test_free_pool(8);
-        let (location, _dir) = registered_file();
+        let (open_file, _dir) = registered_file();
         // N covers blocks 0..=3 (file [0,16384)). N+1 covers blocks 2,3,4 (file
         // [8192,20480)), sharing two whole blocks. The cache returns the shared
         // part as one refill run [2,3], fully inside N's read, so it folds in whole.
-        let n_reads = fs_reads(&location, 0, 16384);
+        let n_reads = fs_reads(&open_file, 0, 16384);
         let mut tracker = RequestTracker::default();
         tracker.admit_request(TestRequest::with_fs(n_reads));
 
-        let n1_reads = fs_reads(&location, 8192, 12288);
+        let n1_reads = fs_reads(&open_file, 8192, 12288);
         assert_eq!(n1_reads.len(), 2, "one shared run + body");
         tracker.admit_request(TestRequest::with_fs(n1_reads));
 
@@ -517,12 +525,12 @@ mod tests {
     #[test]
     fn disjoint_reads_each_get_their_own_io() {
         init_test_free_pool(8);
-        let (location, _dir) = registered_file();
+        let (open_file, _dir) = registered_file();
         // Non-overlapping ranges - neither contains the other - stay separate.
         let mut tracker = RequestTracker::default();
         tracker.admit_request(TestRequest::with_fs(vec![
-            fs_read(&location, 0, 4096),
-            fs_read(&location, 65536, 4096),
+            fs_read(&open_file, 0, 4096),
+            fs_read(&open_file, 65536, 4096),
         ]));
 
         assert_eq!(tracker.take_fs_requests().len(), 2);
@@ -532,8 +540,8 @@ mod tests {
     #[test]
     fn complete_drops_the_in_flight_charge() {
         init_test_free_pool(4);
-        let (location, _dir) = registered_file();
-        let read = fs_read(&location, 0, 4096);
+        let (open_file, _dir) = registered_file();
+        let read = fs_read(&open_file, 0, 4096);
         let key = ReadRequest::of_fs(&read);
         let mut tracker = RequestTracker::default();
         let slot = tracker.admit_request(TestRequest::with_fs(vec![read]));
@@ -562,9 +570,9 @@ mod tests {
     #[test]
     fn take_fs_requests_caps_each_batch_and_drains_the_rest() {
         init_test_free_pool(8);
-        let (location, _dir) = registered_file();
+        let (open_file, _dir) = registered_file();
         let reads: Vec<FsRequest> = (0..MAX_SUBMIT_BATCH + 5)
-            .map(|i| fs_read(&location, i * 4096, 4096))
+            .map(|i| fs_read(&open_file, i * 4096, 4096))
             .collect();
         let mut tracker = RequestTracker::default();
         tracker.admit_request(TestRequest::with_fs(reads));

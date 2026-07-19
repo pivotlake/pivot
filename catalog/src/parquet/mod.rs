@@ -58,12 +58,12 @@ pub(crate) mod test_utils {
     use crate::parquet::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
     use crate::parquet::types::table::ParquetTable;
     use arrow_schema::Schema;
-    use dispatch::io::FileLocation;
+    use dispatch::io::OpenFile;
     use std::sync::Arc;
 
     pub fn dummy_row_group() -> Arc<RowGroupMetadata> {
         Arc::new(RowGroupMetadata {
-            location: FileLocation::Local(Arc::new(std::fs::File::open("/dev/null").unwrap())),
+            open_file: OpenFile::Local(Arc::new(std::fs::File::open("/dev/null").unwrap())),
             schema: Arc::new(Schema::empty()),
             columns: vec![],
             num_rows: 0,

@@ -1,7 +1,7 @@
 //! HTTP(S) reads as part of the per-core io_uring, driven by
 //! [`IORequester`](super::IORequester).
 //!
-//! Reads of [`Remote`](super::FileLocation::Remote) cache regions are served by
+//! Reads of [`Remote`](super::OpenFile::Remote) cache regions are served by
 //! issuing HTTP `Range` requests whose body lands directly in the pinned cache
 //! slot — exactly like a disk read, just over TLS instead of `pread`. The
 //! transport ([`HttpEngine`]) is ring-less: on Linux it submits its socket SQEs
