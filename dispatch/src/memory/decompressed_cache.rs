@@ -23,7 +23,7 @@
 //!
 //! ## Maps
 //!
-//! `files` maps a [`FileLocation`] to its own `RwLock`'d table of `offset ->
+//! `files` maps a [`OpenFile`] to its own `RwLock`'d table of `offset ->
 //! block`, ordered by offset, so a `get` only contends on one file's lock and
 //! [`get_range`](DecompressedCache::get_range) can walk a byte range in file
 //! order. `tenants` is a per-slot index - one lockless entry per ring slot, like
@@ -62,7 +62,7 @@
 //! byte string).
 
 use crate::env::get_env_var_with_default;
-use crate::io::FileLocation;
+use crate::io::OpenFile;
 use crate::memory::clock::Owner;
 use crate::memory::context::memory_ctx;
 use crate::memory::fill_cursor::FillCursor;
@@ -83,7 +83,7 @@ use std::sync::{Arc, RwLock};
 /// from a differently-sized region at the same offset.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct BlockKey {
-    pub location: FileLocation,
+    pub open_file: OpenFile,
     pub offset: usize,
     pub len: usize,
 }
@@ -259,7 +259,7 @@ fn push_gap(segments: &mut Vec<Segment>, offset: usize, len: usize) {
 pub struct DecompressedCache {
     /// Per-file: file -> (source offset -> block), offset-ordered. `get`/`get_range`
     /// only lock one file's table.
-    files: RwLock<HashMap<FileLocation, FileBlocks>>,
+    files: RwLock<HashMap<OpenFile, FileBlocks>>,
     /// Per-slot tenant index, indexed by ring slot: the key of every block with
     /// bytes in the slot. `UnsafeCell` (like the compressed cache's per-slot
     /// `tenants`): written only by the slot's filler under the fill pin, taken by
@@ -410,7 +410,7 @@ impl DecompressedCache {
         loop {
             {
                 let files = self.files.read().unwrap();
-                if let Some(table) = files.get(&key.location) {
+                if let Some(table) = files.get(&key.open_file) {
                     let mut table = table.write().unwrap();
                     if table.contains_key(&key.offset) {
                         return;
@@ -427,7 +427,7 @@ impl DecompressedCache {
             self.files
                 .write()
                 .unwrap()
-                .entry(key.location.clone())
+                .entry(key.open_file.clone())
                 .or_default();
         }
     }
@@ -442,7 +442,7 @@ impl DecompressedCache {
             return None;
         }
         let files = self.files.read().unwrap();
-        let table = files.get(&key.location)?.read().unwrap();
+        let table = files.get(&key.open_file)?.read().unwrap();
         let block = table
             .get(&key.offset)
             .filter(|b| b.compressed_len == key.len)?;
@@ -455,7 +455,7 @@ impl DecompressedCache {
     /// or nothing in the file is cached, this is exactly `[Segment::Gap{offset,
     /// len}]` - the range is entirely unresolved, same as if this cache didn't
     /// exist.
-    pub fn get_range(&self, location: &FileLocation, offset: usize, len: usize) -> Vec<Segment> {
+    pub fn get_range(&self, open_file: &OpenFile, offset: usize, len: usize) -> Vec<Segment> {
         if len == 0 {
             return Vec::new();
         }
@@ -471,7 +471,7 @@ impl DecompressedCache {
         let mut cursor = offset;
 
         let files = self.files.read().unwrap();
-        if let Some(table) = files.get(location) {
+        if let Some(table) = files.get(open_file) {
             let table = table.read().unwrap();
             for (&block_offset, block) in table.range(offset..end) {
                 push_gap(&mut segments, cursor, block_offset - cursor);
@@ -498,13 +498,13 @@ impl DecompressedCache {
     /// Takes only read locks. The range is a compressed run (4 KB aligned), so a
     /// block straddling its start is checked for separately from the in-range
     /// walk.
-    pub(crate) fn reinforce_range(&self, location: &FileLocation, offset: usize, len: usize) {
+    pub(crate) fn reinforce_range(&self, open_file: &OpenFile, offset: usize, len: usize) {
         if !self.enabled || len == 0 {
             return;
         }
         let end = offset + len;
         let files = self.files.read().unwrap();
-        let Some(table) = files.get(location) else {
+        let Some(table) = files.get(open_file) else {
             return;
         };
         let table = table.read().unwrap();
@@ -546,10 +546,10 @@ impl DecompressedCache {
         // locks are released: the compressed evictor reinforces our blocks while
         // holding its own maps, which is only cycle-free because we never hold
         // ours when walking its.
-        for (location, offset, len) in dropped {
+        for (open_file, offset, len) in dropped {
             memory_ctx()
                 .compressed_cache()
-                .reinforce_range(&location, offset, len);
+                .reinforce_range(&open_file, offset, len);
         }
         Some(victim)
     }
@@ -557,14 +557,14 @@ impl DecompressedCache {
     /// Drop every tenant block of `slot` whose current map entry still references
     /// it, returning the dropped blocks' source ranges. Sound only while `slot`
     /// is held exclusively (`try_write` succeeded).
-    fn purge_slot_tenants(&self, slot: usize) -> Vec<(FileLocation, usize, usize)> {
+    fn purge_slot_tenants(&self, slot: usize) -> Vec<(OpenFile, usize, usize)> {
         let keys = std::mem::take(self.tenants_mut(slot));
         let mut dropped = Vec::new();
         let mut emptied_files = Vec::new();
         {
             let files = self.files.read().unwrap();
             for key in keys {
-                let Some(table) = files.get(&key.location) else {
+                let Some(table) = files.get(&key.open_file) else {
                     continue;
                 };
                 let mut table = table.write().unwrap();
@@ -576,31 +576,31 @@ impl DecompressedCache {
                 if !block.extents.iter().any(|extent| extent.slot == slot) {
                     continue;
                 }
-                dropped.push((key.location.clone(), key.offset, block.compressed_len));
+                dropped.push((key.open_file.clone(), key.offset, block.compressed_len));
                 table.remove(&key.offset);
                 self.blocks.fetch_sub(1, Ordering::Relaxed);
                 if table.is_empty() {
-                    emptied_files.push(key.location);
+                    emptied_files.push(key.open_file);
                 }
             }
         }
-        for location in emptied_files {
-            self.prune_empty_file(&location);
+        for open_file in emptied_files {
+            self.prune_empty_file(&open_file);
         }
         dropped
     }
 
-    /// Remove `location`'s table if it is now empty, so its never-reused
-    /// `FileLocation` (an `Arc<File>`/`Arc<RemoteFile>` pinning the file/connection
+    /// Remove `open_file`'s table if it is now empty, so its never-reused
+    /// `OpenFile` (an `Arc<File>`/`Arc<RemoteFile>` pinning the file/connection
     /// it holds) isn't kept alive for every file ever opened. Re-checks emptiness
     /// under the outer write lock so a concurrent `claim` that just re-created the
     /// table isn't dropped.
-    fn prune_empty_file(&self, location: &FileLocation) {
+    fn prune_empty_file(&self, open_file: &OpenFile) {
         let mut files = self.files.write().unwrap();
-        if let Some(table) = files.get(location)
+        if let Some(table) = files.get(open_file)
             && table.read().unwrap().is_empty()
         {
-            files.remove(location);
+            files.remove(open_file);
         }
     }
 
@@ -611,15 +611,15 @@ impl DecompressedCache {
         self.blocks.load(Ordering::Relaxed) == 0
     }
 
-    /// Drop every block belonging to `location` (e.g. when its fd is reopened) so a
+    /// Drop every block belonging to `open_file` (e.g. when its fd is reopened) so a
     /// stale block can't serve a later read. The slots stay `Decompressed` with
     /// stale tenants and are recycled lazily by the clock (via
     /// [`reclaim`](Self::reclaim), whose identity guard skips them).
-    pub fn invalidate(&self, location: &FileLocation) {
+    pub fn invalidate(&self, open_file: &OpenFile) {
         if !self.enabled {
             return;
         }
-        if let Some(table) = self.files.write().unwrap().remove(location) {
+        if let Some(table) = self.files.write().unwrap().remove(open_file) {
             self.blocks
                 .fetch_sub(table.into_inner().unwrap().len(), Ordering::Relaxed);
         }
@@ -682,24 +682,24 @@ mod tests {
     use crate::memory::context::{init_test_free_pool, memory_ctx};
     use std::sync::{Arc, OnceLock};
 
-    /// A fresh, independent local location (distinct cache key bucket).
-    fn new_file() -> FileLocation {
-        FileLocation::Local(Arc::new(std::fs::File::open("/dev/null").unwrap()))
+    /// A fresh, independent local file (distinct cache key bucket).
+    fn new_file() -> OpenFile {
+        OpenFile::Local(Arc::new(std::fs::File::open("/dev/null").unwrap()))
     }
 
-    fn key_for(location: &FileLocation) -> BlockKey {
+    fn key_for(open_file: &OpenFile) -> BlockKey {
         BlockKey {
-            location: location.clone(),
+            open_file: open_file.clone(),
             offset: 0,
             len: 1,
         }
     }
 
-    /// One shared local location, reused across tests that key by `offset` alone.
+    /// One shared local file, reused across tests that key by `offset` alone.
     #[allow(non_snake_case)]
-    fn FD() -> FileLocation {
+    fn FD() -> OpenFile {
         static FILE: OnceLock<Arc<std::fs::File>> = OnceLock::new();
-        FileLocation::Local(
+        OpenFile::Local(
             FILE.get_or_init(|| Arc::new(std::fs::File::open("/dev/null").unwrap()))
                 .clone(),
         )
@@ -708,7 +708,7 @@ mod tests {
     /// Keys over `FD()`, distinguished by `offset`.
     fn test_key(offset: usize) -> BlockKey {
         BlockKey {
-            location: FD(),
+            open_file: FD(),
             offset,
             len: 1,
         }
@@ -949,11 +949,11 @@ mod tests {
     fn evicting_a_files_last_block_releases_its_file_handle() {
         init_test_free_pool(2);
         let cache = for_test(true);
-        let location = new_file();
-        let FileLocation::Local(file) = &location else {
+        let open_file = new_file();
+        let OpenFile::Local(file) = &open_file else {
             unreachable!()
         };
-        insert_page(&cache, key_for(&location), 8, 0);
+        insert_page(&cache, key_for(&open_file), 8, 0);
         let slot = cursor_slot();
         release_cursor(&cache);
 

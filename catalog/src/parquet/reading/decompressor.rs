@@ -71,7 +71,7 @@ impl Decompressor {
             // per-query filter mask, so a cache hit reuses them across queries; the
             // mask is attached to the `DataPage` below either way.
             let key = BlockKey {
-                location: page.row_group.get_metadata().location.clone(),
+                open_file: page.row_group.get_metadata().open_file.clone(),
                 offset: page.file_offset,
                 len: page.span,
             };

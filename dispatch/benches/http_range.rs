@@ -52,7 +52,7 @@ use std::thread;
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 use url::Url;
 
-use dispatch::io::{DataFlowRequest, FileLocation, HttpRequest, IORequester, RemoteFile};
+use dispatch::io::{DataFlowRequest, HttpRequest, IORequester, OpenFile, RemoteFile};
 use dispatch::memory::init_test_free_pool;
 use dispatch::{BUFFER_SIZE, memory_ctx};
 
@@ -265,7 +265,7 @@ fn spawn_backend(tls: bool) -> u16 {
 /// the pinned slots can't be evicted mid-read. Returns bytes fetched.
 fn run_batch(
     requester: &mut IORequester,
-    loc: &FileLocation,
+    loc: &OpenFile,
     remote: &Arc<RemoteFile>,
     reads: usize,
     block: usize,
@@ -311,7 +311,7 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
     let scheme = if tls { "https" } else { "http" };
     let url = Url::parse(&format!("{scheme}://127.0.0.1:{port}/obj")).unwrap();
     let remote = Arc::new(RemoteFile::open(url, None, 1_000_000_000_000).unwrap());
-    let loc = FileLocation::Remote(remote.clone());
+    let loc = OpenFile::Remote(remote.clone());
     memory_ctx().compressed_cache().open_entry(loc.clone());
 
     let mut requester = IORequester::with_http_config(client_config());
