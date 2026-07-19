@@ -67,3 +67,50 @@ pub(crate) struct RemoteRead {
 // writes to `[dest, dest+len)` (currently-invalid sub-blocks), so moving the
 // descriptor into the engine is sound. Mirrors the file path's PendingRead.
 unsafe impl Send for RemoteRead {}
+
+/// A whole-object upload. The body is reference counted so the operator-owned
+/// bytes remain stable while socket SQEs point into them.
+#[derive(Clone)]
+pub(crate) struct RemoteUpload {
+    pub remote: Arc<RemoteFile>,
+    pub data: Arc<[u8]>,
+}
+
+#[derive(Clone)]
+pub(crate) enum RemoteRequest {
+    Read(RemoteRead),
+    Upload(RemoteUpload),
+}
+
+impl RemoteRequest {
+    pub fn remote(&self) -> &Arc<RemoteFile> {
+        match self {
+            Self::Read(r) => &r.remote,
+            Self::Upload(r) => &r.remote,
+        }
+    }
+
+    pub fn request_head(&self) -> Vec<u8> {
+        let remote = self.remote();
+        let auth = remote.auth_header();
+        match self {
+            Self::Read(read) => proto::build_range_get(
+                remote.host_header(),
+                remote.request_target(),
+                read.offset,
+                read.len,
+                auth.as_deref(),
+            ),
+            Self::Upload(upload) => proto::build_upload(
+                remote.host_header(),
+                remote.request_target(),
+                upload.data.len(),
+                auth.as_deref(),
+            ),
+        }
+    }
+}
+
+// The read pointer has the safety argument above; uploads contain only Arc-owned
+// data and are Send without an unsafe implementation of their own.
+unsafe impl Send for RemoteRequest {}

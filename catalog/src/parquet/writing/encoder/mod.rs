@@ -50,7 +50,7 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
 
 /// Encode a column chunk, preferring a dictionary and falling back to PLAIN.
 /// Returns the optional dictionary page and the data pages.
-pub(in crate::parquet_writing) fn encode_column_chunk(
+pub(in crate::parquet::writing) fn encode_column_chunk(
     values: &ArrayRef,
 ) -> WriteResult<(Option<EncodedPage>, Vec<EncodedPage>)> {
     match dictionary::try_encode(values)? {

@@ -40,7 +40,6 @@
 
 mod compact;
 mod otel;
-mod parquet_writing;
 mod sink;
 
 use std::sync::Arc;

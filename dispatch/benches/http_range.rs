@@ -52,7 +52,9 @@ use std::thread;
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 use url::Url;
 
-use dispatch::io::{DataFlowRequest, FileLocation, HttpRequest, IORequester, RemoteFile};
+use dispatch::io::{
+    DataFlowRequest, FileLocation, HttpGetRequest, HttpRequest, IORequester, RemoteFile,
+};
 use dispatch::memory::init_test_free_pool;
 use dispatch::{BUFFER_SIZE, memory_ctx};
 
@@ -280,12 +282,12 @@ fn run_batch(
         let off = offset.fetch_add(block as u64, Ordering::Relaxed) as usize;
         let lookups = memory_ctx().compressed_cache().get(loc, off, block);
         for lookup in &lookups {
-            for missing in lookup.missing() {
+            if let Some(missing) = lookup.missing() {
                 bytes += missing.len();
-                let req = HttpRequest {
+                let req = HttpRequest::Get(HttpGetRequest {
                     remote: remote.clone(),
                     block: missing.clone(),
-                };
+                });
                 requester
                     .request_http(DataFlowRequest::new(0, 0, req))
                     .unwrap();
@@ -300,7 +302,7 @@ fn run_batch(
         if requester.has_pending() {
             requester.wait().unwrap();
         }
-        completed += requester.completions().unwrap().count();
+        completed += requester.completions().unwrap().len();
     }
     drop(pins); // unpin only after every read has committed
     bytes

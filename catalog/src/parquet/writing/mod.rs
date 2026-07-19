@@ -44,7 +44,7 @@ mod error;
 mod partition;
 mod types;
 
-pub(crate) use types::EncodedFile;
+pub use types::EncodedFile;
 
 use std::sync::Arc;
 
@@ -95,6 +95,7 @@ pub fn encode_items<T: ToRecordBatch>(
         target_rows,
         target_row_groups,
     )
+    .execute()
 }
 
 /// Encode an existing `RecordBatch` dataflow into Parquet files (the batches are
@@ -109,6 +110,20 @@ pub fn encode_record_batches(
     target_rows: usize,
     target_row_groups: usize,
 ) -> DataFlowHandle<EncodedFile> {
+    encode_record_batches_spec(spec, partition_by, sort_by, target_rows, target_row_groups)
+        .execute()
+}
+
+/// Attach the Parquet encoding stages without executing the dataflow. Catalog
+/// INSERT uses this to continue directly into asynchronous upload and commit
+/// operators on the same workers.
+pub(crate) fn encode_record_batches_spec(
+    spec: RecordBatchOperatorSpec,
+    partition_by: Arc<[String]>,
+    sort_by: Arc<[String]>,
+    target_rows: usize,
+    target_row_groups: usize,
+) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + Send + 'static> {
     let (dispatcher, heads) = spec.into_parts();
     let workers = heads.len();
     let batches = OperatorSpec::new(
@@ -137,7 +152,7 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
     sort_by: Arc<[String]>,
     target_rows: usize,
     target_row_groups: usize,
-) -> DataFlowHandle<EncodedFile> {
+) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + Send + 'static> {
     // One file's worth of rows; a partition flushes a file once it reaches this.
     let file_rows = target_rows.saturating_mul(target_row_groups).max(1);
     batches
@@ -155,5 +170,4 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
                 .collect(),
             assembler::factories(workers),
         )
-        .execute()
 }

@@ -173,14 +173,15 @@ pub(crate) fn row_groups_from_footer(
     location: dispatch::io::FileLocation,
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    build_row_groups(file_meta, location)
+    row_groups_from_metadata(file_meta, location)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
-/// remote) open file. Shared by the local and remote readers. Row groups carry
-/// only their *file-local* index; the global index is the row group's eventual
-/// position in the table's flat list.
-fn build_row_groups(
+/// remote) open file. Shared by the local and remote readers and by the writer's
+/// upload path, which already holds the footer metadata it wrote and so skips the
+/// parse. Row groups carry only their *file-local* index; the global index is the
+/// row group's eventual position in the table's flat list.
+pub(crate) fn row_groups_from_metadata(
     file_meta: FileMetaData,
     location: dispatch::io::FileLocation,
 ) -> Result<Vec<RowGroupMetadata>> {

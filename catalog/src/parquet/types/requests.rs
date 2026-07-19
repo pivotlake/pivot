@@ -4,7 +4,7 @@ use crate::parquet::types::projection::Projection;
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::ThriftReadInputProtocol;
 use bytes::Bytes;
-use dispatch::io::{FileLocation, FsRequest, HttpRequest};
+use dispatch::io::{FileLocation, FsReadRequest, FsRequest, HttpGetRequest};
 use dispatch::memory::{CacheLookup, MultiBufferReader, ReaderPosition, Segment, memory_ctx};
 
 /// One resolved piece of a column chunk, in file order, named by the form its
@@ -78,7 +78,7 @@ impl ColumnRequest {
         meta: &ColumnChunkMeta,
         location: &FileLocation,
         fs_requests: &mut Vec<FsRequest>,
-        http_requests: &mut Vec<HttpRequest>,
+        http_requests: &mut Vec<HttpGetRequest>,
     ) -> Self {
         let col_start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
         let len = meta.total_compressed_size as usize;
@@ -123,17 +123,17 @@ fn compressed_lookup(
     offset: usize,
     len: usize,
     fs_requests: &mut Vec<FsRequest>,
-    http_requests: &mut Vec<HttpRequest>,
+    http_requests: &mut Vec<HttpGetRequest>,
 ) -> Vec<CacheLookup> {
     let parts = memory_ctx().compressed_cache().get(location, offset, len);
     for lookup in &parts {
         if let Some(block) = lookup.missing() {
             match location {
-                FileLocation::Local(file) => fs_requests.push(FsRequest {
+                FileLocation::Local(file) => fs_requests.push(FsRequest::Read(FsReadRequest {
                     file: file.clone(),
                     block: block.clone(),
-                }),
-                FileLocation::Remote(remote) => http_requests.push(HttpRequest {
+                })),
+                FileLocation::Remote(remote) => http_requests.push(HttpGetRequest {
                     remote: remote.clone(),
                     block: block.clone(),
                 }),
@@ -170,7 +170,7 @@ pub struct RowGroupRequest {
     /// row group is admitted).
     pending_fs: Vec<FsRequest>,
     /// Remote HTTP reads not yet handed to the fetcher.
-    pending_http: Vec<HttpRequest>,
+    pending_http: Vec<HttpGetRequest>,
     /// Outstanding read count (decremented as each of this row group's reads
     /// lands).
     remaining: usize,
@@ -234,7 +234,7 @@ impl PendingRequest for RowGroupRequest {
         &mut self.pending_fs
     }
 
-    fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
+    fn pending_http(&mut self) -> &mut Vec<HttpGetRequest> {
         &mut self.pending_http
     }
 }

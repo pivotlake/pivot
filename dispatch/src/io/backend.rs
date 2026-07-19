@@ -32,6 +32,13 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Largest byte count a single io_uring read/write/send may carry. The opcode
+/// length field is 32-bit, so a larger `usize` would truncate when cast; this is
+/// also the kernel's own per-syscall transfer cap (`MAX_RW_COUNT`). A transfer
+/// bigger than this is submitted in successive ops, each resuming where the last
+/// left off, so the caller must already handle a short completion (it does).
+pub(crate) const MAX_IO_OP_LEN: usize = 0x7fff_f000;
+
 // ============================================================================
 // Linux: io_uring backend
 // ============================================================================
@@ -73,6 +80,7 @@ mod uring_backend {
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
+            let length = length.min(MAX_IO_OP_LEN);
             let read_op = opcode::Read::new(types::Fd(fd), dest, length as u32)
                 .offset(offset)
                 .build()
@@ -88,9 +96,13 @@ mod uring_backend {
             Ok(())
         }
 
-        /// Pushes a write of `length` bytes from `src` onto the submission queue
-        /// (does not flush). `src` points into a pinned cache slot. Used to fill
-        /// the on-disk cache after a remote (HTTP) read has landed.
+        /// Pushes a write from `src` onto the submission queue (does not flush).
+        /// `src` is the request-owned buffer to write out - a pinned cache slot for
+        /// a cache write-back (filling the on-disk cache after a remote read lands),
+        /// or an operator's own buffer for a filesystem write. At most
+        /// [`MAX_IO_OP_LEN`] bytes go out per op, so a larger `length` is written
+        /// over successive calls resuming at `offset` - the caller drives the
+        /// resubmit on a short completion.
         pub fn submit_write(
             &mut self,
             fd: RawFd,
@@ -99,6 +111,7 @@ mod uring_backend {
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
+            let length = length.min(MAX_IO_OP_LEN);
             let write_op = opcode::Write::new(types::Fd(fd), src, length as u32)
                 .offset(offset)
                 .build()

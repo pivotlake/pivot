@@ -2,7 +2,7 @@ use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
-use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteReadSplit};
+use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteSplit};
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -40,8 +40,11 @@ pub const RING_SIZE: u32 = 64;
 /// Held one per worker.
 pub struct IORequester {
     backend: IOBackend,
-    /// In-flight local-file reads, keyed by their backend `user_data` id.
-    pending_io_requests: HashMap<Identifier, DataFlowRequest<FsRequest>>,
+    /// In-flight operator-owned local-file operations, keyed by backend id,
+    /// each with the bytes already completed by earlier submissions (nonzero
+    /// only for a write whose prior completion came up short and was
+    /// resubmitted).
+    pending_io_requests: HashMap<Identifier, (DataFlowRequest<FsRequest>, usize)>,
     /// Allocates backend disk-op ids - shared by fs reads here and the engine's
     /// cache-file reads/write-backs, so a completion routes by which map holds it.
     next_id: Identifier,
@@ -88,19 +91,26 @@ impl IORequester {
         Self::with_config(http_config, None)
     }
 
-    /// Submits the block's read straight into its (pinned) cache slot and
-    /// flushes immediately. No intermediate buffer: the slot region is the read
-    /// target. The block holds an `Arc` on the slot pin, so it stays alive for
-    /// the read even if the issuing query is cancelled meanwhile.
+    /// Submit an operator-owned filesystem operation through the worker's
+    /// shared I/O backend. Request-owned storage remains alive until completion.
     pub fn request(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
-        self.backend.submit_read(
-            request.request.file.as_raw_fd(),
-            request.request.block.file_offset() as u64,
-            request.request.block.dest(),
-            request.request.block.len(),
-            self.next_id,
-        )?;
-        self.pending_io_requests.insert(self.next_id, request);
+        match &request.request {
+            FsRequest::Read(read) => self.backend.submit_read(
+                read.file.as_raw_fd(),
+                read.block.file_offset() as u64,
+                read.block.dest(),
+                read.block.len(),
+                self.next_id,
+            )?,
+            FsRequest::Write(write) => self.backend.submit_write(
+                write.file.as_raw_fd(),
+                0,
+                write.data.as_ptr(),
+                write.data.len(),
+                self.next_id,
+            )?,
+        }
+        self.pending_io_requests.insert(self.next_id, (request, 0));
         self.next_id += 1;
         self.backend.submit()?;
 
@@ -110,15 +120,45 @@ impl IORequester {
     /// Submit a read for a remote region, served from the on-disk cache where
     /// possible (only the missing ranges hit the network). Delegates to the
     /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
-    pub fn request_http(
-        &mut self,
-        request: DataFlowRequest<HttpRequest>,
-    ) -> Result<RemoteReadSplit> {
-        self.http
-            .request(&mut self.backend, &mut self.next_id, request)
+    pub fn request_http(&mut self, request: DataFlowRequest<HttpRequest>) -> Result<RemoteSplit> {
+        let DataFlowRequest {
+            data_flow_id,
+            operator_idx,
+            request,
+            submitted_at,
+        } = request;
+        match request {
+            HttpRequest::Get(request) => self.http.get(
+                &mut self.backend,
+                &mut self.next_id,
+                DataFlowRequest {
+                    data_flow_id,
+                    operator_idx,
+                    request,
+                    submitted_at,
+                },
+            ),
+            HttpRequest::Upload(request) => {
+                let bytes = request.data.len() as u64;
+                self.http.upload(
+                    &mut self.backend,
+                    DataFlowRequest {
+                        data_flow_id,
+                        operator_idx,
+                        request,
+                        submitted_at,
+                    },
+                )?;
+                Ok(RemoteSplit {
+                    http_requests: 1,
+                    http_bytes: bytes,
+                    ..RemoteSplit::default()
+                })
+            }
+        }
     }
 
-    /// Returns `true` if any read (disk or HTTP) has not yet completed.
+    /// Returns `true` if any disk or HTTP operation has not yet completed.
     pub fn has_pending(&self) -> bool {
         self.has_file_pending() || self.has_http_pending()
     }
@@ -129,13 +169,13 @@ impl IORequester {
         !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
     }
 
-    /// Returns `true` if any HTTP read is in flight.
+    /// Returns `true` if any HTTP operation is in flight.
     pub fn has_http_pending(&self) -> bool {
         self.http.has_network_pending()
     }
 
-    /// Number of HTTP reads issued but not yet completed — the current read-ahead
-    /// depth a worker uses to decide whether to submit more.
+    /// Number of HTTP operations issued but not yet completed — the depth a
+    /// worker uses to decide whether to submit more.
     pub fn http_in_flight(&self) -> usize {
         self.http.network_in_flight()
     }
@@ -174,16 +214,78 @@ impl IORequester {
             if !disk_completion(ud) {
                 continue; // HTTP socket op, already routed above
             }
-            if let Some(request) = self.pending_io_requests.remove(&ud) {
-                if result < 0 {
+            if let Some((request, done)) = self.pending_io_requests.remove(&ud) {
+                // A write may legitimately complete short (the kernel caps a
+                // single write at ~2 GiB, among other reasons); resubmit the
+                // remainder at the matching file offset until the whole buffer
+                // lands. Zero progress means the file accepts no more bytes,
+                // which is an error, not a retry.
+                if let FsRequest::Write(write) = &request.request {
+                    let done = done + result.max(0) as usize;
+                    if result > 0 && done < write.data.len() {
+                        self.backend.submit_write(
+                            write.file.as_raw_fd(),
+                            done as u64,
+                            write.data[done..].as_ptr(),
+                            write.data.len() - done,
+                            self.next_id,
+                        )?;
+                        self.pending_io_requests
+                            .insert(self.next_id, (request, done));
+                        self.next_id += 1;
+                        self.backend.submit()?;
+                        continue;
+                    }
+                }
+                let failure = match &request.request {
+                    FsRequest::Read(_) if result < 0 => {
+                        Some(std::io::Error::from_raw_os_error(-result))
+                    }
+                    FsRequest::Write(write)
+                        if result < 0 || done + result as usize != write.data.len() =>
+                    {
+                        Some(if result < 0 {
+                            std::io::Error::from_raw_os_error(-result)
+                        } else {
+                            std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "file accepted no more bytes mid-write",
+                            )
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(error) = failure {
                     out.push(Err(FailedRead {
                         data_flow_id: request.data_flow_id,
                         operator_idx: request.operator_idx,
-                        error: std::io::Error::from_raw_os_error(-result).into(),
+                        error: error.into(),
                     }));
                 } else {
-                    request.request.block.commit();
-                    out.push(Ok(Completion::Fs(request)));
+                    let DataFlowRequest {
+                        data_flow_id,
+                        operator_idx,
+                        request: fs_request,
+                        submitted_at,
+                    } = request;
+                    let completion = match fs_request {
+                        FsRequest::Read(read) => {
+                            read.block.commit();
+                            Completion::FsRead(DataFlowRequest {
+                                data_flow_id,
+                                operator_idx,
+                                request: read,
+                                submitted_at,
+                            })
+                        }
+                        FsRequest::Write(write) => Completion::FsWrite(DataFlowRequest {
+                            data_flow_id,
+                            operator_idx,
+                            request: write,
+                            submitted_at,
+                        }),
+                    };
+                    out.push(Ok(completion));
                 }
             } else {
                 // Not one of ours → a cache-file read or write-back.
@@ -249,7 +351,7 @@ mod tests {
     //! issuing a second read for a different region of the same object.
 
     use super::*;
-    use crate::io::{FileLocation, RemoteFile};
+    use crate::io::{FileLocation, HttpGetRequest, HttpUploadRequest, RemoteFile};
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -336,6 +438,101 @@ mod tests {
         )
         .unwrap();
         Arc::new(config)
+    }
+
+    #[test]
+    fn plain_http_upload_uses_shared_connection_engine() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let server_received = received.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut wire = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (head_len, content_len) = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                wire.extend_from_slice(&chunk[..n]);
+                if let Some(end) = wire.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head_len = end + 4;
+                    let head = String::from_utf8_lossy(&wire[..head_len]);
+                    let content_len = head
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length: ")
+                                .and_then(|v| v.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    break (head_len, content_len);
+                }
+            };
+            while wire.len() < head_len + content_len {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                wire.extend_from_slice(&chunk[..n]);
+            }
+            server_received
+                .lock()
+                .unwrap()
+                .extend_from_slice(&wire[head_len..head_len + content_len]);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let data: Arc<[u8]> = Arc::from(&b"parquet upload bytes"[..]);
+        let remote = Arc::new(
+            RemoteFile::open(
+                Url::parse(&format!("http://{addr}/object.parquet")).unwrap(),
+                None,
+                data.len() as u64,
+            )
+            .unwrap(),
+        );
+        let mut requester = IORequester::default();
+        let submitted_at = std::time::Instant::now();
+        let mut upload = DataFlowRequest::new(
+            7,
+            11,
+            HttpRequest::Upload(HttpUploadRequest {
+                remote,
+                data: data.clone(),
+            }),
+        );
+        upload.submitted_at = Some(submitted_at);
+        let split = requester.request_http(upload).unwrap();
+        assert_eq!(
+            split,
+            RemoteSplit {
+                http_requests: 1,
+                http_bytes: data.len() as u64,
+                ..RemoteSplit::default()
+            }
+        );
+
+        let completion = loop {
+            if let Some(completion) = requester.completions().unwrap().into_iter().next() {
+                match completion {
+                    Ok(completion) => break completion,
+                    Err(failed) => panic!("upload failed: {}", failed.error),
+                }
+            }
+            requester.wait().unwrap();
+        };
+        match completion {
+            Completion::HttpUpload(request) => {
+                assert_eq!(request.data_flow_id, 7);
+                assert_eq!(request.operator_idx, 11);
+                assert_eq!(request.submitted_at, Some(submitted_at));
+            }
+            _ => panic!("expected an HTTP upload completion"),
+        }
+        server.join().unwrap();
+        assert_eq!(&*received.lock().unwrap(), &*data);
+        assert_eq!(Arc::strong_count(&data), 1);
     }
 
     /// Read one range request and write back its `206` response body.
@@ -483,19 +680,19 @@ mod tests {
         loc: &FileLocation,
         offset: usize,
         len: usize,
-    ) -> RemoteReadSplit {
+    ) -> RemoteSplit {
         let FileLocation::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
         let lookups = memory_ctx().compressed_cache().get(loc, offset, len);
-        let mut split = RemoteReadSplit::default();
+        let mut split = RemoteSplit::default();
         let mut submitted = 0;
         for lookup in &lookups {
             if let Some(block) = lookup.missing() {
-                let req = HttpRequest {
+                let req = HttpRequest::Get(HttpGetRequest {
                     remote: remote.clone(),
                     block: block.clone(),
-                };
+                });
                 let piece = requester
                     .request_http(DataFlowRequest::new(0, 0, req))
                     .unwrap();
@@ -612,10 +809,10 @@ mod tests {
         let mut submitted = 0;
         for lookup in &lookups {
             if let Some(block) = lookup.missing() {
-                let req = HttpRequest {
+                let req = HttpRequest::Get(HttpGetRequest {
                     remote: remote.clone(),
                     block: block.clone(),
-                };
+                });
                 requester
                     .request_http(DataFlowRequest::new(0, 0, req))
                     .unwrap();

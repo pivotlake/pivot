@@ -1,0 +1,347 @@
+//! Worker-side data-file upload and row counting for SQL INSERT.
+
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::mem;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
+use crossbeam_deque::Injector;
+use dispatch::io::{FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest, RemoteFile};
+use dispatch::{
+    DataFlowDispatcher, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory, stealable,
+};
+use uuid::Uuid;
+
+use crate::catalog::{CatalogTable, TableFile};
+use crate::manifest::ManifestEntry;
+use crate::parquet::writing::{EncodedFile, encode_record_batches_spec};
+use crate::store::{DataFileLocation, ObjectPath, ObjectStore};
+
+/// Build the dataflow that writes `input`'s rows into `table` as Parquet and
+/// emits the inserted-row count. Each finished file is pushed onto `commit_queue`
+/// for the statement's transaction to commit (by the table's durable id). This is
+/// the write mirror of the scan's
+/// [`table_input_with_filter_and_eq_predicates`](crate::parquet::table_input_with_filter_and_eq_predicates):
+/// it wires the encode pipeline into this module's upload operators. Driven by
+/// [`TableBinding::compile_insert`](super::binding::TableBinding::compile_insert).
+pub(super) fn build_insert_spec(
+    table: &CatalogTable,
+    commit_queue: Arc<Injector<TransactionFile>>,
+    input: RecordBatchOperatorSpec,
+    dispatcher: &DataFlowDispatcher,
+) -> crate::Result<RecordBatchOperatorSpec> {
+    let store = table.store();
+    store.prepare_write()?;
+
+    // DuckDB has already bound and cast each VALUES expression to the target
+    // column by position. Stamp the table's names/types onto the batches so
+    // partitioning and the Parquet footer use the durable schema.
+    let schema = Arc::new(Schema::new(
+        table
+            .columns()
+            .into_iter()
+            .map(|column| {
+                Field::new(
+                    column.name,
+                    planner::types::physical_arrow_type(&column.col_type),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let input = input.project({
+        let schema = schema.clone();
+        move || {
+            let schema = schema.clone();
+            move |batch| {
+                RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+                    .expect("DuckDB INSERT binding matches the target table schema")
+            }
+        }
+    });
+
+    const TARGET_ROWS_PER_GROUP: usize = 128 * 1024;
+    const TARGET_ROW_GROUPS_PER_FILE: usize = 8;
+    let encoded = encode_record_batches_spec(
+        input,
+        table.partition_by().to_vec().into(),
+        table.sort_by().to_vec().into(),
+        TARGET_ROWS_PER_GROUP,
+        TARGET_ROW_GROUPS_PER_FILE,
+    );
+    let workers = dispatcher.worker_count();
+    let location = table.object_location().clone();
+    // One shared total; every worker's `Upload` adds its completions to it and the
+    // first worker into `finish` emits it once all uploads have landed (the finish
+    // barrier waits on each `Upload`'s `has_pending_work`), so no fan-in is needed.
+    let rows = Arc::new(AtomicUsize::new(0));
+    let emitted = Arc::new(AtomicBool::new(false));
+    let uploads = encoded.chain(
+        stealable::<EncodedFile>(workers).into_iter().collect(),
+        (0..workers)
+            .map(|_| {
+                UploadFactory::new(
+                    store.clone(),
+                    location.clone(),
+                    table.id(),
+                    commit_queue.clone(),
+                    rows.clone(),
+                    emitted.clone(),
+                )
+            })
+            .collect(),
+    );
+
+    Ok(RecordBatchOperatorSpec::from_spec(uploads))
+}
+
+/// One uploaded file waiting on the statement transaction's Delta commit. It
+/// carries the table's durable id, not its name, so the commit resolves the live
+/// table regardless of any concurrent rename.
+pub(crate) struct TransactionFile {
+    pub table_id: Uuid,
+    pub entry: ManifestEntry,
+    pub table_file: TableFile,
+}
+
+pub(super) struct UploadFactory {
+    store: Arc<dyn ObjectStore>,
+    location: ObjectPath,
+    table_id: Uuid,
+    commit_queue: Arc<Injector<TransactionFile>>,
+    /// Total inserted rows, shared across every worker's `Upload`. Each worker's
+    /// completions add to it; the emitting worker reads it once the finish barrier
+    /// guarantees all uploads landed.
+    rows: Arc<AtomicUsize>,
+    /// Claimed by the first worker to reach `finish` so exactly one emits the
+    /// result. Shared, not decided up front, so a busy worker never holds it up.
+    emitted: Arc<AtomicBool>,
+}
+
+impl UploadFactory {
+    pub fn new(
+        store: Arc<dyn ObjectStore>,
+        location: ObjectPath,
+        table_id: Uuid,
+        commit_queue: Arc<Injector<TransactionFile>>,
+        rows: Arc<AtomicUsize>,
+        emitted: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            store,
+            location,
+            table_id,
+            commit_queue,
+            rows,
+            emitted,
+        }
+    }
+}
+
+impl UnaryFactory<EncodedFile, RecordBatch> for UploadFactory {
+    type Unary = Upload;
+
+    fn build_unary(self) -> Self::Unary {
+        Upload {
+            store: self.store,
+            location: self.location,
+            table_id: self.table_id,
+            commit_queue: self.commit_queue,
+            rows: self.rows,
+            emitted: self.emitted,
+            in_flight: HashMap::new(),
+            pending_fs: Vec::new(),
+            pending_http: Vec::new(),
+        }
+    }
+}
+
+struct PendingUpload {
+    file: crate::store::FileRef,
+    key: ObjectPath,
+    partition: Option<HashMap<String, arrow_array::Scalar<arrow_array::ArrayRef>>>,
+    sort_bounds: Option<crate::SortBounds>,
+    /// The footer metadata the writer produced for this file, used to record its
+    /// row groups once the upload lands (no re-parsing the file we just wrote).
+    metadata: thriftparquet::footer::FileMetaData,
+}
+
+pub(super) struct Upload {
+    store: Arc<dyn ObjectStore>,
+    location: ObjectPath,
+    table_id: Uuid,
+    /// Shared outbox: each finished upload is pushed here for the statement's
+    /// transaction to drain and commit.
+    commit_queue: Arc<Injector<TransactionFile>>,
+    /// Running total of inserted rows, shared by every worker (see
+    /// [`UploadFactory`]). Added to as completions land; read once at `finish`.
+    rows: Arc<AtomicUsize>,
+    /// Shared latch the first worker into `finish` claims, so exactly one emits
+    /// the result row (see [`UploadFactory`]).
+    emitted: Arc<AtomicBool>,
+    /// Uploads whose write has been issued but not yet completed, keyed by their
+    /// encoded-bytes pointer. The write/upload request shares that `Arc<[u8]>`,
+    /// so a completion finds its file by the pointer - completions can arrive in
+    /// any order. Unbounded: every file the dataflow hands us starts its write
+    /// right away and they all run concurrently (some disks and object stores
+    /// have enough latency that serializing would leave throughput on the table).
+    in_flight: HashMap<usize, PendingUpload>,
+    /// Writes/uploads staged by `consume`, drained by
+    /// [`next_fs_requests`](Self::next_fs_requests) / `next_http_requests`.
+    pending_fs: Vec<FsRequest>,
+    pending_http: Vec<HttpRequest>,
+}
+
+impl Upload {
+    /// Finish the in-flight upload whose encoded bytes are at `id`: its data-file
+    /// IO has landed, so build the table file and hand it to the statement's
+    /// transaction.
+    fn complete(&mut self, id: usize) -> dispatch::UnaryResult<()> {
+        let pending = self
+            .in_flight
+            .remove(&id)
+            .expect("completion for an upload not in flight");
+        let source = self
+            .store
+            .source(&pending.key)
+            .map_err(crate::parquet::op_err)?;
+        // Row count is taken from the metadata before it's consumed below.
+        let num_rows = pending.metadata.num_rows as usize;
+        // Build the row groups from the footer the writer already produced; only
+        // the location is bound now, since it names the stored file (which exists
+        // only once the upload has landed) that future scans read.
+        let table_file = crate::parquet::table_file_from_metadata(
+            pending.file.clone(),
+            source,
+            pending.metadata,
+        )
+        .map_err(crate::parquet::op_err)?;
+        // Data-file IO is complete, but publication belongs to the statement's
+        // transaction. Its commit drains this queue and appends every file to
+        // Delta only after the whole dataflow has succeeded.
+        self.commit_queue.push(TransactionFile {
+            table_id: self.table_id,
+            entry: ManifestEntry {
+                file: pending.file,
+                partition: pending.partition,
+                sort_bounds: pending.sort_bounds,
+            },
+            table_file,
+        });
+        // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
+        // this add to whichever worker reads the total.
+        self.rows.fetch_add(num_rows, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+impl Unary<EncodedFile, RecordBatch> for Upload {
+    fn consume<S: Sender<RecordBatch>>(
+        &mut self,
+        encoded: EncodedFile,
+        _sender: &mut S,
+    ) -> dispatch::UnaryResult<()> {
+        let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
+        let key = self.location.resolve(&path);
+        let data: Arc<[u8]> = encoded.bytes.into();
+        // The write/upload request below shares this `Arc`, so its pointer keys
+        // the in-flight entry a later completion resolves against.
+        let id = data.as_ptr() as usize;
+        let file = crate::store::FileRef {
+            path,
+            size: data.len() as u64,
+        };
+
+        match self.store.sink(&key).map_err(crate::parquet::op_err)? {
+            DataFileLocation::Local(path) => {
+                let file_handle = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(crate::parquet::op_err)?;
+                self.pending_fs.push(FsRequest::Write(FsWriteRequest {
+                    file: Arc::new(file_handle),
+                    data: data.clone(),
+                }));
+            }
+            DataFileLocation::Remote { url, auth } => {
+                let remote = RemoteFile::open(url, auth, data.len() as u64)
+                    .map(Arc::new)
+                    .map_err(crate::parquet::op_err)?;
+                self.pending_http
+                    .push(HttpRequest::Upload(HttpUploadRequest {
+                        remote,
+                        data: data.clone(),
+                    }));
+            }
+        }
+        self.in_flight.insert(
+            id,
+            PendingUpload {
+                file,
+                key,
+                partition: encoded.partition,
+                sort_bounds: encoded.sort_bounds,
+                metadata: encoded.metadata,
+            },
+        );
+        Ok(())
+    }
+
+    fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
+        Ok(mem::take(&mut self.pending_fs))
+    }
+
+    fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
+        Ok(mem::take(&mut self.pending_http))
+    }
+
+    fn process_fs_write_response<S: Sender<RecordBatch>>(
+        &mut self,
+        _sender: &mut S,
+        request: FsWriteRequest,
+    ) -> dispatch::UnaryResult<()> {
+        self.complete(request.data.as_ptr() as usize)
+    }
+
+    fn process_http_upload_response<S: Sender<RecordBatch>>(
+        &mut self,
+        _sender: &mut S,
+        request: HttpUploadRequest,
+    ) -> dispatch::UnaryResult<()> {
+        self.complete(request.data.as_ptr() as usize)
+    }
+
+    /// The uploads are async: their writes/uploads land later on the ring, so the
+    /// worker isn't done until `in_flight` drains. Reporting this keeps the finish
+    /// barrier from firing until every worker's uploads have completed - only then
+    /// is the shared row total final.
+    fn has_pending_work(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> dispatch::UnaryResult<bool> {
+        // Reached only once every worker's uploads have landed (the barrier waits
+        // on `has_pending_work`), so the shared total is complete. The first
+        // worker here claims the latch and emits the single result row; the rest
+        // return without emitting.
+        if self.emitted.swap(true, Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let total = self.rows.load(Ordering::Relaxed) as i64;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "Count",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![total]))],
+        )
+        .map_err(crate::parquet::op_err)?;
+        sender.send(batch)?;
+        Ok(true)
+    }
+}

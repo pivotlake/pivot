@@ -136,9 +136,10 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
             items: groups,
             ..
         } = self.row_groups_by_file.remove(&file_id).unwrap();
-        let bytes = build_file(&header.schema, groups)?;
+        let (bytes, metadata) = build_file(&header.schema, groups)?;
         sender.send(EncodedFile {
             bytes,
+            metadata,
             partition: header.tag.partition.clone(),
             sort_bounds: header.tag.sort_bounds.clone(),
         })?;
@@ -242,8 +243,13 @@ fn assemble_row_group(
 }
 
 /// Stitch several assembled row groups into one Parquet file, rebasing each row
-/// group's column offsets to its position in the file.
-fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult<Vec<u8>> {
+/// group's column offsets to its position in the file. Returns the bytes and the
+/// footer metadata just written into them, so a consumer that needs the file's
+/// row-group metadata can take it directly instead of parsing the footer back.
+fn build_file(
+    schema: &SchemaRef,
+    groups: Vec<AssembledRowGroup>,
+) -> WriteResult<(Vec<u8>, FileMetaData)> {
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(PARQUET_MAGIC);
 
@@ -289,7 +295,7 @@ fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult
         created_by: Some("pivotdb-ingest".to_string()),
     };
     write_footer(&mut out, &file_meta)?;
-    Ok(out)
+    Ok((out, file_meta))
 }
 
 /// Append one column chunk to `out`: its dictionary page (if any) followed by its
@@ -336,7 +342,7 @@ fn write_column_chunk(
     Ok(ColumnChunk {
         file_offset: chunk_start,
         meta_data: Some(ColumnMetaData {
-            physical_type: catalog::parquet::arrow_to_parquet_physical(field.data_type())?,
+            physical_type: crate::parquet::arrow_to_parquet_physical(field.data_type())?,
             encodings,
             path_in_schema: vec![field.name().clone()],
             codec: SNAPPY_CODEC,
@@ -365,7 +371,7 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
     });
     for field in schema.fields() {
         elements.push(SchemaElement {
-            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(
+            physical_type: Some(crate::parquet::arrow_to_parquet_physical(
                 field.data_type(),
             )?),
             repetition_type: Some(REPETITION_REQUIRED),
@@ -394,8 +400,8 @@ fn write_footer(out: &mut Vec<u8>, file_meta: &FileMetaData) -> WriteResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet_writing::encoder::encode_column_chunk;
-    use crate::parquet_writing::types::{EncodedColumnChunk, PartitionTag};
+    use crate::parquet::writing::encoder::encode_column_chunk;
+    use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
     use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_schema::Schema;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -435,7 +441,7 @@ mod tests {
             .collect::<WriteResult<_>>()
             .unwrap();
         let group = assemble_row_group(&batch.schema(), chunks, &HashMap::new()).unwrap();
-        build_file(&batch.schema(), vec![group]).unwrap()
+        build_file(&batch.schema(), vec![group]).unwrap().0
     }
 
     /// Write `batch` and read it back through arrow-rs's strict reader (our

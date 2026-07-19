@@ -9,6 +9,10 @@ dispatch = { path = "../dispatch" }
 thriftparquet = { path = "../thriftparquet" }
 arrow-array = { path = "../arrow-rs/arrow-array" }
 arrow-ord = { path = "../arrow-rs/arrow-ord" }
+arrow-row = { path = "../arrow-rs/arrow-row" }
+arrow-select = { path = "../arrow-rs/arrow-select" }
+arrow-arith = { path = "../arrow-rs/arrow-arith" }
+arrow-cast = { path = "../arrow-rs/arrow-cast" }
 arrow-schema = { path = "../arrow-rs/arrow-schema" }
 arrow-buffer = { path = "../arrow-rs/arrow-buffer" }
 thiserror = "2.0.18"

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use arrow_array::{ArrayRef, Int32Array, RecordBatch, Scalar, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
@@ -370,14 +371,35 @@ fn append(catalog: &ParquetCatalog, name: &str, path: &Path) {
 fn run_sql(catalog: &Arc<ParquetCatalog>, sql: &str) -> Vec<RecordBatch> {
     let planner_catalog = catalog.clone() as Arc<dyn PlannerCatalog>;
     let transaction = planner_catalog.begin_transaction();
-    let mut planner = Planner::new(planner_catalog);
-    planner
+    let mut planner = Planner::new(planner_catalog.clone());
+    let batches = planner
         .plan(sql, transaction.clone())
         .unwrap()
         .compile(&dispatcher(), transaction.as_ref())
         .unwrap()
         .collect()
+        .unwrap();
+    planner_catalog.commit_transaction(transaction).unwrap();
+    batches
+}
+
+/// Run `sql` like [`run_sql`], retaining the dataflow's IO/CPU tally.
+fn run_sql_with_stats(
+    catalog: &Arc<ParquetCatalog>,
+    sql: &str,
+) -> (Vec<RecordBatch>, dispatch::DataFlowStats) {
+    let planner_catalog = catalog.clone() as Arc<dyn PlannerCatalog>;
+    let transaction = planner_catalog.begin_transaction();
+    let mut planner = Planner::new(planner_catalog.clone());
+    let result = planner
+        .plan(sql, transaction.clone())
         .unwrap()
+        .compile(&dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect_with_stats()
+        .unwrap();
+    planner_catalog.commit_transaction(transaction).unwrap();
+    result
 }
 
 /// Flatten a BIGINT column out of the result batches by name.
@@ -394,6 +416,111 @@ fn column_names(batches: &[RecordBatch]) -> Vec<String> {
         .iter()
         .map(|field| field.name().clone())
         .collect()
+}
+
+#[test]
+fn insert_multiple_values_writes_and_publishes_rows() {
+    let data = TempDir::new().unwrap();
+    let columns = vec![
+        Column {
+            name: "id".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "name".to_string(),
+            col_type: Type::Utf8,
+        },
+    ];
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("inserted", data.path(), columns)).unwrap();
+
+    let (inserted, stats) = run_sql_with_stats(
+        &catalog,
+        "INSERT INTO inserted VALUES (2, 'two'), (1, 'one')",
+    );
+    assert_eq!(common::extract_count(&inserted), 2);
+    assert!(stats.disk_requests > 0, "the local INSERT issued a write");
+    assert!(stats.disk_bytes > 0, "the write transferred parquet bytes");
+    assert!(
+        stats.disk_write_time > Duration::ZERO,
+        "the write recorded IO time"
+    );
+    assert_eq!(stats.disk_read_time, Duration::ZERO);
+
+    let inserted = run_sql(&catalog, "INSERT INTO inserted VALUES (3, 'three')");
+    assert_eq!(common::extract_count(&inserted), 1);
+
+    let rows = run_sql(&catalog, "SELECT id, name FROM inserted ORDER BY id");
+    let ids = rows
+        .iter()
+        .flat_map(|batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            (0..values.len()).map(move |row| values.value(row))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![1, 2, 3]);
+    assert_eq!(
+        common::collect_strings(&rows, 1),
+        vec!["one", "two", "three"]
+    );
+}
+
+#[test]
+fn insert_files_publish_only_when_transaction_commits() {
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(
+        &catalog,
+        CreateTableRequest {
+            name: "pending_insert".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                col_type: Type::Int32,
+            }],
+            options: HashMap::new(),
+            if_not_exists: false,
+        },
+    )
+    .unwrap();
+
+    let planner_catalog = catalog.clone() as Arc<dyn PlannerCatalog>;
+    let transaction = planner_catalog.begin_transaction();
+    let mut planner = Planner::new(planner_catalog.clone());
+    let inserted = planner
+        .plan(
+            "INSERT INTO pending_insert VALUES (1), (2)",
+            transaction.clone(),
+        )
+        .unwrap()
+        .compile(&dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(common::extract_count(&inserted), 2);
+
+    let before_commit = run_sql(&catalog, "SELECT COUNT(*) FROM pending_insert");
+    assert_eq!(common::extract_count(&before_commit), 0);
+
+    planner_catalog.commit_transaction(transaction).unwrap();
+    let after_commit = run_sql(&catalog, "SELECT COUNT(*) FROM pending_insert");
+    assert_eq!(common::extract_count(&after_commit), 2);
+
+    let rolled_back = planner_catalog.begin_transaction();
+    let discarded = planner
+        .plan("INSERT INTO pending_insert VALUES (3)", rolled_back.clone())
+        .unwrap()
+        .compile(&dispatcher(), rolled_back.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(common::extract_count(&discarded), 1);
+    planner_catalog.rollback_transaction(rolled_back);
+
+    let after_rollback = run_sql(&catalog, "SELECT COUNT(*) FROM pending_insert");
+    assert_eq!(common::extract_count(&after_rollback), 2);
 }
 
 /// `metadata('t')` reports one row per row group with its stats, read from the
@@ -635,6 +762,27 @@ fn reopened_database_restores_appended_files_from_manifest() {
     }
     let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
+}
+
+/// Delta has no native sort spec, so `sort_by` rides in the table metadata's
+/// configuration; a reopen must restore it or ingest silently stops sorting.
+#[test]
+fn reopened_database_restores_sort_by() {
+    let (data_dir, columns) = three_row_table();
+    let db = TempDir::new().unwrap();
+    {
+        let catalog =
+            Arc::new(ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap());
+        let mut request = create_request("t", data_dir.path(), columns);
+        request
+            .options
+            .insert("sort_by".to_string(), "id".to_string());
+        create_table(&catalog, request).unwrap();
+    }
+
+    let reopened = ParquetCatalog::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+
+    assert_eq!(reopened.table_handle("t").unwrap().sort_by(), ["id"]);
 }
 
 /// Only committed files exist: after a compaction swap, a leftover input

@@ -30,7 +30,7 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::Span;
 
 use super::convert::{Cell, CompiledMapping, Fields, RowView, any_value_to_string, hex};
-use crate::parquet_writing::ToRecordBatch;
+use catalog::parquet::writing::ToRecordBatch;
 
 /// The three OTLP signals. Selects which field table / walk applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -21,7 +21,7 @@
 
 use std::sync::OnceLock;
 
-use crate::store::{DataFileSource, ObjectPath, ObjectStore, open_store};
+use crate::store::{DataFileLocation, ObjectPath, ObjectStore, open_store};
 use testcontainers::core::ContainerPort;
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
@@ -76,10 +76,10 @@ pub fn gcs(prefix: &str) -> Option<Backend> {
 /// reader is handed.
 pub fn read_via_source(store: &dyn ObjectStore, key: &ObjectPath) -> Vec<u8> {
     match store.source(key).expect("source") {
-        DataFileSource::Local(path) => std::fs::read(path).expect("read local source"),
-        DataFileSource::Remote { url, auth } => {
+        DataFileLocation::Local(path) => std::fs::read(path).expect("read local source"),
+        DataFileLocation::Remote { url, auth } => {
             let mut req = ureq::get(url.as_str());
-            if let Some(header) = auth.as_ref().and_then(|f| f()) {
+            if let Some(header) = auth.and_then(|f| f()) {
                 req = req.set("Authorization", &header);
             }
             let resp = req.call().expect("GET source url");

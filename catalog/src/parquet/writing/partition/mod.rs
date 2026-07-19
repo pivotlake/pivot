@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender as StdSender, TryRecvError};
 
+use crate::{SortBounds, pivot_scalar, scalar_values_from_row};
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_ord::partition::partition;
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
@@ -36,7 +37,6 @@ use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
-use catalog::{SortBounds, pivot_scalar, scalar_values_from_row};
 use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult};
 mod stats;
 

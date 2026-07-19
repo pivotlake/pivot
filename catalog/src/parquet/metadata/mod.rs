@@ -23,7 +23,8 @@ mod injector;
 mod writer;
 
 use crate::catalog::TableFile;
-use crate::store::DataFile;
+use crate::store::{DataFile, DataFileLocation, FileRef};
+use dispatch::io::{FileLocation, RemoteFile, open_direct_read};
 use dispatch::{
     DataFlowDispatcher, DefaultUnaryFactory, OperatorSpec, RecordBatchOperatorSpec,
     RootUnaryOperatorFactory, fan_in,
@@ -33,6 +34,29 @@ use injector::FileInjectorFactory;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use writer::TableBuildSinkFactory;
+
+/// Build the scan metadata for a file a worker has just uploaded, from the footer
+/// metadata the writer already produced. This skips both scheduling a nested
+/// metadata dataflow from a worker and re-parsing a footer we just wrote; only
+/// the location has to be bound now, since it names the stored file that future
+/// scans read and exists only once the upload has landed.
+pub(crate) fn table_file_from_metadata(
+    file: FileRef,
+    source: DataFileLocation,
+    metadata: thriftparquet::footer::FileMetaData,
+) -> crate::Result<TableFile> {
+    let location = match source {
+        DataFileLocation::Local(path) => FileLocation::Local(Arc::new(open_direct_read(&path)?)),
+        DataFileLocation::Remote { url, auth } => {
+            FileLocation::Remote(Arc::new(RemoteFile::open(url, auth, file.size)?))
+        }
+    };
+    let row_groups = crate::parquet::types::table::row_groups_from_metadata(metadata, location)?
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    Ok(TableFile::new(file, row_groups))
+}
 
 /// The per-worker source→fetch factories: each worker steals files from a shared
 /// injector and reads their footers, emitting one [`TableFile`] per file (the

@@ -49,6 +49,10 @@ impl TableFile {
 #[derive(Clone)]
 pub struct CatalogTable {
     name: String,
+    /// The table's durable identity, from the Delta `metaData.id` (minted once at
+    /// creation, stable across renames and every commit). The catalog indexes by
+    /// this; `name` is only the user-facing label.
+    id: uuid::Uuid,
     /// Where the table's Parquet data lives in the object store.
     location: ObjectPath,
     pub(super) manifest: TableManifest,
@@ -65,8 +69,10 @@ impl CatalogTable {
     /// Reassemble a persisted table from its loaded `manifest` and the per-file
     /// row groups (`files`) just fetched for it — the reopen path. Does not
     /// persist anything; the manifest it was loaded from is already durable.
+    #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn new(
         name: String,
+        id: uuid::Uuid,
         location: ObjectPath,
         manifest: TableManifest,
         files: Vec<TableFile>,
@@ -76,6 +82,7 @@ impl CatalogTable {
     ) -> Self {
         Self {
             name,
+            id,
             location,
             manifest,
             files,
@@ -109,11 +116,12 @@ impl CatalogTable {
             .iter()
             .map(|file| file.file.clone())
             .collect::<Vec<_>>();
-        let delta_uri = crate::delta::initialize_table(
+        let (delta_uri, id) = crate::delta::initialize_table(
             store.as_ref(),
             &location,
             &columns,
             &partition_by,
+            &sort_by,
             &file_refs,
         )?;
         let manifest = TableManifest {
@@ -125,6 +133,7 @@ impl CatalogTable {
         };
         Ok(Self {
             name,
+            id,
             location,
             manifest,
             files,
@@ -142,12 +151,28 @@ impl CatalogTable {
         if state.version <= self.manifest.version {
             return Ok(false);
         }
+        // The Delta log does not persist per-file sort bounds, so a reloaded
+        // entry carries none; keep the bounds this copy already recorded for
+        // files it still holds, or sort-key pruning would silently degrade on
+        // every refresh.
+        let mut entries = state.entries;
+        let known_bounds: HashMap<&str, &SortBounds> = self
+            .manifest
+            .entries
+            .iter()
+            .filter_map(|e| Some((e.file.path.as_str(), e.sort_bounds.as_ref()?)))
+            .collect();
+        for entry in &mut entries {
+            if entry.sort_bounds.is_none() {
+                entry.sort_bounds = known_bounds.get(entry.file.path.as_str()).cloned().cloned();
+            }
+        }
         self.manifest = TableManifest {
             version: state.version,
             columns: state.columns,
             partition_by: state.partition_by,
-            sort_by: Vec::new(),
-            entries: state.entries,
+            sort_by: state.sort_by,
+            entries,
         };
         self.sync_files_to_manifest()?;
         Ok(true)
@@ -158,12 +183,74 @@ impl CatalogTable {
     /// write and the manifest commit. Idempotent on `path`.
     pub fn append_data_file(
         &mut self,
-        _path: ObjectPath,
-        _bytes: &[u8],
-        _partition: Option<HashMap<String, Scalar<ArrayRef>>>,
-        _sort_bounds: Option<SortBounds>,
+        path: ObjectPath,
+        bytes: &[u8],
+        partition: Option<HashMap<String, Scalar<ArrayRef>>>,
+        sort_bounds: Option<SortBounds>,
     ) -> crate::Result<()> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
+        if self
+            .manifest
+            .entries
+            .iter()
+            .any(|entry| entry.file.path == path)
+        {
+            return Ok(());
+        }
+        let file = self.write_data_file(path, bytes)?;
+        let data_file = file
+            .clone()
+            .into_data_file(self.store.as_ref(), &self.location)?;
+        let table_file = crate::parquet::load_table_files(&self.dispatcher, &[data_file])?
+            .pop()
+            .expect("one uploaded file yields one footer");
+        self.commit_uploaded_files(vec![(
+            ManifestEntry {
+                file,
+                partition,
+                sort_bounds,
+            },
+            table_file,
+        )])
+    }
+
+    /// Commit files whose data and footer metadata are already complete. The
+    /// caller may have uploaded them in parallel; this method performs only the
+    /// small Delta control-plane CAS and updates this table copy.
+    pub(crate) fn commit_uploaded_files(
+        &mut self,
+        uploaded: Vec<(ManifestEntry, TableFile)>,
+    ) -> crate::Result<()> {
+        let entries = uploaded
+            .iter()
+            .map(|(entry, _)| entry.clone())
+            .collect::<Vec<_>>();
+        loop {
+            let next_version = self.manifest.version + 1;
+            if crate::delta::append_files(
+                self.store.as_ref(),
+                &self.location,
+                next_version,
+                &entries,
+            )? {
+                self.manifest.version = next_version;
+                self.manifest.entries.extend(entries.iter().cloned());
+                self.files
+                    .extend(uploaded.iter().map(|(_, file)| file.clone()));
+                return Ok(());
+            }
+            // A concurrent writer took this version. Rebuild from Delta, then
+            // retry our same unique files at the following version.
+            if dispatch::worker::WORKER_IDX.get() != usize::MAX {
+                // Footer refresh is itself a dataflow and must never be launched
+                // recursively from a terminal worker. The INSERT commit path runs
+                // off-worker (`WORKER_IDX == usize::MAX`) and reaches the refresh
+                // below; this branch guards any caller that does commit from a
+                // worker (it would deadlock on the refresh), failing cleanly so
+                // the client can retry.
+                return Err(Error::ConcurrentInsert(self.name.clone()));
+            }
+            self.refresh()?;
+        }
     }
 
     /// Atomically swap a set of this table's files for another — the compaction
@@ -179,29 +266,34 @@ impl CatalogTable {
     /// as orphans and leave the inputs alone — they belong to the swap that won.
     pub fn replace_data_files(
         &mut self,
-        _removed: &[ObjectPath],
-        _added: &[ManifestEntry],
+        removed: &[ObjectPath],
+        added: &[ManifestEntry],
     ) -> crate::Result<bool> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
-    }
-
-    /// Garbage-collect this table's superseded manifest versions, keeping only a
-    /// recent tail (see [`TableManifest::prune_old_versions`]). Each commit
-    /// leaves a new version file behind; this reclaims the old ones so a busy
-    /// table's version directory stays small and the `list` every bind does
-    /// stays cheap. The compacter drives it — it's the background sweep that
-    /// already polls every table.
-    pub fn prune_old_versions(&self) -> crate::Result<()> {
-        Ok(())
-    }
-
-    /// Record the just-swapped-out `removed` inputs (paths as they appear in the
-    /// manifest) for *deferred* deletion at this table's current manifest version.
-    /// Their objects are deleted only when that version is pruned
-    /// ([`prune_old_versions`](Self::prune_old_versions)) — so a query still
-    /// reading the prior version never has a file deleted out from under it.
-    pub fn record_deletions(&self, _removed: &[ObjectPath]) -> crate::Result<()> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
+        loop {
+            if !removed
+                .iter()
+                .all(|p| self.manifest.entries.iter().any(|e| &e.file.path == p))
+            {
+                return Ok(false);
+            }
+            let next_version = self.manifest.version + 1;
+            if crate::delta::replace_files(
+                self.store.as_ref(),
+                &self.location,
+                next_version,
+                removed,
+                added,
+            )? {
+                self.manifest.version = next_version;
+                self.manifest
+                    .entries
+                    .retain(|e| !removed.contains(&e.file.path));
+                self.manifest.entries.extend(added.iter().cloned());
+                self.sync_files_to_manifest()?;
+                return Ok(true);
+            }
+            self.refresh()?;
+        }
     }
 
     /// Reconcile `files` to the current `manifest`: drop the files no longer in
@@ -246,6 +338,12 @@ impl CatalogTable {
     /// The table's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The table's durable identity (Delta `metaData.id`), stable across renames
+    /// and commits. The catalog indexes by this.
+    pub fn id(&self) -> uuid::Uuid {
+        self.id
     }
 
     /// The table's partition columns, in order (empty = unpartitioned). A
@@ -305,14 +403,19 @@ impl CatalogTable {
     /// location like any [`FileRef`] path), returning its [`FileRef`]. The
     /// compaction writer's output, committed with
     /// [`replace_data_files`](Self::replace_data_files).
-    pub fn write_data_file(&self, _path: ObjectPath, _bytes: &[u8]) -> crate::Result<FileRef> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
+    pub fn write_data_file(&self, path: ObjectPath, bytes: &[u8]) -> crate::Result<FileRef> {
+        self.store.put(&self.location.resolve(&path), bytes)?;
+        Ok(FileRef {
+            path,
+            size: bytes.len() as u64,
+        })
     }
 
     /// Delete a data file (a compaction input swapped out of the manifest).
     /// `path` resolves against the table's location like any [`FileRef`] path.
-    pub fn delete_data_file(&self, _path: &ObjectPath) -> crate::Result<()> {
-        Err(Error::DeltaWritesUnsupported(self.name.clone()))
+    pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
+        self.store.delete(&self.location.resolve(path))?;
+        Ok(())
     }
 
     /// The manifest version this copy is at. Monotonic per table; used to
@@ -369,6 +472,14 @@ impl CatalogTable {
     /// to know the physical location.
     pub fn location(&self) -> &str {
         self.location.as_str()
+    }
+
+    pub(crate) fn object_location(&self) -> &ObjectPath {
+        &self.location
+    }
+
+    pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
     }
 
     /// Each committed file's manifest path paired with its loaded row groups, in

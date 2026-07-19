@@ -27,8 +27,9 @@ use crate::catalog::Table;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
-    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Limit,
-    Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
+    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
+    Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
+    Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::type_from_logical;
@@ -113,6 +114,8 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
 
     let operator = match kind {
         DuckOperator::Projection(p) => Operator::Projection(Projection::from_handle(p)?),
+        DuckOperator::Values(v) => Operator::Values(Values::from_handle(v)?),
+        DuckOperator::Insert(i) => Operator::Insert(Insert::from_handle(i)?),
         DuckOperator::Filter(f) => Operator::Filter(Filter::from_handle(f)?),
         DuckOperator::Aggregate(a) => Operator::Aggregate(Aggregate::from_handle(a)?),
         DuckOperator::OrderBy(o) => Operator::OrderBy(OrderBy::from_handle(o)?),

@@ -71,11 +71,12 @@ pub struct CreateTableRequest {
 }
 
 /// One query's transaction: a consistent **snapshot** of the catalog, opened by
-/// [`Catalog::begin_transaction`] before the query is planned and dropped when
-/// the query finishes (the commit). Every table the query binds resolves
-/// through this snapshot (never through the live catalog, which a background
-/// refresh may be updating concurrently), so a plan's scans, its late
-/// materialize, and its metadata peepholes all see one frozen view.
+/// [`Catalog::begin_transaction`] before the query is planned and held until
+/// [`Catalog::commit_transaction`] or [`Catalog::rollback_transaction`]. Every
+/// table the query binds resolves through this snapshot (never through the live
+/// catalog, which a background refresh may be updating concurrently), so a
+/// plan's scans, its late materialize, and its metadata peepholes all see one
+/// frozen view. A backend may also hold pending writes here until commit.
 pub trait CatalogTransaction: Debug + Send + Sync {
     /// Resolve a table name to a fresh, independently-mutable [`Table`] bound
     /// to this transaction's snapshot, or `None` if no such table exists in the
@@ -96,7 +97,7 @@ pub trait CatalogTransaction: Debug + Send + Sync {
 
     /// Downcast hook: a backend's [`Table`] recovers its concrete transaction
     /// from the `&dyn CatalogTransaction` handed to the compile-time methods
-    /// ([`Table::compile`], [`Table::row_count`], ...), so a binding carries no
+    /// ([`Table::compile_scan`], [`Table::row_count`], ...), so a binding carries no
     /// snapshot state of its own.
     fn as_any(&self) -> &dyn Any;
 }
@@ -126,7 +127,7 @@ pub trait Table: Debug + Send + Sync {
     /// table was bound from; the backend resolves the table's file set from its
     /// snapshot (downcasting via [`CatalogTransaction::as_any`]), so the
     /// binding itself carries no snapshot state.
-    fn compile(
+    fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
@@ -134,6 +135,22 @@ pub trait Table: Debug + Send + Sync {
         emit_row_group_metadata: bool,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec>;
+
+    /// Build a dispatch spec that writes the rows produced by `input` into this
+    /// table and emits one `BIGINT` row with the count. Durable publication
+    /// belongs to `transaction`'s [`commit_transaction`](Catalog::commit_transaction).
+    /// The default rejects INSERT (a read-only or virtual table).
+    fn compile_insert(
+        &self,
+        _input: RecordBatchOperatorSpec,
+        _dispatcher: &DataFlowDispatcher,
+        _transaction: &dyn CatalogTransaction,
+    ) -> Result<RecordBatchOperatorSpec> {
+        Err(
+            Box::<dyn std::error::Error + Send + Sync>::from("this table does not support INSERT")
+                .into(),
+        )
+    }
 
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
@@ -174,7 +191,7 @@ pub trait Table: Debug + Send + Sync {
     /// statistics covering every row group, with no predicates pushed into this
     /// binding). The scalars carry the column's physical storage type. `None`
     /// means "unknown, scan instead" and is always a safe answer. Answered from
-    /// `transaction`'s snapshot, as in [`compile`](Table::compile).
+    /// `transaction`'s snapshot, as in [`compile_scan`](Table::compile_scan).
     fn column_min_max(
         &self,
         _column: usize,
@@ -187,7 +204,7 @@ pub trait Table: Debug + Send + Sync {
     /// answered without scanning any rows (e.g. summing Parquet row-group row
     /// counts, with no predicates pushed into this binding). `None` means
     /// "unknown, scan instead" and is always a safe answer. Answered from
-    /// `transaction`'s snapshot, as in [`compile`](Table::compile).
+    /// `transaction`'s snapshot, as in [`compile_scan`](Table::compile_scan).
     fn row_count(&self, _transaction: &dyn CatalogTransaction) -> Option<i64> {
         None
     }
@@ -254,7 +271,7 @@ pub trait Catalog: Debug + Send + Sync {
     /// binding for one query resolves through the returned snapshot, so the
     /// query reads a single consistent view regardless of concurrent refreshes
     /// or commits. The caller holds the transaction for the query's lifetime and
-    /// drops it at commit (when the query finishes).
+    /// passes it to commit or rollback when the query finishes.
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction>;
 
     /// Compile a `CREATE TABLE` statement into the dataflow that writes the new
@@ -274,8 +291,10 @@ pub trait Catalog: Debug + Send + Sync {
     /// Commit `transaction`: the query it served finished successfully. The
     /// default does nothing; the snapshot is simply released when the caller's
     /// last reference drops. A backend with real transactional state hooks its
-    /// finalization here.
-    fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) {}
+    /// finalization here and returns any commit failure to the query.
+    fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) -> Result<()> {
+        Ok(())
+    }
 
     /// Roll back `transaction`: the query it served failed or was cancelled.
     /// Default: nothing, as with [`commit_transaction`](Self::commit_transaction).

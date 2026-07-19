@@ -81,17 +81,20 @@ impl FileRef {
 #[derive(Clone, Debug)]
 pub struct DataFile {
     pub file: FileRef,
-    pub source: DataFileSource,
+    pub source: DataFileLocation,
 }
 
-/// Where a data file's bytes live: a local filesystem path (read via the
-/// io_uring file path) or a remote URL (read via HTTP range requests on the same
-/// ring). A remote URL either carries its own auth (an S3 presigned URL, `auth:
-/// None`) or pairs a stable URL with an [`AuthHeader`] that mints a fresh bearer
-/// token per request (GCS). Which variant a store yields is entirely its
-/// business, not the caller's.
+/// Where a data file's bytes live, for reading or writing: a local filesystem
+/// path (via the io_uring file path) or a remote URL (HTTP on the same ring). A
+/// remote URL either carries its own auth (an S3 presigned URL, `auth: None`) or
+/// pairs a stable URL with an [`AuthHeader`] that mints a fresh bearer token per
+/// request (GCS). Which variant a store yields is its business, not the caller's.
+///
+/// The same key maps to a different URL per direction — [`source`](ObjectStore::source)
+/// builds the read URL, [`sink`](ObjectStore::sink) the write URL (e.g. S3 presigns
+/// a GET vs a PUT) — so both return this one type. Uploads are always a `PUT`.
 #[derive(Clone)]
-pub enum DataFileSource {
+pub enum DataFileLocation {
     Local(PathBuf),
     Remote {
         url: url::Url,
@@ -99,7 +102,7 @@ pub enum DataFileSource {
     },
 }
 
-impl Debug for DataFileSource {
+impl Debug for DataFileLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Local(path) => f.debug_tuple("Local").field(path).finish(),
@@ -122,7 +125,7 @@ impl DataFile {
                 path: ObjectPath::new(path.to_string_lossy().into_owned()),
                 size,
             },
-            source: DataFileSource::Local(path),
+            source: DataFileLocation::Local(path),
         }
     }
 
@@ -134,7 +137,7 @@ impl DataFile {
                 path: ObjectPath::new(url.path()),
                 size,
             },
-            source: DataFileSource::Remote { url, auth: None },
+            source: DataFileLocation::Remote { url, auth: None },
         }
     }
 }
@@ -185,7 +188,16 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// a filesystem path, a remote one a GET URL — either presigned or paired
     /// with a per-request bearer token. (Identity — the [`FileRef`] — is the
     /// caller's; this is only how to read the bytes.)
-    fn source(&self, key: &ObjectPath) -> Result<DataFileSource>;
+    fn source(&self, key: &ObjectPath) -> Result<DataFileLocation>;
+
+    /// How a worker should asynchronously create a data object at `key`.
+    fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation>;
+
+    /// Prime any credentials workers will need for writes. Called on the
+    /// coordinator before launching an INSERT dataflow.
+    fn prepare_write(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// A human-readable description of where this store is rooted - e.g.
     /// `file:///var/lib/pivot`, `s3://bucket/prefix`, or `gs://bucket/prefix`.

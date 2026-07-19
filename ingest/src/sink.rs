@@ -30,7 +30,7 @@ use dispatch::{DataFlowDispatcher, DataFlowError};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::parquet_writing::{self, EncodedFile, ToRecordBatch};
+use catalog::parquet::writing::{self, EncodedFile, ToRecordBatch};
 
 /// Cumulative, lock-free counters for one sink's flush activity - read by the
 /// introspection API to show live ingest throughput per table.
@@ -201,7 +201,7 @@ impl<T: ToRecordBatch> ParquetSink<T> {
     /// Run `items` through the write pipeline and write each Parquet file it
     /// produces.
     ///
-    /// The pipeline (see [`parquet_writing`]) flattens items into Arrow batches,
+    /// The pipeline (see [`writing`]) flattens items into Arrow batches,
     /// then partitions, encodes, and assembles them into Parquet files across the
     /// dispatch worker pool, streaming finished files out as they complete.
     /// Iterating that stream blocks, so it runs on a blocking thread; each
@@ -233,7 +233,7 @@ impl<T: ToRecordBatch> ParquetSink<T> {
         // files per partition, and tags each `EncodedFile` with its tuple +
         // sort_bounds (both `None` when the spec is empty).
         let pipeline = tokio::task::spawn_blocking(move || -> Result<(), DataFlowError> {
-            for file in parquet_writing::encode_items(
+            for file in writing::encode_items(
                 &dispatcher,
                 items,
                 partition_by.into(),

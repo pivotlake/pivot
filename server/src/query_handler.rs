@@ -160,11 +160,19 @@ pub(crate) async fn execute_sql(
         Ok(batches)
     }
     .await;
-    match &result {
-        Ok(_) => catalog.commit_transaction(transaction),
-        Err(_) => catalog.rollback_transaction(transaction),
+    match result {
+        Ok(batches) => {
+            tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            Ok(batches)
+        }
+        Err(error) => {
+            catalog.rollback_transaction(transaction);
+            Err(error)
+        }
     }
-    result
 }
 
 #[derive(Debug, Error)]
@@ -175,10 +183,14 @@ enum Error {
     Compile(#[from] planner::compile::Error),
     #[error(transparent)]
     DataFlow(#[from] dispatch::DataFlowError),
+    #[error(transparent)]
+    Catalog(#[from] planner::catalog::Error),
     #[error("waiter thread panicked: {0}")]
     WorkerPanic(JoinError),
     #[error("waiter thread panicked: {0}")]
     PlannerPanic(JoinError),
+    #[error("transaction commit thread panicked: {0}")]
+    CommitPanic(JoinError),
 }
 
 impl Error {
@@ -405,11 +417,19 @@ impl PivotQueryHandler {
             ))
         }
         .await;
-        match &result {
-            Ok(_) => self.catalog.commit_transaction(transaction),
-            Err(_) => self.catalog.rollback_transaction(transaction),
+        match result {
+            Ok(outcome) => {
+                let catalog = self.catalog.clone();
+                tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
+                    .await
+                    .map_err(Error::CommitPanic)??;
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.catalog.rollback_transaction(transaction);
+                Err(error)
+            }
         }
-        result
     }
 }
 
@@ -435,21 +455,24 @@ impl QueryStats {
     fn summary(&self) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-        // The IO/cpu figures are sums (over workers and in-flight reads), so
-        // `time/reads` is the average read latency and the totals can top exec.
+        // The IO/cpu figures are sums over workers and in-flight operations, so
+        // the totals can top exec time.
         format!(
             "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
-             disk={} reads/{:.1}MiB/{:.1}ms  http={} reads/{:.1}MiB/{:.1}ms  \
-             http-disk-cache={} reads/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
+             disk={} ops/{:.1}MiB/read={:.1}ms/write={:.1}ms  \
+             http={} ops/{:.1}MiB/get={:.1}ms/upload={:.1}ms  \
+             http-disk-cache={} ops/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
             ms(self.plan),
             ms(self.compile),
             ms(self.exec),
             self.flow.disk_requests,
             mib(self.flow.disk_bytes),
-            ms(self.flow.disk_time),
+            ms(self.flow.disk_read_time),
+            ms(self.flow.disk_write_time),
             self.flow.http_requests,
             mib(self.flow.http_bytes),
-            ms(self.flow.http_time),
+            ms(self.flow.http_get_time),
+            ms(self.flow.http_upload_time),
             self.flow.disk_cache_requests,
             mib(self.flow.disk_cache_bytes),
             ms(self.flow.disk_cache_time),

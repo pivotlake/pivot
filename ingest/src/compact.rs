@@ -15,7 +15,7 @@
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups and the write pipeline's encode stages
-//! consume those batches directly ([`parquet_writing::encode_record_batches`]) — the data
+//! consume those batches directly ([`writing::encode_record_batches`]) — the data
 //! never leaves the pool until finished files stream out. The compacter's own
 //! task only drives that dataflow (from a blocking thread) and does the
 //! log/store bookkeeping.
@@ -50,8 +50,8 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::parquet_writing;
 use crate::sink::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
+use catalog::parquet::writing;
 
 /// Why one compaction merge failed: either the scan→encode dataflow, or a
 /// catalog write/swap/delete. Both already carry typed causes.
@@ -230,7 +230,14 @@ impl Compacter {
                 seq: self.seq.fetch_add(1, Ordering::Relaxed),
             };
             match tokio::task::spawn_blocking(move || job.compact(inputs)).await {
-                Ok(Ok(merged)) => {
+                Ok(Ok((committed, merged))) => {
+                    // Continue from the copy that performed the swap: it
+                    // already holds the committed version, and it is the only
+                    // copy carrying the merged files' sort bounds (the Delta
+                    // log does not persist them). Publish it so the next
+                    // query's snapshot reads the merged file instead of the
+                    // swapped-out inputs.
+                    table = committed;
                     // `merged` is empty when another writer won the swap (no real
                     // work happened); only count an actual merge.
                     if !merged.is_empty() {
@@ -241,13 +248,6 @@ impl Compacter {
                         files = merged.len(),
                         "compacted batch"
                     );
-                    // Pull in the swap we just committed before scanning again,
-                    // and publish it so the next query's snapshot reads the
-                    // merged file instead of the swapped-out inputs.
-                    if let Err(e) = table.refresh() {
-                        warn!(table = table.name(), error = %e, "compaction: refresh after merge failed");
-                        return;
-                    }
                     self.catalog.publish_table(table.clone());
                 }
                 Ok(Err(e)) => {
@@ -259,12 +259,6 @@ impl Compacter {
                     return;
                 }
             }
-        }
-        // Reclaim the manifest versions left behind by this round's swaps (and
-        // by any appends since the last sweep). Best-effort: a failure here just
-        // leaves the old version files for the next round.
-        if let Err(e) = table.prune_old_versions() {
-            warn!(table = table.name(), error = %e, "compaction: pruning old manifest versions failed");
         }
     }
 
@@ -351,9 +345,10 @@ struct CompactJob {
 impl CompactJob {
     /// Decode `inputs` and re-encode them as one stream of target-sized row
     /// groups — a single scan→encode dataflow — then commit: write the merged
-    /// file(s), swap them for the inputs in one manifest version, delete the
-    /// inputs. Returns the merged files written.
-    fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, CompactError> {
+    /// file(s) and swap them for the inputs in one log commit. Returns the
+    /// table copy that holds the committed version alongside the merged files
+    /// written (empty when another writer won the swap).
+    fn compact(self, inputs: Vec<FileRef>) -> Result<(CatalogTable, Vec<FileRef>), CompactError> {
         // Scan just the input files and re-encode their rows into target-sized
         // merged files — one scan→encode dataflow on the worker pool. The inputs
         // share one partition (see `next_batch`), so re-applying the table's
@@ -362,7 +357,7 @@ impl CompactJob {
         let parquet = self.table.parquet_table_for(&inputs);
         let columns = parquet.schema().fields().len();
         let scan = table_input(&self.dispatcher, &parquet, Projection::all(columns), false);
-        let merged = parquet_writing::encode_record_batches(
+        let merged = writing::encode_record_batches(
             scan,
             Arc::from(self.table.partition_by()),
             Arc::from(self.table.sort_by()),
@@ -413,16 +408,14 @@ impl CompactJob {
                     warn!(error = %e, file = %entry.file.path, "compaction: deleting discarded merge output failed (orphan left)");
                 }
             }
-            return Ok(Vec::new());
+            return Ok((table, Vec::new()));
         }
         // Don't delete the swapped-out inputs now: a query that loaded the prior
-        // manifest version is still reading them (that's the `404 expected 206`
-        // a reader hits when compaction deletes under it). Record them instead —
-        // they're deleted when this version is pruned, by which point the
-        // retention tail guarantees no reader still references them.
-        if let Err(e) = table.record_deletions(&removed) {
-            warn!(error = %e, "compaction: recording deferred deletions failed (inputs will linger as orphans)");
-        }
-        Ok(added.into_iter().map(|entry| entry.file).collect())
+        // version is still reading them (that's the `404 expected 206` a reader
+        // hits when compaction deletes under it). The swap's Delta Remove
+        // actions are their durable tombstones; the objects themselves stay in
+        // place until the table grows VACUUM-style physical cleanup.
+        let merged = added.into_iter().map(|entry| entry.file).collect();
+        Ok((table, merged))
     }
 }

@@ -100,6 +100,10 @@ pub enum Error {
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("inserting rows: {0}")]
+    Insert(#[source] crate::catalog::Error),
+    #[error("INSERT nodes should have exactly one input operator, got {0}")]
+    UnexpectedInsertInputs(usize),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
     #[error("Unsupported table function: {0}")]
@@ -228,6 +232,7 @@ impl PlanNode {
 
         match &self.operator {
             crate::Operator::Input(o) => o.compile(dispatcher, transaction, slots),
+            crate::Operator::Values(o) => o.compile(dispatcher),
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, transaction),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
@@ -241,6 +246,12 @@ impl PlanNode {
                     return Err(Error::UnexpectedCreateTableInputs);
                 }
                 o.compile(dispatcher, catalog)
+            }
+            crate::Operator::Insert(o) => {
+                if inputs.len() != 1 {
+                    return Err(Error::UnexpectedInsertInputs(inputs.len()));
+                }
+                o.compile(inputs.remove(0), dispatcher, transaction)
             }
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
@@ -277,8 +288,15 @@ impl ExprResult {
         match self {
             ExprResult::Array(a) => a,
             ExprResult::Scalar(s) => {
+                let inner = s.into_inner();
+                // A `Scalar` already holds a length-1 array; when a single row is
+                // all that's asked for, hand it back directly rather than copying
+                // it through `take` (e.g. one `VALUES` row).
+                if inner.len() == num_rows {
+                    return inner;
+                }
                 let indices = UInt32Array::from(vec![0u32; num_rows]);
-                arrow::compute::take(&s.into_inner(), &indices, None).unwrap()
+                arrow::compute::take(&inner, &indices, None).unwrap()
             }
         }
     }

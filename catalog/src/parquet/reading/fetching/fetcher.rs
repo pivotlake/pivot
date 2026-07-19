@@ -18,7 +18,7 @@ use crate::parquet::request_tracker::{ReadRequest, RequestTracker};
 use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::io::{FsRequest, HttpRequest};
+use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest};
 
 /// Disk-backed read blocks outstanding per worker before admitting another row
 /// group. One keeps disk reads serial — io_uring gives a single read ample
@@ -93,20 +93,20 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
             && self.tracker.http_in_flight() < crate::parquet::http_readahead()
     }
 
-    fn process_fs_response<S: Sender<RowGroupBuffer>>(
+    fn process_fs_read_response<S: Sender<RowGroupBuffer>>(
         &mut self,
         sender: &mut S,
-        request: FsRequest,
+        request: FsReadRequest,
     ) -> dispatch::UnaryResult<()> {
         self.deliver(ReadRequest::of_fs(&request), sender)
     }
 
-    fn process_http_response<S: Sender<RowGroupBuffer>>(
+    fn process_http_get_response<S: Sender<RowGroupBuffer>>(
         &mut self,
         sender: &mut S,
-        request: HttpRequest,
+        request: HttpGetRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.deliver(ReadRequest::of_http(&request), sender)
+        self.deliver(ReadRequest::of_http_get(&request), sender)
     }
 
     fn finish<S: Sender<RowGroupBuffer>>(

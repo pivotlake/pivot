@@ -59,6 +59,16 @@ const LogicalOperator &lo_child(const LogicalOperator &op, size_t index);
 size_t lo_projection_expr_count(const LogicalOperator &op);
 const Expression &lo_projection_expr(const LogicalOperator &op, size_t index);
 
+// ---- ExpressionGet (VALUES) ----
+size_t lo_values_row_count(const LogicalOperator &op);
+size_t lo_values_column_count(const LogicalOperator &op);
+const Expression &lo_values_expr(const LogicalOperator &op, size_t row, size_t column);
+
+// ---- Insert ----
+rust::String lo_insert_table_name(const LogicalOperator &op);
+size_t lo_insert_column_map_count(const LogicalOperator &op);
+bool lo_insert_returns_rows(const LogicalOperator &op);
+
 // ---- Filter ----
 size_t lo_filter_expr_count(const LogicalOperator &op);
 const Expression &lo_filter_expr(const LogicalOperator &op, size_t index);

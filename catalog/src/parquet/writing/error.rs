@@ -23,9 +23,9 @@ pub(super) enum WriteError {
     #[error("unsupported column type for Parquet encoding: {0:?}")]
     UnsupportedType(DataType),
     /// A catalog parquet type-mapping error, e.g. an arrow type with no Parquet
-    /// physical type (from [`catalog::parquet::arrow_to_parquet_physical`]).
+    /// physical type (from [`crate::parquet::arrow_to_parquet_physical`]).
     #[error(transparent)]
-    Catalog(#[from] catalog::parquet::ParquetTableError),
+    Catalog(#[from] crate::parquet::ParquetTableError),
     /// A row group whose column yielded no pages — an internal invariant break.
     #[error("column {column} of a row group produced no pages")]
     MissingPages { column: usize },

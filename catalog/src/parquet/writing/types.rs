@@ -10,9 +10,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::SortBounds;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
-use catalog::SortBounds;
 use dispatch::{Identifier, WorkerIdOutput};
 
 /// Identifies a row group across the pipeline so its column chunks reassemble
@@ -65,10 +65,14 @@ pub(crate) struct PartitionTag {
 /// A finished Parquet file from the write pipeline, with the manifest metadata to
 /// record for it (`partition`/`sort_bounds` are `None` for an unpartitioned,
 /// unsorted write).
-pub(crate) struct EncodedFile {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) partition: Option<HashMap<String, Scalar<ArrayRef>>>,
-    pub(crate) sort_bounds: Option<SortBounds>,
+pub struct EncodedFile {
+    pub bytes: Vec<u8>,
+    /// The footer metadata written into `bytes`. Kept so a consumer that records
+    /// the file's row groups can build them straight from here instead of parsing
+    /// the footer back out of a file it just produced.
+    pub metadata: thriftparquet::footer::FileMetaData,
+    pub partition: Option<HashMap<String, Scalar<ArrayRef>>>,
+    pub sort_bounds: Option<SortBounds>,
 }
 
 /// The per-row-group metadata every column chunk of a row group shares: its
