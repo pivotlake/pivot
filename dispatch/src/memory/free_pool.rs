@@ -12,7 +12,7 @@
 //! injector array (so a buffer released *anywhere* can be routed back), but a
 //! worker's stealer list covers only its own NUMA node's siblings: acquiring a
 //! slot is what places memory, so it must stay node-local (see
-//! [`RingLayout`](super::RingLayout)).
+//! [`RingLayout`]).
 //!
 //! On push, the index is routed to its *home worker*
 //! ([`RingLayout::home_worker`](super::RingLayout::home_worker), always a
