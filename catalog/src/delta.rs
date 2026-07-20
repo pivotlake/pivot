@@ -10,7 +10,9 @@ use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Datum, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampSecondArray,
+    new_null_array,
 };
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::Snapshot;
 use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::object_store::DynObjectStore;
@@ -52,13 +54,34 @@ pub enum Error {
     DeletionVector(String),
     #[error("Delta table URI scheme `{0}` is not supported by the catalog")]
     UnsupportedScheme(String),
+    #[error("cannot format Delta partition value for `{column}`: {message}")]
+    PartitionFormat { column: String, message: String },
+    #[error("Delta table has a non-UUID table id `{id}`: {source}")]
+    InvalidTableId {
+        id: String,
+        #[source]
+        source: uuid::Error,
+    },
 }
+
+/// How Delta serializes timestamp partition values (and how Delta Kernel
+/// parses them back): `yyyy-MM-dd HH:mm:ss[.SSSSSS]`.
+const DELTA_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
+
+/// Table-metadata configuration key holding the table's ordered sort columns,
+/// comma-separated. Delta has no native sort spec, so it rides in the
+/// `metaData` action's free-form `configuration` map.
+const SORT_BY_CONFIGURATION_KEY: &str = "pivot.sortBy";
 
 /// The Delta state needed to rebuild one in-memory catalog table.
 pub(crate) struct DeltaTableState {
+    /// The table's durable identity, from the Delta `metaData` action's `id`
+    /// (minted once at creation, stable across every commit).
+    pub id: uuid::Uuid,
     pub version: u64,
     pub columns: Vec<Column>,
     pub partition_by: Vec<String>,
+    pub sort_by: Vec<String>,
     pub entries: Vec<ManifestEntry>,
 }
 
@@ -69,8 +92,9 @@ pub(crate) fn initialize_table(
     location: &ObjectPath,
     columns: &[Column],
     partition_by: &[String],
+    sort_by: &[String],
     files: &[FileRef],
-) -> Result<Url, Error> {
+) -> Result<(Url, uuid::Uuid), Error> {
     let uri = table_uri(&store.describe(), location)?;
     let fields = columns
         .iter()
@@ -84,13 +108,21 @@ pub(crate) fn initialize_table(
         .collect::<Result<Vec<_>, Error>>()?;
     let schema = StructType::try_new(fields)?;
     let schema = serde_json::to_string(&schema).expect("Delta Kernel schema is serializable");
+    let mut configuration = serde_json::Map::new();
+    if !sort_by.is_empty() {
+        configuration.insert(
+            SORT_BY_CONFIGURATION_KEY.to_string(),
+            serde_json::Value::String(sort_by.join(",")),
+        );
+    }
+    let id = uuid::Uuid::new_v4();
     let metadata = serde_json::json!({
         "metaData": {
-            "id": uuid::Uuid::new_v4().to_string(),
+            "id": id.to_string(),
             "format": {"provider": "parquet", "options": {}},
             "schemaString": schema,
             "partitionColumns": partition_by,
-            "configuration": {},
+            "configuration": configuration,
         }
     });
     // A variant column is a Delta table feature: readers and writers must
@@ -133,7 +165,110 @@ pub(crate) fn initialize_table(
             "Delta table version 0 already exists",
         )));
     }
-    Ok(uri)
+    Ok((uri, id))
+}
+
+/// Atomically commit a data-file change at `version`: a Remove action per path
+/// in `removed` and an Add action per entry in `added`, in one Delta commit. An
+/// empty `removed` is a plain append. `data_change` is stamped on every action:
+/// `true` for a logical change (INSERT, DELETE), `false` for a rearrangement
+/// that leaves the table's rows identical (compaction), which lets incremental
+/// log readers skip it. A false return means another writer already committed
+/// that version; callers refresh and retry at the next one.
+pub(crate) fn commit_file_changes(
+    store: &dyn ObjectStore,
+    location: &ObjectPath,
+    version: u64,
+    removed: &[ObjectPath],
+    added: &[ManifestEntry],
+    data_change: bool,
+) -> Result<bool, Error> {
+    let modification_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut lines = removed
+        .iter()
+        .map(|path| remove_action(path, modification_time, data_change))
+        .collect::<Vec<_>>();
+    for entry in added {
+        lines.push(add_action(entry, modification_time, data_change)?);
+    }
+    commit_actions(store, location, version, lines)
+}
+
+/// Serialize one removed file as a Delta `Remove` action line.
+fn remove_action(path: &ObjectPath, modification_time: u64, data_change: bool) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "remove": {
+            "path": path.as_str(),
+            "deletionTimestamp": modification_time,
+            "dataChange": data_change,
+        }
+    }))
+    .expect("Delta Remove action is serializable")
+}
+
+/// Serialize one committed file as a Delta `Add` action line.
+fn add_action(
+    entry: &ManifestEntry,
+    modification_time: u64,
+    data_change: bool,
+) -> Result<String, Error> {
+    let mut partition_values = serde_json::Map::new();
+    if let Some(partition) = &entry.partition {
+        for (column, scalar) in partition {
+            partition_values.insert(column.clone(), format_partition_value(column, scalar)?);
+        }
+    }
+    Ok(serde_json::to_string(&serde_json::json!({
+        "add": {
+            "path": entry.file.path.as_str(),
+            "partitionValues": partition_values,
+            "size": entry.file.size,
+            "modificationTime": modification_time,
+            "dataChange": data_change,
+        }
+    }))
+    .expect("Delta Add action is serializable"))
+}
+
+/// Serialize one typed partition scalar the way Delta stores it in an `Add`
+/// action's `partitionValues`: a string [`partition_scalar`] parses back on
+/// reload, or JSON null for a null value.
+fn format_partition_value(
+    column: &str,
+    scalar: &Scalar<ArrayRef>,
+) -> Result<serde_json::Value, Error> {
+    let (array, _) = scalar.get();
+    if array.is_null(0) {
+        return Ok(serde_json::Value::Null);
+    }
+    // Delta stores timestamp partition values as `yyyy-MM-dd HH:mm:ss[.SSSSSS]`;
+    // arrow's default rendering (`1970-01-01T00:00:01`) would not parse back on
+    // reload.
+    let options = FormatOptions::default().with_timestamp_format(Some(DELTA_TIMESTAMP_FORMAT));
+    let formatter =
+        ArrayFormatter::try_new(array, &options).map_err(|e| Error::PartitionFormat {
+            column: column.to_string(),
+            message: e.to_string(),
+        })?;
+    Ok(serde_json::Value::String(formatter.value(0).to_string()))
+}
+
+/// Atomically write `lines` as the commit at `version`. A false return means
+/// another writer already committed that version.
+fn commit_actions(
+    store: &dyn ObjectStore,
+    location: &ObjectPath,
+    version: u64,
+    lines: Vec<String>,
+) -> Result<bool, Error> {
+    let mut commit = lines.join("\n");
+    commit.push('\n');
+    let version_file = format!("{version:020}.json");
+    let key = location.join("_delta_log").join(&version_file);
+    Ok(store.put_if_absent(&key, commit.as_bytes())?)
 }
 
 /// Resolve a catalog-relative table location into the URI Delta Kernel reads.
@@ -181,6 +316,13 @@ pub(crate) fn load_table(uri: &Url) -> Result<DeltaTableState, Error> {
         .metadata()
         .partition_columns()
         .to_vec();
+    let sort_by = snapshot
+        .table_configuration()
+        .metadata()
+        .configuration()
+        .get(SORT_BY_CONFIGURATION_KEY)
+        .map(|raw| raw.split(',').map(str::to_string).collect())
+        .unwrap_or_default();
 
     let scan = snapshot.clone().scan_builder().build()?;
     let mut files = Vec::new();
@@ -197,10 +339,18 @@ pub(crate) fn load_table(uri: &Url) -> Result<DeltaTableState, Error> {
         .map(|file| scan_file_entry(file, &by_name, &delta_types, &partition_by))
         .collect::<Result<Vec<_>, Error>>()?;
 
+    let raw_id = snapshot.table_configuration().metadata().id();
+    let id = uuid::Uuid::parse_str(raw_id).map_err(|source| Error::InvalidTableId {
+        id: raw_id.to_string(),
+        source,
+    })?;
+
     Ok(DeltaTableState {
+        id,
         version: snapshot.version(),
         columns,
         partition_by,
+        sort_by,
         entries,
     })
 }
@@ -313,10 +463,21 @@ fn partition_scalar(
             data_type: format!("{delta_type:?}"),
         });
     };
-    let scalar = primitive.parse_scalar(raw)?;
-    let scalar = delta_scalar_to_pivot(column, scalar)?;
-    let actual = scalar.get().0.data_type().clone();
     let expected = planner::types::physical_arrow_type(pivot_type);
+    // Delta stores partition values as strings, and Delta Kernel parses an
+    // empty string as null for every type. A string column's value is taken
+    // verbatim so an empty string survives the round trip; for other types a
+    // null parse result becomes a typed null scalar (partition pruning already
+    // compares nulls with SQL semantics).
+    let scalar = if matches!(pivot_type, Type::Utf8) {
+        Scalar::new(Arc::new(StringViewArray::from(vec![raw])) as ArrayRef)
+    } else {
+        match primitive.parse_scalar(raw)? {
+            DeltaScalar::Null(_) => Scalar::new(new_null_array(&expected, 1)),
+            scalar => delta_scalar_to_pivot(column, scalar)?,
+        }
+    };
+    let actual = scalar.get().0.data_type().clone();
     if actual != expected {
         return Err(Error::UnsupportedType {
             column: column.to_string(),
@@ -346,7 +507,7 @@ fn delta_scalar_to_pivot(column: &str, scalar: DeltaScalar) -> Result<Scalar<Arr
         DeltaScalar::Timestamp(value) | DeltaScalar::TimestampNtz(value) => {
             erased(TimestampSecondArray::from(vec![value / 1_000_000]))
         }
-        // Pivot currently executes DECIMAL as Float64; retain that physical
+        // Pivot executes DECIMAL as Float64; retain that physical
         // representation while preserving the logical type in the table schema.
         DeltaScalar::Decimal(value) => {
             let divisor = 10_f64.powi(i32::from(value.scale()));
@@ -417,9 +578,8 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         Type::Utf8 => PrimitiveType::String,
         Type::Date => PrimitiveType::Date,
         Type::Timestamp => PrimitiveType::Timestamp,
-        Type::Int128 => PrimitiveType::decimal(38, 0)?,
         Type::Decimal => PrimitiveType::decimal(38, 18)?,
-        Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
+        Type::Int128 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
             return Err(Error::UnsupportedType {
                 column: column.to_string(),
                 data_type: data_type.to_string(),
@@ -469,6 +629,96 @@ mod tests {
                 .unwrap()
                 .value(0),
             2
+        );
+    }
+
+    /// Every partition value written into an `Add` action must parse back on
+    /// reload, or the table becomes unloadable.
+    #[test]
+    fn timestamp_partition_value_round_trips_through_the_delta_log() {
+        let scalar: Scalar<ArrayRef> =
+            Scalar::new(Arc::new(TimestampSecondArray::from(vec![86_401])) as ArrayRef);
+
+        let written = format_partition_value("ts", &scalar).unwrap();
+        let restored = partition_scalar(
+            "ts",
+            written.as_str().unwrap(),
+            &Type::Timestamp,
+            &DeltaDataType::Primitive(PrimitiveType::Timestamp),
+        )
+        .unwrap();
+
+        assert_eq!(written, serde_json::json!("1970-01-02 00:00:01"));
+        assert_eq!(
+            restored
+                .get()
+                .0
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .value(0),
+            86_401
+        );
+    }
+
+    #[test]
+    fn empty_string_partition_value_round_trips_through_the_delta_log() {
+        let scalar: Scalar<ArrayRef> =
+            Scalar::new(Arc::new(StringViewArray::from(vec![""])) as ArrayRef);
+
+        let written = format_partition_value("service", &scalar).unwrap();
+        let restored = partition_scalar(
+            "service",
+            written.as_str().unwrap(),
+            &Type::Utf8,
+            &DeltaDataType::Primitive(PrimitiveType::String),
+        )
+        .unwrap();
+
+        assert_eq!(
+            restored
+                .get()
+                .0
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .value(0),
+            ""
+        );
+    }
+
+    /// A null non-string partition value parses back as a typed null scalar
+    /// rather than failing the table load.
+    #[test]
+    fn null_partition_value_restores_as_typed_null() {
+        let restored = partition_scalar(
+            "shard",
+            "",
+            &Type::Int64,
+            &DeltaDataType::Primitive(PrimitiveType::Long),
+        )
+        .unwrap();
+
+        let (array, _) = restored.get();
+        assert_eq!(array.data_type(), &arrow_schema::DataType::Int64);
+        assert!(array.is_null(0));
+    }
+
+    /// Delta has no Int128/HUGEINT primitive, and decimal(38, 0) cannot represent
+    /// its full range. Keep Delta decimals as Decimal instead of using an
+    /// ambiguous encoding for Int128.
+    #[test]
+    fn hugeint_is_not_encoded_as_delta_decimal() {
+        assert!(matches!(
+            delta_type("total", &Type::Int128),
+            Err(Error::UnsupportedType { column, data_type })
+                if column == "total" && data_type == "Int128"
+        ));
+        let decimal = DeltaDataType::Primitive(PrimitiveType::decimal(38, 0).unwrap());
+        assert_eq!(
+            pivot_type("amount", &decimal).unwrap(),
+            Type::Decimal,
+            "a genuine Delta decimal must remain Decimal"
         );
     }
 }

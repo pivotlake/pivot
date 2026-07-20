@@ -33,6 +33,7 @@ use super::error::WriteResult;
 use super::shredding;
 use super::stats::column_min_max;
 use super::types::{ColumnChunkJob, PartitionTag, RowGroupHeader};
+use crate::{SortBounds, pivot_scalar, scalar_values_from_row};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ord::partition::partition;
 use arrow_ord::sort::{SortColumn, lexsort_to_indices};
@@ -40,7 +41,6 @@ use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use arrow_select::take::take_record_batch;
-use catalog::{SortBounds, pivot_scalar, scalar_values_from_row};
 use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, UnaryResult};
 
 /// Hashable identity plus the typed values recorded with an output file. Arrow's
@@ -49,7 +49,7 @@ use dispatch::{Consumer, Outputter, PipelineBreaker, Sender, UnaryFactory, Unary
 #[derive(Clone)]
 struct PartitionKey {
     row: Option<OwnedRow>,
-    values: Option<catalog::PartitionValues>,
+    values: Option<crate::PartitionValues>,
 }
 
 impl PartitionKey {
@@ -109,12 +109,12 @@ pub(super) fn factories(
     partition_by: Arc<[String]>,
     sort_by: Arc<[String]>,
     file_rows: usize,
-    target_rows: usize,
+    target_rows_per_group: usize,
     worker_count: usize,
 ) -> Vec<PartitionerFactory> {
     let builder = RowGroupBuilder {
         sort_by,
-        target_rows,
+        target_rows_per_group,
         worker_count,
         next_file_id: Arc::new(AtomicU64::new(0)),
         next_row_group_id: Arc::new(AtomicU64::new(0)),
@@ -287,7 +287,7 @@ impl Outputter<ColumnChunkJob> for TailOutputter {
 #[derive(Clone)]
 struct RowGroupBuilder {
     sort_by: Arc<[String]>,
-    target_rows: usize,
+    target_rows_per_group: usize,
     worker_count: usize,
     next_file_id: Arc<AtomicU64>,
     next_row_group_id: Arc<AtomicU64>,
@@ -317,14 +317,14 @@ impl RowGroupBuilder {
         // chunk to exactly the worker index its header carries. Spread files across
         // workers round-robin by id.
         let dest_worker = (file_id as usize) % self.worker_count;
-        let n_row_groups = rows.div_ceil(self.target_rows);
+        let n_row_groups = rows.div_ceil(self.target_rows_per_group);
         // The file's sort bounds span the whole file; each row group's own
         // sort stats are computed per slice below.
         let sort_bounds = self.file_sort_bounds(&batch, &schema)?;
 
         let mut offset = 0;
         while offset < rows {
-            let len = self.target_rows.min(rows - offset);
+            let len = self.target_rows_per_group.min(rows - offset);
             let slice = batch.slice(offset, len);
             offset += len;
             let tag = Arc::new(PartitionTag {
@@ -404,7 +404,7 @@ mod tests {
             file_rows: usize::MAX,
             builder: RowGroupBuilder {
                 sort_by: Arc::from([]),
-                target_rows: usize::MAX,
+                target_rows_per_group: usize::MAX,
                 worker_count: 1,
                 next_file_id: Arc::new(AtomicU64::new(0)),
                 next_row_group_id: Arc::new(AtomicU64::new(0)),

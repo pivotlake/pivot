@@ -1,31 +1,29 @@
 //! Background compaction of a table's small Parquet files.
 //!
-//! Frequent flushes keep ingest latency low but litter a table with small
-//! files, and scans pay per file. The [`Compacter`] merges them: whenever the
-//! table's files smaller than the target size add up to at least one
-//! target-sized output, it rewrites that batch as one file (with full-size row
-//! groups) and swaps it into the table in a single log commit.
+//! Frequent writes litter a table with small files, and scans pay per file. The
+//! [`Compacter`] merges them: whenever the table's files smaller than the target
+//! size add up to at least one target-sized output, it rewrites that batch as
+//! one file (with full-size row groups) and swaps it into the table in a single
+//! log commit.
 //!
 //! The compacter is **location-agnostic**: candidates come from the table's
-//! manifest (paths + sizes — no directory scanning), reads resolve through the
-//! catalog (a local path or a presigned URL alike), and writes/deletes go
-//! through the table's [`CatalogTable::write_data_file`] /
-//! [`CatalogTable::delete_data_file`]. A table under an `s3://` database root
-//! compacts through the exact same code path as a local one.
+//! manifest (paths + sizes — no directory scanning), and the merge (read,
+//! upload, swap) runs through [`CatalogTable::compact_files`]. A table under an
+//! `s3://` database root compacts through the exact same code path as a local
+//! one.
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
-//! decode the inputs' row groups and the write pipeline's encode stages
-//! consume those batches directly ([`parquet_writing::encode_record_batches`]) — the data
-//! never leaves the pool until finished files stream out. The compacter's own
-//! task only drives that dataflow (from a blocking thread) and does the
-//! log/store bookkeeping.
+//! decode the inputs' row groups, the encode stages repack them into full-size
+//! row groups, and the upload stage writes each merged file over the shared
+//! io_uring ring — the same operators an INSERT uses. The compacter's own task
+//! only drives that dataflow (from a blocking thread) and, once the uploads
+//! land, commits the swap.
 //!
 //! Crash safety comes from the table log, not from ordering tricks: a file is
-//! part of the table iff the current log version lists it. The commit order is
-//! write the merged file(s) → commit the swap ([`replace_data_files`]) →
-//! delete the inputs; a crash anywhere in between leaves only *orphan* objects
-//! (an unlogged merged file, or already-swapped-out inputs), never a double
-//! read.
+//! part of the table iff the current log version lists it. The merged files are
+//! uploaded, then swapped in for the inputs in one Delta commit (labelled a
+//! rearrangement, not a data change); a crash before the commit leaves only
+//! *orphan* objects (unlogged merged files), never a double read.
 //!
 //! The compacter is **deployment-agnostic** for the same reason: it talks to
 //! nothing but the catalog (and through it, the table log and store), so it
@@ -33,38 +31,21 @@
 //! root. It covers every table of the catalog it is handed and polls — each
 //! round reloads a table to its latest log version before scanning — rather
 //! than being woken by a writer; it only ever reads the table log.
-//!
-//! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use catalog::parquet::table_input;
 use catalog::store::ObjectPath;
-use catalog::{CatalogTable, FileRef, ManifestEntry, ParquetCatalog, scalar_values_equal};
-use dispatch::{DataFlowDispatcher, DataFlowError, Projection};
+use catalog::{CatalogTable, FileRef, ParquetCatalog, scalar_values_equal};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
-
-use crate::parquet_writing;
 
 /// Rows per row group in a merged file.
 const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// Row groups per merged file, so a merge emits full-size row groups.
 const ROW_GROUPS_PER_FILE: usize = 8;
-
-/// Why one compaction merge failed: either the scan→encode dataflow, or a
-/// catalog write/swap/delete. Both already carry typed causes.
-#[derive(Debug, thiserror::Error)]
-enum CompactError {
-    #[error("compaction scan/encode: {0}")]
-    Encode(#[from] DataFlowError),
-    #[error(transparent)]
-    Catalog(#[from] catalog::Error),
-}
 
 /// Default compaction target: files smaller than this are merge candidates,
 /// and a merge runs once their combined size reaches it.
@@ -98,9 +79,6 @@ pub struct Compacter {
     /// How often to re-check the tables' logs for newly-accumulated files.
     poll_interval: Duration,
     catalog: Arc<ParquetCatalog>,
-    /// Monotonic sequence for merged-file names, so concurrent merges under one
-    /// table never collide.
-    seq: AtomicU64,
     /// Cumulative work counters, for the introspection API.
     stats: CompactStats,
 }
@@ -159,7 +137,6 @@ impl Compacter {
             min_files: min_files.max(2),
             poll_interval,
             catalog,
-            seq: AtomicU64::new(0),
             stats: CompactStats::default(),
         }
     }
@@ -228,14 +205,18 @@ impl Compacter {
         while let Some(inputs) = self.next_batch(&table) {
             let input_count = inputs.len() as u64;
             let job = CompactJob {
-                dispatcher: self.catalog.dispatcher().clone(),
                 table: table.clone(),
-                seq: self.seq.fetch_add(1, Ordering::Relaxed),
             };
             match tokio::task::spawn_blocking(move || job.compact(inputs)).await {
-                Ok(Ok(merged)) => {
-                    // `merged` is empty when another writer won the swap (no real
-                    // work happened); only count an actual merge.
+                Ok(Ok((committed, merged))) => {
+                    // Continue from the copy that performed the swap: it
+                    // already holds the committed version, and it is the only
+                    // copy carrying the merged files' sort bounds (the Delta
+                    // log does not persist them). Publish it so the next
+                    // query's snapshot reads the merged file instead of the
+                    // swapped-out inputs.
+                    table = committed;
+                    // A non-empty output is an actual merge worth recording.
                     if !merged.is_empty() {
                         self.record_merge(table.name(), input_count, &merged);
                     }
@@ -244,13 +225,6 @@ impl Compacter {
                         files = merged.len(),
                         "compacted batch"
                     );
-                    // Pull in the swap we just committed before scanning again,
-                    // and publish it so the next query's snapshot reads the
-                    // merged file instead of the swapped-out inputs.
-                    if let Err(e) = table.refresh() {
-                        warn!(table = table.name(), error = %e, "compaction: refresh after merge failed");
-                        return;
-                    }
                     self.catalog.publish_table(table.clone());
                 }
                 Ok(Err(e)) => {
@@ -262,12 +236,6 @@ impl Compacter {
                     return;
                 }
             }
-        }
-        // Reclaim the manifest versions left behind by this round's swaps (and
-        // by any appends since the last sweep). Best-effort: a failure here just
-        // leaves the old version files for the next round.
-        if let Err(e) = table.prune_old_versions() {
-            warn!(table = table.name(), error = %e, "compaction: pruning old manifest versions failed");
         }
     }
 
@@ -345,86 +313,25 @@ fn partition_values_equal(
 /// One merge, run on a blocking thread (it drives a dataflow, which blocks the
 /// driving thread while the work itself runs on the dispatch workers).
 struct CompactJob {
-    dispatcher: DataFlowDispatcher,
     table: CatalogTable,
-    seq: u64,
 }
 
 impl CompactJob {
-    /// Decode `inputs` and re-encode them as one stream of target-sized row
-    /// groups — a single scan→encode dataflow — then commit: write the merged
-    /// file(s), swap them for the inputs in one manifest version, delete the
-    /// inputs. Returns the merged files written.
-    fn compact(self, inputs: Vec<FileRef>) -> Result<Vec<FileRef>, CompactError> {
-        // Scan just the input files and re-encode their rows into target-sized
-        // merged files — one scan→encode dataflow on the worker pool. The inputs
-        // share one partition (see `next_batch`), so re-applying the table's
-        // partition/sort spec reproduces that partition tuple and recomputes the
-        // merged file's sort bounds.
-        let parquet = self.table.parquet_table_for(&inputs);
-        let columns = parquet.schema().fields().len();
-        let scan = table_input(&self.dispatcher, &parquet, Projection::all(columns), false);
-        let merged = parquet_writing::encode_record_batches(
-            scan,
-            Arc::from(self.table.partition_by()),
-            Arc::from(self.table.sort_by()),
-            ROW_GROUP_ROWS,
-            ROW_GROUPS_PER_FILE,
-        );
-
-        // Write each merged file into the table's data location as it streams out
-        // — so we never hold them all in memory at once — keeping the partition
-        // tuple and sort bounds the pipeline recorded for it. Only the lightweight
-        // manifest entries are gathered, for the one atomic swap below.
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut added = Vec::new();
-        for (i, encoded) in merged.enumerate() {
-            let encoded = encoded?;
-            let name = format!("compacted-{millis}-{:06}-{i}.parquet", self.seq);
-            let file = self
-                .table
-                .write_data_file(ObjectPath::new(name), &encoded.bytes)?;
-            added.push(ManifestEntry {
-                file,
-                partition: encoded.partition,
-                sort_bounds: encoded.sort_bounds,
-            });
-        }
-
-        // Commit the swap (one manifest version: inputs out, merged in), then
-        // delete the now-orphaned inputs. The order is crash-safe: a file is part
-        // of the table iff the committed manifest lists it, so a crash before the
-        // deletes leaves only orphan objects, never a double read.
-        let removed: Vec<ObjectPath> = inputs.iter().map(|f| f.path.clone()).collect();
-        let mut table = self.table;
-        let committed = table.replace_data_files(&removed, &added)?;
-        if !committed {
-            // Another writer (a second compacter over the same root) already
-            // swapped these inputs out. Our merged output was never committed —
-            // delete it so it doesn't linger as an orphan, and leave the inputs
-            // alone: they belong to the swap that won.
-            warn!(
-                table = table.name(),
-                "compaction: inputs already swapped by another writer; discarding merge"
-            );
-            for entry in &added {
-                if let Err(e) = table.delete_data_file(&entry.file.path) {
-                    warn!(error = %e, file = %entry.file.path, "compaction: deleting discarded merge output failed (orphan left)");
-                }
-            }
-            return Ok(Vec::new());
-        }
-        // Don't delete the swapped-out inputs now: a query that loaded the prior
-        // manifest version is still reading them (that's the `404 expected 206`
-        // a reader hits when compaction deletes under it). Record them instead —
-        // they're deleted when this version is pruned, by which point the
-        // retention tail guarantees no reader still references them.
-        if let Err(e) = table.record_deletions(&removed) {
-            warn!(error = %e, "compaction: recording deferred deletions failed (inputs will linger as orphans)");
-        }
-        Ok(added.into_iter().map(|entry| entry.file).collect())
+    /// Merge `inputs` into target-sized files and swap them into the table in one
+    /// log commit ([`CatalogTable::compact_files`]). Returns the table copy that
+    /// holds the committed version alongside the merged files written.
+    ///
+    /// The swapped-out inputs are not deleted here: a query that loaded the prior
+    /// version is still reading them, and the swap's Delta Remove actions are
+    /// their durable tombstones. The objects stay in place until the table grows
+    /// VACUUM-style physical cleanup.
+    fn compact(
+        mut self,
+        inputs: Vec<FileRef>,
+    ) -> Result<(CatalogTable, Vec<FileRef>), catalog::Error> {
+        let merged = self
+            .table
+            .compact_files(&inputs, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE)?;
+        Ok((self.table, merged))
     }
 }

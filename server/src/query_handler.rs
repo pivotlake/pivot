@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
+use arrow_array::{Array, Int64Array, RecordBatch};
 use async_trait::async_trait;
 use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
 use futures::{Sink, SinkExt, stream};
@@ -160,11 +161,19 @@ pub(crate) async fn execute_sql(
         Ok(batches)
     }
     .await;
-    match &result {
-        Ok(_) => catalog.commit_transaction(transaction),
-        Err(_) => catalog.rollback_transaction(transaction),
+    match result {
+        Ok(batches) => {
+            tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            Ok(batches)
+        }
+        Err(error) => {
+            catalog.rollback_transaction(transaction);
+            Err(error)
+        }
     }
-    result
 }
 
 #[derive(Debug, Error)]
@@ -175,10 +184,16 @@ enum Error {
     Compile(#[from] planner::compile::Error),
     #[error(transparent)]
     DataFlow(#[from] dispatch::DataFlowError),
+    #[error(transparent)]
+    Catalog(#[from] planner::catalog::Error),
     #[error("waiter thread panicked: {0}")]
     WorkerPanic(JoinError),
     #[error("waiter thread panicked: {0}")]
     PlannerPanic(JoinError),
+    #[error("transaction commit thread panicked: {0}")]
+    CommitPanic(JoinError),
+    #[error("invalid INSERT row-count result: {0}")]
+    InvalidInsertResult(String),
 }
 
 impl Error {
@@ -197,6 +212,78 @@ impl Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Output converted before it leaves the dispatch worker. Query
+/// batches become pgwire rows; INSERT's internal one-row result becomes an
+/// owned count that the coordinator turns into an `INSERT 0 n` command tag.
+enum WorkerOutput {
+    QueryRows(PGRowBatch),
+    AffectedRows(std::result::Result<usize, String>),
+}
+
+fn build_worker_output(batch: RecordBatch, is_insert: bool) -> WorkerOutput {
+    if !is_insert {
+        return WorkerOutput::QueryRows(PGRowBatch::from(batch));
+    }
+    let count = (|| {
+        if batch.num_rows() != 1 || batch.num_columns() != 1 {
+            return Err(format!(
+                "expected one row and one column, got {} rows and {} columns",
+                batch.num_rows(),
+                batch.num_columns()
+            ));
+        }
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| format!("expected Int64, got {}", batch.column(0).data_type()))?;
+        if counts.is_null(0) {
+            return Err("count is null".to_string());
+        }
+        usize::try_from(counts.value(0)).map_err(|_| "count is negative or too large".to_string())
+    })();
+    WorkerOutput::AffectedRows(count)
+}
+
+fn build_pgwire_response(outputs: Vec<WorkerOutput>, is_insert: bool) -> Result<Response> {
+    if is_insert {
+        if outputs.len() != 1 {
+            return Err(Error::InvalidInsertResult(format!(
+                "expected one affected-row output, got {}",
+                outputs.len()
+            )));
+        }
+        let count = match outputs.into_iter().next().unwrap() {
+            WorkerOutput::AffectedRows(count) => count.map_err(Error::InvalidInsertResult)?,
+            WorkerOutput::QueryRows(_) => {
+                return Err(Error::InvalidInsertResult(
+                    "received a query batch".to_string(),
+                ));
+            }
+        };
+        return Ok(Response::Execution(
+            Tag::new("INSERT").with_oid(0).with_rows(count),
+        ));
+    }
+
+    let batches = outputs
+        .into_iter()
+        .map(|output| match output {
+            WorkerOutput::QueryRows(batch) => Ok(batch),
+            WorkerOutput::AffectedRows(_) => Err(Error::InvalidInsertResult(
+                "received an INSERT count for a query".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let fields = batches
+        .first()
+        .map_or(Arc::new(vec![]), |batch| batch.fields.clone());
+    Ok(Response::Query(QueryResponse::new(
+        fields,
+        stream::iter(batches.into_iter().flat_map(|batch| batch.rows).map(Ok)),
+    )))
+}
 
 /// If `do_query` is dropped (cancel request, client disconnect)
 /// before the dataflow finishes, this guard fires `handle.cancel()` so the
@@ -321,11 +408,12 @@ impl PivotQueryHandler {
                     value: set.value.clone(),
                 });
             }
+            let is_insert = matches!(&plan.root.operator, planner::Operator::Insert(_));
 
             // When the session ran `SET perf = 1`, start a `perf record` scoped to the
             // worker threads and mark this query's dataflows profiled. Marking them
             // makes the workers run *only* this dataflow for its duration (other
-            // queries / ingest on the pool pause), so the capture is just this
+            // queries on the pool pause), so the capture is just this
             // dataflow, and exclusive mode lifts as the dataflows finish. `start`
             // runs on a blocking thread (it sleeps waiting for perf to attach); the
             // guard is stopped off the reactor after drain (its `child.wait()` blocks
@@ -355,13 +443,13 @@ impl PivotQueryHandler {
             let started = Instant::now();
             let compile_transaction = transaction.clone();
             let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-                let rows = plan
+                let outputs = plan
                     .compile(&dispatcher, compile_transaction.as_ref())?
-                    .map(|| |b| PGRowBatch::from(b));
+                    .map(move || move |batch| build_worker_output(batch, is_insert));
                 Ok(if collect_stats {
-                    rows.execute_with_stats()
+                    outputs.execute_with_stats()
                 } else {
-                    rows.execute()
+                    outputs.execute()
                 })
             })
             .await
@@ -373,7 +461,7 @@ impl PivotQueryHandler {
             // raw disconnects (whole connection task dropped).
             let guard = CancelOnDrop::new(handle.cancel_token());
             let started = Instant::now();
-            let (batches, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
+            let (outputs, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
                 .await
                 .map_err(Error::WorkerPanic)??;
             let exec_time = started.elapsed();
@@ -387,14 +475,8 @@ impl PivotQueryHandler {
                 let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
             }
 
-            let fields = batches
-                .first()
-                .map_or(Arc::new(vec![]), |b| b.fields.clone());
-            let response = Response::Query(QueryResponse::new(
-                fields,
-                stream::iter(batches.into_iter().flat_map(|b| b.rows).map(Ok)),
-            ));
-            Ok(Outcome::Query(
+            let response = build_pgwire_response(outputs, is_insert)?;
+            Ok(Outcome::Response(
                 response,
                 QueryStats {
                     plan: plan_time,
@@ -405,18 +487,26 @@ impl PivotQueryHandler {
             ))
         }
         .await;
-        match &result {
-            Ok(_) => self.catalog.commit_transaction(transaction),
-            Err(_) => self.catalog.rollback_transaction(transaction),
+        match result {
+            Ok(outcome) => {
+                let catalog = self.catalog.clone();
+                tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
+                    .await
+                    .map_err(Error::CommitPanic)??;
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.catalog.rollback_transaction(transaction);
+                Err(error)
+            }
         }
-        result
     }
 }
 
 /// What [`run_query`](PivotQueryHandler::run_query) resolved a statement to.
 enum Outcome {
-    /// A normal query: its rows plus where its time went.
-    Query(Response, QueryStats),
+    /// A completed statement response plus where its time went.
+    Response(Response, QueryStats),
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
     /// for `RESET`; the server decides which names actually mean anything.
     Set { name: String, value: Option<String> },
@@ -435,21 +525,24 @@ impl QueryStats {
     fn summary(&self) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
-        // The IO/cpu figures are sums (over workers and in-flight reads), so
-        // `time/reads` is the average read latency and the totals can top exec.
+        // The IO/cpu figures are sums over workers and in-flight operations, so
+        // the totals can top exec time.
         format!(
             "stats: plan={:.1}ms compile={:.1}ms exec={:.1}ms | \
-             disk={} reads/{:.1}MiB/{:.1}ms  http={} reads/{:.1}MiB/{:.1}ms  \
-             http-disk-cache={} reads/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
+             disk={} ops/{:.1}MiB/read={:.1}ms/write={:.1}ms  \
+             http={} ops/{:.1}MiB/get={:.1}ms/upload={:.1}ms  \
+             http-disk-cache={} ops/{:.1}MiB/{:.1}ms  cpu={:.1}ms",
             ms(self.plan),
             ms(self.compile),
             ms(self.exec),
             self.flow.disk_requests,
             mib(self.flow.disk_bytes),
-            ms(self.flow.disk_time),
+            ms(self.flow.disk_read_time),
+            ms(self.flow.disk_write_time),
             self.flow.http_requests,
             mib(self.flow.http_bytes),
-            ms(self.flow.http_time),
+            ms(self.flow.http_get_time),
+            ms(self.flow.http_upload_time),
             self.flow.disk_cache_requests,
             mib(self.flow.disk_cache_bytes),
             ms(self.flow.disk_cache_time),
@@ -532,7 +625,7 @@ impl SimpleQueryHandler for PivotQueryHandler {
 
         let res = match outcome {
             Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
-            Outcome::Query(res, stats) => {
+            Outcome::Response(res, stats) => {
                 // Send the breakdown as an INFO notice before the rows.
                 if with_stats {
                     let notice = NoticeResponse::from(ErrorInfo::new(

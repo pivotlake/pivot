@@ -359,15 +359,17 @@ fn remote_scan_reports_io_and_cpu_stats() {
         "and those reads moved bytes over the wire"
     );
     assert!(
-        stats.http_time > Duration::ZERO,
+        stats.http_get_time > Duration::ZERO,
         "and those reads took time"
     );
+    assert_eq!(stats.http_upload_time, Duration::ZERO);
     assert_eq!(stats.disk_requests, 0, "a remote scan reads no local files");
     assert_eq!(stats.disk_bytes, 0, "and so reads no bytes off disk");
     assert_eq!(
-        stats.disk_time,
+        stats.disk_read_time,
         Duration::ZERO,
         "and so spends no disk-read time"
     );
+    assert_eq!(stats.disk_write_time, Duration::ZERO);
     assert!(stats.cpu > Duration::ZERO, "the scan spent cpu decoding");
 }

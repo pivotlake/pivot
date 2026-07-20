@@ -34,7 +34,7 @@ impl RecordingTable {
 }
 
 impl Table for RecordingTable {
-    fn compile(
+    fn compile_scan(
         &self,
         _dispatcher: &DataFlowDispatcher,
         _projection: Projection,

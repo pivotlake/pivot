@@ -10,9 +10,9 @@
 
 use std::sync::Arc;
 
+use crate::SortBounds;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
-use catalog::SortBounds;
 use dispatch::{Identifier, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
 
@@ -35,7 +35,7 @@ pub(crate) struct PartitionTag {
     pub(crate) file_id: FileId,
     /// Total row groups in this file, so the assembler knows when it's complete.
     pub(crate) n_row_groups: usize,
-    pub(crate) partition: Option<catalog::PartitionValues>,
+    pub(crate) partition: Option<crate::PartitionValues>,
     /// The file's sort-key bounds (min/max per sort column over the whole file),
     /// recorded in the manifest. `None` when the table has no sort key. The
     /// per-row-group, per-column statistics the footer carries are a separate
@@ -46,10 +46,14 @@ pub(crate) struct PartitionTag {
 /// A finished Parquet file from the write pipeline, with the manifest metadata to
 /// record for it (`partition`/`sort_bounds` are `None` for an unpartitioned,
 /// unsorted write).
-pub(crate) struct EncodedFile {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) partition: Option<catalog::PartitionValues>,
-    pub(crate) sort_bounds: Option<SortBounds>,
+pub struct EncodedFile {
+    pub bytes: Vec<u8>,
+    /// The footer metadata written into `bytes`. Kept so a consumer that records
+    /// the file's row groups can build them straight from here instead of parsing
+    /// the footer back out of a file it just produced.
+    pub metadata: thriftparquet::footer::FileMetaData,
+    pub partition: Option<crate::PartitionValues>,
+    pub sort_bounds: Option<SortBounds>,
 }
 
 /// The per-row-group metadata every column chunk of a row group shares: its

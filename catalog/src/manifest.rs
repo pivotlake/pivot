@@ -8,8 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar, StringArray, StringViewArray};
+use arrow_array::{
+    Array, ArrayRef, Datum, RecordBatch, Scalar, StringArray, StringViewArray, UInt32Array,
+};
 use arrow_schema::{ArrowError, DataType};
+use arrow_select::take::take;
 
 use crate::FileRef;
 use crate::store::{ObjectPath, ObjectStore};
@@ -86,6 +89,10 @@ pub(crate) fn scalar_equal(left: &Scalar<ArrayRef>, right: &Scalar<ArrayRef>) ->
 }
 
 pub fn pivot_scalar(array: &ArrayRef, row: usize) -> Scalar<ArrayRef> {
+    // The scalar must own its memory outright: `array` may be a zero-copy view
+    // into a dispatch worker's read buffer, while the scalar lands in manifest
+    // entries that outlive the scan and drop on non-worker threads. A plain
+    // slice would keep (and later mis-drop) the worker buffer.
     let value: ArrayRef = match array.data_type() {
         DataType::Utf8 => {
             let strings = array
@@ -96,7 +103,18 @@ pub fn pivot_scalar(array: &ArrayRef, row: usize) -> Scalar<ArrayRef> {
                 (!strings.is_null(row)).then(|| strings.value(row)),
             ]))
         }
-        _ => array.slice(row, 1),
+        // `slice` would keep referencing the scan-backed string buffers. Here
+        // `gc` copies the selected value into new buffers, detaching the scalar
+        // from the dispatch worker's memory before it enters the manifest.
+        DataType::Utf8View => {
+            let strings = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("Utf8View array has StringViewArray representation");
+            Arc::new(strings.slice(row, 1).gc())
+        }
+        _ => take(array, &UInt32Array::from(vec![row as u32]), None)
+            .expect("one-row take supports every physical column type"),
     };
     Scalar::new(value)
 }
@@ -116,8 +134,8 @@ pub struct SortBounds {
 }
 
 /// One file in a table manifest: its store identity ([`FileRef`]) plus the
-/// optional partition tuple and sort-key bounds the partitioning/sorting ingest
-/// sink stamps on it. Both are `None` for files written without that metadata
+/// optional partition tuple and sort-key bounds a partitioned/sorted INSERT
+/// stamps on it. Both are `None` for files written without that metadata
 /// (an unpartitioned/unsorted table, or compaction output today).
 #[derive(Clone)]
 pub struct ManifestEntry {

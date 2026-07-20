@@ -147,6 +147,16 @@ pub mod ffi {
         fn lo_projection_expr_count(op: &LogicalOperator) -> usize;
         fn lo_projection_expr(op: &LogicalOperator, index: usize) -> &Expression;
 
+        // ---- ExpressionGet (VALUES) ----
+        fn lo_values_row_count(op: &LogicalOperator) -> usize;
+        fn lo_values_column_count(op: &LogicalOperator) -> usize;
+        fn lo_values_expr(op: &LogicalOperator, row: usize, column: usize) -> &Expression;
+
+        // ---- Insert ----
+        fn lo_insert_take_table(op: &LogicalOperator) -> Box<OptionalTableWrapper>;
+        fn lo_insert_column_map_count(op: &LogicalOperator) -> usize;
+        fn lo_insert_returns_rows(op: &LogicalOperator) -> bool;
+
         // ---- Filter ----
         fn lo_filter_expr_count(op: &LogicalOperator) -> usize;
         fn lo_filter_expr(op: &LogicalOperator, index: usize) -> &Expression;

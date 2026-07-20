@@ -1,26 +1,26 @@
 //! End-to-end tests for writing JSON as a shredded variant column: drive the
-//! whole pipeline the ingest sink drives ([`encode_items`]) and read the finished
-//! files back with arrow-rs's strict reader — the oracle for "another engine can
+//! whole write pipeline ([`encode_record_batches`]) and read the finished files
+//! back with arrow-rs's strict reader — the oracle for "another engine can
 //! read this".
 //!
-//! The two paths that write variants both come through here. Ingest hands the
-//! pipeline unshredded documents ([`JsonItem`]); compaction hands it batches read
-//! back out of files that each shredded differently ([`ShreddedItem`]). The
-//! pipeline is the same either way, which is the point of normalizing on the way
-//! in.
+//! The two batch shapes that write variants both come through here: unshredded
+//! documents ([`JsonItem`]), and batches read back out of files that each
+//! shredded differently ([`ShreddedItem`], as compaction feeds the pipeline).
+//! The pipeline is the same either way, which is the point of normalizing on the
+//! way in.
 
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{ArrowError, Schema};
-use dispatch::{BUFFER_SIZE, Dispatch};
+use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet_variant_compute::{
     ShreddedSchemaBuilder, VariantArray, json_to_variant, shred_variant, unshred_variant,
 };
 use parquet_variant_json::VariantToJson;
 
-use super::{EncodedFile, ToRecordBatch, encode_items};
+use super::{EncodedFile, encode_record_batches};
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
 const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
@@ -28,17 +28,18 @@ const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
 /// The column name every test writes its documents under.
 const COLUMN: &str = "attrs";
 
-/// One flush's worth of JSON documents, converted to an unshredded variant
+/// A batch of input rows for the pipeline, one per test shape below.
+trait IntoBatch {
+    fn into_batch(self) -> Result<RecordBatch, ArrowError>;
+}
+
+/// One batch's worth of JSON documents, converted to an unshredded variant
 /// column — what a producer feeding JSON into the pipeline looks like.
 struct JsonItem(Vec<String>);
 
-impl ToRecordBatch for JsonItem {
-    fn num_rows(&self) -> usize {
-        self.0.len()
-    }
-
-    fn to_record_batch(self) -> Result<Option<RecordBatch>, ArrowError> {
-        Ok(Some(variant_batch(&self.0, None)?))
+impl IntoBatch for JsonItem {
+    fn into_batch(self) -> Result<RecordBatch, ArrowError> {
+        variant_batch(&self.0, None)
     }
 }
 
@@ -49,13 +50,9 @@ struct ShreddedItem {
     paths: Vec<&'static str>,
 }
 
-impl ToRecordBatch for ShreddedItem {
-    fn num_rows(&self) -> usize {
-        self.rows.len()
-    }
-
-    fn to_record_batch(self) -> Result<Option<RecordBatch>, ArrowError> {
-        Ok(Some(variant_batch(&self.rows, Some(&self.paths))?))
+impl IntoBatch for ShreddedItem {
+    fn into_batch(self) -> Result<RecordBatch, ArrowError> {
+        variant_batch(&self.rows, Some(&self.paths))
     }
 }
 
@@ -77,18 +74,17 @@ fn variant_batch(rows: &[String], paths: Option<&[&str]>) -> Result<RecordBatch,
 /// Run the write pipeline over `items` (one unpartitioned, unsorted file stream)
 /// and return the finished files' bytes. `rows_per_file` caps a file's rows, so a
 /// test can force more than one file.
-fn write<T: ToRecordBatch>(items: Vec<T>, rows_per_file: usize) -> Vec<Vec<u8>> {
+fn write<T: IntoBatch>(items: Vec<T>, rows_per_file: usize) -> Vec<Vec<u8>> {
     let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
-    let files: Vec<EncodedFile> = encode_items(
-        dispatch.dispatcher(),
-        items,
-        Arc::from([]),
-        Arc::from([]),
-        rows_per_file,
-        1,
-    )
-    .collect()
-    .unwrap();
+    let batches: Vec<RecordBatch> = items
+        .into_iter()
+        .map(|item| item.into_batch().unwrap())
+        .collect();
+    let spec = values_input(dispatch.dispatcher(), batches).record_batches();
+    let files: Vec<EncodedFile> =
+        encode_record_batches(spec, Arc::from([]), Arc::from([]), rows_per_file, 1)
+            .collect()
+            .unwrap();
     dispatch.exit();
     files.into_iter().map(|f| f.bytes).collect()
 }
