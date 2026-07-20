@@ -172,8 +172,8 @@ impl Server {
         // table to its latest committed Delta version and fetch any new
         // files' footers. Queries bind against a snapshot of the in-memory set
         // and never read the store themselves, so this sweep is what makes
-        // externally committed data (another process's ingest, a bucket
-        // writer) visible. The catalog was fully loaded at open, so the
+        // externally committed data (another process, a bucket writer)
+        // visible. The catalog was fully loaded at open, so the
         // immediate first tick is skipped.
         let refresh_task = {
             let catalog = self.catalog.clone();

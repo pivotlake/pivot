@@ -16,7 +16,7 @@
 //! [`source`](GcsStore::source)), so a worker only ever *reads* a current token.
 //! RS256 signing uses `ring`; everything is synchronous, no async runtime.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use base64::Engine;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -357,7 +357,7 @@ impl ObjectStore for GcsStore {
         self.list_impl(prefix, Some(start))
     }
 
-    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
+    fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
         // The same media URL the JSON API serves for `get`, but range-read
         // straight off the ring. Unlike a presigned URL it's stable (no embedded
         // signature to expire) — auth rides in a per-request `Authorization`
@@ -373,16 +373,41 @@ impl ObjectStore for GcsStore {
 
         // An emulator ignores `Authorization`, so its reads need no header.
         if self.auth.emulated {
-            return Ok(DataFileSource::Remote { url, auth: None });
+            return Ok(DataFileLocation::Remote { url, auth: None });
         }
         // Prime the token here on the control thread (a blocking mint is fine off
         // the ring) so the query's worker reads find a fresh one and never mint.
         self.auth.header()?;
         let auth = self.auth.clone();
-        Ok(DataFileSource::Remote {
+        Ok(DataFileLocation::Remote {
             url,
             auth: Some(Arc::new(move || auth.current())),
         })
+    }
+
+    fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation> {
+        let url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}",
+            self.endpoint,
+            self.bucket,
+            self.object_path(key)
+        );
+        let url = url::Url::parse(&url)
+            .map_err(|e| StoreError::Config(format!("building gcs upload url: {e}")))?;
+        if self.auth.emulated {
+            return Ok(DataFileLocation::Remote { url, auth: None });
+        }
+        self.auth.header()?;
+        let auth = self.auth.clone();
+        Ok(DataFileLocation::Remote {
+            url,
+            auth: Some(Arc::new(move || auth.current())),
+        })
+    }
+
+    fn prepare_write(&self) -> Result<()> {
+        self.auth.header()?;
+        Ok(())
     }
 }
 

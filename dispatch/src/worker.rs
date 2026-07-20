@@ -746,8 +746,8 @@ impl Worker {
         Ok(())
     }
 
-    /// Submit HTTP reads from dataflows onto the same ring until this worker has
-    /// `HTTP_INFLIGHT_TARGET` reads in flight or no more requests remain. Gated
+    /// Submit HTTP operations from dataflows onto the same ring until this worker
+    /// has `HTTP_INFLIGHT_TARGET` requests in flight or none remain. Gated
     /// on HTTP activity only (not disk) so the two queues fill independently.
     ///
     /// Remote objects sit behind ~tens-of-ms RTTs, so a deep read-ahead is what
@@ -771,11 +771,11 @@ impl Worker {
             while let Some(mut requests) = flow.get_next_http_request() {
                 flow.stats().stamp_issued(&mut requests);
                 for r in requests {
-                    // Submitting a remote read can fail (socket exhaustion, TLS
-                    // setup). Fail just this dataflow rather than propagating, which
-                    // would panic the worker and take the whole server down. The
-                    // disk cache resolves how each read splits across tiers, so the
-                    // per-tier counts come from what it returns.
+                    // Submitting an HTTP operation can fail (socket exhaustion,
+                    // TLS setup). Fail just this dataflow rather than propagating,
+                    // which would panic the worker and take the whole server down.
+                    // Every operation reports how to charge its transport stats:
+                    // GETs can split across cache tiers; uploads are all HTTP.
                     match self.io.request_http(r) {
                         Ok(split) => flow.stats().record_issued_remote(split),
                         Err(e) => {
@@ -819,16 +819,28 @@ impl Worker {
                 // flight, and their completions land here afterwards. The block
                 // was already committed in the requester, so a missing dataflow
                 // just means drop the completion (the slot pin releases with it).
-                Ok(Completion::Fs(r)) => {
+                Ok(Completion::FsRead(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_disk_time(r.submitted_at);
-                        data_flow.process_fs(r.operator_idx, r.request);
+                        data_flow.stats().record_disk_read_time(r.submitted_at);
+                        data_flow.process_fs_read(r.operator_idx, r.request);
                     }
                 }
-                Ok(Completion::Http(r, time)) => {
+                Ok(Completion::FsWrite(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_remote_time(time);
-                        data_flow.process_http(r.operator_idx, r.request);
+                        data_flow.stats().record_disk_write_time(r.submitted_at);
+                        data_flow.process_fs_write(r.operator_idx, r.request);
+                    }
+                }
+                Ok(Completion::HttpGet(r, time)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.stats().record_http_get_time(time);
+                        data_flow.process_http_get_response(r.operator_idx, r.request);
+                    }
+                }
+                Ok(Completion::HttpUpload(r)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.stats().record_http_upload_time(r.submitted_at);
+                        data_flow.process_http_upload_response(r.operator_idx, r.request);
                     }
                 }
                 Err(failed) => {

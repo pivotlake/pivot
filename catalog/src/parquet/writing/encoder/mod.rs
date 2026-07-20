@@ -64,7 +64,7 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
 
 /// Encode one column's values for a row group: flatten it into leaves and encode
 /// each, in the depth-first order Parquet numbers them.
-pub(in crate::parquet_writing) fn encode_column_chunk(
+pub(in crate::parquet::writing) fn encode_column_chunk(
     field: &Field,
     values: &ArrayRef,
 ) -> WriteResult<Vec<EncodedLeaf>> {
@@ -76,7 +76,7 @@ pub(in crate::parquet_writing) fn encode_column_chunk(
 
 /// Encode one leaf, preferring a dictionary and falling back to PLAIN.
 fn encode_leaf(leaf: Leaf) -> WriteResult<EncodedLeaf> {
-    let physical_type = catalog::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
+    let physical_type = crate::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
     let statistics = leaf_statistics(&leaf);
     let (dictionary_page, data_pages) = match dictionary::try_encode(&leaf)? {
         Some((dictionary_page, index_page)) => (Some(dictionary_page), vec![index_page]),

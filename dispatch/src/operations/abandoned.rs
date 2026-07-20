@@ -1,7 +1,7 @@
 //! An inert operator used to retire a node in place.
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpUploadRequest};
 use crate::operations::{FinishStatus, Operator, Result};
 
 /// A do-nothing operator that a node's real operator is replaced with when it is
@@ -25,11 +25,19 @@ impl Operator for AbandonedOperator {
         Ok(vec![])
     }
 
-    fn process_fs_response(&mut self, _request: FsRequest) -> Result<()> {
+    fn process_fs_read_response(&mut self, _request: FsReadRequest) -> Result<()> {
         Ok(())
     }
 
-    fn process_http_response(&mut self, _request: HttpRequest) -> Result<()> {
+    fn process_fs_write_response(&mut self, _request: FsWriteRequest) -> Result<()> {
+        Ok(())
+    }
+
+    fn process_http_get_response(&mut self, _request: HttpGetRequest) -> Result<()> {
+        Ok(())
+    }
+
+    fn process_http_upload_response(&mut self, _request: HttpUploadRequest) -> Result<()> {
         Ok(())
     }
 

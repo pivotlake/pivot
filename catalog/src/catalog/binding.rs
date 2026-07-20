@@ -20,9 +20,10 @@ use planner::catalog::{
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
 
 use super::ParquetTransaction;
+use super::insert_sink::build_insert_spec;
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
-/// DuckDB during binding. Recorded as-is; applied at [`compile`](Table::compile)
+/// DuckDB during binding. Recorded as-is; applied at [`compile_scan`](Table::compile_scan)
 /// time after the row-group metadata exists — min/max stats prune row groups,
 /// and equality additionally prunes by dictionary contents in the decoder. The
 /// upstream `Filter` always runs, so this is a pure optimization.
@@ -79,17 +80,17 @@ fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPa
     }
 }
 
-/// A catalog table resolved by name from one transaction: it carries the
-/// table's name, schema, and this query's pushed-down predicates, but no
-/// catalog state. The file set is read from the transaction handed to the
-/// compile-time methods, so the binding is a plain value and the transaction
-/// stays the single owner of the frozen view. Cloned per-binding so each query
-/// accumulates its own predicates.
+/// A catalog table resolved from one transaction: it carries the table's durable
+/// id, schema, and this query's pushed-down predicates, but no catalog state. The
+/// file set is read from the transaction handed to the compile-time methods, so
+/// the binding is a plain value and the transaction stays the single owner of the
+/// frozen view. Cloned per-binding so each query accumulates its own predicates.
 #[derive(Clone, Debug)]
 pub struct TableBinding {
-    /// The catalog name resolved, used to fetch this table's row groups from
-    /// the transaction's snapshot at compile time.
-    name: String,
+    /// The table's durable id, resolved once at binding time. Reads pin their
+    /// view by the frozen snapshot regardless, but a write resolves the live
+    /// table by this id at commit, so it survives a concurrent rename.
+    id: uuid::Uuid,
     pub columns: Vec<Column>,
     /// Single-column predicates pushed down for this binding (recorded here
     /// because the `Table` trait gives no channel from `pushdown_filter` to
@@ -98,10 +99,10 @@ pub struct TableBinding {
 }
 
 impl TableBinding {
-    /// A binding over `name`, with no predicates pushed yet.
-    pub(super) fn new(name: String, columns: Vec<Column>) -> Self {
+    /// A binding over `id`, with no predicates pushed yet.
+    pub(super) fn new(id: uuid::Uuid, columns: Vec<Column>) -> Self {
         Self {
-            name,
+            id,
             columns,
             predicates: Vec::new(),
         }
@@ -122,9 +123,20 @@ impl TableBinding {
             .as_any()
             .downcast_ref::<ParquetTransaction>()
             .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
-        transaction
+        // Resolve by the durable id, same as the write path. The snapshot is
+        // frozen, so id and name would resolve the same table here; keying both
+        // paths off the id keeps `name` a pure label. It's still the label in the
+        // error, since a table missing from the snapshot has no id to look up.
+        let table = transaction
             .snapshot
-            .parquet(&self.name, self.partition_filter_candidates())
+            .catalog_table_by_id(&self.id)
+            .ok_or_else(|| {
+                CatalogError::Other(format!("table {} is not in this snapshot", self.id).into())
+            })?;
+        let filters: Vec<PartitionEqFilter> = self.partition_filter_candidates().collect();
+        table
+            .build_scan_view(&filters)
+            .map_err(|e| CatalogError::Other(Box::new(e)))
     }
 
     /// This binding's pushed equality predicates as partition-filter candidates:
@@ -146,7 +158,7 @@ impl TableBinding {
 }
 
 impl Table for TableBinding {
-    fn compile(
+    fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
@@ -185,6 +197,32 @@ impl Table for TableBinding {
             scan_order,
             Arc::new(eq_predicates),
         ))
+    }
+
+    fn compile_insert(
+        &self,
+        input: RecordBatchOperatorSpec,
+        dispatcher: &DataFlowDispatcher,
+        transaction: &dyn CatalogTransaction,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        let transaction = transaction
+            .as_any()
+            .downcast_ref::<ParquetTransaction>()
+            .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
+        // Resolve the live-view table by its durable id (not name), so the write
+        // targets this exact table even if it was renamed since binding.
+        let table = transaction
+            .snapshot
+            .catalog_table_by_id(&self.id)
+            .ok_or_else(|| {
+                CatalogError::Other(format!("table {} is not in this snapshot", self.id).into())
+            })?;
+        Ok(build_insert_spec(
+            &table,
+            transaction.uploaded_files.clone(),
+            input,
+            dispatcher,
+        )?)
     }
 
     fn columns(&self) -> Vec<Column> {
@@ -305,7 +343,7 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 
 impl TableBinding {
     /// Clone `parquet`'s row groups and keep only those that survive this
-    /// binding's pushed-down predicates — i.e. what [`Table::compile`] actually
+    /// binding's pushed-down predicates — i.e. what [`Table::compile_scan`] actually
     /// scans over the table's current files. A min/max stat that proves no row in
     /// a group can match drops it; a stats-comparison error means "can't prune"
     /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning

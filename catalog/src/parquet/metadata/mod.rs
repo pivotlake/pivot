@@ -1,7 +1,7 @@
 //! Parallel **footer metadata** fetch — the table-load pipeline, run once at
 //! `CREATE`/`ATTACH` (the reading pipeline scans the row groups it produces).
 //! A small work-stealing dataflow with one module per stage, carrying one
-//! [`TableFile`] (a file's [`FileRef`](crate::store::FileRef) plus its row
+//! [`TableFile`] (a file's [`FileRef`] plus its row
 //! groups) per file end to end:
 //!
 //! - [`injector`] — the source: hands out the input files.
@@ -23,7 +23,7 @@ mod injector;
 mod writer;
 
 use crate::catalog::TableFile;
-use crate::store::DataFile;
+use crate::store::{DataFile, DataFileLocation, FileRef};
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
     UnaryFactory, fan_in,
@@ -49,9 +49,32 @@ impl UnaryFactory<DataFile, TableFile> for MetadataFetcherFactory {
     }
 }
 
+/// Build the scan metadata for a file a worker has just uploaded, from the footer
+/// metadata the writer already produced. This skips both scheduling a nested
+/// metadata dataflow from a worker and re-parsing a footer we just wrote; only
+/// the open_file has to be bound now, since it names the stored file that future
+/// scans read and exists only once the upload has landed.
+pub(crate) fn table_file_from_metadata(
+    file: FileRef,
+    source: DataFileLocation,
+    metadata: thriftparquet::footer::FileMetaData,
+    declared_columns: &[Column],
+) -> crate::Result<TableFile> {
+    let open_file = source.open_read(file.size)?;
+    let row_groups = crate::parquet::types::table::row_groups_from_metadata(
+        metadata,
+        open_file,
+        declared_columns,
+    )?
+    .into_iter()
+    .map(Arc::new)
+    .collect();
+    Ok(TableFile::new(file, row_groups))
+}
+
 /// The per-worker source→fetch factories: each worker steals files from a shared
 /// injector and reads their footers, emitting one [`TableFile`] per file (the
-/// file's [`FileRef`](crate::store::FileRef) rides along on the [`DataFile`] and
+/// file's [`FileRef`] rides along on the [`DataFile`] and
 /// lands on the `TableFile`).
 fn fetch_table_file_factories(
     files: &[DataFile],

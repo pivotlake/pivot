@@ -9,7 +9,7 @@
 //! a completion hands back every slot waiting on that read so the fetcher can
 //! advance it.
 
-use dispatch::io::{FsRequest, HttpRequest, OpenFile, RING_SIZE};
+use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest, OpenFile, RING_SIZE};
 use std::collections::HashMap;
 
 /// Most reads to hand the worker for submission in one pass. The worker submits a
@@ -64,7 +64,7 @@ pub(crate) struct ReadRequest {
 
 impl ReadRequest {
     /// The read a local filesystem request fulfills.
-    pub fn of_fs(req: &FsRequest) -> Self {
+    pub fn of_fs(req: &FsReadRequest) -> Self {
         Self {
             open_file: OpenFile::Local(req.file.clone()),
             offset: req.block.file_offset(),
@@ -74,7 +74,7 @@ impl ReadRequest {
     }
 
     /// The read a remote HTTP request fulfills.
-    pub fn of_http(req: &HttpRequest) -> Self {
+    pub fn of_http_get(req: &HttpGetRequest) -> Self {
         Self {
             open_file: OpenFile::Remote(req.remote.clone()),
             offset: req.block.file_offset(),
@@ -89,7 +89,7 @@ impl ReadRequest {
 /// request reads one file, which is local xor remote.
 pub(crate) trait PendingRequest {
     fn pending_fs(&mut self) -> &mut Vec<FsRequest>;
-    fn pending_http(&mut self) -> &mut Vec<HttpRequest>;
+    fn pending_http(&mut self) -> &mut Vec<HttpGetRequest>;
 }
 
 /// Tracks in-flight requests and their cache-block reads. See the module doc.
@@ -109,7 +109,7 @@ pub(crate) struct RequestTracker<T: PendingRequest> {
     /// Deduped reads queued for submission to the ring (drained by
     /// [`take_fs_requests`](Self::take_fs_requests) / `take_http_requests`).
     pending_fs: Vec<FsRequest>,
-    pending_http: Vec<HttpRequest>,
+    pending_http: Vec<HttpGetRequest>,
     /// Submitted-but-not-landed reads, per medium - the fetcher caps disk and
     /// HTTP separately since their latencies differ.
     disk_in_flight: usize,
@@ -162,13 +162,16 @@ impl<T: PendingRequest> RequestTracker<T> {
             )
         };
         for req in fs {
-            if self.schedule_or_join(ReadRequest::of_fs(&req), slot) {
+            let read = req
+                .as_read()
+                .expect("the parquet read tracker only issues filesystem reads");
+            if self.schedule_or_join(ReadRequest::of_fs(read), slot) {
                 self.pending_fs.push(req);
                 self.disk_in_flight += 1;
             }
         }
         for req in http {
-            if self.schedule_or_join(ReadRequest::of_http(&req), slot) {
+            if self.schedule_or_join(ReadRequest::of_http_get(&req), slot) {
                 self.pending_http.push(req);
                 self.http_in_flight += 1;
             }
@@ -253,6 +256,9 @@ impl<T: PendingRequest> RequestTracker<T> {
     /// submission; the rest stay queued for the next pass.
     pub fn take_http_requests(&mut self) -> Vec<HttpRequest> {
         take_batch(&mut self.pending_http)
+            .into_iter()
+            .map(HttpRequest::Get)
+            .collect()
     }
 
     /// A read landed: return every slot waiting on it (the caller advances each)
@@ -309,6 +315,7 @@ impl<T: PendingRequest> RequestTracker<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dispatch::io::FsReadRequest;
     use dispatch::memory::compressed_cache::MissingExtent;
     use dispatch::memory::{init_test_free_pool, memory_ctx};
     use std::sync::Arc;
@@ -317,7 +324,7 @@ mod tests {
     /// A minimal [`PendingRequest`] for driving the tracker directly.
     struct TestRequest {
         pending_fs: Vec<FsRequest>,
-        pending_http: Vec<HttpRequest>,
+        pending_http: Vec<HttpGetRequest>,
     }
 
     impl TestRequest {
@@ -333,7 +340,7 @@ mod tests {
         fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
             &mut self.pending_fs
         }
-        fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
+        fn pending_http(&mut self) -> &mut Vec<HttpGetRequest> {
             &mut self.pending_http
         }
     }
@@ -354,10 +361,10 @@ mod tests {
     /// Wrap a cache missing-block as a local `FsRequest`.
     fn as_fs_request(open_file: &OpenFile, block: MissingExtent) -> FsRequest {
         match open_file {
-            OpenFile::Local(file) => FsRequest {
+            OpenFile::Local(file) => FsRequest::Read(FsReadRequest {
                 file: file.clone(),
                 block,
-            },
+            }),
             OpenFile::Remote(_) => unreachable!("test builds local reads"),
         }
     }
@@ -404,7 +411,7 @@ mod tests {
     fn stage_dedups_an_already_scheduled_read_and_credits_both_waiters() {
         init_test_free_pool(4);
         let (open_file, _dir) = registered_file();
-        let shared = ReadRequest::of_fs(&fs_read(&open_file, 0, 4096));
+        let shared = ReadRequest::of_fs(fs_read(&open_file, 0, 4096).as_read().unwrap());
         let mut tracker = RequestTracker::default();
         let first = tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 4096)]));
         let second =
@@ -422,7 +429,7 @@ mod tests {
         let (open_file, _dir) = registered_file();
         // Schedule [0,8192). A later [0,4096) is fully inside it (it refills into
         // the same slot), so it rides on the bigger read instead of issuing its own.
-        let big = ReadRequest::of_fs(&fs_read(&open_file, 0, 8192));
+        let big = ReadRequest::of_fs(fs_read(&open_file, 0, 8192).as_read().unwrap());
         let mut tracker = RequestTracker::default();
         let big_slot =
             tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 8192)]));
@@ -449,8 +456,8 @@ mod tests {
             .open_entry(open_file.clone());
         let second = fs_read(&open_file, 0, 4096);
         assert_ne!(
-            ReadRequest::of_fs(&first).dest,
-            ReadRequest::of_fs(&second).dest,
+            ReadRequest::of_fs(first.as_read().unwrap()).dest,
+            ReadRequest::of_fs(second.as_read().unwrap()).dest,
             "re-read after open_entry should land in a different slot",
         );
 
@@ -472,13 +479,13 @@ mod tests {
         // refill (into N's slot) + a block-2 body read; the refill is contained in
         // N's read, so only N's read and N+1's body are issued.
         let n_reads = fs_reads(&open_file, 0, 8192);
-        let n = ReadRequest::of_fs(&n_reads[0]);
+        let n = ReadRequest::of_fs(n_reads[0].as_read().unwrap());
         let mut tracker = RequestTracker::default();
         let n_slot = tracker.admit_request(TestRequest::with_fs(n_reads));
 
         let n1_reads = fs_reads(&open_file, 4096, 8192);
         assert_eq!(n1_reads.len(), 2, "shared head + body");
-        let n1_body = ReadRequest::of_fs(&n1_reads[1]);
+        let n1_body = ReadRequest::of_fs(n1_reads[1].as_read().unwrap());
         let n1_slot = tracker.admit_request(TestRequest::with_fs(n1_reads));
 
         // N's read + N+1's body = 2 reads; the shared block-1 refill folds in.
@@ -542,7 +549,7 @@ mod tests {
         init_test_free_pool(4);
         let (open_file, _dir) = registered_file();
         let read = fs_read(&open_file, 0, 4096);
-        let key = ReadRequest::of_fs(&read);
+        let key = ReadRequest::of_fs(read.as_read().unwrap());
         let mut tracker = RequestTracker::default();
         let slot = tracker.admit_request(TestRequest::with_fs(vec![read]));
 

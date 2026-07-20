@@ -92,6 +92,28 @@ async fn create_table_and_query(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn insert_returns_affected_row_count(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_insert", dir.path()).await;
+
+    let messages = conn
+        .simple_query("INSERT INTO people_insert VALUES (4, 'dave'), (5, 'eve')")
+        .await
+        .unwrap();
+
+    assert_eq!(messages.len(), 1, "INSERT should not return a data row");
+    match &messages[0] {
+        SimpleQueryMessage::CommandComplete(rows) => assert_eq!(*rows, 2),
+        other => panic!("expected INSERT command completion, got {other:?}"),
+    }
+
+    let rows = select_rows(&conn, "SELECT id FROM people_insert ORDER BY id").await;
+    assert_eq!(rows.len(), 5);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn second_connection_sees_table_created_by_first(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     let reader = connect_client(server_port()).await;

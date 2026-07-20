@@ -52,7 +52,9 @@ use std::thread;
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 use url::Url;
 
-use dispatch::io::{DataFlowRequest, HttpRequest, IORequester, OpenFile, RemoteFile};
+use dispatch::io::{
+    DataFlowRequest, HttpGetRequest, HttpRequest, IORequester, OpenFile, RemoteFile,
+};
 use dispatch::memory::init_test_free_pool;
 use dispatch::{BUFFER_SIZE, memory_ctx};
 
@@ -282,10 +284,10 @@ fn run_batch(
         for lookup in &lookups {
             if let Some(missing) = lookup.missing() {
                 bytes += missing.len();
-                let req = HttpRequest {
+                let req = HttpRequest::Get(HttpGetRequest {
                     remote: remote.clone(),
                     block: missing.clone(),
-                };
+                });
                 requester
                     .request_http(DataFlowRequest::new(0, 0, req))
                     .unwrap();

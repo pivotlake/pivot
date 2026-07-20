@@ -2,8 +2,8 @@
 //! [`DataType`].
 //!
 //! The read path ([`parquet_to_arrow`], used when loading a file's footer) and
-//! the write path ([`arrow_to_parquet_physical`], used by `ingest` when stamping
-//! a footer) are inverses kept side by side, so a type added to one is added to
+//! the write path ([`arrow_to_parquet_physical`], used when stamping a Parquet
+//! footer) are inverses kept side by side, so a type added to one is added to
 //! the other instead of the two drifting apart.
 //!
 //! ```text

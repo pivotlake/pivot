@@ -140,9 +140,10 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
             items: groups,
             ..
         } = self.row_groups_by_file.remove(&file_id).unwrap();
-        let bytes = build_file(&header.schema, groups)?;
+        let (bytes, metadata) = build_file(&header.schema, groups)?;
         sender.send(EncodedFile {
             bytes,
+            metadata,
             partition: header.tag.partition.clone(),
             sort_bounds: header.tag.sort_bounds.clone(),
         })?;
@@ -175,8 +176,13 @@ fn assemble_row_group(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Assemb
 }
 
 /// Stitch several assembled row groups into one Parquet file, rebasing each row
-/// group's column offsets to its position in the file.
-fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult<Vec<u8>> {
+/// group's column offsets to its position in the file. Returns the bytes and the
+/// footer metadata just written into them, so a consumer that needs the file's
+/// row-group metadata can take it directly instead of parsing the footer back.
+fn build_file(
+    schema: &SchemaRef,
+    groups: Vec<AssembledRowGroup>,
+) -> WriteResult<(Vec<u8>, FileMetaData)> {
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(PARQUET_MAGIC);
 
@@ -219,10 +225,10 @@ fn build_file(schema: &SchemaRef, groups: Vec<AssembledRowGroup>) -> WriteResult
         schema: build_schema_elements(schema)?,
         num_rows,
         row_groups,
-        created_by: Some("pivotdb-ingest".to_string()),
+        created_by: Some("pivotdb".to_string()),
     };
     write_footer(&mut out, &file_meta)?;
-    Ok(out)
+    Ok((out, file_meta))
 }
 
 /// Append one leaf's column chunk to `out`: its dictionary page (if any) followed
@@ -317,7 +323,7 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 // The VARIANT annotation is the whole difference between a
                 // variant column and a plain struct of binary leaves: it is what
                 // a reader keys off to treat the group as semi-structured.
-                logical_type: catalog::parquet::is_variant_field(field)
+                logical_type: crate::parquet::is_variant_field(field)
                     .then_some(LogicalType::Variant),
             });
             for child in children {
@@ -325,7 +331,7 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
             }
         }
         data_type => elements.push(SchemaElement {
-            physical_type: Some(catalog::parquet::arrow_to_parquet_physical(data_type)?),
+            physical_type: Some(crate::parquet::arrow_to_parquet_physical(data_type)?),
             repetition_type,
             name: field.name().clone(),
             num_children: None,
@@ -352,8 +358,8 @@ fn write_footer(out: &mut Vec<u8>, file_meta: &FileMetaData) -> WriteResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet_writing::encoder::encode_column_chunk;
-    use crate::parquet_writing::types::{EncodedColumnChunk, PartitionTag};
+    use crate::parquet::writing::encoder::encode_column_chunk;
+    use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int64Type;
     use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
@@ -395,7 +401,7 @@ mod tests {
             .collect::<WriteResult<_>>()
             .unwrap();
         let group = assemble_row_group(chunks).unwrap();
-        build_file(&schema, vec![group]).unwrap()
+        build_file(&schema, vec![group]).unwrap().0
     }
 
     /// Write `batch` and read it back through arrow-rs's strict reader (our

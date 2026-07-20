@@ -9,7 +9,7 @@
 //!
 //! Covered: store contract (round-trip `source`, one-level `list`, the
 //! `put_if_absent` CAS), and the table lifecycle end to end — `CREATE TABLE`,
-//! reopen, **appending a file** (ingest registration), and **compaction**
+//! reopen, **appending a file** (out-of-band registration), and **compaction**
 //! (replacing files) — all over object storage.
 
 mod common;
@@ -136,7 +136,7 @@ mod bodies {
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }
 
-    /// Registering a new file (the ingest append) makes its rows visible to the
+    /// Registering a new file (an out-of-band append) makes its rows visible to the
     /// next bind, on top of the existing ones.
     pub fn append_registers_new_file(b: &Backend) {
         let d = dispatch_with_buffers(2, 32);
@@ -160,8 +160,7 @@ mod bodies {
             .put(&ObjectPath::new("events/merged.parquet"), &merged)
             .unwrap();
 
-        let swapped = cat
-            .table_handle("events")
+        cat.table_handle("events")
             .unwrap()
             .replace_data_files(
                 &[ObjectPath::new("p1.parquet"), ObjectPath::new("p2.parquet")],
@@ -172,7 +171,6 @@ mod bodies {
             )
             .unwrap();
 
-        assert!(swapped);
         assert_eq!(scan(&d, &cat, "events"), vec![1, 2, 3, 4]);
         assert_eq!(row_groups(&cat, "events"), 1);
     }

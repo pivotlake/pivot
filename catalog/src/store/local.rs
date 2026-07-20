@@ -1,7 +1,7 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError};
+use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError};
 use std::path::PathBuf;
 
 /// The local-filesystem backend: keys are paths under `root`.
@@ -142,8 +142,12 @@ impl ObjectStore for LocalStore {
         Ok(objects)
     }
 
-    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
-        Ok(DataFileSource::Local(self.path_for(key)))
+    fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
+        Ok(DataFileLocation::Local(self.path_for(key)))
+    }
+
+    fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation> {
+        Ok(DataFileLocation::Local(self.path_for(key)))
     }
 }
 

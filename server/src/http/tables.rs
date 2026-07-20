@@ -98,7 +98,7 @@ pub(super) async fn rowgroups_page(
 ) -> Json<RowGroupsPage> {
     let limit = page.limit.min(500);
     // Filter by the file's stable path (`file_name`), not a positional index, so
-    // it stays correct while ingest/compaction add and remove files. The
+    // it stays correct while INSERT/compaction add and remove files. The
     // `file_name` column itself is not selected - it'd be the same on every row.
     let filter = page
         .file

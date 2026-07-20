@@ -33,8 +33,10 @@
 //!    [`next_http_requests`](Operator::next_http_requests) — return any pending IO requests
 //!    (e.g. read a parquet page from disk, or a byte range over HTTP). The worker submits
 //!    these asynchronously and delivers completions via
-//!    [`process_fs_response`](Operator::process_fs_response) /
-//!    [`process_http_response`](Operator::process_http_response).
+//!    [`process_fs_read_response`](Operator::process_fs_read_response) /
+//!    [`process_fs_write_response`](Operator::process_fs_write_response) /
+//!    [`process_http_get_response`](Operator::process_http_get_response) or
+//!    [`process_http_upload_response`](Operator::process_http_upload_response).
 //!
 //! 3. [`try_finish`](Operator::try_finish) — called when the input channel is drained
 //!    and all sibling operators (across workers) have also drained. The operator does
@@ -44,7 +46,9 @@
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{
+    FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest,
+};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -104,28 +108,35 @@ pub trait Operator {
     /// Returns [`WorkStatus::Ran`] if work was done, [`Pending`](WorkStatus::Pending) otherwise.
     fn run_cpu_work(&mut self) -> Result<WorkStatus>;
 
-    /// Return any pending filesystem read requests (e.g. parquet page reads from
-    /// a local file). The worker submits them and later calls
-    /// [`process_fs_response`](Self::process_fs_response).
+    /// Return any pending filesystem requests. The worker submits them and later
+    /// calls [`process_fs_read_response`](Self::process_fs_read_response) or
+    /// [`process_fs_write_response`](Self::process_fs_write_response).
     fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>>;
 
     /// Return any pending HTTP requests (reads of [`Remote`](crate::io::OpenFile::Remote)
     /// regions). The worker submits these on the same per-core io_uring and
-    /// delivers completions via
-    /// [`process_http_response`](Self::process_http_response) — by the time it
-    /// is called the bytes are already committed to the cache slot, identical to
-    /// a disk read.
+    /// delivers completions via the handler matching the request variant. By the
+    /// time [`process_http_get_response`](Self::process_http_get_response) is
+    /// called, GET bytes are already committed to the cache slot, identical to a
+    /// disk read.
     fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
         Ok(vec![])
     }
 
     /// Handle a completed filesystem read; its bytes are already committed to
-    /// the cache. Called by the worker when the read finishes.
-    fn process_fs_response(&mut self, request: FsRequest) -> Result<()>;
+    /// the cache slot.
+    fn process_fs_read_response(&mut self, request: FsReadRequest) -> Result<()>;
 
-    /// Handle a completed HTTP read; its bytes are already committed to the
+    /// Handle a completed filesystem write.
+    fn process_fs_write_response(&mut self, request: FsWriteRequest) -> Result<()>;
+
+    /// Handle a completed HTTP GET; its bytes are already committed to the
     /// cache. Called by the worker when the read finishes.
-    fn process_http_response(&mut self, request: HttpRequest) -> Result<()>;
+    fn process_http_get_response(&mut self, request: HttpGetRequest) -> Result<()>;
+
+    /// Handle a completed HTTP upload. Called by the worker when the upload
+    /// finishes.
+    fn process_http_upload_response(&mut self, request: HttpUploadRequest) -> Result<()>;
 
     /// Attempt to finish. Returns a [`FinishStatus`] telling the worker whether
     /// the operator is done, still working (re-drive, don't park), or not yet
