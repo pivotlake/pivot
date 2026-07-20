@@ -19,7 +19,7 @@
 //! **push, not pull**: a periodic [`refresh_catalog`](ParquetCatalog::refresh_catalog)
 //! sweep (the server runs one on an interval) reloads every table to its latest
 //! committed version and fetches any new files' footers, and an in-process
-//! writer (ingest, compaction) [`publish_table`](ParquetCatalog::publish_table)s
+//! writer (INSERT, compaction) [`publish_table`](ParquetCatalog::publish_table)s
 //! its committed copy immediately. Queries never touch the store: a query opens
 //! a transaction ([`Catalog::begin_transaction`]) whose [`CatalogSnapshot`]
 //! freezes the table set as of that moment, and every binding, scan, and late
@@ -29,6 +29,7 @@
 //! pushdown accumulates on that binding alone.
 
 mod binding;
+mod insert_sink;
 mod metadata_function;
 mod table;
 
@@ -39,11 +40,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use uuid::Uuid;
+
 use crate::manifest::{
-    self, CatalogManifest, CatalogManifestTableEntry, PartitionEqFilter, TableManifest,
+    self, CatalogManifest, CatalogManifestTableEntry, ManifestEntry, TableManifest,
 };
-use crate::parquet::{ParquetTable, ParquetTableError};
+use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
+use crossbeam_deque::{Injector, Steal};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
 use planner::TableFunction;
@@ -75,10 +79,10 @@ pub enum Error {
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
     TableExists(String),
-    #[error(
-        "catalog writes are not converted to Delta Lake yet; ingest and compaction are disabled for table `{0}`"
-    )]
-    DeltaWritesUnsupported(String),
+    #[error("table `{0}` does not exist")]
+    TableNotFound(String),
+    #[error("catalog received a transaction created by a different backend")]
+    WrongTransaction,
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
@@ -93,6 +97,8 @@ pub enum Error {
         "table `{table}`: file `{file}` has no loaded row-group metadata; the copy was not synced to its manifest"
     )]
     FooterNotLoaded { table: String, file: String },
+    #[error("table `{table}` commit conflict: input file `{file}` is no longer active")]
+    CommitConflict { table: String, file: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -105,6 +111,46 @@ impl From<Error> for CatalogError {
     }
 }
 
+/// The catalog's table set. A table's durable identity is its [`Uuid`], so the
+/// tables are owned by `by_uuid`; `name_to_uuid` is a lightweight lookup index
+/// on top. Keeping them separate means only one map owns each [`CatalogTable`]
+/// (no aliasing), a rename touches only the name index, and a commit/publish
+/// touches only `by_uuid` - the two never fight over the same value.
+#[derive(Clone, Default)]
+struct TableIndex {
+    by_uuid: HashMap<Uuid, CatalogTable>,
+    name_to_uuid: HashMap<String, Uuid>,
+}
+
+impl TableIndex {
+    /// Insert or replace a table under both its identity and its current name.
+    fn insert(&mut self, table: CatalogTable) {
+        self.name_to_uuid
+            .insert(table.name().to_string(), table.id());
+        self.by_uuid.insert(table.id(), table);
+    }
+
+    fn get_by_name(&self, name: &str) -> Option<&CatalogTable> {
+        self.by_uuid.get(self.name_to_uuid.get(name)?)
+    }
+
+    fn get_by_id(&self, id: &Uuid) -> Option<&CatalogTable> {
+        self.by_uuid.get(id)
+    }
+
+    fn contains_name(&self, name: &str) -> bool {
+        self.name_to_uuid.contains_key(name)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &CatalogTable> {
+        self.by_uuid.values()
+    }
+
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.name_to_uuid.keys().map(String::as_str)
+    }
+}
+
 /// Concurrent catalog of tables, keyed by name.
 ///
 /// `CREATE TABLE` compiles to a single dataflow that reads every data file's
@@ -112,17 +158,15 @@ impl From<Error> for CatalogError {
 /// stage, commits the table (its manifest + the database index) and publishes
 /// the entry in this shared map. After that, a table evolves by manifest commits
 /// on a [`CatalogTable`] *copy* — a writer takes one with
-/// [`table_handle`](Self::table_handle) and calls
-/// [`append_data_file`](CatalogTable::append_data_file) /
-/// [`replace_data_files`](CatalogTable::replace_data_files), which CAS a new
-/// version into the store. Copies drift; every query resolve refreshes its copy
+/// [`table_handle`](Self::table_handle) and appends its uploaded files or swaps
+/// them (compaction), which CAS a new version into the store. Copies drift; every query resolve refreshes its copy
 /// to the latest committed version, so a commit by another process (or this one)
 /// becomes visible to the next query.
 pub struct ParquetCatalog {
     /// The in-memory table set. The lock guards the *set* (add on `CREATE`,
     /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
     /// lock-free value that callers clone out and evolve independently.
-    tables: Arc<RwLock<HashMap<String, CatalogTable>>>,
+    tables: Arc<RwLock<TableIndex>>,
     /// The database's object store — the table index, Delta logs, and tables'
     /// Parquet data. A local directory by default ([`new`], an ephemeral one
     /// under the temp dir), or the directory / S3 / GCS root a database is
@@ -156,7 +200,7 @@ impl ParquetCatalog {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("catalog-{}-{}", std::process::id(), seq));
         Self {
-            tables: Arc::new(RwLock::new(HashMap::new())),
+            tables: Arc::new(RwLock::new(TableIndex::default())),
             store: Arc::new(LocalStore::new(root)),
             dispatcher,
         }
@@ -171,10 +215,10 @@ impl ParquetCatalog {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
         let manifest = CatalogManifest::load(store.as_ref())?;
 
-        let mut tables = HashMap::new();
+        let mut tables = TableIndex::default();
         for entry in &manifest.tables {
             let table = Self::load_table(dispatcher, &store, entry)?;
-            tables.insert(entry.name.clone(), table);
+            tables.insert(table);
         }
 
         Ok(Self {
@@ -195,11 +239,12 @@ impl ParquetCatalog {
     ) -> Result<CatalogTable> {
         let delta_uri = crate::delta::table_uri(&store.describe(), &entry.location)?;
         let state = crate::delta::load_table(&delta_uri)?;
+        let id = state.id;
         let manifest = TableManifest {
             version: state.version,
             columns: state.columns,
             partition_by: state.partition_by,
-            sort_by: Vec::new(),
+            sort_by: state.sort_by,
             entries: state.entries,
         };
         let files = manifest
@@ -215,6 +260,7 @@ impl ParquetCatalog {
         let table_files = crate::parquet::load_table_files(dispatcher, &files, declared_columns)?;
         Ok(CatalogTable::new(
             entry.name.clone(),
+            id,
             entry.location.clone(),
             manifest,
             table_files,
@@ -225,8 +271,8 @@ impl ParquetCatalog {
     }
 
     /// Open a transaction, typed: freeze the current table set into a
-    /// [`CatalogSnapshot`] and hand back the concrete [`ParquetTransaction`]
-    /// over it. Cheap: clones the map (the row-group metadata inside is
+    /// [`CatalogSnapshot`] and create the injector that receives completed
+    /// INSERT files. Cheap: clones the map (the row-group metadata inside is
     /// `Arc`-shared), no I/O. The [`Catalog::begin_transaction`] trait impl
     /// delegates here.
     pub fn begin_transaction(&self) -> Arc<ParquetTransaction> {
@@ -234,6 +280,7 @@ impl ParquetCatalog {
             snapshot: Arc::new(CatalogSnapshot {
                 tables: self.tables.read().unwrap().clone(),
             }),
+            uploaded_files: Arc::new(Injector::new()),
         })
     }
 
@@ -247,19 +294,30 @@ impl ParquetCatalog {
     ///
     /// Tables are never removed here: there is no `DROP TABLE`, and removing a
     /// map entry on a manifest miss could race a concurrent in-process create.
+    ///
+    /// One table failing to load or refresh (an unsupported Delta feature, a
+    /// transient store error) must not starve every other table of its
+    /// refresh, so per-table failures are logged and the sweep continues; only
+    /// a database-index load failure aborts it.
     pub fn refresh_catalog(&self) -> Result<bool> {
         let mut changed = false;
 
         let index = CatalogManifest::load(self.store.as_ref())?;
         for entry in &index.tables {
-            if self.tables.read().unwrap().contains_key(&entry.name) {
+            if self.tables.read().unwrap().contains_name(&entry.name) {
                 continue;
             }
-            let table = Self::load_table(&self.dispatcher, &self.store, entry)?;
+            let table = match Self::load_table(&self.dispatcher, &self.store, entry) {
+                Ok(table) => table,
+                Err(e) => {
+                    tracing::warn!(table = entry.name, error = %e, "catalog refresh: loading table failed");
+                    continue;
+                }
+            };
             let mut map = self.tables.write().unwrap();
             // An in-process CREATE TABLE may have published it since the read.
-            if !map.contains_key(&entry.name) {
-                map.insert(entry.name.clone(), table);
+            if !map.contains_name(&entry.name) {
+                map.insert(table);
                 changed = true;
             }
         }
@@ -267,8 +325,12 @@ impl ParquetCatalog {
         // Refresh each table on a clone outside the lock (footer fetches are
         // I/O), then publish the advanced copy back.
         for mut table in self.tables() {
-            if table.refresh()? {
-                changed |= self.publish_table(table);
+            match table.refresh() {
+                Ok(true) => changed |= self.publish_table(table),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(table = table.name(), error = %e, "catalog refresh: refreshing table failed");
+                }
             }
         }
 
@@ -277,15 +339,15 @@ impl ParquetCatalog {
 
     /// Publish a committed [`CatalogTable`] copy into the shared map, so its
     /// new version is visible to the next transaction immediately (rather than
-    /// after the next background refresh). Ingest and compaction call this
+    /// after the next background refresh). INSERT and compaction call this
     /// right after their commit. A copy at or behind the map's current version
     /// is dropped (`false`); a newer one replaces it.
     pub fn publish_table(&self, table: CatalogTable) -> bool {
         let mut map = self.tables.write().unwrap();
-        match map.get(table.name()) {
+        match map.get_by_id(&table.id()) {
             Some(existing) if existing.version() >= table.version() => false,
             _ => {
-                map.insert(table.name().to_string(), table);
+                map.insert(table);
                 true
             }
         }
@@ -297,27 +359,34 @@ impl ParquetCatalog {
         &self.dispatcher
     }
 
-    /// A clone of the named table's current state for a writer (ingest,
-    /// compaction) to evolve — [`append_data_file`](CatalogTable::append_data_file)
-    /// or [`replace_data_files`](CatalogTable::replace_data_files). Those commit
-    /// a new version by CAS to the shared store, so this catalog's own copy may
+    /// A clone of the named table's current state for a writer (INSERT,
+    /// compaction) to evolve — appending its uploaded files or swapping them
+    /// (compaction). Those commit a new version by CAS to the shared store, so
+    /// this catalog's own copy may
     /// lag until its next resolve refreshes it (which is fine — the store is the
     /// source of truth). `None` if no such table exists.
     pub fn table_handle(&self, name: &str) -> Option<CatalogTable> {
-        self.tables.read().unwrap().get(name).cloned()
+        self.tables.read().unwrap().get_by_name(name).cloned()
     }
 
     /// Whether a table named `name` exists in the catalog (a cheap membership
-    /// check — no clone). Used by ingest to fail fast at startup when a sink's
-    /// table hasn't been created.
+    /// check — no clone). Used to fail fast when a table a writer targets
+    /// hasn't been created.
     pub fn contains_table(&self, name: &str) -> bool {
-        self.tables.read().unwrap().contains_key(name)
+        self.tables.read().unwrap().contains_name(name)
     }
 
     /// A snapshot clone of every table the catalog currently holds — for a sweep
     /// (e.g. the compacter) that refreshes and evolves each one independently.
     pub fn tables(&self) -> Vec<CatalogTable> {
         self.tables.read().unwrap().values().cloned().collect()
+    }
+
+    /// A clone of the table with identity `id`, or `None` if it's gone (dropped,
+    /// or a stale reference outliving the table). Used by INSERT commit to resolve
+    /// the *live* table its files belong to, regardless of any concurrent rename.
+    pub fn table_handle_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
+        self.tables.read().unwrap().get_by_id(id).cloned()
     }
 
     /// A human-readable description of where this database is rooted (local
@@ -328,7 +397,7 @@ impl ParquetCatalog {
     }
 
     /// Table `name`'s current committed files — refreshing to the latest version
-    /// first, so a commit by ingest/compaction (in this process or another) is
+    /// first, so a commit by INSERT/compaction (in this process or another) is
     /// reflected. `None` if no such table exists.
     pub fn table_files(&self, name: &str) -> Option<Vec<FileRef>> {
         let mut table = self.table_handle(name)?;
@@ -357,7 +426,7 @@ impl ParquetCatalog {
         }
         // Reject a duplicate up front; the commit re-checks under the lock as a
         // race backstop.
-        if self.tables.read().unwrap().contains_key(&request.name) {
+        if self.tables.read().unwrap().contains_name(&request.name) {
             return Err(Error::TableExists(request.name));
         }
 
@@ -389,7 +458,7 @@ impl ParquetCatalog {
             declared_columns,
             move |loaded: Vec<TableFile>| {
                 let mut map = tables.write().unwrap();
-                if map.contains_key(&request.name) {
+                if map.contains_name(&request.name) {
                     return Err(Box::new(Error::TableExists(request.name))
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
@@ -410,7 +479,7 @@ impl ParquetCatalog {
                     location,
                 ));
                 index.store(store.as_ref())?;
-                map.insert(request.name, table);
+                map.insert(table);
                 Ok(())
             },
         ))
@@ -476,8 +545,8 @@ impl Catalog for ParquetCatalog {
     /// table the transaction binds resolves from that frozen
     /// [`CatalogSnapshot`] (pure in-memory, no I/O), so one query reads one
     /// consistent version of every table regardless of concurrent refreshes or
-    /// commits. Dropping the returned transaction (the commit) releases the
-    /// snapshot.
+    /// commits. [`Catalog::commit_transaction`] publishes files injected by an
+    /// INSERT; rollback or dropping the transaction discards that pending set.
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
         ParquetCatalog::begin_transaction(self)
     }
@@ -489,6 +558,43 @@ impl Catalog for ParquetCatalog {
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         Ok(self.create(request, dispatcher)?)
     }
+
+    fn commit_transaction(&self, transaction: Arc<dyn CatalogTransaction>) -> CatalogResult<()> {
+        let transaction = transaction
+            .as_any()
+            .downcast_ref::<ParquetTransaction>()
+            .ok_or(Error::WrongTransaction)?;
+        let mut files_by_table = HashMap::<Uuid, Vec<_>>::new();
+        for uploaded in transaction.drain_uploaded_files() {
+            let insert_sink::UploadedFile {
+                table_id,
+                file,
+                partition,
+                sort_bounds,
+                row_groups,
+            } = uploaded;
+            files_by_table.entry(table_id).or_default().push((
+                ManifestEntry {
+                    file: file.clone(),
+                    partition,
+                    sort_bounds,
+                },
+                TableFile::new(file, row_groups),
+            ));
+        }
+        if files_by_table.is_empty() {
+            return Ok(());
+        }
+
+        for (table_id, files) in files_by_table {
+            let mut table = self
+                .table_handle_by_id(&table_id)
+                .ok_or_else(|| Error::TableNotFound(table_id.to_string()))?;
+            table.commit_uploaded_files(files)?;
+            self.publish_table(table);
+        }
+        Ok(())
+    }
 }
 
 /// One transaction's frozen view of the catalog: every table at the version it
@@ -497,13 +603,13 @@ impl Catalog for ParquetCatalog {
 /// Everything a query does against it (binding, scan-view construction, late
 /// materialize, `metadata()`) is pure in-memory.
 pub struct CatalogSnapshot {
-    tables: HashMap<String, CatalogTable>,
+    tables: TableIndex,
 }
 
 impl std::fmt::Debug for CatalogSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatalogSnapshot")
-            .field("tables", &self.tables.keys())
+            .field("tables", &self.tables.names().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
@@ -513,48 +619,41 @@ impl CatalogSnapshot {
     /// if the snapshot has no such table. Pure in-memory. The typed counterpart
     /// of [`CatalogTransaction::table`].
     pub fn table(&self, name: &str) -> Option<TableBinding> {
-        let columns = self.tables.get(name)?.columns();
-        Some(TableBinding::new(name.to_string(), columns))
+        let table = self.tables.get_by_name(name)?;
+        Some(TableBinding::new(table.id(), table.columns()))
+    }
+
+    /// A clone of the table with identity `id`, or `None` if this snapshot has no
+    /// such table. Used by [`TableBinding::compile_insert`](binding::TableBinding::compile_insert)
+    /// to resolve the table it writes into by its durable id.
+    pub(super) fn catalog_table_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
+        self.tables.get_by_id(id).cloned()
     }
 
     /// Table `name`'s row groups for the files that can match
-    /// `partition_filter_candidates` — the partition-pruned scan view. Built
-    /// from the snapshot's already materialized row groups: no manifest read,
-    /// no footer fetch. The snapshot is immutable, so two asks with the same
-    /// candidates (a scan and its late materialize) always build identical views
-    /// addressing the same row-group indices. Errors if the table isn't in the
-    /// snapshot (it never was, or the binding outlived its transaction into a
-    /// catalog where it's gone) rather than scanning an empty file set.
-    pub(super) fn parquet(
-        &self,
-        name: &str,
-        partition_filter_candidates: impl Iterator<Item = PartitionEqFilter>,
-    ) -> CatalogResult<Arc<ParquetTable>> {
-        let filters: Vec<PartitionEqFilter> = partition_filter_candidates.collect();
-        let table = self.tables.get(name).ok_or_else(|| {
-            CatalogError::Other(format!("table {name:?} is not in this snapshot").into())
-        })?;
-        table
-            .build_scan_view(&filters)
-            .map_err(|e| CatalogError::Other(Box::new(e)))
-    }
-
     /// Per-file row groups (path + its row groups, manifest order) for the
     /// `metadata()` table function. Errors if the snapshot has no such table.
     pub(super) fn file_row_groups(
         &self,
         name: &str,
     ) -> Option<Vec<(String, Vec<Arc<crate::parquet::RowGroupMetadata>>)>> {
-        Some(self.tables.get(name)?.file_row_groups())
+        Some(self.tables.get_by_name(name)?.file_row_groups())
     }
 }
 
-/// The [`CatalogTransaction`] a [`ParquetCatalog`] opens: one query's handle on
-/// its [`CatalogSnapshot`]. Dropped when the query finishes (the commit),
-/// releasing the snapshot.
-#[derive(Debug)]
+/// The [`CatalogTransaction`] a [`ParquetCatalog`] opens: one query's frozen
+/// [`CatalogSnapshot`] plus an injector of uploaded files awaiting commit.
 pub struct ParquetTransaction {
     pub(super) snapshot: Arc<CatalogSnapshot>,
+    pub(super) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
+}
+
+impl std::fmt::Debug for ParquetTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetTransaction")
+            .field("snapshot", &self.snapshot)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ParquetTransaction {
@@ -565,6 +664,17 @@ impl ParquetTransaction {
     /// one function cannot return both).
     pub fn table(&self, name: &str) -> Option<TableBinding> {
         self.snapshot.table(name)
+    }
+
+    fn drain_uploaded_files(&self) -> Vec<insert_sink::UploadedFile> {
+        let mut files = Vec::new();
+        loop {
+            match self.uploaded_files.steal() {
+                Steal::Success(file) => files.push(file),
+                Steal::Retry => continue,
+                Steal::Empty => return files,
+            }
+        }
     }
 }
 

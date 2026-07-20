@@ -111,7 +111,7 @@ impl TestTable {
 }
 
 impl Table for TestTable {
-    fn compile(
+    fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,

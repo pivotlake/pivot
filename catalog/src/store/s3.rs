@@ -6,7 +6,7 @@
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
 //! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
 
-use super::{DataFileSource, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -243,10 +243,17 @@ impl ObjectStore for S3Store {
             .collect())
     }
 
-    fn source(&self, key: &ObjectPath) -> Result<DataFileSource> {
+    fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
         // S3 presigns the URL: auth rides in the query string, no per-request header.
-        Ok(DataFileSource::Remote {
+        Ok(DataFileLocation::Remote {
             url: self.presign_get(key)?,
+            auth: None,
+        })
+    }
+
+    fn sink(&self, key: &ObjectPath) -> Result<DataFileLocation> {
+        Ok(DataFileLocation::Remote {
+            url: self.presign("PUT", key)?,
             auth: None,
         })
     }
@@ -256,6 +263,10 @@ impl S3Store {
     /// A time-limited GET URL for `key`, signed in the query string so the
     /// io_uring HTTP reader can range-read it with no auth headers.
     fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {
+        self.presign("GET", key)
+    }
+
+    fn presign(&self, method: &str, key: &ObjectPath) -> Result<url::Url> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
 
@@ -285,7 +296,7 @@ impl S3Store {
         // can add a `Range` header the signature doesn't cover.
         let host_header = [("host", self.host.as_str())];
         let signable = SignableRequest::new(
-            "GET",
+            method,
             &url,
             host_header.iter().copied(),
             SignableBody::UnsignedPayload,

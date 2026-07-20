@@ -137,6 +137,8 @@ impl<'plan> LogicalOp<'plan> {
         use LogicalOperatorType as L;
         match self.op_type() {
             L::LOGICAL_PROJECTION => Operator::Projection(Projection { raw: self.raw }),
+            L::LOGICAL_EXPRESSION_GET => Operator::Values(Values { raw: self.raw }),
+            L::LOGICAL_INSERT => Operator::Insert(Insert { raw: self.raw }),
             L::LOGICAL_FILTER => Operator::Filter(Filter { raw: self.raw }),
             L::LOGICAL_AGGREGATE_AND_GROUP_BY => Operator::Aggregate(Aggregate { raw: self.raw }),
             L::LOGICAL_ORDER_BY => Operator::OrderBy(OrderBy { raw: self.raw }),
@@ -166,6 +168,8 @@ impl<'plan> LogicalOp<'plan> {
 #[derive(Clone, Copy)]
 pub enum Operator<'plan> {
     Projection(Projection<'plan>),
+    Values(Values<'plan>),
+    Insert(Insert<'plan>),
     Filter(Filter<'plan>),
     Aggregate(Aggregate<'plan>),
     OrderBy(OrderBy<'plan>),
@@ -209,6 +213,10 @@ macro_rules! define_handles {
 define_handles! { ffi::LogicalOperator;
     /// A `LogicalProjection`: a list of output expressions.
     Projection,
+    /// A `LogicalExpressionGet`: rows of bound expressions from `VALUES`.
+    Values,
+    /// A `LogicalInsert`: the target table above its value-producing child.
+    Insert,
     /// A `LogicalFilter`: boolean conditions plus an optional projection map.
     Filter,
     /// A `LogicalAggregate`: GROUP BY keys plus aggregate expressions.
@@ -239,6 +247,38 @@ impl<'plan> Projection<'plan> {
         (0..ffi::lo_projection_expr_count(self.raw)).map(move |i| Expr {
             raw: ffi::lo_projection_expr(self.raw, i),
         })
+    }
+}
+
+impl<'plan> Values<'plan> {
+    pub fn row_count(self) -> usize {
+        ffi::lo_values_row_count(self.raw)
+    }
+
+    pub fn column_count(self) -> usize {
+        ffi::lo_values_column_count(self.raw)
+    }
+
+    pub fn expression(self, row: usize, column: usize) -> Expr<'plan> {
+        Expr {
+            raw: ffi::lo_values_expr(self.raw, row, column),
+        }
+    }
+}
+
+impl<'plan> Insert<'plan> {
+    /// Take the table binding DuckDB resolved for this INSERT target.
+    pub fn take_table(self) -> Box<OptionalTableWrapper> {
+        ffi::lo_insert_take_table(self.raw)
+    }
+
+    /// Empty means DuckDB bound an insert into every physical column by position.
+    pub fn has_column_map(self) -> bool {
+        ffi::lo_insert_column_map_count(self.raw) != 0
+    }
+
+    pub fn returns_rows(self) -> bool {
+        ffi::lo_insert_returns_rows(self.raw)
     }
 }
 

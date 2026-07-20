@@ -9,11 +9,19 @@ dispatch = { workspace = true }
 thriftparquet = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-buffer = { workspace = true }
 # Filtering a decoded batch down to the rows a pushed-down equality keeps
 # (see the row-group decoder's view-equality test).
 arrow-select = { workspace = true }
+# Variant (JSON) columns: `parquet-variant` supplies the value/path types the
+# shredding inference walks, `parquet-variant-compute` the shred/unshred kernels
+# each output file's layout is applied with.
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
@@ -75,9 +83,11 @@ parquet = { workspace = true, features = ["variant_experimental"] }
 arrow-schema = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
 # Build a variant column (`json_to_variant`) and extract a path (`variant_get`)
-# in the variant scan test.
+# in the variant scan test; render a written-back variant to JSON to assert the
+# documents survived shredding, the same way a query renders a variant column.
 parquet-variant = { workspace = true }
 parquet-variant-compute = { workspace = true }
+parquet-variant-json = { workspace = true }
 tempfile = { workspace = true }
 core_affinity = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -72,7 +72,7 @@ impl Input {
         let projection = DispatchProjection::columns(column_indices);
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
         self.table
-            .compile(
+            .compile_scan(
                 dispatcher,
                 projection,
                 dynamic_filters,

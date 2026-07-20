@@ -7,7 +7,9 @@
 use super::{FinishStatus, Operator};
 use crate::api::{Chain, OperatorFactory};
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{
+    FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest,
+};
 use crate::operations::channels::Sender;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -33,7 +35,7 @@ pub trait Nullary<O> {
     /// Run one unit of work, possibly sending output.
     fn run<S: Sender<O>>(&mut self, sender: &mut S) -> Result<WorkStatus>;
 
-    /// Return any pending filesystem read requests.
+    /// Return any pending filesystem requests.
     fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
         Ok(vec![])
     }
@@ -46,20 +48,38 @@ pub trait Nullary<O> {
 
     /// Handle a completed filesystem read; its bytes are already committed to
     /// the cache slot.
-    fn process_fs_response<S: Sender<O>>(
+    fn process_fs_read_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _request: FsRequest,
+        _request: FsReadRequest,
     ) -> Result<()> {
         unreachable!()
     }
 
-    /// Handle a completed HTTP read; its bytes are already committed to the
-    /// cache slot.
-    fn process_http_response<S: Sender<O>>(
+    /// Handle a completed filesystem write.
+    fn process_fs_write_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _request: HttpRequest,
+        _request: FsWriteRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed HTTP GET; its bytes are already committed to the
+    /// cache slot.
+    fn process_http_get_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: HttpGetRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed HTTP upload.
+    fn process_http_upload_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: HttpUploadRequest,
     ) -> Result<()> {
         unreachable!()
     }
@@ -100,16 +120,28 @@ impl<O, N: Nullary<O>, S: Sender<O>> Operator for NullaryOperator<O, N, S> {
         Ok(self.nullary.next_http_requests()?)
     }
 
-    fn process_fs_response(&mut self, request: FsRequest) -> super::Result<()> {
+    fn process_fs_read_response(&mut self, request: FsReadRequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_fs_response(&mut self.sender, request)?)
+            .process_fs_read_response(&mut self.sender, request)?)
     }
 
-    fn process_http_response(&mut self, request: HttpRequest) -> super::Result<()> {
+    fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_http_response(&mut self.sender, request)?)
+            .process_fs_write_response(&mut self.sender, request)?)
+    }
+
+    fn process_http_get_response(&mut self, request: HttpGetRequest) -> super::Result<()> {
+        Ok(self
+            .nullary
+            .process_http_get_response(&mut self.sender, request)?)
+    }
+
+    fn process_http_upload_response(&mut self, request: HttpUploadRequest) -> super::Result<()> {
+        Ok(self
+            .nullary
+            .process_http_upload_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<FinishStatus> {

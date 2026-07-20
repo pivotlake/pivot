@@ -294,62 +294,116 @@ impl Hash for RemoteFile {
     }
 }
 
-/// A filesystem read request: read `block` from `file` into its pinned cache
-/// slot. This is what an operator's
-/// [`next_fs_requests`](crate::operations::Operator::next_fs_requests) yields —
-/// by construction it can only describe a local read, never a remote one — what
-/// the requester submits and completes, and what comes back to the operator's
-/// [`process_fs_response`](crate::operations::Operator::process_fs_response);
-/// the transport stays a type-level fact the whole way. Owning the `Arc<File>`
-/// (the way [`HttpRequest`] owns its `Arc<RemoteFile>`) keeps the descriptor
-/// alive for the read's whole flight.
-pub struct FsRequest {
+/// A filesystem read: read `block` from `file` into its pinned cache slot.
+/// Owning the `Arc<File>` keeps the descriptor alive for the read's whole
+/// flight.
+pub struct FsReadRequest {
     pub file: Arc<File>,
     pub block: MissingExtent,
 }
 
-/// An HTTP(S) read request: read `block` (a byte range) from `remote` into its
-/// pinned cache slot. This is what an operator's
-/// [`next_http_requests`](crate::operations::Operator::next_http_requests)
-/// yields — by construction it can only describe a remote read, never a local
-/// one — what the requester submits and completes, and what comes back to the
-/// operator's
-/// [`process_http_response`](crate::operations::Operator::process_http_response);
-/// the transport stays a type-level fact the whole way.
-pub struct HttpRequest {
+/// An asynchronous filesystem write owned by a dataflow operator. `data` stays
+/// alive until the shared io_uring reports the write complete.
+pub struct FsWriteRequest {
+    pub file: Arc<File>,
+    pub data: Arc<[u8]>,
+}
+
+/// A filesystem operation issued by a dataflow operator. Reads and writes use
+/// the same worker-local io_uring and operator request/completion path.
+pub enum FsRequest {
+    Read(FsReadRequest),
+    Write(FsWriteRequest),
+}
+
+impl FsRequest {
+    /// Borrow the cache-backed read payload, or return `None` for a write.
+    pub fn as_read(&self) -> Option<&FsReadRequest> {
+        match self {
+            Self::Read(request) => Some(request),
+            Self::Write(_) => None,
+        }
+    }
+}
+
+/// A cache-backed HTTP(S) range GET: read `block` from `remote` into its pinned
+/// cache slot.
+pub struct HttpGetRequest {
     pub remote: Arc<RemoteFile>,
     pub block: MissingExtent,
 }
 
-/// A read request that knows how many bytes it transfers, so stats can total
-/// the bytes read alongside the request count. Both transports read a
-/// [`MissingExtent`], so both report its byte length.
+/// An object upload driven by the same per-worker HTTP connection pool and
+/// io_uring as range GETs. Always a `PUT`.
+pub struct HttpUploadRequest {
+    pub remote: Arc<RemoteFile>,
+    pub data: Arc<[u8]>,
+}
+
+/// An HTTP operation issued by a dataflow operator. GETs pass through the
+/// compressed/disk cache; uploads bypass it but share the same worker-local
+/// transport and connection pool.
+pub enum HttpRequest {
+    Get(HttpGetRequest),
+    Upload(HttpUploadRequest),
+}
+
+/// An I/O request that knows how many bytes it transfers, so stats can total
+/// bytes alongside request counts.
 pub trait ReadyBytesLen {
     fn ready_bytes_len(&self) -> u64;
 }
 
-impl ReadyBytesLen for FsRequest {
+impl ReadyBytesLen for FsReadRequest {
     fn ready_bytes_len(&self) -> u64 {
         self.block.len() as u64
+    }
+}
+
+impl ReadyBytesLen for HttpGetRequest {
+    fn ready_bytes_len(&self) -> u64 {
+        self.block.len() as u64
+    }
+}
+
+impl ReadyBytesLen for FsWriteRequest {
+    fn ready_bytes_len(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
+impl ReadyBytesLen for FsRequest {
+    fn ready_bytes_len(&self) -> u64 {
+        match self {
+            Self::Read(request) => request.ready_bytes_len(),
+            Self::Write(request) => request.ready_bytes_len(),
+        }
+    }
+}
+
+impl ReadyBytesLen for HttpUploadRequest {
+    fn ready_bytes_len(&self) -> u64 {
+        self.data.len() as u64
     }
 }
 
 impl ReadyBytesLen for HttpRequest {
     fn ready_bytes_len(&self) -> u64 {
-        self.block.len() as u64
+        match self {
+            Self::Get(request) => request.ready_bytes_len(),
+            Self::Upload(request) => request.ready_bytes_len(),
+        }
     }
 }
 
-/// Associates a read request ([`FsRequest`] or [`HttpRequest`]) with the
-/// dataflow and operator that issued it, so the completed read can be routed
-/// back to the correct operator.
+/// Associates an I/O request with the dataflow and operator that issued it, so
+/// its completion can be routed back to the correct operator.
 pub struct DataFlowRequest<R> {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
     pub request: R,
-    /// When the issuing dataflow handed this read off, stamped only when the
-    /// query opted into stats — the completion path reads it back to bill the
-    /// read's in-flight time. `None` (no clock read) otherwise.
+    /// When the issuing dataflow handed this operation off, stamped only when
+    /// the query opted into stats. `None` (no clock read) otherwise.
     pub submitted_at: Option<std::time::Instant>,
 }
 
@@ -362,14 +416,23 @@ impl<R> DataFlowRequest<R> {
             submitted_at: None,
         }
     }
+
+    /// Transform the request payload while preserving its routing and timing.
+    pub fn map<T>(self, f: impl FnOnce(R) -> T) -> DataFlowRequest<T> {
+        DataFlowRequest {
+            data_flow_id: self.data_flow_id,
+            operator_idx: self.operator_idx,
+            request: f(self.request),
+            submitted_at: self.submitted_at,
+        }
+    }
 }
 
-/// How one remote read split across the tiers that served it, counted per piece:
-/// each resident piece is a disk-cache read, each hole an HTTP fetch. A read split
-/// across both reports a request and its bytes under each tier, so neither tier's
-/// work is hidden. The byte totals sum to the read's length.
+/// How one remote operation is charged across its transports. A GET counts each
+/// resident piece as a disk-cache read and each hole as an HTTP fetch; an upload
+/// is one HTTP operation with no disk-cache component.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub struct RemoteReadSplit {
+pub struct RemoteSplit {
     pub disk_cache_requests: u64,
     pub disk_cache_bytes: u64,
     pub http_requests: u64,
@@ -386,17 +449,20 @@ pub struct RemoteReadTime {
     pub http: Duration,
 }
 
-/// One completed read drained from [`IORequester::completions`]: either a
-/// filesystem read or an HTTP one, with the originating dataflow/operator
-/// attached and the transport kind preserved in the type. The HTTP arm also
-/// carries the [`RemoteReadTime`] its pieces accrued, so each tier bills its wait.
+/// One completed I/O operation drained from [`IORequester::completions`], with
+/// its originating dataflow/operator attached. Each variant carries the concrete
+/// request it finished; a completed cache-backed GET also carries the
+/// [`RemoteReadTime`] its pieces accrued.
 pub enum Completion {
-    Fs(DataFlowRequest<FsRequest>),
-    Http(DataFlowRequest<HttpRequest>, RemoteReadTime),
+    FsRead(DataFlowRequest<FsReadRequest>),
+    FsWrite(DataFlowRequest<FsWriteRequest>),
+    HttpGet(DataFlowRequest<HttpGetRequest>, RemoteReadTime),
+    HttpUpload(DataFlowRequest<HttpUploadRequest>),
 }
 
-/// A read that failed transport-side — an HTTP read that exhausted its retries
-/// (or hit a non-retryable error), or a disk read whose CQE came back negative.
+/// An operation that failed transport-side — an HTTP operation that exhausted
+/// its retries (or hit a non-retryable error), or a disk operation whose CQE
+/// came back negative.
 /// Carries the dataflow/operator that issued it so the worker can cancel just
 /// that dataflow, plus the error to report. Surfaced as the `Err` arm of a
 /// per-read result from [`IORequester::completions`], so one failed read never

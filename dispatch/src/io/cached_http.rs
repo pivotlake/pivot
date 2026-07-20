@@ -24,9 +24,10 @@ use crate::Identifier;
 use crate::io::IORequesterError as Error;
 use crate::io::backend::IOBackend;
 use crate::io::disk_cache::{DiskCache, Object, Segment};
-use crate::io::http::{HttpEngine, RemoteRead, default_client_config};
+use crate::io::http::{HttpEngine, RemoteRead, RemoteUpload, default_client_config};
 use crate::io::{
-    Completion, DataFlowRequest, FailedRead, HttpRequest, RemoteReadSplit, RemoteReadTime,
+    Completion, DataFlowRequest, FailedRead, HttpGetRequest, HttpUploadRequest, RemoteReadTime,
+    RemoteSplit,
 };
 use crate::memory::compressed_cache::MissingExtent;
 use std::collections::HashMap;
@@ -60,6 +61,9 @@ pub(crate) struct CachedHttpEngine {
     cache_reads: HashMap<Identifier, CacheRead>,
     /// Pieces being fetched over HTTP (engine request-id space).
     http_reads: HashMap<Identifier, HttpRead>,
+    /// Whole-object uploads, keyed by the same engine request id space and
+    /// driven by the same connection pool as reads.
+    http_uploads: HashMap<Identifier, DataFlowRequest<HttpUploadRequest>>,
     next_http_id: Identifier,
     /// Write-backs populating the cache file after an HTTP piece landed (backend
     /// disk-id space). Each holds the slot pin until the write has read it.
@@ -71,7 +75,7 @@ pub(crate) struct CachedHttpEngine {
 /// original request and yields it unchanged once the last piece has landed.
 struct RequestedRead {
     remaining: usize,
-    request: DataFlowRequest<HttpRequest>,
+    request: DataFlowRequest<HttpGetRequest>,
     /// In-flight time accrued so far, per tier: each piece adds its own wait as it
     /// lands, and the total bills the dataflow's stats once the read completes.
     time: RemoteReadTime,
@@ -114,6 +118,7 @@ impl CachedHttpEngine {
             next_read_id: 0,
             cache_reads: HashMap::new(),
             http_reads: HashMap::new(),
+            http_uploads: HashMap::new(),
             next_http_id: 0,
             cache_writes: HashMap::new(),
         })
@@ -127,12 +132,12 @@ impl CachedHttpEngine {
     /// are served from the cache file and holes fetched over HTTP, so only the
     /// missing ranges hit the network. With no cache the whole block is a single
     /// fetched piece. `disk_id` allocates ids for cache-file ops on the backend.
-    pub fn request(
+    pub fn get(
         &mut self,
         backend: &mut IOBackend,
         disk_id: &mut Identifier,
-        request: DataFlowRequest<HttpRequest>,
-    ) -> Result<RemoteReadSplit> {
+        request: DataFlowRequest<HttpGetRequest>,
+    ) -> Result<RemoteSplit> {
         // The cache file for this object, or `None` to read straight from the
         // network. A resident segment is only ever produced for a `Some` object,
         // so its fd is read inside the resident branch below.
@@ -159,7 +164,7 @@ impl CachedHttpEngine {
         // Count each piece against the tier that serves it: a resident segment is
         // one cache-file read, a hole one HTTP fetch. A read split across both
         // reports under each tier so neither's work is hidden.
-        let mut split = RemoteReadSplit::default();
+        let mut split = RemoteSplit::default();
 
         for seg in &segments {
             let block = request.request.block.carve(seg.rel_offset, seg.len);
@@ -240,12 +245,49 @@ impl CachedHttpEngine {
     ) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
-            self.http.start(&mut backend.ring, id, read)?;
+            self.http.start_get(&mut backend.ring, id, read)?;
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = backend;
-            self.http.start(id, read)?;
+            self.http.start_get(id, read)?;
+        }
+        Ok(())
+    }
+
+    /// Submit an upload directly to the underlying transport. Uploads bypass the
+    /// read cache but otherwise share its worker-local HTTP engine. Unlike a read,
+    /// an upload touches no disk, so it needs no backend disk-op id.
+    pub fn upload(
+        &mut self,
+        backend: &mut IOBackend,
+        request: DataFlowRequest<HttpUploadRequest>,
+    ) -> Result<()> {
+        let id = self.next_http_id;
+        self.next_http_id += 1;
+        let upload = RemoteUpload {
+            remote: request.request.remote.clone(),
+            data: request.request.data.clone(),
+        };
+        self.start_upload(backend, id, upload)?;
+        self.http_uploads.insert(id, request);
+        Ok(())
+    }
+
+    fn start_upload(
+        &mut self,
+        backend: &mut IOBackend,
+        id: Identifier,
+        upload: RemoteUpload,
+    ) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.http.start_upload(&mut backend.ring, id, upload)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = backend;
+            self.http.start_upload(id, upload)?;
         }
         Ok(())
     }
@@ -300,6 +342,8 @@ impl CachedHttpEngine {
         for id in self.http.take_completed() {
             if let Some(http_read) = self.http_reads.remove(&id) {
                 self.complete_http_read(backend, disk_id, http_read, out)?;
+            } else if let Some(upload) = self.http_uploads.remove(&id) {
+                out.push(Ok(Completion::HttpUpload(upload)));
             }
         }
         for (id, error) in self.http.take_failed() {
@@ -311,14 +355,20 @@ impl CachedHttpEngine {
                     operator_idx,
                     error: error.into(),
                 }));
+            } else if let Some(upload) = self.http_uploads.remove(&id) {
+                out.push(Err(FailedRead {
+                    data_flow_id: upload.data_flow_id,
+                    operator_idx: upload.operator_idx,
+                    error: error.into(),
+                }));
             }
         }
         Ok(())
     }
 
-    /// `true` while any HTTP read is in flight.
+    /// `true` while any HTTP GET or upload is in flight.
     pub fn has_network_pending(&self) -> bool {
-        self.http.has_active() || !self.http_reads.is_empty()
+        self.http.has_active() || !self.http_reads.is_empty() || !self.http_uploads.is_empty()
     }
 
     /// `true` if an HTTP completion is already in hand (non-Linux only, where the
@@ -343,11 +393,10 @@ impl CachedHttpEngine {
         !self.cache_reads.is_empty() || !self.cache_writes.is_empty()
     }
 
-    /// Number of HTTP reads issued but not yet completed (the read-ahead depth).
-    /// With no cache this is one per request; with a cache it counts the holes
-    /// being fetched.
+    /// Number of network operations currently outstanding. With no cache this
+    /// is one per GET; with a cache it counts GET holes, plus every upload.
     pub fn network_in_flight(&self) -> usize {
-        self.http_reads.len()
+        self.http_reads.len() + self.http_uploads.len()
     }
 
     /// A cache-file piece landed: commit its sub-blocks and, if it was the last
@@ -384,7 +433,7 @@ impl CachedHttpEngine {
         }
         cache_read.block.commit();
         if let Some((request, time)) = self.finish_piece(cache_read.read, true) {
-            out.push(Ok(Completion::Http(request, time)));
+            out.push(Ok(Completion::HttpGet(request, time)));
         }
     }
 
@@ -425,7 +474,7 @@ impl CachedHttpEngine {
         }
 
         if let Some((request, time)) = self.finish_piece(http_read.read, false) {
-            out.push(Ok(Completion::Http(request, time)));
+            out.push(Ok(Completion::HttpGet(request, time)));
         }
         Ok(())
     }
@@ -439,7 +488,7 @@ impl CachedHttpEngine {
         &mut self,
         read: Identifier,
         from_disk_cache: bool,
-    ) -> Option<(DataFlowRequest<HttpRequest>, RemoteReadTime)> {
+    ) -> Option<(DataFlowRequest<HttpGetRequest>, RemoteReadTime)> {
         let r = self.requested_reads.get_mut(&read)?;
         debug_assert!(r.remaining > 0, "finish_piece: no pieces left");
         if let Some(submitted_at) = r.request.submitted_at {

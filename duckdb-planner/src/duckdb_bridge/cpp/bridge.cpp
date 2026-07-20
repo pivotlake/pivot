@@ -10,6 +10,8 @@
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
@@ -267,6 +269,36 @@ size_t lo_projection_expr_count(const LogicalOperator &op) {
 
 const Expression &lo_projection_expr(const LogicalOperator &op, size_t index) {
 	return *as<duckdb::LogicalProjection>(op).expressions[index];
+}
+
+// ---- ExpressionGet (VALUES) ----
+
+size_t lo_values_row_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalExpressionGet>(op).expressions.size();
+}
+
+size_t lo_values_column_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalExpressionGet>(op).expr_types.size();
+}
+
+const Expression &lo_values_expr(const LogicalOperator &op, size_t row, size_t column) {
+	return *as<duckdb::LogicalExpressionGet>(op).expressions[row][column];
+}
+
+// ---- Insert ----
+
+rust::Box<OptionalTableWrapper> lo_insert_take_table(const LogicalOperator &op) {
+	auto &insert = as<duckdb::LogicalInsert>(op);
+	auto &pivot_entry = insert.table.Cast<PivotTableCatalogEntry>();
+	return std::move(pivot_entry.table);
+}
+
+size_t lo_insert_column_map_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalInsert>(op).column_index_map.size();
+}
+
+bool lo_insert_returns_rows(const LogicalOperator &op) {
+	return as<duckdb::LogicalInsert>(op).return_chunk;
 }
 
 // ---- Filter ----

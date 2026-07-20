@@ -11,8 +11,8 @@ use crate::catalog::TableFile;
 use crate::parquet::request_tracker::{PendingRequest, ReadRequest, RequestTracker};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
-use crate::store::{DataFile, DataFileSource, FileRef};
-use dispatch::io::{FsRequest, HttpRequest, OpenFile, RemoteFile, open_direct_read};
+use crate::store::{DataFile, FileRef};
+use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest, OpenFile};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
 use planner::catalog::Column;
@@ -28,7 +28,7 @@ const MAX_DISK_IN_FLIGHT: usize = 32;
 /// Parse the 4-byte footer length from a file's `tail` (whose final 8 bytes are
 /// `[footer_len][PAR1]`). The reader fetches the tail through the cache, so it
 /// has the bytes in hand rather than `seek`+`read`ing them.
-fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
+pub(super) fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
     if tail.len() < 8 || tail[tail.len() - 4..] != PARQUET_MAGIC {
         return Err(Error::InvalidFooter("missing PAR1 magic".to_string()));
     }
@@ -107,18 +107,9 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
             source,
         } = file;
         let size = file_ref.size as usize;
-        let open_file = match source {
-            DataFileSource::Local(path) => {
-                let fd = open_direct_read(&path).map_err(crate::parquet::op_err)?;
-                OpenFile::Local(Arc::new(fd))
-            }
-            DataFileSource::Remote { url, auth } => {
-                let remote = Arc::new(
-                    RemoteFile::open(url, auth, file_ref.size).map_err(crate::parquet::op_err)?,
-                );
-                OpenFile::Remote(remote)
-            }
-        };
+        let open_file = source
+            .open_read(file_ref.size)
+            .map_err(crate::parquet::op_err)?;
 
         let slot = self
             .tracker
@@ -139,10 +130,10 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
             && self.tracker.http_in_flight() < crate::parquet::http_readahead()
     }
 
-    fn process_fs_response<S: Sender<TableFile>>(
+    fn process_fs_read_response<S: Sender<TableFile>>(
         &mut self,
         sender: &mut S,
-        request: FsRequest,
+        request: FsReadRequest,
     ) -> dispatch::UnaryResult<()> {
         for slot in self.tracker.complete(&ReadRequest::of_fs(&request)) {
             self.tracker.request_for_slot(slot).unwrap().record_block();
@@ -151,12 +142,12 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
         Ok(())
     }
 
-    fn process_http_response<S: Sender<TableFile>>(
+    fn process_http_get_response<S: Sender<TableFile>>(
         &mut self,
         sender: &mut S,
-        request: HttpRequest,
+        request: HttpGetRequest,
     ) -> dispatch::UnaryResult<()> {
-        for slot in self.tracker.complete(&ReadRequest::of_http(&request)) {
+        for slot in self.tracker.complete(&ReadRequest::of_http_get(&request)) {
             self.tracker.request_for_slot(slot).unwrap().record_block();
             self.advance(slot, sender)?;
         }
@@ -186,7 +177,7 @@ struct FooterRead {
     /// Cache lookups pinning the region currently being read.
     lookups: Vec<CacheLookup>,
     pending_fs: Vec<FsRequest>,
-    pending_http: Vec<HttpRequest>,
+    pending_http: Vec<HttpGetRequest>,
     /// Blocks still outstanding for the current region.
     remaining: usize,
     /// `false` while reading the tail probe window; `true` once the footer was
@@ -199,7 +190,7 @@ impl PendingRequest for FooterRead {
         &mut self.pending_fs
     }
 
-    fn pending_http(&mut self) -> &mut Vec<HttpRequest> {
+    fn pending_http(&mut self) -> &mut Vec<HttpGetRequest> {
         &mut self.pending_http
     }
 }
@@ -256,11 +247,11 @@ impl FooterRead {
         for lookup in &self.lookups {
             if let Some(block) = lookup.missing() {
                 match &self.open_file {
-                    OpenFile::Local(file) => self.pending_fs.push(FsRequest {
+                    OpenFile::Local(file) => self.pending_fs.push(FsRequest::Read(FsReadRequest {
                         file: file.clone(),
                         block: block.clone(),
-                    }),
-                    OpenFile::Remote(remote) => self.pending_http.push(HttpRequest {
+                    })),
+                    OpenFile::Remote(remote) => self.pending_http.push(HttpGetRequest {
                         remote: remote.clone(),
                         block: block.clone(),
                     }),

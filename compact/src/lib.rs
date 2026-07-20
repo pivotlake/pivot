@@ -16,7 +16,6 @@
 //! **before** the dispatch workers are torn down (the merge encodes on them).
 
 mod compact;
-mod parquet_writing;
 
 use std::sync::Arc;
 
@@ -120,7 +119,6 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use catalog::parquet::ParquetTable;
-    use catalog::store::ObjectPath;
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
     use parquet::arrow::ArrowWriter;
     use std::path::Path;
@@ -128,14 +126,9 @@ mod tests {
     const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
 
     /// Write `values` as a small SNAPPY Parquet file (single Int64 `Timestamp`
-    /// column) and register it with the `name` table under `file_name` -- the
-    /// way a writer would, so the compacter sees a small input to merge.
-    fn seed_parquet_file(
-        catalog: &Arc<catalog::ParquetCatalog>,
-        name: &str,
-        file_name: &str,
-        values: Vec<i64>,
-    ) {
+    /// column) into `dir` under `file_name`. A table created over `dir` picks it
+    /// up as a small input for the compacter to merge.
+    fn write_parquet_file(dir: &Path, file_name: &str, values: Vec<i64>) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "Timestamp",
             DataType::Int64,
@@ -146,20 +139,14 @@ mod tests {
             vec![Arc::new(Int64Array::from(values)) as _],
         )
         .unwrap();
+        let file = std::fs::File::create(dir.join(file_name)).unwrap();
         // SNAPPY, like every pivot-written file -- the decompressor expects it.
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
-        let mut bytes = Vec::new();
-        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
-
-        let mut table = catalog.table_handle(name).expect("table exists");
-        table
-            .append_data_file(ObjectPath::new(file_name), &bytes, None, None)
-            .unwrap();
-        catalog.publish_table(table);
     }
 
     /// `CREATE TABLE <name> (Timestamp Int64) WITH (path = dir)` against
@@ -220,13 +207,18 @@ mod tests {
     #[test]
     fn compaction_merges_registered_files_and_swaps_catalog() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
-        let dir = tempfile::tempdir().unwrap();
-        let catalog = Arc::new(catalog::ParquetCatalog::new(dispatch.dispatcher().clone()));
-        create_table(&catalog, dispatch.dispatcher(), "events", Some(dir.path()));
+        let db = tempfile::tempdir().unwrap();
+        let table_dir = db.path().join("events");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        write_parquet_file(&table_dir, "a.parquet", vec![1, 2, 3]);
+        write_parquet_file(&table_dir, "b.parquet", vec![4, 5]);
+        write_parquet_file(&table_dir, "c.parquet", vec![6, 7, 8, 9]);
 
-        seed_parquet_file(&catalog, "events", "a.parquet", vec![1, 2, 3]);
-        seed_parquet_file(&catalog, "events", "b.parquet", vec![4, 5]);
-        seed_parquet_file(&catalog, "events", "c.parquet", vec![6, 7, 8, 9]);
+        let catalog = Arc::new(
+            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
+                .unwrap(),
+        );
+        create_table(&catalog, dispatch.dispatcher(), "events", None);
         assert_eq!(catalog.table_files("events").unwrap().len(), 3);
 
         let total: u64 = catalog
@@ -252,7 +244,7 @@ mod tests {
                 .table_files("events")
                 .unwrap()
                 .iter()
-                .any(|f| f.path.as_str().contains("compacted"))
+                .all(|f| f.path.as_str().starts_with("pivot-"))
         );
 
         dispatch.exit();
@@ -270,26 +262,8 @@ mod tests {
         std::fs::create_dir_all(&table_dir).unwrap();
 
         // Two small files under the table's prefix inside the database root.
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "Timestamp",
-            DataType::Int64,
-            false,
-        )]));
-        for (name, values) in [("a.parquet", vec![1i64, 2]), ("b.parquet", vec![3i64])] {
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![Arc::new(Int64Array::from(values)) as _],
-            )
-            .unwrap();
-            let file = std::fs::File::create(table_dir.join(name)).unwrap();
-            // SNAPPY, like every pivot-written file -- the decompressor expects it.
-            let props = parquet::file::properties::WriterProperties::builder()
-                .set_compression(parquet::basic::Compression::SNAPPY)
-                .build();
-            let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-        }
+        write_parquet_file(&table_dir, "a.parquet", vec![1, 2]);
+        write_parquet_file(&table_dir, "b.parquet", vec![3]);
 
         let catalog = Arc::new(
             catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
@@ -316,7 +290,7 @@ mod tests {
         // catalog.
         let files = catalog.table_files("events").unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files[0].path.as_str().contains("compacted"));
+        assert!(files[0].path.as_str().starts_with("pivot-"));
         let on_disk: Vec<_> = std::fs::read_dir(&table_dir)
             .unwrap()
             .flatten()
@@ -346,22 +320,18 @@ mod tests {
     fn compacter_in_another_process_compacts_registered_files() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
-        let data_dir = tempfile::tempdir().unwrap();
+        let table_dir = db.path().join("events");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        write_parquet_file(&table_dir, "a.parquet", vec![1, 2, 3]);
+        write_parquet_file(&table_dir, "b.parquet", vec![4, 5]);
+        write_parquet_file(&table_dir, "c.parquet", vec![6, 7, 8, 9]);
 
-        // "Writer" process: creates the table and registers three files.
+        // "Writer" process: creates the table over the pre-written files.
         let writer_catalog = Arc::new(
             catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
                 .unwrap(),
         );
-        create_table(
-            &writer_catalog,
-            dispatch.dispatcher(),
-            "events",
-            Some(data_dir.path()),
-        );
-        seed_parquet_file(&writer_catalog, "events", "a.parquet", vec![1, 2, 3]);
-        seed_parquet_file(&writer_catalog, "events", "b.parquet", vec![4, 5]);
-        seed_parquet_file(&writer_catalog, "events", "c.parquet", vec![6, 7, 8, 9]);
+        create_table(&writer_catalog, dispatch.dispatcher(), "events", None);
 
         // "Compacter" process: a separate catalog over the same root. Its poll
         // round reloads the table from the log before scanning.
@@ -392,7 +362,7 @@ mod tests {
                 .table_files("events")
                 .unwrap()
                 .iter()
-                .any(|f| f.path.as_str().contains("compacted"))
+                .all(|f| f.path.as_str().starts_with("pivot-"))
         );
         assert_eq!(writer_catalog.table_files("events").unwrap().len(), 1);
 
