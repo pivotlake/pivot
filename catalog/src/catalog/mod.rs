@@ -237,7 +237,7 @@ impl ParquetCatalog {
         store: &Arc<dyn ObjectStore>,
         entry: &CatalogManifestTableEntry,
     ) -> Result<CatalogTable> {
-        let delta_uri = crate::delta::table_uri(&store.describe(), &entry.location)?;
+        let delta_uri = crate::delta::table_uri(&store.location_uri(), &entry.location)?;
         let state = crate::delta::load_table(&delta_uri)?;
         let id = state.id;
         let manifest = TableManifest {
