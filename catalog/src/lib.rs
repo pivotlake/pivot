@@ -5,7 +5,7 @@
 //! - [`parquet`] — the engines: the per-query scan pipeline and the
 //!   metadata-fetch (table load) pipeline, both dataflows over the dispatch
 //!   worker pool.
-//! - [`store`] — the object-store backends (local fs, S3, GCS, in-memory)
+//! - [`store`] — the object-store backends (local fs, S3, in-memory)
 //!   everything above persists through.
 
 // Internal engine crate: the Parquet pipeline's public factories document their
@@ -19,7 +19,7 @@ mod delta;
 mod manifest;
 pub mod parquet;
 pub mod store;
-/// A Docker-backed object-store test harness (MinIO / fake-gcs-server). Gated
+/// A Docker-backed object-store test harness (MinIO). Gated
 /// behind the `test-support` feature so it — and its heavy testcontainers deps —
 /// never enter a normal build.
 #[cfg(feature = "test-support")]
