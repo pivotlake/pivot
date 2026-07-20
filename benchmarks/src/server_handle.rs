@@ -98,7 +98,6 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
                     bind,
                     dispatch,
                     catalog,
-                    vec![],
                     0,
                     4,
                     server::DEFAULT_CATALOG_REFRESH,

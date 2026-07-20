@@ -43,7 +43,6 @@ fn shutdown_signal_drains_all_worker_threads() {
                 bind,
                 dispatch,
                 catalog,
-                vec![],
                 0,
                 4,
                 server::DEFAULT_CATALOG_REFRESH,

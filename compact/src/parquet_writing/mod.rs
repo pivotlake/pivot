@@ -5,15 +5,13 @@
 //! genuinely shared across stages sit beside them: the message [`types`] and the
 //! pipeline's [`WriteError`](error::WriteError) in [`error`].
 //!
-//! A flush's buffered items flow through four work-stealing stages and finished
-//! Parquet files ([`EncodedFile`]) stream out the far end (consumed via
-//! `execute()`), so nothing waits for the whole flush and only a bounded amount
+//! A `RecordBatch` dataflow flows through three work-stealing stages and
+//! finished Parquet files ([`EncodedFile`]) stream out the far end (consumed via
+//! `execute()`), so nothing waits for the whole input and only a bounded amount
 //! sits in memory. After the first stage the unit of work is one **column chunk**
 //! (a single column's values for one row group):
 //!
-//! 1. [`convert`] (`T → RecordBatch`) — each worker flattens the items it
-//!    steals into Arrow batches.
-//! 2. [`partition`] (`RecordBatch → ColumnChunkJob`) — split each batch by its
+//! 1. [`partition`] (`RecordBatch → ColumnChunkJob`) — split each batch by its
 //!    `partition_by` tuple, buffer per partition, and once a partition reaches one
 //!    file's worth, cut it into row groups and emit one job per column — stamping
 //!    each with its file/partition provenance, `sort_bounds`, and sort-column
@@ -24,25 +22,23 @@
 //!    pipeline-breaker, so every later stage is a plain parallel map or a gather.
 //!    (Its partition-tuple and column-statistics helpers live in the `partition`
 //!    directory.)
-//! 3. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) — encode each column
+//! 2. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) — encode each column
 //!    chunk: flatten the column into the leaves Parquet stores, then for each,
 //!    dictionary-encode it where it pays, else PLAIN; cut into pages and
 //!    snappy-compress. The one heavy stage; finished chunks route back to their
 //!    file's owner worker. (Leaf flattening, page cutting and index RLE live in
 //!    the `encoder` directory.)
-//! 4. [`assembler`] (`EncodedColumnChunk → EncodedFile`) — gather a file's column
+//! 3. [`assembler`] (`EncodedColumnChunk → EncodedFile`) — gather a file's column
 //!    chunks, lay each out (the dictionary page, then the data pages) with
 //!    sort-column footer statistics, and emit the finished file.
 //!
-//! There is one pipeline, not two: an unpartitioned, unsorted write is just the
-//! degenerate case where [`partition`] makes a single group (key `None`) and the
-//! per-file metadata is empty. [`encode_items`] feeds it a flush's items (via
-//! [`convert`]); [`encode_record_batches`] feeds it an existing `RecordBatch`
-//! dataflow (skipping [`convert`]), which is how compaction re-encodes a table
-//! without its batches ever leaving the worker pool.
+//! An unpartitioned, unsorted write is just the degenerate case where
+//! [`partition`] makes a single group (key `None`) and the per-file metadata is
+//! empty. [`encode_record_batches`] feeds the pipeline a `RecordBatch` dataflow,
+//! which is how compaction re-encodes a table without its batches ever leaving
+//! the worker pool.
 
 mod assembler;
-mod convert;
 mod encoder;
 mod error;
 mod partition;
@@ -55,57 +51,16 @@ pub(crate) use types::EncodedFile;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::ArrowError;
 use dispatch::{
-    DataFlowDispatcher, DataFlowHandle, OperatorFactory, OperatorSpec, RecordBatchFactoryBridge,
-    RecordBatchOperatorSpec, return_to_worker_mpsc, stealable, values_input,
+    DataFlowHandle, OperatorFactory, OperatorSpec, RecordBatchFactoryBridge,
+    RecordBatchOperatorSpec, return_to_worker_mpsc, stealable,
 };
 
 use types::{ColumnChunkJob, EncodedColumnChunk};
 
-/// A buffered ingest item that flattens itself into one Arrow `RecordBatch`.
-/// Conversion runs inside the pipeline (stage 1) on a worker, so the receive
-/// path only ever buffers the cheap, unconverted item.
-pub trait ToRecordBatch: Send + 'static {
-    /// Output rows this item will produce — a cheap count (not the full
-    /// conversion), used for the flush threshold.
-    fn num_rows(&self) -> usize;
-    /// Flatten into one batch, or `None` if it produced no rows.
-    fn to_record_batch(self) -> Result<Option<arrow_array::RecordBatch>, ArrowError>;
-}
-
-/// Encode a flush's buffered `items` into Parquet files: convert them to Arrow
-/// batches, then route each row to a file by its `partition_by` tuple, recording
-/// the sort-key range (both specs may be empty — then it's one unpartitioned,
-/// unsorted file stream). The returned handle streams [`EncodedFile`]s: iterate
-/// it on a blocking thread and write each file (with its manifest metadata) as it
-/// arrives. This is the ingest flush path.
-pub fn encode_items<T: ToRecordBatch>(
-    dispatcher: &DataFlowDispatcher,
-    items: Vec<T>,
-    partition_by: Arc<[String]>,
-    sort_by: Arc<[String]>,
-    target_rows: usize,
-    target_row_groups: usize,
-) -> DataFlowHandle<EncodedFile> {
-    let workers = dispatcher.worker_count();
-    let batches = values_input(dispatcher, items).chain(
-        stealable::<T>(dispatcher.topology()).into_iter().collect(),
-        convert::factories::<T>(workers),
-    );
-    encode_stages(
-        batches,
-        workers,
-        partition_by,
-        sort_by,
-        target_rows,
-        target_row_groups,
-    )
-}
-
-/// Encode an existing `RecordBatch` dataflow into Parquet files (the batches are
-/// already Arrow, so this skips [`convert`]). Re-applies `partition_by`/`sort_by`,
-/// so the output files carry the right partition tuple and recomputed sort bounds.
+/// Encode an existing `RecordBatch` dataflow into Parquet files. Re-applies
+/// `partition_by`/`sort_by`, so the output files carry the right partition tuple
+/// and recomputed sort bounds.
 /// This is the compaction path: a table scan feeds the batches a worker decodes
 /// straight back into the write pipeline without ever leaving the pool.
 pub fn encode_record_batches(
