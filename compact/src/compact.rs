@@ -32,7 +32,7 @@
 //! can run inside the server or as a separate process over the same database
 //! root. It covers every table of the catalog it is handed and polls — each
 //! round reloads a table to its latest log version before scanning — rather
-//! than being woken by the ingest path; the sinks don't know it exists.
+//! than being woken by a writer; it only ever reads the table log.
 //!
 //! [`replace_data_files`]: catalog::CatalogTable::replace_data_files
 
@@ -50,7 +50,11 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::parquet_writing;
-use crate::sink::{ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE};
+
+/// Rows per row group in a merged file.
+const ROW_GROUP_ROWS: usize = 128 * 1024;
+/// Row groups per merged file, so a merge emits full-size row groups.
+const ROW_GROUPS_PER_FILE: usize = 8;
 
 /// Why one compaction merge failed: either the scan→encode dataflow, or a
 /// catalog write/swap/delete. Both already carry typed causes.
@@ -94,8 +98,8 @@ pub struct Compacter {
     /// How often to re-check the tables' logs for newly-accumulated files.
     poll_interval: Duration,
     catalog: Arc<ParquetCatalog>,
-    /// Monotonic sequence for merged-file names (same collision guard as the
-    /// sink's).
+    /// Monotonic sequence for merged-file names, so concurrent merges under one
+    /// table never collide.
     seq: AtomicU64,
     /// Cumulative work counters, for the introspection API.
     stats: CompactStats,
@@ -298,7 +302,7 @@ impl Compacter {
             if files.len() < 2 {
                 continue;
             }
-            // Oldest first (sink file names embed a timestamp + sequence).
+            // Oldest first (file names embed a timestamp + sequence).
             files.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
 
             // Take as many small files as it takes to fill one ~target-sized
@@ -316,7 +320,7 @@ impl Compacter {
             // The partition's small files don't add up to a full output (e.g. a
             // low-traffic partition of a many-partition table). Merge the pile
             // anyway once enough have accumulated — otherwise such a partition
-            // accumulates small files forever, which is what bloats a sink to
+            // accumulates small files forever, which is what bloats a table to
             // tens of thousands of tiny files. (The merged file is itself a
             // candidate, so it keeps growing toward the target as more arrive.)
             if batch.len() >= self.min_files {

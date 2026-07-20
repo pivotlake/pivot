@@ -67,7 +67,6 @@ fn start_server_on(root: &str) -> u16 {
                 bind,
                 dispatch,
                 catalog,
-                vec![],
                 0,
                 4,
                 server::DEFAULT_CATALOG_REFRESH,
