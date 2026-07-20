@@ -17,6 +17,9 @@ use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
 pub struct S3Store {
+    /// The `s3://bucket/prefix` URI this store was opened with, kept verbatim
+    /// as its addressable root (see [`ObjectStore::location_uri`]).
+    uri: String,
     /// In-bucket prefix under which this catalog's keys live.
     prefix: String,
     region: String,
@@ -69,6 +72,7 @@ impl S3Store {
         };
 
         Ok(Self {
+            uri: uri.to_string(),
             prefix: prefix.to_string(),
             region,
             access_key,
@@ -148,6 +152,10 @@ impl S3Store {
 impl ObjectStore for S3Store {
     fn describe(&self) -> String {
         format!("{} (prefix `{}`)", self.base, self.prefix)
+    }
+
+    fn location_uri(&self) -> String {
+        self.uri.clone()
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
