@@ -1,11 +1,11 @@
-//! A generic key→bytes object store — local filesystem, S3, or GCS — and nothing
+//! A generic key→bytes object store — local filesystem or S3 — and nothing
 //! catalog-specific. It knows how to `get`/`put`/`list`/`delete` objects, do a
 //! conditional create ([`ObjectStore::put_if_absent`], the table log's CAS),
 //! and turn a key into a ring-readable [`DataFile`]; the table manifest,
 //! table log, and catalog build on it one layer up.
 //!
 //! Everything here is **synchronous** and pulls in no async runtime: local
-//! access is plain `std::fs`; S3/GCS go over [`ureq`] (blocking HTTP + rustls).
+//! access is plain `std::fs`; S3 goes over [`ureq`] (blocking HTTP + rustls).
 //! S3 requests are signed with `aws_sigv4::http_request::sign` — a pure function
 //! we call inline (the tokio it transitively links is never driven). Credentials
 //! come from the environment. This runs off the io_uring ring on purpose: a
@@ -17,11 +17,9 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-mod gcs;
 mod local;
 mod object_path;
 mod s3;
-pub use gcs::GcsStore;
 pub use local::LocalStore;
 pub use object_path::ObjectPath;
 pub use s3::S3Store;
@@ -36,7 +34,7 @@ pub enum StoreError {
     },
     #[error("http error talking to object store: {0}")]
     Http(String),
-    #[error("unsupported catalog uri `{0}` (expected a local path, file://, s3://, or gs://)")]
+    #[error("unsupported catalog uri `{0}` (expected a local path, file://, or s3://)")]
     UnsupportedUri(String),
     #[error("missing credential/config: {0}")]
     Config(String),
@@ -89,7 +87,7 @@ pub struct DataFile {
 /// path (via the io_uring file path) or a remote URL (HTTP on the same ring). A
 /// remote URL either carries its own auth (an S3 presigned URL, `auth: None`) or
 /// pairs a stable URL with an [`AuthHeader`] that mints a fresh bearer token per
-/// request (GCS). Which variant a store yields is its business, not the caller's.
+/// request. Which variant a store yields is its business, not the caller's.
 ///
 /// The same key maps to a different URL per direction — [`source`](ObjectStore::source)
 /// builds the read URL, [`sink`](ObjectStore::sink) the write URL (e.g. S3 presigns
@@ -192,7 +190,7 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// Like [`list`](Self::list), but only objects whose key is at or after
     /// `start` (a lexicographic lower bound — a full key under `prefix`, e.g. the
     /// caller's current version file). A backend with a server-side start offset
-    /// (GCS `startOffset`, S3 `start-after`) uses it to begin the scan at `start`
+    /// (S3 `start-after`) uses it to begin the scan at `start`
     /// instead of the bottom of the prefix — crucial when the prefix has
     /// accumulated many soft-deleted tombstones a full scan would wade through.
     /// The default ignores `start` and returns a full `list` (a correct
@@ -217,7 +215,7 @@ pub trait ObjectStore: Debug + Send + Sync {
     }
 
     /// A human-readable description of where this store is rooted - e.g.
-    /// `file:///var/lib/pivot`, `s3://bucket/prefix`, or `gs://bucket/prefix`.
+    /// `file:///var/lib/pivot` or `s3://bucket/prefix`.
     /// Purely for diagnostics and introspection (a dashboard showing whether a
     /// table lives on local disk or object storage); never an addressable key.
     /// The default falls back to the backend's `Debug` form.
@@ -226,13 +224,11 @@ pub trait ObjectStore: Debug + Send + Sync {
     }
 }
 
-/// Open the object store for a catalog root URI: `s3://bucket/prefix`,
-/// `gs://bucket/prefix`, or a local path (optionally `file://`).
+/// Open the object store for a catalog root URI: `s3://bucket/prefix` or a
+/// local path (optionally `file://`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     if uri.starts_with("s3://") || uri.starts_with("s3a://") {
         Ok(Box::new(S3Store::from_uri(uri)?))
-    } else if uri.starts_with("gs://") {
-        Ok(Box::new(GcsStore::from_uri(uri)?))
     } else {
         let path = uri.strip_prefix("file://").unwrap_or(uri);
         Ok(Box::new(LocalStore::new(path)))

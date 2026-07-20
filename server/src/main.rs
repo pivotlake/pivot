@@ -34,7 +34,7 @@ struct Args {
     #[arg(long)]
     path: Option<PathBuf>,
 
-    /// Enable the on-disk cache for remote (S3/GCS) object reads, storing cached
+    /// Enable the on-disk cache for remote (S3) object reads, storing cached
     /// byte ranges under this directory (persists across restarts). Omit to
     /// disable. Only affects object-store reads; local files are unaffected.
     #[arg(long, value_name = "DIR")]

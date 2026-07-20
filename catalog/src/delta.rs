@@ -17,7 +17,6 @@ use delta_kernel::Snapshot;
 use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::aws::AmazonS3Builder;
-use delta_kernel::object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{DataType as DeltaDataType, PrimitiveType, StructField, StructType};
@@ -365,20 +364,6 @@ fn build_engine(uri: &Url) -> Result<DefaultEngine<TokioBackgroundExecutor>, Err
                     .with_endpoint(endpoint)
                     .with_allow_http(true)
                     .with_virtual_hosted_style_request(false);
-            }
-            Arc::new(builder.build()?)
-        }
-        "gs" => {
-            let mut builder = GoogleCloudStorageBuilder::from_env().with_url(uri.as_str());
-            if let Ok(endpoint) = std::env::var("STORAGE_EMULATOR_HOST") {
-                let endpoint = if endpoint.contains("://") {
-                    endpoint
-                } else {
-                    format!("http://{endpoint}")
-                };
-                builder = builder
-                    .with_config(GoogleConfigKey::BaseUrl, endpoint)
-                    .with_config(GoogleConfigKey::SkipSignature, "true");
             }
             Arc::new(builder.build()?)
         }
