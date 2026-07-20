@@ -4,7 +4,7 @@
 //! Credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
 //! `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`); region from
 //! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
-//! path-style S3-compatible endpoint (MinIO, GCS XML interop) for tests.
+//! path-style S3-compatible endpoint (MinIO) for tests.
 
 use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use aws_credential_types::Credentials;

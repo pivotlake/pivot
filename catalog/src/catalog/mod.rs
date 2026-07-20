@@ -5,7 +5,7 @@
 //! coexist with infrequent writers (`CREATE TABLE`, file registrations).
 //! Backing the map is the database's [`ObjectStore`]: an in-memory store by
 //! default ([`ParquetCatalog::new`], ephemeral), or — for a database opened with
-//! [`ParquetCatalog::open`] on a local directory *or* a remote `s3://`/`gs://`
+//! [`ParquetCatalog::open`] on a local directory *or* a remote `s3://`
 //! root — a persisted one.
 //!
 //! Durable state lives in two places, both in the store:
@@ -169,7 +169,7 @@ pub struct ParquetCatalog {
     tables: Arc<RwLock<TableIndex>>,
     /// The database's object store — the table index, Delta logs, and tables'
     /// Parquet data. A local directory by default ([`new`], an ephemeral one
-    /// under the temp dir), or the directory / S3 / GCS root a database is
+    /// under the temp dir), or the directory / S3 root a database is
     /// [`open`](Self::open)ed at. The catalog reads and writes a table's data
     /// through this one store: relative locations live under the database root,
     /// an absolute location at the store's own root (the filesystem root, or the
@@ -207,7 +207,7 @@ impl ParquetCatalog {
     }
 
     /// Open a persisted database rooted at `uri` — a local directory (or
-    /// `file://…`), or a remote `s3://…`/`gs://…` object store — reloading every
+    /// `file://…`), or a remote `s3://…` object store — reloading every
     /// table the manifest records at its latest version: read each table's
     /// manifest (schema + file list) and fetch its files' footers, building the
     /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
