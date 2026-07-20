@@ -77,7 +77,7 @@ fn map_variant_columns(
 ) -> WriteResult<RecordBatch> {
     let schema = batch.schema();
     let variant_columns: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| catalog::parquet::is_variant_field(schema.field(i)))
+        .filter(|&i| crate::parquet::is_variant_field(schema.field(i)))
         .collect();
     if variant_columns.is_empty() {
         return Ok(batch);

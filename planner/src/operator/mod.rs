@@ -19,6 +19,7 @@ mod dummy_scan;
 mod explain;
 mod filter;
 mod input;
+mod insert;
 mod limit;
 mod materialize;
 mod order_by;
@@ -26,6 +27,7 @@ mod projection;
 mod set_variable;
 mod table_function;
 mod top_n;
+mod values;
 
 pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
@@ -33,6 +35,7 @@ pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
+pub use insert::Insert;
 pub use limit::Limit;
 pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
@@ -40,6 +43,7 @@ pub use projection::Projection;
 pub use set_variable::SetVariable;
 pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub use top_n::TopN;
+pub use values::Values;
 
 use crate::compile::{self, DynamicFilterSlots};
 use crate::expression::{self, Expression};
@@ -78,6 +82,8 @@ pub(super) fn slot_for(slots: &mut DynamicFilterSlots, slot_id: usize) -> Arc<Dy
 #[derive(Debug)]
 pub enum Operator {
     Input(Input),
+    Values(Values),
+    Insert(Insert),
     /// A scan over a table-valued function (e.g. `generate_series`).
     TableFunctionScan(TableFunctionScan),
     Projection(Projection),
@@ -131,6 +137,13 @@ impl Operator {
             Operator::Filter(_) | Operator::OrderBy(_) | Operator::TopN(_) | Operator::Limit(_) => {
                 Ok(inputs[0].clone())
             }
+            // A VALUES source emits its expression columns; every row shares
+            // the same types, so the first row speaks for all.
+            Operator::Values(values) => {
+                expression_types(values.rows.first().map_or(&[][..], Vec::as_slice))
+            }
+            // An INSERT emits one row: the inserted-row count.
+            Operator::Insert(_) => Ok(vec![Type::Int64]),
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),
             // EXPLAIN renders its child plan as text, one line per row.
@@ -150,6 +163,8 @@ impl fmt::Display for Operator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Operator::Input(i) => write!(f, "{i}"),
+            Operator::Values(v) => write!(f, "{v}"),
+            Operator::Insert(i) => write!(f, "{i}"),
             Operator::TableFunctionScan(t) => write!(f, "{t}"),
             Operator::Projection(p) => write!(f, "{p}"),
             Operator::OrderBy(o) => write!(f, "{o}"),

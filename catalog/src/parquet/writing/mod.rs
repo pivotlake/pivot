@@ -34,9 +34,10 @@
 //!
 //! An unpartitioned, unsorted write is just the degenerate case where
 //! [`partition`] makes a single group (key `None`) and the per-file metadata is
-//! empty. [`encode_record_batches`] feeds the pipeline a `RecordBatch` dataflow,
-//! which is how compaction re-encodes a table without its batches ever leaving
-//! the worker pool.
+//! empty. [`encode_record_batches`] feeds the pipeline an existing `RecordBatch`
+//! dataflow, which is how compaction re-encodes a table without its batches ever
+//! leaving the worker pool; INSERT continues into the upload operators via
+//! [`encode_record_batches_spec`].
 
 mod assembler;
 mod encoder;
@@ -46,7 +47,7 @@ mod shredding;
 mod stats;
 mod types;
 
-pub(crate) use types::EncodedFile;
+pub use types::EncodedFile;
 
 use std::sync::Arc;
 
@@ -67,9 +68,29 @@ pub fn encode_record_batches(
     spec: RecordBatchOperatorSpec,
     partition_by: Arc<[String]>,
     sort_by: Arc<[String]>,
-    target_rows: usize,
-    target_row_groups: usize,
+    target_rows_per_group: usize,
+    target_row_groups_per_file: usize,
 ) -> DataFlowHandle<EncodedFile> {
+    encode_record_batches_spec(
+        spec,
+        partition_by,
+        sort_by,
+        target_rows_per_group,
+        target_row_groups_per_file,
+    )
+    .execute()
+}
+
+/// Attach the Parquet encoding stages without executing the dataflow. Catalog
+/// INSERT uses this to continue directly into asynchronous upload and commit
+/// operators on the same workers.
+pub(crate) fn encode_record_batches_spec(
+    spec: RecordBatchOperatorSpec,
+    partition_by: Arc<[String]>,
+    sort_by: Arc<[String]>,
+    target_rows_per_group: usize,
+    target_row_groups_per_file: usize,
+) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
     let (dispatcher, heads) = spec.into_parts();
     let workers = heads.len();
     let batches = OperatorSpec::new(
@@ -84,8 +105,8 @@ pub fn encode_record_batches(
         workers,
         partition_by,
         sort_by,
-        target_rows,
-        target_row_groups,
+        target_rows_per_group,
+        target_row_groups_per_file,
     )
 }
 
@@ -99,16 +120,24 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
     workers: usize,
     partition_by: Arc<[String]>,
     sort_by: Arc<[String]>,
-    target_rows: usize,
-    target_row_groups: usize,
-) -> DataFlowHandle<EncodedFile> {
+    target_rows_per_group: usize,
+    target_row_groups_per_file: usize,
+) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
     // One file's worth of rows; a partition flushes a file once it reaches this.
-    let file_rows = target_rows.saturating_mul(target_row_groups).max(1);
+    let file_rows = target_rows_per_group
+        .saturating_mul(target_row_groups_per_file)
+        .max(1);
     let topology = batches.dispatcher().topology();
     batches
         .chain(
             stealable::<RecordBatch>(topology).into_iter().collect(),
-            partition::factories(partition_by, sort_by, file_rows, target_rows, workers),
+            partition::factories(
+                partition_by,
+                sort_by,
+                file_rows,
+                target_rows_per_group,
+                workers,
+            ),
         )
         .chain(
             stealable::<ColumnChunkJob>(topology).into_iter().collect(),
@@ -120,5 +149,4 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
                 .collect(),
             assembler::factories(workers),
         )
-        .execute()
 }

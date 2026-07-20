@@ -152,6 +152,43 @@ fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn values_produces_values_operator(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Projection(col0:Int32, col1:Utf8)
+      Values(rows: 2)
+        DummyScan
+    ");
+}
+
+#[rstest]
+fn insert_values_produces_insert_and_values_operators(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("INSERT INTO example_table VALUES (6, 60, 600, 'eve'), (7, 70, 700, 'bob')")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Insert
+      Projection(a:Int32, b:Int32, c:Int32, name:Utf8)
+        Values(rows: 2)
+          DummyScan
+    ");
+}
+
+#[rstest]
+fn insert_select_keeps_distinct_target_and_scan_bindings(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("INSERT INTO example_table SELECT a, b, c, name FROM example_table")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Insert
+      Projection(a:Int32, b:Int32, c:Int32, name:Utf8)
+        Input([a:Int32, b:Int32, c:Int32, name:Utf8])
+    ");
+}
+
+#[rstest]
 fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")

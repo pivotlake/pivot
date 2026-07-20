@@ -8,28 +8,30 @@
 //! gated so it costs nothing — no clock reads, no counting — when a query didn't
 //! opt in.
 
-use crate::io::{DataFlowRequest, ReadyBytesLen, RemoteReadSplit, RemoteReadTime};
+use crate::io::{DataFlowRequest, FsRequest, ReadyBytesLen, RemoteReadTime, RemoteSplit};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Execution counters for one dataflow, summed across the workers that ran it.
 ///
 /// The `cpu` and `*_time` figures are sums (over workers, and for the IO times
-/// over in-flight reads), so they can each exceed the query's wall time. The
+/// over in-flight operations), so they can each exceed the query's wall time. The
 /// shape they reveal is the point: a high `*_time` relative to `cpu` means the
-/// dataflow spent its time waiting on reads, and `*_time / *_requests` is the
-/// average read latency. A remote read split across tiers counts each piece in
-/// its own tier, so the http and disk-cache counters never hide each other.
+/// dataflow spent its time waiting on I/O. A remote read split across tiers counts
+/// each piece in its own tier, so the HTTP and disk-cache counters never hide each
+/// other; GET/upload and read/write latency also stay in separate time buckets.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct DataFlowStats {
-    /// HTTP fetches issued, one per hole piece of a remote read. A read split
-    /// across the cache and the network counts a fetch here and a cache read under
-    /// `disk_cache_requests`. Pairs with `http_time` for an average fetch latency.
+    /// HTTP operations issued: uploads, plus one fetch per hole piece of a
+    /// remote read. A read split across the cache and the network counts a fetch
+    /// here and a cache read under `disk_cache_requests`.
     pub http_requests: u64,
-    /// Bytes fetched over the network (the hole pieces), summed over every fetch.
+    /// Bytes transferred over HTTP, summed over fetches and uploads.
     pub http_bytes: u64,
-    /// Wall time the network fetches were in flight, summed over every fetch.
-    pub http_time: Duration,
+    /// Wall time HTTP GETs were in flight.
+    pub http_get_time: Duration,
+    /// Wall time HTTP uploads were in flight.
+    pub http_upload_time: Duration,
     /// Cache-file reads issued, one per resident piece of a remote read (a hit
     /// serving a read or part of one). Pairs with `disk_cache_time`.
     pub disk_cache_requests: u64,
@@ -38,12 +40,14 @@ pub struct DataFlowStats {
     pub disk_cache_bytes: u64,
     /// Wall time the cache-file reads were in flight, summed over every cache read.
     pub disk_cache_time: Duration,
-    /// Filesystem block reads issued (local object reads).
+    /// Filesystem operations issued (local object reads and writes).
     pub disk_requests: u64,
-    /// Bytes read over those disk reads, summed over every read.
+    /// Bytes transferred by those filesystem operations.
     pub disk_bytes: u64,
-    /// Wall time those disk reads were in flight, summed over every read.
-    pub disk_time: Duration,
+    /// Wall time local-filesystem reads were in flight.
+    pub disk_read_time: Duration,
+    /// Wall time local-filesystem writes were in flight.
+    pub disk_write_time: Duration,
     /// CPU time spent in this dataflow's operators (decode, group-by, …), summed
     /// across workers. Excludes time parked waiting on IO.
     pub cpu: Duration,
@@ -54,17 +58,19 @@ impl DataFlowStats {
     pub fn merge(&mut self, other: &Self) {
         self.http_requests += other.http_requests;
         self.http_bytes += other.http_bytes;
-        self.http_time += other.http_time;
+        self.http_get_time += other.http_get_time;
+        self.http_upload_time += other.http_upload_time;
         self.disk_cache_requests += other.disk_cache_requests;
         self.disk_cache_bytes += other.disk_cache_bytes;
         self.disk_cache_time += other.disk_cache_time;
         self.disk_requests += other.disk_requests;
         self.disk_bytes += other.disk_bytes;
-        self.disk_time += other.disk_time;
+        self.disk_read_time += other.disk_read_time;
+        self.disk_write_time += other.disk_write_time;
         self.cpu += other.cpu;
     }
 
-    /// Log the IO tally at WARN when any read happened, for a path that has no
+    /// Log the IO tally at WARN when any operation happened, for a path that has no
     /// other reporting: a failed query never reaches the server's stats NOTICE,
     /// so this keeps a slow or failed scan diagnosable. A no-op when the query did
     /// no IO (or did not opt into stats, leaving every counter zero).
@@ -75,11 +81,14 @@ impl DataFlowStats {
         tracing::warn!(
             http_requests = self.http_requests,
             http_mib = self.http_bytes >> 20,
-            http_ms = self.http_time.as_millis() as u64,
+            http_get_ms = self.http_get_time.as_millis() as u64,
+            http_upload_ms = self.http_upload_time.as_millis() as u64,
             disk_cache_requests = self.disk_cache_requests,
             disk_cache_mib = self.disk_cache_bytes >> 20,
             disk_requests = self.disk_requests,
             disk_mib = self.disk_bytes >> 20,
+            disk_read_ms = self.disk_read_time.as_millis() as u64,
+            disk_write_ms = self.disk_write_time.as_millis() as u64,
             cpu_ms = self.cpu.as_millis() as u64,
             "query failed; IO completed before the failure"
         );
@@ -122,24 +131,23 @@ impl StatsCollector {
         }
     }
 
-    /// Count `requests` as local-filesystem reads issued, total their bytes, and
-    /// stamp them for [`record_disk_time`](Self::record_disk_time).
-    pub fn record_issued_disk<R: ReadyBytesLen>(&mut self, requests: &mut [DataFlowRequest<R>]) {
+    /// Count local-filesystem operations, total their bytes, and stamp them so
+    /// their completion can bill the matching read or write time.
+    pub fn record_issued_disk(&mut self, requests: &mut [DataFlowRequest<FsRequest>]) {
         if let Some(stats) = &mut self.stats {
             stats.disk_requests += requests.len() as u64;
             stats.disk_bytes += requests
                 .iter()
-                .map(|r| r.request.ready_bytes_len())
+                .map(|request| request.request.ready_bytes_len())
                 .sum::<u64>();
         }
         self.stamp_issued(requests);
     }
 
-    /// Count one remote read's per-piece split: each piece adds a request and its
-    /// bytes under the tier that served it (the on-disk cache or the network).
-    /// Unlike the disk path this can't count at stamp time, since how a read
-    /// splits across the tiers is known only once the cache is consulted.
-    pub fn record_issued_remote(&mut self, split: RemoteReadSplit) {
+    /// Count a remote operation against the transports that serve it. Unlike
+    /// the disk path this is known only after the requester resolves a GET
+    /// against the cache or accepts an upload.
+    pub fn record_issued_remote(&mut self, split: RemoteSplit) {
         if let Some(stats) = &mut self.stats {
             stats.disk_cache_requests += split.disk_cache_requests;
             stats.disk_cache_bytes += split.disk_cache_bytes;
@@ -150,18 +158,35 @@ impl StatsCollector {
 
     /// Bill a completed remote read's in-flight time, each piece's wait charged to
     /// the tier that served it (see [`RemoteReadTime`]).
-    pub fn record_remote_time(&mut self, time: RemoteReadTime) {
+    pub fn record_http_get_time(&mut self, time: RemoteReadTime) {
         if let Some(stats) = &mut self.stats {
-            stats.http_time += time.http;
+            stats.http_get_time += time.http;
             stats.disk_cache_time += time.disk_cache;
         }
     }
 
-    /// Bill a completed local-filesystem read's in-flight time, from the
-    /// `submitted_at` stamp [`record_issued_disk`](Self::record_issued_disk) left.
-    pub fn record_disk_time(&mut self, submitted_at: Option<Instant>) {
+    /// Bill one completed HTTP upload from submission through response drain.
+    pub fn record_http_upload_time(&mut self, submitted_at: Option<Instant>) {
+        self.record_elapsed(submitted_at, |stats| &mut stats.http_upload_time);
+    }
+
+    /// Bill a completed local-filesystem read's in-flight time.
+    pub fn record_disk_read_time(&mut self, submitted_at: Option<Instant>) {
+        self.record_elapsed(submitted_at, |stats| &mut stats.disk_read_time);
+    }
+
+    /// Bill a completed local-filesystem write's in-flight time.
+    pub fn record_disk_write_time(&mut self, submitted_at: Option<Instant>) {
+        self.record_elapsed(submitted_at, |stats| &mut stats.disk_write_time);
+    }
+
+    fn record_elapsed(
+        &mut self,
+        submitted_at: Option<Instant>,
+        bucket: fn(&mut DataFlowStats) -> &mut Duration,
+    ) {
         if let (Some(stats), Some(submitted_at)) = (&mut self.stats, submitted_at) {
-            stats.disk_time += submitted_at.elapsed();
+            *bucket(stats) += submitted_at.elapsed();
         }
     }
 

@@ -88,7 +88,7 @@ struct Args {
     /// table set up to date with the store: new Delta versions, new files'
     /// footers, and tables committed by other processes. Queries bind against
     /// a snapshot of that in-memory set, so this bounds how stale a query's
-    /// view of *externally* committed data can be (this process's own ingest
+    /// view of *externally* committed data can be (this process's own INSERT
     /// and compaction publish their commits immediately).
     #[arg(long, default_value_t = 30, value_name = "SECS")]
     catalog_refresh_secs: u64,
