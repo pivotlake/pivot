@@ -222,6 +222,15 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn describe(&self) -> String {
         format!("{self:?}")
     }
+
+    /// The machine-addressable URI this store is rooted at — `file:///path` for
+    /// a local store, the `s3://bucket/prefix` it was opened with for S3. This
+    /// is what a durable reference to the store's contents (e.g. a table's
+    /// Delta log location) is derived from, so it must be a parseable URL whose
+    /// path includes the store's key prefix; contrast [`describe`](Self::describe),
+    /// which is free-form text for humans. Required (no default): a backend
+    /// cannot silently fall back to something unaddressable.
+    fn location_uri(&self) -> String;
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix` or a

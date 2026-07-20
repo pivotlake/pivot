@@ -94,7 +94,7 @@ pub(crate) fn initialize_table(
     sort_by: &[String],
     files: &[FileRef],
 ) -> Result<(Url, uuid::Uuid), Error> {
-    let uri = table_uri(&store.describe(), location)?;
+    let uri = table_uri(&store.location_uri(), location)?;
     let fields = columns
         .iter()
         .map(|column| {
