@@ -68,7 +68,6 @@ pub fn server_port() -> u16 {
                     bind,
                     dispatch,
                     catalog,
-                    vec![],
                     0,
                     4,
                     server::DEFAULT_CATALOG_REFRESH,

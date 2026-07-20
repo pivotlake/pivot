@@ -5,7 +5,7 @@ members = [
     "catalog",
     "dispatch",
     "duckdb-planner",
-    "ingest",
+    "compact",
     "planner",
     "server",
     "thriftparquet",
@@ -23,7 +23,7 @@ edition = "2024"
 catalog = { path = "catalog" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
-ingest = { path = "ingest" }
+compact = { path = "compact" }
 planner = { path = "planner" }
 server = { path = "server" }
 thriftparquet = { path = "thriftparquet" }
