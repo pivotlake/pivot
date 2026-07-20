@@ -21,7 +21,7 @@
 
 use std::sync::OnceLock;
 
-use crate::store::{DataFileSource, ObjectPath, ObjectStore, open_store};
+use crate::store::{DataFileLocation, ObjectPath, ObjectStore, open_store};
 use testcontainers::core::ContainerPort;
 use testcontainers::runners::SyncRunner;
 use testcontainers::{Container, GenericImage, ImageExt};
@@ -76,10 +76,10 @@ pub fn gcs(prefix: &str) -> Option<Backend> {
 /// reader is handed.
 pub fn read_via_source(store: &dyn ObjectStore, key: &ObjectPath) -> Vec<u8> {
     match store.source(key).expect("source") {
-        DataFileSource::Local(path) => std::fs::read(path).expect("read local source"),
-        DataFileSource::Remote { url, auth } => {
+        DataFileLocation::Local(path) => std::fs::read(path).expect("read local source"),
+        DataFileLocation::Remote { url, auth } => {
             let mut req = ureq::get(url.as_str());
-            if let Some(header) = auth.as_ref().and_then(|f| f()) {
+            if let Some(header) = auth.and_then(|f| f()) {
                 req = req.set("Authorization", &header);
             }
             let resp = req.call().expect("GET source url");
@@ -239,4 +239,55 @@ fn gcs_create_bucket(endpoint: &str) -> Result<(), String> {
         }
     }
     Err(format!("create bucket: server never became ready ({last})"))
+}
+
+use crate::CatalogTable;
+use crate::manifest::{ManifestEntry, SortBounds};
+
+impl CatalogTable {
+    /// Test-only: write `bytes` as a new data file at `path` (under the table's
+    /// location) and commit it into the table in one manifest version — the way
+    /// tests seed a table with a specific pre-encoded file. Idempotent on `path`.
+    ///
+    /// Production writers never take this path: INSERT and compaction upload
+    /// their files over the shared ring and commit the built row groups. This
+    /// lives here so it stays out of production builds.
+    pub fn append_data_file(
+        &mut self,
+        path: ObjectPath,
+        bytes: &[u8],
+        partition: Option<crate::PartitionValues>,
+        sort_bounds: Option<SortBounds>,
+    ) -> crate::Result<()> {
+        if self.file_refs().iter().any(|file| file.path == path) {
+            return Ok(());
+        }
+        let file = self.write_data_file(path, bytes)?;
+        let entry = ManifestEntry {
+            file,
+            partition,
+            sort_bounds,
+        };
+        // A plain add (data_change = true); the new file's footer is read on a
+        // winning commit via `sync_files_to_manifest`, so no dispatcher is needed.
+        self.commit_manifest_version(&[], &[entry], true, |table| table.sync_files_to_manifest())?;
+        Ok(())
+    }
+}
+
+impl CatalogTable {
+    /// Test-only: atomically swap `removed` files for `added` (bare manifest
+    /// entries) in one manifest version, reading the added files' footers only if
+    /// the swap wins -- so a losing swap errors before touching its output.
+    /// Production compaction commits its merged files through
+    /// `compact_files`, which already holds the row groups.
+    pub fn replace_data_files(
+        &mut self,
+        removed: &[ObjectPath],
+        added: &[ManifestEntry],
+    ) -> crate::Result<()> {
+        self.commit_manifest_version(removed, added, false, |table| {
+            table.sync_files_to_manifest()
+        })
+    }
 }

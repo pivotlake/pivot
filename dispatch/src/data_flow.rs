@@ -15,13 +15,18 @@
 //! - [`get_next_fs_request`](DataFlow::get_next_fs_request) /
 //!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending IO
 //!   requests from operators (e.g. parquet page reads, or HTTP range reads).
-//! - [`process_fs`](DataFlow::process_fs) / [`process_http`](DataFlow::process_http)
-//!   — deliver a completed read to the
-//!   operator that requested it.
+//! - [`process_fs_read`](DataFlow::process_fs_read) /
+//!   [`process_fs_write`](DataFlow::process_fs_write),
+//!   [`process_http_get_response`](DataFlow::process_http_get_response), and
+//!   [`process_http_upload_response`](DataFlow::process_http_upload_response) —
+//!   deliver completed IO to the operator that requested it.
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
-use crate::io::{DataFlowRequest, FsRequest, HttpRequest};
+use crate::io::{
+    DataFlowRequest, FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest,
+    HttpUploadRequest,
+};
 use crate::operations::{AbandonedOperator, FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::worker::waker_set;
@@ -416,22 +421,48 @@ impl DataFlow {
 
     /// Notify the operator that requested it that one of its filesystem reads
     /// has landed (already committed into the cache slot by the requester).
-    pub fn process_fs(&mut self, node_id: Identifier, request: FsRequest) {
+    pub fn process_fs_read(&mut self, node_id: Identifier, request: FsReadRequest) {
         self.try_run(|d| {
             d.graph.operators[node_id]
                 .operator
-                .process_fs_response(request)?;
+                .process_fs_read_response(request)?;
             Ok(())
         });
     }
 
-    /// Notify the operator that requested it that one of its HTTP reads has
-    /// landed (already committed into the cache slot by the requester).
-    pub fn process_http(&mut self, node_id: Identifier, request: HttpRequest) {
+    /// Notify the operator that requested it that one of its filesystem writes
+    /// has completed.
+    pub fn process_fs_write(&mut self, node_id: Identifier, request: FsWriteRequest) {
         self.try_run(|d| {
             d.graph.operators[node_id]
                 .operator
-                .process_http_response(request)?;
+                .process_fs_write_response(request)?;
+            Ok(())
+        });
+    }
+
+    /// Notify the operator that requested it that one of its HTTP GETs has
+    /// landed (already committed into the cache slot by the requester).
+    pub fn process_http_get_response(&mut self, node_id: Identifier, request: HttpGetRequest) {
+        self.try_run(|d| {
+            d.graph.operators[node_id]
+                .operator
+                .process_http_get_response(request)?;
+            Ok(())
+        });
+    }
+
+    /// Notify the operator that requested it that one of its HTTP uploads has
+    /// completed.
+    pub fn process_http_upload_response(
+        &mut self,
+        node_id: Identifier,
+        request: HttpUploadRequest,
+    ) {
+        self.try_run(|d| {
+            d.graph.operators[node_id]
+                .operator
+                .process_http_upload_response(request)?;
             Ok(())
         });
     }
@@ -528,12 +559,27 @@ mod tests {
         fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
             Ok(vec![])
         }
-        fn process_fs_response(&mut self, _request: FsRequest) -> crate::operations::Result<()> {
+        fn process_fs_read_response(
+            &mut self,
+            _request: FsReadRequest,
+        ) -> crate::operations::Result<()> {
             Ok(())
         }
-        fn process_http_response(
+        fn process_fs_write_response(
             &mut self,
-            _request: HttpRequest,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_get_response(
+            &mut self,
+            _request: HttpGetRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
         ) -> crate::operations::Result<()> {
             Ok(())
         }

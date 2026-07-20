@@ -12,17 +12,18 @@ use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
     Aggregate as AggregateView, CreateTable as CreateTableView, Filter as FilterView,
-    Limit as LimitView, OrderBy as OrderByView, OrderKey, Projection as ProjectionView,
-    Reset as ResetView, Set as SetView, TableFunctionScan as TableFunctionScanView,
-    TableScan as TableScanView, TopN as TopNView,
+    Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
+    Projection as ProjectionView, Reset as ResetView, Set as SetView,
+    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
+    Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
 use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, Table};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
-    Aggregate, CreateTable, Error as OperatorError, Filter, Input, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN,
+    Aggregate, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
+    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::type_from_logical;
 
@@ -33,6 +34,37 @@ impl Projection {
                 .exprs()
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl Values {
+    pub(crate) fn from_handle(view: ValuesView<'_>) -> Result<Values, OperatorError> {
+        let rows = (0..view.row_count())
+            .map(|row| {
+                (0..view.column_count())
+                    .map(|column| Expression::from_handle(view.expression(row, column)))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Values { rows })
+    }
+}
+
+impl Insert {
+    pub(crate) fn from_handle(view: InsertView<'_>) -> Result<Insert, OperatorError> {
+        if view.has_column_map() {
+            return Err(OperatorError::Unsupported(
+                "INSERT with an explicit target-column list is not supported".to_string(),
+            ));
+        }
+        if view.returns_rows() {
+            return Err(OperatorError::Unsupported(
+                "INSERT ... RETURNING is not supported".to_string(),
+            ));
+        }
+        Ok(Insert {
+            table: resolve_table(*view.take_table()),
         })
     }
 }
@@ -193,8 +225,8 @@ fn build_orders<'a>(
     .collect()
 }
 
-/// Resolve a scan's catalog entry into the Pivot [`Table`] it wraps: the bound
-/// DuckDB table is a [`DuckDBTableAdapter`] holding the `Box<dyn Table>`.
+/// Resolve a bound catalog entry into the Pivot [`Table`] it wraps: the DuckDB
+/// table is a [`DuckDBTableAdapter`] holding the `Box<dyn Table>`.
 fn resolve_table(wrapper: OptionalTableWrapper) -> Box<dyn Table> {
     let duck: Box<dyn DuckDBTable> = wrapper.table.expect("planner returned an unbound table");
     let any: Box<dyn Any> = duck;

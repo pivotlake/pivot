@@ -56,7 +56,9 @@ mod factory;
 pub use factory::*;
 
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, HttpRequest};
+use crate::io::{
+    FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest,
+};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -117,8 +119,7 @@ pub trait Unary<I, O> {
     /// Process one input item, sending zero or more output items to `sender`.
     fn consume<S: Sender<O>>(&mut self, object: I, sender: &mut S) -> Result<()>;
 
-    /// Return any pending filesystem read requests (e.g. async disk reads for
-    /// parquet pages). See [`Operator::next_fs_requests`].
+    /// Return any pending filesystem requests. See [`Operator::next_fs_requests`].
     fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
         Ok(vec![])
     }
@@ -135,22 +136,39 @@ pub trait Unary<I, O> {
         true
     }
 
-    /// Handle a completed filesystem read; its bytes are already committed to
-    /// the cache slot.
-    fn process_fs_response<S: Sender<O>>(
+    /// Handle a completed filesystem operation. Read bytes are already
+    /// committed to the cache slot.
+    fn process_fs_read_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _request: FsRequest,
+        _request: FsReadRequest,
     ) -> Result<()> {
         unreachable!()
     }
 
-    /// Handle a completed HTTP read; its bytes are already committed to the
-    /// cache slot.
-    fn process_http_response<S: Sender<O>>(
+    fn process_fs_write_response<S: Sender<O>>(
         &mut self,
         _sender: &mut S,
-        _request: HttpRequest,
+        _request: FsWriteRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed HTTP GET; its bytes are already committed to the
+    /// cache slot.
+    fn process_http_get_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: HttpGetRequest,
+    ) -> Result<()> {
+        unreachable!()
+    }
+
+    /// Handle a completed HTTP upload.
+    fn process_http_upload_response<S: Sender<O>>(
+        &mut self,
+        _sender: &mut S,
+        _request: HttpUploadRequest,
     ) -> Result<()> {
         unreachable!()
     }
@@ -179,6 +197,19 @@ pub trait Unary<I, O> {
     /// never consumed (the matching scan is abandoned, see
     /// [`Operator::upstream_cancel_flag`]).
     fn finished_consuming(&self) -> bool {
+        false
+    }
+
+    /// Whether this operator has async work still outstanding that its
+    /// [`finish`](Self::finish) depends on — e.g. writes/uploads submitted to the
+    /// ring whose completions haven't landed yet. The default is `false`.
+    ///
+    /// While `true`, the operator is not counted as done at the cross-worker
+    /// finish barrier, so `finish` runs only once *every* worker's async work has
+    /// settled — letting `finish` read state that those completions produce (e.g.
+    /// a shared row-count total). The worker keeps servicing the ring in the
+    /// meantime, so the outstanding work still makes progress.
+    fn has_pending_work(&self) -> bool {
         false
     }
 
@@ -243,31 +274,53 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         Ok(self.unary.next_http_requests()?)
     }
 
-    fn process_fs_response(&mut self, request: FsRequest) -> super::Result<()> {
-        Ok(self.unary.process_fs_response(&mut self.sender, request)?)
-    }
-
-    fn process_http_response(&mut self, request: HttpRequest) -> super::Result<()> {
+    fn process_fs_read_response(&mut self, request: FsReadRequest) -> super::Result<()> {
         Ok(self
             .unary
-            .process_http_response(&mut self.sender, request)?)
+            .process_fs_read_response(&mut self.sender, request)?)
+    }
+
+    fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
+        Ok(self
+            .unary
+            .process_fs_write_response(&mut self.sender, request)?)
+    }
+
+    fn process_http_get_response(&mut self, request: HttpGetRequest) -> super::Result<()> {
+        Ok(self
+            .unary
+            .process_http_get_response(&mut self.sender, request)?)
+    }
+
+    fn process_http_upload_response(&mut self, request: HttpUploadRequest) -> super::Result<()> {
+        Ok(self
+            .unary
+            .process_http_upload_response(&mut self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<FinishStatus> {
         // Normally an operator finishes only once its input has drained. A
         // transform that has decided to stop early (e.g. a satisfied `LIMIT`)
         // signals `finished_consuming` so we proceed regardless: the unconsumed
-        // tail belongs to a scan that's being abandoned anyway.
-        let done_consuming = || self.receiver.is_empty() || self.unary.finished_consuming();
+        // tail belongs to a scan that's being abandoned anyway. An operator with
+        // outstanding async work (e.g. in-flight uploads) is also not yet done,
+        // so its completions land before the barrier lets `finish` run.
+        let done_consuming = || {
+            (self.receiver.is_empty() || self.unary.finished_consuming())
+                && !self.unary.has_pending_work()
+        };
         if !done_consuming() {
             return Ok(FinishStatus::Pending);
         }
 
+        // Acquire/Release on the counter so the last-out worker's `finish` sees
+        // every peer's pre-decrement writes (e.g. a shared row-count total each
+        // worker's async completions add to), not just channel-delivered data.
         let ready = if self.notified_finished {
-            self.siblings_left.load(Ordering::Relaxed) == 0
+            self.siblings_left.load(Ordering::Acquire) == 0
         } else {
             self.notified_finished = true;
-            let was_last = self.siblings_left.fetch_sub(1, Ordering::Relaxed) == 1;
+            let was_last = self.siblings_left.fetch_sub(1, Ordering::AcqRel) == 1;
             if was_last {
                 // Sibling counter just hit 0: every worker's `try_finish` for this
                 // operator can now run. Wake peers parked on any node's waker so

@@ -18,7 +18,7 @@ use crate::parquet::request_tracker::{ReadRequest, RequestTracker};
 use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::io::{FsRequest, HttpRequest};
+use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -144,20 +144,20 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
             && self.pending_row_groups.load(Ordering::Relaxed) < self.max_pending_row_groups
     }
 
-    fn process_fs_response<S: Sender<RowGroupBuffer>>(
+    fn process_fs_read_response<S: Sender<RowGroupBuffer>>(
         &mut self,
         sender: &mut S,
-        request: FsRequest,
+        request: FsReadRequest,
     ) -> dispatch::UnaryResult<()> {
         self.deliver(ReadRequest::of_fs(&request), sender)
     }
 
-    fn process_http_response<S: Sender<RowGroupBuffer>>(
+    fn process_http_get_response<S: Sender<RowGroupBuffer>>(
         &mut self,
         sender: &mut S,
-        request: HttpRequest,
+        request: HttpGetRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.deliver(ReadRequest::of_http(&request), sender)
+        self.deliver(ReadRequest::of_http_get(&request), sender)
     }
 
     fn finish<S: Sender<RowGroupBuffer>>(

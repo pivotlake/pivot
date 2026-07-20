@@ -2,6 +2,9 @@
 //!
 //! - [`reading`] — the per-query scan: fetch a table's projected column chunks
 //!   over the ring, index, decompress, and decode them into record batches.
+//! - [`writing`] — the encode pipeline: partition record batches into files,
+//!   encode each column chunk, and assemble the Parquet bytes (shared by
+//!   compaction and SQL `INSERT`).
 //! - [`metadata`] — the table load, run once at `CREATE`/`ATTACH`: read every
 //!   file's *footer* into the [`ParquetTable`] whose row groups all later scans
 //!   reuse.
@@ -37,9 +40,12 @@ pub use reading::{
     table_input_with_filter_and_eq_predicates,
 };
 
+pub mod writing;
+
 mod metadata;
 pub use metadata::create_load_and_commit_spec;
 pub(crate) use metadata::load_table_files;
+pub(crate) use metadata::table_file_from_metadata;
 
 mod row_group_stats;
 pub use row_group_stats::{
