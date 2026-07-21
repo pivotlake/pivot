@@ -3,7 +3,7 @@
 use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
-use crate::worker::install_test_worker_waker;
+use crate::waker::install_test_worker_waker;
 use arrow_array::{Decimal128Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
 
 /// A [`Sender`] that collects all sent items for later inspection.

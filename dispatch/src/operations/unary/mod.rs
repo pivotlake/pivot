@@ -67,7 +67,7 @@ use thiserror::Error;
 
 use super::channels::{Receiver, Sender};
 use super::{FinishStatus, Operator};
-use crate::worker::{waker_set, worker_waker};
+use crate::waker::{waker_set, worker_waker};
 
 mod pipeline_breaker;
 pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};

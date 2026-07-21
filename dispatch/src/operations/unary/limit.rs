@@ -29,7 +29,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
-use crate::worker::waker_set;
+use crate::waker::waker_set;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn reached_latches_and_stops_consuming() {
-        crate::worker::install_test_worker_waker();
+        crate::waker::install_test_worker_waker();
         let rows_seen = Arc::new(AtomicUsize::new(0));
         let reached = Arc::new(AtomicBool::new(false));
         let (tx, _rx) = mpsc::channel();

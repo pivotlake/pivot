@@ -12,7 +12,7 @@
 
 use crate::operations::channels::{Receiver, RootChannelFactory, Sender};
 use crate::operations::unary::{self, Unary};
-use crate::worker::waker_set;
+use crate::waker::waker_set;
 use crossbeam_deque::{Injector, Steal};
 use std::marker::PhantomData;
 use std::sync::Arc;
