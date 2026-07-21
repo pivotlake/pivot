@@ -24,6 +24,12 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:5432")]
     bind: SocketAddr,
 
+    /// Memory budget for the buffer pool, as a human-readable size like `32g`
+    /// or `512m` (suffixes k/m/g/t, base-1024, case-insensitive). Overrides the
+    /// `PIVOT_MEMORY_PCT` percentage-of-total-RAM default when set.
+    #[arg(long, value_name = "SIZE", value_parser = parse_memory_size)]
+    memory: Option<usize>,
+
     /// Number of dispatch worker threads. Defaults to the number of cores.
     #[arg(long)]
     workers: Option<usize>,
@@ -107,6 +113,36 @@ fn init_tracing() {
         .init();
 }
 
+/// Parses a human-readable memory size like `32g`, `512m`, or `4096` into a
+/// byte count. Accepts an optional base-1024 suffix (`k`, `m`, `g`, `t`, each
+/// also accepting a trailing `b`), case-insensitive; a bare number is bytes.
+fn parse_memory_size(input: &str) -> Result<usize, String> {
+    let trimmed = input.trim();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(digits_end);
+    if number.is_empty() {
+        return Err(format!("`{input}` has no leading number"));
+    }
+    let value: usize = number
+        .parse()
+        .map_err(|_| format!("`{number}` is not a valid number"))?;
+
+    let multiplier: usize = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1024,
+        "m" | "mb" => 1024 * 1024,
+        "g" | "gb" => 1024 * 1024 * 1024,
+        "t" | "tb" => 1024 * 1024 * 1024 * 1024,
+        other => return Err(format!("`{other}` is not a known size suffix (k/m/g/t)")),
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("`{input}` overflows a byte count"))
+}
+
 /// Returns the total physical memory of the machine in bytes.
 pub fn get_total_memory() -> usize {
     sysinfo::System::new_with_specifics(
@@ -145,8 +181,14 @@ fn main() -> Result<(), Error> {
     let workers = args.workers.unwrap_or_else(dispatch::default_worker_count);
     info!(workers, "initialising dispatch");
     let disk_cache = build_disk_cache(&args);
-    let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
-    let pool_bytes = get_total_memory() * memory_pct / 100;
+    let pool_bytes = match args.memory {
+        Some(bytes) => bytes,
+        None => {
+            let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
+            get_total_memory() * memory_pct / 100
+        }
+    };
+    info!(pool_bytes, "buffer pool memory budget");
     let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
 
     // A handful of runtime threads handles the wire protocol comfortably; the
