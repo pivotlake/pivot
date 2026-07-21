@@ -172,6 +172,7 @@ impl CreateTable {
     pub(crate) fn from_handle(view: CreateTableView<'_>) -> Result<CreateTable, OperatorError> {
         Ok(CreateTable {
             request: CreateTableRequest {
+                catalog: view.catalog(),
                 name: view.name(),
                 columns: view
                     .columns()

@@ -1,0 +1,21 @@
+[package]
+name = "metastore"
+version.workspace = true
+edition.workspace = true
+description = "Server configuration: the named datastores (local dir / S3) the server serves, resolved from a pluggable source (a TOML file today)."
+
+[dependencies]
+# The cross-datastore layer: the metastore returns `Arc<dyn catalog::Datastore>`.
+catalog = { workspace = true }
+# The concrete datastore kind the metastore builds today: a `ParquetCatalog` over
+# an object store (with the datastore's own credentials).
+datastore-delta = { workspace = true }
+# Opening a datastore reads its tables' footers over the worker pool.
+dispatch = { workspace = true }
+
+serde = { workspace = true }
+toml = "0.8"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

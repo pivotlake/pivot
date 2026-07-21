@@ -32,8 +32,9 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::Router;
 use axum::routing::{get, post};
-use catalog::ParquetCatalog;
+use catalog::PivotCatalog;
 use compact::CompactionStats;
+use datastore_delta::ParquetCatalog;
 use sysinfo::{Pid, System};
 use tokio::net::TcpListener;
 
@@ -47,7 +48,8 @@ use tables::{files_page, rowgroups_page};
 #[derive(Clone)]
 pub(crate) struct IntrospectState {
     pub(super) catalog: Arc<ParquetCatalog>,
-    pub(super) catalog_dyn: Arc<dyn planner::catalog::Catalog>,
+    /// Every datastore, for the SQL console (which can query across datastores).
+    pub(super) catalogs: Arc<PivotCatalog>,
     pub(super) dispatcher: dispatch::DataFlowDispatcher,
     pub(super) compaction: CompactionStats,
     /// One persistent `System` so CPU usage is measured across polls.
@@ -57,13 +59,16 @@ pub(crate) struct IntrospectState {
 
 impl IntrospectState {
     pub(crate) fn new(
-        catalog: Arc<ParquetCatalog>,
+        catalogs: Arc<PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
         compaction: CompactionStats,
     ) -> Self {
         Self {
-            catalog_dyn: catalog.clone(),
-            catalog,
+            // The SQL console resolves across every datastore; introspection
+            // (tables/files/row groups) targets the default datastore's concrete
+            // catalog.
+            catalog: crate::default_parquet_catalog(&catalogs),
+            catalogs,
             dispatcher,
             compaction,
             system: Arc::new(Mutex::new(System::new())),

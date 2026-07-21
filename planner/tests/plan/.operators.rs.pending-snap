@@ -1,0 +1,33 @@
+{"run_id":"1784631466-277961075","line":60,"new":{"module_name":"plan__operators","snapshot_name":"order_by_limit_produces_top_n","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":60,"expression":"plan.to_string()"},"snapshot":"TopN(limit: 2, offset: 0, order: \"default\".main.example_table.a:Int32 DESC)\n  Projection(a:Int32)\n    Input([a:Int32])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"TopN(limit: 2, offset: 0, order: pv.main.example_table.a:Int32 DESC)\n  Projection(a:Int32)\n    Input([a:Int32])"}}
+{"run_id":"1784631466-277961075","line":196,"new":{"module_name":"plan__operators","snapshot_name":"combined_filter_order_limit","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":196,"expression":"plan.to_string()"},"snapshot":"TopN(limit: 2, offset: 0, order: \"default\".main.example_table.a:Int32 DESC)\n  Projection(a:Int32)\n    Projection(#0:Int32)\n      Filter(a:Int32 <> b:Int32 -> Boolean)\n        Input([a:Int32, b:Int32])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"TopN(limit: 2, offset: 0, order: pv.main.example_table.a:Int32 DESC)\n  Projection(a:Int32)\n    Projection(#0:Int32)\n      Filter(a:Int32 <> b:Int32 -> Boolean)\n        Input([a:Int32, b:Int32])"}}
+{"run_id":"1784631466-277961075","line":72,"new":{"module_name":"plan__operators","snapshot_name":"order_by_without_limit_produces_order_by","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":72,"expression":"plan.to_string()"},"snapshot":"OrderBy(\"default\".main.example_table.a:Int32 DESC)\n  Projection(a:Int32)\n    Input([a:Int32])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"OrderBy(pv.main.example_table.a:Int32 DESC)\n  Projection(a:Int32)\n    Input([a:Int32])"}}
+{"run_id":"1784631757-343729678","line":171,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":147,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":109,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":84,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":72,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":159,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":97,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":135,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":35,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":24,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":60,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":124,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":196,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":184,"new":null,"old":null}
+{"run_id":"1784631757-343729678","line":47,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":109,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":135,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":124,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":184,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":47,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":159,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":35,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":196,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":171,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":84,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":72,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":24,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":60,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":147,"new":null,"old":null}
+{"run_id":"1784632234-577645233","line":97,"new":null,"old":null}

@@ -18,7 +18,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::ParquetCatalog;
+use datastore_delta::ParquetCatalog;
 use planner::Planner;
 use planner::catalog::{Catalog as PlannerCatalog, Column, CreateTableRequest};
 use planner::types::Type;
@@ -65,6 +65,7 @@ fn make_catalog() -> (TempDir, Arc<ParquetCatalog>) {
     catalog
         .create_table(
             CreateTableRequest {
+                catalog: None,
                 name: "t".to_string(),
                 columns: vec![
                     Column {

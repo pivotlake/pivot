@@ -36,7 +36,7 @@ impl DuckDBBind for TestCatalog {}
 struct TestTransaction;
 
 impl DuckDBTransaction for TestTransaction {
-    fn table(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+    fn table(&self, _catalog: &str, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
             "users" => Some(Box::new(UsersTable)),
             _ => None,
@@ -68,7 +68,11 @@ fn no_memory_leak_across_repeated_plans() {
     std::thread::scope(|s| {
         for thread_id in 0..num_threads {
             s.spawn(move || {
-                let mut ctx = PlannerContext::new(Arc::new(TestCatalog));
+                let mut ctx = PlannerContext::new(
+                    Arc::new(TestCatalog),
+                    vec!["db".to_string()],
+                    "db".to_string(),
+                );
 
                 for i in 0..per_thread {
                     let plan = ctx

@@ -124,6 +124,7 @@ const Value &lo_get_param(const LogicalOperator &op, size_t index);
 
 // ---- CreateTable ----
 rust::String lo_create_table_name(const LogicalOperator &op);
+rust::String lo_create_table_catalog(const LogicalOperator &op);
 size_t lo_create_column_count(const LogicalOperator &op);
 rust::String lo_create_column_name(const LogicalOperator &op, size_t index);
 uint8_t lo_create_column_type(const LogicalOperator &op, size_t index);

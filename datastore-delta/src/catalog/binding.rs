@@ -19,7 +19,6 @@ use planner::catalog::{
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
 
-use super::ParquetTransaction;
 use super::insert_sink::build_insert_spec;
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
@@ -87,6 +86,11 @@ fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPa
 /// frozen view. Cloned per-binding so each query accumulates its own predicates.
 #[derive(Clone, Debug)]
 pub struct TableBinding {
+    /// The datastore (DuckDB database) this table was resolved from — the key
+    /// its snapshot lives under in a multi-datastore `PivotTransaction`. A
+    /// query can span several datastores, so this routes each table back to the
+    /// right one at compile time.
+    catalog_name: String,
     /// The table's durable id, resolved once at binding time. Reads pin their
     /// view by the frozen snapshot regardless, but a write resolves the live
     /// table by this id at commit, so it survives a concurrent rename.
@@ -99,9 +103,11 @@ pub struct TableBinding {
 }
 
 impl TableBinding {
-    /// A binding over `id`, with no predicates pushed yet.
-    pub(super) fn new(id: uuid::Uuid, columns: Vec<Column>) -> Self {
+    /// A binding over `id` in datastore `catalog_name`, with no predicates pushed
+    /// yet.
+    pub(super) fn new(catalog_name: String, id: uuid::Uuid, columns: Vec<Column>) -> Self {
         Self {
+            catalog_name,
             id,
             columns,
             predicates: Vec::new(),
@@ -112,27 +118,19 @@ impl TableBinding {
     /// the pushed equality predicates. Pure in-memory; the snapshot is
     /// immutable, so a scan and its late materialize (same filters) build
     /// identical views addressing the same global row-group indices. The
-    /// transaction is always our own [`ParquetTransaction`] (a `ParquetCatalog`
-    /// only ever compiles its own bindings), so the downcast is an invariant;
-    /// failing it is an error, never a silent empty scan.
+    /// transaction is routed to this binding's datastore (its `catalog_name`) by
+    /// [`snapshot_for`](super::snapshot_for); a missing or non-Parquet datastore
+    /// transaction is a bridge bug, never a silent empty scan.
     fn resolve_files(
         &self,
         transaction: &dyn CatalogTransaction,
     ) -> CatalogResult<Arc<ParquetTable>> {
-        let transaction = transaction
-            .as_any()
-            .downcast_ref::<ParquetTransaction>()
-            .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
+        let snapshot = super::snapshot_for(transaction, &self.catalog_name)?;
         // Resolve by the durable id, same as the write path. The snapshot is
-        // frozen, so id and name would resolve the same table here; keying both
-        // paths off the id keeps `name` a pure label. It's still the label in the
-        // error, since a table missing from the snapshot has no id to look up.
-        let table = transaction
-            .snapshot
-            .catalog_table_by_id(&self.id)
-            .ok_or_else(|| {
-                CatalogError::Other(format!("table {} is not in this snapshot", self.id).into())
-            })?;
+        // frozen, so a table missing from it has no id to look up.
+        let table = snapshot.catalog_table_by_id(&self.id).ok_or_else(|| {
+            CatalogError::Other(format!("table {} is not in this snapshot", self.id).into())
+        })?;
         let filters: Vec<PartitionEqFilter> = self.partition_filter_candidates().collect();
         table
             .build_scan_view(&filters)
@@ -205,10 +203,7 @@ impl Table for TableBinding {
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        let transaction = transaction
-            .as_any()
-            .downcast_ref::<ParquetTransaction>()
-            .ok_or_else(|| CatalogError::Other("transaction is not a ParquetTransaction".into()))?;
+        let transaction = super::parquet_transaction_for(transaction, &self.catalog_name)?;
         // Resolve the live-view table by its durable id (not name), so the write
         // targets this exact table even if it was renamed since binding.
         let table = transaction

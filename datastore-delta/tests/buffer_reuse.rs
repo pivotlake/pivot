@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 
-use catalog::parquet::table_input;
 use common::*;
+use datastore_delta::parquet::table_input;
 use dispatch::{AggregationKind, AggregationSlot, Projection, RECORD_BATCH_SIZE};
 
 #[test]

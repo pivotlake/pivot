@@ -36,8 +36,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use catalog::store::ObjectPath;
-use catalog::{CatalogTable, FileRef, ParquetCatalog, scalar_values_equal};
+use datastore_delta::store::ObjectPath;
+use datastore_delta::{CatalogTable, FileRef, ParquetCatalog, scalar_values_equal};
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
@@ -251,7 +251,8 @@ impl Compacter {
         // would just re-split it back out, making no progress. Group by the
         // typed partition tuple and fill a batch from one group.
         let partition_of: HashMap<ObjectPath, _> = table.file_partitions().into_iter().collect();
-        let mut by_partition: Vec<(Option<catalog::PartitionValues>, Vec<FileRef>)> = Vec::new();
+        let mut by_partition: Vec<(Option<datastore_delta::PartitionValues>, Vec<FileRef>)> =
+            Vec::new();
         for file in table.file_refs() {
             if file.size >= self.target_bytes {
                 continue;
@@ -300,8 +301,8 @@ impl Compacter {
 }
 
 fn partition_values_equal(
-    left: &Option<catalog::PartitionValues>,
-    right: &Option<catalog::PartitionValues>,
+    left: &Option<datastore_delta::PartitionValues>,
+    right: &Option<datastore_delta::PartitionValues>,
 ) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -328,7 +329,7 @@ impl CompactJob {
     fn compact(
         mut self,
         inputs: Vec<FileRef>,
-    ) -> Result<(CatalogTable, Vec<FileRef>), catalog::Error> {
+    ) -> Result<(CatalogTable, Vec<FileRef>), datastore_delta::Error> {
         let merged = self
             .table
             .compact_files(&inputs, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE)?;

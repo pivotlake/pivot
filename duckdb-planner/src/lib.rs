@@ -38,7 +38,7 @@
 //! struct MyTransaction;
 //!
 //! impl DuckDBTransaction for MyTransaction {
-//!     fn table(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
+//!     fn table(&self, _catalog: &str, name: &str) -> Option<Box<dyn DuckDBTable>> {
 //!         match name {
 //!             "users" => Some(Box::new(UsersTable)),
 //!             _ => None,
@@ -46,7 +46,7 @@
 //!     }
 //! }
 //!
-//! let mut ctx = PlannerContext::new(Arc::new(MyCatalog));
+//! let mut ctx = PlannerContext::new(Arc::new(MyCatalog), vec!["db".to_string()], "db".to_string());
 //!
 //! // Plan a query inside a transaction; walk the root handle.
 //! let plan = ctx.plan("SELECT name FROM users", Arc::new(MyTransaction)).unwrap();
@@ -121,9 +121,22 @@ pub struct PlannerContext {
 }
 
 impl PlannerContext {
-    /// Create a planner context backed by the given catalog provider.
-    pub fn new(catalog: Arc<dyn DuckDBBind>) -> Self {
-        let ctx = Box::new(catalog_provider::CatalogContext::new(catalog));
+    /// Create a planner context backed by the given static provider, attaching
+    /// one DuckDB database per name in `database_names` and making `default_name`
+    /// the current database. The provider resolves only the transaction-
+    /// independent names (scalar functions), which are generic across datastores;
+    /// per-query table lookups are routed by database name through the
+    /// transaction handed to [`plan`](Self::plan).
+    pub fn new(
+        provider: Arc<dyn DuckDBBind>,
+        database_names: Vec<String>,
+        default_name: String,
+    ) -> Self {
+        let ctx = Box::new(catalog_provider::CatalogContext::new(
+            provider,
+            database_names,
+            default_name,
+        ));
         Self {
             cxx_context: ffi::new_context(ctx),
         }

@@ -44,6 +44,9 @@ use pgwire::error::PgWireResult;
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::response::NoticeResponse;
+// Brings `begin_transaction`/`commit_transaction`/`rollback_transaction` into
+// scope on the concrete `PivotCatalog`.
+use planner::catalog::Catalog;
 use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::{info, warn};
@@ -89,11 +92,20 @@ fn plan_is_cacheable(plan: &planner::Plan) -> bool {
 }
 
 fn with_planner<R>(
-    catalog: &Arc<dyn planner::catalog::Catalog>,
+    catalog: &Arc<catalog::PivotCatalog>,
     f: impl FnOnce(&mut planner::Planner) -> R,
 ) -> R {
     PLANNER.with_borrow_mut(|opt| {
-        let planner = opt.get_or_insert_with(|| planner::Planner::new(catalog.clone()));
+        let planner = opt.get_or_insert_with(|| {
+            // Attach every datastore as its own DuckDB database (so a query can
+            // name it), with the composite as the compile-time catalog.
+            let names = catalog.iter().map(|(name, _)| name.clone()).collect();
+            planner::Planner::with_datastores(
+                names,
+                catalog.default_name().to_string(),
+                catalog.clone() as Arc<dyn planner::catalog::Catalog>,
+            )
+        });
         f(planner)
     })
 }
@@ -109,7 +121,7 @@ fn with_planner<R>(
 /// (non-worker) thread. Calling `execute().collect()` instead would return
 /// ring-backed batches whose `Drop` reaches `memory_ctx()` off-worker and aborts.
 pub(crate) async fn execute_sql(
-    catalog: Arc<dyn planner::catalog::Catalog>,
+    catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
     sql: String,
 ) -> Result<Vec<arrow_array::RecordBatch>, String> {
@@ -314,7 +326,7 @@ impl Drop for CancelOnDrop {
 /// pgwire `SimpleQueryHandler`: plans, compiles, and runs each query on the
 /// blocking pool, surfacing errors and supporting cancellation.
 pub struct PivotQueryHandler {
-    catalog: Arc<dyn planner::catalog::Catalog>,
+    catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
     /// Cache of planned (but not yet compiled) query plans, keyed by SQL text.
     /// Planning a statement (DuckDB optimize + bridge round-trip + plan
@@ -332,7 +344,7 @@ pub struct PivotQueryHandler {
 
 impl PivotQueryHandler {
     pub fn new(
-        catalog: Arc<dyn planner::catalog::Catalog>,
+        catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         Self {
@@ -682,7 +694,7 @@ pub struct PivotHandlers {
 
 impl PivotHandlers {
     pub fn new(
-        catalog: Arc<dyn planner::catalog::Catalog>,
+        catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());

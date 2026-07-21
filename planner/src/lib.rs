@@ -143,6 +143,11 @@ pub use duckdb_planner::{
     DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
 };
 
+/// The datastore a single-catalog [`Planner`] attaches its catalog under (and
+/// makes DuckDB's current database). Kept in sync with the catalog crate's
+/// `DEFAULT_DATASTORE_NAME`; `planner` sits below `catalog` and can't import it.
+const DEFAULT_DATASTORE: &str = "default";
+
 /// Errors surfaced by [`Planner::plan`].
 #[derive(Debug, Error)]
 pub enum Error {
@@ -164,16 +169,40 @@ pub struct Planner {
 }
 
 impl Planner {
-    /// Create a new `Planner` backed by `catalog`.
-    ///
-    /// The catalog is cloned into the internal DuckDB adapter so both the
-    /// translation layer and DuckDB's binder see the same tables.
+    /// Create a `Planner` backed by a single `catalog`, attached to DuckDB as the
+    /// [`DEFAULT_DATASTORE`] database (its current database, so unqualified names
+    /// resolve against it). The degenerate one-datastore case of
+    /// [`with_datastores`](Self::with_datastores).
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
+        Self::with_datastores(
+            vec![DEFAULT_DATASTORE.to_string()],
+            DEFAULT_DATASTORE.to_string(),
+            catalog,
+        )
+    }
+
+    /// Create a `Planner` over several named datastores, each attached to DuckDB
+    /// as its own database so a query can name it (`db.schema.t`). `default_name`
+    /// is the current database. `composite` is the compile-time catalog — it must
+    /// span every datastore for `begin_transaction`/`create_table` (typically a
+    /// `catalog::PivotCatalog` over the same set); its transaction routes each
+    /// table to the right datastore's snapshot by the attach name.
+    pub fn with_datastores(
+        database_names: Vec<String>,
+        default_name: String,
+        composite: Arc<dyn Catalog>,
+    ) -> Self {
         Self {
-            catalog: catalog.clone(),
-            planner_context: duckdb_planner::PlannerContext::new(Arc::new(DuckDBCatalogAdapter {
-                catalog,
-            })),
+            // The static provider only answers generic scalar functions, so a
+            // single one over the composite serves every attached datastore.
+            planner_context: duckdb_planner::PlannerContext::new(
+                Arc::new(DuckDBCatalogAdapter {
+                    catalog: composite.clone(),
+                }),
+                database_names,
+                default_name,
+            ),
+            catalog: composite,
         }
     }
 

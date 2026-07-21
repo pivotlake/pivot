@@ -16,9 +16,9 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::parquet::table_input_with_filter;
-use catalog::parquet::{RowGroupFilter, RowGroupMetadata};
 use common::*;
+use datastore_delta::parquet::table_input_with_filter;
+use datastore_delta::parquet::{RowGroupFilter, RowGroupMetadata};
 use dispatch::Projection;
 
 /// Write a single Int64 column with one row group per three rows, so each row
@@ -26,7 +26,7 @@ use dispatch::Projection;
 fn row_group_per_three(
     dispatch: &DispatchGuard,
     rows: &[i64],
-) -> (TempDir, Arc<catalog::parquet::ParquetTable>) {
+) -> (TempDir, Arc<datastore_delta::parquet::ParquetTable>) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("data.parquet");
     let schema = Arc::new(Schema::new(vec![Field::new(

@@ -19,7 +19,7 @@ mod compact;
 
 use std::sync::Arc;
 
-use catalog::ParquetCatalog;
+use datastore_delta::ParquetCatalog;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -118,7 +118,7 @@ mod tests {
     use super::*;
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
-    use catalog::parquet::ParquetTable;
+    use datastore_delta::parquet::ParquetTable;
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
     use parquet::arrow::ArrowWriter;
     use std::path::Path;
@@ -153,7 +153,7 @@ mod tests {
     /// `catalog`, the way the server would run it -- or, when `dir` is `None`, at
     /// `<name>` under the database root (a store-relative table).
     fn create_table(
-        catalog: &Arc<catalog::ParquetCatalog>,
+        catalog: &Arc<datastore_delta::ParquetCatalog>,
         dispatcher: &DataFlowDispatcher,
         name: &str,
         dir: Option<&Path>,
@@ -167,6 +167,7 @@ mod tests {
             None => std::collections::HashMap::new(),
         };
         let request = CreateTableRequest {
+            catalog: None,
             name: name.to_string(),
             columns: vec![Column {
                 name: "Timestamp".to_string(),
@@ -186,7 +187,7 @@ mod tests {
     /// Refresh `name` to the latest committed manifest (a writer evolves a
     /// cloned-out handle, so the catalog's own copy lags until a refresh), then
     /// return its current row groups.
-    fn fresh_parquet(catalog: &catalog::ParquetCatalog, name: &str) -> Arc<ParquetTable> {
+    fn fresh_parquet(catalog: &datastore_delta::ParquetCatalog, name: &str) -> Arc<ParquetTable> {
         let mut table = catalog.table_handle(name).expect("table exists");
         table.refresh().expect("manifest reload");
         table.build_scan_view(&[]).expect("build scan view")
@@ -215,8 +216,11 @@ mod tests {
         write_parquet_file(&table_dir, "c.parquet", vec![6, 7, 8, 9]);
 
         let catalog = Arc::new(
-            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
-                .unwrap(),
+            datastore_delta::ParquetCatalog::open(
+                db.path().to_str().unwrap(),
+                dispatch.dispatcher(),
+            )
+            .unwrap(),
         );
         create_table(&catalog, dispatch.dispatcher(), "events", None);
         assert_eq!(catalog.table_files("events").unwrap().len(), 3);
@@ -266,8 +270,11 @@ mod tests {
         write_parquet_file(&table_dir, "b.parquet", vec![3]);
 
         let catalog = Arc::new(
-            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
-                .unwrap(),
+            datastore_delta::ParquetCatalog::open(
+                db.path().to_str().unwrap(),
+                dispatch.dispatcher(),
+            )
+            .unwrap(),
         );
         // No `path` option: the table lives at `events` under the root.
         create_table(&catalog, dispatch.dispatcher(), "events", None);
@@ -328,16 +335,22 @@ mod tests {
 
         // "Writer" process: creates the table over the pre-written files.
         let writer_catalog = Arc::new(
-            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
-                .unwrap(),
+            datastore_delta::ParquetCatalog::open(
+                db.path().to_str().unwrap(),
+                dispatch.dispatcher(),
+            )
+            .unwrap(),
         );
         create_table(&writer_catalog, dispatch.dispatcher(), "events", None);
 
         // "Compacter" process: a separate catalog over the same root. Its poll
         // round reloads the table from the log before scanning.
         let compacter_catalog = Arc::new(
-            catalog::ParquetCatalog::open(db.path().to_str().unwrap(), dispatch.dispatcher())
-                .unwrap(),
+            datastore_delta::ParquetCatalog::open(
+                db.path().to_str().unwrap(),
+                dispatch.dispatcher(),
+            )
+            .unwrap(),
         );
         let total: u64 = writer_catalog
             .table_files("events")

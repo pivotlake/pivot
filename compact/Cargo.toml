@@ -9,7 +9,7 @@ dispatch = { workspace = true }
 thriftparquet = { workspace = true }
 # The catalog: candidates come from a table's manifest, reads resolve through
 # it, and the merged files are swapped in through its table log.
-catalog = { workspace = true }
+datastore-delta = { workspace = true }
 
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

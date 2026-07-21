@@ -9,8 +9,9 @@
 pub mod duckdb_types;
 
 use crate::catalog_provider::{
-    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_get_scalar_function,
-    catalog_get_table, catalog_get_table_function, pushdown_filter,
+    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_context_default,
+    catalog_context_names, catalog_get_scalar_function, catalog_get_table,
+    catalog_get_table_function, pushdown_filter,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -85,10 +86,20 @@ pub mod ffi {
         type CatalogContext;
         type TransactionContext;
         type OptionalTableWrapper;
-        fn catalog_get_table(transaction: &TransactionContext, name: &str)
-        -> CatalogGetTableResult;
+        /// Datastore names to attach (one DuckDB database each), and which is the
+        /// current database — read by the C++ context constructor.
+        fn catalog_context_names(ctx: &CatalogContext) -> Vec<String>;
+        fn catalog_context_default(ctx: &CatalogContext) -> String;
+        /// Table / table-function lookups are routed by `catalog` (the datastore
+        /// / database name) to that datastore's snapshot in the transaction.
+        fn catalog_get_table(
+            transaction: &TransactionContext,
+            catalog: &str,
+            name: &str,
+        ) -> CatalogGetTableResult;
         fn catalog_get_table_function(
             transaction: &TransactionContext,
+            catalog: &str,
             name: &str,
         ) -> CatalogGetTableFunctionResult;
         fn catalog_get_scalar_function(
@@ -232,6 +243,9 @@ pub mod ffi {
 
         // ---- CreateTable ----
         fn lo_create_table_name(op: &LogicalOperator) -> String;
+        /// The target database (datastore) of `CREATE TABLE db.schema.t`, or empty
+        /// when unqualified. Routes the create to the right datastore.
+        fn lo_create_table_catalog(op: &LogicalOperator) -> String;
         fn lo_create_column_count(op: &LogicalOperator) -> usize;
         fn lo_create_column_name(op: &LogicalOperator, index: usize) -> String;
         fn lo_create_column_type(op: &LogicalOperator, index: usize) -> u8;

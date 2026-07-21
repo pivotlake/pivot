@@ -11,7 +11,7 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
+use datastore_delta::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 use planner::Planner;
 use planner::catalog::{Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table};
@@ -120,7 +120,7 @@ impl Table for TestTable {
         projection: Projection,
         _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
-        Ok(catalog::parquet::materialize(
+        Ok(datastore_delta::parquet::materialize(
             input,
             self.parquet_table.clone(),
             projection,

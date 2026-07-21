@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
+use catalog::PivotCatalog;
 use common::{pick_free_port, wait_until_listening};
+use datastore_delta::ParquetCatalog;
 use dispatch::Dispatch;
 use server::Server;
 use tokio::sync::oneshot;
@@ -28,7 +29,9 @@ fn shutdown_signal_drains_all_worker_threads() {
 
     let server_thread = thread::spawn(move || {
         let dispatch = Dispatch::spin_up(workers, 32, None);
-        let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
+        let catalog = Arc::new(PivotCatalog::single(Arc::new(ParquetCatalog::new(
+            dispatch.dispatcher().clone(),
+        ))));
         assert_eq!(
             dispatch.workers(),
             workers,

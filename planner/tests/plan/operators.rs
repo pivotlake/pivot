@@ -57,11 +57,11 @@ fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @"
-    TopN(limit: 2, offset: 0, order: pv.main.example_table.a:Int32 DESC)
+    assert_snapshot!(plan.to_string(), @r#"
+    TopN(limit: 2, offset: 0, order: "default".main.example_table.a:Int32 DESC)
       Projection(a:Int32)
         Input([a:Int32])
-    ");
+    "#);
 }
 
 #[rstest]
@@ -69,11 +69,11 @@ fn order_by_without_limit_produces_order_by(mut testing_planner: TestingPlanner)
     let plan = testing_planner
         .plan("SELECT a FROM example_table ORDER BY a DESC")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @"
-    OrderBy(pv.main.example_table.a:Int32 DESC)
+    assert_snapshot!(plan.to_string(), @r#"
+    OrderBy("default".main.example_table.a:Int32 DESC)
       Projection(a:Int32)
         Input([a:Int32])
-    ");
+    "#);
 }
 
 #[rstest]
@@ -193,13 +193,13 @@ fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")
         .unwrap();
-    assert_snapshot!(plan.to_string(), @"
-    TopN(limit: 2, offset: 0, order: pv.main.example_table.a:Int32 DESC)
+    assert_snapshot!(plan.to_string(), @r#"
+    TopN(limit: 2, offset: 0, order: "default".main.example_table.a:Int32 DESC)
       Projection(a:Int32)
         Projection(#0:Int32)
           Filter(a:Int32 <> b:Int32 -> Boolean)
             Input([a:Int32, b:Int32])
-    ");
+    "#);
 }
 
 #[rstest]

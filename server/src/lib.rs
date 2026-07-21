@@ -9,7 +9,7 @@
 //! hops to `tokio::task::spawn_blocking` to drive the (non-`Send`) DuckDB
 //! planner; the planner is cached in a thread-local on each blocking-pool
 //! thread and reused across queries. When run as a binary, the default is to run with the default
-//! `catalog::ParquetCatalog`.
+//! `datastore_delta::ParquetCatalog`.
 //!
 //! The public interface: hand a bind address to [`Server::new`] together
 //! with a [`Dispatch`](dispatch::Dispatch) (from
@@ -26,14 +26,15 @@
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //!
-//! use catalog::ParquetCatalog;
+//! use catalog::PivotCatalog;
+//! use datastore_delta::ParquetCatalog;
 //! use dispatch::Dispatch;
 //! use server::Server;
 //!
 //! # async fn run() -> Result<(), server::Error> {
 //! let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 //! let dispatch = Dispatch::spin_up(workers, 32, None);
-//! let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
+//! let catalog = Arc::new(PivotCatalog::single(Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()))));
 //! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
 //! let server = Server::new(bind, dispatch, catalog, 0, 4, server::DEFAULT_CATALOG_REFRESH);
@@ -52,3 +53,22 @@ mod query_handler;
 mod server;
 
 pub use server::{DEFAULT_CATALOG_REFRESH, Error, Server};
+
+use std::sync::Arc;
+
+use catalog::PivotCatalog;
+use datastore_delta::ParquetCatalog;
+
+/// The default datastore as its concrete [`ParquetCatalog`]. Compaction and the
+/// dashboard are Parquet-specific, so they operate on the default datastore's
+/// concrete catalog, recovered here through the `Datastore` downcast hook. Panics
+/// if the default datastore is not a `ParquetCatalog`; today it always is (the
+/// metastore only builds Delta datastores).
+pub(crate) fn default_parquet_catalog(catalogs: &PivotCatalog) -> Arc<ParquetCatalog> {
+    catalogs
+        .default_datastore()
+        .clone()
+        .as_any_arc()
+        .downcast::<ParquetCatalog>()
+        .expect("default datastore must be a ParquetCatalog for compaction/dashboard")
+}

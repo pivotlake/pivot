@@ -11,11 +11,12 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
+use catalog::PivotCatalog;
+use datastore_delta::ParquetCatalog;
 use dispatch::Dispatch;
 use rstest::fixture;
 use server::Server;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 pub fn pick_free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -42,43 +43,72 @@ pub fn lock_serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Lazily start a shared server on a free local port and return that port.
-/// `Dispatch::spin_up` and the server's tokio runtime live on a dedicated
-/// background thread so the test runtime stays separate from server work.
+/// Start a server on a fresh local port on a dedicated background thread (so the
+/// server's tokio runtime and `Dispatch` stay separate from the test runtime),
+/// with the datastores that `build_catalogs` constructs from that thread's own
+/// `Dispatch`. `ring_slots` sizes the buffer-pool ring (in 2MB slots). Returns
+/// the port once listening. `Dispatch::spin_up` is process-global, so call this
+/// at most once per test binary.
+pub fn start_server<F>(ring_slots: usize, build_catalogs: F) -> u16
+where
+    F: FnOnce(&Dispatch) -> Arc<PivotCatalog> + Send + 'static,
+{
+    let port = pick_free_port();
+    let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
+    let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    thread::spawn(move || {
+        let dispatch = Dispatch::spin_up(workers, ring_slots, None);
+        let catalogs = build_catalogs(&dispatch);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let server = Server::new(
+                bind,
+                dispatch,
+                catalogs,
+                0,
+                4,
+                server::DEFAULT_CATALOG_REFRESH,
+            );
+            let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
+        });
+    });
+
+    wait_until_listening(bind);
+    port
+}
+
+/// Lazily start a shared single-datastore server and return its port. A generous
+/// ring absorbs the cached footer/page residue the many tables the suite creates
+/// leave behind.
 pub fn server_port() -> u16 {
     static PORT: OnceLock<u16> = OnceLock::new();
     *PORT.get_or_init(|| {
-        let port = pick_free_port();
-        let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
-        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-
-        thread::spawn(move || {
-            // A generous ring (in 2MB slots): the suite creates many tables on
-            // one shared server, and each leaves cached footer/page residue. A
-            // small ring fills with that residue until a query's working set no
-            // longer fits and the eviction guard aborts it.
-            let dispatch = Dispatch::spin_up(workers, 256, None);
-            let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let server = Server::new(
-                    bind,
-                    dispatch,
-                    catalog,
-                    0,
-                    4,
-                    server::DEFAULT_CATALOG_REFRESH,
-                );
-                let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
-            });
-        });
-
-        wait_until_listening(bind);
-        port
+        start_server(256, |dispatch| {
+            Arc::new(PivotCatalog::single(Arc::new(ParquetCatalog::new(
+                dispatch.dispatcher().clone(),
+            ))))
+        })
     })
+}
+
+/// Run `sql` and decode every `DataRow` in the response into
+/// `Vec<Option<String>>` (text format), dropping non-row messages.
+pub async fn select_rows(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
+    let msgs = client.simple_query(sql).await.unwrap();
+    msgs.into_iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(
+                (0..r.len())
+                    .map(|i| r.get(i).map(|s| s.to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .collect()
 }
 
 pub async fn connect_client(port: u16) -> Client {

@@ -5,14 +5,16 @@
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use catalog::ParquetCatalog;
+use catalog::PivotCatalog;
 use clap::Parser;
+use datastore_delta::ParquetCatalog;
 use dispatch::env::get_env_var_with_default;
-use dispatch::{BUFFER_SIZE, Dispatch};
+use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
+use metastore::{DEFAULT_DATASTORE_NAME, Metastore, TomlMetastore};
 use server::{Error, Server};
 use tracing::{error, info};
 
@@ -34,11 +36,14 @@ struct Args {
     #[arg(long)]
     workers: Option<usize>,
 
-    /// Database directory. Tables created with `CREATE TABLE` (without their own
-    /// `path`) live under here, and are reloaded on restart. Omit for an
-    /// in-memory catalog — tables vanish on restart and must each name a `path`.
+    /// Metastore file (TOML) defining the datastores to serve — each a local
+    /// directory or S3 root, attached to DuckDB as its own database
+    /// (`SELECT * FROM <datastore>.main.<table>`). A datastore named `default` is
+    /// required and is the current database (unqualified names resolve against
+    /// it). Omit for an ephemeral in-memory `default` datastore — tables vanish
+    /// on restart.
     #[arg(long)]
-    path: Option<PathBuf>,
+    metastore: Option<PathBuf>,
 
     /// Enable the on-disk cache for remote (S3) object reads, storing cached
     /// byte ranges under this directory (persists across restarts). Omit to
@@ -174,6 +179,32 @@ fn build_disk_cache(args: &Args) -> Option<Arc<dispatch::io::DiskCache>> {
     }
 }
 
+/// Open the datastores the server serves. With `--metastore`, read them from the
+/// TOML file; without it, a single ephemeral in-memory `default` datastore. Exits
+/// the process on any failure — there is nothing to serve without a catalog.
+fn build_catalogs(metastore: Option<&Path>, dispatcher: &DataFlowDispatcher) -> Arc<PivotCatalog> {
+    let Some(path) = metastore else {
+        // No metastore: a single ephemeral in-memory `default` datastore.
+        return Arc::new(PivotCatalog::single(Arc::new(ParquetCatalog::new(
+            dispatcher.clone(),
+        ))));
+    };
+    let store = TomlMetastore::open(path).unwrap_or_else(|e| {
+        error!("failed to read metastore `{}`: {e}", path.display());
+        std::process::exit(1);
+    });
+    let datastores = store.datastores(dispatcher).unwrap_or_else(|e| {
+        error!("failed to open datastores from `{}`: {e}", path.display());
+        std::process::exit(1);
+    });
+    Arc::new(
+        PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap_or_else(|e| {
+            error!("invalid metastore configuration: {e}");
+            std::process::exit(1);
+        }),
+    )
+}
+
 fn main() -> Result<(), Error> {
     init_tracing();
     let args = Args::parse();
@@ -200,28 +231,17 @@ fn main() -> Result<(), Error> {
         .enable_all()
         .build()?;
 
-    // Build the catalog on this (coordinator) thread, before the workers are
-    // handed off: opening a persisted database reloads its tables, which reads
+    // Build the datastores on this (coordinator) thread, before the workers are
+    // handed off: opening a persisted datastore reloads its tables, which reads
     // Parquet footers over the dispatch pool.
-    let catalog = match args.path.as_deref() {
-        Some(dir) => {
-            let dir = dir.to_str().expect("database path must be valid UTF-8");
-            Arc::new(
-                ParquetCatalog::open(dir, dispatch.dispatcher()).unwrap_or_else(|e| {
-                    error!("failed to open database `{dir}`: {e}");
-                    std::process::exit(1);
-                }),
-            )
-        }
-        None => Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone())),
-    };
+    let catalogs = build_catalogs(args.metastore.as_deref(), dispatch.dispatcher());
 
     rt.block_on(async move {
         let compact_bytes = if args.compact { args.compact_bytes } else { 0 };
         let mut server = Server::new(
             args.bind,
             dispatch,
-            catalog,
+            catalogs,
             compact_bytes,
             args.compact_min_files,
             Duration::from_secs(args.catalog_refresh_secs),

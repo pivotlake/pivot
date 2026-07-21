@@ -15,9 +15,9 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
-use catalog::store::ObjectPath;
-use catalog::{ParquetCatalog, PartitionEqFilter, TableBinding};
 use common::current_parquet;
+use datastore_delta::store::ObjectPath;
+use datastore_delta::{ParquetCatalog, PartitionEqFilter, TableBinding};
 use planner::Planner;
 use planner::catalog::{
     Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
@@ -106,6 +106,7 @@ fn create_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableR
     let mut options = HashMap::new();
     options.insert("path".to_string(), path.to_string_lossy().into_owned());
     CreateTableRequest {
+        catalog: None,
         name: name.to_string(),
         columns,
         options,
@@ -167,6 +168,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
     let (_dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     let req = CreateTableRequest {
+        catalog: None,
         name: "t".to_string(),
         columns,
         options: HashMap::new(),
@@ -220,6 +222,7 @@ fn create_table_rejects_a_url_path() {
     // A table path is always a plain path — its storage is the database's, not the
     // path's — so a scheme is rejected regardless of the database's storage class.
     let req = CreateTableRequest {
+        catalog: None,
         name: "t".to_string(),
         columns,
         options: HashMap::from([("path".to_string(), "s3://bucket/data".to_string())]),
@@ -486,6 +489,7 @@ fn insert_files_publish_only_when_transaction_commits() {
     create_table(
         &catalog,
         CreateTableRequest {
+            catalog: None,
             name: "pending_insert".to_string(),
             columns: vec![Column {
                 name: "id".to_string(),
@@ -676,10 +680,12 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         ObjectPath::new("data.parquet"),
         ObjectPath::new("extra.parquet"),
     ];
-    let added = vec![catalog::ManifestEntry::new(catalog::FileRef {
-        path: ObjectPath::new("merged.parquet"),
-        size: merged_size,
-    })];
+    let added = vec![datastore_delta::ManifestEntry::new(
+        datastore_delta::FileRef {
+            path: ObjectPath::new("merged.parquet"),
+            size: merged_size,
+        },
+    )];
     // A losing compacter clones the table out at the version where the inputs
     // are present, before the winning swap lands.
     let mut loser = catalog.table_handle("t").unwrap();
@@ -689,13 +695,18 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
-    let loser_added = vec![catalog::ManifestEntry::new(catalog::FileRef {
-        path: ObjectPath::new("merged-loser.parquet"),
-        size: merged_size,
-    })];
+    let loser_added = vec![datastore_delta::ManifestEntry::new(
+        datastore_delta::FileRef {
+            path: ObjectPath::new("merged-loser.parquet"),
+            size: merged_size,
+        },
+    )];
     let loser_result = loser.replace_data_files(&removed, &loser_added);
     assert!(
-        matches!(&loser_result, Err(catalog::Error::CommitConflict { .. })),
+        matches!(
+            &loser_result,
+            Err(datastore_delta::Error::CommitConflict { .. })
+        ),
         "unexpected losing compaction result: {loser_result:?}"
     );
 
@@ -866,10 +877,12 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     // "Compact" data.parquet into merged.parquet but crash before deleting the
     // input: both files are on disk, only merged is in the manifest.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![catalog::ManifestEntry::new(catalog::FileRef {
-        path: ObjectPath::new("merged.parquet"),
-        size: std::fs::metadata(&merged).unwrap().len(),
-    })];
+    let added = vec![datastore_delta::ManifestEntry::new(
+        datastore_delta::FileRef {
+            path: ObjectPath::new("merged.parquet"),
+            size: std::fs::metadata(&merged).unwrap().len(),
+        },
+    )];
     catalog
         .table_handle("t")
         .unwrap()
@@ -949,6 +962,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
 fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
     let dir = TempDir::new().unwrap();
     let request = CreateTableRequest {
+        catalog: None,
         name: "p".to_string(),
         columns: vec![
             Column {

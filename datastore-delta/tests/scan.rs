@@ -12,8 +12,8 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::parquet::{ParquetTable, table_input};
 use common::*;
+use datastore_delta::parquet::{ParquetTable, table_input};
 use dispatch::{AggregationKind, AggregationSlot, Projection};
 
 #[test]

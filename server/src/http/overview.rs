@@ -5,7 +5,7 @@
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use axum::Json;
 use axum::extract::State;
-use catalog::ParquetCatalog;
+use datastore_delta::ParquetCatalog;
 use serde::Serialize;
 
 use super::IntrospectState;
@@ -159,7 +159,7 @@ fn collect_tables(catalog: &ParquetCatalog) -> Vec<TableMeta> {
 async fn count_rows(state: &IntrospectState, table: &str) -> Option<i64> {
     let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
     let batches =
-        crate::query_handler::execute_sql(state.catalog_dyn.clone(), state.dispatcher.clone(), sql)
+        crate::query_handler::execute_sql(state.catalogs.clone(), state.dispatcher.clone(), sql)
             .await
             .ok()?;
     let batch = batches.first()?;

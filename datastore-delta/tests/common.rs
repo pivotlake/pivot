@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Once};
 use tempfile::TempDir;
 
-use catalog::parquet::ParquetTable;
+use datastore_delta::parquet::ParquetTable;
 use dispatch::{DataFlowDispatcher, Dispatch};
 
 // The process-wide dispatcher, created on the first `init*` call.
@@ -107,7 +107,7 @@ pub fn parquet_table(
 /// Reload `name` to its latest committed manifest and return its current row
 /// groups for inspection. The background refresh does the same sweep; here we
 /// drive it on a cloned-out table handle.
-pub fn current_parquet(catalog: &catalog::ParquetCatalog, name: &str) -> Arc<ParquetTable> {
+pub fn current_parquet(catalog: &datastore_delta::ParquetCatalog, name: &str) -> Arc<ParquetTable> {
     let mut table = catalog.table_handle(name).expect("table exists");
     table.refresh().expect("manifest reload");
     table.build_scan_view(&[]).expect("build scan view")

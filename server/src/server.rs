@@ -19,8 +19,9 @@
 //! thread has already terminated.
 
 use crate::query_handler::PivotHandlers;
-use catalog::ParquetCatalog;
+use catalog::PivotCatalog;
 use compact::Compaction;
+use datastore_delta::ParquetCatalog;
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
 use pgwire::tokio::process_socket;
 use std::io;
@@ -65,10 +66,15 @@ pub struct Server {
     /// Cloned dispatcher, kept for the query handler (compiling plans) and the
     /// bundled web console's in-process queries.
     dispatcher: DataFlowDispatcher,
-    /// The concrete catalog, kept so the bundled compacter can read and swap the
-    /// Parquet files a table holds. The query handlers hold it as a
-    /// `dyn Catalog`.
+    /// The default datastore's concrete catalog, kept so the bundled compacter
+    /// can read and swap the Parquet files a table holds, and the dashboard can
+    /// introspect it. Compaction and introspection target the default datastore
+    /// only; queries reach every datastore via `catalogs`.
     catalog: Arc<ParquetCatalog>,
+    /// Every datastore. The query handlers resolve across all of them, the
+    /// background refresh sweeps all of them, and the dashboard's SQL console can
+    /// query across them.
+    catalogs: Arc<PivotCatalog>,
     /// Target size for the bundled compacter (`0` = don't run one).
     compact_bytes: u64,
     /// The compacter's count trigger for sub-target (low-traffic) partitions.
@@ -93,7 +99,7 @@ impl Server {
     pub fn new(
         bind: SocketAddr,
         dispatch: Dispatch,
-        catalog: Arc<ParquetCatalog>,
+        catalogs: Arc<PivotCatalog>,
         compact_bytes: u64,
         compact_min_files: usize,
         catalog_refresh_interval: Duration,
@@ -107,13 +113,17 @@ impl Server {
         for handle in handles {
             watchers.spawn_blocking(move || handle.join());
         }
+        // Compaction and dashboard introspection operate on the default
+        // datastore's concrete catalog; queries reach every datastore.
+        let catalog = crate::default_parquet_catalog(&catalogs);
         Self {
             bind,
             shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher.clone())),
+            handlers: Arc::new(PivotHandlers::new(catalogs.clone(), dispatcher.clone())),
             dispatcher,
             catalog,
+            catalogs,
             compact_bytes,
             compact_min_files,
             http_bind: None,
@@ -157,7 +167,7 @@ impl Server {
         // `/api/query`, so on shutdown we just abort the task.
         let http_task = self.http_bind.map(|bind| {
             let state = crate::http::IntrospectState::new(
-                self.catalog.clone(),
+                self.catalogs.clone(),
                 self.dispatcher.clone(),
                 compaction.stats(),
             );
@@ -176,7 +186,7 @@ impl Server {
         // visible. The catalog was fully loaded at open, so the
         // immediate first tick is skipped.
         let refresh_task = {
-            let catalog = self.catalog.clone();
+            let catalogs = self.catalogs.clone();
             let mut tick = tokio::time::interval(self.catalog_refresh_interval);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             tokio::spawn(async move {
@@ -186,10 +196,11 @@ impl Server {
                 tick.tick().await;
                 loop {
                     tick.tick().await;
-                    let catalog = catalog.clone();
+                    let catalogs = catalogs.clone();
                     // The refresh drives footer-fetch dataflows and blocking
-                    // store reads, so it runs off the reactor.
-                    match tokio::task::spawn_blocking(move || catalog.refresh_catalog()).await {
+                    // store reads, so it runs off the reactor. Sweep every
+                    // datastore so a query against any of them sees new data.
+                    match tokio::task::spawn_blocking(move || catalogs.refresh_all()).await {
                         Ok(Ok(_)) => {}
                         Ok(Err(e)) => warn!(error = %e, "catalog refresh failed"),
                         Err(e) => warn!(error = %e, "catalog refresh panicked"),
@@ -295,8 +306,10 @@ mod tests {
 
     /// An empty in-memory catalog: `Server::serve` only consults it on
     /// incoming queries, which these tests don't drive.
-    fn catalog(dispatch: &Dispatch) -> Arc<ParquetCatalog> {
-        Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()))
+    fn catalog(dispatch: &Dispatch) -> Arc<PivotCatalog> {
+        Arc::new(PivotCatalog::single(Arc::new(ParquetCatalog::new(
+            dispatch.dispatcher().clone(),
+        ))))
     }
 
     #[tokio::test]

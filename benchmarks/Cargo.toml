@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 server = { workspace = true }
 catalog = { workspace = true }
+datastore-delta = { workspace = true }
 planner = { workspace = true }
 dispatch = { workspace = true }
 

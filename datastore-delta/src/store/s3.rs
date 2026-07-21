@@ -1,10 +1,13 @@
 //! S3 (and S3-compatible) backend: blocking HTTP via [`ureq`], requests signed
 //! with SigV4 via `aws_sigv4::http_request::sign` (a pure function — no runtime).
 //!
-//! Credentials are read from the environment (`AWS_ACCESS_KEY_ID`,
-//! `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`); region from
-//! `AWS_REGION`/`AWS_DEFAULT_REGION`. An optional `AWS_ENDPOINT_URL` selects a
-//! path-style S3-compatible endpoint (MinIO) for tests.
+//! Credentials come from one of two places. [`S3Store::from_uri`] reads them from
+//! the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional
+//! `AWS_SESSION_TOKEN`; region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
+//! `AWS_ENDPOINT_URL` selects a path-style S3-compatible endpoint like MinIO).
+//! [`S3Store::with_credentials`] takes them explicitly, so a metastore can supply
+//! a datastore's own key/secret/region/endpoint rather than relying on ambient
+//! environment.
 
 use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use aws_credential_types::Credentials;
@@ -34,23 +37,48 @@ pub struct S3Store {
     agent: ureq::Agent,
 }
 
+/// Explicit S3 credentials and connection parameters for
+/// [`S3Store::with_credentials`], as a metastore holds them per datastore.
+pub struct S3Credentials {
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+    /// A path-style S3-compatible endpoint (e.g. MinIO). `None` uses AWS
+    /// virtual-hosted style.
+    pub endpoint: Option<String>,
+}
+
 impl S3Store {
     /// Parse `s3://bucket/prefix` and resolve credentials/region/endpoint from
     /// the environment.
     pub fn from_uri(uri: &str) -> Result<Self> {
-        let rest = uri
-            .strip_prefix("s3://")
-            .or_else(|| uri.strip_prefix("s3a://"))
-            .ok_or_else(|| StoreError::UnsupportedUri(uri.to_string()))?;
-        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+        let (bucket, prefix) = parse_s3_uri(uri)?;
 
         let region = env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"])
             .unwrap_or_else(|| "us-east-1".to_string());
-        let access_key = env_req("AWS_ACCESS_KEY_ID")?;
-        let secret_key = env_req("AWS_SECRET_ACCESS_KEY")?;
-        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+        let credentials = S3Credentials {
+            region,
+            access_key: env_req("AWS_ACCESS_KEY_ID")?,
+            secret_key: env_req("AWS_SECRET_ACCESS_KEY")?,
+            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+            endpoint: std::env::var("AWS_ENDPOINT_URL").ok(),
+        };
+        Ok(Self::build(uri, bucket, prefix, credentials))
+    }
 
-        let (base, host) = match std::env::var("AWS_ENDPOINT_URL").ok() {
+    /// Parse `s3://bucket/prefix` but take credentials/region/endpoint from
+    /// `credentials` instead of the environment — the path a metastore uses to
+    /// open a datastore with its own configured keys.
+    pub fn with_credentials(uri: &str, credentials: S3Credentials) -> Result<Self> {
+        let (bucket, prefix) = parse_s3_uri(uri)?;
+        Ok(Self::build(uri, bucket, prefix, credentials))
+    }
+
+    /// Assemble the store from a parsed bucket/prefix and resolved credentials,
+    /// computing the signing origin and `Host` from the (optional) endpoint.
+    fn build(uri: &str, bucket: &str, prefix: &str, credentials: S3Credentials) -> Self {
+        let (base, host) = match credentials.endpoint.as_deref() {
             // Path-style against a custom endpoint (MinIO etc.).
             Some(ep) => {
                 let ep = ep.trim_end_matches('/');
@@ -66,22 +94,22 @@ impl S3Store {
             }
             // Virtual-hosted style on AWS.
             None => {
-                let host = format!("{bucket}.s3.{region}.amazonaws.com");
+                let host = format!("{bucket}.s3.{}.amazonaws.com", credentials.region);
                 (format!("https://{host}"), host)
             }
         };
 
-        Ok(Self {
+        Self {
             uri: uri.to_string(),
             prefix: prefix.to_string(),
-            region,
-            access_key,
-            secret_key,
-            session_token,
+            region: credentials.region,
+            access_key: credentials.access_key,
+            secret_key: credentials.secret_key,
+            session_token: credentials.session_token,
             base,
             host,
             agent: ureq::AgentBuilder::new().build(),
-        })
+        }
     }
 
     /// Full request URL for an in-bucket object name (already prefixed).
@@ -338,6 +366,16 @@ struct Contents {
     key: String,
     #[serde(default)]
     size: u64,
+}
+
+/// Split an `s3://bucket/prefix` (or `s3a://…`) URI into its bucket and
+/// in-bucket prefix (empty when the URI names only a bucket).
+fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
+    let rest = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("s3a://"))
+        .ok_or_else(|| StoreError::UnsupportedUri(uri.to_string()))?;
+    Ok(rest.split_once('/').unwrap_or((rest, "")))
 }
 
 fn env_any(keys: &[&str]) -> Option<String> {

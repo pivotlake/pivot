@@ -18,7 +18,6 @@ use planner::compile::Error;
 use planner::types::Type;
 use planner::{TableFunction, TableFunctionSignature};
 
-use super::ParquetTransaction;
 use crate::parquet::RowGroupMetadata;
 
 /// The output columns, in declared order. The single source of truth for both
@@ -34,7 +33,17 @@ const COLUMNS: [(&str, Type); 6] = [
     ("file_name", Type::Utf8),
 ];
 
-pub(super) struct MetadataTableFunction;
+pub(super) struct MetadataTableFunction {
+    /// The datastore this function was resolved from — indexes its snapshot in a
+    /// multi-datastore `PivotTransaction` (in the `catalog` crate).
+    catalog_name: String,
+}
+
+impl MetadataTableFunction {
+    pub(super) fn new(catalog_name: String) -> Self {
+        Self { catalog_name }
+    }
+}
 
 impl TableFunction for MetadataTableFunction {
     fn name(&self) -> &str {
@@ -78,12 +87,10 @@ impl TableFunction for MetadataTableFunction {
         // Read the per-file row groups straight from the transaction's frozen
         // snapshot (every footer is already materialized there), so each row
         // group's `file_name` is its real manifest path - no positional guessing.
-        let transaction = transaction
-            .as_any()
-            .downcast_ref::<ParquetTransaction>()
-            .ok_or_else(|| invalid("metadata() requires a parquet-backed catalog".to_string()))?;
-        let file_row_groups = transaction
-            .snapshot
+        // Routed to this function's datastore, exactly as a table binding is.
+        let snapshot = super::snapshot_for(transaction, &self.catalog_name)
+            .map_err(|_| invalid("metadata() requires a parquet-backed catalog".to_string()))?;
+        let file_row_groups = snapshot
             .file_row_groups(table_name)
             .ok_or_else(|| invalid(format!("table '{table_name}' does not exist")))?;
         let rows = row_group_rows(&file_row_groups);

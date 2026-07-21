@@ -32,7 +32,7 @@ pub(super) async fn query(
 ) -> Json<QueryResponse> {
     let started = Instant::now();
     let result = crate::query_handler::execute_sql(
-        state.catalog_dyn.clone(),
+        state.catalogs.clone(),
         state.dispatcher.clone(),
         req.sql,
     )

@@ -64,6 +64,10 @@ pub struct Column {
 /// implementation can decide what to do with backend-specific keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTableRequest {
+    /// The datastore (DuckDB database) the statement named — `db` in
+    /// `CREATE TABLE db.schema.t`. `None` when unqualified, meaning the default
+    /// datastore. A multi-datastore catalog routes the create by this.
+    pub catalog: Option<String>,
     pub name: String,
     pub columns: Vec<Column>,
     pub options: HashMap<String, String>,
@@ -84,6 +88,16 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     /// can mutate the table without affecting concurrent queries.
     fn table(&self, name: &str) -> Option<Box<dyn Table>>;
 
+    /// Resolve `name` in datastore `catalog` — the database qualifier of a
+    /// `catalog.schema.table` reference. The default ignores `catalog` and
+    /// resolves against this single-datastore transaction; a composite
+    /// transaction over several datastores overrides it to route to the named
+    /// one. This is how DuckDB's per-database binding reaches the right
+    /// datastore's snapshot.
+    fn table_in(&self, _catalog: &str, name: &str) -> Option<Box<dyn Table>> {
+        self.table(name)
+    }
+
     /// A backend-specific table-valued function by `name`, or `None`. This is
     /// how a backend contributes functions only it can answer (e.g. `metadata`,
     /// which needs the backend's row-group metadata). It lives on the
@@ -92,6 +106,26 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     /// generic functions (`generate_series`, `range`) are resolved by the
     /// planner itself and never reach here. Default: none.
     fn table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
+        None
+    }
+
+    /// [`table_function`](Self::table_function) in datastore `catalog`; the
+    /// composite-transaction analogue of [`table_in`](Self::table_in).
+    fn table_function_in(&self, _catalog: &str, name: &str) -> Option<Box<dyn TableFunction>> {
+        self.table_function(name)
+    }
+
+    /// The per-datastore transaction for `catalog`. A single-datastore
+    /// transaction overrides this to return `Some(self)`, ignoring `catalog`; a
+    /// composite over several datastores returns the child transaction for the
+    /// named datastore, or `None` if it holds no such datastore. The default is
+    /// `None` (the trait object cannot be coerced back to `&dyn` without a
+    /// concrete `Self`, so the self-returning single case is an explicit
+    /// override). A backend's [`Table`] uses this to recover its own concrete
+    /// transaction (through [`as_any`](Self::as_any)) from the top-level
+    /// transaction handed to [`compile`](Table::compile), so cross-datastore
+    /// routing stays in the composite and each backend stays oblivious to it.
+    fn transaction_in(&self, _catalog: &str) -> Option<&dyn CatalogTransaction> {
         None
     }
 
@@ -318,15 +352,18 @@ pub struct DuckDBTransactionAdapter {
 }
 
 impl DuckDBTransaction for DuckDBTransactionAdapter {
-    fn table(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
-        let table = self.transaction.table(name)?;
+    fn table(&self, catalog: &str, name: &str) -> Option<Box<dyn DuckDBTable>> {
+        let table = self.transaction.table_in(catalog, name)?;
         Some(Box::new(DuckDBTableAdapter { table }))
     }
 
-    fn table_function(&self, name: &str) -> Option<TableFunctionDef> {
+    fn table_function(&self, catalog: &str, name: &str) -> Option<TableFunctionDef> {
         // The function's own signature is the single source of truth; convert its
         // Pivot types to DuckDB logical type ids for the binder.
-        let signature = self.transaction.table_function(name)?.signature();
+        let signature = self
+            .transaction
+            .table_function_in(catalog, name)?
+            .signature();
         Some(TableFunctionDef {
             arg_type_ids: signature
                 .arguments

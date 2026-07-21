@@ -55,6 +55,9 @@ use planner::catalog::{
     Catalog, CatalogTransaction, CreateTableRequest, Error as CatalogError,
     Result as CatalogResult, Table,
 };
+// The cross-datastore crate. Named with a leading `::` because this module is
+// itself `crate::catalog`, which would otherwise shadow the extern crate.
+use ::catalog::{DEFAULT_DATASTORE_NAME, Datastore};
 pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
@@ -163,6 +166,12 @@ impl TableIndex {
 /// to the latest committed version, so a commit by another process (or this one)
 /// becomes visible to the next query.
 pub struct ParquetCatalog {
+    /// This datastore's name — the key it is registered under in the metastore
+    /// and the database it is attached as in DuckDB. Stamped onto every
+    /// [`TableBinding`] this catalog's transactions resolve, so a query that
+    /// spans several datastores routes each table back to the one that produced
+    /// it.
+    name: String,
     /// The in-memory table set. The lock guards the *set* (add on `CREATE`,
     /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
     /// lock-free value that callers clone out and evolve independently.
@@ -186,6 +195,7 @@ pub struct ParquetCatalog {
 impl std::fmt::Debug for ParquetCatalog {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ParquetCatalog")
+            .field("name", &self.name)
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
@@ -200,6 +210,7 @@ impl ParquetCatalog {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("catalog-{}-{}", std::process::id(), seq));
         Self {
+            name: DEFAULT_DATASTORE_NAME.to_string(),
             tables: Arc::new(RwLock::new(TableIndex::default())),
             store: Arc::new(LocalStore::new(root)),
             dispatcher,
@@ -213,6 +224,19 @@ impl ParquetCatalog {
     /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Self> {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
+        Self::from_store(DEFAULT_DATASTORE_NAME.to_string(), store, dispatcher)
+    }
+
+    /// Open a persisted database over an already-built object store, under the
+    /// datastore `name`. This is the seam a metastore uses: it constructs the
+    /// store (local dir / S3, with whatever credentials it holds) and hands
+    /// it in, rather than having the catalog re-derive one from a URI. Reloads
+    /// every table the manifest records, exactly as [`open`](Self::open) does.
+    pub fn from_store(
+        name: String,
+        store: Arc<dyn ObjectStore>,
+        dispatcher: &DataFlowDispatcher,
+    ) -> Result<Self> {
         let manifest = CatalogManifest::load(store.as_ref())?;
 
         let mut tables = TableIndex::default();
@@ -222,10 +246,17 @@ impl ParquetCatalog {
         }
 
         Ok(Self {
+            name,
             tables: Arc::new(RwLock::new(tables)),
             store,
             dispatcher: dispatcher.clone(),
         })
+    }
+
+    /// This datastore's name — the database it is attached as in DuckDB and the
+    /// key it is registered under in the metastore.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// Build the in-memory [`CatalogTable`] for one persisted table: read its
@@ -278,6 +309,7 @@ impl ParquetCatalog {
     pub fn begin_transaction(&self) -> Arc<ParquetTransaction> {
         Arc::new(ParquetTransaction {
             snapshot: Arc::new(CatalogSnapshot {
+                catalog_name: self.name.clone(),
                 tables: self.tables.read().unwrap().clone(),
             }),
             uploaded_files: Arc::new(Injector::new()),
@@ -597,18 +629,36 @@ impl Catalog for ParquetCatalog {
     }
 }
 
+impl Datastore for ParquetCatalog {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn refresh(&self) -> CatalogResult<bool> {
+        Ok(self.refresh_catalog()?)
+    }
+
+    fn as_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+}
+
 /// One transaction's frozen view of the catalog: every table at the version it
 /// held when the transaction began, with all row-group metadata already
 /// materialized (the background refresh keeps the master set fully fetched).
 /// Everything a query does against it (binding, scan-view construction, late
 /// materialize, `metadata()`) is pure in-memory.
 pub struct CatalogSnapshot {
+    /// The datastore this snapshot belongs to — stamped onto every binding it
+    /// resolves so a multi-datastore query routes each table back here.
+    catalog_name: String,
     tables: TableIndex,
 }
 
 impl std::fmt::Debug for CatalogSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CatalogSnapshot")
+            .field("catalog_name", &self.catalog_name)
             .field("tables", &self.tables.names().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -620,7 +670,11 @@ impl CatalogSnapshot {
     /// of [`CatalogTransaction::table`].
     pub fn table(&self, name: &str) -> Option<TableBinding> {
         let table = self.tables.get_by_name(name)?;
-        Some(TableBinding::new(table.id(), table.columns()))
+        Some(TableBinding::new(
+            self.catalog_name.clone(),
+            table.id(),
+            table.columns(),
+        ))
     }
 
     /// A clone of the table with identity `id`, or `None` if this snapshot has no
@@ -689,12 +743,54 @@ impl CatalogTransaction for ParquetTransaction {
         // planner. It reads the transaction handed to its compile, the same
         // frozen view the rest of the query reads.
         match name {
-            "metadata" => Some(Box::new(MetadataTableFunction)),
+            "metadata" => Some(Box::new(MetadataTableFunction::new(
+                self.snapshot.catalog_name.clone(),
+            ))),
             _ => None,
         }
+    }
+
+    /// A single-datastore transaction is its own datastore, so it ignores the
+    /// requested `catalog` and returns itself. This is what
+    /// [`snapshot_for`] downcasts back to a `ParquetTransaction`.
+    fn transaction_in(&self, _catalog: &str) -> Option<&dyn CatalogTransaction> {
+        Some(self)
     }
 
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Route to this datastore's [`ParquetTransaction`] in `transaction`. Goes
+/// through [`CatalogTransaction::transaction_in`] to the per-datastore child (the
+/// composite returns the child for `catalog_name`; a bare `ParquetTransaction`
+/// returns itself), then downcasts it. A missing or non-Parquet datastore
+/// transaction is a bridge bug, never a silent empty scan. The write path
+/// ([`compile_insert`](binding::TableBinding)) needs the full transaction (its
+/// uploaded-files injector), not just the snapshot.
+pub(super) fn parquet_transaction_for<'a>(
+    transaction: &'a dyn CatalogTransaction,
+    catalog_name: &str,
+) -> CatalogResult<&'a ParquetTransaction> {
+    let child = transaction.transaction_in(catalog_name).ok_or_else(|| {
+        CatalogError::Other(format!("datastore {catalog_name:?} is not in this transaction").into())
+    })?;
+    child
+        .as_any()
+        .downcast_ref::<ParquetTransaction>()
+        .ok_or_else(|| {
+            CatalogError::Other("datastore transaction is not a ParquetTransaction".into())
+        })
+}
+
+/// The [`CatalogSnapshot`] a binding (or table function) in datastore
+/// `catalog_name` reads at compile time.
+pub(super) fn snapshot_for<'a>(
+    transaction: &'a dyn CatalogTransaction,
+    catalog_name: &str,
+) -> CatalogResult<&'a CatalogSnapshot> {
+    Ok(parquet_transaction_for(transaction, catalog_name)?
+        .snapshot
+        .as_ref())
 }

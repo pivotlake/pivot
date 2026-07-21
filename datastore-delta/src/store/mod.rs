@@ -22,7 +22,7 @@ mod object_path;
 mod s3;
 pub use local::LocalStore;
 pub use object_path::ObjectPath;
-pub use s3::S3Store;
+pub use s3::{S3Credentials, S3Store};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

@@ -14,7 +14,7 @@
 
 mod common;
 
-use catalog::test_support as harness;
+use datastore_delta::test_support as harness;
 
 use std::collections::HashMap;
 
@@ -22,12 +22,12 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use catalog::parquet::table_input;
-use catalog::store::ObjectPath;
-use catalog::{FileRef, ParquetCatalog};
 use common::{
     DispatchGuard, collect_i64s, current_parquet, dispatch_with_buffers, strings_and_ints,
 };
+use datastore_delta::parquet::table_input;
+use datastore_delta::store::ObjectPath;
+use datastore_delta::{FileRef, ParquetCatalog};
 use dispatch::Projection;
 use harness::Backend;
 use planner::catalog::{Catalog as PlannerCatalog, Column, CreateTableRequest};
@@ -52,6 +52,7 @@ fn columns() -> Vec<Column> {
 /// `CREATE TABLE <name> (cols) WITH (path = '<path>')`, `path` store-relative.
 fn path_request(name: &str, path: &str) -> CreateTableRequest {
     CreateTableRequest {
+        catalog: None,
         name: name.to_string(),
         columns: columns(),
         options: HashMap::from([("path".to_string(), path.to_string())]),
@@ -164,7 +165,7 @@ mod bodies {
             .unwrap()
             .replace_data_files(
                 &[ObjectPath::new("p1.parquet"), ObjectPath::new("p2.parquet")],
-                &[catalog::ManifestEntry::new(FileRef {
+                &[datastore_delta::ManifestEntry::new(FileRef {
                     path: ObjectPath::new("merged.parquet"),
                     size: merged.len() as u64,
                 })],

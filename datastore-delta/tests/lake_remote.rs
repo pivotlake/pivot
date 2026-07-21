@@ -21,7 +21,7 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 use url::Url;
 
-use catalog::parquet::{ParquetTable, table_input};
+use datastore_delta::parquet::{ParquetTable, table_input};
 use dispatch::Projection;
 
 /// Serve `bytes` over loopback HTTP, answering `Range` requests with `206`.

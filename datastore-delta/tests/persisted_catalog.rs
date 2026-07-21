@@ -14,8 +14,8 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::ParquetCatalog;
-use catalog::parquet::table_input;
+use datastore_delta::ParquetCatalog;
+use datastore_delta::parquet::table_input;
 use dispatch::Projection;
 use planner::catalog::{Catalog, Column, CreateTableRequest, Result as CatalogResult};
 use planner::types::Type;
@@ -64,6 +64,7 @@ fn path_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableReq
     let mut options = HashMap::new();
     options.insert("path".to_string(), path.to_string_lossy().into_owned());
     CreateTableRequest {
+        catalog: None,
         name: name.to_string(),
         columns,
         options,
@@ -75,6 +76,7 @@ fn path_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableReq
 /// database root).
 fn rooted_request(name: &str, columns: Vec<Column>) -> CreateTableRequest {
     CreateTableRequest {
+        catalog: None,
         name: name.to_string(),
         columns,
         options: HashMap::new(),
