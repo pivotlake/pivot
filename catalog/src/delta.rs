@@ -19,7 +19,9 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::aws::AmazonS3Builder;
 use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::state::ScanFile;
-use delta_kernel::schema::{DataType as DeltaDataType, PrimitiveType, StructField, StructType};
+use delta_kernel::schema::{
+    DataType as DeltaDataType, MetadataValue, PrimitiveType, StructField, StructType,
+};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use planner::catalog::Column;
@@ -97,13 +99,7 @@ pub(crate) fn initialize_table(
     let uri = table_uri(&store.location_uri(), location)?;
     let fields = columns
         .iter()
-        .map(|column| {
-            Ok(StructField::new(
-                column.name.clone(),
-                delta_type(&column.name, &column.col_type)?,
-                false,
-            ))
-        })
+        .map(|column| build_delta_field(&column.name, &column.col_type))
         .collect::<Result<Vec<_>, Error>>()?;
     let schema = StructType::try_new(fields)?;
     let schema = serde_json::to_string(&schema).expect("Delta Kernel schema is serializable");
@@ -306,7 +302,7 @@ pub(crate) fn load_table(uri: &Url) -> Result<DeltaTableState, Error> {
         .map(|field| {
             Ok(Column {
                 name: field.name().clone(),
-                col_type: pivot_type(field.name(), field.data_type())?,
+                col_type: pivot_type_from_field(field)?,
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -508,13 +504,15 @@ fn delta_scalar_to_pivot(column: &str, scalar: DeltaScalar) -> Result<Scalar<Arr
     Ok(scalar)
 }
 
-fn pivot_type(column: &str, data_type: &DeltaDataType) -> Result<Type, Error> {
+/// Errors carry an empty column name; the caller fills it in, since it knows
+/// which column the type came from.
+fn pivot_type(data_type: &DeltaDataType) -> Result<Type, Error> {
     if let DeltaDataType::Variant(_) = data_type {
         return Ok(Type::Variant);
     }
     let DeltaDataType::Primitive(primitive) = data_type else {
         return Err(Error::UnsupportedType {
-            column: column.to_string(),
+            column: String::new(),
             data_type: format!("{data_type:?}"),
         });
     };
@@ -532,7 +530,7 @@ fn pivot_type(column: &str, data_type: &DeltaDataType) -> Result<Type, Error> {
         PrimitiveType::Decimal(_) => Type::Decimal,
         PrimitiveType::Binary | PrimitiveType::Void => {
             return Err(Error::UnsupportedType {
-                column: column.to_string(),
+                column: String::new(),
                 data_type: primitive.to_string(),
             });
         }
@@ -572,6 +570,76 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         }
     };
     Ok(primitive.into())
+}
+
+/// Field-metadata key that records a column's exact Pivot type when Delta's
+/// primitives can't express it. Delta has no unsigned integer type, so an
+/// unsigned column is stored as a signed primitive that holds its range and its
+/// true type is recovered from this tag on read.
+const PIVOT_LOGICAL_TYPE_KEY: &str = "pivot.logicalTypeOverride";
+
+/// Build the Delta struct field for one Pivot column. Types Delta represents
+/// natively map straight through [`delta_type`]; the unsigned types it rejects
+/// fall back to [`build_unsigned_field`], which stores them as a tagged signed
+/// primitive.
+fn build_delta_field(column: &str, data_type: &Type) -> Result<StructField, Error> {
+    match delta_type(column, data_type) {
+        Ok(delta_type) => Ok(StructField::new(column, delta_type, false)),
+        Err(_) => build_unsigned_field(column, data_type),
+    }
+}
+
+/// Build the Delta field for an unsigned integer column, which Delta has no
+/// primitive for: store it as the smallest signed primitive that holds its full
+/// range and tag the field with its true type so the read recovers it. `UInt64`
+/// alone has no wider signed primitive; `Long` still holds every value the
+/// physical file decodes because the read is driven by the recovered type, not
+/// this stored primitive. Any non-unsigned type reaching here is genuinely
+/// unsupported and errors.
+fn build_unsigned_field(column: &str, data_type: &Type) -> Result<StructField, Error> {
+    let primitive = match data_type {
+        Type::UInt8 => PrimitiveType::Short,
+        Type::UInt16 => PrimitiveType::Integer,
+        Type::UInt32 | Type::UInt64 => PrimitiveType::Long,
+        _ => {
+            return Err(Error::UnsupportedType {
+                column: column.to_string(),
+                data_type: data_type.to_string(),
+            });
+        }
+    };
+    Ok(StructField::new(column, primitive, false)
+        .with_metadata([(PIVOT_LOGICAL_TYPE_KEY, data_type.to_string())]))
+}
+
+/// Recover a column's Pivot type from a Delta field, honoring the
+/// [`PIVOT_LOGICAL_TYPE_KEY`] tag that carries unsigned types Delta stores as a
+/// signed primitive.
+fn pivot_type_from_field(field: &StructField) -> Result<Type, Error> {
+    if let Some(MetadataValue::String(tag)) = field.metadata.get(PIVOT_LOGICAL_TYPE_KEY) {
+        return parse_unsigned_tag(tag).ok_or_else(|| Error::UnsupportedType {
+            column: field.name().clone(),
+            data_type: tag.clone(),
+        });
+    }
+    pivot_type(field.data_type()).map_err(|error| match error {
+        Error::UnsupportedType { data_type, .. } => Error::UnsupportedType {
+            column: field.name().clone(),
+            data_type,
+        },
+        other => other,
+    })
+}
+
+/// Parse a [`PIVOT_LOGICAL_TYPE_KEY`] tag back into its unsigned Pivot type.
+fn parse_unsigned_tag(tag: &str) -> Option<Type> {
+    match tag {
+        "UInt8" => Some(Type::UInt8),
+        "UInt16" => Some(Type::UInt16),
+        "UInt32" => Some(Type::UInt32),
+        "UInt64" => Some(Type::UInt64),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -701,9 +769,44 @@ mod tests {
         ));
         let decimal = DeltaDataType::Primitive(PrimitiveType::decimal(38, 0).unwrap());
         assert_eq!(
-            pivot_type("amount", &decimal).unwrap(),
+            pivot_type(&decimal).unwrap(),
             Type::Decimal,
             "a genuine Delta decimal must remain Decimal"
         );
+    }
+
+    /// Delta has no unsigned primitive, so each unsigned column is stored as the
+    /// smallest signed primitive that holds its full value range.
+    #[test]
+    fn unsigned_columns_store_as_signed_delta_primitives() {
+        let stored_primitive = |ty| match build_delta_field("c", &ty).unwrap().data_type() {
+            DeltaDataType::Primitive(p) => p.clone(),
+            other => panic!("expected primitive, got {other:?}"),
+        };
+
+        assert_eq!(stored_primitive(Type::UInt8), PrimitiveType::Short);
+        assert_eq!(stored_primitive(Type::UInt16), PrimitiveType::Integer);
+        assert_eq!(stored_primitive(Type::UInt32), PrimitiveType::Long);
+        assert_eq!(stored_primitive(Type::UInt64), PrimitiveType::Long);
+    }
+
+    /// An unsigned column's exact type survives the Delta round trip: it is
+    /// tagged on write and recovered from the tag on read, so the Parquet
+    /// decoder still sees the unsigned type the file physically stores.
+    #[test]
+    fn unsigned_column_type_round_trips_through_field_metadata() {
+        for ty in [Type::UInt8, Type::UInt16, Type::UInt32, Type::UInt64] {
+            let field = build_delta_field("event_date", &ty).unwrap();
+            assert_eq!(pivot_type_from_field(&field).unwrap(), ty);
+        }
+    }
+
+    /// A signed column carries no tag, so it round-trips through the native
+    /// primitive mapping without one.
+    #[test]
+    fn signed_columns_round_trip_without_a_metadata_tag() {
+        let field = build_delta_field("id", &Type::Int32).unwrap();
+        assert!(field.metadata.get(PIVOT_LOGICAL_TYPE_KEY).is_none());
+        assert_eq!(pivot_type_from_field(&field).unwrap(), Type::Int32);
     }
 }
