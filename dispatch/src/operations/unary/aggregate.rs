@@ -29,7 +29,7 @@ use crate::operations::unary::group::{
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
-use crate::worker::waker_set;
+use crate::waker::waker_set;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,

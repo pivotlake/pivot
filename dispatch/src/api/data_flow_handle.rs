@@ -1,5 +1,5 @@
 use crate::stats::DataFlowStats;
-use crate::worker::WakerSet;
+use crate::waker::WakerSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 

@@ -19,7 +19,7 @@
 use crate::numa::Topology;
 use crate::operations::channels;
 use crate::operations::channels::{ChannelFactory, Receiver, Sender};
-use crate::worker::worker_waker;
+use crate::waker::worker_waker;
 use crossbeam_deque::{Stealer, Worker};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -152,7 +152,7 @@ mod tests {
     );
 
     fn two_node_endpoints<T: Send + 'static>() -> Vec<Endpoint<T>> {
-        crate::worker::install_test_worker_waker();
+        crate::waker::install_test_worker_waker();
         stealable::<T>(Topology {
             workers_per_node: 2,
             node_count: 2,
