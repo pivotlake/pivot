@@ -183,6 +183,10 @@ pub trait Unary<I, O> {
     /// (e.g. aggregation totals). Return `true` when fully done, `false` to be
     /// called again (e.g. if final output requires multiple steps).
     ///
+    /// An important note here is that the siblings may not have finished processing there data, ie
+    /// there may be live sibling workers doing consume while finish is being called. It is the
+    /// responsibility of the specific operator to do any synchronizing necessary.
+    ///
     /// Once finish is called, `consume` is guaranteed never to be called again.
     fn finish<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<bool> {
         Ok(true)
