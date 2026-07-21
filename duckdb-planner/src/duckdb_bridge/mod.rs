@@ -155,6 +155,7 @@ pub mod ffi {
         // ---- Insert ----
         fn lo_insert_take_table(op: &LogicalOperator) -> Box<OptionalTableWrapper>;
         fn lo_insert_column_map_count(op: &LogicalOperator) -> usize;
+        fn lo_insert_column_map_is_positional(op: &LogicalOperator) -> bool;
         fn lo_insert_returns_rows(op: &LogicalOperator) -> bool;
 
         // ---- Filter ----
@@ -337,5 +338,8 @@ pub mod ffi {
 
         // BoundCastExpression
         fn expr_cast_child(expr: &Expression) -> &Expression;
+
+        // BoundParameterExpression: the placeholder's identifier ("1" for $1).
+        fn expr_parameter_identifier(expr: &Expression) -> String;
     }
 }

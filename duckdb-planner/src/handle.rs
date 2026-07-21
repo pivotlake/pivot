@@ -277,6 +277,14 @@ impl<'plan> Insert<'plan> {
         ffi::lo_insert_column_map_count(self.raw) != 0
     }
 
+    /// Whether the column mapping is a plain positional one: no explicit column
+    /// list, or a full-width list already in table order. pivot writes insert
+    /// columns positionally, so a non-positional mapping (a reordered or partial
+    /// column list) can't be honored.
+    pub fn has_positional_column_map(self) -> bool {
+        ffi::lo_insert_column_map_is_positional(self.raw)
+    }
+
     pub fn returns_rows(self) -> bool {
         ffi::lo_insert_returns_rows(self.raw)
     }
@@ -592,6 +600,7 @@ impl<'plan> Expr<'plan> {
             T::CASE_EXPR => Expression::Case(Case { raw: self.raw }),
             T::OPERATOR_NOT => Expression::Not(Not { raw: self.raw }),
             T::OPERATOR_CAST => Expression::Cast(Cast { raw: self.raw }),
+            T::VALUE_PARAMETER => Expression::Parameter(Parameter { raw: self.raw }),
             other => Expression::Unsupported(other),
         }
     }
@@ -621,6 +630,8 @@ pub enum Expression<'plan> {
     Not(Not<'plan>),
     /// A type cast.
     Cast(Cast<'plan>),
+    /// A bound query parameter placeholder (`$1`, `$2`, …).
+    Parameter(Parameter<'plan>),
     /// Any expression type the consumer doesn't handle, carrying the raw type.
     Unsupported(ExpressionType),
 }
@@ -648,6 +659,8 @@ define_handles! { ffi::Expression;
     Not,
     /// A type cast (`CAST(child AS return_type)`).
     Cast,
+    /// A bound query parameter placeholder (`$1`, `$2`, …).
+    Parameter,
 }
 
 impl<'plan> Ref<'plan> {
@@ -835,6 +848,38 @@ impl<'plan> Cast<'plan> {
     /// The cast's target type (a `BoundCastExpression`'s own result type).
     pub fn return_type(self) -> LogicalTypeId {
         LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    }
+}
+
+impl<'plan> Parameter<'plan> {
+    /// The placeholder's zero-based position: `$1` → `0`, `$2` → `1`. DuckDB
+    /// stores the identifier as the one-based string `"1"`, `"2"`, ….
+    pub fn index(self) -> Result<usize, ParameterError> {
+        let identifier = ffi::expr_parameter_identifier(self.raw);
+        let one_based: usize = identifier
+            .parse()
+            .map_err(|_| ParameterError::non_numeric(identifier.clone()))?;
+        one_based
+            .checked_sub(1)
+            .ok_or_else(|| ParameterError::non_numeric(identifier))
+    }
+
+    /// The parameter's resolved logical type (the type DuckDB inferred for the
+    /// placeholder from its surrounding context).
+    pub fn return_type(self) -> LogicalTypeId {
+        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    }
+}
+
+/// A parameter placeholder whose identifier was not the expected one-based
+/// numeric form (e.g. a named `$foo` parameter, which pivot does not support).
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported parameter identifier: ${0}")]
+pub struct ParameterError(String);
+
+impl ParameterError {
+    fn non_numeric(identifier: String) -> Self {
+        ParameterError(identifier)
     }
 }
 

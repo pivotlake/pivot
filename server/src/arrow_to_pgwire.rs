@@ -1,12 +1,14 @@
 //! Encode an Arrow [`RecordBatch`] into pgwire `FieldInfo` schemas and
 //! `DataRow` streams.
 //!
-//! Only **text format** is emitted (pgwire's [`FieldFormat::Text`]). It is the
-//! universally supported representation, requires no per-type binary encoder,
-//! and matches what `psql` prints. Each Arrow array kind has a dedicated
-//! `encode` arm that pushes its native Rust type into [`DataRowEncoder`];
-//! anything we can't represent precisely is shipped as `text` so at least
-//! the value arrives.
+//! Columns are emitted in the format the client requested (see
+//! [`build_field_info_with_format`]): **text** for the simple query protocol, and either
+//! text or binary per column for the extended protocol's Bind. Each Arrow array
+//! kind has a dedicated `encode` arm that pushes its native Rust type into
+//! [`DataRowEncoder`], which encodes text or binary from the field's format;
+//! the scalar types feed a natively-typed value (correct in both formats), while
+//! the pre-stringified ones are text-only (a binary request for them is rejected
+//! up front by [`validate_result_format`]).
 
 use std::sync::Arc;
 
@@ -18,26 +20,122 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 
 use pgwire::api::Type;
+use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::messages::data::DataRow;
 
-/// Build a pgwire row schema from an Arrow [`SchemaRef`]. Each Arrow column
-/// becomes one [`FieldInfo`] with the closest matching Postgres [`Type`].
+/// Build a text-format pgwire row schema from an Arrow [`SchemaRef`].
+#[cfg(test)]
 pub fn build_field_info(schema: &SchemaRef) -> Arc<Vec<FieldInfo>> {
+    build_field_info_with_format(schema, &Format::UnifiedText)
+}
+
+/// Build a pgwire row schema from an Arrow [`SchemaRef`], each column advertised
+/// in the format `format` requests for it (text unless the extended protocol's
+/// Bind asked for binary). Every column encodes correctly in text; only the
+/// scalar types [`pg_type_supports_binary`] allows are correct in binary, so a
+/// binary request for anything else is rejected by [`validate_result_format`]
+/// before execution rather than silently mis-encoded.
+pub fn build_field_info_with_format(schema: &SchemaRef, format: &Format) -> Arc<Vec<FieldInfo>> {
     let fields = schema
         .fields()
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
             FieldInfo::new(
                 f.name().clone(),
                 None,
                 None,
                 pg_type_for_arrow(f.data_type()),
-                FieldFormat::Text,
+                format.format_for(i),
             )
         })
         .collect();
     Arc::new(fields)
+}
+
+/// The Arrow type a value of Postgres type `pg_type` decodes into. This is the
+/// inverse of [`pg_type_for_arrow`] for the scalar types pivot binds. `None` for a type
+/// pivot can't decode a bound parameter of. Used to decode a parameter whose
+/// type the client declared in its Parse message.
+pub(crate) fn arrow_type_for_pg(pg_type: &Type) -> Option<DataType> {
+    Some(match *pg_type {
+        Type::BOOL => DataType::Boolean,
+        Type::INT2 => DataType::Int16,
+        Type::INT4 => DataType::Int32,
+        Type::INT8 => DataType::Int64,
+        Type::FLOAT4 => DataType::Float32,
+        Type::FLOAT8 => DataType::Float64,
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => DataType::Utf8,
+        Type::DATE => DataType::Date32,
+        Type::TIMESTAMP => DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+        _ => return None,
+    })
+}
+
+/// Whether a column of Postgres type `pg_type` can be encoded correctly in the
+/// binary result format. The primitive/string types feed a natively-typed Rust
+/// value into the encoder, so their binary encoding is correct; the types shipped
+/// via a pre-stringified value (NUMERIC/BYTEA/UInt64-as-text) are only correct
+/// in text.
+pub(crate) fn pg_type_supports_binary(pg_type: &Type) -> bool {
+    matches!(
+        *pg_type,
+        Type::BOOL
+            | Type::INT2
+            | Type::INT4
+            | Type::INT8
+            | Type::FLOAT4
+            | Type::FLOAT8
+            | Type::TEXT
+            | Type::DATE
+            | Type::TIMESTAMP
+    )
+}
+
+/// Reject a Bind's result-column formats we can't honor: a binary request for a
+/// column whose type only encodes correctly in text. Returns the offending type
+/// name, or `Ok(())` when every requested format is satisfiable.
+pub(crate) fn validate_result_format(fields: &[FieldInfo], format: &Format) -> Result<(), String> {
+    if let Format::Individual(formats) = format
+        && formats.len() != fields.len()
+    {
+        return Err(format!(
+            "expected {} result format codes, got {}",
+            fields.len(),
+            formats.len()
+        ));
+    }
+    for (i, field) in fields.iter().enumerate() {
+        if format.format_for(i) == FieldFormat::Binary && !pg_type_supports_binary(field.datatype())
+        {
+            return Err(format!(
+                "binary result format is not supported for column of type {}",
+                field.datatype()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_result_fields(
+    fields: &[FieldInfo],
+    format: &Format,
+) -> Result<Vec<FieldInfo>, String> {
+    validate_result_format(fields, format)?;
+    Ok(fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            FieldInfo::new(
+                field.name().to_string(),
+                field.table_id(),
+                field.column_id(),
+                field.datatype().clone(),
+                format.format_for(index),
+            )
+        })
+        .collect())
 }
 
 pub struct PGRowBatch {
@@ -45,18 +143,32 @@ pub struct PGRowBatch {
     pub fields: Arc<Vec<FieldInfo>>,
 }
 
-impl From<RecordBatch> for PGRowBatch {
-    fn from(batch: RecordBatch) -> Self {
-        let fields = build_field_info(&batch.schema());
+impl PGRowBatch {
+    /// Encode `batch` into pgwire rows, each column in the format `format`
+    /// requests (see [`build_field_info_with_format`]). Callers that only ever emit text
+    /// (the simple query protocol) pass [`Format::UnifiedText`].
+    pub fn from_batch(batch: RecordBatch, format: &Format) -> Self {
+        let fields = build_field_info_with_format(&batch.schema(), format);
         let mut encoder = DataRowEncoder::new(fields.clone());
         let mut rows = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             for col in 0..batch.num_columns() {
-                encode_cell(&mut encoder, batch.column(col).as_ref(), row);
+                encode_cell(
+                    &mut encoder,
+                    batch.column(col).as_ref(),
+                    row,
+                    format.format_for(col),
+                );
             }
             rows.push(encoder.take_row());
         }
         Self { rows, fields }
+    }
+}
+
+impl From<RecordBatch> for PGRowBatch {
+    fn from(batch: RecordBatch) -> Self {
+        Self::from_batch(batch, &Format::UnifiedText)
     }
 }
 
@@ -83,7 +195,7 @@ macro_rules! arrow_pg_types {
     ) => {
         /// Map an Arrow [`DataType`] to its closest Postgres [`Type`]. Values we
         /// can't represent precisely fall back to [`Type::TEXT`].
-        fn pg_type_for_arrow(dt: &DataType) -> Type {
+        pub(crate) fn pg_type_for_arrow(dt: &DataType) -> Type {
             match dt {
                 $( DataType::$dt => Type::$pg, )+
                 $( DataType::$udt => Type::$upg, )+
@@ -104,7 +216,12 @@ macro_rules! arrow_pg_types {
         /// Encode a single cell. We always feed the encoder a typed Rust value
         /// (or `Option::None` for SQL NULL) so pgwire's `ToSqlText` impl handles
         /// the formatting, with no manual `to_string()` round-trips.
-        fn encode_cell(encoder: &mut DataRowEncoder, arr: &dyn Array, row: usize) {
+        fn encode_cell(
+            encoder: &mut DataRowEncoder,
+            arr: &dyn Array,
+            row: usize,
+            format: FieldFormat,
+        ) {
             if arr.is_null(row) {
                 // Type is irrelevant for null encoding: the encoder writes -1 length.
                 let _ = encoder.encode_field::<Option<&str>>(&None);
@@ -127,14 +244,24 @@ macro_rules! arrow_pg_types {
                 // Temporal columns render in text format as their ISO string,
                 // which is also Postgres's text wire form for DATE/TIMESTAMP.
                 // The executor only ever produces second-granularity timestamps.
-                DataType::Date32 => encoder.encode_field(
-                    &arr.as_any().downcast_ref::<Date32Array>().unwrap()
-                        .value_as_date(row).map(|d| d.to_string()),
-                ),
-                DataType::Timestamp(_, _) => encoder.encode_field(
-                    &arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap()
-                        .value_as_datetime(row).map(|t| t.to_string()),
-                ),
+                DataType::Date32 => {
+                    let value = arr.as_any().downcast_ref::<Date32Array>().unwrap()
+                        .value_as_date(row);
+                    if format == FieldFormat::Binary {
+                        encoder.encode_field(&value)
+                    } else {
+                        encoder.encode_field(&value.map(|date| date.to_string()))
+                    }
+                },
+                DataType::Timestamp(_, _) => {
+                    let value = arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap()
+                        .value_as_datetime(row);
+                    if format == FieldFormat::Binary {
+                        encoder.encode_field(&value)
+                    } else {
+                        encoder.encode_field(&value.map(|timestamp| timestamp.to_string()))
+                    }
+                },
                 // Best-effort fallback: stringify and ship as text.
                 _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
             };

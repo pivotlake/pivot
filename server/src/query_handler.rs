@@ -27,15 +27,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
-use arrow_array::{Array, Int64Array, RecordBatch};
+use crate::pg_param;
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, Scalar};
+use arrow_schema::DataType;
 use async_trait::async_trait;
-use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
+use dispatch::{CancelToken, DataFlowHandle, DataFlowStats, RecordBatchOperatorSpec};
 use futures::{Sink, SinkExt, stream};
+use pgwire::api::Type;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{QueryResponse, Response, Tag};
+use pgwire::api::portal::{Format, Portal};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::stmt::QueryParser;
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers,
@@ -194,6 +199,8 @@ enum Error {
     CommitPanic(JoinError),
     #[error("invalid INSERT row-count result: {0}")]
     InvalidInsertResult(String),
+    #[error("binding parameters failed: {0}")]
+    ParamBind(String),
 }
 
 impl Error {
@@ -221,9 +228,9 @@ enum WorkerOutput {
     AffectedRows(std::result::Result<usize, String>),
 }
 
-fn build_worker_output(batch: RecordBatch, is_insert: bool) -> WorkerOutput {
+fn build_worker_output(batch: RecordBatch, is_insert: bool, format: &Format) -> WorkerOutput {
     if !is_insert {
-        return WorkerOutput::QueryRows(PGRowBatch::from(batch));
+        return WorkerOutput::QueryRows(PGRowBatch::from_batch(batch, format));
     }
     let count = (|| {
         if batch.num_rows() != 1 || batch.num_columns() != 1 {
@@ -311,6 +318,42 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Build a dataflow spec (`build_spec`, run on the blocking pool since it may
+/// compile a plan), launch it, and drain it to per-worker [`WorkerOutput`]s plus
+/// the IO/CPU stats. Each output batch is turned into a `WorkerOutput` on the
+/// worker (an INSERT count or query rows, per `is_insert`). A [`CancelOnDrop`]
+/// guard cancels the running flow if this future is dropped before the drain
+/// finishes. Shared by the simple and extended query handlers.
+async fn run_dataflow<F>(
+    build_spec: F,
+    is_insert: bool,
+    collect_stats: bool,
+    result_format: Arc<Format>,
+) -> Result<(Vec<WorkerOutput>, DataFlowStats)>
+where
+    F: FnOnce() -> Result<RecordBatchOperatorSpec> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<WorkerOutput>> {
+        let outputs = build_spec()?.map(move || {
+            let format = result_format.clone();
+            move |batch| build_worker_output(batch, is_insert, &format)
+        });
+        Ok(if collect_stats {
+            outputs.execute_with_stats()
+        } else {
+            outputs.execute()
+        })
+    })
+    .await
+    .map_err(Error::PlannerPanic)??;
+    let guard = CancelOnDrop::new(handle.cancel_token());
+    let (outputs, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
+        .await
+        .map_err(Error::WorkerPanic)??;
+    guard.defuse();
+    Ok((outputs, flow))
+}
+
 /// pgwire `SimpleQueryHandler`: plans, compiles, and runs each query on the
 /// blocking pool, surfacing errors and supporting cancellation.
 pub struct PivotQueryHandler {
@@ -328,6 +371,9 @@ pub struct PivotQueryHandler {
     /// query's transaction reads that transaction's view. DDL flushes the
     /// cache (it may change the schema cached plans were bound against).
     plan_cache: Arc<Mutex<HashMap<String, Arc<planner::Plan>>>>,
+    /// The extended-protocol query parser (plans a prepared statement once at
+    /// Parse time). Shared with the `ExtendedQueryHandler` impl on this struct.
+    query_parser: Arc<PivotQueryParser>,
 }
 
 impl PivotQueryHandler {
@@ -336,6 +382,9 @@ impl PivotQueryHandler {
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         Self {
+            query_parser: Arc::new(PivotQueryParser {
+                catalog: catalog.clone(),
+            }),
             catalog,
             dispatcher,
             plan_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -436,36 +485,26 @@ impl PivotQueryHandler {
             #[cfg(not(feature = "perf"))]
             let _ = with_perf;
 
-            // Compile the plan into a fresh dataflow and launch it. `compile` is pure
-            // pivot work (no DuckDB), so it runs on any blocking thread without the
-            // planner thread-local. `execute_with_stats` turns on the dataflow's
-            // IO/CPU tally only when the client asked for it.
+            // Compile the plan into a fresh dataflow, launch it, and drain it.
+            // `compile` is pure pivot work (no DuckDB), so it runs on the blocking
+            // pool without the planner thread-local. `run_dataflow` cancels the
+            // flow if our future is dropped before the drain finishes (psql
+            // Ctrl-C, a raw disconnect).
             let started = Instant::now();
             let compile_transaction = transaction.clone();
-            let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-                let outputs = plan
-                    .compile(&dispatcher, compile_transaction.as_ref())?
-                    .map(move || move |batch| build_worker_output(batch, is_insert));
-                Ok(if collect_stats {
-                    outputs.execute_with_stats()
-                } else {
-                    outputs.execute()
-                })
-            })
-            .await
-            .map_err(Error::PlannerPanic)??;
-            let compile_time = started.elapsed();
-
-            // Cancel the dataflow if our future is dropped before drain finishes —
-            // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
-            // raw disconnects (whole connection task dropped).
-            let guard = CancelOnDrop::new(handle.cancel_token());
-            let started = Instant::now();
-            let (outputs, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
-                .await
-                .map_err(Error::WorkerPanic)??;
+            let (outputs, flow) = run_dataflow(
+                move || {
+                    plan.compile(&dispatcher, compile_transaction.as_ref())
+                        .map_err(Error::from)
+                },
+                is_insert,
+                collect_stats,
+                // The simple query protocol always emits text.
+                Arc::new(Format::UnifiedText),
+            )
+            .await?;
+            let compile_time = Duration::ZERO;
             let exec_time = started.elapsed();
-            guard.defuse();
 
             // Stop perf off the reactor: `child.wait()` blocks until the report is
             // flushed (seconds for a large capture), which would otherwise stall this
@@ -646,6 +685,330 @@ impl SimpleQueryHandler for PivotQueryHandler {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Extended query protocol (prepared statements).
+//
+// The JDBC drivers Kafka Connect uses drive everything through Parse/Bind/
+// Execute. A statement is planned once at Parse (the expensive DuckDB round-trip
+// is cached on the `Prepared`); each Execute binds fresh values and runs. Only
+// Prepared `VALUES` parameters are decoded straight into Arrow columns and
+// handed through the normal plan to the table's insert sink. Scalar parameters
+// are bound into expression holes during compile. Statements without parameters
+// use the same compile/execute core.
+// ---------------------------------------------------------------------------
+
+/// A statement parsed (and planned) once at Parse time, reused across its Bind/
+/// Execute cycles, plus the metadata the extended protocol's Describe needs.
+#[derive(Clone)]
+pub struct Prepared {
+    plan: Arc<planner::Plan>,
+    /// Ordered parameter types (Postgres OIDs), for the statement's
+    /// `ParameterDescription`.
+    param_types: Vec<Type>,
+    /// The Arrow type to decode each bound parameter value at, or `None` if the
+    /// parameter's type is unknown (the plan didn't resolve it and the client
+    /// didn't declare it). Decoding such a parameter is an error.
+    param_arrow: Vec<Option<DataType>>,
+    /// Result columns for `RowDescription`; empty for a statement that produces
+    /// no rows (INSERT / DDL / SET).
+    result_fields: Vec<FieldInfo>,
+}
+
+/// Plans each prepared statement once at Parse time. A parameter's type comes
+/// from the plan where DuckDB resolves it (an INSERT target column) and
+/// otherwise from the client's declared Parse types. The resulting [`Prepared`]
+/// is stored by pgwire and handed back at Bind/Describe/Execute.
+pub struct PivotQueryParser {
+    catalog: Arc<dyn planner::catalog::Catalog>,
+}
+
+#[async_trait]
+impl QueryParser for PivotQueryParser {
+    type Statement = Prepared;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        types: &[Option<Type>],
+    ) -> PgWireResult<Prepared>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let catalog = self.catalog.clone();
+        let sql = sql.to_string();
+        let plan = match tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
+            // Planning reads a snapshot but writes nothing; roll the transaction
+            // back either way (a prepared plan carries no snapshot state, so it
+            // recompiles cleanly under each Execute's own transaction).
+            let transaction = catalog.begin_transaction();
+            let planned = with_planner(&catalog, |planner| planner.plan(&sql, transaction.clone()));
+            catalog.rollback_transaction(transaction);
+            Ok(Arc::new(planned?))
+        })
+        .await
+        {
+            Ok(Ok(plan)) => plan,
+            Ok(Err(e)) => return Err(e.into_pgwire()),
+            Err(e) => return Err(Error::PlannerPanic(e).into_pgwire()),
+        };
+        let (param_types, param_arrow) = resolve_param_types(&plan, types);
+        let result_fields = result_fields(&plan).map_err(Error::into_pgwire)?;
+        Ok(Prepared {
+            plan,
+            param_types,
+            param_arrow,
+            result_fields,
+        })
+    }
+
+    fn get_parameter_types(&self, stmt: &Prepared) -> PgWireResult<Vec<Type>> {
+        Ok(stmt.param_types.clone())
+    }
+
+    fn get_result_schema(
+        &self,
+        stmt: &Prepared,
+        column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        crate::arrow_to_pgwire::format_result_fields(
+            &stmt.result_fields,
+            column_format.unwrap_or(&Format::UnifiedText),
+        )
+        .map_err(|error| Error::ParamBind(error).into_pgwire())
+    }
+}
+
+/// Resolve each parameter's type by combining the plan with the client's Parse
+/// declarations: the plan types an INSERT-target parameter, and the client's
+/// declared type covers a parameter used only in a comparison (which DuckDB
+/// leaves untyped). Returns the Postgres OIDs (for `ParameterDescription`) and
+/// the Arrow type to decode each bound value at. It is `None` where neither source
+/// gives a type, which makes decoding that parameter an error.
+fn resolve_param_types(
+    plan: &planner::Plan,
+    client_types: &[Option<Type>],
+) -> (Vec<Type>, Vec<Option<DataType>>) {
+    let plan_types = plan.parameter_types();
+    let count = plan_types.len().max(client_types.len());
+    let mut pg_types = Vec::with_capacity(count);
+    let mut arrow_types = Vec::with_capacity(count);
+    for i in 0..count {
+        let client_type = client_types.get(i).and_then(Option::as_ref);
+        let arrow = match client_type {
+            Some(client_type) => crate::arrow_to_pgwire::arrow_type_for_pg(client_type),
+            None => plan_types
+                .get(i)
+                .and_then(Option::as_ref)
+                .map(planner::types::physical_arrow_type),
+        };
+        let pg = arrow
+            .as_ref()
+            .map(pg_param::pg_type_for_param)
+            .unwrap_or(Type::UNKNOWN);
+        pg_types.push(pg);
+        arrow_types.push(arrow);
+    }
+    (pg_types, arrow_types)
+}
+
+/// A statement produces no result rows (so Describe returns no `RowDescription`
+/// columns): an INSERT, a `CREATE TABLE`, or a `SET`/`RESET`.
+fn produces_no_rows(plan: &planner::Plan) -> bool {
+    plan.as_set_variable().is_some()
+        || matches!(
+            plan.root.operator,
+            planner::Operator::Insert(_) | planner::Operator::CreateTable(_)
+        )
+}
+
+/// The result columns (`RowDescription`) a statement produces, derived from its
+/// plan without executing. Empty for a statement that yields no rows.
+fn result_fields(plan: &planner::Plan) -> Result<Vec<FieldInfo>> {
+    if produces_no_rows(plan) {
+        return Ok(Vec::new());
+    }
+    let types = plan.root.output_types().map_err(Error::Compile)?;
+    let arrow: Vec<DataType> = types
+        .iter()
+        .map(planner::types::physical_arrow_type)
+        .collect();
+    Ok((*pg_param::result_fields(&plan.output_names, &arrow)).clone())
+}
+
+/// Decode a portal's bound parameters into scalar values, one per placeholder,
+/// each at the parameter's resolved type. These are the values the plan's
+/// `Parameter` holes and prepared `VALUES` bind to at compile time.
+fn decode_params<S: Clone>(
+    portal: &Portal<S>,
+    param_arrow: &[Option<DataType>],
+) -> Result<Vec<Scalar<ArrayRef>>> {
+    if portal.parameter_len() != param_arrow.len() {
+        return Err(Error::ParamBind(format!(
+            "expected {} parameters, got {}",
+            param_arrow.len(),
+            portal.parameter_len()
+        )));
+    }
+    if let Format::Individual(formats) = &portal.parameter_format
+        && formats.len() != param_arrow.len()
+    {
+        return Err(Error::ParamBind(format!(
+            "expected {} parameter format codes, got {}",
+            param_arrow.len(),
+            formats.len()
+        )));
+    }
+    param_arrow
+        .iter()
+        .enumerate()
+        .map(|(index, arrow_type)| {
+            let arrow_type = arrow_type.as_ref().ok_or_else(|| {
+                Error::ParamBind(format!(
+                    "the type of parameter ${} is unknown; declare it or add a cast",
+                    index + 1
+                ))
+            })?;
+            pg_param::bind_param(portal, index, arrow_type)
+                .map_err(|e| Error::ParamBind(e.to_string()))
+        })
+        .collect()
+}
+
+impl PivotQueryHandler {
+    /// Run a prepared statement's portal to completion inside one catalog
+    /// transaction: decode its bound parameters, then compile the (cached) plan
+    /// with those values and execute. Binding the parameters into the plan is the
+    /// whole of it. There is no special INSERT path. A `SET`/`RESET` is handed
+    /// back for the caller to apply to the connection.
+    async fn run_prepared<S: Clone>(
+        &self,
+        prepared: &Prepared,
+        portal: &Portal<S>,
+        collect_stats: bool,
+    ) -> Result<Outcome> {
+        let transaction = self.catalog.begin_transaction();
+        let clears_plan_cache = !plan_is_cacheable(&prepared.plan);
+        let result: Result<Outcome> = async {
+            // A `SET`/`RESET` over the extended protocol is still a session
+            // command; hand it back for the caller to apply to the connection.
+            if let Some(set) = prepared.plan.as_set_variable() {
+                return Ok(Outcome::Set {
+                    name: set.name.clone(),
+                    value: set.value.clone(),
+                });
+            }
+
+            // Honor the client's requested result-column formats; reject a binary
+            // request for a column type we can only encode in text.
+            crate::arrow_to_pgwire::validate_result_format(
+                &prepared.result_fields,
+                &portal.result_column_format,
+            )
+            .map_err(Error::ParamBind)?;
+            let result_format = Arc::new(portal.result_column_format.clone());
+
+            let params = decode_params(portal, &prepared.param_arrow)?;
+            let is_insert = matches!(prepared.plan.root.operator, planner::Operator::Insert(_));
+
+            let started = Instant::now();
+            let plan = prepared.plan.clone();
+            let dispatcher = self.dispatcher.clone();
+            let compile_transaction = transaction.clone();
+            let (outputs, flow) = run_dataflow(
+                move || {
+                    plan.compile_with_params(&dispatcher, compile_transaction.as_ref(), &params)
+                        .map_err(Error::from)
+                },
+                is_insert,
+                collect_stats,
+                result_format,
+            )
+            .await?;
+            let exec = started.elapsed();
+
+            let response = build_pgwire_response(outputs, is_insert)?;
+            Ok(Outcome::Response(
+                response,
+                QueryStats {
+                    plan: Duration::ZERO,
+                    compile: Duration::ZERO,
+                    exec,
+                    flow,
+                },
+            ))
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                let catalog = self.catalog.clone();
+                tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
+                    .await
+                    .map_err(Error::CommitPanic)??;
+                if clears_plan_cache {
+                    self.plan_cache.lock().unwrap().clear();
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.catalog.rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for PivotQueryHandler {
+    type Statement = Prepared;
+    type QueryParser = PivotQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        self.query_parser.clone()
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let with_stats = stats_on(client);
+        let prepared = &portal.statement.statement;
+        let outcome = self
+            .run_prepared(prepared, portal, with_stats)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "prepared query failed");
+                e.into_pgwire()
+            })?;
+
+        let res = match outcome {
+            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+            Outcome::Response(res, stats) => {
+                if with_stats {
+                    let notice = NoticeResponse::from(ErrorInfo::new(
+                        "INFO".to_string(),
+                        "00000".to_string(),
+                        stats.summary(),
+                    ));
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(notice))
+                        .await?;
+                }
+                res
+            }
+        };
+        Ok(res)
+    }
+}
+
 /// Startup handler that registers each new connection with the shared
 /// [`ConnectionManager`] so that subsequent `CancelRequest` packets can be
 /// routed back to the running query. Otherwise behaves as a noop (no auth).
@@ -708,7 +1071,7 @@ impl PgWireServerHandlers for PivotHandlers {
     }
 
     fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+        self.query_handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {

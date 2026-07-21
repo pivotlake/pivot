@@ -83,6 +83,8 @@ pub enum Error {
     UnsupportedInterval(String),
     #[error("Unsupported expression type: {0:?}")]
     UnsupportedExpressionType(ExpressionType),
+    #[error("Unsupported parameter: {0}")]
+    UnsupportedParameter(String),
 }
 
 /// Format an arrow `Scalar<ArrayRef>` constant as `value:Type` for plan
@@ -111,6 +113,29 @@ pub enum Expression {
     Case(Case),
     Not(Not),
     Cast(Cast),
+    /// A bound query parameter placeholder (`$1`, `$2`, …).
+    Parameter(ParameterRef),
+}
+
+/// A bound query parameter placeholder. Parameters only appear in a
+/// parameterized prepared statement; their values are bound at compile time
+/// (`Expression::bind_params`), so a `Parameter` never reaches
+/// [`compile`](Expression::compile).
+#[derive(Debug, Clone)]
+pub struct ParameterRef {
+    /// Zero-based parameter position: `$1` → `0`.
+    pub index: usize,
+    /// The parameter's type. DuckDB resolves it where it can (e.g. an INSERT
+    /// target column), but leaves a parameter used only in a comparison
+    /// (`WHERE a = $1`) unresolved (`None`). The wire server resolves that case
+    /// from the client's Parse declaration.
+    pub ty: Option<Type>,
+}
+
+impl Display for ParameterRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "${}", self.index + 1)
+    }
 }
 
 impl Expression {
@@ -119,7 +144,7 @@ impl Expression {
     /// evaluating it pays for the row gather (see the `Filter` operator).
     pub fn count_kernels(&self) -> usize {
         match self {
-            Expression::Ref(_) | Expression::Constant(_) => 0,
+            Expression::Ref(_) | Expression::Constant(_) | Expression::Parameter(_) => 0,
             Expression::Compare(c) => 1 + c.left.count_kernels() + c.right.count_kernels(),
             Expression::Between(b) => 2 + b.input.count_kernels(),
             Expression::AggregateFunc(_) => 1,
@@ -167,6 +192,11 @@ impl Expression {
             // An aggregate carries DuckDB's bound result type.
             Expression::AggregateFunc(a) => Ok(a.return_type().clone()),
             Expression::Function(f) => Ok(f.result_type()),
+            // A parameter's type, once resolved from its context.
+            Expression::Parameter(p) => {
+                p.ty.clone()
+                    .ok_or(compile::Error::UnresolvedParameter(p.index))
+            }
         }
     }
 
@@ -187,7 +217,127 @@ impl Expression {
             Expression::Case(c) => c.compile(),
             Expression::Not(n) => n.compile(),
             Expression::Cast(c) => c.compile(),
-            _ => Err(compile::Error::UnsupportedExpression(self.clone())),
+            // Aggregates are compiled by their operator, not as scalar
+            // expressions. A `Parameter` is resolved to a constant by
+            // `bind_params` before compilation; one reaching here means it sits
+            // somewhere binding doesn't descend into yet (e.g. inside a function).
+            Expression::AggregateFunc(_) | Expression::Parameter(_) => {
+                Err(compile::Error::UnsupportedExpression(self.clone()))
+            }
+        }
+    }
+
+    /// Return a copy of this expression with every parameter placeholder (`$1`,
+    /// …) replaced by its bound value from `params` (`params[i]` binds `$(i+1)`).
+    /// This is the "single value pointer" side of prepared statements: it makes
+    /// predicates such as `WHERE col = $1` runnable once the values are known.
+    /// Recurses through the structural expression kinds a predicate or projection
+    /// is built from; a parameter nested inside a scalar function is left in place
+    /// and surfaces as an unsupported-expression error at compile.
+    pub(crate) fn bind_params(
+        &self,
+        params: &[Scalar<ArrayRef>],
+    ) -> Result<Expression, compile::Error> {
+        let mut bound = self.clone();
+        bound.bind_params_in_place(params)?;
+        Ok(bound)
+    }
+
+    fn bind_params_in_place(&mut self, params: &[Scalar<ArrayRef>]) -> Result<(), compile::Error> {
+        match self {
+            Expression::Parameter(p) => {
+                let value = params
+                    .get(p.index)
+                    .ok_or(compile::Error::UnboundParameter {
+                        index: p.index,
+                        len: params.len(),
+                    })?
+                    .clone();
+                let mut array = value.into_inner();
+                if let Some(param_type) = &p.ty {
+                    let target_type = crate::types::physical_arrow_type(param_type);
+                    if array.data_type() != &target_type {
+                        array = arrow::compute::cast(&array, &target_type).map_err(|error| {
+                            compile::Error::ParameterCast {
+                                index: p.index,
+                                message: error.to_string(),
+                            }
+                        })?;
+                    }
+                }
+                *self = Expression::Constant(Scalar::new(array));
+            }
+            Expression::Compare(c) => {
+                c.left.bind_params_in_place(params)?;
+                c.right.bind_params_in_place(params)?;
+            }
+            Expression::Between(b) => {
+                b.input.bind_params_in_place(params)?;
+                b.lower.bind_params_in_place(params)?;
+                b.upper.bind_params_in_place(params)?;
+            }
+            Expression::Conjunction(c) => {
+                for child in &mut c.children {
+                    child.bind_params_in_place(params)?;
+                }
+            }
+            Expression::InList(l) => {
+                l.input.bind_params_in_place(params)?;
+                for value in &mut l.values {
+                    value.bind_params_in_place(params)?;
+                }
+            }
+            Expression::Case(c) => {
+                for arm in &mut c.checks {
+                    arm.when.bind_params_in_place(params)?;
+                    arm.then.bind_params_in_place(params)?;
+                }
+                c.else_expr.bind_params_in_place(params)?;
+            }
+            Expression::Not(n) => n.input.bind_params_in_place(params)?,
+            Expression::Cast(c) => c.source.bind_params_in_place(params)?,
+            // Leaves and kinds binding doesn't descend into.
+            Expression::Ref(_)
+            | Expression::Constant(_)
+            | Expression::AggregateFunc(_)
+            | Expression::Function(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Collect the `(index, type)` of every parameter placeholder in this
+    /// expression tree. The type is `None` for a parameter DuckDB left
+    /// unresolved (its type comes from the client's Parse declaration instead).
+    pub(crate) fn collect_params(&self, out: &mut Vec<(usize, Option<Type>)>) {
+        match self {
+            Expression::Parameter(p) => out.push((p.index, p.ty.clone())),
+            Expression::Compare(c) => {
+                c.left.collect_params(out);
+                c.right.collect_params(out);
+            }
+            Expression::Between(b) => {
+                b.input.collect_params(out);
+                b.lower.collect_params(out);
+                b.upper.collect_params(out);
+            }
+            Expression::Conjunction(c) => c.children.iter().for_each(|e| e.collect_params(out)),
+            Expression::InList(l) => {
+                l.input.collect_params(out);
+                l.values.iter().for_each(|e| e.collect_params(out));
+            }
+            Expression::Case(c) => {
+                for arm in &c.checks {
+                    arm.when.collect_params(out);
+                    arm.then.collect_params(out);
+                }
+                c.else_expr.collect_params(out);
+            }
+            Expression::Not(n) => n.input.collect_params(out),
+            Expression::Cast(c) => c.source.collect_params(out),
+            Expression::Ref(_)
+            | Expression::Constant(_)
+            | Expression::AggregateFunc(_)
+            | Expression::Function(_) => {}
         }
     }
 }
@@ -206,6 +356,7 @@ impl Display for Expression {
             Expression::Case(c) => write!(f, "{c}"),
             Expression::Not(n) => write!(f, "{n}"),
             Expression::Cast(c) => write!(f, "{c}"),
+            Expression::Parameter(p) => write!(f, "{p}"),
         }
     }
 }

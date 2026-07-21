@@ -11,6 +11,7 @@ compact = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow = { workspace = true }
+chrono = { workspace = true }
 
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "signal"] }
 axum = "0.8"

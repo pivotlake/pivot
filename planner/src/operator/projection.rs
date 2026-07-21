@@ -2,7 +2,7 @@
 
 use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::Expression;
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use arrow_schema::{Field, Schema};
 use dispatch::RecordBatchOperatorSpec;
 use std::fmt;
@@ -30,13 +30,20 @@ impl Projection {
     pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        params: &[Scalar<ArrayRef>],
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        // Resolve any parameter placeholders (`SELECT $1`) to their bound values.
+        let projections = self
+            .projections
+            .iter()
+            .map(|e| e.bind_params(params))
+            .collect::<Result<Vec<_>, _>>()?;
+
         // Fast path: every projection is a plain column reference, so we can
         // select columns zero-copy and preserve the input schema's fields. The
         // query's client-facing column names are stamped on once at the plan
         // root (see `Plan::compile`), so intermediate field names don't matter.
-        if let Some(idxs) = self
-            .projections
+        if let Some(idxs) = projections
             .iter()
             .map(|e| match e {
                 Expression::Ref(n) => Some(n.column_idx),
@@ -70,7 +77,7 @@ impl Projection {
         // per batch and assemble a new RecordBatch, deriving the output schema
         // from the produced arrays.
         let builders: Arc<Vec<ExprFn>> = Arc::new(
-            self.projections
+            projections
                 .iter()
                 .map(|e| e.compile())
                 .collect::<Result<Vec<_>, _>>()?,
