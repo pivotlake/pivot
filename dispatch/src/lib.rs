@@ -68,6 +68,7 @@ pub mod arrays;
 pub mod env;
 pub mod io;
 pub mod memory;
+pub mod waker;
 pub mod worker;
 
 mod api;
@@ -81,7 +82,8 @@ mod scan;
 mod stats;
 
 use crate::operations::nullary::OneShotNullaryFactory;
-use crate::worker::{WakerSet, Worker, WorkerWaker};
+use crate::waker::{WakerSet, WorkerWaker};
+use crate::worker::Worker;
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;

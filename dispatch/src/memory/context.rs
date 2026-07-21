@@ -361,7 +361,7 @@ impl MemoryContext {
 pub fn init_test_free_pool(dirty_count: usize) {
     WORKER_IDX.set(0);
     crate::worker::NUM_WORKERS.set(1);
-    crate::worker::install_test_worker_waker();
+    crate::waker::install_test_worker_waker();
     let factory = MemoryContextFactory::create_many(1, 128).pop().unwrap();
     init_memory_context(factory.create_memory_ctx());
     for i in 0..dirty_count {

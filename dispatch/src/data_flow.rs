@@ -29,7 +29,7 @@ use crate::io::{
 };
 use crate::operations::{AbandonedOperator, FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
-use crate::worker::waker_set;
+use crate::waker::waker_set;
 use ahash::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::ops::ControlFlow;

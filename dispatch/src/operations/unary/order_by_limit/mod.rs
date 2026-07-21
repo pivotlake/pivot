@@ -54,7 +54,7 @@
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
-use crate::worker::waker_set;
+use crate::waker::waker_set;
 use arrow::compute::kernels::cmp;
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
 use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
@@ -940,7 +940,7 @@ mod tests {
     /// can sleep through the final disconnect and the query hangs forever.
     #[test]
     fn into_outputter_notifies_even_with_no_local_top_k() {
-        use crate::worker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
+        use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
 
         let waker = Arc::new(WorkerWaker::new(1));
         init_worker_waker(&waker);

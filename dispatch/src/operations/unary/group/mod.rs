@@ -116,7 +116,8 @@ use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
     PartitionBuffers, RadixConfig,
 };
-use crate::worker::{current_node, waker_set};
+use crate::waker::waker_set;
+use crate::worker::current_node;
 use ahash::RandomState;
 use arena::SharedArena;
 use arrow_array::RecordBatch;

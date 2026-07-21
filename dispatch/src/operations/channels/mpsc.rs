@@ -8,7 +8,7 @@
 
 use crate::operations::channels;
 use crate::operations::channels::{Receiver, Sender};
-use crate::worker::waker_set;
+use crate::waker::waker_set;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;

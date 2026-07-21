@@ -54,7 +54,7 @@ impl FileInjector {
     /// costs only a redundant wake.
     fn wake_if_drained(&self) {
         if self.files.is_empty() {
-            dispatch::worker::waker_set().notify_all();
+            dispatch::waker::waker_set().notify_all();
         }
     }
 }
@@ -98,7 +98,7 @@ impl Receiver<DataFile> for FileInjector {
 mod tests {
     use super::*;
     use crate::store::{DataFileLocation, FileRef, ObjectPath};
-    use dispatch::worker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
+    use dispatch::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
     use std::path::PathBuf;
 
     /// The injector only ever hands these out, so they need no file behind them.
