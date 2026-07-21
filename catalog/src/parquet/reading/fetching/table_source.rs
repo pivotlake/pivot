@@ -206,7 +206,7 @@ impl SpeculationGate {
     /// one step short of done.
     fn note_claimed(&self) {
         if self.remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
-            dispatch::worker::waker_set().notify_all();
+            dispatch::waker::waker_set().notify_all();
         }
     }
 }
@@ -411,7 +411,7 @@ impl RowGroupInjector {
             // to claim, and decode through, the other node's cached bytes
             // even when local workers were available.
             gate.admitted_claims.fetch_add(1, Ordering::Relaxed);
-            dispatch::worker::waker_set().notify_one_near(self.numa_node_idx);
+            dispatch::waker::waker_set().notify_one_near(self.numa_node_idx);
         }
         ticket.transfer_to_decoder();
         Some(RowGroupRequest::from(row_group, &self.projection))
