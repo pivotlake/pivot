@@ -146,6 +146,9 @@ pub struct RowGroupInjectorFactory {
     projection: Projection,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
+    /// Row groups still queued, scan-wide (see
+    /// [`RowGroupInjector::note_claimed`]).
+    remaining: Arc<AtomicUsize>,
 }
 
 /// The allowance on outstanding claims while the boundary has not yet proven
@@ -190,25 +193,6 @@ pub struct SpeculationGate {
     /// keeps a converged scan at the floor while the ramp opens unprunable
     /// scans geometrically.
     admitted_claims: AtomicUsize,
-    /// Row groups still queued, scan-wide (see
-    /// [`SpeculationGate::note_claimed`]).
-    remaining: AtomicUsize,
-}
-
-impl SpeculationGate {
-    /// Count one row group leaving the queues; broadcast-wake the pool when
-    /// the last one goes. Workers the gate turned away park without having
-    /// finished their pipelines (a denied claim is a no-op pass,
-    /// indistinguishable from an idle one), and neither the drain nor the
-    /// finish cascade wakes them on its own - pruned claims send nothing
-    /// downstream, and the finish protocol needs *every* worker to run its own
-    /// finalization. Without this wake the query hangs with the pool parked
-    /// one step short of done.
-    fn note_claimed(&self) {
-        if self.remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
-            dispatch::worker::waker_set().notify_all();
-        }
-    }
 }
 
 impl RowGroupInjectorFactory {
@@ -238,9 +222,9 @@ impl RowGroupInjectorFactory {
             Arc::new(SpeculationGate {
                 outstanding: outstanding_row_groups,
                 admitted_claims: AtomicUsize::new(0),
-                remaining: AtomicUsize::new(order.len()),
             })
         });
+        let remaining = Arc::new(AtomicUsize::new(order.len()));
         for row_group_idx in order {
             let node = affinity_node(&table.row_groups[row_group_idx], node_count);
             row_group_queues[node].push(QueryRowGroupMetadata::new(table, row_group_idx, None));
@@ -250,6 +234,7 @@ impl RowGroupInjectorFactory {
             projection,
             filter,
             speculation,
+            remaining,
         }
     }
 }
@@ -266,6 +251,7 @@ impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
             projection: self.projection,
             filter: self.filter,
             speculation: self.speculation,
+            remaining: self.remaining,
         }
     }
 }
@@ -280,6 +266,9 @@ pub struct RowGroupInjector {
     projection: Projection,
     filter: Option<RowGroupFilter>,
     speculation: Option<Arc<SpeculationGate>>,
+    /// Row groups still queued, scan-wide (see
+    /// [`note_claimed`](Self::note_claimed)).
+    remaining: Arc<AtomicUsize>,
 }
 
 impl Receiver<RowGroupRequest> for RowGroupInjector {
@@ -379,6 +368,27 @@ impl SpeculationTicket<'_> {
 }
 
 impl RowGroupInjector {
+    /// Count one row group leaving the queues; broadcast-wake the pool when
+    /// the last one goes.
+    ///
+    /// A worker parks with its source's finish still `Pending` while *any*
+    /// row group stays queued, including one on another node's queue that
+    /// only that node's workers will claim. A claim, unlike a channel send,
+    /// wakes nobody on its own, and every downstream wake it triggers stays
+    /// on the claiming node - so once the last row group is claimed, a
+    /// remote worker parked on the "queue not yet empty" condition would
+    /// sleep forever, its sibling barrier one decrement short, and the query
+    /// would hang with the whole pool parked. The same applies to workers a
+    /// speculation gate turned away (a denied claim is a no-op pass), and to
+    /// pruned claims, which send nothing downstream. The finish protocol
+    /// needs *every* worker to run its own finalization, so the last claim
+    /// broadcasts to every node.
+    fn note_claimed(&self) {
+        if self.remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
+            dispatch::worker::waker_set().notify_all();
+        }
+    }
+
     /// Turn a claimed row group into a [`RowGroupRequest`], or `None` (and
     /// release the ticket) when the row-group filter proves it holds no
     /// matching row.
@@ -387,9 +397,7 @@ impl RowGroupInjector {
         row_group: QueryRowGroupMetadata,
         ticket: SpeculationTicket<'_>,
     ) -> Option<RowGroupRequest> {
-        if let Some(gate) = &self.speculation {
-            gate.note_claimed();
-        }
+        self.note_claimed();
         if let Some(filter) = &self.filter
             && !filter(row_group.get_metadata())
         {
