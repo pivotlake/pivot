@@ -263,6 +263,44 @@ impl Plan {
             _ => None,
         }
     }
+
+    /// The pivot [`Type`] of each parameter placeholder (`$1`, `$2`, …) this plan
+    /// references, ordered by parameter position. An entry is `None` where the
+    /// plan itself doesn't determine the type, such as a parameter used only in
+    /// a comparison that DuckDB leaves untyped. The server fills those from the
+    /// client's Parse declaration. Empty for a plan with no parameters.
+    pub fn parameter_types(&self) -> Vec<Option<Type>> {
+        let mut found: Vec<(usize, Option<Type>)> = Vec::new();
+        collect_node_parameters(&self.root, &mut found);
+        let count = found.iter().map(|(index, _)| index + 1).max().unwrap_or(0);
+        let mut types = vec![None; count];
+        for (index, ty) in found {
+            // Prefer a resolved type if any occurrence of this parameter has one.
+            if let Some(slot) = types.get_mut(index)
+                && slot.is_none()
+            {
+                *slot = ty;
+            }
+        }
+        types
+    }
+}
+
+/// Collect each parameter `(index, type)` referenced anywhere binding can reach:
+/// `Filter`/`Projection` expressions and prepared `Values`.
+fn collect_node_parameters(node: &PlanNode, out: &mut Vec<(usize, Option<Type>)>) {
+    match &node.operator {
+        Operator::Filter(filter) => filter.conditions.iter().for_each(|e| e.collect_params(out)),
+        Operator::Projection(projection) => projection
+            .projections
+            .iter()
+            .for_each(|e| e.collect_params(out)),
+        Operator::Values(values) => values.collect_params(out),
+        _ => {}
+    }
+    for child in &node.inputs {
+        collect_node_parameters(child, out);
+    }
 }
 
 impl fmt::Display for Plan {

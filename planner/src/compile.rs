@@ -57,6 +57,16 @@ pub enum Error {
     UnsupportedAggregateExpressionAmount(usize),
     #[error("Unsupported expression: {0:?}")]
     UnsupportedExpression(Expression),
+    #[error("parameter ${} was not bound (only {len} parameter(s) supplied)", .index + 1)]
+    UnboundParameter { index: usize, len: usize },
+    #[error("could not determine the type of parameter ${}", .0 + 1)]
+    UnresolvedParameter(usize),
+    #[error("casting parameter ${}: {message}", .index + 1)]
+    ParameterCast { index: usize, message: String },
+    #[error("unsupported VALUES column type: {0:?}")]
+    UnsupportedValuesType(arrow_schema::DataType),
+    #[error("building VALUES batch: {0}")]
+    ValuesBatch(String),
     #[error("Unsupported type for group by{}: {data_type:?}", .column.as_deref().map(|c| format!(" of column \"{c}\"")).unwrap_or_default())]
     DataTypeNotSupportedForGroupBy {
         column: Option<String>,
@@ -121,15 +131,31 @@ impl Plan {
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        self.compile_with_params(dispatcher, transaction, &[])
+    }
+
+    /// Like [`compile`](Self::compile), but binding the plan's parameter
+    /// placeholders (`$1`, `$2`, …) to `params` as it lowers. A prepared
+    /// statement is planned once with `Parameter` holes and compiled per Execute
+    /// with the freshly-bound values: each [`Expression::Parameter`] becomes the
+    /// bound constant, and a prepared `VALUES` gathers its columns from the
+    /// params. `params[i]` is the value for `$(i+1)`. Non-prepared queries pass
+    /// an empty slice.
+    pub fn compile_with_params(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        transaction: &dyn CatalogTransaction,
+        params: &[Scalar<ArrayRef>],
+    ) -> Result<RecordBatchOperatorSpec, Error> {
         // Every table access resolves through `transaction`, so the whole
         // query reads one frozen view of the catalog and no live catalog
         // state is consulted here. The plan itself carries no snapshot: it can
         // be cached and compiled again under a later transaction, reading that
         // transaction's view.
         let mut slots = DynamicFilterSlots::new();
-        let compiled = self
-            .root
-            .compile(dispatcher, &self.catalog, transaction, &mut slots)?;
+        let compiled =
+            self.root
+                .compile(dispatcher, &self.catalog, transaction, &mut slots, params)?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }
 }
@@ -199,6 +225,7 @@ impl PlanNode {
         catalog: &Arc<dyn Catalog>,
         transaction: &dyn CatalogTransaction,
         slots: &mut DynamicFilterSlots,
+        params: &[Scalar<ArrayRef>],
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
         // fully determined by table metadata (e.g. parquet row-group
@@ -225,15 +252,15 @@ impl PlanNode {
 
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, transaction, slots)?);
+            inputs.push(input.compile(dispatcher, catalog, transaction, slots, params)?);
         }
 
         match &self.operator {
             crate::Operator::Input(o) => o.compile(dispatcher, transaction, slots),
-            crate::Operator::Values(o) => o.compile(dispatcher),
+            crate::Operator::Values(o) => o.compile(dispatcher, params),
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, transaction),
-            crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
-            crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Projection(o) => o.compile(inputs.remove(0), params),
+            crate::Operator::Filter(o) => o.compile(inputs.remove(0), params),
             crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),

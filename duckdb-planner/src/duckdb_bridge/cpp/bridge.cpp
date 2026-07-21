@@ -29,6 +29,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -295,6 +296,22 @@ rust::Box<OptionalTableWrapper> lo_insert_take_table(const LogicalOperator &op) 
 
 size_t lo_insert_column_map_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalInsert>(op).column_index_map.size();
+}
+
+// Whether the insert's column mapping is a plain positional one: either no
+// explicit column list (empty map) or a full-width list already in table order
+// (identity map, entry k == k). pivot writes insert columns positionally, so any
+// other mapping (a reordered or partial column list) is not positional and must
+// be rejected.
+bool lo_insert_column_map_is_positional(const LogicalOperator &op) {
+	auto &map = as<duckdb::LogicalInsert>(op).column_index_map;
+	idx_t position = 0;
+	for (auto entry = map.begin(); entry != map.end(); ++entry, ++position) {
+		if (*entry != position) {
+			return false;
+		}
+	}
+	return true;
 }
 
 bool lo_insert_returns_rows(const LogicalOperator &op) {
@@ -919,4 +936,10 @@ const Expression &expr_case_else(const Expression &expr) {
 
 const Expression &expr_cast_child(const Expression &expr) {
 	return *as_expr<duckdb::BoundCastExpression>(expr).child;
+}
+
+// A BoundParameterExpression's identifier is the placeholder key: "1" for $1,
+// "2" for $2, and so on. The Rust side parses it into a zero-based index.
+rust::String expr_parameter_identifier(const Expression &expr) {
+	return rust::String::lossy(as_expr<duckdb::BoundParameterExpression>(expr).identifier);
 }

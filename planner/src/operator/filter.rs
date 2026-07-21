@@ -4,7 +4,7 @@ use crate::compile::{Error, ExprEvalFn};
 use crate::expression::Expression;
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::boolean::and;
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, Scalar};
 use dispatch::RecordBatchOperatorSpec;
 use std::fmt;
 use std::sync::Arc;
@@ -31,11 +31,14 @@ impl Filter {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        params: &[Scalar<ArrayRef>],
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        // Resolve any parameter placeholders (`WHERE col = $1`) to the bound
+        // values before compiling each condition.
         let filters = Arc::new(
             self.conditions
                 .iter()
-                .map(|e| e.compile())
+                .map(|e| e.bind_params(params)?.compile())
                 .collect::<Result<Vec<_>, _>>()?,
         );
         assert!(!filters.is_empty());

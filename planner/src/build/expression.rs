@@ -16,15 +16,15 @@ use duckdb_planner::handle::{
     AggregateFunc as AggregateFuncHandle, Between as BetweenHandle, Case as CaseHandle,
     Cast as CastHandle, Compare as CompareHandle, Conjunction as ConjunctionHandle,
     Expression as DuckExpression, Function as FunctionHandle, InList as InListHandle,
-    Not as NotHandle, Ref as RefHandle,
+    Not as NotHandle, Parameter as ParameterHandle, Ref as RefHandle,
 };
 use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, ParameterRef,
+    Prefix, Ref, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -48,6 +48,7 @@ impl Expression {
             DuckExpression::Case(c) => Expression::Case(Case::from_handle(c)?),
             DuckExpression::Not(n) => Expression::Not(Not::from_handle(n)?),
             DuckExpression::Cast(c) => Cast::from_handle(c)?,
+            DuckExpression::Parameter(p) => Expression::Parameter(ParameterRef::from_handle(p)?),
             DuckExpression::Unsupported(t) => return Err(Error::UnsupportedExpressionType(t)),
         })
     }
@@ -64,6 +65,22 @@ impl Ref {
             name: view
                 .alias()
                 .filter(|n| !n.is_empty() && !n.bytes().all(|b| b.is_ascii_digit())),
+        })
+    }
+}
+
+impl ParameterRef {
+    pub(crate) fn from_handle(view: ParameterHandle<'_>) -> Result<ParameterRef, Error> {
+        Ok(ParameterRef {
+            index: view
+                .index()
+                .map_err(|e| Error::UnsupportedParameter(e.to_string()))?,
+            // DuckDB resolves a parameter's type where it can (e.g. an INSERT
+            // target column), but leaves one used only in a comparison untyped
+            // (an unknown logical type that doesn't map). Such a parameter's type
+            // comes from the client's Parse declaration at bind time, so leave it
+            // `None` here rather than guessing.
+            ty: type_from_logical(view.return_type()).ok(),
         })
     }
 }
