@@ -12,15 +12,20 @@
 
 use crate::operations::channels::{Receiver, RootChannelFactory, Sender};
 use crate::operations::unary::{self, Unary};
+use crate::worker::waker_set;
 use crossbeam_deque::{Injector, Steal};
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Factory that loads a value set into a shared work-stealing queue and hands
 /// each worker an [`InjectorSource`] over it. Cheaply cloneable (the queue is
 /// shared via `Arc`), so the same source feeds every worker.
 pub struct InjectorSourceFactory<T> {
     items: Arc<Injector<T>>,
+    /// Items not yet claimed; whoever claims the last one broadcast-wakes the
+    /// pool. See [`InjectorSource::wakeup_workers_on_last_claim`].
+    remaining: Arc<AtomicUsize>,
 }
 
 // `Injector<T>` is `Send + Sync` for `T: Send`, so the factory is too. (Derive
@@ -29,6 +34,7 @@ impl<T> Clone for InjectorSourceFactory<T> {
     fn clone(&self) -> Self {
         Self {
             items: self.items.clone(),
+            remaining: self.remaining.clone(),
         }
     }
 }
@@ -36,11 +42,14 @@ impl<T> Clone for InjectorSourceFactory<T> {
 impl<T: Send> InjectorSourceFactory<T> {
     pub fn new(items: impl IntoIterator<Item = T>) -> Self {
         let injector = Injector::new();
+        let mut count = 0;
         for item in items {
             injector.push(item);
+            count += 1;
         }
         Self {
             items: Arc::new(injector),
+            remaining: Arc::new(AtomicUsize::new(count)),
         }
     }
 }
@@ -49,7 +58,10 @@ impl<T: Send + 'static> RootChannelFactory<T> for InjectorSourceFactory<T> {
     type Receiver = InjectorSource<T>;
 
     fn build(self) -> Self::Receiver {
-        InjectorSource { items: self.items }
+        InjectorSource {
+            items: self.items,
+            remaining: self.remaining,
+        }
     }
 }
 
@@ -58,6 +70,23 @@ impl<T: Send + 'static> RootChannelFactory<T> for InjectorSourceFactory<T> {
 /// worker pulls from the same pool and load balances automatically.
 pub struct InjectorSource<T> {
     items: Arc<Injector<T>>,
+    /// Items not yet claimed, shared with every worker's source.
+    remaining: Arc<AtomicUsize>,
+}
+
+impl<T> InjectorSource<T> {
+    /// Count one item leaving the queue; broadcast-wake the pool when the last
+    /// one goes. A worker that saw the queue non-empty at its finish check
+    /// parks without decrementing the stage's sibling barrier, and the drain
+    /// itself is silent: a claim sends nothing, and the claimer's downstream
+    /// sends wake only its own node. Waking every node lets each such worker
+    /// re-check the now-empty queue and sign off, so the dataflow can finish.
+    /// Mirrors the row-group injector's last-claim wake in `catalog`.
+    fn wakeup_workers_on_last_claim(&self) {
+        if self.remaining.fetch_sub(1, Ordering::Relaxed) == 1 {
+            waker_set().notify_all();
+        }
+    }
 }
 
 impl<T: Send> Receiver<T> for InjectorSource<T> {
@@ -76,7 +105,10 @@ impl<T: Send> Receiver<T> for InjectorSource<T> {
             return None;
         }
         match self.items.steal() {
-            Steal::Success(item) => Some(item),
+            Steal::Success(item) => {
+                self.wakeup_workers_on_last_claim();
+                Some(item)
+            }
             Steal::Empty | Steal::Retry => None,
         }
     }
@@ -85,7 +117,10 @@ impl<T: Send> Receiver<T> for InjectorSource<T> {
         while !self.items.is_empty() {
             match self.items.steal() {
                 Steal::Empty => return None,
-                Steal::Success(item) => return Some(item),
+                Steal::Success(item) => {
+                    self.wakeup_workers_on_last_claim();
+                    return Some(item);
+                }
                 Steal::Retry => continue,
             }
         }
