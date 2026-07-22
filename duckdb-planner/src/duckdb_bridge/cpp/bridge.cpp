@@ -727,6 +727,47 @@ size_t lo_late_materialization_column(const LogicalOperator &op, size_t index) {
 	return late_materialization_columns(op)[index];
 }
 
+// ---- ComparisonJoin: general accessors ----
+
+uint8_t lo_join_type(const LogicalOperator &op) {
+	return static_cast<uint8_t>(as<duckdb::LogicalComparisonJoin>(op).join_type);
+}
+
+size_t lo_join_condition_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalComparisonJoin>(op).conditions.size();
+}
+
+const Expression &lo_join_condition_left(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalComparisonJoin>(op).conditions[index].GetLHS();
+}
+
+const Expression &lo_join_condition_right(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalComparisonJoin>(op).conditions[index].GetRHS();
+}
+
+uint8_t lo_join_condition_comparison(const LogicalOperator &op, size_t index) {
+	return static_cast<uint8_t>(as<duckdb::LogicalComparisonJoin>(op).conditions[index].GetComparisonType());
+}
+
+// The join's projection maps: which of each child's output columns survive in
+// the join's output (empty = all of them). Filled by DuckDB's column-lifetime
+// pass, e.g. to drop a build-side key only referenced by the join condition.
+size_t lo_join_left_projection_map_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalComparisonJoin>(op).left_projection_map.size();
+}
+
+size_t lo_join_left_projection_map_index(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalComparisonJoin>(op).left_projection_map[index];
+}
+
+size_t lo_join_right_projection_map_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalComparisonJoin>(op).right_projection_map.size();
+}
+
+size_t lo_join_right_projection_map_index(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalComparisonJoin>(op).right_projection_map[index];
+}
+
 // ---- ExpressionList ----
 
 size_t expr_list_count(const ExpressionList &list) {

@@ -225,3 +225,78 @@ fn reset_variable_carries_no_value(mut testing_planner: TestingPlanner) {
     assert_eq!(set.name, "pivot_stats");
     assert_eq!(set.value, None);
 }
+
+fn add_join_tables(planner: &TestingPlanner) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use planner::types::Type;
+    use std::sync::Arc;
+
+    let int64_col = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
+    planner.add_table(
+        "orders",
+        &[
+            ("o_key", Type::Int64, int64_col(vec![1, 2])),
+            ("o_total", Type::Int64, int64_col(vec![10, 20])),
+        ],
+    );
+    planner.add_table(
+        "items",
+        &[
+            ("i_order", Type::Int64, int64_col(vec![1, 1, 2])),
+            ("i_qty", Type::Int64, int64_col(vec![5, 6, 7])),
+        ],
+    );
+}
+
+#[rstest]
+fn count_star_join_keeps_all_columns(mut testing_planner: TestingPlanner) {
+    add_join_tables(&testing_planner);
+
+    let plan = testing_planner
+        .planner
+        .plan("SELECT count(*) FROM items JOIN orders ON i_order = o_key")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(count_star():Int64)
+      Aggregate(groups: [], exprs: [count_star()])
+        Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])
+          Input([i_order:Int64])
+          Input([o_key:Int64])
+    ");
+}
+
+#[rstest]
+fn join_output_folds_projection_maps(mut testing_planner: TestingPlanner) {
+    add_join_tables(&testing_planner);
+
+    let plan = testing_planner
+        .planner
+        .plan("SELECT i_qty, o_total FROM items JOIN orders ON i_order = o_key")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(i_qty:Int64, o_total:Int64)
+      Join(probe_key: 0, build_key: 0, probe_output: [1], build_output: [1])
+        Input([i_order:Int64, i_qty:Int64])
+        Input([o_key:Int64, o_total:Int64])
+    ");
+}
+
+#[rstest]
+fn join_with_unread_build_side_keeps_it_anyway(mut testing_planner: TestingPlanner) {
+    add_join_tables(&testing_planner);
+
+    let plan = testing_planner
+        .planner
+        .plan("SELECT sum(i_order) FROM items JOIN orders ON i_order = o_key")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(sum(i_order):Int128)
+      Aggregate(groups: [], exprs: [sum(i_order:Int64)])
+        Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])
+          Input([i_order:Int64])
+          Input([o_key:Int64])
+    ");
+}

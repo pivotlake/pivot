@@ -20,6 +20,7 @@ mod explain;
 mod filter;
 mod input;
 mod insert;
+mod join;
 mod limit;
 mod materialize;
 mod order_by;
@@ -36,6 +37,7 @@ pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
 pub use insert::Insert;
+pub use join::Join;
 pub use limit::Limit;
 pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
@@ -63,6 +65,10 @@ pub enum Error {
     /// non-constant LIMIT, a table function with named parameters, ...).
     #[error("{0}")]
     Unsupported(String),
+    /// A subtree's output columns couldn't be typed while shaping the plan
+    /// (the join projection-map replay needs each side's width and types).
+    #[error("{0}")]
+    Typing(#[from] compile::Error),
 }
 
 /// Get-or-create the shared [`DynamicFilterSlot`] for `slot_id` within this
@@ -92,6 +98,8 @@ pub enum Operator {
     Filter(Filter),
     TopN(TopN),
     Limit(Limit),
+    /// Inner hash equi-join: probe (first input) against build (second input).
+    Join(Join),
     CreateTable(CreateTable),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
@@ -144,6 +152,14 @@ impl Operator {
             }
             // An INSERT emits one row: the inserted-row count.
             Operator::Insert(_) => Ok(vec![Type::Int64]),
+            // A join emits its listed probe columns followed by its listed
+            // build columns.
+            Operator::Join(join) => Ok(join
+                .probe_output
+                .iter()
+                .map(|&i| inputs[0][i].clone())
+                .chain(join.build_output.iter().map(|&i| inputs[1][i].clone()))
+                .collect()),
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),
             // EXPLAIN renders its child plan as text, one line per row.
@@ -172,6 +188,7 @@ impl fmt::Display for Operator {
             Operator::Filter(fl) => write!(f, "{fl}"),
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::Limit(l) => write!(f, "{l}"),
+            Operator::Join(j) => write!(f, "{j}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
