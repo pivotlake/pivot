@@ -146,6 +146,13 @@ impl Table for TestTable {
         unreachable!("the in-memory test table is never late-materialized")
     }
 
+    fn estimate_row_count(
+        &self,
+        _transaction: &dyn crate::catalog::CatalogTransaction,
+    ) -> Option<u64> {
+        Some(self.batch.num_rows() as u64)
+    }
+
     /// Exact min/max over the stored column as a scalar of its physical int type,
     /// so the no-scan global MIN/MAX peephole ([`Aggregate::try_compile_from_stats`])
     /// can be exercised. Only the int columns the peephole supports are answered.
