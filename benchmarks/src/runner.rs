@@ -309,7 +309,9 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
 /// Run every query in `suite` (filtered by `opts.query_filter`).
 ///
 /// `setup_template` reads the suite's `setup.sql`, substitutes `{source}`
-/// with the data path, and ships it as one `simple_query`. Tables persist on
+/// with the data path, and ships each `;`-terminated statement as its own
+/// `simple_query` (the server plans one statement at a time; a multi-table
+/// suite's setup holds one CREATE TABLE per table). Tables persist on
 /// the server's `ParquetCatalog` for the lifetime of the process — fine,
 /// since we tear the server down at the end of `main`.
 pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<SuiteRun> {
@@ -324,7 +326,17 @@ pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<Su
 
     let setup_template = read_to_string(&suite.setup_sql_path)?;
     let setup_sql = setup_template.replace("{source}", &opts.source.display().to_string());
-    client.simple_query(&setup_sql).await?;
+    for statement in setup_sql.split(';') {
+        // A chunk with no SQL in it (whitespace, or `--` comment lines only,
+        // e.g. a trailing comment block) has nothing to run.
+        let is_sql = statement
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"));
+        if !is_sql {
+            continue;
+        }
+        client.simple_query(statement).await?;
+    }
 
     if let Some(warmup) = &opts.warmup {
         client.simple_query(warmup).await?;

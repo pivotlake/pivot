@@ -54,7 +54,11 @@ benchmarks/
 │   ├── prep-modes-data.sh prep-clickhouse-native.sh
 │   ├── run-duckdb.sh run-clickhouse.sh
 │   └── duckdb-official/ clickhouse-official/      # vendored native schemas
-└── tpch/
+├── tpch/
+│   ├── setup.sql                 # the 8 normalized TPC-H tables
+│   ├── qNN.sql  qNN.tsv          # official TPC-H query texts
+│   └── prep-tpch-data.sh         # sync the parquet dataset from S3
+└── tpch-flat/
     ├── setup.sql                 # the denormalized flat table
     ├── qNN.sql  qNN.tsv
     └── prep-tpch-flat.sh         # tpchgen-cli → DuckDB denormalize → flat parquet
