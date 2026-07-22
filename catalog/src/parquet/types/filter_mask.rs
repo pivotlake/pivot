@@ -74,6 +74,35 @@ impl FilterMask {
         }
     }
 
+    /// Build a mask for the page spanning `[start_index, end_index)` that keeps
+    /// exactly the rows falling inside `[keep_start, keep_end)`. The ranges must
+    /// overlap. Cheaper than [`new`](Self::new) for a contiguous keep range: at
+    /// most three runs, no per-index walk.
+    pub fn from_range(start_index: u32, end_index: u32, keep_start: u32, keep_end: u32) -> Self {
+        let lo = keep_start.max(start_index);
+        let hi = keep_end.min(end_index);
+        debug_assert!(lo < hi, "keep range must overlap the page");
+
+        let mut run_ends: Vec<i32> = Vec::with_capacity(3);
+        let mut values = Vec::with_capacity(3);
+        if lo > start_index {
+            run_ends.push((lo - start_index) as i32);
+            values.push(false);
+        }
+        run_ends.push((hi - start_index) as i32);
+        values.push(true);
+        if hi < end_index {
+            run_ends.push((end_index - start_index) as i32);
+            values.push(false);
+        }
+
+        Self {
+            total_rows: (hi - lo) as usize,
+            filters: RunArray::try_new(&Int32Array::from(run_ends), &BooleanArray::from(values))
+                .unwrap(),
+        }
+    }
+
     /// Returns `true` when every run is `false` (no rows to keep).
     pub fn all_false(&self) -> bool {
         self.filters
@@ -199,6 +228,35 @@ mod tests {
         let mask = FilterMask::new(10, 15, &[3, 7, 12, 20]);
 
         assert_eq!(mask.rows(), 1);
+    }
+
+    // ── FilterMask::from_range ──
+
+    #[test]
+    fn test_from_range_keep_middle() {
+        let mask = FilterMask::from_range(0, 10, 3, 7);
+
+        assert_eq!(mask.rows(), 4);
+        assert_eq!(mask.get_run_type_and_run_end(0), (false, 3));
+        assert_eq!(mask.get_run_type_and_run_end(1), (true, 7));
+        assert_eq!(mask.get_run_type_and_run_end(2), (false, 10));
+    }
+
+    #[test]
+    fn test_from_range_clips_to_page() {
+        let mask = FilterMask::from_range(5, 15, 0, 8);
+
+        assert_eq!(mask.rows(), 3);
+        assert_eq!(mask.get_run_type_and_run_end(0), (true, 3));
+        assert_eq!(mask.get_run_type_and_run_end(1), (false, 15 - 5));
+    }
+
+    #[test]
+    fn test_from_range_covering_page_keeps_all() {
+        let mask = FilterMask::from_range(10, 20, 10, 20);
+
+        assert_eq!(mask.rows(), 10);
+        assert_eq!(mask.get_run_type_and_run_end(0), (true, 10));
     }
 
     // ── FilterMask::get_run_type_and_run_end ──

@@ -11,6 +11,13 @@
 //! present it attaches a [`FilterMask`] to each data page so the decoder knows which
 //! rows to keep.
 //!
+//! A row group claimed with a [`DecodeFanOut`] plan is instead split into
+//! row-range decode slices, each routed to a different worker as a dense mini
+//! row group (see [`fan_out_row_group`]), so a scan with fewer row groups than
+//! workers still decodes on the whole pool.
+//!
+//! [`DecodeFanOut`]: crate::parquet::types::metadata::DecodeFanOut
+//!
 //! ## Emission order
 //!
 //! Pages are expected to be emitted onto a **LIFO** channel, so the last page sent is the first one
@@ -24,7 +31,7 @@
 //!    dictionary before any RLE-dictionary-encoded data page.
 
 use crate::parquet::types::filter_mask::FilterMask;
-use crate::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::parquet::types::metadata::{DecodeSlice, QueryRowGroupMetadata, SliceRelease};
 use crate::parquet::types::page::CompressedPage;
 use crate::parquet::types::requests::{ColumnPart, RowGroupBuffer};
 use crate::parquet::types::thrift::general::PageType;
@@ -35,6 +42,8 @@ use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 pub type IndexerFactory = DefaultUnaryFactory<Indexer>;
 
@@ -81,39 +90,69 @@ struct ColumnPageBuilder {
     query_row_group_metadata: QueryRowGroupMetadata,
     worker_id: usize,
     cursor: PageCursor,
+    /// Data pages actually emitted so far. Diverges from the cursor's count
+    /// only for a decode slice, which drops pages outside its row range; the
+    /// emitted index keeps each decoder's page slots dense from zero.
+    emitted_data_pages: usize,
 }
 
 impl ColumnPageBuilder {
+    /// The filter mask for a data page spanning `[row_offset, row_end)`, or
+    /// `None` to keep every row. For a decode slice, a page entirely outside
+    /// the slice's row range yields `Err(())`: the page is not emitted at all.
+    fn data_page_mask(&self, row_offset: u32, row_end: u32) -> Result<Option<FilterMask>, ()> {
+        if let Some(slice) = &self.query_row_group_metadata.decode_slice {
+            let (keep_start, keep_end) = slice.row_range;
+            if row_end <= keep_start || row_offset >= keep_end {
+                return Err(());
+            }
+            if keep_start <= row_offset && row_end <= keep_end {
+                return Ok(None);
+            }
+            return Ok(Some(FilterMask::from_range(
+                row_offset, row_end, keep_start, keep_end,
+            )));
+        }
+        Ok(self
+            .query_row_group_metadata
+            .filtered_indices()
+            .as_ref()
+            .map(|f| FilterMask::new(row_offset, row_end, f)))
+    }
+
     /// Build one `CompressedPage`, attaching the current query's filter mask
-    /// and advancing the cursor.
+    /// and advancing the cursor. Returns `None` for a data page that a decode
+    /// slice drops entirely (outside its row range).
     fn build_page(
         &mut self,
         file_offset: usize,
         span: usize,
         header: PageHeader,
         payload: PagePayload,
-    ) -> CompressedPage {
-        let (page_idx, row_offset) = self.cursor.advance(&header);
-        let filter_mask = (header.r#type == PageType::DATA_PAGE)
-            .then(|| {
-                self.query_row_group_metadata
-                    .filtered_indices()
-                    .as_ref()
-                    .map(|f| {
-                        FilterMask::new(
-                            row_offset,
-                            row_offset + header.data_page_num_values() as u32,
-                            f,
-                        )
-                    })
-            })
-            .flatten();
+    ) -> Option<CompressedPage> {
+        let (_, row_offset) = self.cursor.advance(&header);
+        let is_data_page = header.r#type == PageType::DATA_PAGE;
+        let filter_mask = if is_data_page {
+            match self.data_page_mask(
+                row_offset,
+                row_offset + header.data_page_num_values() as u32,
+            ) {
+                Ok(mask) => mask,
+                Err(()) => return None,
+            }
+        } else {
+            None
+        };
+        let page_idx = self.emitted_data_pages;
+        if is_data_page {
+            self.emitted_data_pages += 1;
+        }
         let (data, decompressed) = match payload {
             PagePayload::Compressed(bytes) => (bytes, None),
             PagePayload::Decompressed(bytes) => (Vec::new(), Some(bytes)),
         };
 
-        CompressedPage {
+        Some(CompressedPage {
             // This is the claimer, not necessarily this worker: the indexer
             // often runs on a stealing sibling, but the decode must return to
             // the worker that claimed the row group (it owns the decoder
@@ -128,7 +167,7 @@ impl ColumnPageBuilder {
             decompressed,
             filter_mask,
             header,
-        }
+        })
     }
 
     /// Walk a `Compressed` part's raw byte stream and Thrift-parse it into pages,
@@ -154,12 +193,14 @@ impl ColumnPageBuilder {
             let data = reader.copy_out_buffers(header.compressed_page_size as usize);
             let span = reader.consumed() - page_start;
 
-            pages.push(self.build_page(
+            if let Some(page) = self.build_page(
                 part_offset + page_start,
                 span,
                 header,
                 PagePayload::Compressed(data),
-            ));
+            ) {
+                pages.push(page);
+            }
 
             if reader.remaining_in_cur() == 0
                 && reader.position().buffer_index == buffers_length - 1
@@ -183,6 +224,7 @@ fn build_column_pages(
         query_row_group_metadata,
         worker_id,
         cursor: PageCursor::default(),
+        emitted_data_pages: 0,
     };
     let mut pages = Vec::with_capacity(128);
     for part in parts {
@@ -195,15 +237,143 @@ fn build_column_pages(
                 span,
                 header,
                 data,
-            } => pages.push(builder.build_page(
-                offset,
-                span,
-                *header,
-                PagePayload::Decompressed(data),
-            )),
+            } => {
+                if let Some(page) =
+                    builder.build_page(offset, span, *header, PagePayload::Decompressed(data))
+                {
+                    pages.push(page);
+                }
+            }
         }
     }
     Ok(pages)
+}
+
+/// Emit page lists onto the LIFO channel: data pages interleaved so the list
+/// with the fewest emitted rows goes next (the decoder can cut batches as
+/// early as possible), dictionary pages last so they arrive first.
+fn emit_pages<S: Sender<CompressedPage>>(
+    mut pages_per_column: Vec<Vec<CompressedPage>>,
+    sender: &mut S,
+) -> dispatch::UnaryResult<()> {
+    // We want to send the pages out in an order that will be best for decoding. If we were to,
+    // for example, send all of column A pages and then only column B pages, we would be unable to
+    // send out record batches until AFTER we finished ALL of column A. This is horrible from a
+    // cache standpoint, as it means pages we touched for decompressing won't be in cache for
+    // the decoder.
+    // Therefore, we try to send out pages in "intelligently"- first we send out dict pages,
+    // and then we try sending out pages in an order where we will be able to send out record
+    // batches as soon as possible. We do this by always selecting pages from the column that
+    // has sent out the minimum amount of records so far
+    let dict_pages: Vec<_> = pages_per_column
+        .iter_mut()
+        .flat_map(|pages| {
+            pages
+                .extract_if(..pages.len(), |p| {
+                    p.header.r#type == PageType::DICTIONARY_PAGE
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mut rows_emitted = vec![0u64; pages_per_column.len()];
+
+    while let Some(col) = (0..pages_per_column.len())
+        .filter(|i| !pages_per_column[*i].is_empty())
+        .min_by_key(|i| rows_emitted[*i])
+    {
+        let page = pages_per_column[col].pop().unwrap();
+        rows_emitted[col] += page.header.data_page_num_values() as u64;
+        sender.send(page)?;
+    }
+
+    // We send the dict pages at the end, so they'll be received first (remember, we're LIFO!)
+    for page in dict_pages {
+        sender.send(page)?;
+    }
+    Ok(())
+}
+
+/// Split a fanned-out row group into row-range decode slices, each presented
+/// to a different worker as a dense mini row group: only the pages overlapping
+/// the slice's range are emitted (boundary pages carry a range mask), page
+/// indices are renumbered per slice, and every slice gets its own copy of the
+/// dictionary pages. Slices share the claim via [`SliceRelease`]; the
+/// decompressed cache dedupes the byte work of pages sent to two slices.
+fn fan_out_row_group<S: Sender<CompressedPage>>(
+    buffer: RowGroupBuffer,
+    worker_count: usize,
+    slices: usize,
+    sender: &mut S,
+) -> dispatch::UnaryResult<()> {
+    let num_rows = buffer.metadata.num_rows() as u32;
+    let release = Arc::new(SliceRelease {
+        remaining: AtomicUsize::new(slices),
+        claimer_worker_id: buffer.worker_id,
+    });
+    let rows_per_slice = num_rows.div_ceil(slices as u32);
+    let worker_stride = (worker_count / slices).max(1);
+
+    // Parse each column's parts into pages once; the slices below take cheap
+    // clones (shared `Bytes`) of the pages overlapping their row range instead
+    // of re-parsing the Thrift headers per slice.
+    let base_pages_per_column: Vec<Vec<CompressedPage>> = buffer
+        .columns
+        .into_iter()
+        .enumerate()
+        .map(|(col_idx, parts)| {
+            build_column_pages(col_idx, buffer.metadata.clone(), parts, buffer.worker_id)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(crate::parquet::op_err)?;
+
+    let mut pages_per_slice_column = Vec::with_capacity(slices * base_pages_per_column.len());
+    for slice_idx in 0..slices {
+        let keep_start = slice_idx as u32 * rows_per_slice;
+        let keep_end = (keep_start + rows_per_slice).min(num_rows);
+        let slice_metadata = buffer.metadata.for_decode_slice(DecodeSlice {
+            row_range: (keep_start, keep_end),
+            release: release.clone(),
+        });
+        let slice_worker = (buffer.worker_id + slice_idx * worker_stride) % worker_count;
+        for base_pages in &base_pages_per_column {
+            let mut slice_pages = Vec::with_capacity(base_pages.len() / slices + 2);
+            let mut row_offset = 0u32;
+            let mut emitted_data_pages = 0;
+            for page in base_pages {
+                let is_data_page = page.header.r#type == PageType::DATA_PAGE;
+                let (filter_mask, page_idx) = if is_data_page {
+                    let row_end = row_offset + page.header.data_page_num_values() as u32;
+                    let page_range = (row_offset, row_end);
+                    row_offset = row_end;
+                    if page_range.1 <= keep_start || page_range.0 >= keep_end {
+                        continue;
+                    }
+                    let mask = (keep_start > page_range.0 || page_range.1 > keep_end).then(|| {
+                        FilterMask::from_range(page_range.0, page_range.1, keep_start, keep_end)
+                    });
+                    emitted_data_pages += 1;
+                    (mask, emitted_data_pages - 1)
+                } else {
+                    (None, emitted_data_pages)
+                };
+                slice_pages.push(CompressedPage {
+                    worker_id: slice_worker,
+                    row_group: slice_metadata.clone(),
+                    column_idx: page.column_idx,
+                    file_offset: page.file_offset,
+                    span: page.span,
+                    page_idx,
+                    header: page.header.clone(),
+                    data: page.data.clone(),
+                    decompressed: page.decompressed.clone(),
+                    filter_mask,
+                });
+            }
+            pages_per_slice_column.push(slice_pages);
+        }
+    }
+    emit_pages(pages_per_slice_column, sender)
 }
 
 impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
@@ -212,7 +382,16 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
         buffer: RowGroupBuffer,
         sender: &mut S,
     ) -> dispatch::UnaryResult<()> {
-        let mut pages_per_column: Vec<_> = buffer
+        if let Some(plan) = buffer.metadata.decode_fan_out
+            && buffer.metadata.filtered_indices().is_none()
+        {
+            let slices = plan.slice_count(buffer.metadata.num_rows() as u32);
+            if slices > 1 {
+                return fan_out_row_group(buffer, plan.worker_count, slices, sender);
+            }
+        }
+
+        let pages_per_column: Vec<_> = buffer
             .columns
             .into_iter()
             .enumerate()
@@ -222,42 +401,7 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::parquet::op_err)?;
 
-        // We want to send the pages out in an order that will be best for decoding. If we were to,
-        // for example, send all of column A pages and then only column B pages, we would be unable to
-        // send out record batches until AFTER we finished ALL of column A. This is horrible from a
-        // cache standpoint, as it means pages we touched for decompressing won't be in cache for
-        // the decoder.
-        // Therefore, we try to send out pages in "intelligently"- first we send out dict pages,
-        // and then we try sending out pages in an order where we will be able to send out record
-        // batches as soon as possible. We do this by always selecting pages from the column that
-        // has sent out the minimum amount of records so far
-        let dict_pages: Vec<_> = pages_per_column
-            .iter_mut()
-            .flat_map(|pages| {
-                pages
-                    .extract_if(..pages.len(), |p| {
-                        p.header.r#type == PageType::DICTIONARY_PAGE
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        let mut rows_emitted = vec![0u64; pages_per_column.len()];
-
-        while let Some(col) = (0..pages_per_column.len())
-            .filter(|i| !pages_per_column[*i].is_empty())
-            .min_by_key(|i| rows_emitted[*i])
-        {
-            let page = pages_per_column[col].pop().unwrap();
-            rows_emitted[col] += page.header.data_page_num_values() as u64;
-            sender.send(page)?;
-        }
-
-        // We send the dict pages at the end, so they'll be received first (remember, we're LIFO!)
-        for page in dict_pages {
-            sender.send(page)?;
-        }
-        Ok(())
+        emit_pages(pages_per_column, sender)
     }
 }
 
@@ -528,6 +672,91 @@ mod tests {
         assert_eq!(pages[0].span, 20);
         assert!(pages[0].data.is_empty());
         assert_eq!(pages[0].decompressed, Some(data));
+    }
+
+    fn metadata_with_rows(num_rows: i64) -> QueryRowGroupMetadata {
+        use crate::parquet::types::metadata::RowGroupMetadata;
+        use crate::parquet::types::table::ParquetTable;
+        let dummy = crate::parquet::test_utils::dummy_row_group();
+        let table = ParquetTable::new(vec![std::sync::Arc::new(RowGroupMetadata {
+            open_file: dummy.open_file.clone(),
+            schema: dummy.schema.clone(),
+            columns: vec![],
+            num_rows,
+            file_row_group_idx: 0,
+            live_decompressed_pages: std::sync::Arc::new(AtomicUsize::new(0)),
+        })]);
+        QueryRowGroupMetadata::new(&table, 0, None)
+    }
+
+    /// Two decode slices split a column's pages by row range: interior pages
+    /// go to exactly one slice unmasked, the page straddling the boundary goes
+    /// to both with complementary masks, and the dictionary page goes to both.
+    #[test]
+    fn fan_out_splits_pages_into_row_range_slices() {
+        let col = make_column_buffer(&[
+            (dict_page_header(3, 1), vec![0xDD]),
+            (data_page_header(100, 1), vec![0xA0]),
+            (data_page_header(100, 1), vec![0xA1]),
+            (data_page_header(100, 1), vec![0xA2]),
+        ]);
+        let buffer = RowGroupBuffer {
+            metadata: metadata_with_rows(300),
+            columns: vec![col],
+            worker_id: 3,
+        };
+        let mut sender = dispatch::test_utils::CollectSender::default();
+
+        fan_out_row_group(buffer, 4, 2, &mut sender).unwrap();
+
+        let pages = sender.items;
+        let dicts: Vec<_> = pages
+            .iter()
+            .filter(|p| p.header.r#type == PageType::DICTIONARY_PAGE)
+            .collect();
+        assert_eq!(dicts.len(), 2);
+        let slice_of = |p: &CompressedPage| p.row_group.decode_slice.clone().unwrap();
+        let first_slice: Vec<_> = pages
+            .iter()
+            .filter(|p| p.header.r#type == PageType::DATA_PAGE && slice_of(p).row_range == (0, 150))
+            .collect();
+        let second_slice: Vec<_> = pages
+            .iter()
+            .filter(|p| {
+                p.header.r#type == PageType::DATA_PAGE && slice_of(p).row_range == (150, 300)
+            })
+            .collect();
+        assert_eq!(first_slice.len(), 2);
+        assert_eq!(second_slice.len(), 2);
+        let mask_rows = |pages: &[&CompressedPage]| -> usize {
+            pages
+                .iter()
+                .map(|p| {
+                    p.filter_mask
+                        .as_ref()
+                        .map(|m| m.rows())
+                        .unwrap_or(p.header.data_page_num_values() as usize)
+                })
+                .sum()
+        };
+        assert_eq!(mask_rows(&first_slice), 150);
+        assert_eq!(mask_rows(&second_slice), 150);
+        let workers = |pages: &[&CompressedPage]| -> Vec<usize> {
+            let mut w: Vec<_> = pages.iter().map(|p| p.worker_id).collect();
+            w.dedup();
+            w
+        };
+        assert_ne!(workers(&first_slice), workers(&second_slice));
+        let mut first_indices: Vec<_> = first_slice.iter().map(|p| p.page_idx).collect();
+        first_indices.sort();
+        assert_eq!(first_indices, vec![0, 1]);
+        assert_eq!(
+            slice_of(first_slice[0])
+                .release
+                .remaining
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     /// `page_idx` and filter-mask row offsets stay continuous across a

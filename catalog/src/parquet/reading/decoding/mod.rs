@@ -12,7 +12,7 @@
 //! row group that has enough data. Exhausted row groups are removed immediately.
 
 use crate::parquet::DecompressedPage;
-use crate::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::parquet::types::metadata::{DecodeSlice, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use ahash::HashSet;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
@@ -54,6 +54,10 @@ pub struct DecoderFactory {
     /// with its fetcher; decremented as row groups finish so the fetcher's
     /// claim backpressure releases (see `RowGroupFetcher`).
     pub pending_row_groups: Arc<AtomicUsize>,
+    /// Every worker's pending counter, indexed by worker id. A fanned-out row
+    /// group's slices decode away from the claimer, and the last slice must
+    /// release the claim against the claimer's counter.
+    pub claimer_pending_counters: Arc<Vec<Arc<AtomicUsize>>>,
     /// The scan-wide equivalent, shared with the row-group injector; releases
     /// the speculative-claim throttle of an unarmed Top-N scan.
     pub outstanding_row_groups: Arc<AtomicUsize>,
@@ -69,6 +73,7 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
             self.add_row_group_metadata,
             self.eq_predicates,
             self.pending_row_groups,
+            self.claimer_pending_counters,
             self.outstanding_row_groups,
         )
     }
@@ -100,6 +105,9 @@ pub struct Decoder {
     /// backpressure; decremented once per row group as it completes
     /// (exhausted or pruned).
     pending_row_groups: Arc<AtomicUsize>,
+    /// Every worker's pending counter, indexed by worker id (see
+    /// [`DecoderFactory::claimer_pending_counters`]).
+    claimer_pending_counters: Arc<Vec<Arc<AtomicUsize>>>,
     /// The scan-wide count, shared with the row-group injector.
     outstanding_row_groups: Arc<AtomicUsize>,
 }
@@ -111,6 +119,7 @@ impl Decoder {
         add_row_group_metadata: bool,
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
         pending_row_groups: Arc<AtomicUsize>,
+        claimer_pending_counters: Arc<Vec<Arc<AtomicUsize>>>,
         outstanding_row_groups: Arc<AtomicUsize>,
     ) -> Self {
         Self {
@@ -122,13 +131,26 @@ impl Decoder {
             add_row_group_metadata,
             eq_predicates,
             pending_row_groups,
+            claimer_pending_counters,
             outstanding_row_groups,
         }
     }
 
     /// Mark one claimed row group fully decoded (or pruned), releasing its
-    /// share of the fetcher's claim backpressure.
-    fn release_claim(&self) {
+    /// share of the fetcher's claim backpressure. A decode slice releases the
+    /// claim only when it is the row group's last live slice, and against the
+    /// claimer's counter (the slices decode on other workers).
+    fn release_claim(&self, decode_slice: Option<&DecodeSlice>) {
+        if let Some(slice) = decode_slice {
+            if slice.release.remaining.fetch_sub(1, Ordering::AcqRel) != 1 {
+                return;
+            }
+            self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
+            let claimer = &self.claimer_pending_counters[slice.release.claimer_worker_id];
+            let previous = claimer.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0, "released a row-group claim never made");
+            return;
+        }
         self.outstanding_row_groups.fetch_sub(1, Ordering::Relaxed);
         let previous = self.pending_row_groups.fetch_sub(1, Ordering::Relaxed);
         // An underflow means this decoder released a claim its own fetcher
@@ -186,14 +208,15 @@ impl Decoder {
             {
                 sender.send(batch)?;
                 if decoder.exhausted() {
-                    exhausted_row_group = Some(decoder.row_group_idx());
+                    exhausted_row_group =
+                        Some((decoder.row_group_idx(), decoder.decode_slice().cloned()));
                 }
                 produced = true;
                 break;
             }
         }
 
-        if let Some(row_group_idx) = exhausted_row_group {
+        if let Some((row_group_idx, decode_slice)) = exhausted_row_group {
             // Mark the removed row group closed, exactly like the consume path:
             // a masked row group reaches its total while trailing all-false
             // pages are still in flight, and a late page for an unclosed row
@@ -202,7 +225,7 @@ impl Decoder {
             // release the row group's claim a second time, wrapping the claim
             // counters and wedging the scan).
             self.closed_row_groups.insert(row_group_idx);
-            self.release_claim();
+            self.release_claim(decode_slice.as_ref());
             self.row_group_decoders
                 .retain(|d| d.row_group_idx() != row_group_idx);
         }
@@ -230,10 +253,9 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
         // dictionary excludes a pushed-down equality constant). Drop it without
         // emitting, and ignore its remaining in-flight data pages.
         if self.row_group_decoders[pos].pruned() {
-            let row_group_idx = self.row_group_decoders[pos].row_group_idx();
-            self.closed_row_groups.insert(row_group_idx);
-            self.row_group_decoders.remove(pos);
-            self.release_claim();
+            let removed = self.row_group_decoders.remove(pos);
+            self.closed_row_groups.insert(removed.row_group_idx());
+            self.release_claim(removed.decode_slice());
             return Ok(());
         }
 
@@ -243,10 +265,9 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
             .map_err(crate::parquet::op_err)?
         {
             if self.row_group_decoders[pos].exhausted() {
-                let row_group_idx = self.row_group_decoders[pos].row_group_idx();
-                self.closed_row_groups.insert(row_group_idx);
-                self.row_group_decoders.remove(pos);
-                self.release_claim();
+                let removed = self.row_group_decoders.remove(pos);
+                self.closed_row_groups.insert(removed.row_group_idx());
+                self.release_claim(removed.decode_slice());
             }
             output.send(b)?;
             return Ok(());
@@ -462,6 +483,7 @@ mod tests {
             // counters high enough that releases never hit the underflow
             // assertion.
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
+            Arc::new(Vec::new()),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
         )
     }
@@ -474,6 +496,7 @@ mod tests {
             Arc::new(vec![predicate]),
             // The claim-release counters; seeded like `new_decoder`'s.
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
+            Arc::new(Vec::new()),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
         )
     }
@@ -683,6 +706,73 @@ mod tests {
 
         assert_eq!(sink.items.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
         assert!(dispatch::Unary::finish(&mut decoder, &mut sink).unwrap());
+    }
+
+    /// Two decode slices of one row group, finishing on different workers,
+    /// release the shared claim exactly once, against the claimer's counter.
+    #[test]
+    fn test_slice_decoders_release_claim_once() {
+        use crate::parquet::types::metadata::{DecodeSlice, SliceRelease};
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 5);
+        let base = QueryRowGroupMetadata::new(&table, 0, None);
+        let release = Arc::new(SliceRelease {
+            remaining: std::sync::atomic::AtomicUsize::new(2),
+            claimer_worker_id: 0,
+        });
+        let claimer_pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let outstanding = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let counters = Arc::new(vec![claimer_pending.clone()]);
+        let make_slice_decoder = || {
+            Decoder::new(
+                1024,
+                Projection::all_from_schema(table.schema()),
+                false,
+                Arc::new(Vec::new()),
+                Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
+                counters.clone(),
+                outstanding.clone(),
+            )
+        };
+        let first_metadata = base.for_decode_slice(DecodeSlice {
+            row_range: (0, 3),
+            release: release.clone(),
+        });
+        let second_metadata = base.for_decode_slice(DecodeSlice {
+            row_range: (3, 5),
+            release: release.clone(),
+        });
+
+        let first_out = run_unary(
+            make_slice_decoder(),
+            vec![make_data_page(
+                first_metadata,
+                0,
+                encode_i32s(&[10, 20, 30]),
+                3,
+                0,
+            )],
+        );
+        let pending_after_first = claimer_pending.load(std::sync::atomic::Ordering::Relaxed);
+        let second_out = run_unary(
+            make_slice_decoder(),
+            vec![make_data_page(
+                second_metadata,
+                0,
+                encode_i32s(&[40, 50]),
+                2,
+                0,
+            )],
+        );
+
+        assert_eq!(extract_i32s(&first_out[0], 0), vec![10, 20, 30]);
+        assert_eq!(extract_i32s(&second_out[0], 0), vec![40, 50]);
+        assert_eq!(pending_after_first, 1);
+        assert_eq!(
+            claimer_pending.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(outstanding.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     /// finish() drains remaining batches when batch_size < total rows.

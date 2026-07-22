@@ -104,6 +104,55 @@ impl RowGroupMetadata {
     }
 }
 
+/// A scan-wide plan to split each claimed row group's decode across several
+/// workers. Set on a claim's metadata when the scan has fewer row groups than
+/// workers, so a single row group's decode would otherwise serialize on its
+/// claimer while the rest of the pool idles. The indexer consults it and cuts
+/// the row group into row-range slices, each decoded by a different worker.
+#[derive(Clone, Copy)]
+pub struct DecodeFanOut {
+    /// Total dispatch workers available to the scan.
+    pub worker_count: usize,
+    /// Row groups the whole scan will claim.
+    pub row_group_count: usize,
+}
+
+/// Slices below this many rows are not worth the per-slice overhead
+/// (duplicated dictionary builds, extra channel messages).
+const MIN_SLICE_ROWS: u32 = 32768;
+
+impl DecodeFanOut {
+    /// How many decode slices to cut a row group of `num_rows` into: enough to
+    /// spread the scan's row groups over every worker, but never slices so
+    /// small the per-slice overhead dominates.
+    pub fn slice_count(&self, num_rows: u32) -> usize {
+        let spread = (self.worker_count / self.row_group_count.max(1)).max(1);
+        let by_rows = (num_rows / MIN_SLICE_ROWS).max(1) as usize;
+        spread.min(by_rows).min(self.worker_count)
+    }
+}
+
+/// Release accounting shared by every decode slice of one claimed row group.
+/// The claim was made once (by the claiming worker's fetcher), so it must be
+/// released once: by whichever slice finishes last.
+pub struct SliceRelease {
+    /// Slices not yet fully decoded.
+    pub remaining: AtomicUsize,
+    /// The worker whose fetcher made the claim, and whose pending-claims
+    /// counter the release must decrement.
+    pub claimer_worker_id: usize,
+}
+
+/// Identifies one decode slice of a fanned-out row group: the contiguous row
+/// range this slice decodes, plus the shared release accounting.
+#[derive(Clone)]
+pub struct DecodeSlice {
+    /// Rows `[start, end)` of the row group this slice covers.
+    pub row_range: (u32, u32),
+    /// Shared by all slices of the row group; the last one releases the claim.
+    pub release: Arc<SliceRelease>,
+}
+
 /// Row-group metadata augmented with per-query filtering state.
 ///
 /// Wraps a shared [`RowGroupMetadata`] and optionally carries the sorted row
@@ -119,6 +168,13 @@ pub struct QueryRowGroupMetadata {
     /// The row group's global index — its position in the table's flat
     /// `row_groups` list, which is how the materializer addresses it back.
     pub row_group_index: usize,
+    /// When set (on a claim), the indexer splits this row group's pages into
+    /// row-range decode slices spread across workers instead of leaving the
+    /// whole decode on the claimer.
+    pub decode_fan_out: Option<DecodeFanOut>,
+    /// When set, this metadata describes one decode slice of a fanned-out row
+    /// group rather than the whole row group.
+    pub decode_slice: Option<DecodeSlice>,
     /// Shared across every page of this row group: the decoder flips it once the
     /// row group is pruned (e.g. a dictionary excludes a pushed-down equality
     /// constant), letting the decompressor skip the remaining, not-yet-touched
@@ -132,8 +188,20 @@ impl QueryRowGroupMetadata {
             row_group_metadata: table.row_groups[index].clone(),
             filtered_indices,
             row_group_index: index,
+            decode_fan_out: None,
+            decode_slice: None,
             pruned: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// A copy of this metadata describing one decode slice of the row group.
+    /// The slice shares the row group's pruned flag (pruning any slice prunes
+    /// them all) but drops the fan-out plan so nothing downstream re-splits it.
+    pub fn for_decode_slice(&self, slice: DecodeSlice) -> Self {
+        let mut sliced = self.clone();
+        sliced.decode_fan_out = None;
+        sliced.decode_slice = Some(slice);
+        sliced
     }
 
     /// Whether this row group has been pruned (no row can match a pushed-down
@@ -173,5 +241,41 @@ impl QueryRowGroupMetadata {
 
     pub fn filtered_indices(&self) -> &Option<Vec<u32>> {
         &self.filtered_indices
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_count_spreads_workers_over_row_groups() {
+        let plan = DecodeFanOut {
+            worker_count: 16,
+            row_group_count: 2,
+        };
+
+        assert_eq!(plan.slice_count(442464), 8);
+    }
+
+    #[test]
+    fn slice_count_never_cuts_below_minimum_rows() {
+        let plan = DecodeFanOut {
+            worker_count: 16,
+            row_group_count: 1,
+        };
+
+        assert_eq!(plan.slice_count(40000), 1);
+        assert_eq!(plan.slice_count(MIN_SLICE_ROWS * 3), 3);
+    }
+
+    #[test]
+    fn slice_count_is_one_when_workers_are_covered() {
+        let plan = DecodeFanOut {
+            worker_count: 16,
+            row_group_count: 20,
+        };
+
+        assert_eq!(plan.slice_count(442464), 1);
     }
 }

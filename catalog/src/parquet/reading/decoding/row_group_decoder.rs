@@ -15,7 +15,7 @@ use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
 use crate::parquet::types::leaves::{
     first_leaf, leaf_count, leaf_fields, nest_leaves_into_columns,
 };
-use crate::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::parquet::types::metadata::{DecodeSlice, QueryRowGroupMetadata};
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
 use arrow_array::RecordBatch;
@@ -118,6 +118,9 @@ pub struct RowGroupDecoder {
     /// by their position inside the row group, so every row has to stay in
     /// place.
     filter_batches: bool,
+    /// Set when this decoder covers one decode slice of a fanned-out row
+    /// group; carries the shared release accounting for the claim.
+    decode_slice: Option<DecodeSlice>,
 }
 
 impl RowGroupDecoder {
@@ -174,28 +177,40 @@ impl RowGroupDecoder {
             }
         }
 
+        let total = row_group_metadata
+            .filtered_indices()
+            .as_ref()
+            .map(|f| f.len())
+            .or(row_group_metadata
+                .decode_slice
+                .as_ref()
+                .map(|s| (s.row_range.1 - s.row_range.0) as usize))
+            .unwrap_or(row_group_metadata.num_rows() as usize);
         Ok(Self {
             row_group_idx: row_group_metadata.index(),
             column_decoders,
             schema: Arc::new(Schema::new(Fields::from(output_fields))),
             batch_size,
-            total: row_group_metadata
-                .filtered_indices()
-                .as_ref()
-                .map(|f| f.len())
-                .unwrap_or(row_group_metadata.num_rows() as usize),
+            total,
             row_offset: 0,
             add_row_group_metadata,
             prunable_columns,
             pruned,
             decoder_output_columns,
             filter_batches,
+            decode_slice: row_group_metadata.decode_slice.clone(),
         })
     }
 
     /// Returns the global row-group index this decoder is responsible for.
     pub fn row_group_idx(&self) -> usize {
         self.row_group_idx
+    }
+
+    /// The decode slice this decoder covers, when its row group's decode was
+    /// fanned out across workers.
+    pub fn decode_slice(&self) -> Option<&DecodeSlice> {
+        self.decode_slice.as_ref()
     }
 
     /// Returns `true` when the row group has been pruned (no row can match a

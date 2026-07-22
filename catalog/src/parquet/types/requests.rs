@@ -23,6 +23,7 @@ use dispatch::memory::{CacheLookup, MultiBufferReader, ReaderPosition, Segment, 
 ///   [`parse_page_header`]), and its decompressed bytes, pinned. The indexer
 ///   builds a `CompressedPage` from it directly, no parsing or decompression
 ///   needed.
+#[derive(Clone)]
 pub enum ColumnPart<Payload = Vec<Bytes>> {
     Compressed {
         offset: usize,

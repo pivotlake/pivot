@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicUsize;
 
 use crate::parquet::RowGroupFilter;
 use crate::parquet::reading::empty_projection_scan::empty_projection_scan;
+use crate::parquet::types::metadata::DecodeFanOut;
 use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
@@ -41,6 +42,10 @@ where
 {
     let n = input.dispatcher().worker_count();
     let topology = input.dispatcher().topology();
+    // Every worker's pending-claims counter: a fanned-out row group's decode
+    // slices finish on workers other than the claimer, and the last one must
+    // release the claim against the claimer's counter, not its own.
+    let claimer_pending_counters = Arc::new(pending_row_groups.clone());
     let decoded = input
         .chain(
             stealable::<RowGroupBuffer>(topology).into_iter().collect(),
@@ -62,6 +67,7 @@ where
                     add_row_group_metadata,
                     eq_predicates: eq_predicates.clone(),
                     pending_row_groups: pending,
+                    claimer_pending_counters: claimer_pending_counters.clone(),
                     outstanding_row_groups: outstanding_row_groups.clone(),
                 })
                 .collect(),
@@ -142,6 +148,19 @@ pub fn table_input_with_filter_and_eq_predicates(
     // it, and a Top-N scan throttles its claims against it while its boundary
     // converges (see `RowGroupInjector`).
     let outstanding_row_groups = Arc::new(AtomicUsize::new(0));
+    // A scan with fewer row groups than workers would pin each row group's
+    // whole decode on its claimer and leave the rest of the pool idle, so ask
+    // the indexer to split each row group into decode slices spread across
+    // workers. Restricted to plain scans: a dynamic filter or Top-N steal
+    // order prunes at claim granularity and keeps its own claim throttle.
+    let decode_fan_out = (filter.is_none()
+        && scan_order.is_none()
+        && !table.row_groups.is_empty()
+        && table.row_groups.len() < n)
+        .then_some(DecodeFanOut {
+            worker_count: n,
+            row_group_count: table.row_groups.len(),
+        });
     let injector = RowGroupInjectorFactory::new(
         table,
         projection.clone(),
@@ -149,6 +168,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         scan_order,
         outstanding_row_groups.clone(),
         dispatcher.topology().node_count,
+        decode_fan_out,
     );
     let siblings = Arc::new(AtomicUsize::new(n));
     let pending_row_groups = pending_row_group_counters(n);

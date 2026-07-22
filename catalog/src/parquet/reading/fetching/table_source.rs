@@ -17,7 +17,7 @@
 //! remote for a later query).
 
 use crate::parquet::RowGroupRequest;
-use crate::parquet::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
+use crate::parquet::types::metadata::{DecodeFanOut, QueryRowGroupMetadata, RowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::table::ParquetTable;
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
@@ -227,6 +227,7 @@ impl RowGroupInjectorFactory {
         scan_order: Option<ScanOrder>,
         outstanding_row_groups: Arc<AtomicUsize>,
         node_count: usize,
+        decode_fan_out: Option<DecodeFanOut>,
     ) -> Self {
         let row_group_queues: Arc<Vec<Injector<QueryRowGroupMetadata>>> =
             Arc::new((0..node_count).map(|_| Injector::new()).collect());
@@ -243,7 +244,9 @@ impl RowGroupInjectorFactory {
         });
         for row_group_idx in order {
             let node = affinity_node(&table.row_groups[row_group_idx], node_count);
-            row_group_queues[node].push(QueryRowGroupMetadata::new(table, row_group_idx, None));
+            let mut metadata = QueryRowGroupMetadata::new(table, row_group_idx, None);
+            metadata.decode_fan_out = decode_fan_out;
+            row_group_queues[node].push(metadata);
         }
         Self {
             row_group_queues,
