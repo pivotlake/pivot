@@ -1,0 +1,73 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use duckdb_planner::{
+    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
+};
+
+struct CountingTable {
+    rows: u64,
+    asked: Arc<AtomicUsize>,
+}
+
+impl DuckDBTable for CountingTable {
+    fn clone_box(&self) -> Box<dyn DuckDBTable> {
+        Box::new(CountingTable {
+            rows: self.rows,
+            asked: self.asked.clone(),
+        })
+    }
+
+    fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
+        vec![DuckDBColumn {
+            name: "id".to_string(),
+            duckdb_logical_type_id: LogicalTypeId::INTEGER as u8,
+            decimal_width: 0,
+            decimal_scale: 0,
+        }]
+    }
+
+    fn estimate_row_count(&self) -> Option<u64> {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        Some(self.rows)
+    }
+}
+
+struct StatsCatalog;
+
+impl DuckDBBind for StatsCatalog {}
+
+struct StatsTransaction {
+    asked: Arc<AtomicUsize>,
+}
+
+impl DuckDBTransaction for StatsTransaction {
+    fn table(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+        let rows = match table_name {
+            "small" => 10,
+            "big" => 1_000_000,
+            _ => return None,
+        };
+        Some(Box::new(CountingTable {
+            rows,
+            asked: self.asked.clone(),
+        }))
+    }
+}
+
+#[test]
+fn join_planning_consults_table_row_counts() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let mut planner = PlannerContext::new(Arc::new(StatsCatalog));
+
+    planner
+        .plan(
+            "SELECT small.id FROM small JOIN big ON small.id = big.id",
+            Arc::new(StatsTransaction {
+                asked: asked.clone(),
+            }),
+        )
+        .unwrap();
+
+    assert!(asked.load(Ordering::Relaxed) > 0);
+}
